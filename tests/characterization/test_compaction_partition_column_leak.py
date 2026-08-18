@@ -64,7 +64,6 @@ import collections
 
 import polars as pl
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 import supertable.processing as st_processing
 from supertable.data_reader import DataReader
@@ -92,16 +91,18 @@ def _snapshot():
     return st, snap
 
 
-def _body_names(file_key) -> list:
-    """The file's OWN footer column names (no Hive inference). CWD is the
-    hermetic ``SUPERTABLE_HOME`` so the relative resource key opens directly."""
-    return list(pq.ParquetFile(file_key).schema_arrow.names)
+def _body_names(storage, file_key) -> list:
+    """The logical object's own footer columns, with no Hive inference."""
+    return list(storage.read_parquet(file_key).schema.names)
 
 
-def _baked_partition_cols(snap) -> list:
+def _baked_partition_cols(st, snap) -> list:
     out = []
     for r in (snap.get("resources") or []):
-        leak = [c for c in _PARTITION_COLS if c in _body_names(r["file"])]
+        leak = [
+            c for c in _PARTITION_COLS
+            if c in _body_names(st.storage, r["file"])
+        ]
         if leak:
             out.append((r["file"], leak))
     return out
@@ -120,7 +121,7 @@ def test_compaction_does_not_bake_or_leak_partition_columns():
 
     st, snap = _snapshot()
     # Ground truth: fresh bodies honour the path-only contract (no year/month/day).
-    assert _baked_partition_cols(snap) == [], (
+    assert _baked_partition_cols(st, snap) == [], (
         "fresh writes must not store partition columns in the body"
     )
 
@@ -129,7 +130,7 @@ def test_compaction_does_not_bake_or_leak_partition_columns():
     st2, snap2 = _snapshot()
 
     # PRIMARY seal #1 (no baking): no compacted body carries year/month/day.
-    baked = _baked_partition_cols(snap2)
+    baked = _baked_partition_cols(st2, snap2)
     assert baked == [], (
         f"compaction BAKED partition columns into the body (path-only contract "
         f"violated): {baked}"

@@ -64,17 +64,25 @@ def patched_storage():
 
 
 def _spy_reads(monkeypatch) -> List[str]:
-    """Record every path handed to ``_read_parquet_safe`` (then delegate)."""
+    """Record every path handed to either compaction read lane."""
     from supertable import processing as proc_mod
 
-    real = proc_mod._read_parquet_safe
+    real_read = proc_mod._read_parquet_safe
+    real_iter = proc_mod._iter_parquet_frames_safe
     reads: List[str] = []
 
-    def _rec(path, *a, **k):
-        reads.append(path)
-        return real(path, *a, **k)
+    def _rec_read(path, *a, **k):
+        if not reads or reads[-1] != path:
+            reads.append(path)
+        return real_read(path, *a, **k)
 
-    monkeypatch.setattr(proc_mod, "_read_parquet_safe", _rec)
+    def _rec_iter(path, *a, **k):
+        if not reads or reads[-1] != path:
+            reads.append(path)
+        return real_iter(path, *a, **k)
+
+    monkeypatch.setattr(proc_mod, "_read_parquet_safe", _rec_read)
+    monkeypatch.setattr(proc_mod, "_iter_parquet_frames_safe", _rec_iter)
     return reads
 
 

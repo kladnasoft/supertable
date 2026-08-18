@@ -21,7 +21,11 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from tests.characterization.harness import FIXED_NOW_MS, install_fake_redis
+from tests.characterization.harness import (
+    FIXED_NOW_MS,
+    install_fake_redis,
+    install_privileged_activation,
+)
 from tests.characterization.table_result import TableResult
 
 
@@ -115,17 +119,19 @@ def inject_catalog(
     org = catalog["organization"]
     sup = catalog["super_name"]
 
+    # Privileged RBAC mutations are fenced until a canonical deployment
+    # baseline is anchored.  Characterization uses the real production
+    # baseline verifier and attestation script against its hermetic Redis.
+    from supertable.redis_connector import create_redis_client
+
+    install_privileged_activation(create_redis_client(), org)
+
     # Bootstraps meta:root + RBAC (auto superadmin role) — superadmin bypasses
     # RBAC restriction so reads see all rows/columns.
     SuperTable(sup, org)
 
     cat = RedisCatalog()
     for simple_name, t in catalog["tables"].items():
-        cat.set_table_config(
-            org, sup, simple_name,
-            {"primary_keys": t["primary_keys"], "dedup_on_read": t["dedup_on_read"]},
-        )
-
         resources = []
         resource_keys: Dict[str, str] = {}
         for r in t["resources"]:
@@ -173,11 +179,44 @@ def inject_catalog(
             payload["tombstone"] = tombstone_path
             payload["tombstone_rows"] = tombstone_rows
             payload["tombstone_digest"] = digest
-        cat.set_leaf_payload_cas(
-            org, sup, simple_name, payload,
-            path=f"{org}/{sup}/tables/{simple_name}/snapshots/sealed.json",
-            now_ms=FIXED_NOW_MS,
+        namespace_token = cat.acquire_namespace_lock(
+            org, sup, ttl_s=30, timeout_s=30,
         )
+        if not namespace_token:
+            raise TimeoutError(
+                f"Could not acquire characterization namespace lock for {org}/{sup}"
+            )
+        try:
+            cat.set_leaf_payload_cas(
+                org, sup, simple_name, payload,
+                path=f"{org}/{sup}/tables/{simple_name}/snapshots/sealed.json",
+                now_ms=FIXED_NOW_MS,
+                namespace_token=namespace_token,
+            )
+        finally:
+            cat.release_namespace_lock(org, sup, namespace_token)
+
+        table_token = cat.acquire_simple_lock(
+            org, sup, simple_name, ttl_s=30, timeout_s=30,
+        )
+        if not table_token:
+            raise TimeoutError(
+                "Could not acquire characterization table lock for "
+                f"{org}/{sup}/{simple_name}"
+            )
+        try:
+            cat.set_table_config(
+                org,
+                sup,
+                simple_name,
+                {
+                    "primary_keys": t["primary_keys"],
+                    "dedup_on_read": t["dedup_on_read"],
+                },
+                lock_token=table_token,
+            )
+        finally:
+            cat.release_simple_lock(org, sup, simple_name, table_token)
     cat.bump_root(org, sup)
 
 

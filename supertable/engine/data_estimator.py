@@ -158,6 +158,9 @@ class DataEstimator:
         join_edges: Optional[List[JoinEdge]] = None,
         plan_stats: Optional[PlanStats] = None,
         join_pruning_lanes: Optional[Set[str]] = None,
+        aggregate_children: Optional[
+            Dict[Tuple[str, str], Iterable[str]]
+        ] = None,
     ):
         self.organization = organization
         self.storage = storage
@@ -175,6 +178,16 @@ class DataEstimator:
         # Disabled lanes become unknown and therefore retain files.  ``None``
         # preserves the kernel's full safe-lane set for standalone callers.
         self.join_pruning_lanes = join_pruning_lanes
+        # Aggregate relations (``super_name == simple_name``) are resolved and
+        # authorized by DataReader before estimation.  Pin that exact child set
+        # here so a table created between authorization and Redis SCAN cannot be
+        # pulled into the union without a policy decision.
+        self.aggregate_children: Dict[Tuple[str, str], Set[str]] = {
+            (str(key[0]).casefold(), str(key[1]).casefold()): {
+                str(child).casefold() for child in children
+            }
+            for key, children in (aggregate_children or {}).items()
+        }
         self.timer: Optional[Timer] = None
         # When the caller (DataReader) injects its PlanStats, estimator stats —
         # REFLECTIONS, REFLECTION_SIZE and the read-pruning counters — land on
@@ -296,7 +309,12 @@ class DataEstimator:
             return key
 
         # 3) storage helpers
-        for attr in ("to_duckdb_path", "make_duckdb_url", "make_url"):
+        for attr in (
+            "to_duckdb_path",
+            "make_duckdb_url",
+            "make_url",
+            "canonical_uri",
+        ):
             fn = getattr(self.storage, attr, None)
             if callable(fn):
                 try:
@@ -358,7 +376,22 @@ class DataEstimator:
 
     def _filter_snapshots(self, super_name, simple_name, snapshots: List[Dict]) -> List[Dict]:
         if super_name.lower() == simple_name.lower():
-            return [s for s in snapshots if not (s["table_name"].startswith("__") and s["table_name"].endswith("__"))]
+            authorized = self.aggregate_children.get(
+                (str(super_name).casefold(), str(simple_name).casefold())
+            )
+            # Standalone DataEstimator callers retain the historical aggregate
+            # behavior. DataReader always supplies a pinned set after RBAC.
+            return [
+                s for s in snapshots
+                if not (
+                    s["table_name"].startswith("__")
+                    and s["table_name"].endswith("__")
+                )
+                and (
+                    authorized is None
+                    or str(s["table_name"]).casefold() in authorized
+                )
+            ]
         return [s for s in snapshots if s["table_name"].lower() == simple_name.lower()]
 
     def _get_supertable_map(self) -> List[Tuple[str, List[str]]]:

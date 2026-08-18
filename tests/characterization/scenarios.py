@@ -508,9 +508,8 @@ def _keys() -> List[Scenario]:
 
     out.append(_single(
         "key_int_float_coercion", "keys",
-        "Selecting an int key ALONGSIDE a float column triggers numpy "
-        "homogeneous-array coercion in result_df.values.tolist(): the int key is "
-        "returned as a float. Sealed as-is (a current quirk).",
+        "Arrow streaming preserves each column's scalar type: selecting an int "
+        "key alongside a float no longer coerces the integer key to float.",
         columns={"id": "int", "amount": "float", TS: "timestamp"},
         rows=[
             {"id": 1, "amount": 1.5, TS: ts(seconds=0)},
@@ -829,8 +828,8 @@ def _schema() -> List[Scenario]:
 
     out.append(_single(
         "schema_all_types", "schema",
-        "All supported logical types round-trip through the read in canonical "
-        "form (int/bigint/str/bool/float/double/date/timestamp/decimal).",
+        "The bounded public result preserves exact integers and emits "
+        "date/timestamp/decimal scalars as deterministic JSON-safe strings.",
         columns={
             "id": "int", "n32": "int32", "big": "bigint", "s": "str",
             "b": "bool", "f": "float", "d": "double", "dt": "date",

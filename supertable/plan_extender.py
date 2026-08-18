@@ -7,7 +7,7 @@ from typing import Dict, Any, Tuple
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.engine.plan_stats import PlanStats
 from supertable.monitoring.partitions import MONITORING_SINK_TABLES
-from supertable.monitoring_writer import MonitoringWriter
+from supertable.monitoring_writer import MonitoringDurabilityError, MonitoringWriter
 from supertable.engine.query_observations import (
     QueryObservation,
     QueryObservationStore,
@@ -85,7 +85,9 @@ def extend_execution_plan(
     log a single metric through MonitoringLogger, then delete the raw plan.
 
     Robustness goals:
-    - Never raise from this function (monitoring must not break reads).
+    - Redis outage remains non-fatal after the metric is fsynced to the bounded
+      local spool. Spool durability/backpressure is deliberately raised so an
+      enabled monitoring operation cannot be acknowledged with no record.
     - Handle missing/invalid JSON profile gracefully.
     - Avoid gigantic payloads by JSON-encoding nested parts into strings.
 
@@ -204,7 +206,7 @@ def extend_execution_plan(
             pass
         return  # nothing else to do safely
 
-    # Log the metric (buffered; background writer flushes).
+    # Durably enqueue the metric; Redis outage is absorbed by the bounded WAL.
     # Monitoring is org-wide as of SDK 2.2.0 — the touched supertable
     # is recorded in the payload's ``supertables: [str]`` field.
     #
@@ -213,42 +215,49 @@ def extend_execution_plan(
     # the plans-metric emission. The orchestrator analysing the sink
     # tables would otherwise generate fresh ``plans`` partitions for
     # tomorrow's flush, leading to slow amplification.
-    if _query_targets_sink_table(stats.get("table_name", "")):
-        logger.debug("Skipping plans metric for sink-table query")
-    else:
+    try:
+        if _query_targets_sink_table(stats.get("table_name", "")):
+            logger.debug("Skipping plans metric for sink-table query")
+        else:
+            try:
+                stats["supertables"] = [query_plan_manager.super_name]
+                with MonitoringWriter(
+                    organization=query_plan_manager.organization,
+                    monitor_type="plans",
+                ) as monitor:
+                    monitor.log_metric(stats)
+                    logger.debug("Extended plan metrics queued for logging.")
+            except MonitoringDurabilityError:
+                # Enabled monitoring is part of the acknowledged operation
+                # boundary. Redis outage is already absorbed by the durable
+                # spool; only spool durability/backpressure reaches here.
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Monitoring logging failed (non-fatal): %s", e)
+
+        # Persist only exact, successful, non-fallback AUTO observations in the
+        # compact router store. Forced/failed/fallback executions remain visible
+        # but cannot train a pure-engine EWMA.
         try:
-            stats["supertables"] = [query_plan_manager.super_name]
-            with MonitoringWriter(
-                organization=query_plan_manager.organization,
-                monitor_type="plans",
-            ) as monitor:
-                monitor.log_metric(stats)
-                logger.debug("Extended plan metrics queued for logging.")
-        except Exception as e:  # noqa: BLE001
-            logger.warning("Monitoring logging failed (non-fatal): %s", e)
-
-    # Persist only exact, successful, non-fallback AUTO observations in the
-    # compact router store. Forced/failed/fallback executions remain visible in
-    # the normalized plans metric above but cannot train a pure-engine EWMA.
-    try:
-        observation = QueryObservation.from_profile(
-            normalized,
-            query_id=getattr(query_plan_manager, "query_id", ""),
-        )
-        if observation.feedback_eligible:
-            store = getattr(
-                query_plan_manager, "query_observation_store", None,
-            ) or QueryObservationStore(
-                getattr(query_plan_manager, "organization", ""),
+            observation = QueryObservation.from_profile(
+                normalized,
+                query_id=getattr(query_plan_manager, "query_id", ""),
             )
-            store.record(observation)
-    except Exception as e:  # noqa: BLE001
-        logger.debug("Query observation persistence skipped: %s", e)
-
-    # Delete the raw plan JSON from local disk (best-effort)
-    try:
-        if plan_path and os.path.isfile(plan_path):
-            os.remove(plan_path)
-            logger.debug("Deleted plan JSON: %s", plan_path)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Failed to delete plan JSON (non-fatal): %s", e)
+            if observation.feedback_eligible:
+                store = getattr(
+                    query_plan_manager, "query_observation_store", None,
+                ) or QueryObservationStore(
+                    getattr(query_plan_manager, "organization", ""),
+                )
+                store.record(observation)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Query observation persistence skipped: %s", e)
+    finally:
+        # Raw profiles can include operational details. Always remove them even
+        # when monitoring durability/backpressure is propagated to the caller.
+        try:
+            if plan_path and os.path.isfile(plan_path):
+                os.remove(plan_path)
+                logger.debug("Deleted plan JSON: %s", plan_path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to delete plan JSON (non-fatal): %s", e)

@@ -10,10 +10,15 @@ thread in an API server.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
+import json
 import logging
 import math
+import os
 import random
 import signal
+import stat
 import threading
 import time
 from dataclasses import dataclass
@@ -36,6 +41,9 @@ MAX_BATCH_COUNT = 1_000
 MAX_TRIM_ENTRIES = 1_000
 DEFAULT_VERIFY_MAX_BATCHES = 10_000
 MAX_VERIFY_BATCHES = 1_000_000
+MAX_ACTIVATION_STATE_KEYS = 100_000
+MAX_ACTIVATION_STATE_ENTRIES = 2_000_000
+MAX_ACTIVATION_STATE_BYTES = 256 * 1024 * 1024
 
 
 class WorkerExitCode(IntEnum):
@@ -52,6 +60,10 @@ class RedisDurabilityError(RuntimeError):
     """The strict Redis deployment preflight could not prove durability."""
 
 
+class ActivationBaselineError(RuntimeError):
+    """The pinned existing-estate activation baseline is absent or changed."""
+
+
 @dataclass(frozen=True)
 class RedisDurabilityReport:
     """Non-secret Redis settings proven by the strict startup preflight."""
@@ -63,6 +75,17 @@ class RedisDurabilityReport:
     maxmemory_policy: str
     configured_min_replicas: int = 0
     connected_replicas: int = 0
+
+
+@dataclass(frozen=True)
+class ActivationBaselineReport:
+    """Identity of one deployment-pinned canonical activation baseline."""
+
+    organization: str
+    activation_id: str
+    created_ms: int
+    state_sha256: str
+    artifact_sha256: str
 
 
 def _validate_identity(name: str, value: str) -> None:
@@ -97,10 +120,12 @@ class WorkerConfig:
     retry_initial_seconds: float = 1.0
     retry_max_seconds: float = 30.0
     retry_jitter: float = 0.2
-    require_durable_redis: bool = False
+    require_durable_redis: bool = True
     allow_everysec: bool = False
     min_replicas_to_write: int = 0
     min_connected_replicas: int = 0
+    activation_baseline_path: str = ""
+    activation_baseline_sha256: str = ""
 
     def __post_init__(self) -> None:
         _validate_identity("organization", self.organization)
@@ -197,6 +222,20 @@ class WorkerConfig:
             self.min_replicas_to_write or self.min_connected_replicas
         ) and not self.require_durable_redis:
             raise ValueError("replica thresholds require require_durable_redis")
+        baseline_path = self.activation_baseline_path
+        baseline_hash = self.activation_baseline_sha256
+        if bool(baseline_path) != bool(baseline_hash):
+            raise ValueError(
+                "activation_baseline_path and activation_baseline_sha256 "
+                "must be supplied together"
+            )
+        if baseline_hash and (
+            len(baseline_hash) != 64
+            or any(character not in "0123456789abcdef" for character in baseline_hash)
+        ):
+            raise ValueError(
+                "activation_baseline_sha256 must be lowercase SHA-256 hex"
+            )
 
 
 @dataclass
@@ -211,6 +250,8 @@ class WorkerStats:
     transient_failures: int = 0
     checkpoint_verifications: int = 0
     chain_verifications: int = 0
+    redis_attestations: int = 0
+    baseline_attestations: int = 0
 
 
 def _text(value: Any) -> str:
@@ -266,10 +307,10 @@ def verify_redis_durability(
 ) -> RedisDurabilityReport:
     """Fail unless Redis exposes the deployment durability contract.
 
-    This check is intentionally opt-in at the CLI because managed Redis
-    services frequently deny ``CONFIG GET``.  It verifies deployment state; it
-    does not configure Redis and is not a replacement for tested backups,
-    replicas, or storage-level WORM retention.
+    The operational CLI enables this check by default and requires an explicit
+    unsafe opt-out when a managed service denies ``CONFIG GET``. It verifies
+    deployment state; it does not configure Redis and is not a replacement for
+    tested backups, replicas, or storage-level WORM retention.
     """
 
     if not isinstance(allow_everysec, bool):
@@ -405,6 +446,386 @@ def verify_redis_durability(
     )
 
 
+def verify_activation_baseline(
+    path: str,
+    *,
+    expected_sha256: str,
+    organization: str,
+) -> ActivationBaselineReport:
+    """Verify a canonical activation artifact against a deployment pin.
+
+    The SHA-256 is deliberately supplied out-of-band (service unit, secret
+    manager, or signed deployment manifest). Trusting a mutable hash stored
+    beside the baseline would let replacement of both files silently move the
+    audit genesis point.
+    """
+
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in expected_sha256)
+    ):
+        raise ActivationBaselineError(
+            "activation baseline pin must be lowercase SHA-256 hex"
+        )
+    if not isinstance(path, str) or not path:
+        raise ActivationBaselineError("activation baseline path is required")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ActivationBaselineError(
+            f"cannot open pinned activation baseline: {exc}"
+        ) from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ActivationBaselineError(
+                "activation baseline must be a regular file"
+            )
+        if metadata.st_size < 1 or metadata.st_size > 1024 * 1024:
+            raise ActivationBaselineError(
+                "activation baseline must be between 1 byte and 1 MiB"
+            )
+        chunks: list[bytes] = []
+        remaining = int(metadata.st_size)
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                raise ActivationBaselineError(
+                    "activation baseline changed during read"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ActivationBaselineError(
+                "activation baseline grew during read"
+            )
+        payload = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if not hmac.compare_digest(actual_sha256, expected_sha256):
+        raise ActivationBaselineError(
+            "activation baseline differs from its deployment-pinned SHA-256"
+        )
+    try:
+        document = json.loads(payload)
+    except (UnicodeDecodeError, TypeError, ValueError) as exc:
+        raise ActivationBaselineError(
+            "activation baseline is not valid JSON"
+        ) from exc
+    if not isinstance(document, dict):
+        raise ActivationBaselineError("activation baseline must be a JSON object")
+    required_fields = {
+        "version",
+        "kind",
+        "organization",
+        "activation_id",
+        "created_ms",
+        "state_sha256",
+    }
+    if set(document) != required_fields:
+        raise ActivationBaselineError(
+            "activation baseline must contain exactly the version, kind, "
+            "organization, activation_id, created_ms, and state_sha256 fields"
+        )
+    canonical = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    if payload != canonical:
+        raise ActivationBaselineError(
+            "activation baseline must use canonical JSON encoding"
+        )
+    if (
+        document.get("version") != 1
+        or document.get("kind") != "supertable_privileged_activation_baseline"
+        or document.get("organization") != organization
+    ):
+        raise ActivationBaselineError(
+            "activation baseline identity does not match this worker"
+        )
+    activation_id = document.get("activation_id")
+    state_sha256 = document.get("state_sha256")
+    created_ms = document.get("created_ms")
+    if (
+        not isinstance(activation_id, str)
+        or not activation_id
+        or len(activation_id) > 256
+        or isinstance(created_ms, bool)
+        or not isinstance(created_ms, int)
+        or created_ms < 1
+        or not isinstance(state_sha256, str)
+        or len(state_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in state_sha256)
+    ):
+        raise ActivationBaselineError(
+            "activation baseline contains invalid bounded identity fields"
+        )
+    return ActivationBaselineReport(
+        organization=organization,
+        activation_id=activation_id,
+        created_ms=created_ms,
+        state_sha256=state_sha256,
+        artifact_sha256=actual_sha256,
+    )
+
+
+def _activation_bytes(value: Any, *, label: str) -> bytes:
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    raise ActivationBaselineError(
+        f"privileged-state {label} must be Redis bytes or text"
+    )
+
+
+def _activation_digest_frame(digest: Any, value: bytes) -> None:
+    """Hash one unambiguous length-delimited byte string."""
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
+def compute_privileged_state_sha256(outbox: Any, organization: str) -> str:
+    """Hash the exact live RBAC and auth-token estate canonically.
+
+    The format is versioned and hashes raw Redis bytes. Keys, HASH fields, and
+    SET members are sorted, so Redis iteration order and response decoding do
+    not affect the result. The export is deliberately bounded; an estate over
+    a bound must be partitioned/migrated deliberately rather than silently
+    producing a partial activation baseline.
+    """
+    from supertable import redis_keys as RK
+
+    redis_client = getattr(outbox, "_redis", None)
+    stream_key = getattr(outbox, "stream_key", None)
+    expected_stream_key = RK.audit_privileged_outbox(organization)
+    if redis_client is None or stream_key != expected_stream_key:
+        raise ActivationBaselineError(
+            "outbox does not expose the expected privileged Redis identity"
+        )
+
+    discovered: dict[bytes, Any] = {}
+    try:
+        pattern = RK.rbac_pattern_for_org(organization)
+        for raw_key in redis_client.scan_iter(match=pattern, count=1_000):
+            encoded_key = _activation_bytes(raw_key, label="key")
+            discovered.setdefault(encoded_key, raw_key)
+            if len(discovered) > MAX_ACTIVATION_STATE_KEYS:
+                raise ActivationBaselineError(
+                    "privileged-state key count exceeds the activation bound"
+                )
+
+        # Organization token material and its monotonic namespace revision are
+        # privileged state but live outside each SuperTable's RBAC namespace.
+        for key in (RK.auth_tokens(organization), f"{RK.auth_tokens(organization)}:audit_meta"):
+            key_type = _text(redis_client.type(key)).strip().lower()
+            if key_type != "none":
+                discovered.setdefault(key.encode("utf-8"), key)
+    except ActivationBaselineError:
+        raise
+    except Exception as exc:
+        raise ActivationBaselineError(
+            f"cannot enumerate live privileged Redis state: {exc}"
+        ) from exc
+
+    digest = hashlib.sha256()
+    digest.update(b"supertable-privileged-state-v1\x00")
+    _activation_digest_frame(digest, organization.encode("utf-8"))
+    entry_count = 0
+    byte_count = 0
+    try:
+        for encoded_key in sorted(discovered):
+            raw_key = discovered[encoded_key]
+            key_type = _text(redis_client.type(raw_key)).strip().lower()
+            if key_type == "none":
+                raise ActivationBaselineError(
+                    "privileged-state key disappeared during activation export"
+                )
+            if key_type == "hash":
+                raw_mapping = redis_client.hgetall(raw_key)
+                if not isinstance(raw_mapping, Mapping):
+                    raise ActivationBaselineError(
+                        "privileged-state HASH returned an invalid response"
+                    )
+                items = sorted(
+                    (
+                        _activation_bytes(field, label="HASH field"),
+                        _activation_bytes(value, label="HASH value"),
+                    )
+                    for field, value in raw_mapping.items()
+                )
+            elif key_type == "set":
+                raw_members = redis_client.smembers(raw_key)
+                if isinstance(raw_members, (str, bytes)):
+                    raise ActivationBaselineError(
+                        "privileged-state SET returned an invalid response"
+                    )
+                items = [
+                    (_activation_bytes(member, label="SET member"), b"")
+                    for member in sorted(
+                        raw_members,
+                        key=lambda member: _activation_bytes(member, label="SET member"),
+                    )
+                ]
+            else:
+                raise ActivationBaselineError(
+                    f"privileged-state key has unsupported Redis type {key_type!r}"
+                )
+
+            entry_count += len(items)
+            byte_count += len(encoded_key) + sum(
+                len(field) + len(value) for field, value in items
+            )
+            if entry_count > MAX_ACTIVATION_STATE_ENTRIES:
+                raise ActivationBaselineError(
+                    "privileged-state entry count exceeds the activation bound"
+                )
+            if byte_count > MAX_ACTIVATION_STATE_BYTES:
+                raise ActivationBaselineError(
+                    "privileged-state bytes exceed the activation bound"
+                )
+
+            _activation_digest_frame(digest, b"key")
+            _activation_digest_frame(digest, encoded_key)
+            _activation_digest_frame(digest, key_type.encode("ascii"))
+            _activation_digest_frame(digest, str(len(items)).encode("ascii"))
+            for field, value in items:
+                _activation_digest_frame(digest, field)
+                _activation_digest_frame(digest, value)
+    except ActivationBaselineError:
+        raise
+    except Exception as exc:
+        raise ActivationBaselineError(
+            f"cannot read live privileged Redis state: {exc}"
+        ) from exc
+    return digest.hexdigest()
+
+
+_LUA_ATTEST_ACTIVATION_BASELINE = """
+local activation_key = KEYS[1]
+local outbox_key = KEYS[2]
+local meta_key = KEYS[3]
+local delivery_key = KEYS[4]
+local expected = ARGV[1]
+
+local function normalized_type(key)
+    local value = redis.call('TYPE', key)
+    if type(value) == 'table' then value = value['ok'] end
+    return tostring(value)
+end
+
+local activation_type = normalized_type(activation_key)
+if activation_type ~= 'none' and activation_type ~= 'string' then
+    return redis.error_reply('privileged activation anchor has wrong Redis type')
+end
+local outbox_type = normalized_type(outbox_key)
+if outbox_type ~= 'none' and outbox_type ~= 'stream' then
+    return redis.error_reply('privileged audit outbox has wrong Redis type')
+end
+local meta_type = normalized_type(meta_key)
+if meta_type ~= 'none' and meta_type ~= 'hash' then
+    return redis.error_reply('privileged audit meta has wrong Redis type')
+end
+local delivery_type = normalized_type(delivery_key)
+if delivery_type ~= 'none' and delivery_type ~= 'hash' then
+    return redis.error_reply('privileged audit delivery has wrong Redis type')
+end
+
+local current = redis.call('GET', activation_key)
+if current ~= false then
+    if current ~= expected then
+        return redis.error_reply('privileged activation anchor differs from baseline')
+    end
+    return 1
+end
+if (outbox_type == 'stream' and redis.call('XLEN', outbox_key) > 0)
+    or (meta_type == 'hash' and redis.call('HLEN', meta_key) > 0)
+    or (delivery_type == 'hash' and redis.call('HLEN', delivery_key) > 0) then
+    return redis.error_reply(
+        'privileged ledger exists without its immutable activation anchor'
+    )
+end
+redis.call('SET', activation_key, expected)
+return 2
+"""
+
+
+def _activation_anchor_payload(report: ActivationBaselineReport) -> str:
+    return json.dumps(
+        {
+            "version": 1,
+            "kind": "supertable_privileged_activation_anchor",
+            "organization": report.organization,
+            "activation_id": report.activation_id,
+            "created_ms": report.created_ms,
+            "state_sha256": report.state_sha256,
+            "artifact_sha256": report.artifact_sha256,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def attest_activation_baseline(
+    outbox: Any,
+    report: ActivationBaselineReport,
+) -> bool:
+    """Match/anchor the pinned baseline before any privileged ledger use.
+
+    On first activation, new audited mutations are still fenced because their
+    Lua preamble requires this anchor. Only an empty ledger may be anchored,
+    and only after the live state digest matches the independently pinned
+    artifact. Later calls compare the exact immutable anchor; normal audited
+    state evolution therefore does not invalidate the activation genesis.
+    Returns ``True`` only when this call installs the first anchor.
+    """
+    from supertable import redis_keys as RK
+
+    redis_client = getattr(outbox, "_redis", None)
+    if redis_client is None:
+        raise ActivationBaselineError(
+            "outbox does not expose Redis for activation attestation"
+        )
+    payload = _activation_anchor_payload(report)
+    activation_key = RK.audit_privileged_activation(report.organization)
+    try:
+        current = redis_client.get(activation_key)
+    except Exception as exc:
+        raise ActivationBaselineError(
+            f"cannot read privileged activation anchor: {exc}"
+        ) from exc
+    if current is None:
+        actual_state = compute_privileged_state_sha256(outbox, report.organization)
+        if not hmac.compare_digest(actual_state, report.state_sha256):
+            raise ActivationBaselineError(
+                "activation baseline state_sha256 does not match live privileged state"
+            )
+    try:
+        result = int(redis_client.eval(
+            _LUA_ATTEST_ACTIVATION_BASELINE,
+            4,
+            activation_key,
+            RK.audit_privileged_outbox(report.organization),
+            RK.audit_privileged_meta(report.organization),
+            RK.audit_privileged_delivery(report.organization),
+            payload,
+        ))
+    except Exception as exc:
+        raise ActivationBaselineError(
+            f"privileged activation anchor attestation failed: {exc}"
+        ) from exc
+    if result not in {1, 2}:
+        raise ActivationBaselineError(
+            "privileged activation anchor returned an invalid result"
+        )
+    return result == 2
+
+
 class PrivilegedArchiveWorker:
     """Run bounded archive cycles until stopped or an error policy exits."""
 
@@ -418,6 +839,9 @@ class PrivilegedArchiveWorker:
         wait_for_stop: Optional[Callable[[float], bool]] = None,
         random_uniform: Callable[[float, float], float] = random.uniform,
         worker_logger: logging.Logger = logger,
+        durability_checker: Optional[Callable[..., RedisDurabilityReport]] = None,
+        baseline_checker: Optional[Callable[..., ActivationBaselineReport]] = None,
+        activation_checker: Optional[Callable[..., bool]] = None,
     ) -> None:
         self.outbox = outbox
         self.config = config
@@ -426,9 +850,54 @@ class PrivilegedArchiveWorker:
         self._wait_for_stop = wait_for_stop or self.stop_event.wait
         self._random_uniform = random_uniform
         self._logger = worker_logger
+        self._durability_checker = durability_checker
+        self._baseline_checker = baseline_checker
+        self._activation_checker = activation_checker
         self._stop_signal: Optional[int] = None
         self._pending_trim_id: Optional[str] = None
         self.stats = WorkerStats()
+
+    def _attest_redis(self) -> None:
+        """Re-prove durability against the connection serving this cycle.
+
+        Redis clients transparently reconnect and Sentinel clients transparently
+        follow a new master. A startup-only CONFIG check therefore becomes stale
+        exactly when it matters most. Strict workers run the same fail-closed
+        attestation before every health/drain unit.
+        """
+
+        if not self.config.require_durable_redis:
+            return
+        checker = self._durability_checker or verify_redis_durability
+        checker(
+            self.outbox,
+            allow_everysec=self.config.allow_everysec,
+            min_replicas_to_write=self.config.min_replicas_to_write,
+            min_connected_replicas=self.config.min_connected_replicas,
+        )
+        self.stats.redis_attestations += 1
+
+    def _attest_baseline(self) -> None:
+        """Re-read the externally pinned activation baseline every unit."""
+        if not self.config.activation_baseline_path:
+            return
+        checker = self._baseline_checker or verify_activation_baseline
+        report = checker(
+            self.config.activation_baseline_path,
+            expected_sha256=self.config.activation_baseline_sha256,
+            organization=self.config.organization,
+        )
+        if (
+            getattr(report, "organization", None) != self.config.organization
+            or getattr(report, "artifact_sha256", None)
+            != self.config.activation_baseline_sha256
+        ):
+            raise ActivationBaselineError(
+                "activation baseline attestation report does not match deployment pin"
+            )
+        activation_checker = self._activation_checker or attest_activation_baseline
+        activation_checker(self.outbox, report)
+        self.stats.baseline_attestations += 1
 
     def request_stop(self, signum: Optional[int] = None) -> None:
         """Request cooperative shutdown after the current outbox call returns."""
@@ -641,6 +1110,10 @@ class PrivilegedArchiveWorker:
         next_heartbeat = 0.0
         while not self.stop_event.is_set():
             try:
+                # This is intentionally per unit, not just startup/heartbeat:
+                # redis-py and Sentinel may reconnect between any two calls.
+                self._attest_redis()
+                self._attest_baseline()
                 if self.config.verify_chain:
                     self._verify_chain()
                     reason = "checkpoint chain verification passed"
@@ -707,7 +1180,12 @@ class PrivilegedArchiveWorker:
                 exit_code = WorkerExitCode.INTEGRITY
                 reason = "unrecoverable archive or ledger integrity failure"
                 break
-            except (TypeError, ValueError) as exc:
+            except (
+                TypeError,
+                ValueError,
+                RedisDurabilityError,
+                ActivationBaselineError,
+            ) as exc:
                 self._logger.critical(
                     "privileged_audit_worker_runtime_config_failure organization=%s "
                     "consumer=%s error=%s",
@@ -778,6 +1256,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--organization", required=True)
     parser.add_argument("--consumer", required=True)
+    parser.add_argument(
+        "--activation-baseline",
+        help=(
+            "Canonical existing-estate/greenfield activation baseline file. "
+            "Operational worker startup fails closed when it is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--activation-baseline-sha256",
+        help=(
+            "Lowercase SHA-256 pin supplied independently from the baseline "
+            "storage location."
+        ),
+    )
     parser.add_argument("--group", default=DEFAULT_GROUP)
     parser.add_argument("--count", type=int, default=100)
     parser.add_argument("--reclaim-idle-ms", type=int, default=300_000)
@@ -826,10 +1318,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-jitter", type=float, default=0.2)
     parser.add_argument(
         "--require-durable-redis",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Fail startup unless CONFIG proves AOF, appendfsync=always, "
-            "and noeviction; requires CONFIG GET ACL permission."
+            "Require CONFIG to prove AOF, appendfsync=always, and noeviction "
+            "at startup and before every worker unit. The unsafe --no-require-"
+            "durable-redis opt-out must be an explicit deployment decision."
         ),
     )
     parser.add_argument(
@@ -873,6 +1367,8 @@ def _config_from_args(args: argparse.Namespace) -> WorkerConfig:
         allow_everysec=args.allow_everysec,
         min_replicas_to_write=args.min_replicas_to_write,
         min_connected_replicas=args.min_connected_replicas,
+        activation_baseline_path=args.activation_baseline or "",
+        activation_baseline_sha256=args.activation_baseline_sha256 or "",
     )
 
 
@@ -904,6 +1400,8 @@ def main(
     *,
     outbox_factory: Optional[Callable[[str], Any]] = None,
     durability_checker: Callable[..., RedisDurabilityReport] = verify_redis_durability,
+    baseline_checker: Callable[..., ActivationBaselineReport] = verify_activation_baseline,
+    activation_checker: Callable[..., bool] = attest_activation_baseline,
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -912,9 +1410,63 @@ def main(
     except ValueError as exc:
         parser.error(str(exc))
 
+    if not config.activation_baseline_path:
+        logger.critical(
+            "privileged_audit_worker_baseline_missing organization=%s; "
+            "--activation-baseline and --activation-baseline-sha256 are mandatory",
+            config.organization,
+        )
+        return int(WorkerExitCode.CONFIG)
+    try:
+        baseline = baseline_checker(
+            config.activation_baseline_path,
+            expected_sha256=config.activation_baseline_sha256,
+            organization=config.organization,
+        )
+        if (
+            not isinstance(baseline, ActivationBaselineReport)
+            and not all(
+                hasattr(baseline, field_name)
+                for field_name in (
+                    "organization",
+                    "activation_id",
+                    "created_ms",
+                    "state_sha256",
+                    "artifact_sha256",
+                )
+            )
+        ):
+            raise ActivationBaselineError(
+                "activation baseline checker returned an invalid report"
+            )
+        if (
+            baseline.organization != config.organization
+            or baseline.artifact_sha256 != config.activation_baseline_sha256
+        ):
+            raise ActivationBaselineError(
+                "activation baseline report does not match the deployment pin"
+            )
+    except Exception as exc:
+        logger.critical(
+            "privileged_audit_worker_baseline_failure organization=%s error=%s",
+            config.organization,
+            exc,
+            exc_info=True,
+        )
+        return int(WorkerExitCode.CONFIG)
+
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    logger.info(
+        "privileged_audit_worker_baseline_ok organization=%s activation_id=%s "
+        "created_ms=%s state_sha256=%s artifact_sha256=%s",
+        baseline.organization,
+        baseline.activation_id,
+        baseline.created_ms,
+        baseline.state_sha256,
+        baseline.artifact_sha256,
     )
     factory = outbox_factory or _default_outbox_factory
     try:
@@ -958,7 +1510,13 @@ def main(
             report.connected_replicas,
         )
 
-    worker = PrivilegedArchiveWorker(outbox, config)
+    worker = PrivilegedArchiveWorker(
+        outbox,
+        config,
+        durability_checker=(durability_checker if config.require_durable_redis else None),
+        baseline_checker=baseline_checker,
+        activation_checker=activation_checker,
+    )
     previous_handlers: dict[int, Any] = {}
     try:
         previous_handlers = _install_signal_handlers(worker)
@@ -978,6 +1536,8 @@ if __name__ == "__main__":  # pragma: no cover - exercised through console scrip
 
 
 __all__ = [
+    "ActivationBaselineError",
+    "ActivationBaselineReport",
     "PrivilegedArchiveWorker",
     "RedisDurabilityError",
     "RedisDurabilityReport",
@@ -985,6 +1545,9 @@ __all__ = [
     "WorkerExitCode",
     "WorkerStats",
     "build_parser",
+    "compute_privileged_state_sha256",
     "main",
+    "attest_activation_baseline",
     "verify_redis_durability",
+    "verify_activation_baseline",
 ]

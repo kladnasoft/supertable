@@ -20,6 +20,7 @@ if str(_REPO) not in sys.path:
 from tests.characterization.harness import (  # noqa: E402
     bootstrap_hermetic_env,
     install_fake_redis,
+    install_privileged_activation,
     reset_engine_singletons,
 )
 
@@ -88,9 +89,19 @@ def sealed_manifest_ok(request) -> None:
 
 
 @pytest.fixture(autouse=True)
-def hermetic_fakeredis():
+def hermetic_fakeredis(request):
     """Give every test a fresh, process-local fake Redis and clean engine state."""
     fake = install_fake_redis()
+    # Characterization modules that exercise write/RBAC paths declare their
+    # estate as ``ORG``.  Activate only those modules here: unrelated unit
+    # tests must continue to observe a truly empty fake Redis.  Golden vectors
+    # install their catalog-provided organization in ``current_reader``.
+    test_path = Path(str(request.node.path)).resolve()
+    characterization_dir = (_REPO / "tests" / "characterization").resolve()
+    if test_path.is_relative_to(characterization_dir):
+        organization = getattr(request.module, "ORG", None)
+        if isinstance(organization, str) and organization:
+            install_privileged_activation(fake, organization)
     try:
         yield fake
     finally:

@@ -49,6 +49,13 @@ def get_storage(kind: Optional[str] = None, **kwargs: Any) -> StorageInterface:
 
     if storage_type == "LOCAL":
         mod = importlib.import_module("supertable.storage.local_storage")
+        if "root" not in kwargs:
+            # Runtime storage initialisation is the explicit boundary at which
+            # the configured home may be created/probed.  Importing the package
+            # itself remains side-effect-free and never changes CWD.
+            from supertable.config.homedir import get_app_home
+
+            kwargs["root"] = get_app_home()
         return getattr(mod, "LocalStorage")(**kwargs)
 
     if storage_type == "S3":

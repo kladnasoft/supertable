@@ -121,6 +121,51 @@ This is the primary entry point. It returns a tuple of:
 - `Status`: an enum with values `OK` or `ERROR`.
 - `Optional[str]`: error message (None on success).
 
+Every SELECT is parsed as exactly one statement and receives a server-side
+outer `LIMIT`; a larger client `LIMIT` is clamped to
+`SUPERTABLE_MAX_LIMIT`. SQL byte size, AST nodes, nesting, and join count are
+also bounded before catalog or engine work begins. DuckDB execution consumes
+`SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC` and interrupts the query-private cursor
+when that deadline expires.
+
+The parsed statement also passes a closed function capability policy. Ordinary
+aggregates, casts, string/date operations, and supported window analytics are
+available; settings/secret introspection, filesystem helpers, dynamic table
+functions, unknown extension/UDF calls, qualified function calls, and public
+collection-result amplifiers fail closed. The built-in deep-quality profiler
+has a separate internal capability for collection aggregates, and only when
+their direct subquery has a literal `LIMIT` of at most 10.
+
+DuckDB's bare `USER`, `SESSION_USER`, `CURRENT_ROLE`, `CURRENT_CATALOG`, and
+`CURRENT_SCHEMA` expressions are also rejected because they expose session or
+catalog identity even though the parser models them as columns. A quoted or
+table-qualified data column with the same name remains available.
+
+`EXPLAIN ANALYZE` is not exposed on this untrusted path because DuckDB includes
+physical filenames in its result. Plain `EXPLAIN` remains available for normal
+managed sources, but is rejected for signed data/deletion-vector URLs and for
+queries with RBAC or share restrictions whose expanded plans could expose
+hidden policy columns or literal values.
+
+### The `execute_stream()` Method
+
+```python
+stream, status, message = reader.execute_stream(
+    role_name="reader",
+    engine=engine.ISLANDDB,
+)
+with stream:
+    for record_batch in stream:
+        send(record_batch)
+```
+
+`execute_stream()` runs the same SQL limits, catalog preflight, aggregate-child
+authorization, snapshot pinning, RBAC, and tombstone setup as `execute()`, but
+returns the public cancellable `ArrowBatchStream` instead of a pandas frame.
+DuckDB and IslandDB retain their query resources until exhaustion or close;
+`AUTO` may select either. Spark requests fail explicitly rather than being
+silently materialized under the streaming API.
+
 ### Step-by-Step Walkthrough
 
 **Step 1 -- Parse the SQL**
@@ -135,7 +180,10 @@ tables = parser.get_table_tuples()
 physical_tables = parser.get_physical_tables()
 ```
 
-`SQLParser` uses sqlglot to parse the query with the correct dialect (`"duckdb"` or `"spark"`). It extracts:
+`SQLParser` uses sqlglot to parse exactly one read-only query with the correct
+dialect (`"duckdb"` or `"spark"`). It rejects mutation/locking nodes,
+unmanaged sources, and functions outside the closed capability list before it
+extracts:
 - `tables`: all table references including CTE aliases, as `TableDefinition` objects.
 - `physical_tables`: only real tables (excludes CTE aliases), used for file resolution.
 
@@ -310,10 +358,19 @@ def query_sql(
 ```
 
 This function:
-1. Applies `_ensure_sql_limit()` to cap result size.
-2. Creates a `DataReader` and calls `execute()`.
-3. Converts the DataFrame to columnar format: `(columns, rows, columns_meta)`.
-4. Sanitizes pandas NA variants (`pd.NA`, `pd.NaT`, `np.nan`) to Python `None` for JSON serialization.
+1. Applies `_ensure_sql_limit()` and clamps it to the server maximum.
+2. Routes SELECTs through `execute_stream()` (DuckDB, IslandDB, or AUTO) and
+   converts one Arrow row at a time without constructing a pandas result.
+3. Accounts for each encoded row before retaining it and cancels the stream
+   when the complete JSON response would exceed
+   `SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES`.
+4. Uses the materialized path only for bounded diagnostic commands. Explicit
+   Spark SELECTs fail because Spark has no cancellable incremental result
+   contract in this API.
+
+DuckDB fetches at most `SUPERTABLE_RESULT_STREAM_BATCH_ROWS` rows per Arrow
+batch (hard-clamped to 1–4096). A single row remains the indivisible memory
+floor, but a wide response cannot be prefetched in the old 64K-row batch.
 
 Returns:
 - `columns`: list of column name strings.

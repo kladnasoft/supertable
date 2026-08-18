@@ -65,6 +65,12 @@ def _make_super(
     st.organization = organization
     st.storage = storage or MagicMock()
     st.catalog = catalog or MagicMock()
+    st.catalog.root_exists.return_value = root_exists
+    st.catalog.acquire_namespace_lock.return_value = "namespace-token"
+    st.catalog.begin_namespace_deletion.return_value = {
+        "intent_id": "namespace-delete-intent",
+    }
+    st.catalog.scan_leaf_keys.return_value = iter(())
     st.super_dir = f"{organization}/{super_name}/super"
     return st
 
@@ -118,12 +124,15 @@ class TestSuperTableInit:
         mock_storage.return_value = mock_stor
         mock_cat = MagicMock()
         mock_cat.root_exists.return_value = False
+        mock_cat.acquire_namespace_lock.return_value = "namespace-token"
         MockCat.return_value = mock_cat
 
         st = SuperTable("sup", "org")
 
         mock_stor.makedirs.assert_called_once_with("org/sup/super")
-        mock_cat.ensure_root.assert_called_once_with("org", "sup")
+        mock_cat.ensure_root.assert_called_once_with(
+            "org", "sup", namespace_token="namespace-token",
+        )
         MockRole.assert_called_once_with(super_name="sup", organization="org")
         MockUser.assert_called_once_with(super_name="sup", organization="org")
 
@@ -142,6 +151,7 @@ class TestSuperTableInit:
         mock_storage.return_value = mock_stor
         mock_cat = MagicMock()
         mock_cat.root_exists.return_value = False
+        mock_cat.acquire_namespace_lock.return_value = "namespace-token"
         MockCat.return_value = mock_cat
 
         st = SuperTable("sup", "org")
@@ -191,15 +201,17 @@ class TestSuperTableInit:
 class TestInitSuperTable:
 
     def test_calls_makedirs_and_ensure_root(self):
-        st = _make_super("sup", "org")
+        st = _make_super("sup", "org", root_exists=False)
 
         st.init_super_table()
 
         st.storage.makedirs.assert_called_once_with("org/sup/super")
-        st.catalog.ensure_root.assert_called_once_with("org", "sup")
+        st.catalog.ensure_root.assert_called_once_with(
+            "org", "sup", namespace_token="namespace-token",
+        )
 
     def test_makedirs_exception_swallowed(self):
-        st = _make_super()
+        st = _make_super(root_exists=False)
         st.storage.makedirs.side_effect = OSError("object storage no-op")
 
         # Should not raise
@@ -209,14 +221,14 @@ class TestInitSuperTable:
         st.catalog.ensure_root.assert_called_once()
 
     def test_makedirs_any_exception_swallowed(self):
-        st = _make_super()
+        st = _make_super(root_exists=False)
         st.storage.makedirs.side_effect = RuntimeError("unexpected")
 
         st.init_super_table()
         st.catalog.ensure_root.assert_called_once()
 
     def test_ensure_root_exception_propagates(self):
-        st = _make_super()
+        st = _make_super(root_exists=False)
         st.catalog.ensure_root.side_effect = ConnectionError("redis down")
 
         with pytest.raises(ConnectionError, match="redis down"):
@@ -313,13 +325,17 @@ class TestDelete:
 
     def test_happy_path_deletes_storage_and_redis(self):
         st = _make_super("sup", "org")
-        st.storage.exists.return_value = True
 
         st.delete(role_name="admin")
 
-        st.storage.exists.assert_called_once_with("org/sup")
-        st.storage.delete.assert_called_once_with("org/sup")
-        st.catalog.delete_super_table.assert_called_once_with("org", "sup")
+        st.storage.delete_prefix.assert_called_once_with("org/sup")
+        st.catalog.delete_super_table.assert_called_once_with(
+            "org", "sup", namespace_token="namespace-token",
+            intent_id="namespace-delete-intent",
+        )
+        st.catalog.release_namespace_lock.assert_called_once_with(
+            "org", "sup", "namespace-token",
+        )
         self.resolve_role_context.assert_called_once_with(
             super_name="sup",
             organization="org",
@@ -328,28 +344,29 @@ class TestDelete:
             label="delete this SuperTable",
         )
 
-    def test_storage_not_exists_still_deletes_redis(self):
+    def test_empty_prefix_still_deletes_redis(self):
         st = _make_super("sup", "org")
-        st.storage.exists.return_value = False
 
         st.delete(role_name="admin")
 
-        st.storage.delete.assert_not_called()
-        st.catalog.delete_super_table.assert_called_once_with("org", "sup")
+        st.storage.delete_prefix.assert_called_once_with("org/sup")
+        st.catalog.delete_super_table.assert_called_once_with(
+            "org", "sup", namespace_token="namespace-token",
+            intent_id="namespace-delete-intent",
+        )
 
-    def test_storage_delete_file_not_found_still_deletes_redis(self):
+    def test_storage_prefix_file_not_found_keeps_redis(self):
         st = _make_super("sup", "org")
-        st.storage.exists.return_value = True
-        st.storage.delete.side_effect = FileNotFoundError("gone")
+        st.storage.delete_prefix.side_effect = FileNotFoundError("gone")
 
-        st.delete(role_name="admin")
+        with pytest.raises(FileNotFoundError, match="gone"):
+            st.delete(role_name="admin")
 
-        st.catalog.delete_super_table.assert_called_once_with("org", "sup")
+        st.catalog.delete_super_table.assert_not_called()
 
     def test_storage_delete_other_exception_propagates(self):
         st = _make_super("sup", "org")
-        st.storage.exists.return_value = True
-        st.storage.delete.side_effect = PermissionError("forbidden")
+        st.storage.delete_prefix.side_effect = PermissionError("forbidden")
 
         with pytest.raises(PermissionError, match="forbidden"):
             st.delete(role_name="admin")
@@ -360,16 +377,14 @@ class TestDelete:
     def test_delete_uses_correct_base_dir(self):
         """base_dir = org/super_name (no /super suffix)."""
         st = _make_super("my_sup", "my_org")
-        st.storage.exists.return_value = True
 
         st.delete(role_name="admin")
 
-        st.storage.exists.assert_called_once_with("my_org/my_sup")
-        st.storage.delete.assert_called_once_with("my_org/my_sup")
+        st.storage.delete_prefix.assert_called_once_with("my_org/my_sup")
 
-    def test_storage_exists_exception_propagates(self):
+    def test_storage_prefix_exception_propagates(self):
         st = _make_super()
-        st.storage.exists.side_effect = ConnectionError("storage down")
+        st.storage.delete_prefix.side_effect = ConnectionError("storage down")
 
         with pytest.raises(ConnectionError, match="storage down"):
             st.delete(role_name="admin")
@@ -378,7 +393,6 @@ class TestDelete:
 
     def test_redis_delete_exception_propagates(self):
         st = _make_super()
-        st.storage.exists.return_value = False
         st.catalog.delete_super_table.side_effect = ConnectionError("redis down")
 
         with pytest.raises(ConnectionError, match="redis down"):
@@ -387,7 +401,6 @@ class TestDelete:
     def test_non_superadmin_is_denied_before_mutation(self):
         """ADMIN has CONTROL generally but cannot delete a whole namespace."""
         st = _make_super()
-        st.storage.exists.return_value = False
         self.resolve_role_context.return_value = SimpleNamespace(
             role_type=RoleType.ADMIN,
         )
@@ -395,6 +408,5 @@ class TestDelete:
         with pytest.raises(PermissionError, match="Only SUPERADMIN"):
             st.delete(role_name="admin")
 
-        st.storage.exists.assert_not_called()
-        st.storage.delete.assert_not_called()
+        st.storage.delete_prefix.assert_not_called()
         st.catalog.delete_super_table.assert_not_called()

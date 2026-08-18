@@ -61,7 +61,8 @@ The `Staging` class supports two modes of operation:
 
 **Stage mode** (when `staging_name` is provided):
 - Used for file operations within a specific stage.
-- On construction, the stage directory is created (if it does not exist), the stage is registered in Redis, and the file index JSON is initialized.
+- Construction is read-only. The name is validated as one path component, and storage/Redis state is created lazily by the first authorized upload.
+- Construction and `list_files()` reject namespace/stage deletion tombstones; manager inventory omits tombstoned stages, so stale fixed-path indexes are never presented as live data.
 
 ### Staging Lifecycle
 
@@ -71,17 +72,23 @@ create --> upload files --> review --> commit to table / discard
 
 #### 1. Create
 
-Instantiating `Staging(organization=..., super_name=..., staging_name="my_stage")` triggers `_init_stage()` under a Redis lock:
+The first `save_as_parquet()` call runs `_init_stage()` under the stage lock:
 
 ```python
-def _init_stage(self) -> None:
+def _init_stage(self, lock_token: str) -> None:
+    # Reject namespace/stage deletion tombstones before storage I/O.
+    self.catalog.check_stage_mutation_allowed(
+        org, sup, staging_name, lock_token=lock_token
+    )
+
     # 1. Create physical folder
     if not self.storage.exists(self.stage_dir):
         self.storage.makedirs(self.stage_dir)
 
     # 2. Register in Redis
     self.catalog.upsert_staging_meta(org, sup, staging_name,
-        meta={"path": self.stage_dir, "created_at_ms": int(time.time() * 1000)})
+        meta={"path": self.stage_dir, "created_at_ms": int(time.time() * 1000)},
+        lock_token=lock_token)
 
     # 3. Initialize file index
     if not self.storage.exists(self.files_index_path):
@@ -104,22 +111,23 @@ def save_as_parquet(
 ) -> str
 ```
 
-Writes a PyArrow table as a Parquet file into the stage directory. The file is named with a nanosecond timestamp suffix to avoid collisions: `{clean_name}_{timestamp_ns}.parquet`. After writing, the file index JSON is updated with metadata:
+Writes a PyArrow table as a Parquet file into the stage directory. Storage keys are server-generated as `stage_{timestamp_ns}_{uuid}.parquet`; caller-supplied names never select a path. A sanitized basename is retained only as `original_name` metadata. After writing, the file index JSON is updated:
 
 ```json
 {
-  "file": "orders_1713192000000000000.parquet",
+  "file": "stage_1713192000000000000_a1b2c3d4.parquet",
   "written_at_ns": 1713192000000000000,
   "rows": 50000,
   "source": "upload",
   "duration_ms": 1234,
   "pipe_name": null,
   "pipe_id": null,
-  "status": "ok"
+  "status": "ok",
+  "original_name": "orders.parquet"
 }
 ```
 
-All operations are protected by a Redis lock on the stage (30-second TTL).
+Mutations are protected by an ownership-checked Redis lock. Its 30-second lease is renewed automatically at half-TTL for the full operation; the TTL is a crash-recovery window, not an operation deadline.
 
 #### 3. Review
 
@@ -145,7 +153,7 @@ The manager-mode method `get_directory_structure(role_name)` provides a comprehe
             "files_index_path": "acme/analytics/staging/q1_import_files.json",
             "files_index_exists": True,
             "file_count": 3,
-            "files": ["orders_1713192000.parquet", ...],
+            "files": ["stage_1713192000_a1b2c3d4.parquet", ...],
             "redis_meta": {"path": "...", "created_at_ms": 1713192000000}
         }
     ],
@@ -160,10 +168,22 @@ Committing staged data to a target table is handled by the API layer. The stagin
 #### 5. Discard
 
 ```python
-def delete(self, role_name: str) -> None
+def delete(self, role_name: str) -> str
 ```
 
-Deletes the entire stage: removes the physical directory (recursive), the file index JSON, and all Redis metadata. Runs under a Redis lock.
+Deletes the entire stage under the auto-renewed lock and returns its deletion-intent ID. The storage prefix is deleted and verified first, then the file index, and Redis metadata last. A no-TTL terminal tombstone remains after success. It blocks stage uploads, pipe publication, and recreation even if an earlier saver or deleter resumes after losing its lease.
+
+An ordinary `delete()` never takes over or clears an existing intent. Recovery is an explicit operator boundary:
+
+```python
+stage.recover_delete(
+    role_name,
+    intent_id=recorded_intent_id,
+    confirm_previous_owner_stopped=True,
+)
+```
+
+Before making that confirmation, terminate the exact previous process and account for in-flight storage requests. Recovery repeats physical and catalog cleanup under the same intent, then clears the terminal tombstone so the fixed stage path can be reused.
 
 ### Locking
 
@@ -171,14 +191,16 @@ All mutating stage operations (`_init_stage`, `save_as_parquet`, `delete`) are w
 
 ```python
 def _with_lock(self, fn):
-    lock_key = f"supertable:{org}:{sup}:lock:stage:{staging_name}"
-    token = uuid.uuid4().hex
-    acquired = self.catalog.r.set(lock_key, token, nx=True, ex=30)
-    # ... execute fn() ...
-    # Release via Lua compare-and-delete script
+    token = self.catalog.acquire_stage_lock(
+        org, sup, staging_name, ttl_s=30, timeout_s=30
+    )
+    try:
+        return fn(token)
+    finally:
+        self.catalog.release_stage_lock(org, sup, staging_name, token)
 ```
 
-The lock uses a 30-second TTL with a Lua-script-based atomic release (compare token, then delete).
+`RedisCatalog` delegates to `RedisLocking`, which renews the lease in the background and uses Lua compare-and-extend/compare-and-delete operations so only the owner can extend or release it. Pipe mutations use this same stage lock and atomically reject both namespace and stage deletion tombstones.
 
 ---
 

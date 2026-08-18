@@ -78,7 +78,16 @@ supertable:                                    ── SuperTable SDK state
               pipes:
                 index                          SET     pipe names
                 doc:{pipe_name}                STRING  pipe definition
+          deletion:
+            namespace                          STRING  durable SuperTable deletion tombstone
+            leaf:
+              index                            SET     table names with deletion tombstones
+              doc:{simple}                     STRING  durable per-table deletion tombstone
+            stage:
+              index                            SET     stage names with deletion tombstones
+              doc:{staging_name}               STRING  durable per-stage deletion tombstone
         lock:
+          namespace                            STRING  structural create/delete lock token
           leaf:
             doc:{simple}                       STRING  per-table lock token
           stage:

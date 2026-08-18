@@ -1,0 +1,267 @@
+name: release-gate
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+    # GitHub ref filters are globs, not regular expressions. The immutable
+    # release job below performs the exact SemVer check before publication.
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-gate-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  full-tests:
+    name: full tests / Python ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pip install -e .
+      # No path argument: root characterization tests and package tests are
+      # both mandatory and cannot be bypassed by the release workflow.
+      - run: python -m pytest -q
+
+  dependency-bounds:
+    name: dependencies / ${{ matrix.set }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        set: [minimum, latest-supported]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-min.txt
+            requirements-dev.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - if: matrix.set == 'minimum'
+        run: |
+          python -m pip install -r requirements-min.txt
+          python -m pip install --no-deps -e .
+      - if: matrix.set == 'latest-supported'
+        run: python -m pip install --upgrade --upgrade-strategy eager -e .
+      - run: python -m pip check
+      - run: python -m pytest -q
+
+  mirror-conformance:
+    name: Delta and Iceberg external conformance
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: python -m pip install -e . 'pytest==9.1.1' 'deltalake==1.2.0' 'pyiceberg==0.10.0'
+      - run: python -c 'import deltalake; from pyiceberg.table import StaticTable'
+      # These tests open and scan generated artifacts with independent readers;
+      # importorskip is useful locally but these pinned installs make a skip a
+      # release-gate failure.
+      - run: python -m pytest -q -m integration supertable/tests/test_release_audit_storage_mirroring.py
+
+  quality-security:
+    name: lint, types, and dependency security
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pip install -e .
+      - run: python -m ruff check supertable tests check_mypy_baseline.py
+      # The positional target is deliberate: the baseline checker rejects a
+      # narrowed config or module-level suppression and inventories every
+      # shipped production module, including all release-critical paths.
+      - run: python check_mypy_baseline.py supertable
+      - run: python -m bandit -q -r supertable -lll
+      # The cited Arrow issue is C++ IPC file-reader metadata pre-buffering,
+      # which the advisory says Python bindings do not expose (and upstream
+      # disables by default). Retain the explicit, reviewable exception until
+      # <19 is retired rather than silently disabling the audit.
+      - run: python -m pip_audit -r requirements.txt --ignore-vuln GHSA-rgxp-2hwp-jwgg
+
+  artifact:
+    name: build and install immutable artifacts
+    needs: [full-tests, dependency-bounds, mirror-conformance, quality-security]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Verify tag identifies this versioned source
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git cat-file -t "${GITHUB_REF}")" = tag
+          test "$(git rev-list -n 1 "${GITHUB_REF}")" = "${GITHUB_SHA}"
+          VERSION=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "${GITHUB_REF_NAME}" = "v${VERSION}"
+          # A directly pushed unsigned annotated tag must not bypass the
+          # signed-tag release helper.  GitHub verifies the tag signature
+          # against the signer's registered GPG/SSH key; tag protection below
+          # restricts those verified signers to release maintainers.
+          TAG_OBJECT=$(git rev-parse "${GITHUB_REF}^{tag}")
+          VERIFIED_OBJECT=$(
+            gh api "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT}" \
+              --jq 'select(.verification.verified == true and .verification.reason == "valid") | .sha'
+          )
+          test "${VERIFIED_OBJECT}" = "${TAG_OBJECT}"
+      - run: python -m pip install 'build==1.5.0' 'twine==6.2.0'
+      - run: python -m build
+      - run: python -m twine check dist/*
+      - name: Install and inspect wheel in a clean environment
+        run: |
+          python -m venv /tmp/supertable-artifact-test
+          /tmp/supertable-artifact-test/bin/python -m pip install dist/*.whl
+          SMOKE_CWD=$(mktemp -d "${RUNNER_TEMP}/supertable-wheel-cwd.XXXXXX")
+          cd "${SMOKE_CWD}"
+          /tmp/supertable-artifact-test/bin/python - <<'PY'
+          import importlib
+          import importlib.metadata
+          import os
+          from pathlib import Path
+          import sys
+          before = os.getcwd()
+          import supertable
+          for module in (
+              "supertable.audit.privileged_worker",
+              "supertable.recovery.redis_rebuild",
+              "supertable.demo.quickstart.controller",
+              "supertable.demo.webshop.generate",
+              "supertable.demo.webshop.load",
+              "supertable.demo.webshop.topup",
+              "supertable.demo.medcenter.generate",
+              "supertable.demo.medcenter.load",
+              "supertable.demo.medcenter.transform",
+              "supertable.demo.medcenter.quality",
+              "supertable.demo.medcenter.export_accounting",
+              "supertable.demo.medcenter.run",
+          ):
+              importlib.import_module(module)
+          assert os.getcwd() == before
+          assert Path(supertable.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+          metadata = importlib.metadata.metadata("supertable")
+          assert metadata["License"] == "FSL-1.1-ALv2"
+          assert supertable.__version__ == metadata["Version"]
+          polars_requirements = [
+              value.replace(" ", "")
+              for value in metadata.get_all("Requires-Dist", [])
+              if value.lower().startswith("polars")
+          ]
+          assert polars_requirements == ["polars<2.0,>=1.36.1"]
+          PY
+      - name: Install and inspect sdist in a clean environment
+        run: |
+          python -m venv /tmp/supertable-sdist-test
+          /tmp/supertable-sdist-test/bin/python -m pip install dist/*.tar.gz
+          SMOKE_CWD=$(mktemp -d "${RUNNER_TEMP}/supertable-sdist-cwd.XXXXXX")
+          cd "${SMOKE_CWD}"
+          /tmp/supertable-sdist-test/bin/python - <<'PY'
+          import importlib
+          import importlib.metadata
+          import os
+          from pathlib import Path
+          import sys
+          before = os.getcwd()
+          import supertable
+          for module in (
+              "supertable.audit.privileged_worker",
+              "supertable.recovery.redis_rebuild",
+              "supertable.demo.quickstart.controller",
+              "supertable.demo.webshop.generate",
+              "supertable.demo.webshop.load",
+              "supertable.demo.webshop.topup",
+              "supertable.demo.medcenter.generate",
+              "supertable.demo.medcenter.load",
+              "supertable.demo.medcenter.transform",
+              "supertable.demo.medcenter.quality",
+              "supertable.demo.medcenter.export_accounting",
+              "supertable.demo.medcenter.run",
+          ):
+              importlib.import_module(module)
+          assert os.getcwd() == before
+          assert Path(supertable.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+          metadata = importlib.metadata.metadata("supertable")
+          assert metadata["License"] == "FSL-1.1-ALv2"
+          assert supertable.__version__ == metadata["Version"]
+          polars_requirements = [
+              value.replace(" ", "")
+              for value in metadata.get_all("Requires-Dist", [])
+              if value.lower().startswith("polars")
+          ]
+          assert polars_requirements == ["polars<2.0,>=1.36.1"]
+          PY
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distributions-${{ github.sha }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-pypi:
+    name: protected trusted publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [artifact]
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/project/supertable/
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: distributions-${{ github.sha }}
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
+        with:
+          packages-dir: dist/
+          attestations: true

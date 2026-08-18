@@ -24,6 +24,8 @@ finance, not by the platform.
 
 import argparse
 
+from supertable.config.homedir import initialize_app_home
+
 from supertable.demo.medcenter.defaults import (
     category_default,
     category_prefix_rules,
@@ -342,6 +344,7 @@ def transform() -> None:
 
 
 def main() -> None:
+    initialize_app_home(change_cwd=True)
     argparse.ArgumentParser(
         description="Build the medcenter staging table and all marts"
     ).parse_args()

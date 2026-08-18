@@ -35,7 +35,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 
-import supertable.config.homedir  # noqa: F401 — required side-effect import
+from supertable.config.homedir import initialize_app_home
 from supertable.data_reader import DataReader, Status
 from supertable.data_writer import DataWriter
 
@@ -595,6 +595,7 @@ def parse_args() -> TopUpConfig:
 
 def main() -> None:
     """Console-script entry point."""
+    initialize_app_home(change_cwd=True)
     run(parse_args())
 
 

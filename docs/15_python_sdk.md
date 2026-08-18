@@ -384,7 +384,7 @@ every script (`organization`, `super_name`, `simple_name`, `role_name`,
 |-------|-------|
 | Package name | `supertable` |
 | Python | `>=3.10` |
-| License | Super Table Public Use License (STPUL) v1.0 |
+| License | Functional Source License 1.1, Apache-2.0 Future License (`FSL-1.1-ALv2`) |
 | Homepage | https://github.com/kladnasoft/supertable |
 
 ## Source Files

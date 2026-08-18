@@ -84,6 +84,39 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+def _env_int_strict(
+    name: str, default: int, *, minimum: int, maximum: int,
+) -> int:
+    """Parse a security-sensitive integer without silent fallback."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"{name} must be between {minimum} and {maximum}"
+        )
+    return value
+
+
+def _env_bool_strict(name: str, default: bool) -> bool:
+    """Parse a security-sensitive boolean without silent fallback."""
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    raise ValueError(
+        f"{name} must be one of: "
+        f"{', '.join(sorted(_TRUTHY | _FALSY))}"
+    )
+
+
 def _env_float_optional(name: str) -> Optional[float]:
     raw = (os.getenv(name) or "").strip()
     if not raw:
@@ -255,11 +288,10 @@ class Settings:
     SUPERTABLE_SPARK_STATEMENT_TIMEOUT: int = 120  # SUPERTABLE_SPARK_STATEMENT_TIMEOUT
     SUPERTABLE_SPARK_CONNECT_TIMEOUT: int = 30     # SUPERTABLE_SPARK_CONNECT_TIMEOUT
     SUPERTABLE_SPARK_BATCH_SIZE: int = 50          # SUPERTABLE_SPARK_BATCH_SIZE
-    # Spark file access.  Default False → Spark scans direct s3a://bucket/key
-    # paths using its own fs.s3a.* credentials, independent of the DuckDB
-    # presign setting that shapes the shared reflection file list.  True →
-    # Spark scans presigned http(s):// URLs minted per request (use when the
-    # cluster cannot reach the object store with its own credentials).
+    # Compatibility flag retained so a stale deployment gets a clear error.
+    # Presigned Spark scans are disabled: source URLs share a session with user
+    # SQL and are reusable bearer credentials. Spark must use cluster-side
+    # workload identity or a Hadoop credential provider.
     SUPERTABLE_SPARK_PRESIGNED: bool = False       # SUPERTABLE_SPARK_PRESIGNED
 
     # ── Redis ────────────────────────────────────────────────────────
@@ -270,6 +302,7 @@ class Settings:
     SUPERTABLE_REDIS_PASSWORD: str = ""           # SUPERTABLE_REDIS_PASSWORD
     SUPERTABLE_REDIS_USERNAME: str = ""           # SUPERTABLE_REDIS_USERNAME
     SUPERTABLE_REDIS_SSL: bool = False            # SUPERTABLE_REDIS_SSL
+    SUPERTABLE_REDIS_SSL_CA_CERTS: str = ""       # SUPERTABLE_REDIS_SSL_CA_CERTS
     SUPERTABLE_REDIS_SENTINEL: bool = False       # SUPERTABLE_REDIS_SENTINEL
     SUPERTABLE_REDIS_SENTINELS: str = ""          # SUPERTABLE_REDIS_SENTINELS
     SUPERTABLE_REDIS_SENTINEL_MASTER: str = "mymaster"  # SUPERTABLE_REDIS_SENTINEL_MASTER
@@ -300,6 +333,12 @@ class Settings:
     SUPERTABLE_DEFAULT_LIMIT: int = 200          # SUPERTABLE_DEFAULT_LIMIT
     SUPERTABLE_MAX_LIMIT: int = 5000             # SUPERTABLE_MAX_LIMIT
     SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC: float = 60.0  # SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC
+    SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES: int = 16 * 1024 * 1024  # SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES
+    SUPERTABLE_RESULT_STREAM_BATCH_ROWS: int = 256  # SUPERTABLE_RESULT_STREAM_BATCH_ROWS
+    SUPERTABLE_MAX_QUERY_BYTES: int = 64 * 1024   # SUPERTABLE_MAX_QUERY_BYTES
+    SUPERTABLE_MAX_QUERY_AST_NODES: int = 4096    # SUPERTABLE_MAX_QUERY_AST_NODES
+    SUPERTABLE_MAX_QUERY_JOINS: int = 32          # SUPERTABLE_MAX_QUERY_JOINS
+    SUPERTABLE_MAX_QUERY_NESTING: int = 32        # SUPERTABLE_MAX_QUERY_NESTING
     SUPERTABLE_MAX_CONCURRENCY: int = 6          # SUPERTABLE_MAX_CONCURRENCY
     MCP_SERVER_PATH: str = "mcp_server.py"       # MCP_SERVER_PATH
     MCP_WIRE: str = "ndjson"                     # MCP_WIRE
@@ -340,6 +379,9 @@ class Settings:
     # ── Monitoring ───────────────────────────────────────────────────
     SUPERTABLE_MONITORING_ENABLED: bool = True    # SUPERTABLE_MONITORING_ENABLED
     SUPERTABLE_MONITOR_CACHE_MAX: int = 256      # SUPERTABLE_MONITOR_CACHE_MAX
+    SUPERTABLE_MONITOR_SPOOL_DIR: str = ""      # SUPERTABLE_MONITOR_SPOOL_DIR
+    SUPERTABLE_MONITOR_SPOOL_MAX_BYTES: int = 256 * 1024 * 1024  # SUPERTABLE_MONITOR_SPOOL_MAX_BYTES
+    SUPERTABLE_MONITOR_SPOOL_MAX_RECORDS: int = 100_000  # SUPERTABLE_MONITOR_SPOOL_MAX_RECORDS
     # Compact scalar-only observations used by AUTO's historical cost model.
     # The store enforces additional hard ceilings (1024 samples / 365 days),
     # even if deployment configuration is accidentally larger.
@@ -621,12 +663,21 @@ def _build_settings() -> Settings:
         # ── Redis ────────────────────────────────────────────────────
         SUPERTABLE_REDIS_URL=_env_str("SUPERTABLE_REDIS_URL"),
         SUPERTABLE_REDIS_HOST=_env_str("SUPERTABLE_REDIS_HOST", "localhost"),
-        SUPERTABLE_REDIS_PORT=_env_int("SUPERTABLE_REDIS_PORT", 6379),
-        SUPERTABLE_REDIS_DB=_env_int("SUPERTABLE_REDIS_DB", 0),
+        SUPERTABLE_REDIS_PORT=_env_int_strict(
+            "SUPERTABLE_REDIS_PORT", 6379, minimum=1, maximum=65535,
+        ),
+        SUPERTABLE_REDIS_DB=_env_int_strict(
+            "SUPERTABLE_REDIS_DB", 0, minimum=0, maximum=2**31 - 1,
+        ),
         SUPERTABLE_REDIS_PASSWORD=_env_str("SUPERTABLE_REDIS_PASSWORD"),
         SUPERTABLE_REDIS_USERNAME=_env_str("SUPERTABLE_REDIS_USERNAME"),
-        SUPERTABLE_REDIS_SSL=_env_bool("SUPERTABLE_REDIS_SSL", False),
-        SUPERTABLE_REDIS_SENTINEL=_env_bool("SUPERTABLE_REDIS_SENTINEL", False),
+        SUPERTABLE_REDIS_SSL=_env_bool_strict("SUPERTABLE_REDIS_SSL", False),
+        SUPERTABLE_REDIS_SSL_CA_CERTS=_env_str(
+            "SUPERTABLE_REDIS_SSL_CA_CERTS"
+        ),
+        SUPERTABLE_REDIS_SENTINEL=_env_bool_strict(
+            "SUPERTABLE_REDIS_SENTINEL", False,
+        ),
         SUPERTABLE_REDIS_SENTINELS=_env_str("SUPERTABLE_REDIS_SENTINELS"),
         SUPERTABLE_REDIS_SENTINEL_MASTER=_env_str("SUPERTABLE_REDIS_SENTINEL_MASTER", "mymaster"),
         SUPERTABLE_REDIS_SENTINEL_PASSWORD=_env_str("SUPERTABLE_REDIS_SENTINEL_PASSWORD"),
@@ -657,6 +708,24 @@ def _build_settings() -> Settings:
         SUPERTABLE_DEFAULT_LIMIT=_env_int("SUPERTABLE_DEFAULT_LIMIT", 200),
         SUPERTABLE_MAX_LIMIT=_env_int("SUPERTABLE_MAX_LIMIT", 5000),
         SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC=_env_float("SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC", 60.0),
+        SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES=_env_int(
+            "SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES", 16 * 1024 * 1024,
+        ),
+        SUPERTABLE_RESULT_STREAM_BATCH_ROWS=_env_int(
+            "SUPERTABLE_RESULT_STREAM_BATCH_ROWS", 256,
+        ),
+        SUPERTABLE_MAX_QUERY_BYTES=_env_int(
+            "SUPERTABLE_MAX_QUERY_BYTES", 64 * 1024,
+        ),
+        SUPERTABLE_MAX_QUERY_AST_NODES=_env_int(
+            "SUPERTABLE_MAX_QUERY_AST_NODES", 4096,
+        ),
+        SUPERTABLE_MAX_QUERY_JOINS=_env_int(
+            "SUPERTABLE_MAX_QUERY_JOINS", 32,
+        ),
+        SUPERTABLE_MAX_QUERY_NESTING=_env_int(
+            "SUPERTABLE_MAX_QUERY_NESTING", 32,
+        ),
         SUPERTABLE_MAX_CONCURRENCY=_env_int("SUPERTABLE_MAX_CONCURRENCY", 6),
         MCP_SERVER_PATH=_env_str("MCP_SERVER_PATH", "mcp_server.py"),
         MCP_WIRE=_env_str("MCP_WIRE", "ndjson"),
@@ -697,6 +766,19 @@ def _build_settings() -> Settings:
         # ── Monitoring ───────────────────────────────────────────────
         SUPERTABLE_MONITORING_ENABLED=_env_bool("SUPERTABLE_MONITORING_ENABLED", True),
         SUPERTABLE_MONITOR_CACHE_MAX=_env_int("SUPERTABLE_MONITOR_CACHE_MAX", 256),
+        SUPERTABLE_MONITOR_SPOOL_DIR=_env_str("SUPERTABLE_MONITOR_SPOOL_DIR"),
+        SUPERTABLE_MONITOR_SPOOL_MAX_BYTES=_env_int_strict(
+            "SUPERTABLE_MONITOR_SPOOL_MAX_BYTES",
+            256 * 1024 * 1024,
+            minimum=1,
+            maximum=1024 * 1024 * 1024 * 1024,
+        ),
+        SUPERTABLE_MONITOR_SPOOL_MAX_RECORDS=_env_int_strict(
+            "SUPERTABLE_MONITOR_SPOOL_MAX_RECORDS",
+            100_000,
+            minimum=1,
+            maximum=10_000_000,
+        ),
         SUPERTABLE_QUERY_OBSERVATIONS_ENABLED=_env_bool(
             "SUPERTABLE_QUERY_OBSERVATIONS_ENABLED", True,
         ),

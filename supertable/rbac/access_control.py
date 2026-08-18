@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 import hashlib
 import json
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 from supertable.config.defaults import logger
 from supertable.data_classes import TableDefinition
@@ -12,6 +12,9 @@ from supertable.rbac.permissions import has_permission, Permission, RoleType
 from supertable.rbac.filter_builder import FilterBuilder
 from supertable.rbac.row_column_security import canonicalize_role_tables
 from supertable.utils.sql_parser import SQLParser
+
+if TYPE_CHECKING:
+    from supertable.data_classes import RbacViewDef
 
 
 @dataclass(frozen=True)
@@ -364,6 +367,9 @@ def restrict_read_access(
         role_name: str,
         tables: List[TableDefinition],
         physical_tables: List[TableDefinition],
+        aggregate_children: Optional[
+            Dict[Tuple[str, str], Iterable[str]]
+        ] = None,
 ) -> Dict[str, "RbacViewDef"]:
     """Authorize every physical table and build fail-closed RBAC views.
 
@@ -377,6 +383,12 @@ def restrict_read_access(
 
     contexts: Dict[str, RoleAccessContext] = {}
     policies: Dict[Tuple[str, str], dict] = {}
+    aggregates = {
+        (str(key[0]).casefold(), str(key[1]).casefold()): tuple(
+            str(child) for child in children
+        )
+        for key, children in (aggregate_children or {}).items()
+    }
 
     # Preserve the historical empty-table superadmin check used by health and
     # bootstrap callers, while still validating the role document.
@@ -398,8 +410,83 @@ def restrict_read_access(
         context = contexts.get(str(pt.super_name).casefold())
         if context is None:
             raise PermissionError("No role policy for referenced SuperTable")
-        entry = resolve_table_policy(context, pt.simple_name, "read")
-        _check_requested_columns(entry, pt.columns or None, pt.simple_name)
+
+        physical_key = (
+            str(pt.super_name).casefold(), str(pt.simple_name).casefold(),
+        )
+        child_names = aggregates.get(physical_key)
+        target_names = child_names if child_names is not None else (pt.simple_name,)
+        target_entries = []
+        for target_name in target_names:
+            entry = resolve_table_policy(context, target_name, "read")
+            _check_requested_columns(entry, pt.columns or None, target_name)
+
+            allowed = entry.get("columns", ["*"])
+            excluded = {
+                str(c).casefold() for c in entry.get("exclude_columns", [])
+            }
+            if allowed != ["*"] and not any(
+                str(column).casefold() not in excluded for column in allowed
+            ):
+                raise PermissionError(
+                    f"You don't have permission to read any columns in "
+                    f"'{target_name}'."
+                )
+            target_entries.append(entry)
+
+        if child_names is not None:
+            # The executor currently materializes one union-by-name relation for
+            # an aggregate. Apply the intersection of column grants and the union
+            # of exclusions so no child's narrower policy is widened by another
+            # child. Per-child row predicates cannot safely be represented after
+            # the files have been collapsed; require them to be identical.
+            if not target_entries:
+                entry = {"columns": ["*"], "filters": ["*"]}
+            else:
+                constrained = [
+                    {str(column).casefold() for column in item.get("columns", ["*"])}
+                    for item in target_entries
+                    if item.get("columns", ["*"]) != ["*"]
+                ]
+                if constrained:
+                    allowed_folded = set.intersection(*constrained)
+                    allowed = sorted(allowed_folded)
+                else:
+                    allowed = ["*"]
+                exclusions = sorted({
+                    str(column).casefold()
+                    for item in target_entries
+                    for column in item.get("exclude_columns", [])
+                })
+                filter_docs = {
+                    json.dumps(
+                        item.get("filters", ["*"]), sort_keys=True,
+                        separators=(",", ":"), ensure_ascii=False,
+                    )
+                    for item in target_entries
+                }
+                if len(filter_docs) != 1:
+                    raise PermissionError(
+                        "Aggregate reads require the same row-filter policy "
+                        "for every child table."
+                    )
+                filters = target_entries[0].get("filters", ["*"])
+                entry = {
+                    "columns": allowed,
+                    "exclude_columns": exclusions,
+                    "filters": filters,
+                }
+                _check_requested_columns(entry, pt.columns or None, pt.simple_name)
+                if allowed != ["*"] and not (
+                    {str(column).casefold() for column in allowed}
+                    - set(exclusions)
+                ):
+                    raise PermissionError(
+                        f"You don't have permission to read any columns in "
+                        f"'{pt.simple_name}'."
+                    )
+        else:
+            entry = target_entries[0]
 
         allowed = entry.get("columns", ["*"])
         excluded = {str(c).casefold() for c in entry.get("exclude_columns", [])}
@@ -410,7 +497,7 @@ def restrict_read_access(
                 f"You don't have permission to read any columns in '{pt.simple_name}'."
             )
 
-        policies[(str(pt.super_name).casefold(), str(pt.simple_name).casefold())] = entry
+        policies[physical_key] = entry
 
     rbac_views: Dict[str, RbacViewDef] = {}
     for td in tables:

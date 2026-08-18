@@ -1363,13 +1363,13 @@ class TestDataEstimator:
         assert _make_estimator([])._to_duckdb_path("s3://bucket/key") == "s3://bucket/key"
 
     def test_to_duckdb_path_presign(self, monkeypatch):
-        monkeypatch.setenv("SUPERTABLE_DUCKDB_PRESIGNED", "1")
+        _patch_settings(monkeypatch, SUPERTABLE_DUCKDB_PRESIGNED=True)
         storage = MagicMock()
         storage.presign.return_value = "https://presigned/key"
         assert _make_estimator([], storage)._to_duckdb_path("some/key") == "https://presigned/key"
 
     def test_to_duckdb_path_presign_failure_falls_back(self, monkeypatch):
-        monkeypatch.setenv("SUPERTABLE_DUCKDB_PRESIGNED", "1")
+        _patch_settings(monkeypatch, SUPERTABLE_DUCKDB_PRESIGNED=True)
         storage = MagicMock()
         storage.presign.side_effect = Exception("fail")
         # Falls through to further resolution attempts
@@ -1380,6 +1380,15 @@ class TestDataEstimator:
         storage = MagicMock(spec=["to_duckdb_path"])
         storage.to_duckdb_path.return_value = "s3://resolved/key"
         assert _make_estimator([], storage)._to_duckdb_path("some/key") == "s3://resolved/key"
+
+    def test_to_duckdb_path_uses_backend_canonical_uri_fallback(self):
+        storage = MagicMock(spec=["canonical_uri"])
+        storage.canonical_uri.return_value = "file:///storage/root/some/key"
+
+        assert _make_estimator([], storage)._to_duckdb_path("some/key") == (
+            "file:///storage/root/some/key"
+        )
+        storage.canonical_uri.assert_called_once_with("some/key")
 
     def test_to_duckdb_path_http_construction(self, monkeypatch, clean_env):
         # Provide endpoint/bucket via storage attrs so DataEstimator detection
@@ -1717,7 +1726,11 @@ class TestDuckDB:
     @patch("supertable.engine.duckdb_engine.hashed_table_name", return_value="st_abc")
     @patch("supertable.engine.duckdb_engine.create_reflection_view_with_presign_retry", return_value=False)
     @patch("supertable.engine.duckdb_engine.rewrite_query_with_hashed_tables", return_value="SELECT 1")
-    def test_execute_flow(self, mock_rewrite, mock_create, mock_hash, mock_init, mock_duckdb):
+    @patch("supertable.engine.duckdb_engine._harden_user_query_connection")
+    def test_execute_flow(
+        self, mock_harden, mock_rewrite, mock_create, mock_hash, mock_init,
+        mock_duckdb,
+    ):
         fake_con = MagicMock()
         fake_con.execute.return_value.fetchdf.return_value = pd.DataFrame({"x": [1]})
         mock_duckdb.connect.return_value = fake_con
@@ -1979,18 +1992,17 @@ class TestSparkRewriteQuery:
 
 class TestConfigureSparkS3:
 
-    def test_sets_all_configs(self, monkeypatch, clean_env):
+    def test_sets_non_secret_configs(self, monkeypatch, clean_env):
         cursor = MagicMock()
         cluster = {
             "s3_endpoint": "http://minio:9000",
-            "s3_access_key": "ak",
-            "s3_secret_key": "sk",
             "s3_region": "eu-west-1",
         }
         _configure_spark_s3(cursor, cluster)
         all_sql = [c[0][0] for c in cursor.execute.call_args_list]
         assert any("fs.s3a.endpoint" in s for s in all_sql)
-        assert any("fs.s3a.access.key" in s for s in all_sql)
+        assert any("fs.s3a.endpoint.region" in s for s in all_sql)
+        assert not any("access.key" in s or "secret.key" in s for s in all_sql)
 
     def test_no_cluster_sets_impl_only(self, monkeypatch, clean_env):
         cursor = MagicMock()
@@ -2057,7 +2069,7 @@ class TestSparkThriftExecutor:
         mock_conn.return_value = fake_conn
 
         parser = MagicMock()
-        parser.original_query = "SELECT 1"
+        parser.original_query = "SELECT * FROM t"
         parser.get_table_tuples.return_value = [TableDefinition("s", "t", "t_alias")]
         reflection = Reflection(
             storage_type="mock", reflection_bytes=100, total_reflections=1,
@@ -2217,8 +2229,8 @@ class TestSparkTimestampCast:
         assert units == {"__timestamp__": "ns"}
 
     def test_read_schema_presigned_url_via_storage(self, tmp_path):
-        # Presigned HTTP URL with query string (path-style): key recovered, query
-        # dropped, read through storage.
+        # Presigned custom-endpoint URL: the pinned logical key, never the
+        # ambiguous URL path shape, selects the object through storage.
         p = tmp_path / "data.parquet"
         _write_ts_parquet(str(p), ts_unit="ns")
         raw = p.read_bytes()
@@ -2232,7 +2244,9 @@ class TestSparkTimestampCast:
 
         url = ("https://minio:9000/bucket/t/data.parquet"
                "?X-Amz-Signature=abc&X-Amz-Expires=3600")
-        assert _parquet_timestamp_units(_FakeStorage(), url) == {"__timestamp__": "ns"}
+        assert _parquet_timestamp_units(
+            _FakeStorage(), url, raw_key="t/data.parquet",
+        ) == {"__timestamp__": "ns"}
         assert seen["key"] == "t/data.parquet"
 
     def test_storage_failure_returns_none(self):

@@ -24,29 +24,9 @@ from supertable.config.defaults import logger
 def _binary_copy_if_possible(storage, src_path: str, dst_path: str) -> bool:
     """Copy bytes from src_path to dst_path as efficiently as the backend allows.
 
-    For MinIO, prefer server-side copy_object using CopySource (no download/upload).
-    Falls back to storage.copy(), then read_bytes/write_bytes.
+    The storage adapter owns physical-prefix translation and may implement
+    ``copy`` server-side. Falls back to read_bytes/write_bytes.
     """
-
-    # --- MinIO fast-path (server-side copy) ---------------------------------
-    client = getattr(storage, "client", None)
-    if client is not None and hasattr(client, "copy_object"):
-        # Try to discover bucket name from common attributes
-        bucket = (
-            getattr(storage, "bucket", None)
-            or getattr(storage, "bucket_name", None)
-            or getattr(storage, "_bucket", None)
-            or getattr(storage, "_bucket_name", None)
-        )
-        if isinstance(bucket, str) and bucket:
-            try:
-                from minio.commonconfig import CopySource  # type: ignore
-
-                storage.makedirs(os.path.dirname(dst_path))
-                client.copy_object(bucket, dst_path, CopySource(bucket, src_path))
-                return True
-            except Exception as e:
-                logger.warning(f"[mirror][minio] copy_object failed ({src_path} -> {dst_path}): {e}")
 
     # --- Generic backend copy ------------------------------------------------
     if hasattr(storage, "copy"):
@@ -105,7 +85,9 @@ def _co_locate_or_reuse_path(storage, table_files_dir: str, catalog_file_path: s
     Skips copy when the destination already exists from a prior mirror run.
     """
     base_name = catalog_file_path.rstrip("/").split("/")[-1]  # robust basename for URIs
-    h = hashlib.md5(catalog_file_path.encode("utf-8")).hexdigest()[:8]
+    h = hashlib.md5(
+        catalog_file_path.encode("utf-8"), usedforsecurity=False
+    ).hexdigest()[:8]
     rel_name = f"{h}_{base_name}"
     rel_path = "/".join(("files", rel_name))
     dst_path = os.path.join(table_files_dir, rel_name)
@@ -148,6 +130,35 @@ def write_parquet_table(super_table, table_name: str, simple_snapshot: Dict[str,
     for r in resources:
         src_file = r["file"]
         used_rel_path = _co_locate_or_reuse_path(super_table.storage, files_dir, src_file)
+        destination = os.path.join(base, used_rel_path)
+        source_size, source_digest = super_table.storage.content_sha256(src_file)
+        declared_size = int(r.get("file_size") or 0)
+        if declared_size and source_size != declared_size:
+            raise RuntimeError(
+                f"Parquet mirror source size changed: {src_file!r}"
+            )
+        try:
+            mirror_size, mirror_digest = (
+                super_table.storage.content_sha256(destination)
+            )
+        except Exception:
+            mirror_size, mirror_digest = -1, ""
+        if mirror_size != source_size or mirror_digest != source_digest:
+            # Existing-by-name is only a cache hint, never integrity evidence.
+            # Repair a truncated/stale object and verify its visible bytes.
+            if not _binary_copy_if_possible(
+                super_table.storage, src_file, destination,
+            ):
+                raise RuntimeError(
+                    f"Failed to repair Parquet mirror file: {src_file!r}"
+                )
+            mirror_size, mirror_digest = (
+                super_table.storage.content_sha256(destination)
+            )
+        if mirror_size != source_size or mirror_digest != source_digest:
+            raise RuntimeError(
+                f"Parquet mirror copy failed its content seal: {src_file!r}"
+            )
         current_paths.append(used_rel_path)
 
     current_set = set(current_paths)
@@ -203,3 +214,48 @@ def write_parquet_table(super_table, table_name: str, simple_snapshot: Dict[str,
     logger.info(
         f"[mirror][parquet] updated '{table_name}' (files now={len(current_paths)}, removed={len(to_remove)})"
     )
+
+
+def verify_parquet_table(
+        super_table, table_name: str, simple_snapshot: Dict[str, Any],
+) -> None:
+    """Verify that the latest-only Parquet projection is exact."""
+    files_dir = os.path.join(
+        super_table.organization, super_table.super_name,
+        "parquet", table_name, "files",
+    )
+    expected: Set[str] = set()
+    source_by_relative: Dict[str, Dict[str, Any]] = {}
+    for resource in simple_snapshot.get("resources", []) or []:
+        source = str(resource.get("file") or "")
+        if not source:
+            continue
+        digest = hashlib.md5(
+            source.encode("utf-8"), usedforsecurity=False,
+        ).hexdigest()[:8]
+        relative = f"files/{digest}_{source.rstrip('/').split('/')[-1]}"
+        expected.add(relative)
+        source_by_relative[relative] = resource
+    actual = _list_co_located_paths(super_table.storage, files_dir)
+    if actual != expected:
+        raise RuntimeError(
+            "Parquet mirror does not match the committed snapshot: "
+            f"actual={sorted(actual)!r}, expected={sorted(expected)!r}"
+        )
+    base = os.path.dirname(files_dir)
+    for relative, resource in source_by_relative.items():
+        source = str(resource["file"])
+        source_size, source_digest = super_table.storage.content_sha256(source)
+        mirror_size, mirror_digest = super_table.storage.content_sha256(
+            os.path.join(base, relative)
+        )
+        declared_size = int(resource.get("file_size") or 0)
+        if (
+            (declared_size and source_size != declared_size)
+            or mirror_size != source_size
+            or mirror_digest != source_digest
+        ):
+            raise RuntimeError(
+                f"Parquet mirrored artifact failed its content seal: "
+                f"{relative!r}"
+            )

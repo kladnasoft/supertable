@@ -82,6 +82,14 @@ def _make_simple(
     obj.simple_name = simple_name
     obj.storage = st.storage
     obj.catalog = mock_cat or MagicMock()
+    obj.catalog.root_exists.return_value = True
+    obj.catalog.leaf_exists.return_value = False
+    obj.catalog.acquire_namespace_lock.return_value = "namespace-token"
+    obj.catalog.acquire_simple_lock.return_value = "simple-token"
+    obj.catalog.begin_simple_deletion.return_value = {
+        "intent_id": "delete-intent",
+    }
+    obj.catalog.delete_simple_table.return_value = True
     obj.simple_dir = f"{org}/{sup}/tables/{simple_name}"
     obj.data_dir = f"{org}/{sup}/tables/{simple_name}/data"
     obj.snapshot_dir = f"{org}/{sup}/tables/{simple_name}/snapshots"
@@ -453,39 +461,46 @@ class TestSimpleTableDelete:
     @patch(_P_CHECK_CONTROL)
     def test_happy_path_deletes_storage_and_redis(self, mock_check):
         obj = _make_simple("events", "org", "sup")
-        obj.storage.exists.return_value = True
 
         obj.delete(role_name="admin")
 
-        obj.storage.exists.assert_called_once_with("org/sup/tables/events")
-        obj.storage.delete.assert_called_once_with("org/sup/tables/events")
-        obj.catalog.delete_simple_table.assert_called_once_with("org", "sup", "events")
+        assert obj.storage.delete_prefix.call_args_list == [
+            call("org/sup/tables/events"),
+            call("org/sup/delta/events"),
+            call("org/sup/iceberg/events"),
+            call("org/sup/parquet/events"),
+        ]
+        obj.catalog.delete_simple_table.assert_called_once_with(
+            "org", "sup", "events", lock_token="simple-token",
+            namespace_token="namespace-token", intent_id="delete-intent",
+        )
+        obj.catalog.release_simple_lock.assert_called_once_with(
+            "org", "sup", "events", "simple-token",
+        )
 
     @patch(_P_CHECK_CONTROL)
-    def test_storage_not_exists_still_deletes_redis(self, mock_check):
+    def test_empty_prefix_still_deletes_redis(self, mock_check):
         obj = _make_simple("events", "org", "sup")
-        obj.storage.exists.return_value = False
 
         obj.delete(role_name="admin")
 
-        obj.storage.delete.assert_not_called()
+        assert obj.storage.delete_prefix.call_count == 4
         obj.catalog.delete_simple_table.assert_called_once()
 
     @patch(_P_CHECK_CONTROL)
-    def test_storage_file_not_found_swallowed(self, mock_check):
+    def test_storage_prefix_file_not_found_propagates(self, mock_check):
         obj = _make_simple("events", "org", "sup")
-        obj.storage.exists.return_value = True
-        obj.storage.delete.side_effect = FileNotFoundError("gone")
+        obj.storage.delete_prefix.side_effect = FileNotFoundError("gone")
 
-        obj.delete(role_name="admin")
+        with pytest.raises(FileNotFoundError, match="gone"):
+            obj.delete(role_name="admin")
 
-        obj.catalog.delete_simple_table.assert_called_once()
+        obj.catalog.delete_simple_table.assert_not_called()
 
     @patch(_P_CHECK_CONTROL)
     def test_storage_other_exception_propagates(self, mock_check):
         obj = _make_simple("events", "org", "sup")
-        obj.storage.exists.return_value = True
-        obj.storage.delete.side_effect = PermissionError("forbidden")
+        obj.storage.delete_prefix.side_effect = PermissionError("forbidden")
 
         with pytest.raises(PermissionError, match="forbidden"):
             obj.delete(role_name="admin")
@@ -497,11 +512,12 @@ class TestSimpleTableDelete:
     def test_delete_folder_path_matches_simple_dir(self, mock_check):
         """delete builds its own path from org/sup/identity/simple — matches simple_dir."""
         obj = _make_simple("my_tbl", "my_org", "my_sup")
-        obj.storage.exists.return_value = True
 
         obj.delete(role_name="admin")
 
-        obj.storage.delete.assert_called_once_with("my_org/my_sup/tables/my_tbl")
+        assert obj.storage.delete_prefix.call_args_list[0] == call(
+            "my_org/my_sup/tables/my_tbl"
+        )
 
 
 # ===========================================================================

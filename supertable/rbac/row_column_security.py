@@ -371,7 +371,9 @@ class RowColumnSecurity:
         json_bytes = json.dumps(document, sort_keys=True).encode("utf-8")
         # MD5 remains the persisted compatibility format.  It is a change
         # detector, never an authentication or authorization primitive.
-        self.content_hash = hashlib.md5(json_bytes).hexdigest()
+        self.content_hash = hashlib.md5(
+            json_bytes, usedforsecurity=False
+        ).hexdigest()
 
     def prepare(self) -> None:
         """Validate, canonicalise, apply creation defaults, and hash."""

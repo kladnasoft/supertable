@@ -2,9 +2,77 @@
 import abc
 import base64
 import binascii
+import hashlib
+import os
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, BinaryIO, Dict, List, Optional
 import pyarrow as pa
+import pyarrow.parquet as pq
+
+
+# Decoding one physical row at a time is necessary to make the byte budget
+# skew-safe, but retaining one Python ``RecordBatch`` wrapper per very narrow
+# row until that budget fills can itself consume unbounded metadata memory.
+# Bound both dimensions independently.  The row cap also protects this helper
+# if the decoder batch size is increased in the future.
+PARQUET_DECODE_MAX_PENDING_BATCHES = 4_096
+PARQUET_DECODE_MAX_PENDING_ROWS = 65_536
+
+
+def _iter_bounded_parquet_batch_groups(
+    batches,
+    *,
+    max_decoded_bytes: int,
+    max_pending_batches: int = PARQUET_DECODE_MAX_PENDING_BATCHES,
+    max_pending_rows: int = PARQUET_DECODE_MAX_PENDING_ROWS,
+):
+    """Group decoded batches under independent byte, row, and object caps.
+
+    A single input batch is indivisible.  Production calls this with one-row
+    decoder batches, so only one unusually wide row may exceed the byte cap.
+    Keeping the grouping policy separate also makes its metadata bound directly
+    testable without allocating a pathological Parquet object.
+    """
+    byte_limit = max(1, int(max_decoded_bytes))
+    batch_limit = max(1, int(max_pending_batches))
+    row_limit = max(1, int(max_pending_rows))
+    pending: List[pa.RecordBatch] = []
+    pending_bytes = 0
+    pending_rows = 0
+
+    for decoded_batch in batches:
+        decoded_bytes = max(1, int(decoded_batch.nbytes))
+        decoded_rows = max(0, int(decoded_batch.num_rows))
+        would_exceed = pending and (
+            pending_bytes + decoded_bytes > byte_limit
+            or pending_rows + decoded_rows > row_limit
+            or len(pending) >= batch_limit
+        )
+        if would_exceed:
+            yield pending
+            pending = []
+            pending_bytes = 0
+            pending_rows = 0
+
+        if decoded_rows > row_limit:
+            raise RuntimeError(
+                "Parquet decoder emitted a batch larger than the pending-row "
+                f"cap ({decoded_rows} > {row_limit})"
+            )
+        if decoded_bytes > byte_limit:
+            # Production decoder batches contain one row. Do not retain any
+            # other batch beside an indivisible oversize value.
+            yield [decoded_batch]
+            continue
+
+        pending.append(decoded_batch)
+        pending_bytes += decoded_bytes
+        pending_rows += decoded_rows
+
+    if pending:
+        yield pending
 
 
 def write_all(file_obj: BinaryIO, data: bytes | memoryview) -> int:
@@ -130,11 +198,32 @@ class StorageInterface(abc.ABC):
     base_prefix: str = ""
 
     def _with_base(self, path: str) -> str:
-        """Prepend base_prefix to path if set. No-op when base_prefix is empty."""
+        """Translate one public logical path to a provider object key.
+
+        Public storage methods accept logical paths only.  Provider adapters
+        call this helper exactly once at their boundary; values returned by
+        public listing methods must be translated back with
+        :meth:`_without_base` before they escape the adapter.
+        """
         path = path.strip("/")
         if self.base_prefix:
             return f"{self.base_prefix}/{path}" if path else self.base_prefix
         return path
+
+    def _without_base(self, path: str) -> str:
+        """Translate a provider key back to the public logical namespace."""
+        physical = str(path or "").strip("/")
+        base = str(self.base_prefix or "").strip("/")
+        if not base:
+            return physical
+        if physical == base:
+            return ""
+        prefix = f"{base}/"
+        if not physical.startswith(prefix):
+            raise ValueError(
+                f"Provider key {path!r} is outside configured base prefix {base!r}"
+            )
+        return physical[len(prefix):]
 
 
     @abc.abstractmethod
@@ -180,7 +269,10 @@ class StorageInterface(abc.ABC):
     @abc.abstractmethod
     def list_files(self, path: str, pattern: str = "*") -> List[str]:
         """
-        Returns a list of files/objects found in `path` matching the given pattern.
+        Return logical paths found in `path` matching the given pattern.
+
+        Both the input and every returned value are in the logical namespace;
+        a configured cloud ``base_prefix`` is never exposed to callers.
         This may be limited to a single "directory" level, depending on implementation.
         For recursive scans, either extend with a `recursive=True` parameter or
         provide an additional method.
@@ -194,6 +286,24 @@ class StorageInterface(abc.ABC):
         Raises FileNotFoundError if the path does not exist.
         """
         pass
+
+    def delete_prefix(self, path: str) -> None:
+        """Delete a complete logical prefix and verify that it is empty.
+
+        Object-store implementations override this with provider-native,
+        retried batch deletion.  The compatibility implementation is suitable
+        for local and third-party hierarchical backends whose ``delete`` is
+        already recursive.  Missing prefixes make retries idempotent.
+        """
+        try:
+            self.delete(path)
+        except FileNotFoundError:
+            pass
+        remaining = self.list_files(path, "*")
+        if remaining:
+            raise OSError(
+                f"Storage prefix is not empty after deletion: {path!r}"
+            )
 
     @abc.abstractmethod
     def get_directory_structure(self, path: str) -> dict:
@@ -291,6 +401,111 @@ class StorageInterface(abc.ABC):
         Copies an object from src_path to dst_path within the same storage backend.
         """
         pass
+
+    def canonical_uri(self, path: str) -> str:
+        """Return the backend-owned canonical URI for one logical path.
+
+        Local storage inherits this implementation.  Cloud backends override
+        it so table formats never have to guess a provider from incidental
+        attributes such as ``bucket``.
+        """
+        value = str(path or "")
+        if "://" in value:
+            return value
+        is_local = getattr(self, "is_local_storage", None)
+        if callable(is_local) and bool(is_local()):
+            return Path(os.path.abspath(value)).as_uri()
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement canonical_uri()"
+        )
+
+    def content_sha256(self, path: str) -> tuple[int, str]:
+        """Return an exact size/SHA-256 seal for one logical object.
+
+        Built-in backends download under their strongest available immutable
+        version/ETag condition into a bounded disk spill. This is intentionally
+        stronger than trusting multipart ETags or provider copy responses: a
+        mirror publication may only be acknowledged after its visible bytes
+        match the committed source artifact.
+        """
+        metadata = self.stat_object(path)
+        digest = hashlib.sha256()
+        try:
+            with tempfile.TemporaryFile(prefix="supertable-seal-") as spill:
+                written = self.download_to_file(
+                    path, spill, expected=metadata,
+                )
+                if int(written) != int(metadata.size):
+                    raise OSError(
+                        f"Short sealed read for {path!r}: expected "
+                        f"{metadata.size}, got {written}"
+                    )
+                spill.seek(0)
+                while True:
+                    chunk = spill.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except NotImplementedError:
+            # Compatibility path for third-party adapters that predate the
+            # bounded download API. Built-in production adapters never use it.
+            payload = self.read_bytes(path)
+            if len(payload) != int(metadata.size):
+                raise OSError(
+                    f"Short sealed read for {path!r}: expected "
+                    f"{metadata.size}, got {len(payload)}"
+                )
+            digest.update(payload)
+        return int(metadata.size), digest.hexdigest()
+
+    def iter_parquet_batches(
+        self,
+        path: str,
+        *,
+        max_decoded_bytes: int,
+        columns: Optional[List[str]] = None,
+    ):
+        """Yield bounded Arrow batches from a logical Parquet object.
+
+        Remote objects are streamed to a temporary spill file under an exact
+        version seal, then decoded batch-by-batch.  This avoids materialising a
+        compressed object and its decoded table in memory at the same time.
+        One unusually wide row remains the indivisible lower bound.
+        """
+        budget = max(1, int(max_decoded_bytes))
+        metadata = self.stat_object(path)
+        fd, spill_path = tempfile.mkstemp(prefix="supertable-compact-", suffix=".parquet")
+        try:
+            with os.fdopen(fd, "wb") as spill:
+                self.download_to_file(path, spill, expected=metadata)
+                spill.flush()
+                os.fsync(spill.fileno())
+
+            parquet = pq.ParquetFile(spill_path)
+            # Whole-file averages cannot bound an arbitrarily skewed cluster
+            # of variable-width rows. Decode one physical row at a time (the
+            # indivisible lower bound), then group already-measured batches
+            # into a zero-copy chunked Arrow table no larger than the budget.
+            # This avoids ever materialising a speculative multi-row parent
+            # that can exceed the limit by N times before it is sliced.
+            decoded_batches = parquet.iter_batches(
+                batch_size=1,
+                columns=columns,
+                use_threads=False,
+            )
+            for pending in _iter_bounded_parquet_batch_groups(
+                decoded_batches,
+                max_decoded_bytes=budget,
+            ):
+                if len(pending) == 1 and pending[0].nbytes > budget:
+                    yield pending[0]
+                else:
+                    yield pa.Table.from_batches(pending)
+        finally:
+            try:
+                os.remove(spill_path)
+            except FileNotFoundError:
+                pass
 
     # -------------------------
     # Optional parity helpers (object stores)

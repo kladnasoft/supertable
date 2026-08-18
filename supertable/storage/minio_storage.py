@@ -8,7 +8,7 @@ import re
 import json
 import fnmatch
 from typing import Any, BinaryIO, Dict, List, Iterable, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from datetime import timedelta
 
 import pyarrow as pa
@@ -169,6 +169,11 @@ class MinioStorage(StorageInterface):
             full_key,
             expires=timedelta(seconds=expiry_seconds),
         )
+
+    def canonical_uri(self, path: str) -> str:
+        """Return the canonical S3-compatible URI for one logical path."""
+        full_key = self._with_base(path)
+        return f"s3://{self.bucket_name}/{quote(full_key, safe='/=:@+$,;~-._')}"
 
     # ---------- low-level helpers ----------
 
@@ -413,7 +418,7 @@ class MinioStorage(StorageInterface):
         children = self._child_names_one_level(path)
         filtered_children = [c for c in children if fnmatch.fnmatch(c, pattern)]
         filtered_children.sort()
-        return [path + c for c in filtered_children]
+        return [self._without_base(path + c) for c in filtered_children]
 
     # ---------- delete ----------
 
@@ -422,23 +427,77 @@ class MinioStorage(StorageInterface):
         if self._object_exists(path):
             self.client.remove_object(self.bucket_name, path)
             return
+        logical = self._without_base(path)
         prefix = path if path.endswith("/") else f"{path}/"
-        # Stream object names into a generator — no full list materialised in memory.
-        # The minio SDK handles batching internally via remove_objects().
-        obj_iter = self._list_objects(prefix, recursive=True)
-        # Peek to check if there is anything to delete
+        obj_iter = iter(self._list_objects(prefix, recursive=True))
         first = next(obj_iter, None)
         if first is None:
             raise FileNotFoundError(f"File or folder not found: {path}")
-
         import itertools
-        all_objs = itertools.chain([first], obj_iter)
-        delete_stream = (DeleteObject(obj.object_name) for obj in all_objs)
-        errors = list(self.client.remove_objects(self.bucket_name, delete_stream))
+        objects = itertools.chain((first,), obj_iter)
+        errors = list(self.client.remove_objects(
+            self.bucket_name,
+            (
+                DeleteObject(obj.object_name)
+                for obj in objects
+            ),
+        ))
         if errors:
             raise RuntimeError(
-                f"Failed to delete {len(errors)} object(s) under {path}: {errors[0].message}"
+                f"Failed to delete {len(errors)} object(s) under {path}: "
+                f"{getattr(errors[0], 'message', errors[0])}"
             )
+        self.delete_prefix(logical)
+
+    def delete_prefix(self, path: str) -> None:
+        """Delete and verify a MinIO prefix with bounded retry batches."""
+        import itertools
+
+        physical = self._with_base(path)
+        if self._object_exists(physical):
+            self.client.remove_object(self.bucket_name, physical)
+        prefix = physical if physical.endswith("/") else f"{physical}/"
+        previous_batch = None
+        stagnant = 0
+        prior_errors = []
+        while True:
+            objects = list(itertools.islice(
+                self._list_objects(prefix, recursive=True), 1000,
+            ))
+            if not objects:
+                # A provider-reported partial failure is authoritative.  Some
+                # test doubles and eventually-consistent listing adapters may
+                # subsequently return an exhausted/empty iterator; that must
+                # not turn the failed delete into a false success.
+                if prior_errors:
+                    first = prior_errors[0]
+                    raise RuntimeError(
+                        f"Failed to delete {len(prior_errors)} object(s) under "
+                        f"{path}: {getattr(first, 'message', first)}"
+                    )
+                return
+            names = tuple(obj.object_name for obj in objects)
+            delete_stream = (DeleteObject(obj.object_name) for obj in objects)
+            errors = list(
+                self.client.remove_objects(self.bucket_name, delete_stream)
+            )
+            if errors:
+                prior_errors = errors
+            else:
+                prior_errors = []
+            stagnant = stagnant + 1 if names == previous_batch else 0
+            previous_batch = names
+            if stagnant >= 3:
+                if prior_errors:
+                    first = prior_errors[0]
+                    raise RuntimeError(
+                        f"Failed to delete {len(prior_errors)} object(s) under "
+                        f"{path}: {getattr(first, 'message', first)}"
+                    )
+                raise OSError(
+                    f"MinIO prefix made no deletion progress: {path!r}; "
+                    f"remaining={names[0]!r}"
+                )
 
     # ---------- directory structure ----------
 

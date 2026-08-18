@@ -224,6 +224,24 @@ class TestContention:
         assert ta is not None and tb is not None
         assert ta != tb
 
+    def test_heartbeat_blocks_contender_beyond_original_lease(self, fake_redis):
+        """Long stage/prefix deletion remains exclusive after its first TTL."""
+        owner = RedisLocking(fake_redis)
+        contender = RedisLocking(fake_redis)
+        try:
+            token = owner.acquire("stage-delete", ttl_s=2, timeout_s=1)
+            assert token is not None
+            # Heartbeat runs at t=1s and t=2s; at t>original TTL the key must
+            # still be owned, so a concurrent stage save cannot enter.
+            time.sleep(2.2)
+            assert contender.acquire(
+                "stage-delete", ttl_s=2, timeout_s=1, retry_interval=0.01,
+            ) is None
+            assert fake_redis.get("stage-delete") == token
+        finally:
+            owner._on_exit()
+            contender._on_exit()
+
 
 # ---------------------------------------------------------------------------
 # Expiry

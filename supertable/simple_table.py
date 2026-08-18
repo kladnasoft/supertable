@@ -8,6 +8,7 @@ from datetime import datetime
 from supertable.config.defaults import logger
 from supertable.errors import TableNotFoundError
 from supertable.redis_catalog import RedisCatalog
+from supertable.storage.storage_factory import get_storage
 from supertable.super_table import SuperTable
 from supertable.utils.helper import collect_schema, generate_filename
 from supertable.utils.snapshot import complete_snapshot_payload
@@ -113,6 +114,18 @@ class SimpleTable:
         *,
         create_if_missing: bool = True,
     ):
+        # ``super == simple`` is the public aggregate relation that unions the
+        # parent's children.  A physical child with that name is therefore
+        # unaddressable on its own and would be silently folded into the
+        # aggregate scan.  Enforce the invariant at the table-creation boundary
+        # as well as in DataWriter.validation(), including case-only aliases.
+        if (
+            create_if_missing
+            and str(simple_name).casefold()
+            == str(super_table.super_name).casefold()
+        ):
+            raise ValueError("SimpleTable name can't match with SuperTable name")
+
         self.super_table = super_table
         self.identity = "tables"
         self.simple_name = simple_name
@@ -120,6 +133,16 @@ class SimpleTable:
         # Storage is the same as SuperTable's
         self.storage = self.super_table.storage
         self.catalog = RedisCatalog()
+
+        deletion_guard = getattr(
+            type(self.catalog), "check_deletion_intent_absent", None,
+        )
+        if callable(deletion_guard):
+            self.catalog.check_deletion_intent_absent(
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple=self.simple_name,
+            )
 
 
         # Data layout
@@ -156,61 +179,120 @@ class SimpleTable:
           * Otherwise, create folders and bootstrap an initial empty snapshot and leaf pointer.
         """
 
-        # First-time initialization: ensure directories in storage (best-effort)
-        for p in (self.simple_dir, self.data_dir, self.snapshot_dir):
-            try:
-                if not self.storage.exists(p):
-                    self.storage.makedirs(p)
-            except Exception:
-                # Object storage may no-op; that's fine
-                pass
-
-        # Bootstrap leaf pointer in Redis (version=0, empty initial snapshot)
-        initial_snapshot_file = generate_filename(alias=self.identity)
-        new_simple_path = os.path.join(self.snapshot_dir, initial_snapshot_file)
-        snapshot_data = {
-            "simple_name": self.simple_name,
-            "location": self.simple_dir,
-            "snapshot_version": 0,
-            "last_updated_ms": int(datetime.now().timestamp() * 1000),
-            "previous_snapshot": None,
-            "schema": [],
-            "resources": [],
-            "tombstone": None,
-            "tombstone_rows": 0,
-            "tombstone_digest": None,
-            # Durable recovery floor for the Redis-backed fast row-id
-            # allocator.  Writers atomically reserve strictly above this value,
-            # so restoring/losing the Redis counter cannot reuse an identifier
-            # that immutable Parquet data may still contain.
-            "rowid_high_watermark": 0,
-            "stats_file": None,
-            "stats_rows": 0,
-        }
-        self.storage.write_json(new_simple_path, snapshot_data)
-
-        # CAS set leaf to that path (version becomes 0)
-        now_ms = int(datetime.now().timestamp() * 1000)
-        payload_setter = getattr(self.catalog, "set_leaf_payload_cas", None)
-        if callable(payload_setter):
-            # Once publication is attempted, every exception is propagated: a
-            # timeout may mean Redis committed the payload, and retrying a
-            # weaker path-only update would make the outcome ambiguous.
-            payload_setter(
-                self.super_table.organization,
-                self.super_table.super_name,
-                self.simple_name,
-                snapshot_data,
-                new_simple_path,
-                now_ms=now_ms,
+        org = self.super_table.organization
+        sup = self.super_table.super_name
+        # Only structural creation participates in the namespace lock; writes
+        # to existing tables remain concurrent and are drained by their leaf
+        # locks during SuperTable deletion. Acquiring this before any storage
+        # write closes the new-child write-after-prefix-verification race.
+        namespace_token = self.catalog.acquire_namespace_lock(
+            org, sup, ttl_s=30, timeout_s=60,
+        )
+        if not namespace_token:
+            raise TimeoutError(
+                f"Could not acquire namespace creation lock for {org}/{sup}"
             )
-        else:
-            raise RuntimeError(
-                "Catalog does not support atomic initialize-only leaf payloads; "
-                "refusing to create an ambiguous table snapshot"
+        try:
+            # Check before either fast-path return: stale metadata recreated
+            # behind a terminal tombstone must not make the object live.
+            self.catalog.check_initialization_allowed(
+                org,
+                sup,
+                namespace_token=namespace_token,
+                simple=self.simple_name,
+            )
+            if not self.catalog.root_exists(org, sup):
+                raise TableNotFoundError(org, sup, self.simple_name)
+            # Another initializer may have won while this constructor waited.
+            if self.catalog.leaf_exists(org, sup, self.simple_name):
+                return
+
+            # First-time initialization: ensure directories in storage.
+            for p in (self.simple_dir, self.data_dir, self.snapshot_dir):
+                try:
+                    if not self.storage.exists(p):
+                        self.storage.makedirs(p)
+                except Exception:
+                    # Object storage may no-op; that's fine.
+                    pass
+
+            initial_snapshot_file = generate_filename(alias=self.identity)
+            new_simple_path = os.path.join(
+                self.snapshot_dir, initial_snapshot_file,
+            )
+            snapshot_data = {
+                "simple_name": self.simple_name,
+                "location": self.simple_dir,
+                "snapshot_version": 0,
+                "last_updated_ms": int(datetime.now().timestamp() * 1000),
+                "previous_snapshot": None,
+                "schema": [],
+                "resources": [],
+                "tombstone": None,
+                "tombstone_rows": 0,
+                "tombstone_digest": None,
+                "rowid_high_watermark": 0,
+                "stats_file": None,
+                "stats_rows": 0,
+            }
+            self.storage.write_json(new_simple_path, snapshot_data)
+
+            now_ms = int(datetime.now().timestamp() * 1000)
+            payload_setter = getattr(
+                self.catalog, "set_leaf_payload_cas", None,
+            )
+            if callable(payload_setter):
+                # An ambiguous timeout may mean Redis committed the payload;
+                # never delete or retry that immutable snapshot blindly.
+                payload_setter(
+                    org,
+                    sup,
+                    self.simple_name,
+                    snapshot_data,
+                    new_simple_path,
+                    now_ms=now_ms,
+                    namespace_token=namespace_token,
+                )
+            else:
+                raise RuntimeError(
+                    "Catalog does not support atomic initialize-only leaf "
+                    "payloads; refusing ambiguous table creation"
+                )
+        finally:
+            self.catalog.release_namespace_lock(
+                org, sup, namespace_token,
             )
 
-    def delete(self, role_name: str) -> None:
+    def delete(self, role_name: str) -> str:
+        """Start a new deletion, refusing any abandoned prior intent."""
+        return self._delete_with_intent(role_name=role_name)
+
+    def recover_delete(
+            self,
+            role_name: str,
+            *,
+            intent_id: str,
+            confirm_previous_owner_stopped: bool = False,
+    ) -> str:
+        """Resume an abandoned deletion after external liveness proof.
+
+        The caller must first prove that the previous process cannot resume an
+        already-issued delete against this table's fixed storage prefix.  An
+        ordinary :meth:`delete` never takes over a durable intent.
+        """
+        return self._delete_with_intent(
+            role_name=role_name,
+            recovery_intent_id=intent_id,
+            confirm_previous_owner_stopped=confirm_previous_owner_stopped,
+        )
+
+    def _delete_with_intent(
+            self,
+            *,
+            role_name: str,
+            recovery_intent_id: Optional[str] = None,
+            confirm_previous_owner_stopped: bool = False,
+    ) -> str:
         check_control_access(
             super_name=self.super_table.super_name,
             organization=self.super_table.organization,
@@ -218,24 +300,183 @@ class SimpleTable:
             table_name=self.simple_name,
         )
 
-        # Remove folder (heavy data) from storage
-        simple_table_folder = os.path.join(
-            self.super_table.organization, self.super_table.super_name, self.identity, self.simple_name
+        # Creation is fenced by the namespace lock, while writers are fenced
+        # by the leaf lock. Acquire in the same namespace->leaf order as whole
+        # SuperTable deletion and retain both through prefix verification and
+        # atomic metadata cleanup so a concurrent initializer cannot recreate
+        # the table inside a successful delete.
+        namespace_token = self.catalog.acquire_namespace_lock(
+            self.super_table.organization,
+            self.super_table.super_name,
+            ttl_s=30,
+            timeout_s=60,
         )
-        try:
-            if self.storage.exists(simple_table_folder):
-                self.storage.delete(simple_table_folder)
-        except FileNotFoundError:
-            pass
-
-        # Remove Redis meta (leaf pointer + lock)
-        self.catalog.delete_simple_table(
+        if not namespace_token:
+            raise TimeoutError(
+                f"Could not acquire namespace deletion lock for "
+                f"{self.super_table.super_name!r}"
+            )
+        token = self.catalog.acquire_simple_lock(
             self.super_table.organization,
             self.super_table.super_name,
             self.simple_name,
+            ttl_s=30,
+            timeout_s=60,
         )
+        if not token:
+            self.catalog.release_namespace_lock(
+                self.super_table.organization,
+                self.super_table.super_name,
+                namespace_token,
+            )
+            raise TimeoutError(
+                f"Could not acquire deletion lock for simple {self.simple_name!r}"
+            )
 
-        logger.info(f"Deleted Table (storage): {simple_table_folder}")
+        # The same auto-renewed leaf lock used by DataWriter covers physical
+        # prefix verification and metadata removal as one mutation. A writer
+        # can neither publish into the prefix mid-delete nor orphan a successor
+        # between verification and leaf removal.
+        simple_table_folder = os.path.join(
+            self.super_table.organization, self.super_table.super_name, self.identity, self.simple_name
+        )
+        storage_prefixes = [
+            simple_table_folder,
+            *[
+                os.path.join(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    mirror_name,
+                    self.simple_name,
+                )
+                for mirror_name in ("delta", "iceberg", "parquet")
+            ],
+        ]
+        try:
+            if recovery_intent_id is None:
+                intent = self.catalog.begin_simple_deletion(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    self.simple_name,
+                    namespace_token=namespace_token,
+                    lock_token=token,
+                )
+            else:
+                intent = self.catalog.recover_simple_deletion(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    self.simple_name,
+                    expected_intent_id=recovery_intent_id,
+                    namespace_token=namespace_token,
+                    lock_token=token,
+                    confirm_previous_owner_stopped=(
+                        confirm_previous_owner_stopped
+                    ),
+                )
+            intent_id = intent.get("intent_id") if isinstance(intent, dict) else None
+            if not intent_id:
+                raise RuntimeError("Catalog returned an invalid deletion intent")
+            logger.info(
+                "[deletion] SimpleTable cleanup started for %s/%s/%s; "
+                "deletion_intent_id=%s; recovery=%s",
+                self.super_table.organization,
+                self.super_table.super_name,
+                self.simple_name,
+                intent_id,
+                recovery_intent_id is not None,
+            )
+
+            # Prefixes on cloud stores usually do not have marker objects.
+            # Delete and verify the full logical prefix before making it
+            # undiscoverable in Redis. If this call or a lease becomes
+            # ambiguous, the durable intent remains and recreation stays
+            # blocked; an ordinary retry cannot clear it.
+            for prefix in storage_prefixes:
+                self.storage.delete_prefix(prefix)
+
+            removed = self.catalog.delete_simple_table(
+                self.super_table.organization,
+                self.super_table.super_name,
+                self.simple_name,
+                lock_token=token,
+                namespace_token=namespace_token,
+                intent_id=intent_id,
+            )
+            if not removed:
+                raise RuntimeError(
+                    f"Failed to remove catalog metadata for "
+                    f"{self.simple_name!r} after storage deletion"
+                )
+            if recovery_intent_id is not None:
+                self.catalog.clear_simple_deletion_tombstone(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    self.simple_name,
+                    expected_intent_id=intent_id,
+                    namespace_token=namespace_token,
+                    lock_token=token,
+                    confirm_previous_owner_stopped=(
+                        confirm_previous_owner_stopped
+                    ),
+                )
+        finally:
+            try:
+                self.catalog.release_simple_lock(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    self.simple_name,
+                    token,
+                )
+            finally:
+                self.catalog.release_namespace_lock(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    namespace_token,
+                )
+
+        logger.info(
+            f"Deleted Table (storage): {simple_table_folder}; "
+            f"deletion_intent_id={intent_id}"
+        )
+        return str(intent_id)
+
+    @classmethod
+    def recover_pending_delete(
+            cls,
+            *,
+            organization: str,
+            super_name: str,
+            simple_name: str,
+            role_name: str,
+            intent_id: str,
+            confirm_previous_owner_stopped: bool = False,
+    ) -> str:
+        """Recover a deleted leaf even if its parent root is already absent."""
+        catalog = RedisCatalog()
+        storage = get_storage()
+        parent = SuperTable.__new__(SuperTable)
+        parent.identity = "super"
+        parent.super_name = super_name
+        parent.organization = organization
+        parent.storage = storage
+        parent.catalog = catalog
+        parent.super_dir = os.path.join(organization, super_name, "super")
+        table = cls.__new__(cls)
+        table.super_table = parent
+        table.identity = "tables"
+        table.simple_name = simple_name
+        table.storage = storage
+        table.catalog = catalog
+        table.simple_dir = os.path.join(
+            organization, super_name, "tables", simple_name,
+        )
+        table.data_dir = os.path.join(table.simple_dir, "data")
+        table.snapshot_dir = os.path.join(table.simple_dir, "snapshots")
+        return table.recover_delete(
+            role_name,
+            intent_id=intent_id,
+            confirm_previous_owner_stopped=confirm_previous_owner_stopped,
+        )
 
     def get_simple_table_snapshot(self):
         """

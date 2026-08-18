@@ -1,11 +1,9 @@
 import time
-import uuid
 from typing import Any, Dict, List, Optional
 
 from supertable.config.defaults import logger
 from supertable.redis_catalog import RedisCatalog
 from supertable.rbac.access_control import check_write_access, check_meta_access
-from supertable import redis_keys as RK
 
 
 class SuperPipe:
@@ -22,6 +20,16 @@ class SuperPipe:
         self.staging_name = staging_name
         self.catalog = RedisCatalog()
 
+        deletion_guard = getattr(
+            type(self.catalog), "check_deletion_intent_absent", None,
+        )
+        if callable(deletion_guard):
+            self.catalog.check_deletion_intent_absent(
+                self.organization,
+                self.super_name,
+                stage=self.staging_name,
+            )
+
         # Check if staging exists in Redis before allowing pipe operations
         staging_meta = self.catalog.get_staging_meta(organization, super_name, staging_name)
         if not staging_meta:
@@ -29,23 +37,24 @@ class SuperPipe:
 
     def _with_lock(self, fn):
         # Lock against the staging area to prevent concurrent pipe/stage mutations
-        lock_key = RK.lock_stage(self.organization, self.super_name, self.staging_name)
-        token = uuid.uuid4().hex
-        acquired = self.catalog.r.set(lock_key, token, nx=True, ex=10)
-        if not acquired:
+        token = self.catalog.acquire_stage_lock(
+            self.organization,
+            self.super_name,
+            self.staging_name,
+            ttl_s=30,
+            timeout_s=30,
+        )
+        if not token:
             raise RuntimeError(f"Cannot modify pipes: Stage {self.staging_name} is currently locked.")
         try:
-            return fn()
+            return fn(token)
         finally:
-            # Atomic release via Lua script (compare-and-delete)
-            lua = """
-            if redis.call("get", KEYS[1]) == ARGV[1] then
-                return redis.call("del", KEYS[1])
-            else
-                return 0
-            end
-            """
-            self.catalog.r.eval(lua, 1, lock_key, token)
+            self.catalog.release_stage_lock(
+                self.organization,
+                self.super_name,
+                self.staging_name,
+                token,
+            )
 
     def create(self, *, role_name: str, pipe_name: str, simple_name: str, user_hash: str, overwrite_columns: List[str] = None,
                enabled: bool = True) -> str:
@@ -56,7 +65,7 @@ class SuperPipe:
             table_name=simple_name,
         )
 
-        def _op():
+        def _op(lock_token: str):
             # 1. Check for duplicate simple_name/overwrite_columns combo
             existing_pipes = self.catalog.list_pipe_metas(self.organization, self.super_name, self.staging_name)
             for p in existing_pipes:
@@ -83,7 +92,8 @@ class SuperPipe:
                 self.super_name,
                 self.staging_name,
                 pipe_name,
-                meta=definition
+                meta=definition,
+                lock_token=lock_token,
             )
             logger.info(f"[pipe] created in redis: {pipe_name}")
             return f"redis://{self.organization}/{self.super_name}/{self.staging_name}/{pipe_name}"
@@ -99,7 +109,7 @@ class SuperPipe:
             table_name=self.super_name,
         )
 
-        def _op():
+        def _op(lock_token: str):
             meta = self.catalog.get_pipe_meta(self.organization, self.super_name, self.staging_name, pipe_name)
             if not meta:
                 raise FileNotFoundError(f"Pipe '{pipe_name}' not found.")
@@ -112,7 +122,8 @@ class SuperPipe:
                 self.super_name,
                 self.staging_name,
                 pipe_name,
-                meta=meta
+                meta=meta,
+                lock_token=lock_token,
             )
             logger.info(f"[pipe] updated enabled={enabled} for {pipe_name}")
 
@@ -126,7 +137,7 @@ class SuperPipe:
             table_name=self.super_name,
         )
 
-        def _op():
+        def _op(_lock_token: str):
             return self.catalog.delete_pipe_meta(
                 self.organization,
                 self.super_name,

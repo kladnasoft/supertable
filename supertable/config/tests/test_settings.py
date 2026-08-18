@@ -117,6 +117,12 @@ def fresh_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
         "SUPERTABLE_REDIS_HOST",
         "SUPERTABLE_REDIS_PORT",
         "SUPERTABLE_REDIS_DB",
+        "SUPERTABLE_REDIS_SSL",
+        "SUPERTABLE_REDIS_SSL_CA_CERTS",
+        "SUPERTABLE_REDIS_SENTINEL",
+        "SUPERTABLE_REDIS_SENTINELS",
+        "SUPERTABLE_REDIS_SENTINEL_MASTER",
+        "SUPERTABLE_REDIS_SENTINEL_PASSWORD",
         # Misc
         "SUPERTABLE_SUPER_META_CACHE_TTL_S",
         "XDG_CONFIG_HOME",
@@ -442,12 +448,39 @@ class TestBuildSettings:
         assert s.STORAGE_USE_SSL is True
         assert s.SUPERTABLE_REDIS_PORT == 6380
 
-    def test_garbage_int_falls_back_to_default(
+    def test_garbage_redis_port_is_rejected(
         self, fresh_env: pytest.MonkeyPatch
     ) -> None:
         fresh_env.setenv("SUPERTABLE_REDIS_PORT", "not-a-number")
-        s = _build_settings()
-        assert s.SUPERTABLE_REDIS_PORT == 6379
+        with pytest.raises(ValueError, match="SUPERTABLE_REDIS_PORT"):
+            _build_settings()
+
+    @pytest.mark.parametrize("value", ["0", "-1", "65536"])
+    def test_out_of_range_redis_port_is_rejected(
+        self, fresh_env: pytest.MonkeyPatch, value: str,
+    ) -> None:
+        fresh_env.setenv("SUPERTABLE_REDIS_PORT", value)
+        with pytest.raises(ValueError, match="SUPERTABLE_REDIS_PORT"):
+            _build_settings()
+
+    @pytest.mark.parametrize("name", [
+        "SUPERTABLE_REDIS_SSL",
+        "SUPERTABLE_REDIS_SENTINEL",
+    ])
+    def test_garbage_redis_security_boolean_is_rejected(
+        self, fresh_env: pytest.MonkeyPatch, name: str,
+    ) -> None:
+        fresh_env.setenv(name, "maybe")
+        with pytest.raises(ValueError, match=name):
+            _build_settings()
+
+    @pytest.mark.parametrize("value", ["not-a-number", "-1"])
+    def test_invalid_redis_database_is_rejected(
+        self, fresh_env: pytest.MonkeyPatch, value: str,
+    ) -> None:
+        fresh_env.setenv("SUPERTABLE_REDIS_DB", value)
+        with pytest.raises(ValueError, match="SUPERTABLE_REDIS_DB"):
+            _build_settings()
 
     def test_superuser_token_fallback_chain(
         self, fresh_env: pytest.MonkeyPatch

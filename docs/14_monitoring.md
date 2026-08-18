@@ -4,7 +4,8 @@
 
 SuperTable records read, write, and tool-call metrics as JSON payloads
 in **daily-partitioned** Redis LISTs. The `MonitoringWriter` component
-pushes payloads via `RPUSH` to a key whose suffix is today's UTC date;
+publishes each payload through an idempotent Redis Lua boundary to a key whose
+suffix is the event's original UTC date;
 an external orchestrator drains older partitions into internal sink
 tables (`__reads__`, `__writes__`, `__mcp__`).
 
@@ -25,8 +26,9 @@ The Redis key shape (built by `redis_keys.monitor_partition(org, monitor_type, d
 supertable:{org}:monitor:{monitor_type}:doc:{YYYY-MM-DD}
 ```
 
-Once midnight (UTC) passes, the writer rolls into the new day's key
-automatically — the date is recomputed per batch ship, never cached.
+Once midnight (UTC) passes, new records roll into the new day's key. A locally
+spooled retry remains pinned to its original partition/date/expiry and is never
+silently re-dated.
 
 | Category | `monitor_type` | Source | Sink Table | Key Fields |
 |----------|----------------|--------|-----------|------------|
@@ -61,8 +63,8 @@ from supertable.monitoring_writer import (
     MonitoringWriter, get_monitoring_logger,
 )
 
-# 1. Context-managed (auto-flush on exit)
-with MonitoringWriter(organization, monitor_type="writes") as mw:
+# 1. Context-managed (opportunistic Redis flush on exit; WAL is already durable)
+with MonitoringWriter(organization=organization, monitor_type="writes") as mw:
     mw.log_metric({
         "query_id": "abc",
         "table_name": "facts",
@@ -82,12 +84,63 @@ mw.request_flush()
 ```
 
 `get_monitoring_logger` returns a thread-safe singleton per `(org,
-monitor_type)` pair — **the date is deliberately not part of the cache
-key** so one logger handles the daily rollover by recomputing the
-Redis key per batch ship. Payloads are buffered and flushed in
-batches. The writer captures back-pressure stats (`queue.qsize()`,
-`current_batch`, `queue_stats`) which can be inspected for sizing
-decisions.
+monitor_type)` pair. **The date is deliberately not part of the cache key**;
+each event nevertheless seals its exact original partition coordinates before
+delivery. The writer captures back-pressure stats (`current_batch`,
+`queue_stats`) which can be inspected for sizing decisions.
+
+## Durable Delivery, Backpressure, and Restart Recovery
+
+When monitoring is enabled, returning from `log_metric()` means the event is
+durable: Redis acknowledged its idempotent producer receipt, or the immutable
+record was fsynced into the bounded local WAL. A Redis outage therefore does
+not create an in-memory retry queue and does not lose records on process
+restart.
+
+The WAL directory defaults to
+`<SUPERTABLE_HOME>/monitoring-spool` and can be set explicitly with
+`SUPERTABLE_MONITOR_SPOOL_DIR`. It must be an absolute path on a persistent
+per-instance volume. Directories/files are restricted to `0700`/`0600`; record
+publication uses temp-file fsync, atomic replace, and directory fsync under an
+interprocess lock. This release requires POSIX `fcntl` locking when monitoring
+is enabled.
+
+Two mandatory hard bounds prevent an outage from consuming unbounded memory or
+disk:
+
+- `SUPERTABLE_MONITOR_SPOOL_MAX_BYTES` (default `268435456`)
+- `SUPERTABLE_MONITOR_SPOOL_MAX_RECORDS` (default `100000`)
+
+If either bound is reached, or the WAL cannot be fsynced, the logger raises
+`MonitoringBackpressureError`/`MonitoringDurabilityError`. `DataWriter.write`
+and `compact` surface this as `MonitoringPostCommitError` with
+`core_committed=True` and `core_result`; do not blindly retry that mutation.
+Query monitoring uses `MonitoringPostExecutionError` after execution/stream
+finalization. Generic optional-telemetry catches must not swallow these errors.
+
+Every deployment must replay the WAL during startup even if no new event for an
+old tenant arrives:
+
+```python
+from supertable.monitoring_writer import (
+    MonitoringDeliveryError,
+    drain_monitoring_spool,
+)
+
+try:
+    delivered = drain_monitoring_spool(timeout_s=30)
+except MonitoringDeliveryError as exc:
+    # Keep the instance unhealthy/not-ready until Redis delivery recovers.
+    raise RuntimeError("monitoring WAL recovery is incomplete") from exc
+```
+
+Delivery uses a stable random ID plus a canonical payload SHA-256. One Lua
+operation verifies/creates the producer receipt, appends the payload, and pins
+both expiries. A lost Redis reply is safe to replay and cannot append a second
+copy. Producer receipts outlive the data partition by a grace day so a retry
+cannot recreate a partition already drained by the consumer. A WAL record that
+reaches its immutable partition expiry is retained fail-closed for explicit
+operator disposition; it is never re-dated into today's partition.
 
 ## Reading the Live Tail
 
@@ -193,7 +246,7 @@ takes the source key out from under any concurrent writer in the rare
 day-boundary race; once the drain handle exists, new writes create a
 fresh empty source key for the new day.
 
-**Crash recovery.** If your process crashes between `RENAME` and `DEL`,
+**Crash recovery.** If your process crashes between `RENAME` and explicit ACK,
 the next call sees the `:_drain` handle already populated; the
 `RENAME` fails (because the handle exists), and we read the handle
 directly. No data lost.
@@ -204,8 +257,9 @@ everything into RAM in one shot.
 ### `iter_partition_chunks(catalog, *, organization, monitor_type, date, chunk_size=10000)`
 
 Memory-bounded variant for huge partitions. Same `RENAME` semantics,
-then `LRANGE` in slices. The `:_drain` handle is `DEL`-ed when the
-iterator exhausts.
+then `LRANGE` in slices. Iterator exhaustion does not acknowledge delivery:
+the `:_drain` handle and its sealed receipt remain until
+`acknowledge_partition(...)` verifies and atomically deletes them.
 
 **Resume semantics:** if your process crashes mid-iteration, the
 `:_drain` handle survives. Calling `iter_partition_chunks` or

@@ -1,15 +1,22 @@
 import base64
+import duckdb
 import hashlib
 import io
+import os
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pyarrow as pa
 import pytest
 
 from supertable.storage.local_storage import LocalStorage
 from supertable.storage.storage_interface import (
     ObjectIdentityMismatch,
     ObjectMetadata,
+    PARQUET_DECODE_MAX_PENDING_BATCHES,
+    PARQUET_DECODE_MAX_PENDING_ROWS,
+    _iter_bounded_parquet_batch_groups,
     normalize_sha256_checksum,
 )
 
@@ -72,6 +79,53 @@ def test_local_download_streams_and_honours_expected_metadata(tmp_path):
     assert storage.is_local_storage() is True
 
 
+def test_local_relative_paths_are_rooted_without_changing_process_cwd(tmp_path):
+    root = tmp_path / "storage-root"
+    elsewhere = tmp_path / "caller-cwd"
+    elsewhere.mkdir()
+    before = os.getcwd()
+    try:
+        os.chdir(elsewhere)
+        storage = LocalStorage(root=root)
+        storage.write_bytes("tenant/table/data.bin", b"payload")
+
+        assert os.getcwd() == str(elsewhere)
+        assert (root / "tenant/table/data.bin").read_bytes() == b"payload"
+        assert storage.list_files("tenant/table", "*.bin") == [
+            "tenant/table/data.bin"
+        ]
+        assert storage.canonical_uri("tenant/table/data.bin") == (
+            root / "tenant/table/data.bin"
+        ).resolve().as_uri()
+    finally:
+        os.chdir(before)
+
+
+def test_local_duckdb_path_resolves_logical_hive_key_without_uri_escaping(tmp_path):
+    root = tmp_path / "storage-root"
+    storage = LocalStorage(root=root)
+    logical = "tenant/table/year=2026/month=08/data.parquet"
+    storage.write_parquet(pa.table({"id": [1, 2]}), logical)
+
+    resolved = storage.to_duckdb_path(logical)
+
+    assert resolved == str((root / logical).resolve())
+    assert os.path.isabs(resolved)
+    assert "%3D" not in resolved
+    connection = duckdb.connect()
+    try:
+        assert connection.from_parquet(resolved).fetchall() == [(1,), (2,)]
+    finally:
+        connection.close()
+
+
+def test_local_relative_paths_cannot_escape_configured_root(tmp_path):
+    storage = LocalStorage(root=tmp_path / "storage-root")
+
+    with pytest.raises(ValueError, match="escapes configured root"):
+        storage.write_bytes("../outside.bin", b"forbidden")
+
+
 def test_local_download_rejects_stale_metadata(tmp_path):
     path = tmp_path / "source.parquet"
     path.write_bytes(b"before")
@@ -89,6 +143,87 @@ def test_local_download_rejects_invalid_chunk_size(tmp_path):
 
     with pytest.raises(ValueError, match="chunk_size must be positive"):
         LocalStorage().download_to_file(str(path), io.BytesIO(), chunk_size=0)
+
+
+def test_parquet_stream_splits_clustered_wide_rows_to_decoded_budget(
+        tmp_path, monkeypatch,
+):
+    from supertable.storage import storage_interface
+
+    storage = LocalStorage(root=tmp_path)
+    values = (["x" * 100_000] * 100) + (["x"] * 9_900)
+    storage.write_parquet(pa.table({"value": values}), "skew.parquet")
+    budget = 1 * 1024 * 1024
+    real_parquet_file = storage_interface.pq.ParquetFile
+    decoder_batch_sizes = []
+
+    class RecordingParquetFile:
+        def __init__(self, path):
+            self._inner = real_parquet_file(path)
+
+        def iter_batches(self, **kwargs):
+            decoder_batch_sizes.append(kwargs["batch_size"])
+            yield from self._inner.iter_batches(**kwargs)
+
+    monkeypatch.setattr(
+        storage_interface.pq, "ParquetFile", RecordingParquetFile,
+    )
+
+    batches = list(storage.iter_parquet_batches(
+        "skew.parquet", max_decoded_bytes=budget,
+    ))
+
+    assert sum(batch.num_rows for batch in batches) == len(values)
+    assert all(
+        batch.num_rows == 1 or batch.nbytes <= budget
+        for batch in batches
+    )
+    assert max(batch.nbytes for batch in batches) <= budget
+    assert max(batch.num_rows for batch in batches) <= (
+        PARQUET_DECODE_MAX_PENDING_ROWS
+    )
+    assert decoder_batch_sizes == [1]
+
+
+def test_parquet_batch_group_metadata_is_bounded_for_very_narrow_rows():
+    """A byte-only budget must not retain one wrapper for every tiny row."""
+    row_count = PARQUET_DECODE_MAX_PENDING_BATCHES * 3 + 17
+    narrow_batches = (
+        SimpleNamespace(nbytes=1, num_rows=1)
+        for _ in range(row_count)
+    )
+
+    groups = list(_iter_bounded_parquet_batch_groups(
+        narrow_batches,
+        max_decoded_bytes=row_count * 2,
+    ))
+
+    assert sum(len(group) for group in groups) == row_count
+    assert max(len(group) for group in groups) == (
+        PARQUET_DECODE_MAX_PENDING_BATCHES
+    )
+    assert all(
+        sum(batch.num_rows for batch in group)
+        <= PARQUET_DECODE_MAX_PENDING_ROWS
+        for group in groups
+    )
+
+    row_capped = list(_iter_bounded_parquet_batch_groups(
+        (SimpleNamespace(nbytes=1, num_rows=10) for _ in range(7)),
+        max_decoded_bytes=1_000,
+        max_pending_batches=100,
+        max_pending_rows=25,
+    ))
+    assert [sum(batch.num_rows for batch in group) for group in row_capped] == [
+        20, 20, 20, 10,
+    ]
+
+    with pytest.raises(RuntimeError, match="larger than the pending-row cap"):
+        list(_iter_bounded_parquet_batch_groups(
+            [SimpleNamespace(nbytes=1, num_rows=26)],
+            max_decoded_bytes=1_000,
+            max_pending_rows=25,
+        ))
 
 
 def test_local_range_reads_only_requested_bytes_and_rejects_stale_seal(tmp_path):
@@ -344,4 +479,73 @@ def test_azure_range_uses_offset_length_and_version_fence():
         length=4,
         etag='"etag-7"',
         match_condition=MatchConditions.IfNotModified,
+    )
+
+
+def test_gcs_delete_prefix_drains_all_batches_and_retries_partial_failure():
+    pytest.importorskip("google.cloud.storage")
+    from supertable.storage.gcp_storage import GCSStorage
+
+    remaining = {f"base/table/file-{index:04d}" for index in range(3505)}
+    failed_once = {"value": False}
+
+    class Blob:
+        def __init__(self, name):
+            self.name = name
+
+        def delete(self):
+            if self.name.endswith("file-0000") and not failed_once["value"]:
+                failed_once["value"] = True
+                raise OSError("transient GCS delete error")
+            remaining.discard(self.name)
+
+    client = MagicMock()
+    bucket = client.bucket.return_value
+    bucket.get_blob.return_value = None
+    client.list_blobs.side_effect = lambda *_args, **_kwargs: [
+        Blob(name) for name in sorted(remaining)
+    ]
+    storage = GCSStorage("bucket", client=client, base_prefix="base")
+
+    storage.delete_prefix("table")
+
+    assert remaining == set()
+    assert failed_once["value"] is True
+    assert client.list_blobs.call_count >= 5
+    assert all(
+        call.kwargs["prefix"] == "base/table/"
+        for call in client.list_blobs.call_args_list
+    )
+
+
+def test_azure_delete_prefix_drains_all_batches_and_retries_partial_failure():
+    pytest.importorskip("azure.storage.blob")
+    from supertable.storage.azure_storage import AzureBlobStorage
+
+    remaining = {f"base/table/file-{index:04d}" for index in range(3505)}
+    failed_once = {"value": False}
+    service = MagicMock()
+    container = service.get_container_client.return_value
+    container.list_blobs.side_effect = lambda **_kwargs: [
+        SimpleNamespace(name=name) for name in sorted(remaining)
+    ]
+
+    def delete_blob(name):
+        if name.endswith("file-0000") and not failed_once["value"]:
+            failed_once["value"] = True
+            raise OSError("transient Azure delete error")
+        remaining.discard(name)
+
+    container.delete_blob.side_effect = delete_blob
+    storage = AzureBlobStorage("container", service, base_prefix="base")
+    storage._blob_exists = lambda _name: False
+
+    storage.delete_prefix("table")
+
+    assert remaining == set()
+    assert failed_once["value"] is True
+    assert container.list_blobs.call_count >= 5
+    assert all(
+        call.kwargs["name_starts_with"] == "base/table/"
+        for call in container.list_blobs.call_args_list
     )

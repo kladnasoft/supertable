@@ -165,7 +165,8 @@ def test_demo_tombstone_end_state(n_passes):
     dv = _as_polars(st.storage.read_parquet(tomb_path))
     assert dv.height == EXPECTED_TOMBSTONE_ROWS
     assert snap.get("tombstone_digest") == tombstone_digest(dv)
-    escaped_tombstone = str(tomb_path).replace("'", "''")
+    resolved_tombstone = st.storage.to_duckdb_path(tomb_path)
+    escaped_tombstone = str(resolved_tombstone).replace("'", "''")
     digest_con = duckdb.connect()
     try:
         _rows, duckdb_digest = validate_tombstone_relation(

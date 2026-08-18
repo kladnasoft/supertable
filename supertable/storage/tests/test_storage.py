@@ -1126,7 +1126,11 @@ class TestMinioStorage(unittest.TestCase):
         obj1 = MagicMock(object_name="prefix/a.txt")
         obj2 = MagicMock(object_name="prefix/b.txt")
         client.list_objects.return_value = iter([obj1, obj2])
-        client.remove_objects.return_value = []
+        # MinIO consumes the DeleteObject generator lazily while its returned
+        # error iterator is drained; model that SDK contract in the double.
+        client.remove_objects.side_effect = (
+            lambda _bucket, objects: (list(objects), [])[1]
+        )
         s.delete("prefix")
         client.remove_objects.assert_called_once()
 
@@ -1147,6 +1151,74 @@ class TestMinioStorage(unittest.TestCase):
         client.remove_objects.return_value = [err]
         with self.assertRaises(RuntimeError):
             s.delete("prefix")
+
+    def test_verified_delete_prefix_drains_arbitrary_size_in_batches(self):
+        s, client = self._make_storage()
+        remaining = {f"prefix/file-{index:04d}.parquet" for index in range(3505)}
+
+        def list_current(_prefix, recursive=True):
+            self.assertTrue(recursive)
+            return [types.SimpleNamespace(object_name=name) for name in sorted(remaining)]
+
+        def remove_current(_bucket, delete_stream):
+            names = {
+                getattr(item, "name", getattr(item, "_name", ""))
+                for item in delete_stream
+            }
+            remaining.difference_update(names)
+            return []
+
+        with patch.object(s, "_object_exists", return_value=False), patch.object(
+            s, "_list_objects", side_effect=list_current,
+        ):
+            client.remove_objects.side_effect = remove_current
+            s.delete_prefix("prefix")
+
+        self.assertEqual(remaining, set())
+        self.assertEqual(client.remove_objects.call_count, 4)
+
+    def test_verified_delete_prefix_retries_transient_partial_failure(self):
+        s, client = self._make_storage()
+        remaining = {"prefix/a.parquet", "prefix/b.parquet"}
+        attempts = {"count": 0}
+
+        def list_current(_prefix, recursive=True):
+            return [types.SimpleNamespace(object_name=name) for name in sorted(remaining)]
+
+        def remove_current(_bucket, delete_stream):
+            names = {
+                getattr(item, "name", getattr(item, "_name", ""))
+                for item in delete_stream
+            }
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                return [types.SimpleNamespace(message="transient delete failure")]
+            remaining.difference_update(names)
+            return []
+
+        with patch.object(s, "_object_exists", return_value=False), patch.object(
+            s, "_list_objects", side_effect=list_current,
+        ):
+            client.remove_objects.side_effect = remove_current
+            s.delete_prefix("prefix")
+
+        self.assertEqual(remaining, set())
+        self.assertEqual(attempts["count"], 2)
+
+    def test_verified_delete_prefix_surfaces_error_after_listing_exhaustion(self):
+        s, client = self._make_storage()
+        listings = iter([
+            [types.SimpleNamespace(object_name="prefix/a.parquet")],
+            [],
+        ])
+        client.remove_objects.return_value = [
+            types.SimpleNamespace(message="access denied")
+        ]
+        with patch.object(s, "_object_exists", return_value=False), patch.object(
+            s, "_list_objects", side_effect=lambda *_a, **_k: next(listings),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "access denied"):
+                s.delete_prefix("prefix")
 
     # ---- get_directory_structure ----
 
@@ -1951,6 +2023,81 @@ class TestS3Storage(unittest.TestCase):
             with patch.object(s, "_call", side_effect=tracking_call):
                 s.delete("prefix")
             self.assertEqual(call_count["n"], 2)  # 1000 + 500
+
+    def test_verified_delete_prefix_drains_more_than_three_thousand_objects(self):
+        s, client = self._make_storage()
+        remaining = {f"prefix/file-{index:04d}.parquet" for index in range(3505)}
+        paginator = MagicMock()
+
+        def pages(**_kwargs):
+            return [{"Contents": [{"Key": key} for key in sorted(remaining)]}]
+
+        paginator.paginate.side_effect = pages
+        client.get_paginator.return_value = paginator
+
+        def delete_call(method, **kwargs):
+            if method == "delete_objects":
+                remaining.difference_update(
+                    item["Key"] for item in kwargs["Delete"]["Objects"]
+                )
+                return {}
+            return {}
+
+        with patch.object(s, "_object_exists", return_value=False), patch.object(
+            s, "_call", side_effect=delete_call,
+        ) as call_storage:
+            s.delete_prefix("prefix")
+
+        self.assertEqual(remaining, set())
+        delete_calls = [
+            entry for entry in call_storage.call_args_list
+            if entry.args and entry.args[0] == "delete_objects"
+        ]
+        self.assertEqual(len(delete_calls), 4)
+
+    def test_verified_delete_prefix_never_hides_provider_partial_error(self):
+        s, client = self._make_storage()
+        remaining = {"prefix/a.parquet"}
+        paginator = MagicMock()
+        paginator.paginate.side_effect = lambda **_kwargs: [{
+            "Contents": [{"Key": key} for key in sorted(remaining)]
+        }]
+        client.get_paginator.return_value = paginator
+
+        def delete_call(method, **kwargs):
+            if method == "delete_objects":
+                # Model an inconsistent adapter which reports failure but no
+                # longer returns the object. The provider error must win.
+                remaining.clear()
+                return {"Errors": [{"Code": "AccessDenied", "Message": "denied"}]}
+            return {}
+
+        with patch.object(s, "_object_exists", return_value=False), patch.object(
+            s, "_call", side_effect=delete_call,
+        ):
+            with self.assertRaisesRegex(OSError, "AccessDenied"):
+                s.delete_prefix("prefix")
+
+    def test_base_prefix_is_removed_from_listings_and_applied_once(self):
+        s, _ = self._make_storage()
+        s.base_prefix = "tenant/root"
+
+        with patch.object(
+            s, "_list_common_prefixes_and_objects_one_level",
+            return_value=["part.parquet"],
+        ) as listing:
+            logical = s.list_files("orders")
+
+        self.assertEqual(logical, ["orders/part.parquet"])
+        listing.assert_called_once_with("tenant/root/orders/")
+        self.assertEqual(
+            s._with_base(logical[0]),
+            "tenant/root/orders/part.parquet",
+        )
+        self.assertEqual(
+            s.canonical_uri(logical[0]),
+            "s3://test-bucket/tenant/root/orders/part.parquet",
+        )
 
     # ---- get_directory_structure ----
 

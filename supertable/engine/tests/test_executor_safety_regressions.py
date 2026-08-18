@@ -701,11 +701,16 @@ def test_duckdb_singletons_are_scoped_by_org_and_storage():
     executor_module._duckdb_singletons.clear()
 
 
-def test_builtin_storage_identity_reuses_local_and_seals_full_credentials():
+def test_builtin_storage_identity_reuses_local_and_seals_full_credentials(tmp_path):
     from supertable.storage.local_storage import LocalStorage
 
     assert executor_module._storage_identity(LocalStorage()) == (
         executor_module._storage_identity(LocalStorage())
+    )
+    assert executor_module._storage_identity(
+        LocalStorage(root=tmp_path / "tenant-a")
+    ) != executor_module._storage_identity(
+        LocalStorage(root=tmp_path / "tenant-b")
     )
 
     class S3Like:

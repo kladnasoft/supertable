@@ -64,6 +64,7 @@ def build_history_row(
     check_type: str,
     latest: Dict[str, Any],
     execution_ms: int = 0,
+    history_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Flatten a check result (the 'latest' dict stored in Redis) into a single
@@ -97,7 +98,7 @@ def build_history_row(
             col_stats[col_name]["max"] = col_data.get("max")
 
     row = {
-        "dq_id": str(uuid.uuid4()),
+        "dq_id": str(history_id or uuid.uuid4()),
         "checked_at": latest.get("checked_at", _now_iso()),
         "table_name": table_name,
         "check_type": check_type,
@@ -137,6 +138,8 @@ def write_history(
     check_type: str,
     latest: Dict[str, Any],
     execution_ms: int = 0,
+    *,
+    history_id: Optional[str] = None,
 ) -> bool:
     """
     Append a check result row to the __data_quality__ system table.
@@ -155,7 +158,10 @@ def write_history(
         return False
 
     try:
-        row = build_history_row(table_name, check_type, latest, execution_ms)
+        row = build_history_row(
+            table_name, check_type, latest, execution_ms,
+            history_id=history_id,
+        )
 
         # Build Polars DataFrame with explicit schema for type safety
         df = pl.DataFrame({
@@ -193,7 +199,9 @@ def write_history(
             role_name="superadmin",
             simple_name=HISTORY_TABLE,
             data=arrow_table,
-            overwrite_columns=[],  # append-only, no dedup
+            # A durable outbox intentionally replays after ambiguous failures.
+            # A stable dq_id makes those retries idempotent on read/compaction.
+            overwrite_columns=["dq_id"],
             lineage={
                 "source_type": "dq_check",
                 "source_id": row["dq_id"],
@@ -221,6 +229,8 @@ def write_history_via_sql(
     check_type: str,
     latest: Dict[str, Any],
     execution_ms: int = 0,
+    *,
+    history_id: Optional[str] = None,
 ) -> bool:
     """
     Fallback: store history row as a JSON entry in a Redis list.
@@ -249,7 +259,10 @@ def write_history_via_sql(
         return False
 
     try:
-        row = build_history_row(table_name, check_type, latest, execution_ms)
+        row = build_history_row(
+            table_name, check_type, latest, execution_ms,
+            history_id=history_id,
+        )
         key = _dq_key(org, sup, "history")
 
         # Push to head of list (newest first), cap at 1000 entries
@@ -273,3 +286,25 @@ def write_history_via_sql(
     except Exception as e:
         logger.warning(f"[dq-history] Redis history fallback failed for {table_name}: {e}")
         return False
+
+
+def write_history_payload(payload: Dict[str, Any]) -> bool:
+    """Deliver one validated scheduler-outbox payload to Parquet."""
+
+    if not isinstance(payload, dict):
+        return False
+    required = {
+        "history_id", "organization", "super_name", "table_name",
+        "check_type", "latest", "execution_ms",
+    }
+    if set(payload) != required or not isinstance(payload.get("latest"), dict):
+        return False
+    return write_history(
+        str(payload["organization"]),
+        str(payload["super_name"]),
+        str(payload["table_name"]),
+        str(payload["check_type"]),
+        dict(payload["latest"]),
+        int(payload["execution_ms"]),
+        history_id=str(payload["history_id"]),
+    )

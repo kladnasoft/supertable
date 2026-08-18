@@ -210,7 +210,7 @@ class TestDataReaderInit:
     @patch(_PATCH_TIMER)
     @patch(_PATCH_GET_STORAGE)
     @patch(_PATCH_SQL_PARSER)
-    def test_init_parser_raises_propagates(
+    def test_execute_parser_rejection_returns_clean_error_status(
         self, MockParser, mock_get_storage, MockTimer, MockPlanStats,
         mock_restrict, MockQPM, MockEstimator, MockExecutor, mock_extend,
     ):
@@ -222,8 +222,10 @@ class TestDataReaderInit:
 
         from supertable.data_reader import DataReader, engine
         dr = DataReader("s", "o", "NOT VALID SQL")
-        with pytest.raises(ValueError, match="bad sql"):
-            dr.execute("admin", engine=engine.AUTO)
+        frame, status, message = dr.execute("admin", engine=engine.AUTO)
+        assert frame.empty
+        assert status.value == "error"
+        assert message == "bad sql"
 
 
 # ====================================================================
@@ -845,6 +847,52 @@ class TestExecuteExtendPlanError:
         assert status == Status.OK
         assert message is None
         assert len(df) == 1
+
+    @patch(_PATCH_EXTEND_PLAN)
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_QUERY_PLAN_MGR)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_PLAN_STATS)
+    @patch(_PATCH_TIMER)
+    @patch(_PATCH_GET_STORAGE)
+    @patch(_PATCH_SQL_PARSER)
+    def test_monitoring_durability_failure_is_explicit_post_execution(
+        self, MockParser, mock_get_storage, MockTimer, MockPlanStats,
+        mock_restrict, MockQPM, MockEstimator, MockExecutor, mock_extend,
+    ):
+        from supertable.monitoring_writer import (
+            MonitoringBackpressureError,
+            MonitoringPostExecutionError,
+        )
+
+        mock_get_storage.return_value = MagicMock()
+        parser = MagicMock()
+        parser.get_table_tuples.return_value = []
+        parser.original_query = "Q"
+        MockParser.return_value = parser
+        MockTimer.return_value = MagicMock(timings=[])
+        MockPlanStats.return_value = MagicMock()
+        MockQPM.return_value = MagicMock(
+            query_id="q-monitor", query_hash="h",
+            organization="o", super_name="s",
+        )
+        estimator = MagicMock()
+        estimator.estimate.return_value = _make_reflection()
+        MockEstimator.return_value = estimator
+        MockExecutor.return_value.execute.return_value = (
+            pd.DataFrame({"x": [1]}), "duckdb_pinned",
+        )
+        mock_extend.side_effect = MonitoringBackpressureError("spool full")
+
+        from supertable.data_reader import DataReader, engine
+        reader = DataReader("s", "o", "Q")
+        with pytest.raises(MonitoringPostExecutionError) as raised:
+            reader.execute("admin", engine=engine.AUTO)
+
+        assert raised.value.execution_completed is True
+        assert raised.value.query_id == "q-monitor"
+        assert raised.value.status == "ok"
 
 
 # ====================================================================
@@ -1813,7 +1861,7 @@ class TestExecuteExplainRouting:
     @patch(_PATCH_TIMER)
     @patch(_PATCH_GET_STORAGE)
     @patch(_PATCH_SQL_PARSER)
-    def test_explain_analyze_sets_options(
+    def test_explain_analyze_is_rejected_before_executor(
         self, MockParser, mock_get_storage, MockTimer, MockPlanStats,
         mock_restrict, MockQPM, MockEstimator, MockExecutor, mock_extend,
     ):
@@ -1836,11 +1884,12 @@ class TestExecuteExplainRouting:
 
         from supertable.data_reader import DataReader, engine
         dr = DataReader("s", "o", "EXPLAIN ANALYZE SELECT 1")
-        dr.execute("admin", engine=engine.AUTO)
+        frame, status, message = dr.execute("admin", engine=engine.AUTO)
 
-        ekw = mock_exec.execute.call_args.kwargs
-        assert ekw["explain"] is True
-        assert ekw["explain_options"] == "ANALYZE"
+        assert frame.empty
+        assert status.value == "error"
+        assert "EXPLAIN ANALYZE" in message
+        mock_exec.execute.assert_not_called()
 
     @patch(_PATCH_EXTEND_PLAN)
     @patch(_PATCH_EXECUTOR)

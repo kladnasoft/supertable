@@ -192,32 +192,239 @@ class TestNoOpCases:
     def test_all_files_above_threshold_small_only_skips(
         self, patched_storage, storage_dir,
     ):
-        """When small_only=True and every file ≥ max_memory_chunk_size,
-        nothing qualifies. No writes, no sunsets."""
+        """When every file is at/above the threshold, no object is opened."""
         from supertable.processing import compact_resources
         data_dir, _ = storage_dir
 
-        # Each file ~1 MB — pretend large by setting file_size > threshold.
         df = pl.DataFrame({"a": range(10), "b": range(10)})
         resources = [
-            _write_source_parquet(patched_storage, data_dir, f"big_{i}.parquet", df)
+            _write_source_parquet(
+                patched_storage, data_dir, f"big_{i}.parquet", df,
+            )
             for i in range(3)
         ]
-        # Override file_size to be above the threshold (4 MB) — we don't
-        # want to actually generate 4 MB files in the test.
-        for r in resources:
-            r["file_size"] = 10_000_000  # 10 MB
+        for resource in resources:
+            resource["file_size"] = 10_000_000
 
-        snapshot = _build_snapshot(resources)
-        table_config = {"max_memory_chunk_size": 4 * 1024 * 1024}  # 4 MB threshold
-
-        considered, rows, new_res, sunset = compact_resources(
-            snapshot=snapshot, data_dir=data_dir, compression_level=1,
-            table_config=table_config, small_only=True,
+        considered, _rows, new_res, sunset = compact_resources(
+            snapshot=_build_snapshot(resources),
+            data_dir=data_dir,
+            compression_level=1,
+            table_config={"max_memory_chunk_size": 4 * 1024 * 1024},
+            small_only=True,
         )
         assert considered == 0
         assert new_res == []
         assert sunset == set()
+
+
+def test_ordinary_compaction_is_single_concat_and_decoded_memory_bounded(
+    patched_storage, storage_dir, monkeypatch,
+):
+    """Highly compressed legacy files must not become one quadratic frame."""
+    from supertable import processing as proc_mod
+    from supertable.processing import compact_resources
+    from supertable.utils.profiler import Profiler
+
+    data_dir, _ = storage_dir
+    resources = []
+    for file_index in range(4):
+        frame = pl.DataFrame({
+            "id": list(range(file_index * 100, (file_index + 1) * 100)),
+            # Repetition keeps the Parquet objects small while their decoded
+            # representation materially exceeds the configured 4 KiB budget.
+            "payload": [f"value-{file_index}-" + ("x" * 160)] * 100,
+        })
+        resources.append(
+            _write_source_parquet(
+                patched_storage,
+                data_dir,
+                f"compressed-{file_index}.parquet",
+                frame,
+            )
+        )
+
+    observed_concat_bytes = []
+    real_concat_many = proc_mod.concat_many_with_union
+
+    def bounded_concat(frames):
+        observed_concat_bytes.append(sum(frame.estimated_size() for frame in frames))
+        return real_concat_many(frames)
+
+    def forbidden_pairwise_concat(*_args, **_kwargs):
+        raise AssertionError("ordinary compaction used the quadratic pairwise concat")
+
+    monkeypatch.setattr(proc_mod, "concat_many_with_union", bounded_concat)
+    monkeypatch.setattr(proc_mod, "concat_with_union", forbidden_pairwise_concat)
+    profiler = Profiler()
+
+    considered, rows, new_resources, sunset = compact_resources(
+        snapshot=_build_snapshot(resources),
+        data_dir=data_dir,
+        compression_level=1,
+        table_config={
+            "max_memory_chunk_size": 1024 * 1024,
+            "max_decoded_compaction_bytes": 4096,
+            "tombstone_compaction_workers": 1,
+        },
+        small_only=True,
+        profiler=profiler,
+    )
+
+    assert considered == 4
+    assert rows == 400
+    assert sunset == {resource["file"] for resource in resources}
+    assert len(new_resources) > 1
+    assert len(observed_concat_bytes) > 1
+    assert max(observed_concat_bytes) <= 4096
+    assert profiler.emit_counts()["compact_decoded_peak_buffer_bytes"] <= 4096
+
+
+def test_ordinary_compaction_bounds_pending_frames_for_very_narrow_rows(
+    patched_storage, storage_dir, monkeypatch,
+):
+    """Narrow streamed frames cannot grow the pre-concat Python object list."""
+    from supertable import processing as proc_mod
+    from supertable.processing import compact_resources
+
+    data_dir, _ = storage_dir
+    row_count = proc_mod._MAX_COMPACTION_CHUNK_FRAMES * 3 + 17
+    resource = _write_source_parquet(
+        patched_storage,
+        data_dir,
+        "narrow-source.parquet",
+        pl.DataFrame({"id": [0]}),
+    )
+    resource["rows"] = row_count
+
+    def many_narrow_batches(_path, *, max_decoded_bytes, columns=None):
+        del max_decoded_bytes, columns
+        for value in range(row_count):
+            yield pa.record_batch({"id": pa.array([value], type=pa.int64())})
+
+    observed_frame_counts = []
+    real_concat_many = proc_mod.concat_many_with_union
+
+    def bounded_concat(frames):
+        observed_frame_counts.append(len(frames))
+        return real_concat_many(frames)
+
+    monkeypatch.setattr(
+        patched_storage, "iter_parquet_batches", many_narrow_batches,
+    )
+    monkeypatch.setattr(proc_mod, "concat_many_with_union", bounded_concat)
+
+    considered, rows, new_resources, sunset = compact_resources(
+        snapshot=_build_snapshot([resource]),
+        data_dir=data_dir,
+        compression_level=1,
+        table_config={
+            "max_memory_chunk_size": 64 * 1024 * 1024,
+            "max_decoded_compaction_bytes": 64 * 1024 * 1024,
+            "tombstone_compaction_workers": 1,
+        },
+        small_only=True,
+    )
+
+    assert considered == 1
+    assert rows == row_count
+    assert new_resources
+    assert sunset == {resource["file"]}
+    assert max(observed_frame_counts) == proc_mod._MAX_COMPACTION_CHUNK_FRAMES
+    assert all(
+        count <= proc_mod._MAX_COMPACTION_CHUNK_FRAMES
+        for count in observed_frame_counts
+    )
+
+
+def test_ordinary_compaction_bounds_rows_per_concat(
+    patched_storage, storage_dir, monkeypatch,
+):
+    """The row cap is independent of both decoded bytes and frame count."""
+    from supertable import processing as proc_mod
+    from supertable.processing import compact_resources
+
+    data_dir, _ = storage_dir
+    resource = _write_source_parquet(
+        patched_storage,
+        data_dir,
+        "row-cap-source.parquet",
+        pl.DataFrame({"id": [0]}),
+    )
+    resource["rows"] = 15
+
+    def five_three_row_batches(_path, *, max_decoded_bytes, columns=None):
+        del max_decoded_bytes, columns
+        for start in range(0, 15, 3):
+            yield pa.record_batch({
+                "id": pa.array(range(start, start + 3), type=pa.int64()),
+            })
+
+    observed_concat_rows = []
+    real_concat_many = proc_mod.concat_many_with_union
+
+    def row_bounded_concat(frames):
+        observed_concat_rows.append(sum(frame.height for frame in frames))
+        return real_concat_many(frames)
+
+    monkeypatch.setattr(proc_mod, "_MAX_COMPACTION_CHUNK_ROWS", 7)
+    monkeypatch.setattr(
+        patched_storage, "iter_parquet_batches", five_three_row_batches,
+    )
+    monkeypatch.setattr(proc_mod, "concat_many_with_union", row_bounded_concat)
+
+    considered, rows, _new_resources, sunset = compact_resources(
+        snapshot=_build_snapshot([resource]),
+        data_dir=data_dir,
+        compression_level=1,
+        table_config={
+            "max_memory_chunk_size": 64 * 1024 * 1024,
+            "max_decoded_compaction_bytes": 64 * 1024 * 1024,
+            "tombstone_compaction_workers": 1,
+        },
+        small_only=True,
+    )
+
+    assert considered == 1
+    assert rows == 15
+    assert sunset == {resource["file"]}
+    assert max(observed_concat_rows) == 7
+    assert all(row_count <= 7 for row_count in observed_concat_rows)
+
+
+def test_optional_stream_failure_keeps_original_resource_live(
+    patched_storage, storage_dir, monkeypatch,
+):
+    from supertable.processing import compact_resources
+
+    data_dir, _ = storage_dir
+    resource = _write_source_parquet(
+        patched_storage,
+        data_dir,
+        "temporarily-unreadable.parquet",
+        pl.DataFrame({"id": [1, 2, 3]}),
+    )
+    # Exercise the no-row-count compatibility case; a failed stream used to
+    # look like a valid zero-row file and incorrectly sunset the original.
+    resource.pop("rows")
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("transient backend read failure")
+        yield  # pragma: no cover - make this a generator
+
+    monkeypatch.setattr(patched_storage, "iter_parquet_batches", unavailable)
+    considered, rows, new_resources, sunset = compact_resources(
+        snapshot=_build_snapshot([resource]),
+        data_dir=data_dir,
+        compression_level=1,
+        table_config={"max_memory_chunk_size": 1024 * 1024},
+        small_only=True,
+    )
+
+    assert considered == 0
+    assert rows == 0
+    assert new_resources == []
+    assert sunset == set()
 
 
 # ===========================================================================

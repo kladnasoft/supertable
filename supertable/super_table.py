@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
-# never remove the homedir, it is mandatory be there
-from supertable.config.homedir import app_home
+from supertable.config.defaults import logger
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager
 from supertable.errors import SuperTableNotFoundError
@@ -68,6 +67,15 @@ class SuperTable:
         # Redis catalog for meta & locking
         self.catalog = RedisCatalog()
 
+        deletion_guard = getattr(
+            type(self.catalog), "check_deletion_intent_absent", None,
+        )
+        if callable(deletion_guard):
+            self.catalog.check_deletion_intent_absent(
+                self.organization,
+                self.super_name,
+            )
+
         # Directories for data layout (still used for heavy JSON & data files)
         self.super_dir = os.path.join(self.organization, self.super_name, self.identity)
 
@@ -96,15 +104,42 @@ class SuperTable:
           * Otherwise, create the base folder (best-effort) and bootstrap Redis meta:root.
         """
 
-        # Slow path: first-time initialization
+        token = self.catalog.acquire_namespace_lock(
+            self.organization, self.super_name, ttl_s=30, timeout_s=60,
+        )
+        if not token:
+            raise TimeoutError(
+                f"Could not acquire namespace creation lock for "
+                f"{self.organization}/{self.super_name}"
+            )
         try:
-            self.storage.makedirs(self.super_dir)
-        except Exception:
-            # Object storage may no-op; that's fine
-            pass
+            # Check before either fast-path return: stale root metadata behind
+            # a terminal tombstone must never reopen a deleted namespace.
+            self.catalog.check_initialization_allowed(
+                self.organization,
+                self.super_name,
+                namespace_token=token,
+            )
+            if self.catalog.root_exists(self.organization, self.super_name):
+                return
+            # The structural lock is acquired before the first storage write,
+            # so an initializer paused here cannot write a directory marker
+            # after a concurrent verified namespace deletion.
+            try:
+                self.storage.makedirs(self.super_dir)
+            except Exception:
+                # Object storage may no-op; that's fine
+                pass
 
-        # Initialize Redis root pointer if missing
-        self.catalog.ensure_root(self.organization, self.super_name)
+            self.catalog.ensure_root(
+                self.organization,
+                self.super_name,
+                namespace_token=token,
+            )
+        finally:
+            self.catalog.release_namespace_lock(
+                self.organization, self.super_name, token,
+            )
 
     # ------------------------------------------------------------------ heavy JSON read
     def read_simple_table_snapshot(self, simple_table_path: str) -> Dict[str, Any]:
@@ -119,7 +154,7 @@ class SuperTable:
 
 
     # ------------------------------------------------------------------ delete
-    def delete(self, role_name) -> None:
+    def delete(self, role_name) -> str:
         """Delete this SuperTable's data metadata and storage folder.
 
         WARNING: This is destructive and intended for admin flows.
@@ -129,6 +164,29 @@ class SuperTable:
         audit boundary; recreating the same SuperTable therefore cannot reset
         or silently widen its prior access policy.
         """
+        return self._delete_with_intent(role_name=role_name)
+
+    def recover_delete(
+            self,
+            role_name: str,
+            *,
+            intent_id: str,
+            confirm_previous_owner_stopped: bool = False,
+    ) -> str:
+        """Resume an abandoned namespace deletion after liveness proof."""
+        return self._delete_with_intent(
+            role_name=role_name,
+            recovery_intent_id=intent_id,
+            confirm_previous_owner_stopped=confirm_previous_owner_stopped,
+        )
+
+    def _delete_with_intent(
+            self,
+            *,
+            role_name: str,
+            recovery_intent_id: Optional[str] = None,
+            confirm_previous_owner_stopped: bool = False,
+    ) -> str:
         # Deleting the namespace also deletes every child table.  A scoped
         # ADMIN could otherwise authorize the parent through ``*`` and erase a
         # child that has an exact ``access: deny`` override.  There is no root
@@ -148,16 +206,124 @@ class SuperTable:
             )
 
         base_dir = os.path.join(self.organization, self.super_name)
-
-        # Delete storage first; if this fails (other than missing), do not remove Redis meta.
+        namespace_token = self.catalog.acquire_namespace_lock(
+            self.organization, self.super_name, ttl_s=30, timeout_s=60,
+        )
+        if not namespace_token:
+            raise TimeoutError(
+                f"Could not acquire deletion fence for "
+                f"{self.organization}/{self.super_name}"
+            )
+        leaf_tokens = {}
         try:
-            if self.storage.exists(base_dir):
-                self.storage.delete(base_dir)
-        except FileNotFoundError:
-            # Missing storage is fine; still delete Redis meta
-            pass
+            if recovery_intent_id is None:
+                intent = self.catalog.begin_namespace_deletion(
+                    self.organization,
+                    self.super_name,
+                    namespace_token=namespace_token,
+                )
+            else:
+                intent = self.catalog.recover_namespace_deletion(
+                    self.organization,
+                    self.super_name,
+                    expected_intent_id=recovery_intent_id,
+                    namespace_token=namespace_token,
+                    confirm_previous_owner_stopped=(
+                        confirm_previous_owner_stopped
+                    ),
+                )
+            intent_id = intent.get("intent_id") if isinstance(intent, dict) else None
+            if not intent_id:
+                raise RuntimeError("Catalog returned an invalid deletion intent")
+            logger.info(
+                "[deletion] SuperTable cleanup started for %s/%s; "
+                "deletion_intent_id=%s; recovery=%s",
+                self.organization,
+                self.super_name,
+                intent_id,
+                recovery_intent_id is not None,
+            )
 
-        # Best-effort delete data/meta keys under the SuperTable prefix.  The
-        # catalog deliberately preserves RBAC keys so this generic namespace
-        # cleanup cannot bypass the privileged mutation ledger.
-        self.catalog.delete_super_table(self.organization, self.super_name)
+            # The namespace fence prevents new child initialization and makes
+            # snapshot commit Lua fail closed. Drain every already-published
+            # child's auto-renewed writer lock before touching storage.
+            leaf_marker = "meta:leaf:doc:"
+            names = sorted({
+                key.rsplit(leaf_marker, 1)[-1]
+                for key in self.catalog.scan_leaf_keys(
+                    self.organization, self.super_name,
+                )
+                if leaf_marker in key
+            })
+            for name in names:
+                token = self.catalog.acquire_simple_lock(
+                    self.organization,
+                    self.super_name,
+                    name,
+                    ttl_s=30,
+                    timeout_s=60,
+                )
+                if not token:
+                    raise TimeoutError(
+                        f"Could not drain writer for "
+                        f"{self.organization}/{self.super_name}/{name}"
+                    )
+                leaf_tokens[name] = token
+
+            # Object-store prefixes normally have no exact marker object. The
+            # backend operation drains and verifies the full prefix while no
+            # existing or newly-created table can publish into it.
+            self.storage.delete_prefix(base_dir)
+
+            # Preserve live fence keys throughout the SCAN deletion. Once the
+            # catalog root is gone, finally releasing them cannot admit a stale
+            # writer: its root/leaf recheck or fenced commit fails.
+            self.catalog.delete_super_table(
+                self.organization,
+                self.super_name,
+                namespace_token=namespace_token,
+                intent_id=intent_id,
+            )
+            if recovery_intent_id is not None:
+                self.catalog.clear_namespace_deletion_tombstone(
+                    self.organization,
+                    self.super_name,
+                    expected_intent_id=intent_id,
+                    namespace_token=namespace_token,
+                    confirm_previous_owner_stopped=(
+                        confirm_previous_owner_stopped
+                    ),
+                )
+        finally:
+            for name, token in reversed(list(leaf_tokens.items())):
+                self.catalog.release_simple_lock(
+                    self.organization, self.super_name, name, token,
+                )
+            self.catalog.release_namespace_lock(
+                self.organization, self.super_name, namespace_token,
+            )
+        return str(intent_id)
+
+    @classmethod
+    def recover_pending_delete(
+            cls,
+            *,
+            organization: str,
+            super_name: str,
+            role_name: str,
+            intent_id: str,
+            confirm_previous_owner_stopped: bool = False,
+    ) -> str:
+        """Recover a namespace after its root was already removed."""
+        table = cls.__new__(cls)
+        table.identity = "super"
+        table.super_name = super_name
+        table.organization = organization
+        table.storage = get_storage()
+        table.catalog = RedisCatalog()
+        table.super_dir = os.path.join(organization, super_name, "super")
+        return table.recover_delete(
+            role_name,
+            intent_id=intent_id,
+            confirm_previous_owner_stopped=confirm_previous_owner_stopped,
+        )

@@ -251,6 +251,25 @@ class DQConfig:
                 raise DQConfigReadError(
                     f"persisted {label} has an invalid cooldown_seconds"
                 )
+        timezone_name = document.get("timezone", "UTC")
+        if not isinstance(timezone_name, str) or not timezone_name.strip():
+            raise DQConfigReadError(
+                f"persisted {label} has an invalid timezone"
+            )
+        try:
+            from supertable.quality.cron import CronValidationError, validate_cron
+        except ImportError as exc:
+            raise DQConfigReadError(
+                "timezone-aware cron support is unavailable"
+            ) from exc
+        try:
+            # Validate the timezone even when this document inherits every cron
+            # field from its parent schedule.
+            validate_cron("0 0 * * *", timezone_name)
+        except CronValidationError as exc:
+            raise DQConfigReadError(
+                f"persisted {label} has an invalid timezone: {exc}"
+            ) from exc
         for field_name in ("quick_cron", "deep_cron", "custom_cron"):
             if field_name in document and (
                 not isinstance(document[field_name], str)
@@ -259,6 +278,13 @@ class DQConfig:
                 raise DQConfigReadError(
                     f"persisted {label} has an invalid {field_name}"
                 )
+            if field_name in document:
+                try:
+                    validate_cron(document[field_name], timezone_name)
+                except CronValidationError as exc:
+                    raise DQConfigReadError(
+                        f"persisted {label} has an invalid {field_name}: {exc}"
+                    ) from exc
 
     # ── Global config ─────────────────────────────────────────────────
 
@@ -726,6 +752,7 @@ class DQConfig:
             "post_ingest_custom": True,
             "post_ingest_deep": False,
             "enabled": True,
+            "timezone": "UTC",
         }
         stored = self._read_json(
             self._key("schedule"),

@@ -16,15 +16,14 @@ Covers:
      - happy path: rename → lrange → del; returns parsed dicts
      - source missing, drain missing → []
      - source missing, drain has data → resumes (no rename, returns drain data)
-     - rename succeeds, lrange empty → still deletes drain key
+     - rename succeeds, lrange empty → retains a receipt for explicit ACK
      - lrange fails → leaves drain key for retry, returns []
-     - del fails after successful read → returns parsed data, warns
      - malformed entries are silently skipped
      - catalog without .r → ValueError
   5. iter_partition_chunks
-     - happy path: yields chunks, deletes drain at end
+     - happy path: yields chunks, retains drain until explicit ACK
      - chunk_size clamped to [1, 1_000_000]
-     - empty partition → no yields, deletes drain
+     - empty partition → no yields, retains receipt for explicit ACK
      - lrange in mid-iteration fails → stops, leaves drain
      - caller bails early via break → drain not deleted
   6. monitoring_writer integration
@@ -40,6 +39,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import pytest
+import fakeredis
 
 os.environ.setdefault("SUPERTABLE_ORGANIZATION", "test_org")
 os.environ.setdefault("SUPERTABLE_SUPERUSER_TOKEN", "test_token")
@@ -50,11 +50,15 @@ from supertable.monitoring.partitions import (  # noqa: E402
     MONITORING_SINK_TABLE_FOR,
     MONITORING_SINK_TABLES,
     MonitorPartition,
+    acknowledge_partition,
+    claim_partition_chunks,
+    claim_partition,
     _decode,
     _parse_entries,
     _today_utc,
     drain_partition,
     iter_partition_chunks,
+    iter_claimed_partition_chunks,
     list_drainable_partitions,
     read_recent,
 )
@@ -67,6 +71,9 @@ def _mock_catalog():
     """Mock that mimics RedisCatalog.r ducktyping."""
     cat = MagicMock()
     cat.r = MagicMock()
+    cat.r.eval.return_value = [1, -1]
+    cat.r.pttl.return_value = -1
+    cat.r.set.return_value = True
     return cat
 
 
@@ -249,12 +256,16 @@ class TestDrainPartition:
         assert out == [{"q": 1}, {"q": 2}]
         src = RK.monitor_partition(ORG, "writes", "2026-06-09")
         drain = RK.monitor_partition_drain(ORG, "writes", "2026-06-09")
-        cat.r.renamenx.assert_called_once_with(src, drain)
+        cat.r.eval.assert_called_once()
+        eval_args = cat.r.eval.call_args.args
+        assert eval_args[1:] == (2, src, drain)
+        cat.r.persist.assert_not_called()
+        cat.r.renamenx.assert_not_called()
         # Plain RENAME must NOT be used — it would silently destroy a
         # previous crashed run's drain contents.
         cat.r.rename.assert_not_called()
         cat.r.lrange.assert_called_once_with(drain, 0, -1)
-        cat.r.delete.assert_called_once_with(drain)
+        cat.r.delete.assert_not_called()
 
     def test_source_missing_drain_missing_returns_empty(self):
         cat = _mock_catalog()
@@ -281,9 +292,9 @@ class TestDrainPartition:
             cat, organization=ORG, monitor_type="writes", date="2026-06-09",
         )
         assert out == [{"resumed": True}]
-        # Drain was read and deleted; src untouched (left for next call)
+        # Drain was read but remains until an explicit durable-sink ACK.
         cat.r.lrange.assert_called_once()
-        cat.r.delete.assert_called_once()
+        cat.r.delete.assert_not_called()
         # Critically: RENAME must NOT have been used (it would have
         # overwritten the drain contents and lost the queued entries)
         cat.r.rename.assert_not_called()
@@ -311,7 +322,7 @@ class TestDrainPartition:
         # are still there for the next drain call)
         cat.r.rename.assert_not_called()
 
-    def test_rename_ok_but_lrange_empty_still_deletes_drain(self):
+    def test_rename_ok_but_lrange_empty_never_acks_without_sink_commit(self):
         cat = _mock_catalog()
         cat.r.renamenx.return_value = 1
         cat.r.lrange.return_value = []
@@ -321,8 +332,7 @@ class TestDrainPartition:
             cat, organization=ORG, monitor_type="writes", date="2026-06-09",
         )
         assert out == []
-        # We renamed src→drain creating an empty key; clean up.
-        cat.r.delete.assert_called_once()
+        cat.r.delete.assert_not_called()
 
     def test_lrange_failure_leaves_drain_for_retry(self):
         cat = _mock_catalog()
@@ -354,6 +364,153 @@ class TestDrainPartition:
 # ===========================================================================
 # 5. iter_partition_chunks
 # ===========================================================================
+
+
+class TestExplicitDrainAcknowledgement:
+
+    def test_sink_failure_replays_and_only_exact_receipt_deletes(self):
+        cat = MagicMock()
+        cat.r = fakeredis.FakeRedis(decode_responses=True)
+        date = "2026-06-09"
+        src = RK.monitor_partition(ORG, "writes", date)
+        drain = RK.monitor_partition_drain(ORG, "writes", date)
+        cat.r.rpush(src, json.dumps({"query_id": "q-1"}))
+        cat.r.expire(src, 60)
+
+        first = claim_partition(
+            cat, organization=ORG, monitor_type="writes", date=date,
+        )
+        assert first is not None
+        assert first.entries == ({"query_id": "q-1"},)
+        assert cat.r.pttl(drain) == -1
+
+        # A failed downstream write performs no ACK. The exact claim replays.
+        replay = claim_partition(
+            cat, organization=ORG, monitor_type="writes", date=date,
+        )
+        assert replay == first
+        assert acknowledge_partition(
+            cat,
+            organization=ORG,
+            monitor_type="writes",
+            date=date,
+            receipt="0" * 64,
+        ) is False
+        assert cat.r.exists(drain)
+
+        assert acknowledge_partition(
+            cat,
+            organization=ORG,
+            monitor_type="writes",
+            date=date,
+            receipt=first.receipt,
+        ) is True
+        assert not cat.r.exists(drain)
+
+    def test_crashed_drain_remains_discoverable(self, monkeypatch):
+        cat = MagicMock()
+        cat.r = fakeredis.FakeRedis(decode_responses=True)
+        date = "2026-06-09"
+        cat.r.rpush(
+            RK.monitor_partition_drain(ORG, "writes", date),
+            json.dumps({"query_id": "q-1"}),
+        )
+        monkeypatch.setattr(pmod, "_today_utc", lambda: "2026-06-10")
+        assert list_drainable_partitions(cat, organization=ORG) == [
+            MonitorPartition(ORG, "writes", date)
+        ]
+
+    def test_bounded_claim_stream_exposes_operable_receipt_and_acks(self):
+        cat = MagicMock()
+        inner = fakeredis.FakeRedis(decode_responses=True)
+
+        class BoundedRedis:
+            def __init__(self, redis_client):
+                self.inner = redis_client
+                self.windows = []
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+            def lrange(self, key, start, stop):
+                assert not (start == 0 and stop == -1), "unbounded drain read"
+                self.windows.append((start, stop))
+                return self.inner.lrange(key, start, stop)
+
+        cat.r = BoundedRedis(inner)
+        date = "2026-06-09"
+        src = RK.monitor_partition(ORG, "writes", date)
+        for index in range(5):
+            inner.rpush(src, json.dumps({"query_id": f"q-{index}"}))
+        inner.expire(src, 60)
+
+        claim = claim_partition_chunks(
+            cat,
+            organization=ORG,
+            monitor_type="writes",
+            date=date,
+            chunk_size=2,
+        )
+        assert claim is not None
+        assert claim.entry_count == 5
+        drain = RK.monitor_partition_drain(ORG, "writes", date)
+        assert inner.pttl(drain) == -1
+
+        chunks = list(iter_claimed_partition_chunks(cat, claim, chunk_size=2))
+        assert [[item["query_id"] for item in chunk] for chunk in chunks] == [
+            ["q-0", "q-1"],
+            ["q-2", "q-3"],
+            ["q-4"],
+        ]
+        assert all(stop - start + 1 <= 2 for start, stop in cat.r.windows)
+        # Iterator exhaustion is not an ACK; a sink failure remains replayable.
+        assert inner.exists(drain)
+        assert acknowledge_partition(
+            cat,
+            organization=claim.organization,
+            monitor_type=claim.monitor_type,
+            date=claim.date,
+            receipt=claim.receipt,
+        )
+        assert not inner.exists(drain)
+
+    def test_bounded_claim_refuses_poison_row_without_deleting_source(self):
+        cat = MagicMock()
+        cat.r = fakeredis.FakeRedis(decode_responses=True)
+        date = "2026-06-09"
+        src = RK.monitor_partition(ORG, "writes", date)
+        cat.r.rpush(src, json.dumps({"query_id": "ok"}), "not-json")
+
+        with pytest.raises(pmod.MonitoringPartitionError, match="valid JSON"):
+            claim_partition_chunks(
+                cat,
+                organization=ORG,
+                monitor_type="writes",
+                date=date,
+                chunk_size=1,
+            )
+        assert cat.r.llen(RK.monitor_partition_drain(ORG, "writes", date)) == 2
+
+    def test_bounded_stream_detects_claim_mutation_and_never_acks(self):
+        cat = MagicMock()
+        cat.r = fakeredis.FakeRedis(decode_responses=True)
+        date = "2026-06-09"
+        src = RK.monitor_partition(ORG, "writes", date)
+        cat.r.rpush(src, json.dumps({"query_id": "q-1"}))
+        claim = claim_partition_chunks(
+            cat,
+            organization=ORG,
+            monitor_type="writes",
+            date=date,
+            chunk_size=1,
+        )
+        assert claim is not None
+        drain = RK.monitor_partition_drain(ORG, "writes", date)
+        cat.r.rpush(drain, json.dumps({"query_id": "unexpected"}))
+
+        with pytest.raises(pmod.MonitoringPartitionError, match="size changed"):
+            list(iter_claimed_partition_chunks(cat, claim, chunk_size=1))
+        assert cat.r.exists(drain)
 
 
 class TestIterPartitionChunks:
@@ -396,7 +553,7 @@ class TestIterPartitionChunks:
             cat, organization=ORG, monitor_type="writes", date="2026-06-09",
         ))
         assert chunks == []
-        cat.r.delete.assert_called()  # empty drain handle cleaned up
+        cat.r.delete.assert_not_called()
 
     def test_happy_path_yields_chunks_and_deletes(self):
         cat = _mock_catalog()
@@ -422,7 +579,7 @@ class TestIterPartitionChunks:
             [{"i": 2}, {"i": 3}],
             [{"i": 4}],
         ]
-        cat.r.delete.assert_called_once()
+        cat.r.delete.assert_not_called()
 
     def test_lrange_failure_mid_iteration_stops_leaves_drain(self):
         cat = _mock_catalog()
@@ -796,43 +953,57 @@ class TestPartitionTTL:
         assert key == RK.monitor_partition("acme", "writes", today)
         assert expire_at == _partition_expire_at(today)
 
-    def _bare_logger(self, fake_redis):
-        """An _AsyncMonitoringLogger with no worker thread started."""
-        import threading
-        from supertable.monitoring_writer import _AsyncMonitoringLogger, _MonitorKey
-        log = _AsyncMonitoringLogger.__new__(_AsyncMonitoringLogger)
-        log._key = _MonitorKey(organization="acme", monitor_type="plans")
-        log._ship_to_redis = True
-        log._redis = fake_redis
-        log.queue_stats = {
-            "total_received": 0, "total_processed": 0,
-            "total_dropped": 0, "current_size": 0,
-        }
-        log.queue_stats_lock = threading.Lock()
-        return log
+    def test_durable_delivery_sets_immutable_partition_and_receipt_expiries(
+        self, tmp_path,
+    ):
+        from types import SimpleNamespace
+        from supertable.monitoring_writer import (
+            _AsyncMonitoringLogger,
+            _MonitorKey,
+            _partition_expire_at,
+            _today_utc_date,
+        )
 
-    def test_ship_batch_sets_expireat_once_on_partition(self):
-        from supertable.monitoring_writer import _today_utc_date, _partition_expire_at
-        fake = MagicMock()
-        pipe = MagicMock()
-        fake.r.pipeline.return_value = pipe
-        log = self._bare_logger(fake)
+        redis = fakeredis.FakeRedis(decode_responses=True)
+        log = _AsyncMonitoringLogger(
+            _MonitorKey(organization="acme", monitor_type="plans"),
+            redis_connector=SimpleNamespace(r=redis),
+            spool_dir=str(tmp_path / "wal"),
+            start_worker=False,
+        )
+        log.log_metric({"a": 1})
+        log.log_metric({"a": 2})
 
-        log._ship_batch([{"a": 1}, {"a": 2}])
+        today = _today_utc_date()
+        key = RK.monitor_partition("acme", "plans", today)
+        receipt = RK.monitor_partition_producer_receipts("acme", "plans", today)
+        expires_at = _partition_expire_at(today)
+        assert redis.llen(key) == 2
+        assert redis.expiretime(key) == expires_at
+        assert redis.hlen(receipt) == 2
+        assert redis.expiretime(receipt) == expires_at + 86400
 
-        key = RK.monitor_partition("acme", "plans", _today_utc_date())
-        assert pipe.rpush.call_count == 2
-        pipe.expireat.assert_called_once_with(key, _partition_expire_at(_today_utc_date()))
-        pipe.execute.assert_called_once()
+    def test_retrying_exact_spool_record_does_not_extend_or_duplicate_partition(
+        self, tmp_path,
+    ):
+        from types import SimpleNamespace
+        from supertable.monitoring_writer import (
+            _AsyncMonitoringLogger,
+            _MonitorKey,
+            _deliver_spool_record,
+        )
 
-    def test_ship_one_sets_expireat_on_partition(self):
-        from supertable.monitoring_writer import _today_utc_date, _partition_expire_at
-        fake = MagicMock()
-        log = self._bare_logger(fake)
-
-        log._ship_one({"a": 1})
-
-        key = RK.monitor_partition("acme", "plans", _today_utc_date())
-        fake.r.rpush.assert_called_once()
-        assert fake.r.rpush.call_args[0][0] == key
-        fake.r.expireat.assert_called_once_with(key, _partition_expire_at(_today_utc_date()))
+        redis = fakeredis.FakeRedis(decode_responses=True)
+        connector = SimpleNamespace(r=redis)
+        log = _AsyncMonitoringLogger(
+            _MonitorKey(organization="acme", monitor_type="plans"),
+            redis_connector=connector,
+            spool_dir=str(tmp_path / "wal"),
+            start_worker=False,
+        )
+        log._redis = None
+        log.log_metric({"a": 1})
+        record = log._spool.pending()[0]
+        assert _deliver_spool_record(record, connector, ship_to_redis=True)
+        assert _deliver_spool_record(record, connector, ship_to_redis=True)
+        assert redis.llen(record.envelope["partition_key"]) == 1

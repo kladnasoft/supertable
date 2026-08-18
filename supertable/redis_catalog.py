@@ -22,6 +22,10 @@ except ImportError:  # pragma: no cover
 
 from supertable.locking.redis_lock import RedisLocking
 from supertable import redis_keys as RK
+from supertable.utils.spark_security import (
+    spark_storage_credential_keys,
+    validate_spark_storage_config,
+)
 
 
 def _now_ms() -> int:
@@ -69,6 +73,10 @@ class RbacDuplicateIdentityError(RbacDecisionError):
 
 class RbacIntegrityError(RuntimeError):
     """Persisted RBAC state failed a deterministic integrity check."""
+
+
+class DeletionIntentConflictError(RuntimeError):
+    """A durable delete intent fences ordinary creation or mutation."""
 
 
 _RBAC_ATTEMPT_IDENTITIES = {
@@ -665,27 +673,62 @@ class RedisCatalog:
     # ------------- Lua sources -------------
     _LUA_LEAF_CAS_SET = """
 local key = KEYS[1]
+local namespace_lock = KEYS[2]
+local table_names = KEYS[3]
+local namespace_delete = KEYS[4]
+local simple_delete = KEYS[5]
 local new_path = ARGV[1]
 local now_ms = tonumber(ARGV[2])
+local namespace_token = ARGV[3]
+local simple_name = ARGV[4]
 
+local namespace_holder = redis.call('GET', namespace_lock)
+if namespace_holder and namespace_holder ~= namespace_token then
+  return -2
+end
+if redis.call('EXISTS', namespace_delete) == 1 then return -3 end
+if redis.call('EXISTS', simple_delete) == 1 then return -4 end
 local cur = redis.call('GET', key)
 if cur then
   return -1
 end
+local names_type = redis.call('TYPE', table_names)
+if type(names_type) == 'table' then names_type = names_type['ok'] end
+if names_type ~= 'none' and names_type ~= 'set' then
+  return redis.error_reply('table-name index has wrong Redis type')
+end
 local new_val = cjson.encode({version=0, ts=now_ms, path=new_path})
 redis.call('SET', key, new_val)
+redis.call('SADD', table_names, simple_name)
 return 0
 """
 
     _LUA_LEAF_PAYLOAD_CAS_SET = """
 local key = KEYS[1]
+local namespace_lock = KEYS[2]
+local table_names = KEYS[3]
+local namespace_delete = KEYS[4]
+local simple_delete = KEYS[5]
 local payload_json = ARGV[1]
 local new_path = ARGV[2]
 local now_ms = tonumber(ARGV[3])
+local namespace_token = ARGV[4]
+local simple_name = ARGV[5]
 
+local namespace_holder = redis.call('GET', namespace_lock)
+if namespace_holder and namespace_holder ~= namespace_token then
+  return -2
+end
+if redis.call('EXISTS', namespace_delete) == 1 then return -3 end
+if redis.call('EXISTS', simple_delete) == 1 then return -4 end
 local cur = redis.call('GET', key)
 if cur then
   return -1
+end
+local names_type = redis.call('TYPE', table_names)
+if type(names_type) == 'table' then names_type = names_type['ok'] end
+if names_type ~= 'none' and names_type ~= 'set' then
+  return redis.error_reply('table-name index has wrong Redis type')
 end
 
 local payload = {}
@@ -696,12 +739,149 @@ end
 
 local new_val = cjson.encode({version=0, ts=now_ms, path=new_path, payload=payload})
 redis.call('SET', key, new_val)
+redis.call('SADD', table_names, simple_name)
 return 0
+"""
+
+    _LUA_DELETE_SIMPLE_TABLE = """
+local leaf = KEYS[1]
+local leaf_lock = KEYS[2]
+local table_names = KEYS[3]
+local schema = KEYS[4]
+local rowid = KEYS[5]
+local table_config = KEYS[6]
+local mirror_publication = KEYS[7]
+local root = KEYS[8]
+local simple_delete = KEYS[9]
+local simple_delete_index = KEYS[10]
+local namespace_lock = KEYS[11]
+local namespace_delete = KEYS[12]
+local expected_leaf_token = ARGV[1]
+local simple_name = ARGV[2]
+local expected_namespace_token = ARGV[3]
+local expected_intent_id = ARGV[4]
+local now_ms = tonumber(ARGV[5])
+
+if expected_leaf_token == ''
+    or redis.call('GET', leaf_lock) ~= expected_leaf_token then
+  return -1
+end
+if expected_namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= expected_namespace_token then
+  return -4
+end
+if redis.call('EXISTS', namespace_delete) == 1 then return -5 end
+local intent_raw = redis.call('GET', simple_delete)
+if not intent_raw then return -6 end
+local intent_ok, intent = pcall(cjson.decode, intent_raw)
+if not intent_ok or type(intent) ~= 'table' then return -7 end
+if tostring(intent['intent_id'] or '') ~= expected_intent_id
+    or tostring(intent['leaf_lock_token'] or '') ~= expected_leaf_token
+    or tostring(intent['namespace_lock_token'] or '')
+        ~= expected_namespace_token then
+  return -6
+end
+local names_type = redis.call('TYPE', table_names)
+if type(names_type) == 'table' then names_type = names_type['ok'] end
+if names_type ~= 'none' and names_type ~= 'set' then return -2 end
+
+local root_raw = redis.call('GET', root)
+local root_doc = nil
+if root_raw then
+  local ok, decoded = pcall(cjson.decode, root_raw)
+  if not ok or type(decoded) ~= 'table'
+      or type(decoded['version']) ~= 'number' then
+    return -3
+  end
+  root_doc = decoded
+end
+
+local removed = redis.call(
+  'DEL', leaf, schema, rowid, table_config, mirror_publication
+)
+removed = removed + redis.call('SREM', table_names, simple_name)
+if removed > 0 and root_doc then
+  root_doc['version'] = root_doc['version'] + 1
+  root_doc['ts'] = now_ms
+  redis.call('SET', root, cjson.encode(root_doc))
+end
+intent['status'] = 'deleted'
+intent['deleted_at_ms'] = now_ms
+redis.call('SET', simple_delete, cjson.encode(intent))
+redis.call('SADD', simple_delete_index, simple_name)
+return removed + 1
+"""
+
+    _LUA_ROOT_ENSURE = """
+local root_key = KEYS[1]
+local namespace_lock = KEYS[2]
+local namespace_delete = KEYS[3]
+local initial_json = ARGV[1]
+local namespace_token = ARGV[2]
+local namespace_holder = redis.call('GET', namespace_lock)
+if namespace_holder and namespace_holder ~= namespace_token then
+  return -1
+end
+if redis.call('EXISTS', namespace_delete) == 1 then return -2 end
+if redis.call('EXISTS', root_key) == 1 then
+  return 0
+end
+redis.call('SET', root_key, initial_json)
+return 1
+"""
+
+    _LUA_UPDATE_ROOT_FLAGS = """
+local root_key = KEYS[1]
+local namespace_intent = KEYS[2]
+local flags_json = ARGV[1]
+local now_ms = tonumber(ARGV[2])
+if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
+local flags_ok, flags = pcall(cjson.decode, flags_json)
+if not flags_ok or type(flags) ~= 'table' then return -2 end
+local root = {version=0, ts=now_ms}
+local raw = redis.call('GET', root_key)
+if raw then
+  local root_ok, decoded = pcall(cjson.decode, raw)
+  if not root_ok or type(decoded) ~= 'table' then return -3 end
+  root = decoded
+end
+for key, value in pairs(flags) do root[key] = value end
+redis.call('SET', root_key, cjson.encode(root))
+return 1
+"""
+
+    _LUA_SET_MIRRORS = """
+local mirrors_key = KEYS[1]
+local namespace_intent = KEYS[2]
+local document_json = ARGV[1]
+if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
+local ok, document = pcall(cjson.decode, document_json)
+if not ok or type(document) ~= 'table' then return -2 end
+redis.call('SET', mirrors_key, document_json)
+return 1
+"""
+
+    _LUA_UPSERT_LINKED_SHARE = """
+local document_key = KEYS[1]
+local index_key = KEYS[2]
+local namespace_intent = KEYS[3]
+local document_json = ARGV[1]
+local link_id = ARGV[2]
+local add_to_index = ARGV[3]
+if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
+local ok, document = pcall(cjson.decode, document_json)
+if not ok or type(document) ~= 'table' then return -2 end
+redis.call('SET', document_key, document_json)
+if add_to_index == '1' then redis.call('SADD', index_key, link_id) end
+return 1
 """
 
     _LUA_ROOT_BUMP = """
 local key = KEYS[1]
+local namespace_intent = KEYS[2]
 local now_ms = tonumber(ARGV[1])
+
+if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
 
 local cur = redis.call('GET', key)
 local old_version = -1
@@ -717,6 +897,562 @@ redis.call('SET', key, new_val)
 return new_version
 """
 
+    # Durable deletion intents outlive their expiring locks.  Ordinary delete
+    # calls are create-only: an intent owned by a process whose lease expired
+    # is never silently taken over, because that process may still resume an
+    # in-flight object-store prefix delete.  The RECOVER scripts are exposed
+    # only through APIs that require an explicit operator acknowledgement.
+    _LUA_BEGIN_SIMPLE_DELETION = """
+local intent_key = KEYS[1]
+local intent_index = KEYS[2]
+local namespace_intent = KEYS[3]
+local namespace_lock = KEYS[4]
+local leaf_lock = KEYS[5]
+local leaf = KEYS[6]
+local record_json = ARGV[1]
+local intent_id = ARGV[2]
+local namespace_token = ARGV[3]
+local leaf_token = ARGV[4]
+local simple_name = ARGV[5]
+
+if namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= namespace_token then
+  return -1
+end
+if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
+  return -2
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return -3 end
+
+local index_type = redis.call('TYPE', intent_index)
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+if index_type ~= 'none' and index_type ~= 'set' then return -7 end
+
+local current_raw = redis.call('GET', intent_key)
+if current_raw then
+  local current_ok, current = pcall(cjson.decode, current_raw)
+  if not current_ok or type(current) ~= 'table' then return -5 end
+  if tostring(current['intent_id'] or '') == intent_id
+      and tostring(current['namespace_lock_token'] or '') == namespace_token
+      and tostring(current['leaf_lock_token'] or '') == leaf_token then
+    redis.call('SADD', intent_index, simple_name)
+    return 2
+  end
+  return -4
+end
+if redis.call('EXISTS', leaf) ~= 1 then return -6 end
+
+local record_ok, record = pcall(cjson.decode, record_json)
+if not record_ok or type(record) ~= 'table'
+    or tostring(record['intent_id'] or '') ~= intent_id
+    or tostring(record['namespace_lock_token'] or '') ~= namespace_token
+    or tostring(record['leaf_lock_token'] or '') ~= leaf_token
+    or tostring(record['table_name'] or '') ~= simple_name then
+  return -5
+end
+redis.call('SET', intent_key, record_json)
+redis.call('SADD', intent_index, simple_name)
+return 1
+"""
+
+    _LUA_RECOVER_SIMPLE_DELETION = """
+local intent_key = KEYS[1]
+local intent_index = KEYS[2]
+local namespace_intent = KEYS[3]
+local namespace_lock = KEYS[4]
+local leaf_lock = KEYS[5]
+local expected_intent_id = ARGV[1]
+local namespace_token = ARGV[2]
+local leaf_token = ARGV[3]
+local simple_name = ARGV[4]
+local now_ms = tonumber(ARGV[5])
+
+if namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= namespace_token then
+  return -1
+end
+if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
+  return -2
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return -3 end
+local current_raw = redis.call('GET', intent_key)
+if not current_raw then return -4 end
+local current_ok, current = pcall(cjson.decode, current_raw)
+if not current_ok or type(current) ~= 'table' then return -5 end
+if tostring(current['intent_id'] or '') ~= expected_intent_id then return -4 end
+current['namespace_lock_token'] = namespace_token
+current['leaf_lock_token'] = leaf_token
+current['status'] = 'deleting'
+current['recovered_at_ms'] = now_ms
+current['recovery_count'] = tonumber(current['recovery_count'] or 0) + 1
+redis.call('SET', intent_key, cjson.encode(current))
+redis.call('SADD', intent_index, simple_name)
+return 1
+"""
+
+    _LUA_CLEAR_SIMPLE_DELETION = """
+local intent_key = KEYS[1]
+local intent_index = KEYS[2]
+local namespace_intent = KEYS[3]
+local namespace_lock = KEYS[4]
+local leaf_lock = KEYS[5]
+local leaf = KEYS[6]
+local schema = KEYS[7]
+local rowid = KEYS[8]
+local table_config = KEYS[9]
+local mirror_publication = KEYS[10]
+local table_names = KEYS[11]
+local expected_intent_id = ARGV[1]
+local namespace_token = ARGV[2]
+local leaf_token = ARGV[3]
+local simple_name = ARGV[4]
+if namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= namespace_token then return -1 end
+if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then return -2 end
+if redis.call('EXISTS', namespace_intent) == 1 then return -3 end
+local raw = redis.call('GET', intent_key)
+if not raw then return -4 end
+local ok, intent = pcall(cjson.decode, raw)
+if not ok or type(intent) ~= 'table' then return -5 end
+if tostring(intent['intent_id'] or '') ~= expected_intent_id
+    or tostring(intent['namespace_lock_token'] or '') ~= namespace_token
+    or tostring(intent['leaf_lock_token'] or '') ~= leaf_token
+    or tostring(intent['status'] or '') ~= 'deleted' then return -4 end
+if redis.call('EXISTS', leaf, schema, rowid, table_config, mirror_publication) ~= 0
+    or redis.call('SISMEMBER', table_names, simple_name) ~= 0 then return -6 end
+redis.call('DEL', intent_key)
+redis.call('SREM', intent_index, simple_name)
+return 1
+"""
+
+    _LUA_BEGIN_NAMESPACE_DELETION = """
+local intent_key = KEYS[1]
+local namespace_lock = KEYS[2]
+local simple_intent_index = KEYS[3]
+local stage_intent_index = KEYS[4]
+local record_json = ARGV[1]
+local intent_id = ARGV[2]
+local namespace_token = ARGV[3]
+
+if namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= namespace_token then
+  return -1
+end
+local index_type = redis.call('TYPE', simple_intent_index)
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+if index_type ~= 'none' and index_type ~= 'set' then return -5 end
+if redis.call('SCARD', simple_intent_index) ~= 0 then return -3 end
+local stage_index_type = redis.call('TYPE', stage_intent_index)
+if type(stage_index_type) == 'table' then
+  stage_index_type = stage_index_type['ok']
+end
+if stage_index_type ~= 'none' and stage_index_type ~= 'set' then return -6 end
+if redis.call('SCARD', stage_intent_index) ~= 0 then return -7 end
+
+local current_raw = redis.call('GET', intent_key)
+if current_raw then
+  local current_ok, current = pcall(cjson.decode, current_raw)
+  if not current_ok or type(current) ~= 'table' then return -4 end
+  if tostring(current['intent_id'] or '') == intent_id
+      and tostring(current['namespace_lock_token'] or '') == namespace_token then
+    return 2
+  end
+  return -2
+end
+local record_ok, record = pcall(cjson.decode, record_json)
+if not record_ok or type(record) ~= 'table'
+    or tostring(record['intent_id'] or '') ~= intent_id
+    or tostring(record['namespace_lock_token'] or '') ~= namespace_token then
+  return -4
+end
+redis.call('SET', intent_key, record_json)
+return 1
+"""
+
+    _LUA_RECOVER_NAMESPACE_DELETION = """
+local intent_key = KEYS[1]
+local namespace_lock = KEYS[2]
+local simple_intent_index = KEYS[3]
+local stage_intent_index = KEYS[4]
+local expected_intent_id = ARGV[1]
+local namespace_token = ARGV[2]
+local now_ms = tonumber(ARGV[3])
+
+if namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= namespace_token then
+  return -1
+end
+local index_type = redis.call('TYPE', simple_intent_index)
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+if index_type ~= 'none' and index_type ~= 'set' then return -5 end
+if redis.call('SCARD', simple_intent_index) ~= 0 then return -3 end
+local stage_index_type = redis.call('TYPE', stage_intent_index)
+if type(stage_index_type) == 'table' then
+  stage_index_type = stage_index_type['ok']
+end
+if stage_index_type ~= 'none' and stage_index_type ~= 'set' then return -6 end
+if redis.call('SCARD', stage_intent_index) ~= 0 then return -7 end
+local current_raw = redis.call('GET', intent_key)
+if not current_raw then return -2 end
+local current_ok, current = pcall(cjson.decode, current_raw)
+if not current_ok or type(current) ~= 'table' then return -4 end
+if tostring(current['intent_id'] or '') ~= expected_intent_id then return -2 end
+current['namespace_lock_token'] = namespace_token
+current['status'] = 'deleting'
+current['recovered_at_ms'] = now_ms
+current['recovery_count'] = tonumber(current['recovery_count'] or 0) + 1
+redis.call('SET', intent_key, cjson.encode(current))
+return 1
+"""
+
+    _LUA_CLEAR_NAMESPACE_DELETION = """
+local intent_key = KEYS[1]
+local namespace_lock = KEYS[2]
+local root = KEYS[3]
+local simple_intent_index = KEYS[4]
+local stage_intent_index = KEYS[5]
+local expected_intent_id = ARGV[1]
+local namespace_token = ARGV[2]
+if namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= namespace_token then return -1 end
+local raw = redis.call('GET', intent_key)
+if not raw then return -2 end
+local ok, intent = pcall(cjson.decode, raw)
+if not ok or type(intent) ~= 'table' then return -3 end
+if tostring(intent['intent_id'] or '') ~= expected_intent_id
+    or tostring(intent['namespace_lock_token'] or '') ~= namespace_token
+    or tostring(intent['status'] or '') ~= 'deleted' then return -2 end
+if redis.call('EXISTS', root) ~= 0
+    or redis.call('SCARD', simple_intent_index) ~= 0
+    or redis.call('SCARD', stage_intent_index) ~= 0 then return -4 end
+redis.call('DEL', intent_key)
+return 1
+"""
+
+    _LUA_ASSERT_TABLE_MUTATION_ALLOWED = """
+local leaf_lock = KEYS[1]
+local namespace_intent = KEYS[2]
+local simple_intent = KEYS[3]
+local leaf_token = ARGV[1]
+if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
+  return -1
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
+if redis.call('EXISTS', simple_intent) == 1 then return -3 end
+return 1
+"""
+
+    _LUA_ASSERT_INITIALIZATION_ALLOWED = """
+local namespace_lock = KEYS[1]
+local namespace_intent = KEYS[2]
+local simple_intent = KEYS[3]
+local namespace_token = ARGV[1]
+if namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= namespace_token then
+  return -1
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
+if simple_intent ~= namespace_intent
+    and redis.call('EXISTS', simple_intent) == 1 then
+  return -3
+end
+return 1
+"""
+
+    _LUA_SET_TABLE_CONFIG = """
+local config_key = KEYS[1]
+local leaf_key = KEYS[2]
+local leaf_lock = KEYS[3]
+local namespace_intent = KEYS[4]
+local simple_intent = KEYS[5]
+local config_json = ARGV[1]
+local lock_token = ARGV[2]
+if lock_token == '' or redis.call('GET', leaf_lock) ~= lock_token then
+  return -1
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
+if redis.call('EXISTS', simple_intent) == 1 then return -3 end
+if redis.call('EXISTS', leaf_key) ~= 1 then return -4 end
+local ok, config = pcall(cjson.decode, config_json)
+if not ok or type(config) ~= 'table' then return -5 end
+redis.call('SET', config_key, config_json)
+return 1
+"""
+
+    _LUA_DELETE_NAMESPACE_BATCH = """
+local namespace_lock = KEYS[1]
+local namespace_intent = KEYS[2]
+local namespace_token = ARGV[1]
+local expected_intent_id = ARGV[2]
+if namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= namespace_token then
+  return -1
+end
+local intent_raw = redis.call('GET', namespace_intent)
+if not intent_raw then return -2 end
+local intent_ok, intent = pcall(cjson.decode, intent_raw)
+if not intent_ok or type(intent) ~= 'table' then return -3 end
+if tostring(intent['intent_id'] or '') ~= expected_intent_id
+    or tostring(intent['namespace_lock_token'] or '') ~= namespace_token then
+  return -2
+end
+local removed = 0
+for index = 3, #KEYS do
+  removed = removed + redis.call('DEL', KEYS[index])
+end
+return removed
+"""
+
+    _LUA_FINALIZE_NAMESPACE_DELETION = """
+local namespace_lock = KEYS[1]
+local namespace_intent = KEYS[2]
+local simple_intent_index = KEYS[3]
+local stage_intent_index = KEYS[4]
+local namespace_token = ARGV[1]
+local expected_intent_id = ARGV[2]
+local now_ms = tonumber(ARGV[3])
+if namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= namespace_token then
+  return -1
+end
+local intent_raw = redis.call('GET', namespace_intent)
+if not intent_raw then return -2 end
+local intent_ok, intent = pcall(cjson.decode, intent_raw)
+if not intent_ok or type(intent) ~= 'table' then return -3 end
+if tostring(intent['intent_id'] or '') ~= expected_intent_id
+    or tostring(intent['namespace_lock_token'] or '') ~= namespace_token then
+  return -2
+end
+local index_type = redis.call('TYPE', simple_intent_index)
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+if index_type ~= 'none' and index_type ~= 'set' then return -3 end
+if redis.call('SCARD', simple_intent_index) ~= 0 then return -4 end
+local stage_index_type = redis.call('TYPE', stage_intent_index)
+if type(stage_index_type) == 'table' then
+  stage_index_type = stage_index_type['ok']
+end
+if stage_index_type ~= 'none' and stage_index_type ~= 'set' then return -3 end
+if redis.call('SCARD', stage_intent_index) ~= 0 then return -4 end
+redis.call('DEL', simple_intent_index)
+redis.call('DEL', stage_intent_index)
+intent['status'] = 'deleted'
+intent['deleted_at_ms'] = now_ms
+redis.call('SET', namespace_intent, cjson.encode(intent))
+return 1
+"""
+
+    _LUA_BEGIN_STAGE_DELETION = """
+local intent_key = KEYS[1]
+local intent_index = KEYS[2]
+local namespace_intent = KEYS[3]
+local stage_lock = KEYS[4]
+local record_json = ARGV[1]
+local intent_id = ARGV[2]
+local lock_token = ARGV[3]
+local stage_name = ARGV[4]
+if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
+  return -1
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
+local index_type = redis.call('TYPE', intent_index)
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+if index_type ~= 'none' and index_type ~= 'set' then return -5 end
+local current_raw = redis.call('GET', intent_key)
+if current_raw then
+  local ok, current = pcall(cjson.decode, current_raw)
+  if not ok or type(current) ~= 'table' then return -4 end
+  if tostring(current['intent_id'] or '') == intent_id
+      and tostring(current['lock_token'] or '') == lock_token then
+    redis.call('SADD', intent_index, stage_name)
+    return 2
+  end
+  return -3
+end
+local ok, record = pcall(cjson.decode, record_json)
+if not ok or type(record) ~= 'table'
+    or tostring(record['intent_id'] or '') ~= intent_id
+    or tostring(record['lock_token'] or '') ~= lock_token
+    or tostring(record['staging_name'] or '') ~= stage_name then
+  return -4
+end
+redis.call('SET', intent_key, record_json)
+redis.call('SADD', intent_index, stage_name)
+return 1
+"""
+
+    _LUA_RECOVER_STAGE_DELETION = """
+local intent_key = KEYS[1]
+local intent_index = KEYS[2]
+local namespace_intent = KEYS[3]
+local stage_lock = KEYS[4]
+local expected_intent_id = ARGV[1]
+local lock_token = ARGV[2]
+local stage_name = ARGV[3]
+local now_ms = tonumber(ARGV[4])
+if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
+  return -1
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
+local raw = redis.call('GET', intent_key)
+if not raw then return -3 end
+local ok, intent = pcall(cjson.decode, raw)
+if not ok or type(intent) ~= 'table' then return -4 end
+if tostring(intent['intent_id'] or '') ~= expected_intent_id then return -3 end
+intent['lock_token'] = lock_token
+intent['status'] = 'deleting'
+intent['recovered_at_ms'] = now_ms
+intent['recovery_count'] = tonumber(intent['recovery_count'] or 0) + 1
+redis.call('SET', intent_key, cjson.encode(intent))
+redis.call('SADD', intent_index, stage_name)
+return 1
+"""
+
+    _LUA_CLEAR_STAGE_DELETION = """
+local intent_key = KEYS[1]
+local intent_index = KEYS[2]
+local stage_lock = KEYS[3]
+local stage_meta = KEYS[4]
+local stage_index = KEYS[5]
+local expected_intent_id = ARGV[1]
+local lock_token = ARGV[2]
+local stage_name = ARGV[3]
+if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
+  return -1
+end
+local raw = redis.call('GET', intent_key)
+if not raw then return -2 end
+local ok, intent = pcall(cjson.decode, raw)
+if not ok or type(intent) ~= 'table' then return -3 end
+if tostring(intent['intent_id'] or '') ~= expected_intent_id
+    or tostring(intent['lock_token'] or '') ~= lock_token
+    or tostring(intent['status'] or '') ~= 'deleted' then return -2 end
+if redis.call('EXISTS', stage_meta) ~= 0
+    or redis.call('SISMEMBER', stage_index, stage_name) ~= 0 then return -4 end
+redis.call('DEL', intent_key)
+redis.call('SREM', intent_index, stage_name)
+return 1
+"""
+
+    _LUA_ASSERT_STAGE_MUTATION_ALLOWED = """
+local stage_lock = KEYS[1]
+local namespace_intent = KEYS[2]
+local stage_intent = KEYS[3]
+local lock_token = ARGV[1]
+if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
+  return -1
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
+if redis.call('EXISTS', stage_intent) == 1 then return -3 end
+return 1
+"""
+
+    _LUA_UPSERT_STAGING_META = """
+local meta_key = KEYS[1]
+local index_key = KEYS[2]
+local stage_lock = KEYS[3]
+local namespace_intent = KEYS[4]
+local stage_intent = KEYS[5]
+local payload_json = ARGV[1]
+local stage_name = ARGV[2]
+local lock_token = ARGV[3]
+if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
+  return -1
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
+if redis.call('EXISTS', stage_intent) == 1 then return -3 end
+local ok, payload = pcall(cjson.decode, payload_json)
+if not ok or type(payload) ~= 'table' then return -4 end
+redis.call('SET', meta_key, payload_json)
+redis.call('SADD', index_key, stage_name)
+return 1
+"""
+
+    _LUA_UPSERT_PIPE_META = """
+local pipe_key = KEYS[1]
+local pipe_index = KEYS[2]
+local stage_lock = KEYS[3]
+local namespace_intent = KEYS[4]
+local stage_intent = KEYS[5]
+local payload_json = ARGV[1]
+local pipe_name = ARGV[2]
+local lock_token = ARGV[3]
+if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
+  return -1
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return -2 end
+if redis.call('EXISTS', stage_intent) == 1 then return -3 end
+local ok, payload = pcall(cjson.decode, payload_json)
+if not ok or type(payload) ~= 'table' then return -4 end
+redis.call('SET', pipe_key, payload_json)
+redis.call('SADD', pipe_index, pipe_name)
+return 1
+"""
+
+    # Finalize deletion of one staging namespace after its child keys have been
+    # removed and verified.  The stage lock token is checked in the same Redis
+    # command as the metadata/index mutation so an expired or stolen lease can
+    # never make a stage undiscoverable underneath a new writer.
+    #
+    # Return values:
+    #   >= 0  number of metadata/index entries removed (zero is idempotent)
+    #     -1  caller no longer owns the staging lock
+    _LUA_STAGING_DELETE_CHILDREN = """
+local lock_key = KEYS[1]
+local intent_key = KEYS[2]
+local lock_token = ARGV[1]
+local expected_intent_id = ARGV[2]
+
+if redis.call('GET', lock_key) ~= lock_token then
+  return -1
+end
+local raw = redis.call('GET', intent_key)
+if not raw then return -2 end
+local ok, intent = pcall(cjson.decode, raw)
+if not ok or type(intent) ~= 'table' then return -3 end
+if tostring(intent['intent_id'] or '') ~= expected_intent_id
+    or tostring(intent['lock_token'] or '') ~= lock_token then
+  return -2
+end
+
+local removed = 0
+for index = 3, #KEYS do
+  removed = removed + redis.call('DEL', KEYS[index])
+end
+return removed
+"""
+
+    _LUA_STAGING_DELETE_META = """
+local index_key = KEYS[1]
+local meta_key = KEYS[2]
+local lock_key = KEYS[3]
+local intent_key = KEYS[4]
+local intent_index = KEYS[5]
+local staging_name = ARGV[1]
+local lock_token = ARGV[2]
+local expected_intent_id = ARGV[3]
+local now_ms = tonumber(ARGV[4])
+
+if redis.call('GET', lock_key) ~= lock_token then
+  return -1
+end
+local raw = redis.call('GET', intent_key)
+if not raw then return -2 end
+local ok, intent = pcall(cjson.decode, raw)
+if not ok or type(intent) ~= 'table' then return -3 end
+if tostring(intent['intent_id'] or '') ~= expected_intent_id
+    or tostring(intent['lock_token'] or '') ~= lock_token then
+  return -2
+end
+
+local removed_meta = redis.call('DEL', meta_key)
+local removed_index = redis.call('SREM', index_key, staging_name)
+intent['status'] = 'deleted'
+intent['deleted_at_ms'] = now_ms
+redis.call('SET', intent_key, cjson.encode(intent))
+redis.call('SADD', intent_index, staging_name)
+return removed_meta + removed_index + 1
+"""
+
     # Publish the leaf payload and invalidate the supertable root in one
     # fenced transaction.  KEYS deliberately include the table lock: checking
     # it in the same script as the writes closes the expiry/heartbeat race
@@ -730,11 +1466,20 @@ return new_version
     #  -4  invalid new payload JSON
     #  -5  missing/wrong mirror publication intent
     #  -6  mirror publication intent is not prepared
+    #  -7  SuperTable namespace lock is held by a delete
+    #  -8  durable SuperTable deletion intent exists
+    #  -9  durable SimpleTable deletion intent exists
+    # -10  mirror publication is owned by another publisher
     _LUA_SNAPSHOT_COMMIT = """
 local leaf_key = KEYS[1]
 local root_key = KEYS[2]
 local lock_key = KEYS[3]
 local mirror_key = KEYS[4]
+local namespace_lock = KEYS[5]
+local table_names = KEYS[6]
+local namespace_delete = KEYS[7]
+local simple_delete = KEYS[8]
+local schema_key = KEYS[9]
 
 local payload_json = ARGV[1]
 local new_path = ARGV[2]
@@ -744,10 +1489,26 @@ local expected_path = ARGV[5]
 local lock_token = ARGV[6]
 local commit_id = ARGV[7]
 local mirror_required = ARGV[8]
+local simple_name = ARGV[9]
+local schema_json = ARGV[10]
 
 local held_token = redis.call('GET', lock_key)
 if not held_token or held_token ~= lock_token then
   return {-2, 0, 0}
+end
+if redis.call('EXISTS', namespace_lock) == 1 then
+  return {-7, 0, 0}
+end
+if redis.call('EXISTS', namespace_delete) == 1 then
+  return {-8, 0, 0}
+end
+if redis.call('EXISTS', simple_delete) == 1 then
+  return {-9, 0, 0}
+end
+local names_type = redis.call('TYPE', table_names)
+if type(names_type) == 'table' then names_type = names_type['ok'] end
+if names_type ~= 'none' and names_type ~= 'set' then
+  return {-3, 0, 0}
 end
 
 local old_version = -1
@@ -774,6 +1535,10 @@ local okp, payload = pcall(cjson.decode, payload_json)
 if not okp or type(payload) ~= 'table' then
   return {-4, 0, 0}
 end
+local oks, schema = pcall(cjson.decode, schema_json)
+if not oks or type(schema) ~= 'table' then
+  return {-4, 0, 0}
+end
 
 local mirror = nil
 if mirror_required == '1' then
@@ -788,6 +1553,9 @@ if mirror_required == '1' then
   end
   if parsed_mirror['status'] ~= 'prepared' then
     return {-6, 0, 0}
+  end
+  if tostring(parsed_mirror['publication_owner'] or '') ~= lock_token then
+    return {-10, 0, 0}
   end
   mirror = parsed_mirror
 end
@@ -822,6 +1590,7 @@ root['commit_id'] = commit_id
 if mirror ~= nil then
   mirror['status'] = 'core_committed'
   mirror['core_committed'] = true
+  mirror['publisher_quiesced'] = false
   mirror['core_committed_at_ms'] = now_ms
   mirror['updated_at_ms'] = now_ms
   mirror['leaf_version'] = new_leaf_version
@@ -830,6 +1599,8 @@ end
 
 redis.call('SET', leaf_key, cjson.encode(leaf))
 redis.call('SET', root_key, cjson.encode(root))
+redis.call('SET', schema_key, schema_json)
+redis.call('SADD', table_names, simple_name)
 if mirror ~= nil then
   redis.call('SET', mirror_key, cjson.encode(mirror))
 end
@@ -839,6 +1610,8 @@ return {1, new_leaf_version, new_root_version}
     _LUA_MIRROR_PUBLICATION_PREPARE = """
 local state_key = KEYS[1]
 local lock_key = KEYS[2]
+local namespace_delete = KEYS[3]
+local simple_delete = KEYS[4]
 local record_json = ARGV[1]
 local lock_token = ARGV[2]
 local commit_id = ARGV[3]
@@ -847,10 +1620,13 @@ local held_token = redis.call('GET', lock_key)
 if not held_token or held_token ~= lock_token then
   return -2
 end
+if redis.call('EXISTS', namespace_delete) == 1 then return -5 end
+if redis.call('EXISTS', simple_delete) == 1 then return -6 end
 
 local okr, record = pcall(cjson.decode, record_json)
 if not okr or type(record) ~= 'table'
     or tostring(record['commit_id'] or '') ~= commit_id
+    or tostring(record['publication_owner'] or '') ~= lock_token
     or record['status'] ~= 'prepared' then
   return -4
 end
@@ -862,6 +1638,9 @@ if current_raw then
     return -3
   end
   if tostring(current['commit_id'] or '') == commit_id then
+    if tostring(current['publication_owner'] or '') ~= lock_token then
+      return -7
+    end
     if tostring(current['snapshot_path'] or '')
           ~= tostring(record['snapshot_path'] or '') then
       return -4
@@ -889,9 +1668,59 @@ redis.call('SET', state_key, record_json)
 return 1
 """
 
+    # Rebind an unresolved mirror intent only after an operator has established
+    # that the exact previous publisher cannot resume object-store I/O.  A
+    # Redis lease expiring is intentionally insufficient evidence.
+    _LUA_MIRROR_PUBLICATION_CLAIM = """
+local state_key = KEYS[1]
+local lock_key = KEYS[2]
+local namespace_delete = KEYS[3]
+local simple_delete = KEYS[4]
+local commit_id = ARGV[1]
+local expected_previous_owner = ARGV[2]
+local lock_token = ARGV[3]
+local now_ms = tonumber(ARGV[4])
+local previous_owner_stopped = ARGV[5]
+
+if lock_token == '' or redis.call('GET', lock_key) ~= lock_token then
+  return -2
+end
+if redis.call('EXISTS', namespace_delete) == 1 then return -6 end
+if redis.call('EXISTS', simple_delete) == 1 then return -7 end
+local raw = redis.call('GET', state_key)
+if not raw then return -1 end
+local ok, record = pcall(cjson.decode, raw)
+if not ok or type(record) ~= 'table' then return -3 end
+if tostring(record['commit_id'] or '') ~= commit_id then return -1 end
+if tostring(record['status'] or '') == 'complete' then return -4 end
+
+-- A cooperative, exact-owner failure transition runs only after its mirror
+-- call has returned, and durably marks that publisher quiescent.  Any
+-- abandoned prepared/core-committed owner still needs operator confirmation.
+if record['publisher_quiesced'] ~= true
+    and previous_owner_stopped ~= '1' then
+  return -5
+end
+
+local current_owner = tostring(record['publication_owner'] or '')
+if current_owner == lock_token then return 2 end
+if current_owner ~= expected_previous_owner then return -4 end
+
+record['previous_publication_owner'] = current_owner
+record['publication_owner'] = lock_token
+record['owner_claimed_at_ms'] = now_ms
+record['updated_at_ms'] = now_ms
+record['owner_generation'] = tonumber(record['owner_generation'] or 0) + 1
+record['publisher_quiesced'] = false
+redis.call('SET', state_key, cjson.encode(record))
+return 1
+"""
+
     _LUA_MIRROR_PUBLICATION_TRANSITION = """
 local state_key = KEYS[1]
 local lock_key = KEYS[2]
+local namespace_delete = KEYS[3]
+local simple_delete = KEYS[4]
 local commit_id = ARGV[1]
 local target_status = ARGV[2]
 local now_ms = tonumber(ARGV[3])
@@ -904,6 +1733,8 @@ local held_token = redis.call('GET', lock_key)
 if not held_token or held_token ~= lock_token then
   return -2
 end
+if redis.call('EXISTS', namespace_delete) == 1 then return -5 end
+if redis.call('EXISTS', simple_delete) == 1 then return -6 end
 
 local raw = redis.call('GET', state_key)
 if not raw then
@@ -915,6 +1746,9 @@ if not ok or type(record) ~= 'table' then
 end
 if tostring(record['commit_id'] or '') ~= commit_id then
   return -1
+end
+if tostring(record['publication_owner'] or '') ~= lock_token then
+  return -7
 end
 
 local current_status = tostring(record['status'] or '')
@@ -929,6 +1763,7 @@ if target_status == 'complete' then
   record['status'] = 'complete'
   record['completed_at_ms'] = now_ms
   record['updated_at_ms'] = now_ms
+  record['publisher_quiesced'] = true
   record['error'] = cjson.null
 elseif target_status == 'failed' then
   if current_status == 'complete' then
@@ -937,6 +1772,14 @@ elseif target_status == 'failed' then
   record['status'] = 'failed'
   record['updated_at_ms'] = now_ms
   record['failed_at_ms'] = now_ms
+  -- A generic object-store error is ambiguous: a timed-out remote request may
+  -- become visible after the Python call returns.  Only failures known to be
+  -- outside mirror I/O can establish quiescence without operator evidence.
+  record['publisher_quiesced'] = (
+      failure_stage == 'core_commit'
+      or failure_stage == 'recovery:core_not_committed'
+      or failure_stage == 'outbox_complete'
+  )
   record['failure_stage'] = failure_stage
   record['error'] = {type=error_type, message=error_message}
 else
@@ -997,8 +1840,9 @@ return {cur, new_value}
 
     # Mandatory privileged-audit WAL support shared by every RBAC mutation.
     #
-    # The final two KEYS are always the organization-level privileged outbox
-    # STREAM and its sequence/meta HASH; the final ARGV is a validated event
+    # The final three KEYS are always the immutable activation anchor, the
+    # organization-level privileged outbox STREAM, and its sequence/meta HASH;
+    # the final ARGV is a validated event
     # template JSON produced by ``audit.privileged``.  The append happens only
     # after all data-dependent validation and immediately before deterministic
     # commit commands.  Audit configuration is deliberately irrelevant here:
@@ -1008,6 +1852,7 @@ return {cur, new_value}
     # preamble validates the two audit key types, sequence value, event shape,
     # and size before any mutation script performs a write.
     _LUA_RBAC_AUDIT_PREAMBLE = """
+local privileged_audit_activation = KEYS[#KEYS - 2]
 local privileged_audit_outbox = KEYS[#KEYS - 1]
 local privileged_audit_meta = KEYS[#KEYS]
 local privileged_audit_json = ARGV[#ARGV]
@@ -1085,6 +1930,32 @@ local function require_namespace_head_for_state(key, has_state)
     if has_state and redis.call('HGET', key, 'version') == false then
         error('RBAC namespace revision head is missing')
     end
+end
+
+local activation_type = normalized_type(privileged_audit_activation)
+if activation_type ~= 'string' then
+    return redis.error_reply(
+        'privileged audit activation baseline is not anchored'
+    )
+end
+local activation_json = redis.call('GET', privileged_audit_activation)
+local activation_ok, activation = pcall(cjson.decode, activation_json or '')
+if not activation_ok
+    or type(activation) ~= 'table'
+    or activation['version'] ~= 1
+    or activation['kind'] ~= 'supertable_privileged_activation_anchor'
+    or activation['organization'] ~= privileged_audit_org
+    or type(activation['activation_id']) ~= 'string'
+    or activation['activation_id'] == ''
+    or type(activation['state_sha256']) ~= 'string'
+    or string.len(activation['state_sha256']) ~= 64
+    or not string.match(activation['state_sha256'], '^[0-9a-f]+$')
+    or type(activation['artifact_sha256']) ~= 'string'
+    or string.len(activation['artifact_sha256']) ~= 64
+    or not string.match(activation['artifact_sha256'], '^[0-9a-f]+$') then
+    return redis.error_reply(
+        'privileged audit activation baseline anchor is invalid'
+    )
 end
 
 local outbox_type = normalized_type(privileged_audit_outbox)
@@ -1311,8 +2182,8 @@ end
     # Lua invocation as XADD so the evidence cannot claim a revision observed
     # before or after some unrelated race.  Successful mutations are rejected
     # here; they must use one of the transactional mutation scripts above.
-    # KEYS: namespace meta, optional condition keys, privileged outbox,
-    #       privileged audit meta
+    # KEYS: namespace meta, optional condition keys, activation anchor,
+    #       privileged outbox, privileged audit meta
     # ARGV: optional condition JSON, organization, super table, validated
     #       event template JSON
     _LUA_RBAC_APPEND_ATTEMPT = _LUA_RBAC_AUDIT_PREAMBLE + """
@@ -1420,7 +2291,7 @@ if #ARGV == 4 then
     local decoded_ok, conditions = pcall(cjson.decode, condition_json)
     if not decoded_ok or type(conditions) ~= 'table'
         or #conditions == 0 or #conditions > 16
-        or #conditions ~= (#KEYS - 3) then
+        or #conditions ~= (#KEYS - 4) then
         return redis.error_reply('invalid RBAC attempt conditions')
     end
     for condition_index, condition in ipairs(conditions) do
@@ -2441,22 +3312,102 @@ redis.call(
 return 1
 """
 
-    def __init__(self, options: Optional[RedisOptions] = None):
-        self.r = RedisConnector(options).r
+    def __init__(
+        self,
+        options: Optional[RedisOptions] = None,
+        *,
+        redis_client: Optional[redis.Redis] = None,
+    ):
+        if options is not None and redis_client is not None:
+            raise ValueError("options and redis_client are mutually exclusive")
+        self.r = redis_client if redis_client is not None else RedisConnector(options).r
 
         # Register scripts
         self._leaf_cas_set = self.r.register_script(self._LUA_LEAF_CAS_SET)
         self._leaf_payload_cas_set = self.r.register_script(self._LUA_LEAF_PAYLOAD_CAS_SET)
+        self._delete_simple_table = self.r.register_script(
+            self._LUA_DELETE_SIMPLE_TABLE
+        )
+        self._root_ensure = self.r.register_script(self._LUA_ROOT_ENSURE)
         self._root_bump = self.r.register_script(self._LUA_ROOT_BUMP)
+        self._update_root_flags = self.r.register_script(
+            self._LUA_UPDATE_ROOT_FLAGS
+        )
+        self._set_mirrors_fenced = self.r.register_script(
+            self._LUA_SET_MIRRORS
+        )
+        self._upsert_linked_share_fenced = self.r.register_script(
+            self._LUA_UPSERT_LINKED_SHARE
+        )
+        self._begin_simple_deletion = self.r.register_script(
+            self._LUA_BEGIN_SIMPLE_DELETION
+        )
+        self._recover_simple_deletion = self.r.register_script(
+            self._LUA_RECOVER_SIMPLE_DELETION
+        )
+        self._clear_simple_deletion = self.r.register_script(
+            self._LUA_CLEAR_SIMPLE_DELETION
+        )
+        self._begin_namespace_deletion = self.r.register_script(
+            self._LUA_BEGIN_NAMESPACE_DELETION
+        )
+        self._recover_namespace_deletion = self.r.register_script(
+            self._LUA_RECOVER_NAMESPACE_DELETION
+        )
+        self._clear_namespace_deletion = self.r.register_script(
+            self._LUA_CLEAR_NAMESPACE_DELETION
+        )
+        self._assert_table_mutation_allowed = self.r.register_script(
+            self._LUA_ASSERT_TABLE_MUTATION_ALLOWED
+        )
+        self._assert_initialization_allowed = self.r.register_script(
+            self._LUA_ASSERT_INITIALIZATION_ALLOWED
+        )
+        self._set_table_config_fenced = self.r.register_script(
+            self._LUA_SET_TABLE_CONFIG
+        )
+        self._delete_namespace_batch = self.r.register_script(
+            self._LUA_DELETE_NAMESPACE_BATCH
+        )
+        self._finalize_namespace_deletion = self.r.register_script(
+            self._LUA_FINALIZE_NAMESPACE_DELETION
+        )
         self._snapshot_commit = self.r.register_script(self._LUA_SNAPSHOT_COMMIT)
         self._mirror_publication_prepare = self.r.register_script(
             self._LUA_MIRROR_PUBLICATION_PREPARE
+        )
+        self._mirror_publication_claim = self.r.register_script(
+            self._LUA_MIRROR_PUBLICATION_CLAIM
         )
         self._mirror_publication_transition = self.r.register_script(
             self._LUA_MIRROR_PUBLICATION_TRANSITION
         )
         self._reserve_rowids_at_least = self.r.register_script(
             self._LUA_RESERVE_ROWIDS_AT_LEAST
+        )
+        self._staging_delete_meta = self.r.register_script(
+            self._LUA_STAGING_DELETE_META
+        )
+        self._staging_delete_children = self.r.register_script(
+            self._LUA_STAGING_DELETE_CHILDREN
+        )
+        self._begin_stage_deletion = self.r.register_script(
+            self._LUA_BEGIN_STAGE_DELETION
+        )
+        self._recover_stage_deletion = self.r.register_script(
+            self._LUA_RECOVER_STAGE_DELETION
+        )
+        self._clear_stage_deletion = self.r.register_script(
+            self._LUA_CLEAR_STAGE_DELETION
+        )
+        self._assert_stage_mutation_allowed = self.r.register_script(
+            self._LUA_ASSERT_STAGE_MUTATION_ALLOWED
+        )
+        self._upsert_staging_meta = self.r.register_script(
+            self._LUA_UPSERT_STAGING_META
+        )
+        self._upsert_pipe_meta = self.r.register_script(
+            self._LUA_UPSERT_PIPE_META
         )
 
         # Distributed locking (delegates to supertable.locking.redis_lock)
@@ -2505,6 +3456,468 @@ return 1
         """Compare-and-delete via Lua."""
         return self._locker.release(RK.lock_leaf(org, sup, simple), token)
 
+    def acquire_namespace_lock(
+            self, org: str, sup: str, ttl_s: int = 30,
+            timeout_s: int = 30,
+    ) -> Optional[str]:
+        """Fence creation/publication while deleting a SuperTable namespace."""
+        return self._locker.acquire(
+            RK.lock_namespace(org, sup), ttl_s=ttl_s, timeout_s=timeout_s,
+        )
+
+    def release_namespace_lock(
+            self, org: str, sup: str, token: str,
+    ) -> bool:
+        return self._locker.release(RK.lock_namespace(org, sup), token)
+
+    @staticmethod
+    def _decode_deletion_intent(
+            raw: Any, *, scope: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
+            raise RuntimeError(f"Corrupt deletion intent for {scope}") from exc
+        if not isinstance(value, dict) or not value.get("intent_id"):
+            raise RuntimeError(f"Corrupt deletion intent for {scope}")
+        return value
+
+    def get_simple_deletion_intent(
+            self, org: str, sup: str, simple: str,
+    ) -> Optional[Dict[str, Any]]:
+        raw = self.r.get(RK.meta_simple_deletion_intent(org, sup, simple))
+        return self._decode_deletion_intent(
+            raw, scope=f"{org}/{sup}/{simple}",
+        )
+
+    def get_namespace_deletion_intent(
+            self, org: str, sup: str,
+    ) -> Optional[Dict[str, Any]]:
+        raw = self.r.get(RK.meta_namespace_deletion_intent(org, sup))
+        return self._decode_deletion_intent(raw, scope=f"{org}/{sup}")
+
+    def check_deletion_intent_absent(
+            self,
+            org: str,
+            sup: str,
+            *,
+            simple: Optional[str] = None,
+            stage: Optional[str] = None,
+    ) -> None:
+        """Reject an already-opened object while a durable tombstone exists.
+
+        This is an early, read-only guard for constructor fast paths. Mutation
+        publication still repeats the check atomically with its lock token;
+        this guard prevents stale metadata recreated behind a terminal
+        tombstone from making a deleted table appear openable.
+        """
+        if simple is not None and stage is not None:
+            raise ValueError("Only one child deletion scope may be checked")
+        keys = [RK.meta_namespace_deletion_intent(org, sup)]
+        if simple is not None:
+            keys.append(RK.meta_simple_deletion_intent(org, sup, simple))
+        if stage is not None:
+            keys.append(RK.meta_stage_deletion_intent(org, sup, stage))
+        values = self.r.mget(keys)
+        if any(value is not None for value in values):
+            child = simple if simple is not None else stage
+            scope = f"{org}/{sup}" + (f"/{child}" if child else "")
+            raise DeletionIntentConflictError(
+                f"Durable deletion intent blocks opening {scope}"
+            )
+
+    def check_table_mutation_allowed(
+            self, org: str, sup: str, simple: str, *, lock_token: str,
+    ) -> None:
+        """Fail before storage I/O when a durable deletion intent exists.
+
+        The check shares one Lua boundary with ownership validation.  Since a
+        SimpleTable deleter needs this same leaf lock, absence of its intent is
+        stable while the caller retains the lease.  The commit and mirror Lua
+        scripts repeat the durable checks as the authoritative final fence.
+        """
+        result = int(self._assert_table_mutation_allowed(
+            keys=[
+                RK.lock_leaf(org, sup, simple),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.meta_simple_deletion_intent(org, sup, simple),
+            ],
+            args=[lock_token or ""],
+        ) or 0)
+        if result == -1:
+            raise LockLostError(
+                f"Lost fencing lock before mutating {org}/{sup}/{simple}"
+            )
+        if result in (-2, -3):
+            raise DeletionIntentConflictError(
+                f"Table has a durable deletion intent: {org}/{sup}/{simple}"
+            )
+        if result != 1:
+            raise RuntimeError(f"Invalid mutation fence result: {result}")
+
+    def check_initialization_allowed(
+            self,
+            org: str,
+            sup: str,
+            *,
+            namespace_token: str,
+            simple: Optional[str] = None,
+    ) -> None:
+        """Check durable deletion state before the first storage-side init."""
+        namespace_intent = RK.meta_namespace_deletion_intent(org, sup)
+        simple_intent = (
+            RK.meta_simple_deletion_intent(org, sup, simple)
+            if simple is not None else namespace_intent
+        )
+        result = int(self._assert_initialization_allowed(
+            keys=[
+                RK.lock_namespace(org, sup),
+                namespace_intent,
+                simple_intent,
+            ],
+            args=[namespace_token or ""],
+        ) or 0)
+        if result == -1:
+            raise LockLostError("Lost namespace initialization lock")
+        if result in (-2, -3):
+            scope = f"{org}/{sup}" + (f"/{simple}" if simple else "")
+            raise DeletionIntentConflictError(
+                f"Durable deletion intent blocks initialization of {scope}"
+            )
+        if result != 1:
+            raise RuntimeError(f"Invalid initialization fence result: {result}")
+
+    def begin_simple_deletion(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            *,
+            namespace_token: str,
+            lock_token: str,
+            intent_id: Optional[str] = None,
+            now_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Create a no-TTL SimpleTable delete intent under both live locks."""
+        iid = intent_id or secrets.token_hex(16)
+        timestamp = int(now_ms or _now_ms())
+        record = {
+            "schema_version": 1,
+            "kind": "simple_table",
+            "organization": org,
+            "super_name": sup,
+            "table_name": simple,
+            "intent_id": iid,
+            "status": "deleting",
+            "namespace_lock_token": namespace_token,
+            "leaf_lock_token": lock_token,
+            "created_at_ms": timestamp,
+            "recovery_count": 0,
+        }
+        result = int(self._begin_simple_deletion(
+            keys=[
+                RK.meta_simple_deletion_intent(org, sup, simple),
+                RK.meta_simple_deletion_intent_index(org, sup),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.lock_namespace(org, sup),
+                RK.lock_leaf(org, sup, simple),
+                RK.meta_leaf(org, sup, simple),
+            ],
+            args=[
+                json.dumps(record, sort_keys=True, separators=(",", ":")),
+                iid,
+                namespace_token or "",
+                lock_token or "",
+                simple,
+            ],
+        ) or 0)
+        if result == -1:
+            raise LockLostError("Lost namespace lock before deletion intent")
+        if result == -2:
+            raise LockLostError("Lost table lock before deletion intent")
+        if result == -3:
+            raise DeletionIntentConflictError(
+                f"SuperTable deletion is already pending: {org}/{sup}"
+            )
+        if result == -4:
+            raise DeletionIntentConflictError(
+                f"A prior deletion intent still fences {org}/{sup}/{simple}; "
+                "ordinary retry is unsafe"
+            )
+        if result == -5:
+            raise RuntimeError(f"Corrupt deletion intent for {org}/{sup}/{simple}")
+        if result == -6:
+            raise RuntimeError(f"Cannot delete missing table {org}/{sup}/{simple}")
+        if result == -7:
+            raise RuntimeError("simple deletion-intent index has wrong Redis type")
+        if result not in (1, 2):
+            raise RuntimeError(f"Invalid begin_simple_deletion result: {result}")
+        return self.get_simple_deletion_intent(org, sup, simple) or record
+
+    def recover_simple_deletion(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            *,
+            expected_intent_id: str,
+            namespace_token: str,
+            lock_token: str,
+            confirm_previous_owner_stopped: bool,
+    ) -> Dict[str, Any]:
+        """Explicitly rebind an abandoned intent after operator liveness proof.
+
+        A boolean cannot itself prove process death.  Its deliberately verbose
+        name makes the required operational precondition part of the API: the
+        caller must first ensure the former worker cannot resume its old
+        fixed-prefix object-store delete.
+        """
+        if confirm_previous_owner_stopped is not True:
+            raise PermissionError(
+                "Deletion recovery requires confirmation that the previous "
+                "owner has stopped"
+            )
+        result = int(self._recover_simple_deletion(
+            keys=[
+                RK.meta_simple_deletion_intent(org, sup, simple),
+                RK.meta_simple_deletion_intent_index(org, sup),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.lock_namespace(org, sup),
+                RK.lock_leaf(org, sup, simple),
+            ],
+            args=[
+                expected_intent_id or "",
+                namespace_token or "",
+                lock_token or "",
+                simple,
+                _now_ms(),
+            ],
+        ) or 0)
+        if result in (-1, -2):
+            raise LockLostError("Lost deletion-recovery lock")
+        if result == -3:
+            raise DeletionIntentConflictError(
+                f"SuperTable deletion is already pending: {org}/{sup}"
+            )
+        if result == -4:
+            raise DeletionIntentConflictError(
+                "Deletion intent changed or no longer exists"
+            )
+        if result == -5:
+            raise RuntimeError(f"Corrupt deletion intent for {org}/{sup}/{simple}")
+        if result != 1:
+            raise RuntimeError(f"Invalid recover_simple_deletion result: {result}")
+        record = self.get_simple_deletion_intent(org, sup, simple)
+        if record is None:
+            raise RuntimeError("Recovered deletion intent disappeared")
+        return record
+
+    def clear_simple_deletion_tombstone(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            *,
+            expected_intent_id: str,
+            namespace_token: str,
+            lock_token: str,
+            confirm_previous_owner_stopped: bool,
+    ) -> None:
+        if confirm_previous_owner_stopped is not True:
+            raise PermissionError(
+                "Tombstone clearing requires confirmation that every previous "
+                "mutation owner has stopped"
+            )
+        result = int(self._clear_simple_deletion(
+            keys=[
+                RK.meta_simple_deletion_intent(org, sup, simple),
+                RK.meta_simple_deletion_intent_index(org, sup),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.lock_namespace(org, sup),
+                RK.lock_leaf(org, sup, simple),
+                RK.meta_leaf(org, sup, simple),
+                RK.schema(org, sup, simple),
+                RK.meta_rowid_seq(org, sup, simple),
+                RK.meta_table_config(org, sup, simple),
+                RK.meta_mirror_publication(org, sup, simple),
+                RK.meta_table_names(org, sup),
+            ],
+            args=[
+                expected_intent_id or "",
+                namespace_token or "",
+                lock_token or "",
+                simple,
+            ],
+        ) or 0)
+        if result in (-1, -2):
+            raise LockLostError("Lost lock before clearing table tombstone")
+        if result == -3:
+            raise DeletionIntentConflictError("Parent deletion is pending")
+        if result == -4:
+            raise DeletionIntentConflictError(
+                "Table deletion tombstone changed or is not terminal"
+            )
+        if result == -5:
+            raise RuntimeError(f"Corrupt deletion intent for {org}/{sup}/{simple}")
+        if result == -6:
+            raise RuntimeError("Table catalog state remains after deletion")
+        if result != 1:
+            raise RuntimeError(f"Invalid table tombstone clear result: {result}")
+
+    def begin_namespace_deletion(
+            self,
+            org: str,
+            sup: str,
+            *,
+            namespace_token: str,
+            intent_id: Optional[str] = None,
+            now_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Create a no-TTL whole-SuperTable deletion intent."""
+        iid = intent_id or secrets.token_hex(16)
+        timestamp = int(now_ms or _now_ms())
+        record = {
+            "schema_version": 1,
+            "kind": "super_table",
+            "organization": org,
+            "super_name": sup,
+            "intent_id": iid,
+            "status": "deleting",
+            "namespace_lock_token": namespace_token,
+            "created_at_ms": timestamp,
+            "recovery_count": 0,
+        }
+        result = int(self._begin_namespace_deletion(
+            keys=[
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.lock_namespace(org, sup),
+                RK.meta_simple_deletion_intent_index(org, sup),
+                RK.meta_stage_deletion_intent_index(org, sup),
+            ],
+            args=[
+                json.dumps(record, sort_keys=True, separators=(",", ":")),
+                iid,
+                namespace_token or "",
+            ],
+        ) or 0)
+        if result == -1:
+            raise LockLostError("Lost namespace lock before deletion intent")
+        if result == -2:
+            raise DeletionIntentConflictError(
+                f"A prior deletion intent still fences {org}/{sup}; "
+                "ordinary retry is unsafe"
+            )
+        if result == -3:
+            raise DeletionIntentConflictError(
+                "A SimpleTable deletion must be recovered before deleting its parent"
+            )
+        if result == -4:
+            raise RuntimeError(f"Corrupt deletion intent for {org}/{sup}")
+        if result == -5:
+            raise RuntimeError("simple deletion-intent index has wrong Redis type")
+        if result == -6:
+            raise RuntimeError("stage deletion-intent index has wrong Redis type")
+        if result == -7:
+            raise DeletionIntentConflictError(
+                "A staging deletion must be recovered before deleting its parent"
+            )
+        if result not in (1, 2):
+            raise RuntimeError(f"Invalid begin_namespace_deletion result: {result}")
+        return self.get_namespace_deletion_intent(org, sup) or record
+
+    def recover_namespace_deletion(
+            self,
+            org: str,
+            sup: str,
+            *,
+            expected_intent_id: str,
+            namespace_token: str,
+            confirm_previous_owner_stopped: bool,
+    ) -> Dict[str, Any]:
+        if confirm_previous_owner_stopped is not True:
+            raise PermissionError(
+                "Deletion recovery requires confirmation that the previous "
+                "owner has stopped"
+            )
+        result = int(self._recover_namespace_deletion(
+            keys=[
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.lock_namespace(org, sup),
+                RK.meta_simple_deletion_intent_index(org, sup),
+                RK.meta_stage_deletion_intent_index(org, sup),
+            ],
+            args=[expected_intent_id or "", namespace_token or "", _now_ms()],
+        ) or 0)
+        if result == -1:
+            raise LockLostError("Lost namespace deletion-recovery lock")
+        if result == -2:
+            raise DeletionIntentConflictError(
+                "Deletion intent changed or no longer exists"
+            )
+        if result == -3:
+            raise DeletionIntentConflictError(
+                "A SimpleTable deletion must be recovered before its parent"
+            )
+        if result == -4:
+            raise RuntimeError(f"Corrupt deletion intent for {org}/{sup}")
+        if result == -5:
+            raise RuntimeError("simple deletion-intent index has wrong Redis type")
+        if result == -6:
+            raise RuntimeError("stage deletion-intent index has wrong Redis type")
+        if result == -7:
+            raise DeletionIntentConflictError(
+                "A staging deletion must be recovered before its parent"
+            )
+        if result != 1:
+            raise RuntimeError(
+                f"Invalid recover_namespace_deletion result: {result}"
+            )
+        record = self.get_namespace_deletion_intent(org, sup)
+        if record is None:
+            raise RuntimeError("Recovered namespace deletion intent disappeared")
+        return record
+
+    def clear_namespace_deletion_tombstone(
+            self,
+            org: str,
+            sup: str,
+            *,
+            expected_intent_id: str,
+            namespace_token: str,
+            confirm_previous_owner_stopped: bool,
+    ) -> None:
+        if confirm_previous_owner_stopped is not True:
+            raise PermissionError(
+                "Tombstone clearing requires confirmation that every previous "
+                "mutation owner has stopped"
+            )
+        result = int(self._clear_namespace_deletion(
+            keys=[
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.lock_namespace(org, sup),
+                RK.meta_root(org, sup),
+                RK.meta_simple_deletion_intent_index(org, sup),
+                RK.meta_stage_deletion_intent_index(org, sup),
+            ],
+            args=[expected_intent_id or "", namespace_token or ""],
+        ) or 0)
+        if result == -1:
+            raise LockLostError("Lost lock before clearing namespace tombstone")
+        if result == -2:
+            raise DeletionIntentConflictError(
+                "Namespace deletion tombstone changed or is not terminal"
+            )
+        if result == -3:
+            raise RuntimeError(f"Corrupt deletion intent for {org}/{sup}")
+        if result == -4:
+            raise RuntimeError("Namespace catalog state remains after deletion")
+        if result != 1:
+            raise RuntimeError(
+                f"Invalid namespace tombstone clear result: {result}"
+            )
+
 
     def acquire_stage_lock(
             self,
@@ -2519,18 +3932,216 @@ return 1
         """
         return self._locker.acquire(RK.lock_stage(org, sup, stage_name), ttl_s=ttl_s, timeout_s=timeout_s)
 
+    def release_stage_lock(
+            self, org: str, sup: str, stage_name: str, token: str,
+    ) -> bool:
+        """Release a stage lock through the same auto-renewing lock owner."""
+        return self._locker.release(RK.lock_stage(org, sup, stage_name), token)
+
+    def get_stage_deletion_intent(
+            self, org: str, sup: str, stage_name: str,
+    ) -> Optional[Dict[str, Any]]:
+        raw = self.r.get(RK.meta_stage_deletion_intent(org, sup, stage_name))
+        return self._decode_deletion_intent(
+            raw, scope=f"{org}/{sup}/staging/{stage_name}",
+        )
+
+    def check_stage_mutation_allowed(
+            self, org: str, sup: str, stage_name: str, *, lock_token: str,
+    ) -> None:
+        result = int(self._assert_stage_mutation_allowed(
+            keys=[
+                RK.lock_stage(org, sup, stage_name),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.meta_stage_deletion_intent(org, sup, stage_name),
+            ],
+            args=[lock_token or ""],
+        ) or 0)
+        if result == -1:
+            raise LockLostError("Lost staging mutation lock")
+        if result in (-2, -3):
+            raise DeletionIntentConflictError(
+                f"Durable deletion intent fences staging {org}/{sup}/{stage_name}"
+            )
+        if result != 1:
+            raise RuntimeError(f"Invalid staging mutation fence result: {result}")
+
+    def begin_stage_deletion(
+            self,
+            org: str,
+            sup: str,
+            stage_name: str,
+            *,
+            lock_token: str,
+            intent_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        iid = intent_id or secrets.token_hex(16)
+        record = {
+            "schema_version": 1,
+            "kind": "staging",
+            "organization": org,
+            "super_name": sup,
+            "staging_name": stage_name,
+            "intent_id": iid,
+            "status": "deleting",
+            "lock_token": lock_token,
+            "created_at_ms": _now_ms(),
+            "recovery_count": 0,
+        }
+        result = int(self._begin_stage_deletion(
+            keys=[
+                RK.meta_stage_deletion_intent(org, sup, stage_name),
+                RK.meta_stage_deletion_intent_index(org, sup),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.lock_stage(org, sup, stage_name),
+            ],
+            args=[
+                json.dumps(record, sort_keys=True, separators=(",", ":")),
+                iid,
+                lock_token or "",
+                stage_name,
+            ],
+        ) or 0)
+        if result == -1:
+            raise LockLostError("Lost staging lock before deletion intent")
+        if result == -2:
+            raise DeletionIntentConflictError(
+                f"SuperTable deletion is already pending: {org}/{sup}"
+            )
+        if result == -3:
+            raise DeletionIntentConflictError(
+                f"A prior deletion intent still fences staging "
+                f"{org}/{sup}/{stage_name}; ordinary retry is unsafe"
+            )
+        if result == -4:
+            raise RuntimeError(
+                f"Corrupt deletion intent for staging {org}/{sup}/{stage_name}"
+            )
+        if result == -5:
+            raise RuntimeError("stage deletion-intent index has wrong Redis type")
+        if result not in (1, 2):
+            raise RuntimeError(f"Invalid begin_stage_deletion result: {result}")
+        return self.get_stage_deletion_intent(org, sup, stage_name) or record
+
+    def recover_stage_deletion(
+            self,
+            org: str,
+            sup: str,
+            stage_name: str,
+            *,
+            expected_intent_id: str,
+            lock_token: str,
+            confirm_previous_owner_stopped: bool,
+    ) -> Dict[str, Any]:
+        if confirm_previous_owner_stopped is not True:
+            raise PermissionError(
+                "Deletion recovery requires confirmation that the previous "
+                "owner has stopped"
+            )
+        result = int(self._recover_stage_deletion(
+            keys=[
+                RK.meta_stage_deletion_intent(org, sup, stage_name),
+                RK.meta_stage_deletion_intent_index(org, sup),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.lock_stage(org, sup, stage_name),
+            ],
+            args=[
+                expected_intent_id or "",
+                lock_token or "",
+                stage_name,
+                _now_ms(),
+            ],
+        ) or 0)
+        if result == -1:
+            raise LockLostError("Lost staging deletion-recovery lock")
+        if result == -2:
+            raise DeletionIntentConflictError(
+                f"SuperTable deletion is already pending: {org}/{sup}"
+            )
+        if result == -3:
+            raise DeletionIntentConflictError(
+                "Staging deletion intent changed or no longer exists"
+            )
+        if result == -4:
+            raise RuntimeError(
+                f"Corrupt deletion intent for staging {org}/{sup}/{stage_name}"
+            )
+        if result != 1:
+            raise RuntimeError(f"Invalid recover_stage_deletion result: {result}")
+        record = self.get_stage_deletion_intent(org, sup, stage_name)
+        if record is None:
+            raise RuntimeError("Recovered staging deletion intent disappeared")
+        return record
+
+    def clear_stage_deletion_tombstone(
+            self,
+            org: str,
+            sup: str,
+            stage_name: str,
+            *,
+            expected_intent_id: str,
+            lock_token: str,
+            confirm_previous_owner_stopped: bool,
+    ) -> None:
+        if confirm_previous_owner_stopped is not True:
+            raise PermissionError(
+                "Tombstone clearing requires confirmation that every previous "
+                "mutation owner has stopped"
+            )
+        result = int(self._clear_stage_deletion(
+            keys=[
+                RK.meta_stage_deletion_intent(org, sup, stage_name),
+                RK.meta_stage_deletion_intent_index(org, sup),
+                RK.lock_stage(org, sup, stage_name),
+                RK.staging_doc(org, sup, stage_name),
+                RK.staging_index(org, sup),
+            ],
+            args=[expected_intent_id or "", lock_token or "", stage_name],
+        ) or 0)
+        if result == -1:
+            raise LockLostError("Lost lock before clearing staging tombstone")
+        if result == -2:
+            raise DeletionIntentConflictError(
+                "Staging deletion tombstone changed or is not terminal"
+            )
+        if result == -3:
+            raise RuntimeError(
+                f"Corrupt deletion intent for staging {org}/{sup}/{stage_name}"
+            )
+        if result == -4:
+            raise RuntimeError("Staging catalog state remains after deletion")
+        if result != 1:
+            raise RuntimeError(f"Invalid staging tombstone clear result: {result}")
 
 
 
 
-    def ensure_root(self, org: str, sup: str) -> None:
+
+    def ensure_root(
+            self, org: str, sup: str, *, namespace_token: str = "",
+    ) -> None:
         """Initialize meta:root if missing with version=0."""
         key = RK.meta_root(org, sup)
         try:
             init = {"version": 0, "ts": _now_ms()}
-            # One atomic initialize-only write. A concurrent creator or a
-            # stale absence observation can never overwrite root version/flags.
-            self.r.set(key, json.dumps(init), nx=True)
+            # The namespace fence and initialize-only write share one Redis
+            # transaction, so recreation cannot slip into a verified delete.
+            result = int(self._root_ensure(
+                keys=[
+                    key,
+                    RK.lock_namespace(org, sup),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                ],
+                args=[json.dumps(init), namespace_token or ""],
+            ) or 0)
+            if result == -1:
+                raise RuntimeError(
+                    f"SuperTable namespace is fenced for deletion: {org}/{sup}"
+                )
+            if result == -2:
+                raise DeletionIntentConflictError(
+                    f"SuperTable has a durable deletion intent: {org}/{sup}"
+                )
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] ensure_root failed: {e}")
             raise
@@ -2583,14 +4194,24 @@ return 1
         """
         key = RK.meta_root(org, sup)
         try:
-            raw = self.r.get(key)
-            doc = json.loads(raw) if raw else {"version": 0, "ts": _now_ms()}
-            doc.update(flags)
-            self.r.set(key, json.dumps(doc))
+            result = int(self._update_root_flags(
+                keys=[key, RK.meta_namespace_deletion_intent(org, sup)],
+                args=[json.dumps(dict(flags or {})), _now_ms()],
+            ) or 0)
+            if result == -1:
+                raise DeletionIntentConflictError(
+                    f"Durable deletion intent fences {org}/{sup}"
+                )
+            if result == -2:
+                raise ValueError("Root flags are not valid JSON")
+            if result == -3:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+            if result != 1:
+                raise RuntimeError(f"Invalid root flag update result: {result}")
             return True
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] update_root_flags error: {e}")
-            return False
+            raise
 
     def find_readonly_clones(self, org: str, source_sup: str) -> List[str]:
         """Return names of supertables that are read-only clones of *source_sup*."""
@@ -2625,10 +4246,35 @@ return 1
 
     def bump_root(self, org: str, sup: str, now_ms: Optional[int] = None) -> int:
         try:
-            return int(self._root_bump(keys=[RK.meta_root(org, sup)], args=[int(now_ms or _now_ms())]) or 0)
+            result = int(self._root_bump(
+                keys=[
+                    RK.meta_root(org, sup),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                ],
+                args=[int(now_ms or _now_ms())],
+            ) or 0)
+            if result == -1:
+                raise DeletionIntentConflictError(
+                    f"Durable deletion intent fences {org}/{sup}"
+                )
+            return result
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] root_bump error: {e}")
             raise
+
+    @staticmethod
+    def _snapshot_schema_document(payload: Mapping[str, Any]) -> Dict[str, Any]:
+        """Return the legacy schema HASH-shaped JSON stored beside the leaf."""
+        schema_raw = (payload or {}).get("schema", {})
+        if isinstance(schema_raw, dict):
+            return dict(schema_raw)
+        if isinstance(schema_raw, list):
+            merged: Dict[str, Any] = {}
+            for item in schema_raw:
+                if isinstance(item, dict):
+                    merged.update(item)
+            return merged
+        return {}
 
     def commit_snapshot(
             self,
@@ -2678,6 +4324,11 @@ return 1
                     RK.meta_root(org, sup),
                     RK.lock_leaf(org, sup, simple),
                     RK.meta_mirror_publication(org, sup, simple),
+                    RK.lock_namespace(org, sup),
+                    RK.meta_table_names(org, sup),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_simple_deletion_intent(org, sup, simple),
+                    RK.schema(org, sup, simple),
                 ],
                 args=[
                     payload_json,
@@ -2688,6 +4339,8 @@ return 1
                     lock_token,
                     cid,
                     "1" if mirror_publication else "0",
+                    simple,
+                    json.dumps(self._snapshot_schema_document(payload)),
                 ],
             )
         except redis.RedisError as exc:
@@ -2724,6 +4377,19 @@ return 1
                 f"Mirror publication intent is not prepared for "
                 f"{org}/{sup}/{simple} commit {cid}"
             )
+        if code == -7:
+            raise RuntimeError(
+                f"SuperTable namespace is fenced for deletion: {org}/{sup}"
+            )
+        if code in (-8, -9):
+            raise DeletionIntentConflictError(
+                f"Table has a durable deletion intent: {org}/{sup}/{simple}"
+            )
+        if code == -10:
+            raise SnapshotCommitConflictError(
+                f"Mirror publication is owned by another publisher for "
+                f"{org}/{sup}/{simple} commit {cid}"
+            )
         raise RuntimeError(f"Unknown snapshot commit status {code}")
 
     def prepare_mirror_publication(
@@ -2757,7 +4423,7 @@ return 1
             raise ValueError("mirror publication requires at least one format")
         timestamp = int(now_ms or _now_ms())
         record: Dict[str, Any] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "prepared",
             "organization": org,
             "super_name": sup,
@@ -2766,6 +4432,9 @@ return 1
             "snapshot_path": snapshot_path,
             "mirrors": normalized,
             "core_committed": False,
+            "publication_owner": lock_token,
+            "owner_generation": 0,
+            "publisher_quiesced": False,
             "created_at_ms": timestamp,
             "updated_at_ms": timestamp,
             "error": None,
@@ -2774,6 +4443,8 @@ return 1
             keys=[
                 RK.meta_mirror_publication(org, sup, simple),
                 RK.lock_leaf(org, sup, simple),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.meta_simple_deletion_intent(org, sup, simple),
             ],
             args=[json.dumps(record), lock_token, commit_id],
         )
@@ -2792,6 +4463,15 @@ return 1
         if code == -3:
             raise RuntimeError(
                 f"Corrupt mirror publication state for {org}/{sup}/{simple}"
+            )
+        if code in (-5, -6):
+            raise DeletionIntentConflictError(
+                f"Table has a durable deletion intent: {org}/{sup}/{simple}"
+            )
+        if code == -7:
+            raise SnapshotCommitConflictError(
+                f"Mirror publication is owned by another publisher for "
+                f"{org}/{sup}/{simple} commit {commit_id}"
             )
         raise RuntimeError(f"Invalid mirror publication prepare status {code}")
 
@@ -2814,6 +4494,88 @@ return 1
             )
         return record
 
+    def claim_mirror_publication(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            *,
+            commit_id: str,
+            expected_previous_owner: str,
+            lock_token: str,
+            confirm_previous_owner_stopped: bool,
+            now_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Explicitly rebind one unresolved mirror publisher.
+
+        The durable owner is deliberately independent of the expiring Redis
+        lease.  Only an allowlisted pre-I/O or post-success transition can mark
+        itself quiescent and be claimed automatically; generic storage errors
+        remain ambiguous.  Otherwise the caller must identify the exact intent
+        and previous owner and attest that the old process cannot resume.  The
+        Lua claim compares that identity, the new live lock, and deletion
+        fences in one atomic operation.
+        """
+        if not commit_id or expected_previous_owner is None or not lock_token:
+            raise ValueError(
+                "Mirror recovery requires an exact commit, previous owner, "
+                "and live lock token"
+            )
+        raw = self._mirror_publication_claim(
+            keys=[
+                RK.meta_mirror_publication(org, sup, simple),
+                RK.lock_leaf(org, sup, simple),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.meta_simple_deletion_intent(org, sup, simple),
+            ],
+            args=[
+                commit_id,
+                expected_previous_owner,
+                lock_token,
+                int(now_ms or _now_ms()),
+                "1" if confirm_previous_owner_stopped is True else "0",
+            ],
+        )
+        code = int(raw or 0)
+        if code in (1, 2):
+            record = self.get_mirror_publication(org, sup, simple)
+            if record is None:
+                raise RuntimeError("Claimed mirror publication disappeared")
+            if (
+                str(record.get("commit_id") or "") != commit_id
+                or str(record.get("publication_owner") or "") != lock_token
+            ):
+                raise RuntimeError("Mirror owner claim returned invalid state")
+            return record
+        if code == -1:
+            raise SnapshotCommitConflictError(
+                f"Mirror publication intent changed for {org}/{sup}/{simple}"
+            )
+        if code == -2:
+            raise LockLostError(
+                f"Lost fencing lock while claiming mirror publication for "
+                f"{org}/{sup}/{simple}"
+            )
+        if code == -3:
+            raise RuntimeError(
+                f"Corrupt mirror publication state for {org}/{sup}/{simple}"
+            )
+        if code == -4:
+            raise SnapshotCommitConflictError(
+                f"Mirror publication owner or status changed for "
+                f"{org}/{sup}/{simple}"
+            )
+        if code == -5:
+            raise PermissionError(
+                "Mirror recovery requires confirmation that the previous "
+                "publisher has stopped"
+            )
+        if code in (-6, -7):
+            raise DeletionIntentConflictError(
+                f"Table has a durable deletion intent: {org}/{sup}/{simple}"
+            )
+        raise RuntimeError(f"Invalid mirror owner claim result: {code}")
+
     def _transition_mirror_publication(
             self,
             org: str,
@@ -2832,6 +4594,8 @@ return 1
             keys=[
                 RK.meta_mirror_publication(org, sup, simple),
                 RK.lock_leaf(org, sup, simple),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.meta_simple_deletion_intent(org, sup, simple),
             ],
             args=[
                 commit_id,
@@ -2861,6 +4625,15 @@ return 1
         if code == -3:
             raise RuntimeError(
                 f"Corrupt mirror publication state for {org}/{sup}/{simple}"
+            )
+        if code in (-5, -6):
+            raise DeletionIntentConflictError(
+                f"Table has a durable deletion intent: {org}/{sup}/{simple}"
+            )
+        if code == -7:
+            raise SnapshotCommitConflictError(
+                f"Mirror publication is owned by another publisher for "
+                f"{org}/{sup}/{simple}"
             )
         raise RuntimeError(
             f"Invalid mirror publication transition {status!r} from current state"
@@ -2989,11 +4762,36 @@ return 1
             logger.error(f"[redis-catalog] delete_leaf error: {e}")
             return False
 
-    def set_leaf_path_cas(self, org: str, sup: str, simple: str, path: str, now_ms: Optional[int] = None) -> int:
+    def set_leaf_path_cas(
+            self, org: str, sup: str, simple: str, path: str,
+            now_ms: Optional[int] = None, *, namespace_token: str = "",
+    ) -> int:
         try:
             result = int(
-                self._leaf_cas_set(keys=[RK.meta_leaf(org, sup, simple)], args=[path, int(now_ms or _now_ms())]) or 0
+                self._leaf_cas_set(
+                    keys=[
+                        RK.meta_leaf(org, sup, simple),
+                        RK.lock_namespace(org, sup),
+                        RK.meta_table_names(org, sup),
+                        RK.meta_namespace_deletion_intent(org, sup),
+                        RK.meta_simple_deletion_intent(org, sup, simple),
+                    ],
+                    args=[
+                        path,
+                        int(now_ms or _now_ms()),
+                        namespace_token or "",
+                        simple,
+                    ],
+                ) or 0
             )
+            if result == -2:
+                raise RuntimeError(
+                    f"SuperTable namespace is fenced for deletion: {org}/{sup}"
+                )
+            if result in (-3, -4):
+                raise DeletionIntentConflictError(
+                    f"Table has a durable deletion intent: {org}/{sup}/{simple}"
+                )
             if result < 0:
                 raise SnapshotCommitConflictError(
                     f"Cannot initialize existing table {org}/{sup}/{simple}"
@@ -3011,6 +4809,8 @@ return 1
             payload: Dict[str, Any],
             path: str,
             now_ms: Optional[int] = None,
+            *,
+            namespace_token: str = "",
     ) -> int:
         """Atomically write a leaf pointer *and* snapshot payload (so readers avoid storage reads)."""
         try:
@@ -3021,11 +4821,31 @@ return 1
         try:
             result = int(
                 self._leaf_payload_cas_set(
-                    keys=[RK.meta_leaf(org, sup, simple)],
-                    args=[payload_json, path, int(now_ms or _now_ms())],
+                    keys=[
+                        RK.meta_leaf(org, sup, simple),
+                        RK.lock_namespace(org, sup),
+                        RK.meta_table_names(org, sup),
+                        RK.meta_namespace_deletion_intent(org, sup),
+                        RK.meta_simple_deletion_intent(org, sup, simple),
+                    ],
+                    args=[
+                        payload_json,
+                        path,
+                        int(now_ms or _now_ms()),
+                        namespace_token or "",
+                        simple,
+                    ],
                 )
                 or 0
             )
+            if result == -2:
+                raise RuntimeError(
+                    f"SuperTable namespace is fenced for deletion: {org}/{sup}"
+                )
+            if result in (-3, -4):
+                raise DeletionIntentConflictError(
+                    f"Table has a durable deletion intent: {org}/{sup}/{simple}"
+                )
             if result < 0:
                 raise SnapshotCommitConflictError(
                     f"Cannot initialize existing table {org}/{sup}/{simple}"
@@ -3084,7 +4904,21 @@ return 1
                 ordered.append(fu)
         try:
             payload = {"formats": ordered, "ts": int(now_ms or _now_ms())}
-            self.r.set(RK.meta_mirrors(org, sup), json.dumps(payload))
+            result = int(self._set_mirrors_fenced(
+                keys=[
+                    RK.meta_mirrors(org, sup),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                ],
+                args=[json.dumps(payload)],
+            ) or 0)
+            if result == -1:
+                raise DeletionIntentConflictError(
+                    f"Durable deletion intent fences {org}/{sup}"
+                )
+            if result == -2:
+                raise ValueError("Mirror configuration is not valid JSON")
+            if result != 1:
+                raise RuntimeError(f"Invalid mirror configuration result: {result}")
             return ordered
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] set_mirrors error: {e}")
@@ -3330,6 +5164,7 @@ return 1
     @staticmethod
     def _rbac_audit_keys(org: str) -> List[str]:
         return [
+            RK.audit_privileged_activation(org),
             RK.audit_privileged_outbox(org),
             RK.audit_privileged_meta(org),
         ]
@@ -5944,15 +7779,8 @@ return 1
         return True
 
     def validate_auth_token(self, org: str, token: str) -> bool:
-        """Validate a plaintext auth token."""
-        if not token:
-            return False
-        token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        try:
-            return bool(self.r.hexists(RK.auth_tokens(org), token_id))
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] validate_auth_token error: {e}")
-            return False
+        """Validate through the same state/expiry path as metadata callers."""
+        return self.validate_auth_token_full(org, token) is not None
 
     def validate_auth_token_full(self, org: str, token: str) -> Optional[Dict[str, Any]]:
         """Validate a plaintext auth token and return its metadata.
@@ -5978,15 +7806,21 @@ return 1
             return None
         if not isinstance(meta, dict):
             return None
-        # enabled flag — if missing, treat as enabled (back-compat)
-        if "enabled" in meta and not bool(meta.get("enabled")):
+        # Missing means enabled for pre-field documents, but malformed values
+        # must not gain truthiness (for example, the string ``"false"``).
+        if "enabled" in meta and meta.get("enabled") is not True:
             return None
         # expiry — 0 / missing means "never expires"
         try:
-            exp = int(meta.get("expires_ms") or 0)
-        except (TypeError, ValueError):
-            exp = 0
-        if exp and exp < _now_ms():
+            raw_expiry = meta.get("expires_ms", 0)
+            if isinstance(raw_expiry, bool):
+                return None
+            exp = int(raw_expiry or 0)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if exp < 0:
+            return None
+        if exp and exp <= _now_ms():
             return None
         return meta
 
@@ -6093,26 +7927,92 @@ return 1
 
     # ------------- Deletions (dangerous) -------------
 
-    def delete_simple_table(self, org: str, sup: str, simple: str) -> bool:
-        """Delete a simple table's Redis meta (leaf pointer + lock).
+    def delete_simple_table(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            *,
+            lock_token: str,
+            namespace_token: str,
+            intent_id: str,
+    ) -> bool:
+        """Atomically remove every table-scoped catalog/control record.
 
-        This does **not** delete storage. Callers should delete storage first, then call this.
+        Storage must already be empty and the caller must still own the same
+        auto-renewed leaf lock used by writers. The table-name index, schema,
+        row-id allocator, runtime config, and mirror-recovery intent are
+        removed with the leaf so delete/recreate cannot inherit stale state.
         """
-        if not (org and sup and simple):
+        if not (
+            org and sup and simple and lock_token and namespace_token
+            and intent_id
+        ):
             return False
-        keys = [
-            RK.meta_leaf(org, sup, simple),
-            RK.lock_leaf(org, sup, simple),
-        ]
         try:
-            # DEL returns number of keys removed
-            self.r.delete(*keys)
+            result = int(self._delete_simple_table(
+                keys=[
+                    RK.meta_leaf(org, sup, simple),
+                    RK.lock_leaf(org, sup, simple),
+                    RK.meta_table_names(org, sup),
+                    RK.schema(org, sup, simple),
+                    RK.meta_rowid_seq(org, sup, simple),
+                    RK.meta_table_config(org, sup, simple),
+                    RK.meta_mirror_publication(org, sup, simple),
+                    RK.meta_root(org, sup),
+                    RK.meta_simple_deletion_intent(org, sup, simple),
+                    RK.meta_simple_deletion_intent_index(org, sup),
+                    RK.lock_namespace(org, sup),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                ],
+                args=[
+                    lock_token,
+                    simple,
+                    namespace_token,
+                    intent_id,
+                    _now_ms(),
+                ],
+            ))
+            if result == -1:
+                logger.error(
+                    "[redis-catalog] delete_simple_table lost its leaf lock"
+                )
+                return False
+            if result == -2:
+                raise RuntimeError("table-name index has wrong Redis type")
+            if result == -3:
+                raise RuntimeError("catalog root is corrupt")
+            if result == -4:
+                logger.error(
+                    "[redis-catalog] delete_simple_table lost its namespace lock"
+                )
+                return False
+            if result == -5:
+                raise DeletionIntentConflictError(
+                    f"SuperTable deletion supersedes {org}/{sup}/{simple}"
+                )
+            if result == -6:
+                logger.error(
+                    "[redis-catalog] delete_simple_table intent ownership changed"
+                )
+                return False
+            if result == -7:
+                raise RuntimeError(
+                    f"Corrupt deletion intent for {org}/{sup}/{simple}"
+                )
+            if result < 0:
+                raise RuntimeError(
+                    f"invalid delete_simple_table result: {result}"
+                )
             return True
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] delete_simple_table error: {e}")
             return False
 
-    def delete_super_table(self, org: str, sup: str, count: int = 1000) -> int:
+    def delete_super_table(
+            self, org: str, sup: str, count: int = 1000,
+            *, namespace_token: str, intent_id: str,
+    ) -> int:
         """Delete data/metadata keys for a SuperTable, preserving RBAC state.
 
         Role, user, and assignment state is security-control data.  Removing it
@@ -6123,14 +8023,55 @@ return 1
         This is implemented via SCAN to avoid blocking Redis.
         Returns the number of keys deleted (best-effort).
         """
-        if not (org and sup):
+        if not (org and sup and namespace_token and intent_id):
             return 0
         pattern = RK.super_table_pattern(org, sup)
-        return self._delete_by_scan(
+        # RBAC is security-control state. Locks and the no-TTL intent must stay
+        # visible throughout every SCAN batch; removing any of them early
+        # would let a stale caller finish after lease takeover.
+        preserved = (
+            RK.rbac_scope(org, sup) + ":",
+            RK.lock_scope_prefix(org, sup),
+            RK.meta_deletion_scope_prefix(org, sup),
+        )
+        deleted = self._delete_by_scan(
             pattern=pattern,
             count=count,
-            preserve_prefixes=(RK.rbac_scope(org, sup) + ":",),
+            preserve_prefixes=preserved,
+            strict=True,
+            namespace_lock=RK.lock_namespace(org, sup),
+            namespace_intent=RK.meta_namespace_deletion_intent(org, sup),
+            namespace_token=namespace_token,
+            intent_id=intent_id,
         )
+        result = int(self._finalize_namespace_deletion(
+            keys=[
+                RK.lock_namespace(org, sup),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.meta_simple_deletion_intent_index(org, sup),
+                RK.meta_stage_deletion_intent_index(org, sup),
+            ],
+            args=[namespace_token, intent_id, _now_ms()],
+        ) or 0)
+        if result == -1:
+            raise LockLostError(
+                f"Lost namespace lock before finalizing deletion of {org}/{sup}"
+            )
+        if result == -2:
+            raise DeletionIntentConflictError(
+                f"Namespace deletion intent changed for {org}/{sup}"
+            )
+        if result == -3:
+            raise RuntimeError(f"Corrupt deletion intent for {org}/{sup}")
+        if result == -4:
+            raise DeletionIntentConflictError(
+                "SimpleTable deletion intents remain under this namespace"
+            )
+        if result != 1:
+            raise RuntimeError(
+                f"Invalid namespace deletion finalizer result: {result}"
+            )
+        return deleted
 
     def _delete_by_scan(
         self,
@@ -6138,39 +8079,80 @@ return 1
         count: int = 1000,
         *,
         preserve_prefixes: tuple[str, ...] = (),
+        strict: bool = False,
+        namespace_lock: str = "",
+        namespace_intent: str = "",
+        namespace_token: str = "",
+        intent_id: str = "",
     ) -> int:
         deleted = 0
-        cursor = 0
         try:
+            # Deleting while iterating SCAN can move buckets and omit keys.
+            # Repeat complete passes until one observes no deletable key. The
+            # durable intent prevents supported writers from replenishing the
+            # namespace between passes.
             while True:
-                cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=max(1, int(count)))
-                # redis-py may return list[str] or list[bytes]
-                str_keys = [
-                    k if isinstance(k, str) else k.decode("utf-8")
-                    for k in (keys or [])
-                ]
-                if preserve_prefixes:
+                cursor = 0
+                candidates = 0
+                while True:
+                    cursor, keys = self.r.scan(
+                        cursor=cursor,
+                        match=pattern,
+                        count=max(1, int(count)),
+                    )
                     str_keys = [
-                        key
-                        for key in str_keys
-                        if not any(
-                            key.startswith(prefix) for prefix in preserve_prefixes
-                        )
+                        k if isinstance(k, str) else k.decode("utf-8")
+                        for k in (keys or [])
                     ]
-                if str_keys:
-                    try:
-                        with self.r.pipeline() as p:
-                            for k in str_keys:
-                                p.delete(k)
-                            res = p.execute()
-                        # Each delete returns 0/1, sum them
-                        deleted += sum(int(x or 0) for x in res)
-                    except redis.RedisError as e:
-                        logger.error(f"[redis-catalog] pipeline DEL error: {e}")
-                if cursor == 0:
+                    if preserve_prefixes:
+                        str_keys = [
+                            key
+                            for key in str_keys
+                            if not any(
+                                key.startswith(prefix)
+                                for prefix in preserve_prefixes
+                            )
+                        ]
+                    if str_keys:
+                        candidates += len(str_keys)
+                        if not (
+                            namespace_lock and namespace_intent
+                            and namespace_token and intent_id
+                        ):
+                            raise RuntimeError(
+                                "Strict namespace cleanup requires a deletion fence"
+                            )
+                        raw = int(self._delete_namespace_batch(
+                            keys=[
+                                namespace_lock,
+                                namespace_intent,
+                                *str_keys,
+                            ],
+                            args=[namespace_token, intent_id],
+                        ) or 0)
+                        if raw == -1:
+                            raise LockLostError(
+                                "Lost namespace lock during catalog cleanup"
+                            )
+                        if raw == -2:
+                            raise DeletionIntentConflictError(
+                                "Namespace deletion intent ownership changed"
+                            )
+                        if raw == -3:
+                            raise RuntimeError("Corrupt namespace deletion intent")
+                        if raw < 0:
+                            raise RuntimeError(
+                                f"Invalid namespace batch deletion result: {raw}"
+                            )
+                        deleted += raw
+                    if cursor == 0:
+                        break
+                if candidates == 0:
                     break
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] SCAN delete error: {e}")
+            if strict:
+                raise
         return deleted
 
     # --------------------------------------------------------------------------- #
@@ -6229,10 +8211,24 @@ return 1
 
     def create_linked_share(self, org: str, sup: str, link_id: str, link_doc: Dict[str, Any]) -> None:
         try:
-            with self.r.pipeline() as p:
-                p.set(RK.linked_share_doc(org, sup, link_id), json.dumps(link_doc))
-                p.sadd(RK.linked_share_index(org, sup), link_id)
-                p.execute()
+            result = int(self._upsert_linked_share_fenced(
+                keys=[
+                    RK.linked_share_doc(org, sup, link_id),
+                    RK.linked_share_index(org, sup),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                ],
+                args=[json.dumps(link_doc), link_id, "1"],
+            ) or 0)
+            if result == -1:
+                raise DeletionIntentConflictError(
+                    f"Durable deletion intent fences {org}/{sup}"
+                )
+            if result == -2:
+                raise ValueError("Linked-share document is not valid JSON")
+            if result != 1:
+                raise RuntimeError(
+                    f"Invalid linked-share publication result: {result}"
+                )
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] create_linked_share error: {e}")
             raise
@@ -6247,7 +8243,24 @@ return 1
 
     def update_linked_share(self, org: str, sup: str, link_id: str, doc: Dict[str, Any]) -> bool:
         try:
-            self.r.set(RK.linked_share_doc(org, sup, link_id), json.dumps(doc))
+            result = int(self._upsert_linked_share_fenced(
+                keys=[
+                    RK.linked_share_doc(org, sup, link_id),
+                    RK.linked_share_index(org, sup),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                ],
+                args=[json.dumps(doc), link_id, "0"],
+            ) or 0)
+            if result == -1:
+                raise DeletionIntentConflictError(
+                    f"Durable deletion intent fences {org}/{sup}"
+                )
+            if result == -2:
+                raise ValueError("Linked-share document is not valid JSON")
+            if result != 1:
+                raise RuntimeError(
+                    f"Invalid linked-share publication result: {result}"
+                )
             return True
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] update_linked_share error: {e}")
@@ -6284,7 +8297,15 @@ return 1
     # Staging / Pipe meta (for website UI)
     # --------------------------------------------------------------------------- #
 
-    def upsert_staging_meta(self, org: str, sup: str, staging_name: str, meta: Dict[str, Any]) -> bool:
+    def upsert_staging_meta(
+            self,
+            org: str,
+            sup: str,
+            staging_name: str,
+            meta: Dict[str, Any],
+            *,
+            lock_token: str,
+    ) -> bool:
         """Upsert staging metadata and ensure it is indexed for listing."""
         if not (org and sup and staging_name):
             return False
@@ -6295,10 +8316,27 @@ return 1
         payload["updated_at_ms"] = _now_ms()
 
         try:
-            with self.r.pipeline() as p:
-                p.set(RK.staging(org, sup, staging_name), json.dumps(payload))
-                p.sadd(RK.staging_index(org, sup), staging_name)
-                p.execute()
+            result = int(self._upsert_staging_meta(
+                keys=[
+                    RK.staging_doc(org, sup, staging_name),
+                    RK.staging_index(org, sup),
+                    RK.lock_stage(org, sup, staging_name),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_stage_deletion_intent(org, sup, staging_name),
+                ],
+                args=[json.dumps(payload), staging_name, lock_token or ""],
+            ) or 0)
+            if result == -1:
+                raise LockLostError("Lost staging lock before metadata publication")
+            if result in (-2, -3):
+                raise DeletionIntentConflictError(
+                    f"Durable deletion intent fences staging "
+                    f"{org}/{sup}/{staging_name}"
+                )
+            if result == -4:
+                raise ValueError("Staging metadata is not valid JSON")
+            if result != 1:
+                raise RuntimeError(f"Invalid staging upsert result: {result}")
             return True
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] upsert_staging_meta error: {e}")
@@ -6309,7 +8347,7 @@ return 1
         if not (org and sup and staging_name):
             return None
         try:
-            raw = self.r.get(RK.staging(org, sup, staging_name))
+            raw = self.r.get(RK.staging_doc(org, sup, staging_name))
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_staging_meta error: {e}")
             return None
@@ -6332,34 +8370,150 @@ return 1
             return []
         return sorted({(n if isinstance(n, str) else n.decode('utf-8')) for n in names if n})
 
-    def delete_staging_meta(self, org: str, sup: str, staging_name: str, *, count: int = 1000) -> int:
-        """Delete staging meta and *all* related keys under the staging prefix.
+    def delete_staging_meta(
+            self,
+            org: str,
+            sup: str,
+            staging_name: str,
+            *,
+            lock_token: str,
+            intent_id: str,
+            count: int = 1000,
+    ) -> bool:
+        """Delete one staging's Redis state without losing discoverability.
 
-        This removes the staging from the staging index set, deletes the staging meta key,
-        and deletes any keys matching:
-            supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:*
-        Returns number of keys deleted (best-effort; does not include SREM).
+        Child pipe keys are removed first with strict Redis error propagation and
+        an explicit empty-prefix check.  Only then does one bounded Lua command
+        atomically remove the base metadata and its listing-index membership,
+        conditional on continued ownership of the staging lock.  Zero removals
+        are a successful idempotent retry; any uncertain or partial result raises.
         """
         if not (org and sup and staging_name):
-            return 0
+            raise ValueError("organization, supertable, and staging name are required")
+        if not lock_token or not intent_id:
+            raise ValueError(
+                "staging metadata deletion requires lock and intent tokens"
+            )
 
-        deleted = 0
-        try:
-            # Remove from list index
-            self.r.srem(RK.staging_index(org, sup), staging_name)
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] delete_staging_meta srem error: {e}")
-
-        try:
-            # Delete the base meta key
-            deleted += int(self.r.delete(RK.staging(org, sup, staging_name)) or 0)
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] delete_staging_meta del error: {e}")
-
-        # Delete everything under the staging namespace (pipes, pipe meta set, etc.)
+        meta_key = RK.staging_doc(org, sup, staging_name)
         pattern = RK.staging_subkey_pattern(org, sup, staging_name)
-        deleted += self._delete_by_scan(pattern=pattern, count=count)
-        return deleted
+        lock_key = RK.lock_stage(org, sup, staging_name)
+        intent_key = RK.meta_stage_deletion_intent(org, sup, staging_name)
+        try:
+            batch_size = max(1, min(int(count), 1000))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("staging deletion count must be an integer") from exc
+
+        # ``staging_subkey_pattern`` also matches the base ``:meta`` key. Keep
+        # that discoverable until every actual child is gone; if SCAN skips a
+        # key while the keyspace is changing, the verification below fails and
+        # a retry resumes from the same visible staging record.
+        cursor: Any = 0
+        try:
+            while True:
+                cursor, keys = self.r.scan(
+                    cursor=cursor,
+                    match=pattern,
+                    count=batch_size,
+                )
+                children = [
+                    key if isinstance(key, str) else key.decode("utf-8")
+                    for key in (keys or [])
+                    if (key if isinstance(key, str) else key.decode("utf-8"))
+                    != meta_key
+                ]
+                for offset in range(0, len(children), batch_size):
+                    result = int(self._staging_delete_children(
+                        keys=[
+                            lock_key,
+                            intent_key,
+                            *children[offset:offset + batch_size],
+                        ],
+                        args=[lock_token, intent_id],
+                    ) or 0)
+                    if result == -1:
+                        raise LockLostError(
+                            f"Lost staging lock while deleting metadata for "
+                            f"{org}/{sup}/{staging_name}"
+                        )
+                    if result < 0:
+                        if result == -2:
+                            raise DeletionIntentConflictError(
+                                "Staging deletion intent ownership changed"
+                            )
+                        if result == -3:
+                            raise RuntimeError("Corrupt staging deletion intent")
+                        raise RuntimeError(
+                            f"Invalid staging child deletion result: {result}"
+                        )
+                if int(cursor) == 0:
+                    break
+
+            # Deleting keys during SCAN can make a cursor skip an entry.  A
+            # separate complete verification pass detects that ambiguity and
+            # leaves the base metadata/index intact for a safe retry.
+            cursor = 0
+            while True:
+                cursor, keys = self.r.scan(
+                    cursor=cursor,
+                    match=pattern,
+                    count=batch_size,
+                )
+                remaining = [
+                    key if isinstance(key, str) else key.decode("utf-8")
+                    for key in (keys or [])
+                    if (key if isinstance(key, str) else key.decode("utf-8"))
+                    != meta_key
+                ]
+                if remaining:
+                    raise RuntimeError(
+                        f"Staging metadata children remain after deletion: "
+                        f"{remaining[0]!r}"
+                    )
+                if int(cursor) == 0:
+                    break
+
+            result = int(self._staging_delete_meta(
+                keys=[
+                    RK.staging_index(org, sup),
+                    meta_key,
+                    lock_key,
+                    intent_key,
+                    RK.meta_stage_deletion_intent_index(org, sup),
+                ],
+                args=[staging_name, lock_token, intent_id, _now_ms()],
+            ) or 0)
+            if result == -1:
+                raise LockLostError(
+                    f"Lost staging lock before deleting metadata for "
+                    f"{org}/{sup}/{staging_name}"
+                )
+            if result < 0:
+                if result == -2:
+                    raise DeletionIntentConflictError(
+                        "Staging deletion intent ownership changed"
+                    )
+                if result == -3:
+                    raise RuntimeError("Corrupt staging deletion intent")
+                raise RuntimeError(
+                    f"Invalid staging metadata deletion result: {result}"
+                )
+            if self.r.exists(meta_key) or self.r.sismember(
+                RK.staging_index(org, sup), staging_name,
+            ):
+                raise RuntimeError(
+                    f"Staging metadata deletion failed verification for "
+                    f"{org}/{sup}/{staging_name}"
+                )
+        except (LockLostError, RuntimeError, ValueError):
+            raise
+        except redis.RedisError as exc:
+            logger.error(
+                "[redis-catalog] delete_staging_meta failed for %s/%s/%s: %s",
+                org, sup, staging_name, exc,
+            )
+            raise
+        return True
 
     def upsert_pipe_meta(
             self,
@@ -6368,6 +8522,8 @@ return 1
             staging_name: str,
             pipe_name: str,
             meta: Dict[str, Any],
+            *,
+            lock_token: str,
     ) -> bool:
         """Upsert pipe metadata and ensure it is indexed for listing under a staging."""
         if not (org and sup and staging_name and pipe_name):
@@ -6380,10 +8536,27 @@ return 1
         payload["updated_at_ms"] = _now_ms()
 
         try:
-            with self.r.pipeline() as p:
-                p.set(RK.pipe(org, sup, staging_name, pipe_name), json.dumps(payload))
-                p.sadd(RK.pipe_index(org, sup, staging_name), pipe_name)
-                p.execute()
+            result = int(self._upsert_pipe_meta(
+                keys=[
+                    RK.pipe_doc(org, sup, staging_name, pipe_name),
+                    RK.pipe_index(org, sup, staging_name),
+                    RK.lock_stage(org, sup, staging_name),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_stage_deletion_intent(org, sup, staging_name),
+                ],
+                args=[json.dumps(payload), pipe_name, lock_token or ""],
+            ) or 0)
+            if result == -1:
+                raise LockLostError("Lost staging lock before pipe publication")
+            if result in (-2, -3):
+                raise DeletionIntentConflictError(
+                    f"Durable deletion intent fences staging "
+                    f"{org}/{sup}/{staging_name}"
+                )
+            if result == -4:
+                raise ValueError("Pipe metadata is not valid JSON")
+            if result != 1:
+                raise RuntimeError(f"Invalid pipe upsert result: {result}")
             return True
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] upsert_pipe_meta error: {e}")
@@ -6393,7 +8566,9 @@ return 1
         if not (org and sup and staging_name and pipe_name):
             return None
         try:
-            raw = self.r.get(RK.pipe(org, sup, staging_name, pipe_name))
+            raw = self.r.get(
+                RK.pipe_doc(org, sup, staging_name, pipe_name)
+            )
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_pipe_meta error: {e}")
             return None
@@ -6471,7 +8646,9 @@ return 1
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] delete_pipe_meta srem error: {e}")
         try:
-            return int(self.r.delete(RK.pipe(org, sup, staging_name, pipe_name)) or 0)
+            return int(self.r.delete(
+                RK.pipe_doc(org, sup, staging_name, pipe_name)
+            ) or 0)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] delete_pipe_meta del error: {e}")
             return 0
@@ -6495,6 +8672,10 @@ return 1
         """
         if not org:
             raise ValueError("organization is required")
+        # Reject reusable object-store credentials and malformed session SET
+        # values before the document reaches Redis.  The separate ``password``
+        # field is the Thrift transport credential and remains supported.
+        validate_spark_storage_config(config)
         try:
             doc = dict(config)
             doc["cluster_id"] = cluster_id
@@ -6525,7 +8706,22 @@ return 1
             clusters = []
             for _cid, data in raw.items():
                 try:
-                    clusters.append(json.loads(data))
+                    cluster = json.loads(data)
+                    if not isinstance(cluster, dict):
+                        continue
+                    unsafe_keys = spark_storage_credential_keys(cluster)
+                    if unsafe_keys:
+                        # Legacy documents may predate registration validation.
+                        # Never return their credential values to API callers or
+                        # select them for execution. Redis maintenance can then
+                        # replace/delete the quarantined document deliberately.
+                        for key in unsafe_keys:
+                            cluster.pop(key, None)
+                        cluster["status"] = "offline"
+                        cluster["security_error"] = (
+                            "inline_object_store_credentials"
+                        )
+                    clusters.append(cluster)
                 except json.JSONDecodeError:
                     pass
             return clusters
@@ -6630,6 +8826,8 @@ return 1
             sup: str,
             simple: str,
             config: Dict[str, Any],
+            *,
+            lock_token: str,
     ) -> bool:
         """Store per-table configuration (primary keys, dedup mode, etc.).
 
@@ -6641,14 +8839,32 @@ return 1
         try:
             doc = dict(config)
             doc["modified_ms"] = _now_ms()
-            self.r.set(
-                RK.meta_table_config(org, sup, simple),
-                json.dumps(doc, default=str),
-            )
+            result = int(self._set_table_config_fenced(
+                keys=[
+                    RK.meta_table_config(org, sup, simple),
+                    RK.meta_leaf(org, sup, simple),
+                    RK.lock_leaf(org, sup, simple),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_simple_deletion_intent(org, sup, simple),
+                ],
+                args=[json.dumps(doc, default=str), lock_token or ""],
+            ) or 0)
+            if result == -1:
+                raise LockLostError("Lost table lock before configuration commit")
+            if result in (-2, -3):
+                raise DeletionIntentConflictError(
+                    f"Durable deletion intent fences {org}/{sup}/{simple}"
+                )
+            if result == -4:
+                raise RuntimeError(f"Cannot configure missing table {org}/{sup}/{simple}")
+            if result == -5:
+                raise ValueError("Table configuration is not valid JSON")
+            if result != 1:
+                raise RuntimeError(f"Invalid table configuration result: {result}")
             return True
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] set_table_config error: {e}")
-            return False
+            raise
 
     def get_table_config(
             self,

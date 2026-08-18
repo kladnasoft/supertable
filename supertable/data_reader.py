@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import math
 import re
+from datetime import date, datetime, timezone
 from enum import Enum
-from typing import Optional, Tuple, Any, List, Dict
-from urllib.parse import urlsplit, urlunsplit
+from typing import Callable, Optional, Tuple, Any, List, Dict
 
 import pandas as pd
 import polars as pl
@@ -22,7 +23,12 @@ from supertable.utils.timer import Timer
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
 from supertable.plan_extender import extend_execution_plan
+from supertable.monitoring_writer import (
+    MonitoringDurabilityError,
+    MonitoringPostExecutionError,
+)
 from supertable.engine.plan_stats import PlanStats
+from supertable.engine.engine_common import redact_url_credentials
 from supertable.rbac.access_control import restrict_read_access  # noqa: F401
 
 from supertable.engine.data_estimator import DataEstimator
@@ -36,6 +42,137 @@ from supertable.system_query import classify_query, CommandKind
 class Status(Enum):
     OK = "ok"
     ERROR = "error"
+
+
+def _cancel_and_close_stream(stream: Any) -> None:
+    """Terminate a live result stream that cannot be returned to its caller."""
+    cancel = getattr(stream, "cancel", None)
+    try:
+        if callable(cancel):
+            cancel()
+    except Exception as exc:
+        logger.warning(
+            "Arrow result cancellation during monitoring failure: %s", exc,
+        )
+    finally:
+        close = getattr(stream, "close", None)
+        try:
+            if callable(close):
+                close()
+        except Exception as exc:
+            logger.warning(
+                "Arrow result close during monitoring failure: %s", exc,
+            )
+
+
+class _MonitoredResultStream:
+    """Arrow stream wrapper that finalizes monitoring at the real outcome.
+
+    Creating a stream is not a successful read: production can fail, the
+    serialized-byte consumer can cancel, or a caller can close early.  This
+    wrapper counts yielded rows/Arrow bytes and emits exactly one monitoring
+    outcome on exhaustion, cancellation, close, or producer failure.
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        finalize: Callable[[str, Optional[str], int, int], None],
+    ) -> None:
+        self._inner = inner
+        self._finalize_callback = finalize
+        self.schema = inner.schema
+        self._rows = 0
+        self._bytes = 0
+        self._finalized = False
+        self._finalize_error: BaseException | None = None
+
+    def __iter__(self):
+        return self
+
+    def _finish(self, status: str, message: Optional[str]) -> None:
+        if self._finalized:
+            if self._finalize_error is not None:
+                raise self._finalize_error
+            return
+        self._finalized = True
+        try:
+            self._finalize_callback(status, message, self._rows, self._bytes)
+        except BaseException as exc:
+            self._finalize_error = exc
+            raise
+
+    def __next__(self):
+        try:
+            batch = next(self._inner)
+        except StopIteration:
+            close = getattr(self._inner, "close", None)
+            try:
+                if callable(close):
+                    close()
+            finally:
+                self._finish(Status.OK.value, None)
+            raise
+        except BaseException as exc:
+            try:
+                self._finish(Status.ERROR.value, str(exc))
+            except BaseException as monitoring_exc:
+                setattr(monitoring_exc, "stream_error", exc)
+                raise monitoring_exc from exc
+            raise
+        self._rows += max(0, int(getattr(batch, "num_rows", 0)))
+        self._bytes += max(0, int(getattr(batch, "nbytes", 0)))
+        return batch
+
+    def cancel(self) -> None:
+        cancel = getattr(self._inner, "cancel", None)
+        try:
+            if callable(cancel):
+                cancel()
+            else:
+                close = getattr(self._inner, "close", None)
+                if callable(close):
+                    close()
+        finally:
+            self._finish(Status.ERROR.value, "result stream cancelled")
+
+    def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        try:
+            if callable(close):
+                close()
+        finally:
+            if not self._finalized:
+                self._finish(
+                    Status.ERROR.value,
+                    "result stream closed before exhaustion",
+                )
+            elif self._finalize_error is not None:
+                raise self._finalize_error
+
+    @property
+    def closed(self) -> bool:
+        return bool(getattr(self._inner, "closed", self._finalized))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc is not None and not self._finalized:
+            try:
+                self.cancel()
+            except Exception:
+                if not isinstance(exc, MonitoringPostExecutionError):
+                    raise
+        else:
+            self.close()
+
+    def __del__(self):
+        try:
+            if not self._finalized:
+                self.cancel()
+        except Exception:
+            pass
 
 
 _SPARK_UNSAFE_PREDICATE_LANES = frozenset({
@@ -53,7 +190,49 @@ _DUCKDB_JOIN_PRUNING_LANES = frozenset({
 })
 _COMMON_JOIN_PRUNING_LANES = frozenset({"numeric"})
 
-_URL_IN_ERROR_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+def _positive_budget(name: str, fallback: int) -> int:
+    try:
+        value = int(getattr(settings, name, fallback))
+    except (TypeError, ValueError, OverflowError):
+        value = fallback
+    return value if value > 0 else fallback
+
+
+def _validate_query_complexity(sql: str) -> None:
+    """Reject oversized/deep SELECT syntax before planning or execution."""
+    if len(str(sql).encode("utf-8")) > _positive_budget(
+        "SUPERTABLE_MAX_QUERY_BYTES", 64 * 1024,
+    ):
+        raise ValueError("SQL text exceeds the configured query-size budget")
+    try:
+        statements = [
+            statement
+            for statement in sqlglot.parse(sql, read="duckdb")
+            if statement is not None
+        ]
+    except Exception as exc:
+        raise ValueError("SQL query is invalid") from exc
+    if len(statements) != 1 or statements[0] is None:
+        raise ValueError("Exactly one SQL statement is required")
+
+    max_nodes = _positive_budget("SUPERTABLE_MAX_QUERY_AST_NODES", 4096)
+    max_joins = _positive_budget("SUPERTABLE_MAX_QUERY_JOINS", 32)
+    max_depth = _positive_budget("SUPERTABLE_MAX_QUERY_NESTING", 32)
+    node_count = 0
+    join_count = 0
+    stack = [(statements[0], 1)]
+    while stack:
+        node, depth = stack.pop()
+        node_count += 1
+        if node_count > max_nodes:
+            raise ValueError("SQL query exceeds the AST-node budget")
+        if depth > max_depth:
+            raise ValueError("SQL query exceeds the nesting budget")
+        if isinstance(node, exp.Join):
+            join_count += 1
+            if join_count > max_joins:
+                raise ValueError("SQL query exceeds the join budget")
+        stack.extend((child, depth + 1) for child in node.iter_expressions())
 
 
 def _validated_share_row_filter(raw_filter: object) -> str:
@@ -96,26 +275,8 @@ def _validated_share_row_filter(raw_filter: object) -> str:
 
 
 def _redact_storage_credentials(message: object) -> str:
-    """Remove presign/SAS query strings from logs and public read errors."""
-    text = str(message or "")
-
-    def replace(match: re.Match) -> str:
-        raw = match.group(0)
-        # Error prose commonly places punctuation immediately after a URL.
-        url = raw.rstrip(").,;]}")
-        suffix = raw[len(url):]
-        try:
-            parsed = urlsplit(url)
-            if parsed.query or parsed.fragment:
-                url = urlunsplit(
-                    (parsed.scheme, parsed.netloc, parsed.path, "<redacted>", "")
-                )
-        except Exception:
-            # Even an unparsable URL must not retain a potential credential.
-            url = url.split("?", 1)[0] + ("?<redacted>" if "?" in url else "")
-        return url + suffix
-
-    return _URL_IN_ERROR_RE.sub(replace, text)
+    """Remove query/fragment and URL user-info from public read errors."""
+    return redact_url_credentials(message)
 
 
 def _engine_safe_join_pruning_lanes(requested_engine: engine):
@@ -192,6 +353,8 @@ class DataReader:
         organization: str,
         query: str,
         source: str = "sdk",
+        *,
+        _allow_bounded_collection_aggregates: bool = False,
     ):
         self.super_name = super_name
         self.organization = organization
@@ -200,6 +363,9 @@ class DataReader:
         # default for direct SDK callers; the API/OData/MCP entry points
         # pass "api"/"odata"/"mcp" so each query records where it came from.
         self.source = source
+        self._allow_bounded_collection_aggregates = bool(
+            _allow_bounded_collection_aggregates
+        )
 
         self.storage: StorageInterface = get_storage()
 
@@ -246,10 +412,58 @@ class DataReader:
             seen.add(key)
             if not catalog.root_exists(self.organization, super_name):
                 raise SuperTableNotFoundError(self.organization, super_name)
+            # ``super.super`` is the intentional aggregate relation. It is
+            # backed by the parent's leaf set rather than by a same-named leaf.
+            if str(super_name).casefold() == str(simple_name).casefold():
+                continue
             if not catalog.leaf_exists(self.organization, super_name, simple_name):
                 raise TableNotFoundError(
                     self.organization, super_name, simple_name
                 )
+
+    def _resolve_aggregate_children(self, physical_tables):
+        """Pin the child names behind every aggregate relation.
+
+        The resulting map is shared by RBAC and the estimator.  This prevents a
+        child created after authorization from entering the independently run
+        estimator SCAN, and makes every expanded relation an explicit policy
+        target before any files are selected.
+        """
+        aggregate_keys = {
+            (str(td.super_name).casefold(), str(td.simple_name).casefold()): (
+                str(td.super_name), str(td.simple_name)
+            )
+            for td in physical_tables
+            if td.super_name
+            and td.simple_name
+            and str(td.super_name).casefold() == str(td.simple_name).casefold()
+        }
+        if not aggregate_keys:
+            return {}
+
+        catalog = RedisCatalog()
+        resolved = {}
+        for key, (super_name, simple_name) in aggregate_keys.items():
+            children = []
+            seen = set()
+            for item in catalog.scan_leaf_items(
+                self.organization, super_name, count=512,
+            ):
+                child = str(item.get("simple") or "")
+                if not child or (
+                    child.startswith("__") and child.endswith("__")
+                ):
+                    continue
+                folded = child.casefold()
+                if folded in seen:
+                    raise RuntimeError(
+                        f"Catalog contains case-colliding children for "
+                        f"{super_name}.{simple_name}"
+                    )
+                seen.add(folded)
+                children.append(child)
+            resolved[key] = tuple(children)
+        return resolved
 
     def _resolve_latest_stats_file(
         self, super_name: str, simple_name: str,
@@ -373,7 +587,10 @@ class DataReader:
         role_name: str,
         with_scan: bool = False,
         engine: engine = engine.AUTO,
-    ) -> Tuple[pd.DataFrame, Status, Optional[str]]:
+        *,
+        _streaming: bool = False,
+        _stream_batch_rows: Optional[int] = None,
+    ) -> Tuple[Any, Status, Optional[str]]:
         status = Status.ERROR
         message: Optional[str] = None
         self.timer = Timer()
@@ -389,6 +606,32 @@ class DataReader:
             logger.warning(self._lp(f"rejected query: {e}"))
             return pd.DataFrame(), Status.ERROR, str(e)
 
+        # DuckDB's EXPLAIN ANALYZE result includes physical Filename(s). Those
+        # can be local server paths or presigned bearer URLs used by a managed
+        # reflection fallback. Plain EXPLAIN remains available and describes
+        # the logical managed-view plan without executing/scanning sources.
+        if command.explain and command.explain_options.strip().casefold() == "analyze":
+            message = "EXPLAIN ANALYZE is not available on the untrusted read path"
+            logger.warning(self._lp(f"rejected query: {message}"))
+            return pd.DataFrame(), Status.ERROR, message
+
+        if command.kind is not CommandKind.SHOW_STATS:
+            try:
+                _validate_query_complexity(command.sql)
+            except ValueError as e:
+                logger.warning(self._lp(f"rejected query: {e}"))
+                return pd.DataFrame(), Status.ERROR, str(e)
+
+        bounded_sql = command.sql
+        if command.kind is CommandKind.SELECT:
+            # Enforce the server ceiling at the DataReader boundary too.  SDK
+            # callers can instantiate DataReader directly and must not bypass
+            # query_sql()'s convenience LIMIT injection.
+            bounded_sql = _ensure_sql_limit(
+                command.sql,
+                _positive_budget("SUPERTABLE_MAX_LIMIT", 5000),
+            )
+
         # SHOW STATS short-circuits the engine entirely — it returns the raw
         # statistics artifact, no reflection/estimation/execution.
         if command.kind is CommandKind.SHOW_STATS:
@@ -397,13 +640,28 @@ class DataReader:
         # Build parser with the correct dialect for the chosen engine. For
         # EXPLAIN, parse only the inner SELECT so estimation/RBAC/reflection
         # behave exactly as for the equivalent plain SELECT.
-        parser = SQLParser(
-            super_name=self.super_name,
-            query=command.sql,
-            dialect=engine.dialect,
-        )
+        try:
+            parser = SQLParser(
+                super_name=self.super_name,
+                query=bounded_sql,
+                dialect=engine.dialect,
+                allow_bounded_collection_aggregates=(
+                    self._allow_bounded_collection_aggregates
+                ),
+            )
+        except ValueError as e:
+            logger.warning(self._lp(f"rejected query: {e}"))
+            return pd.DataFrame(), Status.ERROR, str(e)
         tables = parser.get_table_tuples()
         physical_tables = parser.get_physical_tables()
+
+        try:
+            aggregate_children = self._resolve_aggregate_children(
+                physical_tables
+            )
+        except Exception as e:
+            logger.warning(self._lp(f"aggregate expansion failed: {e}"))
+            return pd.DataFrame(), Status.ERROR, str(e)
 
         # Read-path policy: reads never create. Verify every referenced
         # (super, simple) exists in the Redis catalog **before** anything
@@ -431,13 +689,16 @@ class DataReader:
 
         # RBAC check — also returns per-alias column/row filter definitions.
         # PermissionError propagates to the caller (legacy behaviour).
-        rbac_views = restrict_read_access(
-            super_name=self.super_name,
-            organization=self.organization,
-            role_name=role_name,
-            tables=tables,
-            physical_tables=physical_tables,
-        )
+        rbac_kwargs = {
+            "super_name": self.super_name,
+            "organization": self.organization,
+            "role_name": role_name,
+            "tables": tables,
+            "physical_tables": physical_tables,
+        }
+        if aggregate_children:
+            rbac_kwargs["aggregate_children"] = aggregate_children
+        rbac_views = restrict_read_access(**rbac_kwargs)
 
         try:
             observation_store = None
@@ -507,7 +768,7 @@ class DataReader:
                         f"[prune] join-edge extraction failed: {je_err}"))
 
             # 1) ESTIMATE — use physical_tables so CTE aliases are excluded
-            estimator = DataEstimator(
+            estimator_kwargs = dict(
                 organization=self.organization,
                 storage=self.storage,
                 tables=physical_tables,
@@ -516,6 +777,9 @@ class DataReader:
                 join_pruning_lanes=_engine_safe_join_pruning_lanes(engine),
                 plan_stats=self.plan_stats,
             )
+            if aggregate_children:
+                estimator_kwargs["aggregate_children"] = aggregate_children
+            estimator = DataEstimator(**estimator_kwargs)
             reflection = estimator.estimate()
 
             logger.info(self._lp(f"[estimate] storage={reflection.storage_type} | files={reflection.total_reflections} | bytes={reflection.reflection_bytes}"))
@@ -646,40 +910,122 @@ class DataReader:
             if command.explain:
                 from supertable.engine.engine_enum import Engine as _EngineEnum
                 exec_engine = _EngineEnum.DUCKDB
-            result_df, engine_used = executor.execute(
-                engine=exec_engine,
-                reflection=reflection,
-                parser=parser,
-                query_manager=self.query_plan_manager,
-                timer=self.timer,
-                plan_stats=self.plan_stats,
-                log_prefix=self._lp(""),
-                explain=command.explain,
-                explain_options=command.explain_options,
-            )
-            try:
-                result_bytes = int(
-                    result_df.memory_usage(index=False, deep=True).sum()
+            if _streaming:
+                if command.explain:
+                    raise ValueError("EXPLAIN does not support result streaming")
+                result_value, _engine_used = executor.execute_stream(
+                    engine=exec_engine,
+                    reflection=reflection,
+                    parser=parser,
+                    query_manager=self.query_plan_manager,
+                    timer=self.timer,
+                    plan_stats=self.plan_stats,
+                    log_prefix=self._lp(""),
+                    max_batch_rows=_stream_batch_rows,
                 )
-            except Exception:
-                result_bytes = 0
-            self.plan_stats.add_stat({
-                "RESULT_BYTES": max(0, result_bytes),
-                "RESULT_ROWS": max(0, int(result_df.shape[0])),
-                "RESULT_COLUMNS": max(0, int(result_df.shape[1])),
-            })
+                result_shape = (0, len(result_value.schema))
+                self.plan_stats.add_stat({
+                    "RESULT_ROWS": None,
+                    "RESULT_COLUMNS": result_shape[1],
+                    "RESULT_MODE": "arrow_stream",
+                })
+            else:
+                result_value, _engine_used = executor.execute(
+                    engine=exec_engine,
+                    reflection=reflection,
+                    parser=parser,
+                    query_manager=self.query_plan_manager,
+                    timer=self.timer,
+                    plan_stats=self.plan_stats,
+                    log_prefix=self._lp(""),
+                    explain=command.explain,
+                    explain_options=command.explain_options,
+                )
+                result_shape = result_value.shape
+                try:
+                    result_bytes = int(
+                        result_value.memory_usage(index=False, deep=True).sum()
+                    )
+                except Exception:
+                    result_bytes = 0
+                self.plan_stats.add_stat({
+                    "RESULT_BYTES": max(0, result_bytes),
+                    "RESULT_ROWS": max(0, int(result_shape[0])),
+                    "RESULT_COLUMNS": max(0, int(result_shape[1])),
+                })
             status = Status.OK
         except Exception as e:
             message = _redact_storage_credentials(e)
             logger.error(self._lp(f"Exception: {message}"))
-            result_df = pd.DataFrame()
+            result_value = pd.DataFrame()
+            result_shape = result_value.shape
 
-        # Extend plan + timings
+        # A created Arrow stream is not yet a successful read. Defer the plan
+        # metric until exhaustion/cancel/error so status, rows and bytes describe
+        # what the consumer actually observed and the engine profile is final.
+        if _streaming and status is Status.OK:
+            stream_timer = self.timer
+            stream_plan_stats = self.plan_stats
+            stream_qpm = self.query_plan_manager
+            if (
+                stream_timer is None
+                or stream_plan_stats is None
+                or stream_qpm is None
+            ):
+                _cancel_and_close_stream(result_value)
+                raise RuntimeError(
+                    "stream execution completed without monitoring context"
+                )
+            result_columns = max(0, int(result_shape[1]))
+
+            def _finalize_stream_monitoring(
+                final_status: str,
+                final_message: Optional[str],
+                result_rows: int,
+                result_bytes: int,
+            ) -> None:
+                stream_plan_stats.add_stat({
+                    "RESULT_BYTES": max(0, int(result_bytes)),
+                    "RESULT_ROWS": max(0, int(result_rows)),
+                    "RESULT_COLUMNS": result_columns,
+                    "RESULT_MODE": "arrow_stream_final",
+                })
+                stream_timer.capture_and_reset_timing(event="EXECUTING_QUERY")
+                stream_timer.capture_duration(event="TOTAL_EXECUTE")
+                try:
+                    extend_execution_plan(
+                        query_plan_manager=stream_qpm,
+                        role_name=role_name,
+                        timing=stream_timer.timings,
+                        plan_stats=stream_plan_stats,
+                        status=final_status,
+                        message=(
+                            _redact_storage_credentials(final_message)
+                            if final_message else None
+                        ),
+                        result_shape=(result_rows, result_columns),
+                    )
+                except MonitoringDurabilityError as exc:
+                    raise MonitoringPostExecutionError(
+                        organization=stream_qpm.organization,
+                        super_name=stream_qpm.super_name,
+                        query_id=str(getattr(stream_qpm, "query_id", "")),
+                        status=final_status,
+                        cause=exc,
+                    ) from exc
+                finally:
+                    stream_timer.capture_and_reset_timing(event="EXTENDING_PLAN")
+
+            return (
+                _MonitoredResultStream(result_value, _finalize_stream_monitoring),
+                status,
+                message,
+            )
+
+        # Materialized/error outcomes are final here. Capture end-to-end query
+        # latency before monitoring itself so Redis/WAL latency does not distort
+        # engine feedback.
         self.timer.capture_and_reset_timing(event="EXECUTING_QUERY")
-        # Capture end-to-end query latency before monitoring itself.  The
-        # normalized cross-engine observation uses this stable field for AUTO
-        # feedback; including Redis enqueue/profile serialization would make
-        # the engine look slower merely because monitoring was slow.
         self.timer.capture_duration(event="TOTAL_EXECUTE")
         try:
             extend_execution_plan(
@@ -689,13 +1035,46 @@ class DataReader:
                 plan_stats=self.plan_stats,
                 status=str(status.value),
                 message=message,
-                result_shape=result_df.shape,
+                result_shape=result_shape,
             )
+        except MonitoringDurabilityError as e:
+            if _streaming:
+                _cancel_and_close_stream(result_value)
+            qpm = self.query_plan_manager
+            raise MonitoringPostExecutionError(
+                organization=str(getattr(qpm, "organization", self.organization)),
+                super_name=str(getattr(qpm, "super_name", self.super_name)),
+                query_id=str(getattr(qpm, "query_id", "")),
+                status=str(status.value),
+                cause=e,
+            ) from e
         except Exception as e:
             logger.error(self._lp(f"extend_execution_plan exception: {e}"))
 
         self.timer.capture_and_reset_timing(event="EXTENDING_PLAN")
-        return result_df, status, message
+        return result_value, status, message
+
+    def execute_stream(
+        self,
+        role_name: str,
+        engine: engine = engine.ISLANDDB,
+        *,
+        max_batch_rows: Optional[int] = None,
+    ) -> Tuple[Any, Status, Optional[str]]:
+        """Execute through the normal preflight/RBAC path as an Arrow stream.
+
+        Streaming is intentionally explicit and never disguises a materialized
+        fallback. DuckDB and IslandDB return cancellable Arrow batches (AUTO
+        may safely select either); unsupported Spark requests return the
+        ordinary ``Status.ERROR`` result without running user SQL.
+        """
+        return self.execute(
+            role_name=role_name,
+            engine=engine,
+            with_scan=False,
+            _streaming=True,
+            _stream_batch_rows=max_batch_rows,
+        )
 
 def _ensure_sql_limit(sql: str, default_limit: int) -> str:
     """
@@ -706,15 +1085,108 @@ def _ensure_sql_limit(sql: str, default_limit: int) -> str:
     already specify their own LIMIT, subqueries that contain LIMIT internally,
     or CTEs.
     """
-    # Strip trailing whitespace and optional semicolons for inspection
-    stripped = sql.rstrip().rstrip(";").rstrip()
+    try:
+        requested = int(default_limit)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Query limit must be an integer") from exc
+    requested = max(0, requested)
+    maximum = _positive_budget("SUPERTABLE_MAX_LIMIT", 5000)
+    enforced = min(requested, maximum)
 
-    # Check if the query already ends with LIMIT <number> (possibly with OFFSET)
-    # Pattern: LIMIT <digits> [OFFSET <digits>] at the very end
-    if re.search(r'\bLIMIT\s+\d+\s*(?:OFFSET\s+\d+\s*)?$', stripped, re.IGNORECASE):
-        return sql
+    # Inspect the actual outer query node. Regex-only detection mistakes nested
+    # LIMITs for response bounds and cannot clamp a client-supplied huge limit.
+    stripped_for_parse = sql.rstrip()
+    while stripped_for_parse.endswith(";"):
+        stripped_for_parse = stripped_for_parse[:-1].rstrip()
+    try:
+        statements = sqlglot.parse(stripped_for_parse, read="duckdb")
+        root = statements[0] if len(statements) == 1 else None
+    except Exception:
+        root = None
+    if root is not None:
+        limit_node = root.args.get("limit")
+        if limit_node is not None:
+            expression = getattr(limit_node, "expression", None)
+            current = None
+            if isinstance(expression, exp.Literal) and not expression.is_string:
+                try:
+                    current = int(expression.this)
+                except (TypeError, ValueError, OverflowError):
+                    current = None
+            if current is not None and 0 <= current <= enforced:
+                return sql
+            # LIMIT ALL, expressions, negative limits, and numeric limits over
+            # the server ceiling are replaced at the outer AST node.
+            return root.limit(enforced, copy=True).sql(dialect="duckdb")
 
-    return f"{sql}\nLIMIT {int(default_limit)}"
+    # Preserve familiar formatting for the no-LIMIT path while removing
+    # trailing semicolons so the injected clause remains part of the statement.
+    stripped = sql.rstrip()
+    while stripped.endswith(";"):
+        stripped = stripped[:-1].rstrip()
+    return f"{stripped}\nLIMIT {enforced}"
+
+
+def _json_safe_result_value(value: Any) -> Any:
+    """Return the exact JSON-safe value retained in a public result row.
+
+    Arrow can produce nested values, datetimes, decimals, bytes and non-finite
+    floats. Byte accounting must encode the same object that ``query_sql``
+    returns; using ``default=str`` only while measuring would under-specify the
+    downstream payload and leave raw unserializable objects in ``rows``.
+    """
+    if value is None or value is pd.NA or value is pd.NaT:
+        return None
+    if type(value).__module__.startswith("numpy"):
+        item = getattr(value, "item", None)
+        if callable(item):
+            try:
+                return _json_safe_result_value(item())
+            except (TypeError, ValueError, OverflowError):
+                return str(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            # DuckDB materializes TIMESTAMPTZ in the connection/session zone.
+            # Public rows and their serialized-byte accounting must be stable
+            # across hosts, so represent the instant canonically in UTC.
+            return (
+                value.astimezone(timezone.utc)
+                .isoformat(timespec="microseconds")
+                .replace("+00:00", "Z")
+            )
+        # A timezone-free SQL TIMESTAMP is a wall-clock value, not an instant.
+        # Preserve that distinction while making its representation explicit.
+        return value.isoformat(timespec="microseconds")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe_result_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_result_value(item) for item in value]
+    try:
+        json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        return str(value)
+    return value
+
+
+def _public_arrow_type_name(field_type: Any) -> str:
+    """Return stable metadata for the JSON-safe public Arrow result.
+
+    Arrow's TIMESTAMPTZ type names include the DuckDB session timezone even
+    though the public values above are normalized to UTC. Expose the normalized
+    value contract rather than deployment-local connection state.
+    """
+    source_timezone = getattr(field_type, "tz", None)
+    unit = getattr(field_type, "unit", None)
+    if source_timezone is not None and unit:
+        return f"timestamp[{unit}, tz=UTC]"
+    return str(field_type)
 
 
 def query_sql(
@@ -750,12 +1222,35 @@ def query_sql(
         organization=organization, super_name=super_name, query=sql, source=source,
     )
 
-    # Execute the query
-    result_df, status, message = reader.execute(
-        role_name=role_name,
-        engine=engine,
-        with_scan=False,
-    )
+    # SELECT responses use the Arrow stream in the normal API path.  Applying
+    # the JSON byte budget after ``fetchdf()`` is too late: a few very wide
+    # cells can consume unbounded pandas memory despite the outer row LIMIT.
+    # Spark does not expose a cancellable incremental result contract here, so
+    # fail explicitly instead of silently falling back to materialization.
+    from supertable.engine.engine_enum import Engine as _EngineEnum
+
+    stream_response = bool(is_select and isinstance(engine, _EngineEnum))
+    if stream_response and engine is _EngineEnum.SPARK_SQL:
+        raise RuntimeError(
+            "Bounded query_sql responses do not support Spark SQL streaming"
+        )
+    if stream_response:
+        result_value, status, message = reader.execute_stream(
+            role_name=role_name,
+            engine=engine,
+            # Serialized-byte accounting begins after a native Arrow batch is
+            # produced. One row per producer batch prevents multiple
+            # arbitrary-width cells from accumulating ahead of that guard.
+            max_batch_rows=1,
+        )
+    else:
+        # Diagnostic commands are intrinsically bounded; the non-enum branch
+        # also preserves duck-typed compatibility for custom/test executors.
+        result_value, status, message = reader.execute(
+            role_name=role_name,
+            engine=engine,
+            with_scan=False,
+        )
 
     # Expose the query identity so the caller (e.g. the MCP audit log) can
     # link back to this read's monitoring entry. Populated even on error,
@@ -769,23 +1264,81 @@ def query_sql(
     if status == Status.ERROR:
         raise RuntimeError(f"Query execution failed: {message}")
 
+    max_serialized_bytes = _positive_budget(
+        "SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES", 16 * 1024 * 1024,
+    )
+
+    if stream_response:
+        stream = result_value
+        schema = getattr(stream, "schema", None)
+        if schema is None:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+            raise RuntimeError("Query execution returned an invalid Arrow stream")
+        columns = [str(name) for name in schema.names]
+        columns_meta = [
+            {
+                "name": str(field.name),
+                "type": _public_arrow_type_name(field.type),
+                "nullable": bool(field.nullable),
+            }
+            for field in schema
+        ]
+        rows: List[List[Any]] = []
+        serialized_bytes = len(json.dumps(
+            {"columns": columns, "rows": [], "columns_meta": columns_meta},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8"))
+        if serialized_bytes > max_serialized_bytes:
+            stream.close()
+            raise RuntimeError(
+                "Query result exceeds SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES"
+            )
+        try:
+            for batch in stream:
+                # Convert one row at a time. ``RecordBatch.to_pylist()`` would
+                # allocate a second copy of the complete batch before the byte
+                # guard gets a chance to stop consumption.
+                for row_index in range(batch.num_rows):
+                    row = [
+                        _json_safe_result_value(
+                            batch.column(column_index)[row_index].as_py()
+                        )
+                        for column_index in range(batch.num_columns)
+                    ]
+                    try:
+                        encoded = json.dumps(
+                            row,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError(
+                            "Query result is not JSON serializable"
+                        ) from exc
+                    serialized_bytes += len(encoded) + (1 if rows else 0)
+                    if serialized_bytes > max_serialized_bytes:
+                        cancel = getattr(stream, "cancel", None)
+                        try:
+                            if callable(cancel):
+                                cancel()
+                        except Exception:
+                            pass
+                        raise RuntimeError(
+                            "Query result exceeds "
+                            "SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES"
+                        )
+                    rows.append(row)
+        finally:
+            stream.close()
+        return columns, rows, columns_meta
+
     # Convert DataFrame to the expected format
+    result_df = result_value
     columns = list(result_df.columns)
-
-    # Sanitize pandas NA variants (pd.NA, pd.NaT, np.nan) to Python None
-    # so downstream JSON serialization does not choke on NAType.
-    # Note: DataFrame.where() + .values.tolist() does NOT fully sanitize
-    # nullable dtypes (Int64, string) or np.nan in float columns.
-    # We must sanitize the final Python objects after .tolist().
-    rows = result_df.values.tolist()
-    for row in rows:
-        for i, val in enumerate(row):
-            if val is pd.NA or val is pd.NaT:
-                row[i] = None
-            elif isinstance(val, float) and math.isnan(val):
-                row[i] = None
-
-    # Create basic column metadata
     columns_meta = [
         {
             "name": col,
@@ -794,5 +1347,38 @@ def query_sql(
         }
         for col in columns
     ]
+
+    # Sanitize pandas NA variants (pd.NA, pd.NaT, np.nan) to Python None
+    # so downstream JSON serialization does not choke on NAType.
+    # Note: DataFrame.where() + .values.tolist() does NOT fully sanitize
+    # nullable dtypes (Int64, string) or np.nan in float columns.
+    # We must sanitize the final Python objects after .tolist().
+    rows = []
+    serialized_bytes = len(json.dumps(
+        {"columns": columns, "rows": [], "columns_meta": columns_meta},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8"))
+    if serialized_bytes > max_serialized_bytes:
+        raise RuntimeError(
+            "Query result exceeds SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES"
+        )
+    for raw_row in result_df.itertuples(index=False, name=None):
+        row = [_json_safe_result_value(value) for value in raw_row]
+        try:
+            encoded = json.dumps(
+                row,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Query result is not JSON serializable") from exc
+        serialized_bytes += len(encoded) + (1 if rows else 0)
+        if serialized_bytes > max_serialized_bytes:
+            raise RuntimeError(
+                "Query result exceeds SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES"
+            )
+        rows.append(row)
 
     return columns, rows, columns_meta

@@ -1,7 +1,7 @@
 {
   "scenario": "key_int_float_coercion",
   "category": "keys",
-  "description": "Selecting an int key ALONGSIDE a float column triggers numpy homogeneous-array coercion in result_df.values.tolist(): the int key is returned as a float. Sealed as-is (a current quirk).",
+  "description": "Arrow streaming preserves each column's scalar type: selecting an int key alongside a float no longer coerces the integer key to float.",
   "business_key_columns": [
     "id"
   ],
@@ -18,7 +18,7 @@
     ]
   },
   "input_checksum": "sha256:fd9167c168624fa76faa18d3493fc785d28445ec619af01b81e5988a9ed5c212",
-  "expected_checksum": "sha256:a871a98fbf39d4d42d5964d041366932c3c98f9ec022eeb2772293a711c35756",
+  "expected_checksum": "sha256:15d93d1e1cb14d10f1087ef8a5599fa91465f2eaee4991589709ec2566a6d92f",
   "created_from": "deletion-vector-current-reader",
   "contains_internal_rowid": false
 }

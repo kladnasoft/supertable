@@ -9,6 +9,305 @@ from sqlglot.optimizer.scope import traverse_scope
 from supertable.data_classes import JoinEdge, PredInterval, TableDefinition
 
 
+# User queries execute in backend sessions that also own managed reflection
+# views.  A read-only SELECT is therefore not, by itself, a sandbox: DuckDB
+# exposes connection settings, secret catalogs, files, extension entry points,
+# and environment-dependent helpers as functions.  Keep the public SQL surface
+# explicit and fail closed when sqlglot learns about (or an extension adds) a
+# new function.
+_COMMON_READ_FUNCTIONS = frozenset({
+    # Boolean/conditional/type expressions.
+    "and", "case", "cast", "coalesce", "decode", "exists", "if",
+    "nullif", "nvl2", "or", "try", "try_cast", "typeof",
+    # Numeric expressions and aggregates.
+    "abs", "any_value", "approx_distinct", "approx_quantile", "avg", "cbrt",
+    "ceil", "corr", "count", "count_if",
+    "covar_pop", "covar_samp", "exp", "floor", "greatest", "least", "ln",
+    "log", "max", "median", "min", "percentile_cont", "percentile_disc",
+    "power", "quantile", "rand", "randn", "round", "safe_divide", "sign",
+    "sqrt", "stddev", "stddev_pop", "stddev_samp", "sum", "variance",
+    "variance_pop",
+    # String/binary expressions.
+    "cast_to_str_type", "chr", "collate", "concat", "concat_ws",
+    "contains", "encode", "ends_with", "from_base", "from_base64", "hex",
+    "initcap", "is_ascii", "left", "length", "levenshtein", "lower",
+    "lower_hex", "md5", "md5_digest", "normalize", "overlay",
+    "regexp_extract", "regexp_extract_all", "regexp_ilike", "regexp_like",
+    "regexp_replace", "regexp_split", "replace", "right", "sha", "sha2",
+    "split", "split_part", "starts_with", "str_position", "string",
+    "string_to_array", "stuff", "substring", "substring_index", "to_base64",
+    "to_char", "trim", "unhex", "unicode", "upper",
+    # Temporal expressions.  Current clock values are data, not session
+    # identity; connection/catalog identity functions are intentionally absent.
+    "add_months", "current_date", "current_datetime", "current_time",
+    "current_timestamp", "current_timestamp_l_t_z", "date", "datediff",
+    "datetime", "datetime_add", "datetime_diff", "datetime_sub",
+    "datetime_trunc", "date_add", "date_bin", "date_from_parts",
+    "date_str_to_date", "date_sub", "date_to_date_str", "date_trunc", "day",
+    "dayofweek_iso", "day_of_month", "day_of_week", "day_of_year", "extract",
+    "from_iso8601_timestamp", "last_day", "make_interval", "month",
+    "months_between", "quarter", "str_to_date", "str_to_time", "str_to_unix",
+    "time", "timestamp", "timestampdiff", "timestamp_add",
+    "timestamp_from_parts", "timestamp_sub", "timestamp_trunc", "time_add",
+    "time_diff", "time_from_parts", "time_str_to_date", "time_str_to_time",
+    "time_str_to_unix", "time_sub", "time_to_str", "time_to_time_str",
+    "time_to_unix", "time_trunc", "to_days", "ts_or_di_to_di",
+    "ts_or_ds_add", "ts_or_ds_diff", "ts_or_ds_to_date",
+    "ts_or_ds_to_datetime", "ts_or_ds_to_date_str", "ts_or_ds_to_time",
+    "ts_or_ds_to_timestamp", "unix_date", "unix_seconds", "unix_to_str",
+    "unix_to_time", "unix_to_time_str", "week", "week_of_year", "year",
+    # Bounded value-container and JSON operations.  Row generators, dynamic
+    # table functions, XML/JSON table functions, and external readers are not
+    # part of this list.
+    "array", "array_all", "array_any", "array_concat",
+    "array_contains", "array_contains_all", "array_first", "array_intersect",
+    "array_last", "array_overlaps", "array_remove", "array_reverse",
+    "array_size", "array_slice", "array_sort", "array_sum", "array_to_string",
+    "json_array_contains", "json_extract", "json_extract_array",
+    "json_extract_scalar", "json_format", "jsonb_contains", "jsonb_exists",
+    "jsonb_extract", "jsonb_extract_scalar", "j_s_o_n_array", "j_s_o_n_cast",
+    "j_s_o_n_exists", "j_s_o_n_object", "j_s_o_n_value_array", "map",
+    "map_from_entries", "object_insert", "parse_json", "struct",
+    "struct_extract", "to_array", "to_double", "to_map", "to_number",
+    # Analytic aggregates/window functions.
+    "first", "first_value", "lag", "last", "last_value", "lead",
+    "logical_and", "logical_or", "nth_value", "row_number", "var_map", "xor",
+})
+
+
+# DuckDB functions that sqlglot intentionally represents as Anonymous.  They
+# receive the same closed-list treatment as modelled functions.  In particular,
+# current_setting, getvariable, duckdb_*, pragma_*, read_*, glob,
+# input_file_name, query/query_table, getenv, and extension/UDF names are absent.
+_DUCKDB_READ_FUNCTIONS = frozenset({
+    "arbitrary", "ascii", "bit_and", "bit_count", "bit_length", "bit_or", "bit_xor",
+    "bool_and", "bool_or", "date_diff", "date_part", "dayofmonth",
+    "dayofweek", "dayofyear", "dense_rank", "entropy", "epoch", "epoch_ms",
+    "epoch_ns", "epoch_us", "even", "favg", "fsum",
+    "gamma", "geometric_mean", "hash", "ifnull", "instr", "isfinite",
+    "kurtosis", "kurtosis_pop", "lcase", "lgamma", "mad",
+    "make_date", "make_time", "make_timestamp", "make_timestamptz", "mode",
+    "nvl", "ntile", "percent_rank", "product", "rank",
+    "regr_avgx", "regr_avgy", "regr_count", "regr_intercept", "regr_r2",
+    "regr_slope", "regr_sxx", "regr_sxy", "regr_syy", "regexp_escape",
+    "regexp_full_match", "regexp_matches", "reverse", "sem",
+    "signbit", "skewness", "stddev_pop", "stddev_samp",
+    "strftime", "strip_accents", "strpos", "strptime", "time_bucket",
+    "translate", "trunc", "ucase", "var_pop", "var_samp", "weekofyear",
+    "weighted_avg", "yearweek",
+})
+
+
+_READ_FUNCTIONS_BY_DIALECT = {
+    "duckdb": _COMMON_READ_FUNCTIONS | _DUCKDB_READ_FUNCTIONS,
+    # Spark execution performs a second validation with its own backend list.
+    # Keeping the parser baseline explicit also makes direct Spark parsing fail
+    # closed until that backend opts a function in.
+    "spark": _COMMON_READ_FUNCTIONS,
+}
+
+# SQLGlot 26.x represents these DuckDB session/catalog expressions as plain
+# unqualified ``Column`` nodes rather than ``Func`` nodes.  DuckDB nevertheless
+# evaluates them as connection metadata, so the function allowlist alone does
+# not cover them.  Match only the exact, unquoted and unqualified spelling:
+# ``records.user`` and ``"USER"`` remain ordinary data-column references.
+_BARE_SESSION_IDENTIFIERS_BY_DIALECT = {
+    "duckdb": frozenset({
+        "user",
+        "session_user",
+        "current_role",
+        "current_catalog",
+        "current_schema",
+    }),
+}
+
+_COLLECTION_AGGREGATE_FUNCTIONS = frozenset({
+    "array_agg", "array_concat_agg", "array_union_agg", "array_unique_agg",
+    "group_concat", "j_s_o_n_array_agg", "j_s_o_n_b_object_agg",
+    "j_s_o_n_object_agg", "list", "string_agg",
+})
+_MAX_COLLECTION_AGGREGATE_SOURCE_ROWS = 10
+
+
+def _normalized_function_name(node: exp.Func) -> str:
+    if isinstance(node, (exp.Anonymous, exp.AnonymousAggFunc)):
+        return str(node.name or "").strip().casefold()
+    return str(node.sql_name() or "").strip().casefold()
+
+
+def _has_bounded_collection_source(node: exp.Func) -> bool:
+    """Require collection aggregates to consume an explicitly capped subquery."""
+    owner = node.parent
+    while owner is not None and not isinstance(owner, exp.Select):
+        owner = owner.parent
+    if not isinstance(owner, exp.Select):
+        return False
+    from_clause = owner.args.get("from")
+    source = getattr(from_clause, "this", None)
+    if not isinstance(source, exp.Subquery) or not isinstance(source.this, exp.Select):
+        return False
+    limit = source.this.args.get("limit")
+    if limit is None or any(
+        value is not None
+        for key, value in limit.args.items()
+        if key != "expression"
+    ):
+        return False
+    limit_expression = getattr(limit, "expression", None)
+    if isinstance(limit_expression, exp.Literal) and not limit_expression.is_string:
+        try:
+            value = int(str(limit_expression.this))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return 0 <= value <= _MAX_COLLECTION_AGGREGATE_SOURCE_ROWS
+
+    return False
+
+
+def validate_read_query_functions(
+    parsed: exp.Expression,
+    dialect: str,
+    *,
+    allow_bounded_collection_aggregates: bool = False,
+) -> None:
+    """Reject every backend function outside the read-query allowlist.
+
+    This validation is deliberately based on the parsed AST, not SQL text, so
+    quoting, comments, qualification, nesting, CTEs, and window clauses cannot
+    hide a call.  Backends that can be selected after initial parsing (AUTO)
+    must call this helper again immediately before execution with their actual
+    dialect.
+    """
+    allowed = _READ_FUNCTIONS_BY_DIALECT.get(str(dialect).casefold())
+    if allowed is None:
+        raise ValueError(f"Unsupported SQL dialect for read query: {dialect!r}")
+
+    for node in parsed.find_all(exp.Func):
+        name = _normalized_function_name(node)
+        # ``evil.sum(x)`` parses as Dot(Identifier, Anonymous('sum')).  A
+        # name-only check would mistake a namespaced UDF/extension function for
+        # the trusted built-in of the same name.
+        qualified = isinstance(node.parent, exp.Dot)
+        collection_allowed = (
+            allow_bounded_collection_aggregates
+            and
+            name in _COLLECTION_AGGREGATE_FUNCTIONS
+            and _has_bounded_collection_source(node)
+        )
+        fixed_width_arg_extreme = (
+            name in {"arg_max", "arg_min"}
+            and node.args.get("count") is None
+        )
+        if qualified or not name or not (
+            name in allowed or collection_allowed or fixed_width_arg_extreme
+        ):
+            safe_name = name or type(node).__name__.casefold()
+            raise ValueError(
+                f"SQL function '{safe_name}' is not allowed in supertable "
+                "read queries"
+            )
+
+
+def _reject_unmanaged_table_sources(
+    parsed: exp.Expression,
+    dialect: str,
+) -> None:
+    """Require every physical FROM source to be a rewritable identifier."""
+    for table in parsed.find_all(exp.Table):
+        if table.args.get("version") is not None or table.args.get("when") is not None:
+            raise ValueError(
+                "VERSION/TIMESTAMP AS OF is not supported until historical "
+                "supertable snapshots and deletion vectors can be pinned together"
+            )
+        source = table.this
+        if not isinstance(source, exp.Identifier):
+            rendered = table.sql(dialect=dialect)
+            raise ValueError(
+                "External or table-valued sources are not allowed in "
+                f"supertable SELECT queries: {rendered}"
+            )
+        name = str(source.this or "")
+        lowered = name.lower()
+        if source.args.get("quoted") and (
+            "/" in name
+            or "\\" in name
+            or lowered.startswith(("s3:", "s3a:", "http:", "https:"))
+            or lowered.endswith((".parquet", ".csv", ".json"))
+        ):
+            raise ValueError(
+                "External file sources are not allowed in supertable "
+                f"SELECT queries: {table.sql(dialect=dialect)}"
+            )
+
+
+def _reject_bare_session_identifiers(
+    parsed: exp.Expression,
+    dialect: str,
+) -> None:
+    """Reject backend identity expressions parsed as ordinary columns."""
+    denied = _BARE_SESSION_IDENTIFIERS_BY_DIALECT.get(
+        str(dialect).casefold(), frozenset()
+    )
+    if not denied:
+        return
+    for column in parsed.find_all(exp.Column):
+        identifier = column.this
+        if (
+            column.table
+            or column.db
+            or column.catalog
+            or not isinstance(identifier, exp.Identifier)
+            or bool(identifier.args.get("quoted"))
+        ):
+            continue
+        name = str(identifier.this or "").strip().casefold()
+        if name in denied:
+            raise ValueError(
+                f"DuckDB session identity expression '{name}' is not allowed "
+                "in supertable read queries; quote or qualify it to read a "
+                "data column with that name"
+            )
+
+
+def validate_read_query_ast(
+    parsed: exp.Expression,
+    dialect: str,
+    *,
+    allow_bounded_collection_aggregates: bool = False,
+) -> None:
+    """Validate the complete read AST at parser and backend boundaries."""
+    if not isinstance(parsed, exp.Query):
+        raise ValueError(
+            "Only read-only SELECT/WITH/set-operation queries are allowed "
+            "on the supertable read path"
+        )
+    mutating_types = tuple(
+        expression_type
+        for name in (
+            "Insert", "Update", "Delete", "Merge", "Create", "Drop",
+            "Alter", "Command", "Copy", "Transaction", "Commit", "Rollback",
+            "Grant", "Revoke", "TruncateTable", "Into", "Lock",
+        )
+        if isinstance((expression_type := getattr(exp, name, None)), type)
+    )
+    if mutating_types and any(
+        isinstance(node, mutating_types) for node in parsed.walk()
+    ):
+        raise ValueError(
+            "Only read-only SELECT/WITH/set-operation queries are allowed "
+            "on the supertable read path"
+        )
+    _reject_unmanaged_table_sources(parsed, dialect)
+    _reject_bare_session_identifiers(parsed, dialect)
+    validate_read_query_functions(
+        parsed,
+        dialect,
+        allow_bounded_collection_aggregates=(
+            allow_bounded_collection_aggregates
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Predicate → interval extraction helpers (read-path file pruning)
 # ---------------------------------------------------------------------------
@@ -295,7 +594,14 @@ class SQLParser:
 
     SUPPORTED_DIALECTS = ("duckdb", "spark")
 
-    def __init__(self, super_name: str, query: str, dialect: str):
+    def __init__(
+        self,
+        super_name: str,
+        query: str,
+        dialect: str,
+        *,
+        allow_bounded_collection_aggregates: bool = False,
+    ):
         if not super_name or not isinstance(super_name, str):
             raise ValueError("Parameter 'super_name' must be a non-empty string.")
 
@@ -310,37 +616,19 @@ class SQLParser:
         self.default_super_name: str = super_name
         self.original_query: str = query
         self.dialect: str = dialect
+        self.allow_bounded_collection_aggregates = bool(
+            allow_bounded_collection_aggregates
+        )
 
         # Internal parsed expression
         self._parsed: exp.Expression = self._parse_query(query, dialect)
-        if not isinstance(self._parsed, exp.Query):
-            raise ValueError(
-                "Only read-only SELECT/WITH/set-operation queries are allowed "
-                "on the supertable read path"
-            )
-        # A read-only root is not sufficient: sqlglot can represent a SELECT
-        # whose CTE contains DML (for example ``WITH x AS (DELETE ...)") as a
-        # Query.  Reject mutating nodes recursively so a future backend cannot
-        # turn today's syntax error into an RBAC bypass.
-        mutating_types = tuple(
-            expression_type
-            for name in (
-                "Insert", "Update", "Delete", "Merge", "Create", "Drop",
-                "Alter", "Command", "Copy", "Transaction", "Commit",
-                "Rollback", "Grant", "Revoke", "TruncateTable",
-            )
-            if isinstance(
-                (expression_type := getattr(exp, name, None)), type
-            )
+        validate_read_query_ast(
+            self._parsed,
+            self.dialect,
+            allow_bounded_collection_aggregates=(
+                self.allow_bounded_collection_aggregates
+            ),
         )
-        if mutating_types and any(
-            isinstance(node, mutating_types) for node in self._parsed.walk()
-        ):
-            raise ValueError(
-                "Only read-only SELECT/WITH/set-operation queries are allowed "
-                "on the supertable read path"
-            )
-        self._reject_unmanaged_table_sources()
 
         # Predicate and join pruning analyses consume the same sqlglot scope
         # graph and are strictly read-only.  Build it lazily and retain an
@@ -453,10 +741,25 @@ class SQLParser:
     @staticmethod
     def _parse_query(query: str, dialect: str) -> exp.Expression:
         try:
-            return sqlglot.parse_one(query, read=dialect)
+            parsed = sqlglot.parse(query, read=dialect)
+            semicolon_type = getattr(exp, "Semicolon", None)
+            statements = [
+                statement
+                for statement in parsed
+                if statement is not None
+                and not (
+                    isinstance(semicolon_type, type)
+                    and isinstance(statement, semicolon_type)
+                )
+            ]
+            if len(statements) != 1:
+                raise ValueError("Exactly one SQL statement is required")
+            return statements[0]
         except ParseError as e:
             message = SQLParser._build_parse_error_message(e)
             raise ValueError(f"Failed to parse SQL query: {message}") from None
+        except ValueError:
+            raise
         except Exception as e:
             raise ValueError(
                 f"An unexpected error occurred while parsing SQL query: {e}"

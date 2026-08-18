@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 
-import supertable.config.homedir  # noqa: F401  (resolves the app home)
+from supertable.config.homedir import initialize_app_home
 from supertable.demo.medcenter.core import (
     GenerationConfig,
     MedcenterDataGenerator,
@@ -167,6 +167,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    initialize_app_home(change_cwd=True)
     args = parse_args()
     if args.year is not None:
         months = [f"{args.year}-{m:02d}" for m in range(1, 13)]

@@ -26,9 +26,10 @@ SDK state — they only touch Redis. None of them spawn threads or
 loops. Your service is expected to call them on its own schedule.
 
   * :func:`list_drainable_partitions` — discover what's drainable.
-  * :func:`drain_partition` — atomic read + delete of one partition.
-  * :func:`iter_partition_chunks` — memory-bounded streaming variant
-    with explicit resume semantics.
+  * :func:`claim_partition` — claim a small partition and return its receipt.
+  * :func:`claim_partition_chunks` + :func:`iter_claimed_partition_chunks` —
+    memory-bounded claim/stream with an operable explicit receipt.
+  * :func:`acknowledge_partition` — delete only after the sink commits.
 
 Mapping to internal sink tables
 -------------------------------
@@ -42,10 +43,12 @@ sink tables are exempted from monitoring emission by
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterator, List, NamedTuple, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Sequence
 
 from supertable import redis_keys as RK
 
@@ -114,6 +117,32 @@ class MonitorPartition(NamedTuple):
     date: str  # ISO 8601 YYYY-MM-DD
 
 
+class MonitoringPartitionError(RuntimeError):
+    """A drain could not be claimed or acknowledged without data loss."""
+
+
+@dataclass(frozen=True)
+class MonitorDrainClaim:
+    """A stable at-least-once claim which must be acknowledged explicitly."""
+
+    organization: str
+    monitor_type: str
+    date: str
+    receipt: str
+    entries: tuple[Dict[str, Any], ...]
+
+
+@dataclass(frozen=True)
+class MonitorChunkClaim:
+    """Receipt and immutable size for a memory-bounded drain claim."""
+
+    organization: str
+    monitor_type: str
+    date: str
+    receipt: str
+    entry_count: int
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -171,6 +200,344 @@ def _parse_entries(raw_entries: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _parse_entries_strict(raw_entries: Sequence[Any]) -> List[Dict[str, Any]]:
+    """Parse a drain without allowing malformed source rows to disappear."""
+
+    parsed: List[Dict[str, Any]] = []
+    for index, raw in enumerate(raw_entries or ()):
+        value = _decode(raw)
+        try:
+            item = json.loads(value)
+        except (json.JSONDecodeError, TypeError, UnicodeError) as exc:
+            raise MonitoringPartitionError(
+                f"monitoring drain entry {index} is not valid JSON"
+            ) from exc
+        if not isinstance(item, dict):
+            raise MonitoringPartitionError(
+                f"monitoring drain entry {index} is not a JSON object"
+            )
+        parsed.append(item)
+    return parsed
+
+
+def _new_receipt_hasher():
+    digest = hashlib.sha256()
+    digest.update(b"supertable-monitor-drain-v1\0")
+    return digest
+
+
+def _update_receipt_hasher(digest, raw_entries: Sequence[Any]) -> None:
+    for raw in raw_entries:
+        if isinstance(raw, bytes):
+            encoded = raw
+        elif isinstance(raw, str):
+            encoded = raw.encode("utf-8")
+        else:
+            raise MonitoringPartitionError(
+                "monitoring drain contains a non-text Redis value"
+            )
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+
+
+def _raw_receipt(raw_entries: Sequence[Any]) -> str:
+    digest = _new_receipt_hasher()
+    _update_receipt_hasher(digest, raw_entries)
+    return digest.hexdigest()
+
+
+_LUA_CLAIM_WITHOUT_EXPIRY = """
+local source = KEYS[1]
+local drain = KEYS[2]
+local drain_exists = redis.call('EXISTS', drain)
+local renamed = 0
+if drain_exists == 0 and redis.call('EXISTS', source) == 1 then
+    renamed = redis.call('RENAMENX', source, drain)
+end
+if redis.call('EXISTS', drain) == 1 then
+    -- RENAME preserves TTL. PERSIST in this same atomic script removes the
+    -- crash window where an acknowledged source becomes an expiring drain.
+    redis.call('PERSIST', drain)
+end
+return {renamed, redis.call('PTTL', drain)}
+"""
+
+
+def _claim_without_expiry(r: Any, source: str, drain: str) -> bool:
+    """Atomically claim a partition and make its drain non-expiring."""
+    try:
+        result = r.eval(_LUA_CLAIM_WITHOUT_EXPIRY, 2, source, drain)
+        if (
+            not isinstance(result, (list, tuple))
+            or len(result) != 2
+            or isinstance(result[0], bool)
+            or not isinstance(result[0], int)
+            or isinstance(result[1], bool)
+            or not isinstance(result[1], int)
+        ):
+            raise MonitoringPartitionError(
+                "monitoring claim script returned an invalid response"
+            )
+        renamed, pttl = result
+        if pttl not in {-1, -2}:
+            raise MonitoringPartitionError(
+                "claimed monitoring partition still has an expiry"
+            )
+        return bool(renamed)
+    except MonitoringPartitionError:
+        raise
+    except Exception as exc:
+        raise MonitoringPartitionError(
+            "could not atomically claim monitoring partition"
+        ) from exc
+
+
+def claim_partition(
+    catalog: Any,
+    *,
+    organization: str,
+    monitor_type: str,
+    date: str,
+) -> Optional[MonitorDrainClaim]:
+    """Claim and read a frozen partition without deleting its Redis source.
+
+    Call :func:`acknowledge_partition` with the returned receipt only after
+    the downstream sink durably and idempotently commits every entry.
+    """
+
+    r = _get_redis(catalog)
+    src = RK.monitor_partition(organization, monitor_type, date)
+    drain = RK.monitor_partition_drain(organization, monitor_type, date)
+    receipt_key = RK.monitor_partition_receipt(
+        organization, monitor_type, date,
+    )
+    try:
+        _claim_without_expiry(r, src, drain)
+        raw_entries = r.lrange(drain, 0, -1)
+    except Exception as exc:
+        raise MonitoringPartitionError(
+            f"could not read claimed monitoring partition "
+            f"{organization}/{monitor_type}/{date}"
+        ) from exc
+    if not raw_entries:
+        return None
+
+    receipt = _raw_receipt(raw_entries)
+    try:
+        created = r.set(receipt_key, receipt, nx=True)
+        persisted = r.get(receipt_key)
+    except Exception as exc:
+        raise MonitoringPartitionError(
+            "could not persist monitoring drain receipt"
+        ) from exc
+    # Minimal Redis duck-types used by embedders sometimes acknowledge SET NX
+    # without implementing a value-returning GET. Production redis-py always
+    # returns bytes/text here; accept the acknowledged creation in that narrow
+    # compatibility case, but never accept an explicit conflicting value.
+    if isinstance(persisted, (bytes, str)):
+        persisted_receipt = _decode(persisted)
+    elif created:
+        persisted_receipt = receipt
+    else:
+        persisted_receipt = None
+    if persisted_receipt != receipt:
+        raise MonitoringPartitionError(
+            "monitoring drain content differs from its persisted receipt"
+        )
+    return MonitorDrainClaim(
+        organization=organization,
+        monitor_type=monitor_type,
+        date=date,
+        receipt=receipt,
+        entries=tuple(_parse_entries_strict(raw_entries)),
+    )
+
+
+def _bounded_chunk_size(chunk_size: int) -> int:
+    try:
+        value = int(chunk_size)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("chunk_size must be an integer") from exc
+    return max(1, min(value, 1_000_000))
+
+
+def claim_partition_chunks(
+    catalog: Any,
+    *,
+    organization: str,
+    monitor_type: str,
+    date: str,
+    chunk_size: int = 10_000,
+) -> Optional[MonitorChunkClaim]:
+    """Claim and validate a partition using bounded ``LRANGE`` windows.
+
+    The returned receipt is the token passed to
+    :func:`acknowledge_partition` *after* every chunk has committed to an
+    idempotent sink. The drain's writer TTL is removed before this function
+    returns, so downstream delay cannot silently expire acknowledged work.
+    """
+
+    size = _bounded_chunk_size(chunk_size)
+    r = _get_redis(catalog)
+    src = RK.monitor_partition(organization, monitor_type, date)
+    drain = RK.monitor_partition_drain(organization, monitor_type, date)
+    receipt_key = RK.monitor_partition_receipt(
+        organization, monitor_type, date,
+    )
+    try:
+        _claim_without_expiry(r, src, drain)
+        total = int(r.llen(drain) or 0)
+    except MonitoringPartitionError:
+        raise
+    except Exception as exc:
+        raise MonitoringPartitionError(
+            "could not inspect claimed monitoring partition"
+        ) from exc
+    if total == 0:
+        return None
+
+    digest = _new_receipt_hasher()
+    for start in range(0, total, size):
+        stop = min(start + size, total) - 1
+        try:
+            raw = r.lrange(drain, start, stop)
+        except Exception as exc:
+            raise MonitoringPartitionError(
+                f"could not read monitoring claim window {start}..{stop}"
+            ) from exc
+        if len(raw) != stop - start + 1:
+            raise MonitoringPartitionError(
+                "monitoring drain changed while its receipt was calculated"
+            )
+        # Refuse poison rows before a downstream sink sees any part of this
+        # claim. Parsing is per-window and therefore remains memory bounded.
+        _parse_entries_strict(raw)
+        _update_receipt_hasher(digest, raw)
+    try:
+        if int(r.llen(drain) or 0) != total:
+            raise MonitoringPartitionError(
+                "monitoring drain changed while its receipt was calculated"
+            )
+        receipt = digest.hexdigest()
+        created = r.set(receipt_key, receipt, nx=True)
+        persisted = r.get(receipt_key)
+    except MonitoringPartitionError:
+        raise
+    except Exception as exc:
+        raise MonitoringPartitionError(
+            "could not persist bounded monitoring drain receipt"
+        ) from exc
+    persisted_receipt = _decode(persisted) if isinstance(persisted, (bytes, str)) else None
+    if persisted_receipt is None and created:
+        persisted_receipt = receipt
+    if persisted_receipt != receipt:
+        raise MonitoringPartitionError(
+            "monitoring drain content differs from its persisted receipt"
+        )
+    return MonitorChunkClaim(
+        organization=organization,
+        monitor_type=monitor_type,
+        date=date,
+        receipt=receipt,
+        entry_count=total,
+    )
+
+
+def iter_claimed_partition_chunks(
+    catalog: Any,
+    claim: MonitorChunkClaim,
+    *,
+    chunk_size: int = 10_000,
+) -> Iterator[List[Dict[str, Any]]]:
+    """Stream a bounded claim and re-verify its receipt before exhaustion.
+
+    Exhaustion does not acknowledge. Commit every yielded chunk idempotently,
+    let this iterator reach its verified end, then call
+    :func:`acknowledge_partition` with ``claim.receipt``.
+    """
+
+    if not isinstance(claim, MonitorChunkClaim):
+        raise TypeError("claim must be a MonitorChunkClaim")
+    size = _bounded_chunk_size(chunk_size)
+    r = _get_redis(catalog)
+    drain = RK.monitor_partition_drain(
+        claim.organization, claim.monitor_type, claim.date,
+    )
+    receipt_key = RK.monitor_partition_receipt(
+        claim.organization, claim.monitor_type, claim.date,
+    )
+    try:
+        persisted = r.get(receipt_key)
+        total = int(r.llen(drain) or 0)
+        pttl = int(r.pttl(drain))
+    except Exception as exc:
+        raise MonitoringPartitionError(
+            "could not reopen bounded monitoring drain claim"
+        ) from exc
+    if not isinstance(persisted, (bytes, str)) or _decode(persisted) != claim.receipt:
+        raise MonitoringPartitionError("monitoring chunk claim receipt is no longer current")
+    if total != claim.entry_count:
+        raise MonitoringPartitionError("monitoring chunk claim size changed before delivery")
+    if pttl != -1:
+        raise MonitoringPartitionError("monitoring chunk claim is not durable for delivery")
+
+    digest = _new_receipt_hasher()
+    for start in range(0, total, size):
+        stop = min(start + size, total) - 1
+        try:
+            raw = r.lrange(drain, start, stop)
+        except Exception as exc:
+            raise MonitoringPartitionError(
+                f"could not stream monitoring claim window {start}..{stop}"
+            ) from exc
+        if len(raw) != stop - start + 1:
+            raise MonitoringPartitionError("monitoring chunk claim changed during delivery")
+        _update_receipt_hasher(digest, raw)
+        yield _parse_entries_strict(raw)
+    if digest.hexdigest() != claim.receipt:
+        raise MonitoringPartitionError("monitoring chunk claim failed final receipt verification")
+
+
+def acknowledge_partition(
+    catalog: Any,
+    *,
+    organization: str,
+    monitor_type: str,
+    date: str,
+    receipt: str,
+) -> bool:
+    """Delete a claimed partition iff its exact receipt still matches."""
+
+    if (
+        not isinstance(receipt, str)
+        or len(receipt) != 64
+        or any(character not in "0123456789abcdef" for character in receipt)
+    ):
+        raise ValueError("receipt must be a lowercase SHA-256 digest")
+    r = _get_redis(catalog)
+    drain = RK.monitor_partition_drain(organization, monitor_type, date)
+    receipt_key = RK.monitor_partition_receipt(
+        organization, monitor_type, date,
+    )
+    script = """
+    if redis.call('get', KEYS[2]) ~= ARGV[1] then
+        return 0
+    end
+    local removed = redis.call('del', KEYS[1])
+    if removed ~= 1 then
+        return redis.error_reply('monitoring drain disappeared before acknowledgement')
+    end
+    redis.call('del', KEYS[2])
+    return 1
+    """
+    try:
+        return bool(r.eval(script, 2, drain, receipt_key, receipt))
+    except Exception as exc:
+        raise MonitoringPartitionError(
+            "monitoring partition acknowledgement was not confirmed"
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # 1. list_drainable_partitions
 # ---------------------------------------------------------------------------
@@ -226,18 +593,20 @@ def list_drainable_partitions(
     )
 
     today = _today_utc()
-    out: List[MonitorPartition] = []
+    out: set[MonitorPartition] = set()
     try:
         for raw_key in r.scan_iter(match=pattern, count=512):
             key = _decode(raw_key)
             parsed = RK.parse_monitor_partition_key(key)
+            if parsed is None:
+                parsed = RK.parse_monitor_partition_drain_key(key)
             if parsed is None:
                 continue
             org, mt, dt = parsed
             if dt >= today:
                 # Today's partition is still being written to — skip.
                 continue
-            out.append(MonitorPartition(organization=org, monitor_type=mt, date=dt))
+            out.add(MonitorPartition(organization=org, monitor_type=mt, date=dt))
     except Exception as e:  # noqa: BLE001 — best-effort discovery
         logger.warning(
             "[monitoring.partitions] list scan failed for %s/%s: %s",
@@ -245,8 +614,7 @@ def list_drainable_partitions(
         )
         return []
 
-    out.sort()
-    return out
+    return sorted(out)
 
 
 # ---------------------------------------------------------------------------
@@ -261,14 +629,16 @@ def drain_partition(
     monitor_type: str,
     date: str,
 ) -> List[Dict[str, Any]]:
-    """Atomically take a snapshot of one partition and delete the source.
+    """Claim and read one partition without acknowledging its source.
 
     The implementation uses ``RENAMENX`` (atomic in Redis, **does not
     overwrite**) to move the source key out from under any concurrent
     writer in the rare day-boundary race where a writer started a batch
     before midnight UTC. After the rename, no writer can hit the old
     key again — they'd create a fresh empty one for the new day. We
-    then ``LRANGE 0 -1`` the renamed handle and ``DEL`` it.
+    then ``LRANGE 0 -1`` the renamed handle. The handle is deliberately
+    retained until :func:`acknowledge_partition` is called after a durable
+    downstream write.
 
     **Crash recovery via RENAMENX.** Using ``RENAME`` here would be a
     silent-data-loss bug: a previous run crashing between LRANGE and
@@ -290,75 +660,25 @@ def drain_partition(
         organization, monitor_type, date: partition coordinates.
 
     Returns:
-        List of parsed JSON payloads. Empty when the partition was
-        already gone or held no entries. Malformed entries are
-        silently skipped.
+        List of strictly parsed JSON-object payloads. Empty when the partition
+        was already gone, held no entries, or could not be safely claimed.
+        The source remains until an explicit receipt acknowledgement.
 
     Raises:
         ValueError: if ``catalog`` does not expose ``.r``. Other
             transient Redis errors are surfaced to the caller.
     """
-    r = _get_redis(catalog)
-
-    src = RK.monitor_partition(organization, monitor_type, date)
-    drain = RK.monitor_partition_drain(organization, monitor_type, date)
-
-    # Atomic non-overwriting rename. Three outcomes:
-    #   1. src exists, drain does not  →  renamenx returns truthy.
-    #                                     We own the drain handle.
-    #   2. src exists, drain also exists (previous run crashed mid-process)
-    #      →  renamenx returns falsy. We DON'T destroy the existing
-    #         drain contents. We LRANGE the drain handle to recover the
-    #         earlier run's entries; the new src is left in place and
-    #         the *next* call to drain_partition picks it up.
-    #   3. src does not exist           →  renamenx raises ResponseError.
-    #                                     LRANGE drain still works (it
-    #                                     may be empty or hold prior data).
-    renamed = False
     try:
-        # redis-py returns True/False or 1/0 depending on encoding mode
-        renamed = bool(r.renamenx(src, drain))
-    except Exception:
-        # ResponseError when src missing, network blip, etc. Either way
-        # try the drain key — it may legitimately hold data from a
-        # crashed previous run.
-        renamed = False
-
-    try:
-        raw_entries = r.lrange(drain, 0, -1)
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "[monitoring.partitions] drain LRANGE failed for %s/%s/%s: %s",
-            organization, monitor_type, date, e,
+        claim = claim_partition(
+            catalog,
+            organization=organization,
+            monitor_type=monitor_type,
+            date=date,
         )
-        # Leave the drain key in place so a retry can finish the job.
+    except MonitoringPartitionError as exc:
+        logger.warning("[monitoring.partitions] claim failed: %s", exc)
         return []
-
-    if not raw_entries:
-        # Nothing in the drain handle. If we did rename, delete the
-        # (empty) handle to keep Redis clean.
-        if renamed:
-            try:
-                r.delete(drain)
-            except Exception:
-                pass
-        return []
-
-    entries = _parse_entries(raw_entries)
-
-    # Successful read — delete the drain handle. Failure here means a
-    # retry will redeliver entries; the caller's write to the sink
-    # table should be idempotent (e.g. include a stable ``query_id``).
-    try:
-        r.delete(drain)
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "[monitoring.partitions] drain DEL failed for %s/%s/%s: %s "
-            "(entries already returned; next call will redeliver)",
-            organization, monitor_type, date, e,
-        )
-
-    return entries
+    return list(claim.entries) if claim is not None else []
 
 
 # ---------------------------------------------------------------------------
@@ -374,12 +694,19 @@ def iter_partition_chunks(
     date: str,
     chunk_size: int = 10_000,
 ) -> Iterator[List[Dict[str, Any]]]:
-    """Stream a partition in memory-bounded chunks; delete on exhaustion.
+    """Compatibility replay-only chunk reader without acknowledgement.
 
     Same atomicity model as :func:`drain_partition` — the source key is
     ``RENAME``-d to a private drain handle up front, then sliced with
-    ``LRANGE start stop``. The drain handle is ``DEL``-ed when the
-    iterator exhausts.
+    ``LRANGE start stop``. Iterator exhaustion never deletes the drain handle;
+    only an explicit receipt acknowledgement may do so after the sink commits.
+    An exhausted or abandoned iterator therefore remains replayable.
+
+    This legacy API does not expose the content receipt and therefore cannot
+    safely acknowledge. New orchestrators must use
+    :func:`claim_partition_chunks` followed by
+    :func:`iter_claimed_partition_chunks`, then acknowledge that claim only
+    after the downstream commit.
 
     **Resume semantics:** if your process crashes mid-iteration, the
     drain handle survives. Calling this function (or
@@ -416,16 +743,13 @@ def iter_partition_chunks(
     src = RK.monitor_partition(organization, monitor_type, date)
     drain = RK.monitor_partition_drain(organization, monitor_type, date)
 
-    # Atomic non-overwriting rename. Same semantics as
+    # Atomic non-overwriting rename + PERSIST. Same semantics as
     # ``drain_partition``: if the drain key already exists from a
     # previous crashed run, RENAMENX returns False (does NOT overwrite),
     # we fall through to LRANGE the existing drain handle, the earlier
     # run's entries are recovered, and the new src is left in place for
     # the next call. Plain RENAME would silently destroy queued data.
-    try:
-        r.renamenx(src, drain)
-    except Exception:
-        pass
+    _claim_without_expiry(r, src, drain)
 
     # Determine how many entries we have to walk.
     try:
@@ -438,12 +762,6 @@ def iter_partition_chunks(
         return
 
     if total == 0:
-        # Either drain didn't exist or the partition was empty. Delete
-        # the (possibly empty) handle to keep Redis clean.
-        try:
-            r.delete(drain)
-        except Exception:
-            pass
         return
 
     start = 0
@@ -463,20 +781,9 @@ def iter_partition_chunks(
             yield chunk
             start = stop + 1
     finally:
-        # Iterator either exhausted naturally or the caller bailed
-        # (``break``); either way attempt the cleanup. If the caller
-        # bailed early we delete a partially-consumed handle —
-        # acceptable because chunked drain is opt-in (orchestrator
-        # chose this mode and must handle replay-on-resume anyway).
-        if start >= total:
-            try:
-                r.delete(drain)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "[monitoring.partitions] chunk DEL failed for %s/%s/%s: "
-                    "%s (entries already yielded)",
-                    organization, monitor_type, date, e,
-                )
+        # Downstream persistence, not iterator exhaustion, is the authority
+        # for deletion. Keep the exact drain available for replay.
+        pass
 
 
 # ---------------------------------------------------------------------------

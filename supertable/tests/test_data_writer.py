@@ -126,6 +126,18 @@ def _hardened_writer_contract_adapter(monkeypatch):
 
     monkeypatch.setattr(DataWriter, "_reserve_snapshot_rowids", reserve)
     monkeypatch.setattr(DataWriter, "_publish_snapshot", publish)
+    # Footer-stat extraction is a storage boundary. Legacy orchestration tests
+    # use synthetic file names and must never resolve the process-configured
+    # backend (which may be a real MinIO endpoint). Dedicated stats tests below
+    # replace these fixture defaults with their own explicit mocks.
+    monkeypatch.setattr(
+        f"{_MOD}.extract_stats_rows",
+        lambda *_args, **_kwargs: pl.DataFrame(),
+    )
+    monkeypatch.setattr(
+        f"{_MOD}.build_stats_file",
+        lambda **_kwargs: (None, None),
+    )
 
 
 @pytest.fixture()

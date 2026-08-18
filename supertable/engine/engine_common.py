@@ -22,6 +22,7 @@ from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.config.homedir import get_app_home
 from supertable.engine.engine_config import normalize_memory_size
+from supertable.utils.sql_parser import validate_read_query_ast
 
 
 # =========================================================
@@ -69,9 +70,29 @@ def redact_url_credentials(value: object) -> str:
         suffix = raw[len(url):]
         try:
             parsed = urlsplit(url)
-            if parsed.query or parsed.fragment:
+            netloc = parsed.netloc
+            if parsed.username is not None or parsed.password is not None:
+                host = parsed.hostname or ""
+                if ":" in host and not host.startswith("["):
+                    host = f"[{host}]"
+                try:
+                    port = parsed.port
+                except ValueError:
+                    port = None
+                netloc = host + (f":{port}" if port is not None else "")
+            if (
+                parsed.query
+                or parsed.fragment
+                or netloc != parsed.netloc
+            ):
                 url = urlunsplit(
-                    (parsed.scheme, parsed.netloc, parsed.path, "<redacted>", "")
+                    (
+                        parsed.scheme,
+                        netloc,
+                        parsed.path,
+                        "<redacted>" if parsed.query else "",
+                        "",
+                    )
                 )
         except Exception:
             if "?" in url:
@@ -457,7 +478,9 @@ def hashed_table_name(
     """Generate a deterministic table name from (super, simple, version, columns)."""
     cols_part = ",".join(sorted(columns)) if columns else "*"
     key = f"{super_name}_{simple_name}_{simple_version}_{cols_part}"
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha1(
+        key.encode("utf-8"), usedforsecurity=False
+    ).hexdigest()[:16]
     return f"st_{digest}"
 
 
@@ -600,10 +623,119 @@ def _derive_thread_count(
 # httpfs / S3 configuration
 # =========================================================
 
+def _selected_s3_configuration(storage: Optional[object]) -> Dict[str, object]:
+    """Resolve S3 auth from the selected server-side storage context.
+
+    A DuckDB executor can be constructed with an injected storage backend whose
+    credentials deliberately differ from process-global settings.  Falling
+    back to those globals would silently widen the query's principal.  Built-in
+    S3/MinIO instances expose the exact credentials they were constructed with;
+    custom adapters may opt in through ``duckdb_s3_config()``.
+    """
+    if storage is None:
+        access_key, secret_key, session_token = detect_creds()
+        return {
+            "endpoint": detect_endpoint(),
+            "access_key": access_key,
+            "secret_key": secret_key,
+            "session_token": session_token,
+            "region": detect_region(),
+            "url_style": detect_url_style(),
+            "use_ssl": detect_ssl(),
+            # An explicitly selected process-global configuration with no
+            # credential values is the existing anonymous/endpoint-only mode.
+            # Partial credentials still fail the validation below.
+            "anonymous": not any((access_key, secret_key, session_token)),
+        }
+
+    module = storage.__class__.__module__
+    qualname = storage.__class__.__qualname__
+    if module == "supertable.storage.s3_storage" and qualname == "S3Storage":
+        config = {
+            "endpoint": getattr(storage, "endpoint_url", None),
+            "access_key": getattr(storage, "_aws_access_key_id", None),
+            "secret_key": getattr(storage, "_aws_secret_access_key", None),
+            "session_token": getattr(storage, "_aws_session_token", None),
+            "region": getattr(storage, "region", None),
+            "url_style": getattr(storage, "url_style", "vhost"),
+            "use_ssl": getattr(storage, "secure", True),
+            "anonymous": False,
+        }
+    elif (
+        module == "supertable.storage.minio_storage"
+        and qualname == "MinioStorage"
+    ):
+        config = {
+            "endpoint": (
+                getattr(storage, "_endpoint", None)
+                or getattr(storage, "endpoint_url", None)
+            ),
+            "access_key": getattr(storage, "_access_key", None),
+            "secret_key": getattr(storage, "_secret_key", None),
+            "session_token": None,
+            "region": getattr(storage, "region", None),
+            "url_style": getattr(storage, "url_style", "path"),
+            "use_ssl": getattr(storage, "secure", False),
+            "anonymous": False,
+        }
+    else:
+        provider = getattr(storage, "duckdb_s3_config", None)
+        if not callable(provider):
+            raise RuntimeError(
+                "Selected storage does not expose a DuckDB S3 authorization context"
+            )
+        supplied = provider()
+        if not isinstance(supplied, dict):
+            raise RuntimeError(
+                "Selected storage returned an invalid DuckDB S3 authorization context"
+            )
+        config = {
+            "endpoint": supplied.get("endpoint"),
+            "access_key": supplied.get("access_key"),
+            "secret_key": supplied.get("secret_key"),
+            "session_token": supplied.get("session_token"),
+            "region": supplied.get("region"),
+            "url_style": supplied.get("url_style", "vhost"),
+            "use_ssl": supplied.get("use_ssl", True),
+            "anonymous": supplied.get("anonymous") is True,
+        }
+
+    access_key = config["access_key"]
+    secret_key = config["secret_key"]
+    anonymous = config["anonymous"] is True
+    if anonymous and (access_key or secret_key or config["session_token"]):
+        raise RuntimeError("Anonymous S3 authorization cannot include credentials")
+    if not anonymous and (not access_key or not secret_key):
+        # SDK clients may hide refreshable IAM credentials.  DuckDB cannot be
+        # safely bound to that opaque principal, so direct s3:// scans fail
+        # closed. Operators can select the existing presigned-path mode.
+        raise RuntimeError(
+            "Selected storage credentials are unavailable for DuckDB S3 access"
+        )
+    if config["session_token"] and not (access_key and secret_key):
+        raise RuntimeError("Incomplete DuckDB S3 authorization context")
+
+    endpoint = config["endpoint"]
+    config["endpoint"] = (
+        normalize_endpoint_for_s3(str(endpoint)) if endpoint else None
+    )
+    config["region"] = str(config["region"] or "")
+    url_style = str(config["url_style"] or "").casefold()
+    if url_style not in {"path", "vhost"}:
+        raise RuntimeError("Invalid DuckDB S3 URL style")
+    config["url_style"] = url_style
+    if not isinstance(config["use_ssl"], bool):
+        raise RuntimeError("Invalid DuckDB S3 TLS configuration")
+    return config
+
+
 def configure_httpfs_and_s3(
-        con: duckdb.DuckDBPyConnection, for_paths: List[str]
+        con: duckdb.DuckDBPyConnection,
+        for_paths: List[str],
+        *,
+        storage: Optional[object] = None,
 ) -> None:
-    """Load httpfs and configure S3 credentials + caches on the given connection.
+    """Load httpfs and configure an in-memory S3 secret plus HTTP caches.
 
     Both cache settings (HTTP metadata cache and external file cache) are
     registered by the httpfs extension, not DuckDB core.  They must be SET
@@ -672,9 +804,6 @@ def configure_httpfs_and_s3(
         }
     except Exception:
         supported = {
-            "s3_endpoint", "s3_region", "s3_access_key_id",
-            "s3_secret_access_key", "s3_session_token",
-            "s3_url_style", "s3_use_ssl",
             "http_timeout", "enable_http_metadata_cache",
             "enable_external_file_cache", "external_file_cache_max_size",
             "external_file_cache_directory",
@@ -684,24 +813,64 @@ def configure_httpfs_and_s3(
         if param in supported:
             con.execute(f"SET {param}={sanitize_sql_string(value_sql)};")
 
-    endpoint = detect_endpoint()
-    access_key, secret_key, session_token = detect_creds()
-    region = detect_region()
-    url_style = detect_url_style()
-    use_ssl = detect_ssl()
+    if any_s3:
+        # Never install credentials as SET variables. DuckDB exposes those
+        # verbatim through current_setting(), which user SELECT expressions can
+        # call. A TEMPORARY SECRET stays in memory, resolves S3 scans normally,
+        # and redacts SECRET/SESSION_TOKEN in DuckDB's own secret catalog.
+        #
+        # Reset legacy variables as a defence for long-lived processes upgraded
+        # in place or tests that reuse a previously configured connection.
+        try:
+            selected = _selected_s3_configuration(storage)
+            endpoint = selected["endpoint"]
+            access_key = selected["access_key"]
+            secret_key = selected["secret_key"]
+            session_token = selected["session_token"]
+            region = selected["region"]
+            url_style = selected["url_style"]
+            use_ssl = selected["use_ssl"]
+            for legacy_setting in (
+                "s3_access_key_id", "s3_secret_access_key", "s3_session_token",
+            ):
+                con.execute(f"RESET {legacy_setting};")
 
-    if endpoint:
-        set_if_supported("s3_endpoint", f"'{endpoint}'")
-    if access_key:
-        set_if_supported("s3_access_key_id", f"'{access_key}'")
-    if secret_key:
-        set_if_supported("s3_secret_access_key", f"'{secret_key}'")
-    if session_token:
-        set_if_supported("s3_session_token", f"'{session_token}'")
-    if region:
-        set_if_supported("s3_region", f"'{region}'")
-    set_if_supported("s3_url_style", f"'{url_style}'")
-    set_if_supported("s3_use_ssl", "TRUE" if use_ssl else "FALSE")
+            secret_options = ["TYPE S3", "PROVIDER CONFIG"]
+
+            def add_secret_option(name: str, value: Optional[str]) -> None:
+                if value:
+                    quoted_value = sanitize_sql_string("'" + value + "'")
+                    secret_options.append(f"{name} {quoted_value}")
+
+            add_secret_option("KEY_ID", access_key)
+            add_secret_option("SECRET", secret_key)
+            add_secret_option("SESSION_TOKEN", session_token)
+            add_secret_option("REGION", region)
+            add_secret_option("ENDPOINT", endpoint)
+            add_secret_option("URL_STYLE", url_style)
+            secret_options.append("USE_SSL TRUE" if use_ssl else "USE_SSL FALSE")
+            con.execute(
+                "CREATE OR REPLACE TEMPORARY SECRET supertable_s3 ("
+                + ", ".join(secret_options)
+                + ");"
+            )
+
+            # Treat the readable setting interface as a postcondition, not an
+            # assumption about DuckDB defaults or version behaviour.
+            for legacy_setting in (
+                "s3_access_key_id", "s3_secret_access_key", "s3_session_token",
+            ):
+                row = con.execute(
+                    "SELECT current_setting(?)", [legacy_setting]
+                ).fetchone()
+                if row and row[0] not in (None, ""):
+                    raise RuntimeError("readable credential setting remained active")
+        except Exception:
+            # Do not chain a backend exception: DuckDB parser/binder messages can
+            # echo the CREATE SECRET statement, including its literal values.
+            raise RuntimeError(
+                "DuckDB could not configure protected in-memory S3 access"
+            ) from None
 
     http_timeout_env = settings.SUPERTABLE_DUCKDB_HTTP_TIMEOUT
     if http_timeout_env:
@@ -927,7 +1096,7 @@ def create_reflection_table_with_presign_retry(
     Create a reflection table with automatic presign fallback on HTTP errors.
     Returns True if presign retry was used.
     """
-    configure_httpfs_and_s3(con, files)
+    configure_httpfs_and_s3(con, files, storage=storage)
     tried_presign = False
 
     try:
@@ -944,7 +1113,7 @@ def create_reflection_table_with_presign_retry(
             )
             tried_presign = True
             presigned_files = make_presigned_list(storage, files)
-            configure_httpfs_and_s3(con, presigned_files)
+            configure_httpfs_and_s3(con, presigned_files, storage=storage)
             create_reflection_table(
                 con, table_name, presigned_files, columns, resource_keys,
             )
@@ -1018,7 +1187,7 @@ def create_reflection_view_with_presign_retry(
             con, storage, view_name, files, columns, log_prefix, resource_keys
         )
 
-    configure_httpfs_and_s3(con, files)
+    configure_httpfs_and_s3(con, files, storage=storage)
     tried_presign = False
 
     try:
@@ -1035,7 +1204,7 @@ def create_reflection_view_with_presign_retry(
             )
             tried_presign = True
             presigned_files = make_presigned_list(storage, files)
-            configure_httpfs_and_s3(con, presigned_files)
+            configure_httpfs_and_s3(con, presigned_files, storage=storage)
             create_reflection_view(
                 con, view_name, presigned_files, columns, resource_keys,
             )
@@ -1703,6 +1872,58 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
 # RBAC view creation
 # =========================================================
 
+def _validated_rbac_predicate_sql(raw_predicate: object) -> str:
+    """Return one canonical, table-local DuckDB predicate or fail closed."""
+    text = str(raw_predicate or "").strip()
+    if not text:
+        return ""
+    try:
+        statements = [
+            statement
+            for statement in sqlglot.parse(
+                f"SELECT 1 WHERE ({text})", read="duckdb"
+            )
+            if statement is not None
+        ]
+    except Exception:
+        raise ValueError("RBAC row predicate is invalid") from None
+    if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+        raise ValueError("RBAC row predicate must be one scalar expression")
+    statement = statements[0]
+    where = statement.args.get("where")
+    predicate = getattr(where, "this", None)
+    if not isinstance(predicate, exp.Expression):
+        raise ValueError("RBAC row predicate must be one scalar expression")
+
+    # Full validation is required here as well: DuckDB parses bare USER /
+    # CURRENT_ROLE-style identity expressions as Columns rather than Funcs.
+    validate_read_query_ast(statement, "duckdb")
+
+    forbidden_types = tuple(
+        expression_type
+        for name in (
+            "AggFunc", "Command", "From", "Join", "Query", "Subquery",
+            "Table", "UDTF", "Window", "Parameter", "Placeholder",
+            "SessionParameter", "Var",
+        )
+        if isinstance((expression_type := getattr(exp, name, None)), type)
+    )
+    for node in predicate.walk():
+        if forbidden_types and isinstance(node, forbidden_types):
+            raise ValueError(
+                "RBAC row predicate may contain only scalar, table-local expressions"
+            )
+        if isinstance(node, exp.Dot):
+            raise ValueError("Qualified RBAC row predicate expressions are not allowed")
+        if isinstance(node, exp.Column) and (
+            node.table or node.db or node.catalog
+        ):
+            raise ValueError("Qualified RBAC row predicate columns are not allowed")
+        if isinstance(node, exp.Star):
+            raise ValueError("RBAC row predicate wildcard is not allowed")
+    return predicate.sql(dialect="duckdb")
+
+
 def create_rbac_view(
         con: duckdb.DuckDBPyConnection,
         base_table_name: str,
@@ -1722,6 +1943,13 @@ def create_rbac_view(
         view_name: the view name to create (query will reference this)
         rbac_view_def: RbacViewDef with allowed_columns and where_clause
     """
+    # Validate before issuing DESCRIBE or DDL on the credential-bearing
+    # connection. Policy text is another SQL channel and must meet the same
+    # closed function boundary as user SELECTs.
+    canonical_where = _validated_rbac_predicate_sql(
+        getattr(rbac_view_def, "where_clause", "")
+    )
+
     # Resolve the deny list against the actual post-tombstone relation on
     # every query.  This avoids dialect-specific ``EXCLUDE`` syntax, keeps an
     # absent excluded column harmless, and automatically hides it if schema
@@ -1772,8 +2000,8 @@ def create_rbac_view(
 
     # Row filter
     where_sql = ""
-    if rbac_view_def.where_clause:
-        where_sql = f" WHERE {rbac_view_def.where_clause}"
+    if canonical_where:
+        where_sql = f" WHERE {canonical_where}"
 
     sql = (
         f"CREATE OR REPLACE VIEW {view_name} AS "

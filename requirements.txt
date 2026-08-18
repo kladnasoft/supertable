@@ -4,12 +4,14 @@ pandas>=2.1,<2.3
 pyarrow>=16,<19
 pytz>=2023.3
 tzdata>=2023.3
+apscheduler>=3.10,<4.0
 
 # -------- Engine / query / utils --------
-duckdb>=1.1,<2.0
-polars>=1.6,<2.0
-sqlglot>=26,<27
+duckdb>=1.5.1,<2.0
+polars>=1.36.1,<2.0
+sqlglot>=26.22,<27
 colorlog>=6.9,<7.0
+tqdm>=4.66,<5.0
 python-dotenv>=1.0,<2.0
 setuptools>=68
 

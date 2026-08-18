@@ -24,6 +24,8 @@ import os
 
 import pandas as pd
 
+from supertable.config.homedir import initialize_app_home
+
 from supertable.demo.medcenter.defaults import (
     demo_month,
     export_dir,
@@ -227,6 +229,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    initialize_app_home(change_cwd=True)
     args = parse_args()
     export_accounting_import(month=args.month, output_dir=args.output_dir)
 

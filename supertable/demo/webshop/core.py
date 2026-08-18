@@ -9,10 +9,11 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import supertable.config.homedir
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+
+from supertable.config.homedir import initialize_app_home
 
 
 @dataclass
@@ -1161,6 +1162,7 @@ def parse_args() -> GenerationConfig:
 
 
 def main() -> None:
+    initialize_app_home(change_cwd=True)
     config = parse_args()
     generator = WebshopDataGenerator(config)
     tables = generator.run()

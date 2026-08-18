@@ -210,10 +210,15 @@ activation as a security migration, not a rolling feature toggle:
    direct `SUPERTABLE_REDIS_URL`, or via `SUPERTABLE_REDIS_USERNAME` when split
    settings/Sentinel are used. Revoke the legacy user and close its existing
    connections before accepting another privileged mutation.
-4. Keep normal traffic closed, start one audited writer, and perform one
-   approved, controlled privileged mutation tied to a cutover ticket. Confirm
-   that it produced the expected next ledger sequence.
-5. Archive that queued event with one bounded worker cycle. Omitting `--trim`
+4. Keep normal traffic closed and run the worker once in `--health-check` mode
+   with the independently pinned baseline. It recomputes the canonical live
+   RBAC/auth-token digest, requires an empty ledger, and atomically installs
+   the immutable activation anchor. Audited privileged mutations are rejected
+   until this succeeds.
+5. Start one audited writer and perform one approved, controlled privileged
+   mutation tied to a cutover ticket. Confirm that it produced the expected
+   next ledger sequence.
+6. Archive that queued event with one bounded worker cycle. Omitting `--trim`
    here is intentional, so the Redis source remains available during cutover
    validation:
 
@@ -222,10 +227,11 @@ activation as a security migration, not a rolling feature toggle:
      --organization acme \
      --consumer audit-cutover \
      --once \
-     --require-durable-redis
+     --activation-baseline /etc/supertable/acme-activation-baseline.json \
+     --activation-baseline-sha256 "$SUPERTABLE_ACTIVATION_BASELINE_SHA256"
    ```
 
-6. Verify the complete checkpoint/artifact chain and independently confirm the
+7. Verify the complete checkpoint/artifact chain and independently confirm the
    new objects' WORM/Object-Lock and retention settings through the storage
    provider control plane:
 
@@ -235,18 +241,35 @@ activation as a security migration, not a rolling feature toggle:
      --consumer audit-cutover-verifier \
      --verify-chain \
      --verify-max-batches 10000 \
-     --require-durable-redis
+     --activation-baseline /etc/supertable/acme-activation-baseline.json \
+     --activation-baseline-sha256 "$SUPERTABLE_ACTIVATION_BASELINE_SHA256"
    ```
 
-7. Match the mutation's pre/post digest and checkpoint to the signed baseline,
+8. Match the mutation's pre/post digest and checkpoint to the signed baseline,
    then start normal audited writers and the supervised archive worker.
-8. Preserve the baseline, deployment manifest, ACL change evidence, controlled
+9. Preserve the baseline, deployment manifest, ACL change evidence, controlled
    mutation ticket, and first checkpoint together for restore and forensic
    verification.
 
 Running `--once` against an empty stream does not open or write archive storage
 and is not a storage-credential canary. The controlled event above must be
 present before the validation cycle.
+
+The baseline file passed to the worker is canonical JSON with
+`version=1`, `kind="supertable_privileged_activation_baseline"`, the exact
+organization, a cutover `activation_id`, `created_ms`, and the canonical
+privileged-state `state_sha256`. Supply the artifact SHA-256 independently
+(for example from a deployment secret manager). The worker re-opens and verifies
+that pin before every health/drain/verification unit, including after Redis
+reconnection or Sentinel failover. See the
+[worker runbook](17_privileged_audit_worker.md) for the exact schema and
+trusted-service credential boundary.
+
+Generate `state_sha256` with `compute_privileged_state_sha256()` as shown in
+the runbook. The first worker unit compares it to live state and creates the
+activation anchor; subsequent units require that exact anchor. The RBAC/token
+commit scripts refuse every privileged mutation while the anchor is absent or
+malformed.
 
 Do not activate exclusion or audit-v2 policies while an older writer still has
 Redis write credentials: old code does not know the new transaction boundary

@@ -588,7 +588,7 @@ WITH
         SELECT {q}, NTILE({bucket_limit}) OVER (ORDER BY {q}) AS bucket_id
         FROM {table_fqn} WHERE {q} IS NOT NULL
       ) ordered
-      GROUP BY bucket_id ORDER BY bucket_id
+      GROUP BY bucket_id ORDER BY bucket_id LIMIT {bucket_limit}
     ) t
   )
 SELECT
@@ -694,7 +694,7 @@ WITH
         SELECT {finite} AS finite_value, NTILE({bucket_limit}) OVER (ORDER BY {finite}) AS bucket_id
         FROM {table_fqn} WHERE {finite} IS NOT NULL
       ) ordered
-      GROUP BY bucket_id ORDER BY bucket_id
+      GROUP BY bucket_id ORDER BY bucket_id LIMIT {bucket_limit}
     ) t
   )
 SELECT

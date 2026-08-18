@@ -244,7 +244,9 @@ class FakeCatalog:
     def get_table_config(self, org, sup, simple) -> Optional[Dict]:
         return self._table_configs.get(f"{org}:{sup}:{simple}")
 
-    def set_table_config(self, org, sup, simple, config) -> bool:
+    def set_table_config(
+            self, org, sup, simple, config, *, lock_token=None,
+    ) -> bool:
         self._table_configs[f"{org}:{sup}:{simple}"] = config
         return True
 
@@ -564,6 +566,27 @@ class TestConfigureTable:
         with patch("supertable.data_writer.check_write_access"):
             with pytest.raises(ValueError, match="max_memory_chunk_size must be a positive"):
                 dw.configure_table("admin", "t1", max_memory_chunk_size=-5)
+
+    def test_max_decoded_compaction_budget_is_stored(self, fake_catalog):
+        dw = self._make_writer(fake_catalog)
+        with patch("supertable.data_writer.check_write_access"):
+            dw.configure_table(
+                "admin", "t1", max_decoded_compaction_bytes=64 * 1024 * 1024,
+            )
+
+        cfg = fake_catalog.get_table_config("testorg", "testsuper", "t1")
+        assert cfg["max_decoded_compaction_bytes"] == 64 * 1024 * 1024
+
+    @pytest.mark.parametrize("value", [0, -1, True, 1.5, "1024"])
+    def test_max_decoded_compaction_budget_rejects_invalid_values(
+        self, fake_catalog, value,
+    ):
+        dw = self._make_writer(fake_catalog)
+        with patch("supertable.data_writer.check_write_access"):
+            with pytest.raises(ValueError, match="must be a positive integer"):
+                dw.configure_table(
+                    "admin", "t1", max_decoded_compaction_bytes=value,
+                )
 
     def test_max_overlapping_files_positive(self, fake_catalog):
         dw = self._make_writer(fake_catalog)
@@ -1012,6 +1035,59 @@ class TestWriteMonitoring:
 
         # Write should still succeed
         assert result is not None
+
+    def test_monitoring_spool_backpressure_is_explicit_post_commit(
+        self, writer,
+    ):
+        """A full/fsync-failed WAL cannot be logged as a successful write."""
+        from supertable.monitoring_writer import (
+            MonitoringBackpressureError,
+            MonitoringPostCommitError,
+        )
+
+        monitor = writer._mocks["monitor"]
+        monitor.log_metric = MagicMock(
+            side_effect=MonitoringBackpressureError("spool full")
+        )
+        with patch("supertable.data_writer.MonitoringWriter") as monitor_cls:
+            monitor_cls.return_value.__enter__.return_value = monitor
+            with pytest.raises(MonitoringPostCommitError) as raised:
+                writer.write(
+                    "admin", "t1", _simple_arrow(3), overwrite_columns=[],
+                )
+
+        assert raised.value.core_committed is True
+        assert raised.value.core_result is not None
+        assert raised.value.operation == "write"
+
+    def test_monitoring_backpressure_preserves_mirror_recovery_error(
+        self, writer, fake_catalog,
+    ):
+        from supertable.monitoring_writer import (
+            MonitoringBackpressureError,
+            MonitoringPostCommitError,
+        )
+
+        fake_catalog._mirrors = ["PARQUET"]
+        mirror = writer._mocks["mirror"]
+        mirror.mirror_if_enabled.side_effect = RuntimeError("mirror failed")
+        monitor = writer._mocks["monitor"]
+        monitor.log_metric = MagicMock(
+            side_effect=MonitoringBackpressureError("spool full")
+        )
+        with (
+            patch("supertable.data_writer.MirrorFormats", mirror),
+            patch("supertable.data_writer.MonitoringWriter") as monitor_cls,
+        ):
+            monitor_cls.return_value.__enter__.return_value = monitor
+            with pytest.raises(MonitoringPostCommitError) as raised:
+                writer.write(
+                    "admin", "t1", _simple_arrow(3), overwrite_columns=[],
+                )
+
+        assert raised.value.core_committed is True
+        assert isinstance(raised.value.mirror_error, RuntimeError)
+        assert fake_catalog._mirror_publication["status"] == "failed"
 
     def test_monitoring_not_enqueued_on_write_failure(self, writer, fake_catalog):
         """If write() fails, stats_payload is None → monitoring not enqueued."""

@@ -16,9 +16,12 @@ from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.errors import SuperTableNotFoundError, TableNotFoundError
 from supertable.monitoring.partitions import MONITORING_SINK_TABLES
-from supertable.monitoring_writer import MonitoringWriter  # async monitoring
+from supertable.monitoring_writer import (
+    MonitoringDurabilityError,
+    MonitoringPostCommitError,
+    MonitoringWriter,
+)
 from supertable.super_table import SuperTable
-from supertable import redis_keys as RK
 from supertable.simple_table import SimpleTable
 from supertable.utils.timer import Timer
 from supertable.utils.profiler import Profiler
@@ -436,6 +439,7 @@ class DataWriter:
             role_name: str,
             simple_name: str,
             max_memory_chunk_size: int | None = None,
+            max_decoded_compaction_bytes: int | None = None,
             max_overlapping_files: int | None = None,
             max_tombstone_rows: int | None = None,
             tombstone_compaction_workers: int | None = None,
@@ -454,6 +458,9 @@ class DataWriter:
                 this table. The legacy name denotes the compressed source-byte
                 packing/output target; it is not a hard decoded-RAM limit.
                 None leaves the existing value unchanged.
+            max_decoded_compaction_bytes: Hard decoded-frame budget shared by
+                the compaction coordinator and pending encoder workers. One
+                indivisible row may exceed it. None keeps the existing value.
             max_overlapping_files: Override MAX_OVERLAPPING_FILES for this
                 table.  None leaves the existing value unchanged.
             max_tombstone_rows: Maximum number of rows in the deletion-vector
@@ -475,6 +482,7 @@ class DataWriter:
         # preserving the cache-population guarantee for callers that omit them.
         if (
             max_memory_chunk_size is not None
+            or max_decoded_compaction_bytes is not None
             or max_overlapping_files is not None
             or max_tombstone_rows is not None
             or tombstone_compaction_workers is not None
@@ -491,6 +499,18 @@ class DataWriter:
             if max_memory_chunk_size <= 0:
                 raise ValueError("max_memory_chunk_size must be a positive integer")
             config["max_memory_chunk_size"] = int(max_memory_chunk_size)
+        if max_decoded_compaction_bytes is not None:
+            if (
+                isinstance(max_decoded_compaction_bytes, bool)
+                or not isinstance(max_decoded_compaction_bytes, int)
+                or max_decoded_compaction_bytes <= 0
+            ):
+                raise ValueError(
+                    "max_decoded_compaction_bytes must be a positive integer"
+                )
+            config["max_decoded_compaction_bytes"] = (
+                max_decoded_compaction_bytes
+            )
         if max_overlapping_files is not None:
             if max_overlapping_files <= 0:
                 raise ValueError("max_overlapping_files must be a positive integer")
@@ -510,12 +530,32 @@ class DataWriter:
                 )
             config["tombstone_compaction_workers"] = tombstone_compaction_workers
 
-        self.catalog.set_table_config(
+        token = self.catalog.acquire_simple_lock(
             self.super_table.organization,
             self.super_table.super_name,
             simple_name,
-            config,
+            ttl_s=30,
+            timeout_s=60,
         )
+        if not token:
+            raise TimeoutError(
+                f"Could not acquire configuration lock for {simple_name!r}"
+            )
+        try:
+            self.catalog.set_table_config(
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple_name,
+                config,
+                lock_token=token,
+            )
+        finally:
+            self.catalog.release_simple_lock(
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple_name,
+                token,
+            )
 
         # Update local cache so the next write() sees it immediately
         self._table_config_cache[simple_name] = config
@@ -705,6 +745,7 @@ class DataWriter:
         stats_payload = None
         mirror_error: Exception | None = None
         mirror_snapshot_path: str | None = None
+        monitoring_error: MonitoringDurabilityError | None = None
 
         try:
             logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level}, newer_than={newer_than}, delete_only={delete_only})"))
@@ -778,6 +819,16 @@ class DataWriter:
             if not token:
                 raise TimeoutError(f"Could not acquire lock for simple '{simple_name}'")
             mark("lock")
+            mutation_fence = getattr(
+                type(self.catalog), "check_table_mutation_allowed", None,
+            )
+            if callable(mutation_fence):
+                self.catalog.check_table_mutation_allowed(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    simple_name,
+                    lock_token=token,
+                )
 
             # --- Read last snapshot (via leaf pointer) ------------------------
             # A target that existed at authorization time must not be
@@ -1749,25 +1800,6 @@ class DataWriter:
                     )
                 mark("bump_root")
 
-                # --- Store schema + table name in Redis (permanent, not cache) ---
-                try:
-                    schema_raw = new_snapshot_dict.get("schema", {})
-                    if isinstance(schema_raw, dict):
-                        schema_json = json.dumps(schema_raw, ensure_ascii=False)
-                    elif isinstance(schema_raw, list):
-                        merged = {}
-                        for item in schema_raw:
-                            if isinstance(item, dict):
-                                merged.update(item)
-                        schema_json = json.dumps(merged, ensure_ascii=False)
-                    else:
-                        schema_json = "{}"
-                    _org, _sup = self.super_table.organization, self.super_table.super_name
-                    self.catalog.r.set(RK.schema(_org, _sup, simple_name), schema_json)
-                    self.catalog.r.sadd(RK.meta_table_names(_org, _sup), simple_name)
-                except Exception as e:
-                    logger.debug(f"[data-writer] schema/table_names Redis write failed: {e}")
-
                 # --- Optional mirroring ---------------------------------------
                 # The core snapshot is already authoritative at this point.
                 # Preserve it on mirror failure, but never return an ambiguous
@@ -1781,6 +1813,8 @@ class DataWriter:
                             table_name=simple_name,
                             simple_snapshot=new_snapshot_dict,
                             mirrors=enabled_mirrors,
+                            commit_id=qid,
+                            snapshot_path=new_snapshot_path,
                         )
                     except Exception as e:
                         mirror_error = e
@@ -1892,8 +1926,9 @@ class DataWriter:
 
         # ---------- LOCK IS RELEASED HERE ----------
         # Monitoring enqueue + flush is fully outside any data locks.
-        # MonitoringWriter.__exit__ calls request_flush() so the metric is
-        # guaranteed to reach Redis before this scope closes.
+        # log_metric() fsyncs the bounded WAL before returning; __exit__ then
+        # attempts an opportunistic Redis delivery without weakening that
+        # durable local acknowledgement.
         #
         # Loop guard: writes targeted at a monitoring sink table
         # (``__writes__``/``__reads__``/``__mcp__``/``__plans__``)
@@ -1912,6 +1947,9 @@ class DataWriter:
                     monitor_type="writes",
                 ) as monitor:
                     monitor.log_metric(stats_payload)
+        except MonitoringDurabilityError as me:
+            monitoring_error = me
+            logger.error(lp(f"monitoring durability/backpressure failure: {me}"))
         except Exception as me:
             logger.error(lp(f"monitoring enqueue failed: {me}"))
 
@@ -1953,6 +1991,18 @@ class DataWriter:
         except Exception:
             pass  # Never fail a write due to audit
 
+        if monitoring_error is not None:
+            failure = MonitoringPostCommitError(
+                organization=self.super_table.organization,
+                super_name=self.super_table.super_name,
+                table_name=simple_name,
+                operation="write",
+                core_result=result_tuple,
+                cause=monitoring_error,
+            )
+            if mirror_error is not None:
+                failure.mirror_error = mirror_error
+            raise failure from monitoring_error
         if mirror_error is not None:
             failure = MirrorPublicationError(
                 organization=self.super_table.organization,
@@ -1995,8 +2045,10 @@ class DataWriter:
              byte target. When ``small_only=True`` (default),
              only files strictly smaller than ``max_memory_chunk_size``
              qualify — large files are left untouched. ``small_only=False``
-             rewrites every resource regardless of size. This target is not a
-             hard bound on decoded RAM; each source is currently decoded whole.
+             rewrites every resource regardless of size. Source Parquet is
+             decoded under a separate hard decoded-byte budget; a single wide
+             row is the indivisible lower bound and oversized output groups
+             spill before publication.
           5. Commit the new snapshot via ``simple_table.update``,
              leaf-CAS, ``bump_root``, optional mirroring, and the same
              monitoring + audit pipeline as ``write``.
@@ -2064,6 +2116,7 @@ class DataWriter:
         stats_payload: dict | None = None
         mirror_error: Exception | None = None
         mirror_snapshot_path: str | None = None
+        monitoring_error: MonitoringDurabilityError | None = None
         result: dict = {
             "query_id": qid,
             "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -2131,6 +2184,16 @@ class DataWriter:
             if not token:
                 raise TimeoutError(f"Could not acquire lock for simple '{simple_name}'")
             mark("lock")
+            mutation_fence = getattr(
+                type(self.catalog), "check_table_mutation_allowed", None,
+            )
+            if callable(mutation_fence):
+                self.catalog.check_table_mutation_allowed(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    simple_name,
+                    lock_token=token,
+                )
 
             # --- Read last snapshot — refuse to bootstrap ---------------------
             # Compaction is an in-place operation on existing data, so we
@@ -2504,6 +2567,8 @@ class DataWriter:
                             table_name=simple_name,
                             simple_snapshot=new_snapshot_dict,
                             mirrors=enabled_mirrors,
+                            commit_id=qid,
+                            snapshot_path=new_snapshot_path,
                         )
                     except Exception as e:
                         mirror_error = e
@@ -2598,6 +2663,9 @@ class DataWriter:
                     monitor_type="compact",
                 ) as monitor:
                     monitor.log_metric(stats_payload)
+        except MonitoringDurabilityError as me:
+            monitoring_error = me
+            logger.error(lp(f"monitoring durability/backpressure failure: {me}"))
         except Exception as me:
             logger.error(lp(f"monitoring enqueue failed: {me}"))
 
@@ -2624,6 +2692,18 @@ class DataWriter:
         except Exception:
             pass
 
+        if monitoring_error is not None:
+            failure = MonitoringPostCommitError(
+                organization=self.super_table.organization,
+                super_name=self.super_table.super_name,
+                table_name=simple_name,
+                operation="compact",
+                core_result=result,
+                cause=monitoring_error,
+            )
+            if mirror_error is not None:
+                failure.mirror_error = mirror_error
+            raise failure from monitoring_error
         if mirror_error is not None:
             failure = MirrorPublicationError(
                 organization=self.super_table.organization,
@@ -2641,7 +2721,7 @@ class DataWriter:
     def validation(self, dataframe: DataFrame, simple_name: str, overwrite_columns: list, newer_than: str = None, delete_only: bool = False):
         if len(simple_name) == 0 or len(simple_name) > 128:
             raise ValueError("SimpleTable name can't be empty or longer than 128")
-        if simple_name == self.super_table.super_name:
+        if simple_name.casefold() == self.super_table.super_name.casefold():
             raise ValueError("SimpleTable name can't match with SuperTable name")
         pattern = r"^[A-Za-z_][A-Za-z0-9_]*$"
         if not re.match(pattern, simple_name):

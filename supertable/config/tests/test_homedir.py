@@ -1,21 +1,148 @@
 # route: supertable.config.tests.test_homedir
-"""Tests for ``supertable.config.homedir``.
-
-The module resolves the application home directory from
-``settings.SUPERTABLE_HOME``, expands ``~``, makes the directory if it does
-not exist, and changes the process working directory to it. We exercise the
-helper functions in isolation without disturbing the real test runner's CWD
-beyond the test boundary.
-"""
+"""Tests for explicit, side-effect-free application-home initialisation."""
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from supertable.config import homedir as homedir_mod
+
+
+def test_package_import_does_not_change_cwd_or_create_runtime_home(
+    tmp_path: Path,
+) -> None:
+    working = tmp_path / "working"
+    configured_home = tmp_path / "must-not-exist"
+    working.mkdir()
+    script = (
+        "import json, os, pathlib, sys; "
+        "before=os.getcwd(); import supertable; "
+        "print(json.dumps({'before': before, 'after': os.getcwd(), "
+        "'home_exists': pathlib.Path(sys.argv[1]).exists(), "
+        "'heavy': any(name in sys.modules for name in "
+        "('pyarrow', 'polars', 'supertable.redis_catalog'))}))"
+    )
+    env = os.environ.copy()
+    env["SUPERTABLE_HOME"] = str(configured_home)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(configured_home)],
+        cwd=working,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    import json
+
+    result = json.loads(completed.stdout)
+    assert result == {
+        "before": str(working),
+        "after": str(working),
+        "home_exists": False,
+        "heavy": False,
+    }
+
+
+def test_homedir_import_does_not_load_settings_or_touch_process_state(
+    tmp_path: Path,
+) -> None:
+    working = tmp_path / "working"
+    configured_home = tmp_path / "must-not-exist"
+    working.mkdir()
+    script = (
+        "import json, os, pathlib, sys; before=os.getcwd(); "
+        "import supertable.config.homedir; "
+        "print(json.dumps({'cwd_same': os.getcwd() == before, "
+        "'home_exists': pathlib.Path(sys.argv[1]).exists(), "
+        "'settings_loaded': 'supertable.config.settings' in sys.modules}))"
+    )
+    env = os.environ.copy()
+    env["SUPERTABLE_HOME"] = str(configured_home)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(configured_home)],
+        cwd=working,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    import json
+
+    assert json.loads(completed.stdout) == {
+        "cwd_same": True,
+        "home_exists": False,
+        "settings_loaded": False,
+    }
+
+
+def test_legacy_app_home_attribute_is_lazy_and_does_not_change_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    working = tmp_path / "working"
+    configured_home = tmp_path / "legacy-home"
+    working.mkdir()
+    monkeypatch.chdir(working)
+    monkeypatch.setattr(
+        homedir_mod,
+        "settings",
+        SimpleNamespace(SUPERTABLE_HOME=str(configured_home)),
+        raising=True,
+    )
+
+    assert "app_home" not in vars(homedir_mod)
+    assert "app_home" in dir(homedir_mod)
+    assert not configured_home.exists()
+
+    from supertable.config.homedir import app_home
+
+    assert app_home == str(configured_home.resolve())
+    assert configured_home.is_dir()
+    assert Path.cwd() == working.resolve()
+    # Keep the compatibility value dynamic rather than caching a stale module
+    # global; resetting the resolver in applications/tests remains effective.
+    assert "app_home" not in vars(homedir_mod)
+
+
+def test_lazy_core_exports_preserve_public_engine_enum_without_home_side_effect(
+    tmp_path: Path,
+) -> None:
+    working = tmp_path / "working"
+    configured_home = tmp_path / "must-not-exist"
+    working.mkdir()
+    script = (
+        "import json, os, pathlib, sys; before=os.getcwd(); "
+        "from supertable import SuperTable, DataWriter, DataReader, engine; "
+        "print(json.dumps({'auto': engine.AUTO.value, "
+        "'is_enum': engine.__name__ == 'Engine', "
+        "'cwd_same': os.getcwd() == before, "
+        "'home_exists': pathlib.Path(sys.argv[1]).exists()}))"
+    )
+    env = os.environ.copy()
+    env["SUPERTABLE_HOME"] = str(configured_home)
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(configured_home)],
+        cwd=working,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    import json
+
+    assert json.loads(completed.stdout) == {
+        "auto": "auto",
+        "is_enum": True,
+        "cwd_same": True,
+        "home_exists": False,
+    }
 
 
 @pytest.fixture(autouse=True)

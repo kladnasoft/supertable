@@ -76,13 +76,16 @@ class TestSuperTableCreateIfMissing:
         mock_storage.return_value = stor
         cat = MagicMock()
         cat.root_exists.return_value = False  # missing
+        cat.acquire_namespace_lock.return_value = "namespace-token"
         MockCat.return_value = cat
 
         st = SuperTable("new_sup", "org")
 
         # Bootstrap happened
         stor.makedirs.assert_called_once()
-        cat.ensure_root.assert_called_once_with("org", "new_sup")
+        cat.ensure_root.assert_called_once_with(
+            "org", "new_sup", namespace_token="namespace-token",
+        )
         MockRole.assert_called_once()
         MockUser.assert_called_once()
         assert st.super_name == "new_sup"
@@ -101,11 +104,14 @@ class TestSuperTableCreateIfMissing:
         mock_storage.return_value = stor
         cat = MagicMock()
         cat.root_exists.return_value = False
+        cat.acquire_namespace_lock.return_value = "namespace-token"
         MockCat.return_value = cat
 
         SuperTable("new_sup", "org", create_if_missing=True)
 
-        cat.ensure_root.assert_called_once_with("org", "new_sup")
+        cat.ensure_root.assert_called_once_with(
+            "org", "new_sup", namespace_token="namespace-token",
+        )
 
     @patch(_P_SUP_USER_MGR)
     @patch(_P_SUP_ROLE_MGR)

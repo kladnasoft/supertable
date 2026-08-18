@@ -14,7 +14,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-import supertable.config.homedir  # noqa: F401  (resolves the app home)
+from supertable.config.homedir import initialize_app_home
 from supertable.data_writer import DataWriter
 from supertable.demo.medcenter.defaults import (
     generated_data_dir,
@@ -89,6 +89,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    initialize_app_home(change_cwd=True)
     args = parse_args()
     stats = load(data_dir=args.data_dir)
     print("\nLoad complete:")

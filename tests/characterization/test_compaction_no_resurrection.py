@@ -61,7 +61,6 @@ import collections
 
 import polars as pl
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from supertable.data_writer import DataWriter
 from supertable.simple_table import SimpleTable
@@ -95,18 +94,14 @@ def _dv_rowids(st, snap) -> set:
     return set(dv.get_column("__rowid__").to_list())
 
 
-def _read_data_file(file_key) -> pl.DataFrame:
+def _read_data_file(st, file_key) -> pl.DataFrame:
     """Read ONE data file's own footer columns with hive partition inference OFF.
 
-    Compaction bakes the partition column ``year`` into the file body (int32),
-    while the hive path ``year=YYYY/...`` implies ``year`` as a dictionary, so the
-    default partition-aware read (``storage.read_parquet`` -> ``pq.read_table``)
-    trips an int32-vs-dictionary merge on POST-compaction files -- an unrelated
-    partition quirk also documented in ``test_tombstone_compact_read_failure.py``.
-    ``pq.ParquetFile(...).read()`` opens just this one file (no directory/partition
-    discovery), so it returns the footer columns (incl. ``grp``/``__rowid__``)
-    unaffected by that quirk."""
-    return pl.from_arrow(pq.ParquetFile(file_key).read())
+    The storage backend owns logical-path resolution and disables partition
+    inference, returning the footer columns (including ``grp``/``__rowid__``).
+    """
+    table = st.storage.read_parquet(file_key)
+    return table if isinstance(table, pl.DataFrame) else pl.from_arrow(table)
 
 
 def _physical_key_counts(st, snap) -> collections.Counter:
@@ -115,7 +110,7 @@ def _physical_key_counts(st, snap) -> collections.Counter:
     subtracted."""
     c: collections.Counter = collections.Counter()
     for r in (snap.get("resources") or []):
-        c.update(_read_data_file(r["file"]).get_column(KEY).to_list())
+        c.update(_read_data_file(st, r["file"]).get_column(KEY).to_list())
     return c
 
 
@@ -126,7 +121,7 @@ def _live_key_counts(st, snap) -> collections.Counter:
     dv = _dv_rowids(st, snap)
     c: collections.Counter = collections.Counter()
     for r in (snap.get("resources") or []):
-        df = _read_data_file(r["file"])
+        df = _read_data_file(st, r["file"])
         for key, rowid in df.select([KEY, "__rowid__"]).iter_rows():
             if rowid not in dv:
                 c.update([key])

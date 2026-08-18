@@ -49,6 +49,14 @@ Hierarchy (v2)
               mirrors                                STRING  enabled mirror formats
               mirror_publication:
                 doc:{simple}                         STRING  durable latest mirror outbox
+              deletion:
+                namespace                            STRING  durable SuperTable delete intent
+                leaf:
+                  index                              SET     tables with delete intents
+                  doc:{simple}                       STRING  durable SimpleTable delete intent
+                stage:
+                  index                              SET     stages with delete intents
+                  doc:{stage_name}                   STRING  durable staging delete intent
               table_names                            SET     all simple table names
               leaf:
                 doc:{simple}                         STRING  leaf snapshot pointer
@@ -316,6 +324,20 @@ def parse_lake_key(key: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def org_prefix(org: str) -> str:
+    """Persistent SuperTable namespace prefix for one organization.
+
+    Disaster-recovery tooling uses this closed constructor instead of
+    assembling a broad Redis pattern outside this module.
+    """
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:"
+
+
+def org_pattern(org: str) -> str:
+    """SCAN pattern for every SuperTable-owned key in one organization."""
+    return org_prefix(org) + "*"
+
+
 def parse_registry_key(key: str) -> Optional[Tuple[str, str, str, str]]:
     """Extract ``(org, service_type, host, pid)`` from a registry key.
 
@@ -405,6 +427,19 @@ def audit_privileged_meta(org: str) -> str:
     return (
         f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}"
         ":audit:privileged:meta"
+    )
+
+
+def audit_privileged_activation(org: str) -> str:
+    """Immutable activation anchor for the privileged audit ledger.
+
+    Audited RBAC/token mutations are rejected until the supervised worker has
+    matched the independently pinned baseline to the live privileged state and
+    installed this anchor.  The anchor is re-attested before every worker unit.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}"
+        ":audit:privileged:activation"
     )
 
 
@@ -529,6 +564,64 @@ def meta_mirror_publication(org: str, sup: str, simple: str) -> str:
         f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
         f":{_safe('sup', sup)}:meta:mirror_publication:doc:"
         f"{_safe('simple', simple)}"
+    )
+
+
+def meta_namespace_deletion_intent(org: str, sup: str) -> str:
+    """Durable whole-SuperTable deletion intent (STRING JSON).
+
+    Unlike the expiring namespace lock, this key has no TTL.  Creation and
+    publication paths must reject it until the exact deleter finalizes, or an
+    operator explicitly recovers the intent after proving its former owner is
+    no longer able to issue object-store operations.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:deletion:namespace"
+    )
+
+
+def meta_simple_deletion_intent(org: str, sup: str, simple: str) -> str:
+    """Durable deletion intent for one physical SimpleTable (STRING JSON)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:deletion:leaf:doc:"
+        f"{_safe('simple', simple)}"
+    )
+
+
+def meta_simple_deletion_intent_index(org: str, sup: str) -> str:
+    """Tables with live SimpleTable deletion intents (SET)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:deletion:leaf:index"
+    )
+
+
+def meta_stage_deletion_intent(
+        org: str, sup: str, stage_name: str,
+) -> str:
+    """Durable deletion intent for one staging prefix (STRING JSON)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:deletion:stage:doc:"
+        f"{_safe('stage_name', stage_name)}"
+    )
+
+
+def meta_stage_deletion_intent_index(org: str, sup: str) -> str:
+    """Stages with live deletion intents (SET)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:deletion:stage:index"
+    )
+
+
+def meta_deletion_scope_prefix(org: str, sup: str) -> str:
+    """Prefix covering durable deletion intents (no wildcard)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:deletion:"
     )
 
 
@@ -667,6 +760,22 @@ def engine_duckdb(org: str) -> str:
 
 # --- Locks ----------------------------------------------------------------- #
 
+def lock_namespace(org: str, sup: str) -> str:
+    """Exclusive SuperTable namespace mutation/deletion fence (STRING)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:lock:namespace"
+    )
+
+
+def lock_scope_prefix(org: str, sup: str) -> str:
+    """Prefix covering every lock key for one SuperTable (no wildcard)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:lock:"
+    )
+
+
 def lock_leaf(org: str, sup: str, simple: str) -> str:
     """Per-table lock token (STRING)."""
     return (
@@ -712,6 +821,13 @@ def rbac_scope(org: str, sup: str) -> str:
     return (
         f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
         f":{_safe('sup', sup)}:rbac"
+    )
+
+
+def rbac_pattern_for_org(org: str) -> str:
+    """SCAN pattern for all privileged RBAC state in one organization."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}:*:rbac:*"
     )
 
 def rbac_user_meta(org: str, sup: str) -> str:
@@ -920,13 +1036,39 @@ def monitor_partition_drain(org: str, monitor_type: str, date: str) -> str:
     During ``iter_partition_chunks`` the source key is ``RENAME``-d to
     this handle. That gives the chunked iterator an atomic snapshot
     while leaving the source key free for new writes (which would
-    otherwise be lost mid-iteration). The handle is deleted when the
-    iterator exhausts.
+    otherwise be lost mid-iteration). Iterator exhaustion retains the handle;
+    only explicit acknowledgement of a verified delivery receipt deletes it.
     """
     return (
         f"{SUPERTABLE_PREFIX}:{_safe('org', org)}"
         f":{MONITOR_SCOPE}:{_safe_monitor_type(monitor_type)}"
         f":doc:{_safe_date(date)}:_drain"
+    )
+
+
+def monitor_partition_receipt(org: str, monitor_type: str, date: str) -> str:
+    """Immutable receipt for an in-progress monitoring partition drain."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}"
+        f":{MONITOR_SCOPE}:{_safe_monitor_type(monitor_type)}"
+        f":doc:{_safe_date(date)}:_drain_receipt"
+    )
+
+
+def monitor_partition_producer_receipts(
+    org: str, monitor_type: str, date: str,
+) -> str:
+    """Idempotency receipts for producer delivery into one partition.
+
+    The monitoring writer records ``delivery_id -> payload_sha256`` here in
+    the same Lua operation that appends to :func:`monitor_partition`.  A lost
+    Redis reply can therefore be retried without duplicating a metric, even if
+    the partition has already been claimed and acknowledged by its consumer.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}"
+        f":{MONITOR_SCOPE}:{_safe_monitor_type(monitor_type)}"
+        f":doc:{_safe_date(date)}:_producer_receipts"
     )
 
 
@@ -973,6 +1115,18 @@ def parse_monitor_partition_key(key: str) -> Optional[Tuple[str, str, str]]:
     ):
         return parts[1], parts[3], parts[5]
     return None
+
+
+def parse_monitor_partition_drain_key(
+    key: str,
+) -> Optional[Tuple[str, str, str]]:
+    """Extract coordinates from an in-progress ``:_drain`` LIST key."""
+    if not isinstance(key, str):
+        return None
+    suffix = ":_drain"
+    if not key.endswith(suffix):
+        return None
+    return parse_monitor_partition_key(key[:-len(suffix)])
 
 
 # --- AUTO routing observations -------------------------------------------- #

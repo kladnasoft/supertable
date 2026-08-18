@@ -362,6 +362,12 @@ def _make_estimator(monkeypatch, *, query: str, pruning: bool):
     est.catalog = None
     est._collect_snapshots_from_redis = lambda organization, super_name: list(snapshots)
     est._to_duckdb_path = lambda key: key
+    # This fixture exercises join-propagation soundness with synthetic footer
+    # frames. Resource-seal validation has its own tests; keep that independent
+    # boundary from discarding these deliberately unsealed synthetic stats.
+    est._stats_for_complete_files = (
+        lambda stats_df, resource_rows, resource_seals=None, stats_path=None: stats_df
+    )
 
     class _DummySuper:
         def __init__(self, *a, **k):
@@ -370,7 +376,9 @@ def _make_estimator(monkeypatch, *, query: str, pruning: bool):
     monkeypatch.setattr(de_mod, "SuperTable", _DummySuper)
     monkeypatch.setattr(
         de_mod, "load_stats",
-        lambda path, allow_cache=False, profiler=None: stats_by_file[path],
+        lambda path, allow_cache=False, cache_identity=None, profiler=None: stats_by_file[
+            path
+        ],
     )
     test_settings = dataclasses.replace(
         settings, SUPERTABLE_READ_PRUNING_ENABLED=pruning

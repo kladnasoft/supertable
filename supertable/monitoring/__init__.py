@@ -10,26 +10,37 @@ into daily-partitioned Redis LISTs:
 This package exposes the **drain side** as pure functions that an
 external service (yours) calls from its own scheduling. The SDK does
 not spawn background threads or run loops on its own; it just answers
-"what is drainable?" and "give me this partition's contents (and
-delete it)".
+"what is drainable?", "give me a verified claim", and "acknowledge this
+claim only after my sink commit".
 
 Typical drain orchestration::
 
     from supertable.monitoring import (
-        list_drainable_partitions, drain_partition,
+        acknowledge_partition,
+        claim_partition_chunks,
+        iter_claimed_partition_chunks,
+        list_drainable_partitions,
     )
 
     for part in list_drainable_partitions(catalog, organization="acme"):
-        entries = drain_partition(
+        claim = claim_partition_chunks(
             catalog,
             organization=part.organization,
             monitor_type=part.monitor_type,
             date=part.date,
         )
-        # entries is a list[dict] — write to your internal sink table:
-        #   plans  -> __reads__
-        #   writes -> __writes__
-        #   mcp    -> __mcp__
+        if claim is None:
+            continue
+        for entries in iter_claimed_partition_chunks(catalog, claim):
+            # Commit idempotently to __reads__/__writes__/__mcp__.
+            durable_sink_write(entries)
+        acknowledge_partition(
+            catalog,
+            organization=claim.organization,
+            monitor_type=claim.monitor_type,
+            date=claim.date,
+            receipt=claim.receipt,
+        )
 
 Read the live tail (e.g. for a "recent N" UI)::
 
@@ -44,9 +55,16 @@ Read the live tail (e.g. for a "recent N" UI)::
 from supertable.monitoring.partitions import (
     MONITORING_SINK_TABLE_FOR,
     MONITORING_SINK_TABLES,
+    MonitorChunkClaim,
+    MonitorDrainClaim,
     MonitorPartition,
+    MonitoringPartitionError,
+    acknowledge_partition,
+    claim_partition_chunks,
+    claim_partition,
     drain_partition,
     iter_partition_chunks,
+    iter_claimed_partition_chunks,
     list_drainable_partitions,
     read_recent,
 )
@@ -54,9 +72,16 @@ from supertable.monitoring.partitions import (
 __all__ = [
     "MONITORING_SINK_TABLE_FOR",
     "MONITORING_SINK_TABLES",
+    "MonitorChunkClaim",
+    "MonitorDrainClaim",
     "MonitorPartition",
+    "MonitoringPartitionError",
+    "acknowledge_partition",
+    "claim_partition_chunks",
+    "claim_partition",
     "drain_partition",
     "iter_partition_chunks",
+    "iter_claimed_partition_chunks",
     "list_drainable_partitions",
     "read_recent",
 ]

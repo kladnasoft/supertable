@@ -4,13 +4,9 @@ import logging
 import json
 from typing import Dict, Iterator, List, Optional, Tuple
 from pathlib import Path
-from urllib.parse import urlparse
-import time
 
 
 import redis
-from redis import Sentinel
-from redis.sentinel import MasterNotFoundError
 
 
 
@@ -287,188 +283,37 @@ class _FallbackCatalog:
         return None
 
 
-def _coerce_password(pw: Optional[str]) -> Optional[str]:
-    if pw is None:
-        return None
-    v = pw.strip()
-    # Treat these as "no password"
-    if v in ("", "None", "none", "null", "NULL"):
-        return None
-    return v
-
-
 def _build_redis_client() -> redis.Redis:
-    """
-    Build a Redis client from SUPERTABLE_* envs.
+    """Return the process-shared, strictly validated Redis client.
 
-    Precedence:
-      1) SUPERTABLE_REDIS_URL (parsed)
-      2) SUPERTABLE_REDIS_HOST/PORT/DB/PASSWORD (overrides URL parts if provided)
-
-    Sentinel:
-      If SUPERTABLE_REDIS_SENTINEL is enabled and SUPERTABLE_REDIS_SENTINELS is set,
-      use the same Sentinel connection behavior as RedisCatalog (ping-probe + optional fallback).
+    Redis endpoint parsing, TLS verification, Sentinel validation, and strict
+    no-fallback behavior have one authority boundary in ``redis_connector``.
+    Keeping a second parser here previously let audit consumers silently use a
+    different and weaker connection policy.
     """
-    # Gate runtime-credential validation here so that simply importing the
-    # module (e.g. to inspect ``redis_keys`` helpers or run unit tests
-    # against the public API) does not require an organization + token to
-    # be set. Anything that actually opens a connection still fails fast.
     _require_runtime_env()
-    settings = Settings()
-    url = (settings.SUPERTABLE_REDIS_URL or "").strip() or None
+    from supertable.redis_connector import RedisOptions, create_redis_client
 
-    host = settings.SUPERTABLE_REDIS_HOST
-    port = settings.SUPERTABLE_REDIS_PORT
-    db = settings.SUPERTABLE_REDIS_DB
-    username = (settings.SUPERTABLE_REDIS_USERNAME or "").strip() or None
-    password = _coerce_password(settings.SUPERTABLE_REDIS_PASSWORD)
-
-    use_ssl = url.startswith("rediss://") if url else False
-
-    if url:
-        u = urlparse(url)
-        if u.scheme not in ("redis", "rediss"):
-            raise ValueError(f"Unsupported Redis URL scheme: {u.scheme}")
-        # Extract from URL
-        if u.hostname:
-            host = u.hostname
-        if u.port:
-            port = u.port
-        # db from path: "/0", "/1", ...
-        if u.path and len(u.path) > 1:
-            try:
-                db_from_url = int(u.path.lstrip("/"))
-                db = db_from_url
-            except Exception:
-                pass
-        if u.username:
-            username = u.username
-        if u.password:
-            password = _coerce_password(u.password)
-
-    # Sentinel detection + options
-    sentinel_enabled = (settings.SUPERTABLE_REDIS_SENTINEL or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
-    )
-    sentinel_strict = (settings.SUPERTABLE_REDIS_SENTINEL_STRICT or "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
-    )
-    sentinel_master = (settings.SUPERTABLE_REDIS_SENTINEL_MASTER or "").strip() or "mymaster"
-
-    sentinel_password = _coerce_password(settings.SUPERTABLE_REDIS_SENTINEL_PASSWORD) or password
-
-    # Single-password setup: if Sentinel is enabled and Redis password is not set, reuse Sentinel password.
-    if sentinel_enabled and password is None and sentinel_password:
-        password = sentinel_password
-
-    # If username is set but password is None, drop username (ACL requires both)
-    if username and not password:
-        username = None
-
-    sentinel_hosts: List[Tuple[str, int]] = []
-    sentinel_raw = (settings.SUPERTABLE_REDIS_SENTINELS or "").strip()
-    if sentinel_raw:
-        for part in sentinel_raw.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                h, p = part.split(":")
-                sentinel_hosts.append((h.strip(), int(p)))
-            except ValueError:
-                # Keep behavior non-fatal; invalid entries are ignored.
-                continue
-
-    if sentinel_enabled and sentinel_hosts:
-        sentinel_kwargs: dict = {
-            "socket_timeout": 0.5,
-            "decode_responses": True,
-            "ssl": use_ssl,
-        }
-        if sentinel_password:
-            sentinel_kwargs["password"] = sentinel_password
-        if username:
-            sentinel_kwargs["username"] = username
-
-        sentinel = Sentinel(
-            sentinel_hosts,
-            sentinel_kwargs=sentinel_kwargs,
-            socket_timeout=0.5,
-            decode_responses=True,
-            ssl=use_ssl,
-            username=username,
-            password=password,
-        )
-
-        sentinel_client: redis.Redis = sentinel.master_for(
-            sentinel_master,
-            db=db,
-            decode_responses=True,
-            ssl=use_ssl,
-            username=username,
-            password=password,
-        )
-
-        # Fail-fast probe (matches RedisCatalog behavior).
-        sentinel_err: Optional[BaseException] = None
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
-            try:
-                sentinel_client.ping()
-                sentinel_err = None
-                break
-            except (MasterNotFoundError, redis.RedisError, OSError) as e:
-                sentinel_err = e
-                time.sleep(0.2)
-
-        if sentinel_err is None:
-            return sentinel_client
-
-        if sentinel_strict:
-            raise sentinel_err
-
-        # Non-strict fallback to standard Redis
-        return redis.Redis(
-            host=host,
-            port=port,
-            db=db,
-            password=password,
-            username=username,
-            decode_responses=True,
-            ssl=use_ssl,
-        )
-
-    # Standard Redis mode
-    return redis.Redis(
-        host=host,
-        port=port,
-        db=db,
-        password=password,
-        username=username,
-        decode_responses=True,
-        ssl=use_ssl,
-    )
+    return create_redis_client(RedisOptions())
 
 
 def _build_catalog() -> Tuple[object, redis.Redis]:
     r = _build_redis_client()
     try:
         from supertable.redis_catalog import RedisCatalog as _RC  # type: ignore
-        return _RC(), r
-    except Exception:
+    except ImportError:
         try:
             from redis_catalog import RedisCatalog as _RC  # type: ignore
-            return _RC(), r
-        except Exception:
+        except ImportError:
             return _FallbackCatalog(r), r
+
+    # Inject the already validated shared client.  Audit consumers importing
+    # ``redis_client`` and the catalog must never talk through different pools
+    # or connection policies.
+    catalog = _RC(redis_client=r)
+    if getattr(catalog, "r", None) is not r:
+        raise RuntimeError("RedisCatalog did not retain the hardened Redis client")
+    return catalog, r
 
 
 catalog, redis_client = _build_catalog()

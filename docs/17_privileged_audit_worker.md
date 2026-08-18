@@ -10,7 +10,9 @@ The installed command is:
 ```bash
 supertable-privileged-audit-worker \
   --organization acme \
-  --consumer audit-worker-01
+  --consumer audit-worker-01 \
+  --activation-baseline /etc/supertable/acme-activation-baseline.json \
+  --activation-baseline-sha256 "$SUPERTABLE_ACTIVATION_BASELINE_SHA256"
 ```
 
 Run one worker deployment per organization. Use a stable, unique consumer name
@@ -43,17 +45,65 @@ Before enabling the worker:
    retention, backup, and independently controlled credentials. The worker's
    readback checks do not replace these deployment controls.
 6. Restrict direct writes to RBAC/auth-token state, the privileged stream,
-   delivery ledger, and archive paths. Applications must mutate privileged
-   state through the catalog Lua boundaries.
+   delivery ledger, and archive paths. Keep the mutation-capable Redis
+   credential behind a trusted API/worker service; never distribute it to
+   notebooks, browsers, or ordinary SDK consumers. Applications must mutate
+   privileged state through the catalog Lua boundaries.
 
-The optional strict preflight verifies the Redis settings without changing
-them:
+Every invocation—including health and chain-verification modes—requires an
+immutable activation baseline. The file must be canonical JSON, a regular
+non-symlink file no larger than 1 MiB, and have this exact schema:
+
+```json
+{"activation_id":"cutover-ticket-123","created_ms":1787040000000,"kind":"supertable_privileged_activation_baseline","organization":"acme","state_sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","version":1}
+```
+
+Compute the artifact SHA-256 after the controlled export. Inject
+`--activation-baseline-sha256` through an independent deployment trust path
+(for example, a secret manager), not from a sibling file stored beside the
+baseline. The worker opens without following symlinks, checks the independent
+pin before creating the outbox, and re-attests the baseline and Redis before
+every unit. Replacement/tampering or a Redis reconnect/Sentinel failover to a
+non-conforming server exits with configuration code 2 before another drain.
+
+The `state_sha256` is not an operator-supplied label. While every legacy writer
+is stopped and its credential revoked, compute it from the exact live Redis
+bytes with the production canonical exporter:
+
+```bash
+python - <<'PY'
+from supertable.audit import get_privileged_audit_outbox
+from supertable.audit.privileged_worker import compute_privileged_state_sha256
+
+outbox = get_privileged_audit_outbox("acme")
+print(compute_privileged_state_sha256(outbox, "acme"))
+PY
+```
+
+The digest covers every per-SuperTable RBAC HASH/SET plus the organization auth
+token HASH and its namespace revision. The first worker unit recomputes the
+live digest and atomically installs an immutable activation anchor only when
+the ledger is empty. Every audited RBAC/token Lua mutation is fenced until that
+anchor exists. Later units compare the exact pinned anchor; they do not compare
+evolving post-genesis RBAC state to the genesis digest.
+
+Redis ACLs cannot express “this credential may mutate only through these exact
+script bodies” when it also has direct hash/key command permissions. A true
+trusted-service-only boundary therefore also requires deployment isolation:
+separate mutation/read identities, network policy, and a trusted service that
+does not expose raw Redis commands. The embedded SDK cannot prove that external
+boundary; the live-state digest, mutation fence, immutable activation anchor,
+and worker checks fail closed at their in-repo enforcement points.
+
+The mandatory-by-default strict preflight verifies Redis settings without
+changing them:
 
 ```bash
 supertable-privileged-audit-worker \
   --organization acme \
   --consumer audit-worker-01 \
-  --require-durable-redis \
+  --activation-baseline /etc/supertable/acme-activation-baseline.json \
+  --activation-baseline-sha256 "$SUPERTABLE_ACTIVATION_BASELINE_SHA256" \
   --min-replicas-to-write 1 \
   --min-connected-replicas 1 \
   --health-check
@@ -64,12 +114,14 @@ opts into the weaker persistence policy. It also verifies that the privileged
 stream is a Redis Stream (or is
 not created yet) and that the delivery ledger is a Hash (or is not created
 yet). It requires `CONFIG GET`; a connected-replica threshold also requires
-`INFO replication`. If a managed Redis service denies either command, strict
-mode exits with configuration code 2 and names the missing permission. Omitting
-the flag does not attempt `CONFIG GET`. Check these controls through the
-provider control plane when the worker identity cannot receive CONFIG access.
-This preflight is only a deployment check, not a substitute for configuring
-and testing AOF, replicas, failover, and backups.
+`INFO replication`. If a managed Redis service denies either command, the
+worker exits with configuration code 2 and names the missing permission.
+`--require-durable-redis` is already the default. The explicit
+`--no-require-durable-redis` opt-out skips CONFIG attestation and accepts an
+unverified loss window; use it only as a recorded exceptional risk decision,
+never as an automatic managed-service fallback. Provider checks are not a
+substitute for fail-closed runtime attestation, nor for testing AOF, replicas,
+failover, and backups.
 
 For the first archive-storage validation, keep normal traffic closed and first
 perform one approved, controlled privileged mutation with an audited writer.
@@ -81,14 +133,16 @@ supertable-privileged-audit-worker \
   --organization acme \
   --consumer audit-cutover \
   --once \
-  --require-durable-redis
+  --activation-baseline /etc/supertable/acme-activation-baseline.json \
+  --activation-baseline-sha256 "$SUPERTABLE_ACTIVATION_BASELINE_SHA256"
 
 supertable-privileged-audit-worker \
   --organization acme \
   --consumer audit-cutover-verifier \
   --verify-chain \
   --verify-max-batches 10000 \
-  --require-durable-redis
+  --activation-baseline /etc/supertable/acme-activation-baseline.json \
+  --activation-baseline-sha256 "$SUPERTABLE_ACTIVATION_BASELINE_SHA256"
 ```
 
 The missing `--trim` is intentional. Confirm the checkpoint and Parquet
@@ -105,6 +159,8 @@ Continuous mode is the default. Important options are:
 |---|---|
 | `--organization` | Required organization whose privileged stream is drained. |
 | `--consumer` | Required stable consumer identity for the Redis group. |
+| `--activation-baseline` | Mandatory canonical activation-baseline file, re-read before every unit. |
+| `--activation-baseline-sha256` | Mandatory lowercase SHA-256 pin injected independently from the file. |
 | `--group` | Consumer group; defaults to `__privileged_archival__`. |
 | `--count` | Entries per bounded drain, from 1 through 1,000. |
 | `--reclaim-idle-ms` | Minimum idle time before abandoned pending work is reclaimed. |
@@ -118,7 +174,8 @@ Continuous mode is the default. Important options are:
 | `--trim-max-entries` | Hard bound (1–1000) passed to the conservative trim operation. |
 | `--max-retries` | Consecutive backend/pending retries before exiting nonzero. |
 | `--retry-initial-seconds`, `--retry-max-seconds`, `--retry-jitter` | Bounded exponential retry policy. |
-| `--require-durable-redis` | Require AOF, `appendfsync always`, `noeviction`, and healthy key types at startup. |
+| `--require-durable-redis` | Default: require AOF, `appendfsync always`, `noeviction`, healthy key types, and re-attest before every unit. |
+| `--no-require-durable-redis` | Exceptional unsafe opt-out; disables Redis durability attestation and requires explicit risk acceptance. |
 | `--allow-everysec` | Explicitly weaken strict preflight to accept the `everysec` persistence window. |
 | `--min-replicas-to-write`, `--min-connected-replicas` | Optional replica thresholds in strict mode. |
 
@@ -157,7 +214,9 @@ Run the deeper read-only verification manually or on a scheduled control:
 supertable-privileged-audit-worker \
   --organization acme \
   --consumer audit-chain-verifier \
-  --verify-chain
+  --verify-chain \
+  --activation-baseline /etc/supertable/acme-activation-baseline.json \
+  --activation-baseline-sha256 "$SUPERTABLE_ACTIVATION_BASELINE_SHA256"
 ```
 
 `--verify-chain` is mutually exclusive with `--once` and `--health-check`,
@@ -181,8 +240,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/supertable/acme.env
-ExecStartPre=/opt/supertable/bin/supertable-privileged-audit-worker --organization acme --consumer audit-worker-01 --health-check --max-retries 0 --require-durable-redis
-ExecStart=/opt/supertable/bin/supertable-privileged-audit-worker --organization acme --consumer audit-worker-01 --count 500 --reclaim-idle-ms 300000 --heartbeat-seconds 60 --require-durable-redis
+ExecStartPre=/opt/supertable/bin/supertable-privileged-audit-worker --organization acme --consumer audit-worker-01 --activation-baseline /etc/supertable/acme-activation-baseline.json --activation-baseline-sha256 ${SUPERTABLE_ACTIVATION_BASELINE_SHA256} --health-check --max-retries 0
+ExecStart=/opt/supertable/bin/supertable-privileged-audit-worker --organization acme --consumer audit-worker-01 --activation-baseline /etc/supertable/acme-activation-baseline.json --activation-baseline-sha256 ${SUPERTABLE_ACTIVATION_BASELINE_SHA256} --count 500 --reclaim-idle-ms 300000 --heartbeat-seconds 60
 Restart=on-failure
 RestartSec=10
 KillSignal=SIGTERM
@@ -228,9 +287,12 @@ spec:
             - acme
             - --consumer
             - audit-worker-01
+            - --activation-baseline
+            - /etc/supertable/baseline/activation.json
+            - --activation-baseline-sha256
+            - $(SUPERTABLE_ACTIVATION_BASELINE_SHA256)
             - --count
             - "500"
-            - --require-durable-redis
           envFrom:
             - secretRef:
                 name: supertable-acme
@@ -242,11 +304,23 @@ spec:
                 - acme
                 - --consumer
                 - audit-worker-probe
+                - --activation-baseline
+                - /etc/supertable/baseline/activation.json
+                - --activation-baseline-sha256
+                - $(SUPERTABLE_ACTIVATION_BASELINE_SHA256)
                 - --health-check
                 - --max-retries
                 - "0"
             periodSeconds: 30
             timeoutSeconds: 10
+          volumeMounts:
+            - name: activation-baseline
+              mountPath: /etc/supertable/baseline
+              readOnly: true
+      volumes:
+        - name: activation-baseline
+          secret:
+            secretName: supertable-acme-activation-baseline
 ```
 
 Add `--trim` only after the retention prerequisites above are satisfied.

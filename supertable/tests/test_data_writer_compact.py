@@ -798,6 +798,40 @@ class TestMonitoring:
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
+    def test_monitoring_spool_backpressure_is_explicit_after_compact_commit(
+        self, mock_check_write, MockSimple, mock_settings,
+        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+    ):
+        from supertable.monitoring_writer import (
+            MonitoringBackpressureError,
+            MonitoringPostCommitError,
+        )
+
+        dw = _build_writer()
+        MockSimple.return_value = _mk_simple_mock(_snapshot([_resource("a")]))
+        mock_compact_res.return_value = (
+            1, 100, [{"file": "c", "file_size": 1, "columns": []}], {"a"},
+        )
+        mock_mon = MagicMock()
+        mock_mon.log_metric.side_effect = MonitoringBackpressureError("spool full")
+        MockMW.return_value.__enter__.return_value = mock_mon
+        dw._get_table_config = MagicMock(return_value={})
+
+        with pytest.raises(MonitoringPostCommitError) as raised:
+            dw.compact("admin", "tbl")
+
+        assert raised.value.core_committed is True
+        assert raised.value.operation == "compact"
+        assert raised.value.core_result["files_after"] == 1
+
+    @patch(_P_AUDIT)
+    @patch(_P_MON_WRITER)
+    @patch(_P_MIRROR)
+    @patch(_P_COMPACT_RES)
+    @patch(_P_COMPACT_TOMB, return_value=(0, [], set()))
+    @patch(_P_SETTINGS, new_callable=_stub_settings)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
     def test_sink_table_compact_skips_monitoring(
         self, mock_check_write, MockSimple, mock_settings,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,

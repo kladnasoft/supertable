@@ -148,6 +148,8 @@ def _all_helpers() -> list[tuple[str, str, str]]:
                                                                                f"supertable:{ORG}:monitor:compact:doc:2026-06-09"),
         ("monitor_partition_drain",      RK.monitor_partition_drain(ORG, "writes", "2026-06-09"),
                                                                                f"supertable:{ORG}:monitor:writes:doc:2026-06-09:_drain"),
+        ("monitor_partition_producer_receipts", RK.monitor_partition_producer_receipts(ORG, "writes", "2026-06-09"),
+                                                                               f"supertable:{ORG}:monitor:writes:doc:2026-06-09:_producer_receipts"),
         ("monitor_partition_pattern",    RK.monitor_partition_pattern(ORG, "writes"),
                                                                                f"supertable:{ORG}:monitor:writes:doc:*"),
         ("monitor_partition_pattern_for_org", RK.monitor_partition_pattern_for_org(ORG),
@@ -464,6 +466,11 @@ def test_parse_monitor_partition_key_returns_none_for_other_keys():
     # Drain handle is rejected (7 segments, not 6)
     assert RK.parse_monitor_partition_key(
         RK.monitor_partition_drain("acme", "writes", "2026-06-09")
+    ) is None
+    assert RK.parse_monitor_partition_key(
+        RK.monitor_partition_producer_receipts(
+            "acme", "writes", "2026-06-09",
+        )
     ) is None
     # Invalid monitor_type
     assert RK.parse_monitor_partition_key(

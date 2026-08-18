@@ -13,7 +13,7 @@ the generator is seeded and every load/transform is an upsert.
 import argparse
 import sys
 
-import supertable.config.homedir  # noqa: F401  (resolves the app home)
+from supertable.config.homedir import initialize_app_home
 from supertable.demo.medcenter import defaults
 from supertable.demo.medcenter.export_accounting import (
     export_accounting_import,
@@ -148,6 +148,7 @@ def snapshot_for_idempotency() -> tuple[int, str, str]:
 
 
 def main() -> None:
+    initialize_app_home(change_cwd=True)
     ap = argparse.ArgumentParser(description="Run the full medcenter demo")
     ap.add_argument("--data-dir", default=defaults.generated_data_dir)
     ap.add_argument("--export-dir", default=defaults.export_dir)

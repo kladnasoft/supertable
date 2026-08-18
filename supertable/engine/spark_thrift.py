@@ -12,18 +12,21 @@ import uuid
 from typing import Dict, List, Optional
 
 import pandas as pd
+import sqlglot
+from sqlglot import exp
 
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.query_plan_manager import QueryPlanManager
-from supertable.utils.sql_parser import SQLParser
+from supertable.utils.sql_parser import SQLParser, validate_read_query_ast
+from supertable.utils.spark_security import validate_spark_storage_config
 from supertable.data_classes import Reflection, RbacViewDef
 from supertable.redis_catalog import RedisCatalog
 
 from supertable.engine.engine_common import (
     quote_if_needed,
     rewrite_query_with_hashed_tables,
-    escape_parquet_path,
+    redact_url_credentials,
     snapshot_spark_type,
 )
 
@@ -34,6 +37,309 @@ from urllib.parse import urlparse, unquote
 # at INFO level, which floods the application log.
 for _lib in ("pyhive", "pyhive.hive", "TCLIService", "thrift", "thrift_sasl"):
     logging.getLogger(_lib).setLevel(logging.WARNING)
+
+
+# Spark SQL runs inside a long-lived JVM with access to cluster classes,
+# Hadoop configuration and source-file metadata.  Unknown functions are not a
+# compatibility feature on this boundary: they can resolve to cluster UDFs or
+# newly added Spark built-ins with capabilities we have not reviewed.  Keep the
+# user-query surface deliberately closed and version it through code review.
+#
+# Operators, literals, columns, joins, CASE predicates and window clauses are
+# not Func nodes.  CASE/IF and CAST/TRY_CAST *are* Func nodes in sqlglot and are
+# therefore listed explicitly alongside ordinary analytics functions.
+_SPARK_SAFE_USER_FUNCTIONS = frozenset(
+    """
+    abs acos acosh add_months aggregate and any_value array array_append
+    array_compact array_contains array_distinct array_except array_intersect array_join
+    array_max array_min array_position array_prepend array_remove
+    array_size array_sort array_union arrays_overlap arrays_zip ascii asin asinh
+    atan atan2 atanh avg base64 bin bit_and bit_count bit_get bit_length bit_or
+    bit_xor bitmap_bit_position bitmap_bucket_number bool_and bool_or bround
+    btrim cardinality case cast cbrt ceil ceiling char char_length character_length
+    chr coalesce contains conv corr cos
+    cosh cot count count_if covar_pop covar_samp crc32 csc cube cume_dist
+    current_date current_timestamp date_add date_diff date_format date_from_unix_date
+    date_part date_sub date_trunc dateadd datediff day dayofmonth dayofweek
+    dayofyear decode degrees dense_rank e element_at elt encode endswith every
+    exp expm1 extract factorial filter find_in_set first first_value flatten floor
+    forall from_unixtime get
+    get_json_object greatest grouping grouping_id hash hex hour
+    hypot if ifnull initcap instr kurtosis lag last last_day last_value lcase lead
+    least left length levenshtein ln localtimestamp locate log log10 log1p log2
+    lower ltrim make_date make_dt_interval make_interval make_timestamp
+    make_timestamp_ltz make_timestamp_ntz make_ym_interval map map_concat
+    map_contains_key map_entries map_filter map_from_arrays map_from_entries
+    map_keys map_values map_zip_with max max_by md5 mean median min min_by minute
+    mode month months_between named_struct nanvl negative next_day nth_value ntile
+    nullif nullifzero nvl nvl2 octet_length overlay parse_url percent_rank
+    percentile pi pmod position
+    or positive pow power quarter radians rand randn rank reduce regexp_count
+    regexp_extract regexp_extract_all regexp_instr regexp_like
+    regexp_substr reverse right rint round row_number rtrim
+    sec second sha sha1 sha2 shiftleft shiftright shiftrightunsigned
+    shuffle sign signum sin sinh size slice some sort_array soundex split
+    split_part sqrt startswith std stddev stddev_pop stddev_samp str_to_map struct
+    substr substring substring_index sum tan tanh timestamp_add timestamp_diff timestamp_trunc
+    timestamp_micros timestamp_millis timestamp_seconds to_binary to_char to_csv
+    to_date to_json to_number to_timestamp to_timestamp_ltz to_timestamp_ntz
+    transform translate trim trunc try_avg try_cast try_make_interval
+    try_make_timestamp try_make_timestamp_ltz try_make_timestamp_ntz try_sum
+    try_to_binary typeof ucase unbase64 unhex unix_date unix_micros unix_millis
+    unix_seconds unix_timestamp upper url_decode url_encode var_pop var_samp
+    variance weekday weekofyear width_bucket xxhash64 year zip_with zeroifnull
+    """.split()
+)
+
+
+_SPARK_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)("
+    r"(?:spark\.hadoop\.)?(?:fs\.)?(?:s3a\.)?"
+    r"(?:access\.key|secret\.key|session\.token|credentials?)"
+    r"|s3_(?:access_key|secret_key|session_token)"
+    r"|aws_(?:access_key_id|secret_access_key|session_token)"
+    r"|password|token|signature"
+    r")(\s*(?:=|:)\s*)(?:'[^']*'|\"[^\"]*\"|[^\s,;]+)"
+)
+_SPARK_VARIABLE_SUBSTITUTION_RE = re.compile(r"\$\{")
+
+# Several Spark SQL identity expressions are accepted without parentheses.
+# In the sqlglot versions supported by SuperTable those tokens parse as plain,
+# unqualified columns rather than Func nodes (for example ``SELECT USER``), so
+# the function allowlist alone cannot see them.  Quoted identifiers and
+# qualified data columns remain available (``SELECT `user``` / ``t.user``).
+_SPARK_BARE_SESSION_IDENTIFIERS = frozenset({
+    "user",
+    "session_user",
+    "system_user",
+    "current_role",
+    "current_catalog",
+    "current_database",
+    "current_schema",
+    "current_namespace",
+    "current_version",
+    "version",
+})
+_SPARK_DUCKDB_ONLY_BOUNDED_COLLECTION_AGGREGATES = frozenset({
+    "array_agg",
+    "list",
+})
+
+
+def _redact_spark_sensitive_text(value: object) -> str:
+    """Return a bounded, credential-safe Spark error/log message."""
+    text = redact_url_credentials(value)
+    # The shared URL redactor historically targeted signed query strings.
+    # Strip authority userinfo here as well, including URLs without a query.
+    def _strip_userinfo(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        try:
+            parsed = urlparse(raw)
+            if parsed.username is None and parsed.password is None:
+                return raw
+            host = parsed.hostname or ""
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            if parsed.port is not None:
+                host = f"{host}:{parsed.port}"
+            suffix = f"?{parsed.query}" if parsed.query else ""
+            return f"{parsed.scheme}://{host}{parsed.path}{suffix}"
+        except Exception:
+            return "<redacted-url>"
+
+    text = re.sub(
+        r"(?i)https?://[^\s'\"<>]+",
+        _strip_userinfo,
+        text,
+    )
+    text = _SPARK_SENSITIVE_ASSIGNMENT_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
+        text,
+    )
+    if len(text) > 4_096:
+        text = text[:4_096] + "<truncated>"
+    return text
+
+
+def _redact_spark_plan_text(value: object) -> str:
+    """Return no attacker-controlled Spark plan text.
+
+    Catalyst plans can render source paths, unquoted literals, configuration
+    values and connector-specific fields whose grammar changes across Spark
+    versions. Regex redaction cannot prove that every future rendering is safe,
+    so persisted/API-visible profiles retain only the section's presence.
+    """
+    return "<spark-plan-redacted>" if str(value or "") else ""
+
+
+def _spark_function_name(node: exp.Func) -> str:
+    """Return the backend-visible function name used by the policy."""
+    if isinstance(node, exp.Anonymous):
+        name = node.name
+    else:
+        try:
+            name = node.sql_name()
+        except Exception:
+            name = ""
+    return str(name or "").strip().casefold()
+
+
+def _validate_spark_expression_capabilities(parsed: exp.Expression) -> None:
+    """Apply the closed Spark capability policy to one parsed expression."""
+    forbidden_backend_nodes = tuple(
+        node_type
+        for name in ("QueryTransform", "Hint", "Lock")
+        if isinstance((node_type := getattr(exp, name, None)), type)
+    )
+    if forbidden_backend_nodes and any(
+        isinstance(node, forbidden_backend_nodes) for node in parsed.walk()
+    ):
+        raise ValueError(
+            "Spark SQL scripts, locking clauses, and query hints are not allowed in "
+            "SuperTable queries"
+        )
+
+    for column in parsed.find_all(exp.Column):
+        identifier = column.this
+        if (
+            not column.table
+            and isinstance(identifier, exp.Identifier)
+            and not identifier.args.get("quoted")
+            and str(identifier.this or "").casefold()
+            in _SPARK_BARE_SESSION_IDENTIFIERS
+        ):
+            raise ValueError(
+                "Spark SQL session identity expression is not allowed in "
+                "SuperTable queries"
+            )
+
+    for function in parsed.find_all(exp.Func):
+        name = _spark_function_name(function)
+        qualified = (
+            isinstance(function.parent, exp.Dot)
+            and function.parent.expression is function
+        )
+        if qualified or not name or name not in _SPARK_SAFE_USER_FUNCTIONS:
+            rendered = name or "<unknown>"
+            raise ValueError(
+                "Spark SQL function is not allowed in SuperTable queries: "
+                f"{rendered}"
+            )
+
+
+def _validate_spark_user_functions(parser: SQLParser) -> None:
+    """Reject every Spark function not explicitly reviewed as data-only.
+
+    This check intentionally lives in the Spark executor as well as the SQL
+    parser boundary.  AUTO requests are initially parsed with DuckDB grammar
+    and can later route to Spark; validating immediately before cluster
+    selection prevents that route from bypassing the Spark-specific policy.
+    """
+    original_query = getattr(parser, "original_query", None)
+    if isinstance(original_query, str) and _SPARK_VARIABLE_SUBSTITUTION_RE.search(
+        original_query
+    ):
+        raise ValueError(
+            "Spark SQL variable substitution is not allowed in SuperTable queries"
+        )
+
+    parsed = getattr(parser, "_parsed", None)
+    if not isinstance(parsed, exp.Expression):
+        query = getattr(parser, "original_query", None)
+        if not isinstance(query, str) or not query.strip():
+            raise RuntimeError("Spark query is missing a validated SQL expression")
+        dialect = getattr(parser, "dialect", "spark")
+        if dialect not in {"duckdb", "spark"}:
+            dialect = "spark"
+        try:
+            parsed = sqlglot.parse_one(query, read=dialect)
+        except Exception as exc:
+            raise RuntimeError("Spark query could not be validated safely") from exc
+
+    # Built-in deep-quality SQL can opt into a narrowly bounded DuckDB LIST
+    # aggregate. Spark SQL does not preserve that aggregate's ordered semantics
+    # under the current transpiler. Reject it before cluster setup instead of
+    # silently widening the public function surface or returning wrong data.
+    if (
+        getattr(parser, "allow_bounded_collection_aggregates", False) is True
+        and any(
+            _spark_function_name(function)
+            in _SPARK_DUCKDB_ONLY_BOUNDED_COLLECTION_AGGREGATES
+            for function in parsed.find_all(exp.Func)
+        )
+    ):
+        raise ValueError(
+            "Bounded collection aggregates require the DuckDB quality route "
+            "and are not supported by Spark execution"
+        )
+
+    _validate_spark_expression_capabilities(parsed)
+
+
+def _revalidate_spark_parser(
+    parser: SQLParser,
+    reflection: Reflection,
+) -> SQLParser:
+    """Rebuild the complete read policy from original SQL at the backend.
+
+    A caller can supply a parser-like object whose ``_parsed`` tree does not
+    match ``original_query`` or whose table helpers lie. Never use that object
+    for Spark setup, bindings, or rewrite decisions.
+    """
+    # Reject obvious capabilities in the supplied tree first. This keeps the
+    # failure before any attempt to infer missing parser context.
+    _validate_spark_user_functions(parser)
+
+    query = getattr(parser, "original_query", None)
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("Spark execution requires original SQL text")
+    dialect = getattr(parser, "dialect", "spark")
+    if not isinstance(dialect, str):
+        dialect = "spark"
+    elif dialect not in {"duckdb", "spark"}:
+        raise ValueError("Spark execution received an unsupported SQL dialect")
+    super_name = getattr(parser, "default_super_name", None)
+    if not isinstance(super_name, str) or not super_name:
+        reflected_supers = {
+            str(getattr(snapshot, "super_name", ""))
+            for snapshot in (getattr(reflection, "supers", None) or [])
+            if str(getattr(snapshot, "super_name", ""))
+        }
+        if len(reflected_supers) != 1:
+            raise ValueError("Spark execution requires a validated supertable scope")
+        super_name = reflected_supers.pop()
+
+    # SQLParser reasserts read-only roots, recursive DML/DDL rejection,
+    # identifier-only managed sources, historical-snapshot denial and scope
+    # analysis. It parses from the original text rather than accepting the
+    # caller's AST.
+    validated = SQLParser(
+        super_name=super_name,
+        query=query,
+        dialect=dialect,
+    )
+    # Reassert the complete shared boundary explicitly at the selected backend,
+    # even if a future SQLParser construction path becomes more permissive.
+    validate_read_query_ast(validated._parsed, dialect)
+    _validate_spark_user_functions(validated)
+
+    reflected_keys = {
+        (
+            str(getattr(snapshot, "super_name", "")).casefold(),
+            str(getattr(snapshot, "simple_name", "")).casefold(),
+        )
+        for snapshot in (getattr(reflection, "supers", None) or [])
+    }
+    requested_keys = {
+        (str(table.super_name).casefold(), str(table.simple_name).casefold())
+        for table in validated.get_physical_tables()
+    }
+    missing = requested_keys - reflected_keys
+    if missing:
+        raise ValueError(
+            "Spark query sources do not match the authorized pinned reflection"
+        )
+    return validated
 
 
 # =========================================================
@@ -68,8 +374,13 @@ def _to_s3a_path(file_path: str) -> str:
 
     Handles three cases:
       1. s3://bucket/key          → s3a://bucket/key
-      2. http(s)://endpoint/bucket/key?presign_params → s3a://bucket/key
+      2. recognised provider HTTP URLs → their credential-less native URI
       3. s3a://… or local path    → returned as-is
+
+    Custom S3-compatible endpoints are deliberately not inferred from their
+    URL shape. Path-style and virtual-hosted forms are ambiguous without the
+    backend's configured bucket and logical key; ``_resolve_spark_file`` uses
+    ``storage.canonical_uri(raw_key)`` for those instead.
     """
     if file_path.startswith("s3://"):
         return "s3a://" + file_path[5:]
@@ -120,9 +431,13 @@ def _to_s3a_path(file_path: str) -> str:
         if host.endswith(".s3.amazonaws.com"):
             bucket = host[: -len(".s3.amazonaws.com")]
             return f"s3a://{bucket}/{path}" if bucket and path else file_path
-        if "/" in path:
+        if host == "s3.amazonaws.com" or (
+            host.startswith("s3.") and host.endswith(".amazonaws.com")
+        ):
             return f"s3a://{path}"
-        # Degenerate case: only bucket, no key — return as-is
+        # Unknown/custom endpoint: only the storage backend can prove which
+        # path segment is the bucket. Leave it untouched so the resolver can
+        # use a pinned raw key or fail closed.
         return file_path
 
     return file_path
@@ -135,52 +450,73 @@ def _resolve_spark_file(
 
     ``sup.files`` are resolved once by the estimator using the *DuckDB* presign
     setting (``SUPERTABLE_DUCKDB_PRESIGNED``) and shared by every engine, so
-    Spark re-resolves here to make its access method depend solely on
-    ``SUPERTABLE_SPARK_PRESIGNED``:
-
-      * default (False) → a direct ``s3a://bucket/key`` path that Spark reads
-        with its own ``fs.s3a.*`` credentials (``_to_s3a_path`` already
-        normalises ``s3://``, presigned ``http(s)://`` and ``s3a://`` inputs);
-      * opt-in (True)   → a freshly minted presigned ``http(s)://`` URL, so
-        Spark works even when the cluster has no object-store credentials — and
-        regardless of whether ``sup.files`` were presigned for DuckDB.
-
-    Presigning is best-effort: a missing ``presign``, a local path, or an
-    unparseable key falls back to the s3a form.
+    Spark re-resolves them here. Spark user SQL runs in the same session that
+    owns the temporary parquet views. A presigned source path is therefore a
+    reusable bearer credential if any Spark metadata/introspection surface
+    reveals it. The presigned mode is disabled until source provisioning is
+    isolated from the user session.
+    Existing signed estimator paths are converted back to credential-less
+    backend URIs; an ambiguous signed URL fails closed.
     """
-    direct = _to_s3a_path(file_path)
-    if not settings.SUPERTABLE_SPARK_PRESIGNED:
-        return direct
+    if settings.SUPERTABLE_SPARK_PRESIGNED:
+        raise RuntimeError(
+            "SUPERTABLE_SPARK_PRESIGNED is disabled: configure Spark-side "
+            "workload identity or a Hadoop credential provider"
+        )
 
-    is_remote = direct.startswith(("s3a://", "gs://", "abfss://"))
-    if not is_remote:
-        return direct
-
-    presign_fn = getattr(storage, "presign", None)
-    if not callable(presign_fn):
-        return direct
-
-    # s3a://bucket/full_key → object key.  storage.presign() re-applies
-    # base_prefix (like read_bytes), so strip it here — mirroring
-    # _read_parquet_schema — to avoid doubling it.
-    if raw_key:
-        full_key = str(raw_key).lstrip("/")
-    else:
-        full_key = direct.partition("://")[2].partition("/")[2]
-    if not full_key:
-        return direct
-    base = (getattr(storage, "base_prefix", "") or "").strip("/")
-    rel_key = (
-        full_key[len(base) + 1:]
-        if base and full_key.startswith(base + "/")
-        else full_key
-    )
     try:
-        url = presign_fn(rel_key)
-        if isinstance(url, str) and url:
-            return url
-    except Exception as e:  # pragma: no cover - defensive
-        logger.debug(f"[spark.thrift] presign failed for {rel_key!r}; using s3a: {e}")
+        source = urlparse(file_path)
+    except Exception:
+        raise RuntimeError("Spark source path could not be resolved safely") from None
+
+    # A signed URL from a custom S3-compatible endpoint can be path-style
+    # (endpoint/bucket/key) or virtual-hosted (bucket.endpoint/key). Guessing
+    # from URL text can silently bind Spark to the wrong bucket/key. When the
+    # estimator supplies the pinned logical object key, ask the owning storage
+    # backend for its canonical URI and ignore the incidental signed URL shape.
+    used_backend_canonical = False
+    if source.scheme.casefold() in {"http", "https"} and raw_key is not None:
+        canonical_uri = getattr(storage, "canonical_uri", None)
+        if not callable(canonical_uri) or not isinstance(raw_key, str) or not raw_key:
+            raise RuntimeError(
+                "Spark HTTP source requires a pinned backend-owned object URI"
+            )
+        try:
+            canonical = canonical_uri(raw_key)
+        except Exception:
+            raise RuntimeError(
+                "Spark HTTP source requires a pinned backend-owned object URI"
+            ) from None
+        if not isinstance(canonical, str) or not canonical:
+            raise RuntimeError(
+                "Spark HTTP source requires a pinned backend-owned object URI"
+            )
+        direct = _to_s3a_path(canonical)
+        used_backend_canonical = True
+    else:
+        direct = _to_s3a_path(file_path)
+
+    parsed = urlparse(direct)
+    scheme = parsed.scheme.casefold()
+    if used_backend_canonical and scheme not in {"s3a", "gs", "abfss", "file"}:
+        raise RuntimeError(
+            "Spark backend returned an unsupported canonical object URI"
+        )
+    # ``container@account`` is required ABFSS authority syntax, not userinfo.
+    has_userinfo = scheme in {"http", "https", "s3", "s3a", "gs"} and (
+        parsed.username is not None or parsed.password is not None
+    )
+    if scheme in {"http", "https", "s3", "s3a", "gs", "abfss"} and (
+        parsed.query or parsed.fragment or has_userinfo
+    ):
+        raise RuntimeError(
+            "Spark source path contains a bearer credential that cannot be "
+            "safely isolated from user SQL"
+        )
+    if scheme in {"http", "https"}:
+        raise RuntimeError(
+            "Spark HTTP source cannot be mapped to a pinned backend object"
+        )
     return direct
 
 
@@ -190,13 +526,55 @@ def _resolve_spark_file(
 
 def _spark_quote_identifier(value: object) -> str:
     """Return one safely backtick-quoted Spark SQL identifier."""
-    return "`" + str(value).replace("`", "``") + "`"
+    text = _spark_metadata_text(value, "Spark identifier")
+    return "`" + text.replace("`", "``") + "`"
+
+
+def _spark_metadata_text(value: object, label: str) -> str:
+    """Validate metadata before embedding it in a Spark SQL statement.
+
+    Spark performs variable substitution before parsing and accepts literal
+    newlines/control bytes in surprising contexts.  Session substitution is
+    disabled independently, but metadata is also fenced here so a later
+    session-regression cannot turn a catalog path or column into SQL text.
+    """
+    if not isinstance(value, str):
+        raise RuntimeError(f"{label} must be a string")
+    text = value
+    if not text or len(text) > 16_384:
+        raise RuntimeError(f"{label} has an invalid length")
+    if _SPARK_VARIABLE_SUBSTITUTION_RE.search(text):
+        raise RuntimeError(f"{label} contains Spark variable substitution")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in text):
+        raise RuntimeError(f"{label} contains a control character")
+    return text
+
+
+def _spark_string_literal(value: object, label: str = "Spark string") -> str:
+    """Render a validated string using Spark's backslash-escape semantics."""
+    text = _spark_metadata_text(value, label)
+    return exp.Literal.string(text).sql(dialect="spark")
+
+
+def _execute_spark_setup_sql(cursor, sql: str, phase: str) -> None:
+    """Execute generated setup SQL without exposing backend-echoed SQL.
+
+    Thrift errors commonly include the complete failed CREATE VIEW statement.
+    Those statements contain storage paths, hidden columns, and protected RBAC
+    literals, so setup errors cross the public boundary as phase-only messages.
+    """
+    try:
+        cursor.execute(sql)
+    except Exception:
+        raise RuntimeError(f"Spark {phase} failed") from None
 
 
 def _spark_table_name(super_name: str, simple_name: str, version: int) -> str:
     """Generate a deterministic Spark temp table name."""
     key = f"{super_name}_{simple_name}"
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+    digest = hashlib.sha1(
+        key.encode("utf-8"), usedforsecurity=False
+    ).hexdigest()[:12]
     return f"spark_{digest}_v{version}"
 
 
@@ -236,6 +614,11 @@ def _spark_create_parquet_view_impl(
     if not files:
         raise ValueError(f"No files provided for Spark reflection {table_name!r}")
 
+    # Validate every path before recording a possibly-created view.  Invalid
+    # catalog metadata must not cause even cleanup/setup SQL to reach Spark.
+    for file_path in files:
+        _spark_string_literal(file_path, "Spark parquet path")
+
     snapshot_schema = dict(column_types or {})
     snapshot_by_fold: Dict[str, tuple[str, str]] = {}
     for raw_name, raw_type in snapshot_schema.items():
@@ -268,10 +651,12 @@ def _spark_create_parquet_view_impl(
             # Record before execution: a lost Thrift response is ambiguous and
             # may mean Spark created the view even though execute raised.
             _created_names.append(part_name)
-            cursor.execute(
+            _execute_spark_setup_sql(
+                cursor,
                 f"CREATE OR REPLACE TEMPORARY VIEW {part_name} "
                 f"USING parquet "
-                f"OPTIONS (path '{escape_parquet_path(f)}')"
+                f"OPTIONS (path {_spark_string_literal(f, 'Spark parquet path')})",
+                "parquet source view creation",
             )
             part_views.append(part_name)
             intermediate_views.append(part_name)
@@ -279,10 +664,10 @@ def _spark_create_parquet_view_impl(
             try:
                 cursor.execute(f"DESCRIBE {part_name}")
                 described = cursor.fetchall()
-            except Exception as exc:
+            except Exception:
                 raise RuntimeError(
                     "Cannot resolve a parquet source schema for safe Spark union"
-                ) from exc
+                ) from None
 
             if not isinstance(described, (list, tuple)):
                 raise RuntimeError(
@@ -376,8 +761,10 @@ def _spark_create_parquet_view_impl(
             _aligned_select(part_name) for part_name in part_views
         )
         _created_names.append(batch_view)
-        cursor.execute(
-            f"CREATE OR REPLACE TEMPORARY VIEW {batch_view} AS {union_sql}"
+        _execute_spark_setup_sql(
+            cursor,
+            f"CREATE OR REPLACE TEMPORARY VIEW {batch_view} AS {union_sql}",
+            "schema-alignment view creation",
         )
         all_batch_views.append(batch_view)
         intermediate_views.append(batch_view)
@@ -392,8 +779,10 @@ def _spark_create_parquet_view_impl(
         union_sql = " UNION ALL ".join(f"SELECT * FROM {v}" for v in all_batch_views)
 
     _created_names.append(table_name)
-    cursor.execute(
-        f"CREATE OR REPLACE TEMPORARY VIEW {table_name} AS {union_sql}"
+    _execute_spark_setup_sql(
+        cursor,
+        f"CREATE OR REPLACE TEMPORARY VIEW {table_name} AS {union_sql}",
+        "reflection view creation",
     )
 
     # Do NOT drop batch views — the target view references them lazily.
@@ -451,10 +840,12 @@ def _spark_create_empty_view(cursor, table_name: str, column_types: Dict[str, st
         expressions.append(
             f"CAST(NULL AS {type_name}) AS {_spark_quote_identifier(name)}"
         )
-    cursor.execute(
+    _execute_spark_setup_sql(
+        cursor,
         f"CREATE OR REPLACE TEMPORARY VIEW {table_name} AS SELECT "
         + ", ".join(expressions)
-        + " WHERE 1 = 0"
+        + " WHERE 1 = 0",
+        "empty reflection view creation",
     )
 
 
@@ -477,10 +868,10 @@ def _spark_create_rbac_view(
             try:
                 cursor.execute(f"DESCRIBE {base_table_name}")
                 described = cursor.fetchall()
-            except Exception as exc:
+            except Exception:
                 raise RuntimeError(
                     "Cannot resolve source schema for RBAC exclusions"
-                ) from exc
+                ) from None
             actual_columns = [
                 str(row[0]) for row in described
                 if row and str(row[0]).strip() and not str(row[0]).startswith("#")
@@ -524,16 +915,45 @@ def _spark_create_rbac_view(
         # expression as one AST so Spark identifier quoting is correct and no
         # conjunct can be discarded by regenerating only ``filter_spec``.
         try:
-            import sqlglot
-            secured = sqlglot.parse_one(
-                f"SELECT 1 WHERE {where_clause}", dialect="duckdb",
+            if _SPARK_VARIABLE_SUBSTITUTION_RE.search(where_clause):
+                raise ValueError("Spark variable substitution is not allowed")
+            parsed_statements = sqlglot.parse(
+                f"SELECT 1 WHERE {where_clause}", read="duckdb",
             )
+            semicolon_type = getattr(exp, "Semicolon", None)
+            statements = [
+                statement
+                for statement in parsed_statements
+                if statement is not None
+                and not (
+                    isinstance(semicolon_type, type)
+                    and isinstance(statement, semicolon_type)
+                )
+            ]
+            if len(statements) != 1:
+                raise ValueError("RBAC predicate must contain exactly one statement")
+            secured = statements[0]
             where_expr = secured.args.get("where")
             if where_expr is None:
                 raise ValueError("missing WHERE expression")
+            scalar_forbidden = tuple(
+                node_type
+                for name in (
+                    "Query", "Subquery", "Table", "QueryTransform", "Hint",
+                    "Lateral", "AggFunc", "Window", "Parameter",
+                    "Placeholder", "SessionParameter", "Var",
+                )
+                if isinstance((node_type := getattr(exp, name, None)), type)
+            )
+            if scalar_forbidden and any(
+                isinstance(node, scalar_forbidden)
+                for node in where_expr.this.walk()
+            ):
+                raise ValueError("RBAC predicate must be a table-local scalar")
+            _validate_spark_expression_capabilities(where_expr.this)
             where_clause = where_expr.this.sql(dialect="spark")
-        except Exception as exc:
-            raise RuntimeError("Unable to transpile protected Spark predicate") from exc
+        except Exception:
+            raise RuntimeError("Unable to transpile protected Spark predicate") from None
 
     where_sql = ""
     if where_clause:
@@ -543,10 +963,13 @@ def _spark_create_rbac_view(
         f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
         f"SELECT {select_cols} FROM {base_table_name}{where_sql}"
     )
-    cursor.execute(sql)
+    _execute_spark_setup_sql(cursor, sql, "protected RBAC view creation")
 
 
-_SPARK_SYSTEM_COLS = ("__rowid__", "__timestamp__")
+_SPARK_SYSTEM_COLS = ("__rowid__", "__timestamp__", "__file__")
+_SPARK_CANONICAL_RESERVED = {
+    name.casefold(): name for name in _SPARK_SYSTEM_COLS
+}
 
 
 def _spark_create_tombstone_view(
@@ -560,8 +983,8 @@ def _spark_create_tombstone_view(
 
     Spark has no ``EXCLUDE`` syntax, so the source schema is introspected via
     ``DESCRIBE`` and an explicit column list is built that omits the system
-    columns (``__rowid__`` / ``__timestamp__``).  When the table has a
-    deletion-vector (``tombstone_def.tombstone_path``), rows whose
+    columns (``__rowid__`` / ``__timestamp__`` / ``__file__``). When the table
+    has a deletion-vector (``tombstone_def.tombstone_path``), rows whose
     ``__rowid__`` appears in the vector parquet are removed with a
     LEFT ANTI JOIN before the columns are projected away.
 
@@ -584,21 +1007,19 @@ def _spark_create_tombstone_view(
         # vectors and stripping storage-only columns.  Falling back to ``*``
         # would expose reserved columns even on a table with no tombstones.
         raise RuntimeError(
-            f"Cannot validate source schema for protected projection: {describe_error}"
-        ) from describe_error
+            "Cannot validate source schema for protected projection"
+        ) from None
 
-    canonical_reserved = {
-        "__rowid__": "__rowid__",
-        "__timestamp__": "__timestamp__",
-        "__file__": "__file__",
-    }
     seen_reserved = set()
     for name in src_cols:
         folded = name.casefold()
-        is_reserved = folded in canonical_reserved or folded.startswith("__supertable_")
+        is_reserved = (
+            folded in _SPARK_CANONICAL_RESERVED
+            or folded.startswith("__supertable_")
+        )
         if not is_reserved:
             continue
-        expected = canonical_reserved.get(folded)
+        expected = _SPARK_CANONICAL_RESERVED.get(folded)
         if expected is None or name != expected or folded in seen_reserved:
             raise RuntimeError(
                 f"Invalid reserved system column in Spark reflection schema: {name!r}"
@@ -639,9 +1060,8 @@ def _spark_create_tombstone_view(
             )
         # Resolve the deletion-vector pointer the same way as the data files
         # (see the data-file loop in the executor) so Spark reads it through the
-        # same access method — direct s3a:// by default, presigned when
-        # SUPERTABLE_SPARK_PRESIGNED is on — instead of a bare key or a
-        # DuckDB-shaped presigned URL.
+        # same credential-less access method as the data files instead of a
+        # bare key or a DuckDB-shaped presigned URL.
         resolved_path = _resolve_spark_file(
             storage,
             tomb_path,
@@ -710,7 +1130,7 @@ def _spark_create_tombstone_view(
                         "outside the pinned table snapshot"
                     )
                 allowed_sql = ", ".join(
-                    "'" + path.replace("'", "''") + "'"
+                    _spark_string_literal(path, "Spark snapshot resource key")
                     for path in sorted(set(allowed_keys))
                 )
                 if allowed_sql:
@@ -730,8 +1150,8 @@ def _spark_create_tombstone_view(
                         )
         except RuntimeError:
             raise
-        except Exception as exc:
-            raise RuntimeError(f"Unable to validate deletion vector: {exc}") from exc
+        except Exception:
+            raise RuntimeError("Unable to validate deletion vector safely") from None
 
         sql = (
             f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
@@ -745,7 +1165,7 @@ def _spark_create_tombstone_view(
             f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
             f"SELECT {select_cols} FROM {source_table} AS src"
         )
-    cursor.execute(sql)
+    _execute_spark_setup_sql(cursor, sql, "protected projection view creation")
 
 
 # ---------------------------------------------------------------------------
@@ -763,7 +1183,11 @@ def _spark_create_tombstone_view(
 # ``FROM_UNIXTIME(created_at / 1000.0)`` that need a number, not a TIMESTAMP.
 
 
-def _read_parquet_schema(storage, original_path: str):
+def _read_parquet_schema(
+    storage,
+    original_path: str,
+    raw_key: Optional[str] = None,
+):
     """Read one parquet file's schema (footer only); return a ``pyarrow.Schema``.
 
     Returns ``None`` if the schema can't be read.  *original_path* is a snapshot
@@ -771,11 +1195,9 @@ def _read_parquet_schema(storage, original_path: str):
     presigned ``http(s)://`` URL), NOT the s3a form handed to Spark.
 
       * Local file   → footer-only read straight from disk.
-      * Object store → the bucket/key is recovered from the path (reusing
-        :func:`_to_s3a_path`, which drops any presign query string and decodes
-        percent-escapes) and the object is pulled through *storage*, which holds
-        the endpoint/credentials.  The whole object is fetched (the storage
-        abstraction exposes no range read), but only once per table.
+      * Object store → the pinned logical ``raw_key`` is read through *storage*,
+        which owns the endpoint/bucket mapping. Legacy direct s3/s3a paths can
+        still recover a key, but ambiguous HTTP URL shapes never do.
     """
     if not original_path:
         return None
@@ -784,6 +1206,15 @@ def _read_parquet_schema(storage, original_path: str):
         import pyarrow.parquet as pq
     except Exception:
         return None
+
+    # Prefer the catalog-pinned logical key. This neither guesses a bucket from
+    # a custom endpoint URL nor reapplies the backend's base prefix.
+    if storage is not None and isinstance(raw_key, str) and raw_key:
+        try:
+            data = storage.read_bytes(raw_key)
+            return pq.read_schema(pa.BufferReader(data))
+        except Exception:
+            return None
 
     s3a = _to_s3a_path(original_path)
     if not s3a.startswith("s3a://"):
@@ -815,14 +1246,18 @@ def _read_parquet_schema(storage, original_path: str):
         return None
 
 
-def _parquet_timestamp_units(storage, original_path: str) -> Optional[Dict[str, str]]:
+def _parquet_timestamp_units(
+    storage,
+    original_path: str,
+    raw_key: Optional[str] = None,
+) -> Optional[Dict[str, str]]:
     """Map ``column -> parquet timestamp unit`` ('s'/'ms'/'us'/'ns') for every
     column whose PARQUET logical type is a timestamp.
 
     Returns ``None`` when the footer can't be read — the caller then casts only
     ``__timestamp__`` (never the name heuristic).
     """
-    schema = _read_parquet_schema(storage, original_path)
+    schema = _read_parquet_schema(storage, original_path, raw_key=raw_key)
     if schema is None:
         return None
     try:
@@ -994,67 +1429,99 @@ def _double_quotes_to_backticks(sql: str) -> str:
 # S3/MinIO configuration for Spark
 # =========================================================
 
+def _configure_spark_session_security(cursor) -> None:
+    """Install mandatory fail-closed guards before metadata or user SQL."""
+    try:
+        cursor.execute("SET spark.sql.variable.substitute=false")
+    except Exception:
+        raise RuntimeError("Spark session security configuration failed") from None
+
+
 def _configure_spark_s3(cursor, cluster: Optional[Dict] = None) -> None:
     """Set S3/MinIO configuration on the Spark Thrift session.
 
-    If the cluster registration includes s3_endpoint, s3_access_key, or
-    s3_secret_key, those values are SET on the session.
+    Inline object-store access keys are deliberately rejected.  Session SET
+    values are readable through Spark/JVM introspection surfaces and share the
+    lifetime of user SQL.  Configure workload identity or a Hadoop credential
+    provider on the Spark cluster instead.  Non-secret endpoint/region options
+    remain supported for compatibility.
 
-    **Important**: when the cluster dict does NOT include these keys, the
-    function no longer falls back to host-side environment variables
+    **Important**: when the cluster dict does not include non-secret overrides,
+    the function does not fall back to host-side environment variables
     (e.g. ``STORAGE_ENDPOINT_URL``).  The Spark Thrift Server is typically
     launched with ``--conf spark.hadoop.fs.s3a.*`` set to Docker-internal
     addresses (e.g. ``http://minio:9000``).  Overriding them with the
     host-side ``localhost:9000`` breaks S3 access from within the container.
 
-    To explicitly override S3 settings, include them in the cluster
-    registration dict (``s3_endpoint``, ``s3_access_key``, ``s3_secret_key``,
-    ``s3_region``).
+    To explicitly override non-secret S3 settings, use ``s3_endpoint``,
+    ``s3_region``, ``s3_use_ssl`` and ``s3_path_style`` in the cluster
+    registration.  Access keys in that document are rejected.
     """
     _cluster = cluster or {}
 
-    # Only SET values that are explicitly provided in the cluster config.
+    try:
+        safe_config = validate_spark_storage_config(_cluster)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from None
+
+    # Only SET non-secret values that are explicitly provided in the cluster
+    # config.
     # Falling back to host env vars (STORAGE_ENDPOINT_URL etc.) is wrong
     # because those point to localhost which is unreachable from Docker.
-    settings = []
+    spark_settings = []
 
-    endpoint = _cluster.get("s3_endpoint")
+    endpoint = safe_config.get("s3_endpoint")
     if endpoint:
-        settings.append(("spark.hadoop.fs.s3a.endpoint", endpoint))
+        spark_settings.append(("spark.hadoop.fs.s3a.endpoint", endpoint, True))
 
-    access_key = _cluster.get("s3_access_key")
-    if access_key:
-        settings.append(("spark.hadoop.fs.s3a.access.key", access_key))
-
-    secret_key = _cluster.get("s3_secret_key")
-    if secret_key:
-        settings.append(("spark.hadoop.fs.s3a.secret.key", secret_key))
-
-    region = _cluster.get("s3_region")
+    region = safe_config.get("s3_region")
     if region:
-        settings.append(("spark.hadoop.fs.s3a.endpoint.region", region))
+        spark_settings.append(("spark.hadoop.fs.s3a.endpoint.region", region, True))
 
-    use_ssl = _cluster.get("s3_use_ssl")
+    use_ssl = safe_config.get("s3_use_ssl")
     if use_ssl is not None:
-        settings.append(("spark.hadoop.fs.s3a.connection.ssl.enabled", str(use_ssl).lower()))
+        spark_settings.append((
+            "spark.hadoop.fs.s3a.connection.ssl.enabled",
+            use_ssl,
+            True,
+        ))
 
-    path_style = _cluster.get("s3_path_style")
+    path_style = safe_config.get("s3_path_style")
     if path_style is not None:
-        settings.append(("spark.hadoop.fs.s3a.path.style.access", str(path_style).lower()))
+        spark_settings.append((
+            "spark.hadoop.fs.s3a.path.style.access",
+            path_style,
+            True,
+        ))
 
     # Always ensure the S3A filesystem impl is set (harmless if already set).
-    settings.append(("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem"))
+    spark_settings.append((
+        "spark.hadoop.fs.s3a.impl",
+        "org.apache.hadoop.fs.s3a.S3AFileSystem",
+        False,
+    ))
 
-    if not settings:
+    if not spark_settings:
         logger.debug("[spark.thrift] no S3 overrides in cluster config; using spark-submit defaults")
 
-    for key, value in settings:
+    for key, value, required in spark_settings:
         try:
             sql = f"SET {key}={value}"
-            logger.debug(f"[spark.thrift] {sql}")
+            # Values may include private infrastructure names.  Log the setting
+            # key only and never echo the SQL or a backend exception that may
+            # repeat it.
+            logger.debug("[spark.thrift] applying session setting %s", key)
             cursor.execute(sql)
-        except Exception as e:
-            logger.debug(f"[spark.thrift] SET {key} failed: {e}")
+        except Exception as exc:
+            logger.debug(
+                "[spark.thrift] session setting %s failed (%s)",
+                key,
+                type(exc).__name__,
+            )
+            if required:
+                raise RuntimeError(
+                    f"Spark storage session configuration failed for {key}"
+                ) from None
 
 
 def _execute_with_stmt_timeout(
@@ -1082,7 +1549,7 @@ def _execute_with_stmt_timeout(
     def _on_timeout():
         logger.error(
             f"{log_prefix}[spark.thrift] statement timeout after {stmt_timeout_s}s — "
-            f"closing connection: {sql[:120]}"
+            "closing connection"
         )
         timed_out_event.set()
         try:
@@ -1201,11 +1668,26 @@ class SparkThriftExecutor:
         If the timeout fires the connection is forcibly closed, which unblocks any
         pending Thrift RPC and raises a RuntimeError to the caller.
         """
+        # This must precede cluster selection, connection establishment and
+        # storage configuration.  In particular, AUTO requests are parsed with
+        # DuckDB grammar and only learn that Spark won during routing.
+        if settings.SUPERTABLE_SPARK_PRESIGNED:
+            raise RuntimeError(
+                "SUPERTABLE_SPARK_PRESIGNED is disabled: configure Spark-side "
+                "workload identity or a Hadoop credential provider"
+            )
+        caller_parser = parser
+        parser = _revalidate_spark_parser(parser, reflection)
+
         query_timeout = _spark_timeout_seconds()
         stmt_timeout = _spark_statement_timeout_seconds()
 
         # 1. Select cluster
         cluster = self._select_cluster(reflection.reflection_bytes, force=force)
+        try:
+            validate_spark_storage_config(cluster)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from None
         timer_capture("CONNECTING")
 
         conn = None
@@ -1242,10 +1724,18 @@ class SparkThriftExecutor:
             _conn_ref.append(conn)
             cursor = conn.cursor()
 
-            # 3. Configure S3
+            # 3. Disable Spark/Hive/system/environment variable substitution
+            # before issuing any statement containing metadata-derived values.
+            # The lexical fence above is still required because this setting
+            # is session-local and a compromised/misconfigured server could
+            # refuse it.
+            _configure_spark_session_security(cursor)
+
+            # 3a. Configure non-secret S3 options. Credentials must already be
+            # installed cluster-side through workload identity/provider APIs.
             _configure_spark_s3(cursor, cluster)
 
-            # 3a. Work around Spark's inability to read TIMESTAMP(NANOS, false)
+            # 3b. Work around Spark's inability to read TIMESTAMP(NANOS, false)
             #     parquet columns written by DuckDB.  DuckDB writes
             #     __timestamp__ and other timestamp columns as INT64
             #     nanosecond-precision non-UTC-adjusted timestamps.
@@ -1267,7 +1757,10 @@ class SparkThriftExecutor:
                 try:
                     cursor.execute(f"SET {_tw_key}={_tw_val}")
                 except Exception as _tw_err:
-                    logger.debug(f"{log_prefix}[spark.thrift] SET {_tw_key} failed (non-fatal): {_tw_err}")
+                    logger.debug(
+                        f"{log_prefix}[spark.thrift] SET {_tw_key} failed "
+                        f"(non-fatal, {type(_tw_err).__name__})"
+                    )
 
             # 4. Register reflection tables
             snapshots_by_key = {
@@ -1279,7 +1772,7 @@ class SparkThriftExecutor:
             # table_name -> a representative ORIGINAL (pre-s3a) snapshot file,
             # used to read the parquet footer once per table for type-based
             # timestamp detection in step 4a below.
-            table_repr_file: Dict[str, str] = {}
+            table_repr_file: Dict[str, tuple[str, Optional[str]]] = {}
 
             for td in table_defs:
                 key = (td.super_name, td.simple_name)
@@ -1291,19 +1784,22 @@ class SparkThriftExecutor:
                     sup.super_name, sup.simple_name, sup.simple_version,
                 )
 
-                # Keep one ORIGINAL (pre-s3a) file per table for the footer read
-                # that drives type-based timestamp detection (step 4a).
-                if sup.files and table_name not in table_repr_file:
-                    table_repr_file[table_name] = sup.files[0]
-
-                # Resolve to Spark's access form: direct s3a:// by default, or
-                # presigned URLs when SUPERTABLE_SPARK_PRESIGNED is on (handles
-                # s3://, presigned HTTP URLs and bare keys either way).
+                # Resolve to a credential-less backend URI.  Estimator input may
+                # itself be a DuckDB presigned URL; its query string is removed
+                # during conversion and an ambiguous signed form fails closed.
                 raw_keys = list(getattr(sup, "resource_keys", ()) or ())
                 if raw_keys and len(raw_keys) != len(sup.files):
                     raise RuntimeError(
                         "Resolved Spark files and stable resource keys must "
                         "correspond one-for-one"
+                    )
+                # Keep one ORIGINAL path plus its catalog-pinned logical key for
+                # the footer read that drives timestamp detection. The key is
+                # authoritative for ambiguous custom endpoint URL shapes.
+                if sup.files and table_name not in table_repr_file:
+                    table_repr_file[table_name] = (
+                        sup.files[0],
+                        raw_keys[0] if raw_keys else None,
                     )
                 files = [
                     _resolve_spark_file(
@@ -1369,8 +1865,11 @@ class SparkThriftExecutor:
                     desc_rows = cursor.fetchall()
 
                     if table_name not in _ts_units_cache:
+                        representative = table_repr_file.get(table_name)
                         _ts_units_cache[table_name] = _parquet_timestamp_units(
-                            self.storage, table_repr_file.get(table_name),
+                            self.storage,
+                            representative[0] if representative else None,
+                            raw_key=(representative[1] if representative else None),
                         )
                     ts_units = _ts_units_cache[table_name]
 
@@ -1397,7 +1896,8 @@ class SparkThriftExecutor:
                     # mismatch, but at least we don't break the happy path.
                     logger.debug(
                         f"{log_prefix}[spark.thrift] timestamp wrapper "
-                        f"failed for {table_name} (non-fatal): {cast_err}"
+                        f"failed for {table_name} "
+                        f"(non-fatal, {type(cast_err).__name__})"
                     )
 
             logger.info(
@@ -1412,7 +1912,7 @@ class SparkThriftExecutor:
             query_suffix = uuid.uuid4().hex
 
             # 5a. Tombstone / system-column views — created for EVERY alias so
-            # the system columns (__rowid__/__timestamp__) are always stripped
+            # the system columns (__rowid__/__timestamp__/__file__) are always stripped
             # and the deletion-vector (when present) is anti-joined out.  Built
             # on the reflection table directly, before RBAC.
             tombstone_views = getattr(reflection, "tombstone_views", None) or {}
@@ -1449,8 +1949,12 @@ class SparkThriftExecutor:
                 parsed_expression=getattr(parser, "_parsed", None),
             )
             parser.executing_query = executing_query
+            if caller_parser is not parser:
+                caller_parser.executing_query = executing_query
 
-            logger.debug(f"{log_prefix}[spark.thrift] SQL: {executing_query}")
+            logger.debug(
+                f"{log_prefix}[spark.thrift] protected user query prepared"
+            )
 
             # 6a. Capture Spark query plan via EXPLAIN EXTENDED.
             #     Runs the Catalyst optimizer without executing the query
@@ -1486,10 +1990,18 @@ class SparkThriftExecutor:
 
                 spark_plan = {
                     "engine": "spark_sql",
-                    "parsed_logical_plan": plan_sections.get("parsed_logical_plan", ""),
-                    "analyzed_logical_plan": plan_sections.get("analyzed_logical_plan", ""),
-                    "optimized_logical_plan": plan_sections.get("optimized_logical_plan", ""),
-                    "physical_plan": plan_sections.get("physical_plan", ""),
+                    "parsed_logical_plan": _redact_spark_plan_text(
+                        plan_sections.get("parsed_logical_plan", "")
+                    ),
+                    "analyzed_logical_plan": _redact_spark_plan_text(
+                        plan_sections.get("analyzed_logical_plan", "")
+                    ),
+                    "optimized_logical_plan": _redact_spark_plan_text(
+                        plan_sections.get("optimized_logical_plan", "")
+                    ),
+                    "physical_plan": _redact_spark_plan_text(
+                        plan_sections.get("physical_plan", "")
+                    ),
                 }
 
                 # Write to the local plan path so plan_extender finds it.
@@ -1504,14 +2016,14 @@ class SparkThriftExecutor:
                         )
                     except Exception as plan_write_err:
                         logger.debug(
-                            f"{log_prefix}[spark.thrift] failed to write plan JSON: "
-                            f"{plan_write_err}"
+                            f"{log_prefix}[spark.thrift] failed to write plan "
+                            f"JSON ({type(plan_write_err).__name__})"
                         )
             except Exception as explain_err:
                 # EXPLAIN failure must never block the actual query.
                 logger.debug(
-                    f"{log_prefix}[spark.thrift] EXPLAIN EXTENDED failed (non-fatal): "
-                    f"{explain_err}"
+                    f"{log_prefix}[spark.thrift] EXPLAIN EXTENDED failed "
+                    f"(non-fatal, {type(explain_err).__name__})"
                 )
 
             _execute_with_stmt_timeout(
@@ -1542,8 +2054,12 @@ class SparkThriftExecutor:
             if _timed_out.is_set():
                 raise RuntimeError(
                     f"Spark query timed out after {query_timeout}s"
-                ) from e
-            raise
+                ) from None
+            # Direct executor callers deserve the same credential-safe error
+            # boundary as DataReader/API callers.  Suppress the original cause
+            # because some DB-API errors embed the failed SQL statement.
+            safe_message = _redact_spark_sensitive_text(e)
+            raise RuntimeError(safe_message or "Spark query failed") from None
 
         finally:
             # Cancel the watchdog so it doesn't fire after we're done.

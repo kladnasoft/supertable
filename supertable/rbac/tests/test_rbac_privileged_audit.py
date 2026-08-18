@@ -20,6 +20,11 @@ from supertable.audit.privileged import (
     PrivilegedAuditRecord,
 )
 from supertable.audit.privileged_outbox import PrivilegedAuditOutbox
+from supertable.audit.privileged_worker import (
+    ActivationBaselineReport,
+    attest_activation_baseline,
+    compute_privileged_state_sha256,
+)
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager
 from supertable.redis_catalog import (
@@ -47,6 +52,9 @@ _RBAC_SCRIPT_ATTRIBUTES = (
     "_rbac_add_role_to_user",
     "_auth_create_token",
     "_auth_delete_token",
+    "_begin_namespace_deletion",
+    "_delete_namespace_batch",
+    "_finalize_namespace_deletion",
 )
 
 
@@ -59,6 +67,18 @@ def catalog() -> RedisCatalog:
     for attribute in _RBAC_SCRIPT_ATTRIBUTES:
         source = getattr(instance, "_LUA" + attribute.upper())
         setattr(instance, attribute, instance.r.register_script(source))
+    outbox = _outbox(instance)
+    state_sha256 = compute_privileged_state_sha256(outbox, ORG)
+    assert attest_activation_baseline(
+        outbox,
+        ActivationBaselineReport(
+            organization=ORG,
+            activation_id="test-activation",
+            created_ms=1_700_000_000_000,
+            state_sha256=state_sha256,
+            artifact_sha256="a" * 64,
+        ),
+    )
     return instance
 
 
@@ -168,10 +188,27 @@ def test_super_table_data_cleanup_cannot_bypass_the_rbac_ledger(
         RK.audit_privileged_meta(ORG), "sequence"
     )
 
-    deleted = catalog.delete_super_table(ORG, SUP)
+    namespace_token = "namespace-delete-token"
+    catalog.r.set(RK.lock_namespace(ORG, SUP), namespace_token)
+    intent = catalog.begin_namespace_deletion(
+        ORG,
+        SUP,
+        namespace_token=namespace_token,
+    )
+    try:
+        deleted = catalog.delete_super_table(
+            ORG,
+            SUP,
+            namespace_token=namespace_token,
+            intent_id=intent["intent_id"],
+        )
+    finally:
+        if catalog.r.get(RK.lock_namespace(ORG, SUP)) == namespace_token:
+            catalog.r.delete(RK.lock_namespace(ORG, SUP))
 
     assert deleted == 1
     assert catalog.r.get(RK.meta_root(ORG, SUP)) is None
+    assert catalog.get_namespace_deletion_intent(ORG, SUP)["status"] == "deleted"
     assert catalog.rbac_role_exists(ORG, SUP, "retained-role")
     assert catalog.r.hget(
         RK.audit_privileged_meta(ORG), "sequence"
@@ -207,6 +244,24 @@ def test_standalone_denied_attempt_advances_only_the_shared_audit_ledger(
     assert entry.event["affected_count"] == 0
     assert entry.event["mutation_id"] == context.mutation_id
     assert catalog.r.hget(RK.audit_privileged_meta(ORG), "sequence") == "1"
+
+
+def test_privileged_mutation_is_fenced_until_live_baseline_is_anchored(
+    catalog: RedisCatalog,
+) -> None:
+    catalog.r.delete(RK.audit_privileged_activation(ORG))
+
+    with pytest.raises(ResponseError, match="baseline is not anchored"):
+        catalog.rbac_create_role(
+            ORG,
+            SUP,
+            "must-not-exist",
+            _role("must-not-exist"),
+            action_context=next(_contexts()),
+        )
+
+    assert not catalog.r.exists(RK.rbac_role_doc(ORG, SUP, "must-not-exist"))
+    assert catalog.r.xlen(RK.audit_privileged_outbox(ORG)) == 0
 
 
 def test_standalone_attempt_records_failure_despite_corrupt_namespace(

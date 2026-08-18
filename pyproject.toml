@@ -8,13 +8,13 @@ version = "2.4.1"
 description = "SuperTable — versioned data lake library for SQL analytics on Parquet + Redis."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Super Table Public Use License (STPUL) v1.0" }
+license = { text = "FSL-1.1-ALv2" }
 authors = [{ name = "Levente Kupas", email = "lkupas@kladnasoft.com" }]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "License :: Other/Proprietary License",
-  "Operating System :: OS Independent"
+  "Operating System :: POSIX"
 ]
 
 # Read runtime deps from requirements.txt to keep a single source of truth
@@ -39,6 +39,7 @@ Homepage = "https://github.com/kladnasoft/supertable"
 
 [project.scripts]
 supertable-privileged-audit-worker = "supertable.audit.privileged_worker:main"
+supertable-redis-recovery = "supertable.recovery.redis_rebuild:main"
 supertable-demo-quickstart       = "supertable.demo.quickstart.controller:main"
 supertable-demo-webshop-generate = "supertable.demo.webshop.generate:main"
 supertable-demo-webshop-load     = "supertable.demo.webshop.load:main"
@@ -61,3 +62,28 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
   "integration: requires an explicitly configured disposable external service",
 ]
+
+[tool.ruff.lint]
+# Start with correctness rules that can never be waived by formatting taste:
+# syntax errors, invalid control flow, and undefined names. Broader rule groups
+# can be enabled incrementally without weakening this release-blocking baseline.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["supertable"]
+# Tests and benchmarks have their own runtime gates.  Every shipped production
+# module (including demos/console entry points) remains inside the mypy target.
+exclude = [
+  "^supertable/(?:[^/]+/)*(?:tests|benchmarks)/",
+]
+follow_imports = "skip"
+ignore_missing_imports = true
+# Keep the debt baseline reproducible across the minimum/latest dependency
+# jobs; runtime compatibility is exercised by pytest, while this gate checks
+# SuperTable's own modules against one pinned mypy/typeshed version.
+no_site_packages = true
+check_untyped_defs = true
+incremental = false
+show_error_codes = true
+warn_unused_ignores = true

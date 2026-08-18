@@ -56,6 +56,7 @@ def test_dispatch_reports_exact_failed_and_completed_formats():
     snapshot = {"resources": [], "tombstone": None, "tombstone_rows": 0}
     with (
         patch("supertable.mirroring.mirror_formats.write_delta_table") as delta,
+        patch("supertable.mirroring.mirror_formats.verify_delta_table") as verify_delta,
         patch(
             "supertable.mirroring.mirror_formats.write_parquet_table",
             side_effect=OSError("PUT failed"),
@@ -74,7 +75,34 @@ def test_dispatch_reports_exact_failed_and_completed_formats():
     assert isinstance(raised.value.cause, OSError)
     assert "PUT failed" in str(raised.value)
     delta.assert_called_once()
+    verify_delta.assert_called_once()
     parquet.assert_called_once()
+
+
+def test_dispatch_verifies_normal_publication_before_reporting_success():
+    super_table = MagicMock()
+    snapshot = {"resources": [], "tombstone": None, "tombstone_rows": 0}
+    with (
+        patch("supertable.mirroring.mirror_formats.write_iceberg_table") as writer,
+        patch(
+            "supertable.mirroring.mirror_formats.verify_iceberg_table",
+            side_effect=RuntimeError("invalid Iceberg pointer"),
+        ) as verifier,
+    ):
+        with pytest.raises(MirrorSyncError) as raised:
+            MirrorFormats.mirror_if_enabled(
+                super_table,
+                "events",
+                snapshot,
+                mirrors=["ICEBERG"],
+                commit_id="commit-7",
+                snapshot_path="snapshots/7.json",
+            )
+
+    assert raised.value.failed_format == "ICEBERG"
+    assert raised.value.completed_formats == ()
+    writer.assert_called_once()
+    verifier.assert_called_once()
 
 
 def test_parquet_listing_failure_cannot_report_success():
@@ -157,6 +185,9 @@ def test_delta_publishes_remove_log_before_physical_cleanup():
     events = []
 
     class Storage:
+        def __init__(self):
+            self.objects = {"source/new.parquet": b"x" * 10}
+
         def makedirs(self, path):
             pass
 
@@ -165,15 +196,27 @@ def test_delta_publishes_remove_log_before_physical_cleanup():
 
         def copy(self, source, destination):
             events.append(("copy", destination))
+            self.objects[destination] = self.objects[source]
 
         def exists(self, path):
-            return False
+            return path in self.objects
+
+        def content_sha256(self, path):
+            import hashlib
+
+            payload = self.objects[path]
+            return len(payload), hashlib.sha256(payload).hexdigest()
 
         def write_bytes(self, path, payload):
             events.append(("commit", path))
+            self.objects[path] = payload
+
+        def read_bytes(self, path):
+            return self.objects[path]
 
         def delete(self, path):
             events.append(("delete", path))
+            self.objects.pop(path, None)
 
     super_table = MagicMock(
         organization="org", super_name="lake", storage=Storage(),

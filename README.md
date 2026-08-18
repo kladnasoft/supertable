@@ -23,8 +23,9 @@ pip install "supertable[gcp]"         # Google Cloud Storage
 pip install "supertable[all]"         # everything
 ```
 
-Requirements: Python 3.10+, a reachable Redis 6+, and a configured storage
-backend (or local disk for development). See
+Requirements: Python 3.10+, a POSIX host (the durable monitoring spool uses
+`fcntl` locking), a reachable Redis 6+, and a configured storage backend (or
+local disk for development). See
 [docs/02_configuration.md](docs/02_configuration.md) for environment
 variables.
 

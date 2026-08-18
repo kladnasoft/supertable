@@ -435,6 +435,10 @@ class TestWriteParquetAndCollectResources:
     @patch("supertable.processing._storage")
     def test_writes_file_and_appends_resource(self, mock_storage):
         from supertable.processing import write_parquet_and_collect_resources
+        # Exercise the compatibility-backend branch whose reported object size
+        # comes from storage.size(); an unconstrained MagicMock otherwise also
+        # advertises the native write_bytes capability.
+        mock_storage.write_bytes = None
         mock_storage.exists.return_value = True
         mock_storage.size.return_value = 4096
 
@@ -772,12 +776,18 @@ class TestSimpleTableDelete:
     """Tests for SimpleTable.delete."""
 
     @patch("supertable.simple_table.RedisCatalog")
-    @patch("supertable.simple_table.check_write_access")
+    @patch("supertable.simple_table.check_control_access")
     def test_delete_calls_storage_and_catalog(self, mock_access, mock_catalog_cls):
         from supertable.simple_table import SimpleTable
 
         mock_catalog = MagicMock()
         mock_catalog.leaf_exists.return_value = True
+        mock_catalog.acquire_namespace_lock.return_value = "namespace-token"
+        mock_catalog.acquire_simple_lock.return_value = "leaf-token"
+        mock_catalog.begin_simple_deletion.return_value = {
+            "intent_id": "delete-intent",
+        }
+        mock_catalog.delete_simple_table.return_value = True
         mock_catalog_cls.return_value = mock_catalog
 
         mock_super = MagicMock()
@@ -787,32 +797,50 @@ class TestSimpleTableDelete:
         mock_super.storage.exists.return_value = True
 
         st = SimpleTable(mock_super, "del_table")
-        st.delete(role_name="test_role")
+        assert st.delete(role_name="test_role") == "delete-intent"
 
         mock_access.assert_called_once()
-        mock_super.storage.delete.assert_called_once()
-        mock_catalog.delete_simple_table.assert_called_once_with("org", "super", "del_table")
+        assert mock_super.storage.delete_prefix.call_args_list == [
+            call("org/super/tables/del_table"),
+            call("org/super/delta/del_table"),
+            call("org/super/iceberg/del_table"),
+            call("org/super/parquet/del_table"),
+        ]
+        mock_catalog.delete_simple_table.assert_called_once_with(
+            "org",
+            "super",
+            "del_table",
+            lock_token="leaf-token",
+            namespace_token="namespace-token",
+            intent_id="delete-intent",
+        )
 
     @patch("supertable.simple_table.RedisCatalog")
-    @patch("supertable.simple_table.check_write_access")
-    def test_delete_handles_missing_storage(self, mock_access, mock_catalog_cls):
+    @patch("supertable.simple_table.check_control_access")
+    def test_delete_storage_failure_keeps_catalog_fenced(
+        self, mock_access, mock_catalog_cls,
+    ):
         from supertable.simple_table import SimpleTable
 
         mock_catalog = MagicMock()
         mock_catalog.leaf_exists.return_value = True
+        mock_catalog.acquire_namespace_lock.return_value = "namespace-token"
+        mock_catalog.acquire_simple_lock.return_value = "leaf-token"
+        mock_catalog.begin_simple_deletion.return_value = {
+            "intent_id": "delete-intent",
+        }
         mock_catalog_cls.return_value = mock_catalog
 
         mock_super = MagicMock()
         mock_super.organization = "org"
         mock_super.super_name = "super"
         mock_super.storage = MagicMock()
-        mock_super.storage.exists.return_value = True
-        mock_super.storage.delete.side_effect = FileNotFoundError("gone")
+        mock_super.storage.delete_prefix.side_effect = FileNotFoundError("gone")
 
         st = SimpleTable(mock_super, "del_table")
-        # Should not raise
-        st.delete(role_name="test_role")
-        mock_catalog.delete_simple_table.assert_called_once()
+        with pytest.raises(FileNotFoundError, match="gone"):
+            st.delete(role_name="test_role")
+        mock_catalog.delete_simple_table.assert_not_called()
 
 
 # ===========================================================================
@@ -855,11 +883,14 @@ class TestSuperTableInit:
 
         mock_catalog = MagicMock()
         mock_catalog.root_exists.return_value = False
+        mock_catalog.acquire_namespace_lock.return_value = "namespace-token"
         mock_catalog_cls.return_value = mock_catalog
 
         st = SuperTable("new_super", "org")
         mock_storage.makedirs.assert_called_once()
-        mock_catalog.ensure_root.assert_called_once_with("org", "new_super")
+        mock_catalog.ensure_root.assert_called_once_with(
+            "org", "new_super", namespace_token="namespace-token",
+        )
 
 
 class TestSuperTableReadSnapshot:
@@ -953,6 +984,7 @@ class TestSuperTableDelete:
     @patch("supertable.super_table.get_storage")
     def test_delete_removes_storage_and_redis(self, mock_get_storage, mock_catalog_cls, mock_role, mock_user):
         from supertable.super_table import SuperTable
+        from supertable.rbac.permissions import RoleType
 
         mock_storage = MagicMock()
         mock_storage.exists.return_value = True
@@ -960,40 +992,63 @@ class TestSuperTableDelete:
 
         mock_catalog = MagicMock()
         mock_catalog.root_exists.return_value = True
+        mock_catalog.acquire_namespace_lock.return_value = "namespace-token"
+        mock_catalog.begin_namespace_deletion.return_value = {
+            "intent_id": "delete-intent",
+        }
+        mock_catalog.scan_leaf_keys.return_value = []
         mock_catalog_cls.return_value = mock_catalog
 
         st = SuperTable("s", "o")
-        st.delete(role_name="admin")
-        mock_storage.delete.assert_called_once()
-        mock_catalog.delete_super_table.assert_called_once_with("o", "s")
+        with patch(
+            "supertable.super_table.resolve_role_access_context",
+            return_value=types.SimpleNamespace(role_type=RoleType.SUPERADMIN),
+        ):
+            assert st.delete(role_name="admin") == "delete-intent"
+        mock_storage.delete_prefix.assert_called_once_with("o/s")
+        mock_catalog.delete_super_table.assert_called_once_with(
+            "o",
+            "s",
+            namespace_token="namespace-token",
+            intent_id="delete-intent",
+        )
 
     @patch("supertable.super_table.UserManager")
     @patch("supertable.super_table.RoleManager")
     @patch("supertable.super_table.RedisCatalog")
     @patch("supertable.super_table.get_storage")
-    def test_delete_handles_missing_storage(self, mock_get_storage, mock_catalog_cls, mock_role, mock_user):
+    def test_delete_storage_failure_keeps_catalog_fenced(self, mock_get_storage, mock_catalog_cls, mock_role, mock_user):
         from supertable.super_table import SuperTable
+        from supertable.rbac.permissions import RoleType
 
         mock_storage = MagicMock()
-        mock_storage.exists.return_value = True
-        mock_storage.delete.side_effect = FileNotFoundError("gone")
+        mock_storage.delete_prefix.side_effect = FileNotFoundError("gone")
         mock_get_storage.return_value = mock_storage
 
         mock_catalog = MagicMock()
         mock_catalog.root_exists.return_value = True
+        mock_catalog.acquire_namespace_lock.return_value = "namespace-token"
+        mock_catalog.begin_namespace_deletion.return_value = {
+            "intent_id": "delete-intent",
+        }
+        mock_catalog.scan_leaf_keys.return_value = []
         mock_catalog_cls.return_value = mock_catalog
 
         st = SuperTable("s", "o")
-        st.delete(role_name="admin")
-        # Should still delete Redis meta
-        mock_catalog.delete_super_table.assert_called_once()
+        with patch(
+            "supertable.super_table.resolve_role_access_context",
+            return_value=types.SimpleNamespace(role_type=RoleType.SUPERADMIN),
+        ), pytest.raises(FileNotFoundError, match="gone"):
+            st.delete(role_name="admin")
+        mock_catalog.delete_super_table.assert_not_called()
 
     @patch("supertable.super_table.UserManager")
     @patch("supertable.super_table.RoleManager")
     @patch("supertable.super_table.RedisCatalog")
     @patch("supertable.super_table.get_storage")
-    def test_delete_when_storage_not_exists(self, mock_get_storage, mock_catalog_cls, mock_role, mock_user):
+    def test_delete_does_not_require_a_prefix_marker(self, mock_get_storage, mock_catalog_cls, mock_role, mock_user):
         from supertable.super_table import SuperTable
+        from supertable.rbac.permissions import RoleType
 
         mock_storage = MagicMock()
         mock_storage.exists.return_value = False
@@ -1001,11 +1056,21 @@ class TestSuperTableDelete:
 
         mock_catalog = MagicMock()
         mock_catalog.root_exists.return_value = True
+        mock_catalog.acquire_namespace_lock.return_value = "namespace-token"
+        mock_catalog.begin_namespace_deletion.return_value = {
+            "intent_id": "delete-intent",
+        }
+        mock_catalog.scan_leaf_keys.return_value = []
         mock_catalog_cls.return_value = mock_catalog
 
         st = SuperTable("s", "o")
-        st.delete(role_name="admin")
-        mock_storage.delete.assert_not_called()
+        with patch(
+            "supertable.super_table.resolve_role_access_context",
+            return_value=types.SimpleNamespace(role_type=RoleType.SUPERADMIN),
+        ):
+            st.delete(role_name="admin")
+        mock_storage.exists.assert_not_called()
+        mock_storage.delete_prefix.assert_called_once_with("o/s")
         mock_catalog.delete_super_table.assert_called_once()
 
 
@@ -1119,6 +1184,22 @@ class TestDataWriterValidation:
 
 class TestDataWriterWrite:
     """Tests for DataWriter.write method."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_footer_stats(self, monkeypatch):
+        """Keep writer-flow tests independent of configured object storage."""
+        import supertable.data_writer as data_writer_module
+
+        monkeypatch.setattr(
+            data_writer_module,
+            "extract_stats_rows",
+            lambda *args, **kwargs: pl.DataFrame(),
+        )
+        monkeypatch.setattr(
+            data_writer_module,
+            "build_stats_file",
+            lambda **kwargs: (None, None),
+        )
 
     @patch("supertable.data_writer.MonitoringWriter")
     @patch("supertable.data_writer.MirrorFormats")

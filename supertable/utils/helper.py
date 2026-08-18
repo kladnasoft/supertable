@@ -75,4 +75,4 @@ def generate_hash_uid(name: str) -> str:
     """
     Returns an MD5 hash of the given name.
     """
-    return hashlib.md5(name.encode()).hexdigest()
+    return hashlib.md5(name.encode(), usedforsecurity=False).hexdigest()

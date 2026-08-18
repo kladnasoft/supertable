@@ -20,6 +20,8 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import hashlib
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -117,6 +119,89 @@ def new_fake_redis():
     import fakeredis
 
     return fakeredis.FakeStrictRedis(decode_responses=True)
+
+
+def install_privileged_activation(redis_client, organization: str) -> None:
+    """Install the canonical privileged-audit activation for a test estate.
+
+    Characterization tests intentionally run the real RBAC mutation scripts.
+    Those scripts now fail closed until the deployment's existing estate has a
+    pinned activation baseline.  Build and verify that baseline with the same
+    production helpers used by the worker, then let the production attestation
+    Lua install the immutable anchor.  This is test infrastructure, not a
+    direct Redis-key bypass.
+
+    The operation is idempotent for a Redis instance that is already anchored:
+    the existing anchor is reconstructed as a report and re-attested through
+    the production comparison path.
+    """
+    if not isinstance(organization, str) or not organization:
+        raise ValueError("organization is required")
+
+    from supertable import redis_keys as RK
+    from supertable.audit import get_privileged_audit_outbox
+    from supertable.audit.privileged_worker import (
+        ActivationBaselineReport,
+        attest_activation_baseline,
+        compute_privileged_state_sha256,
+        verify_activation_baseline,
+    )
+
+    outbox = get_privileged_audit_outbox(
+        organization,
+        redis_client=redis_client,
+    )
+    existing = redis_client.get(RK.audit_privileged_activation(organization))
+    if existing is not None:
+        document = json.loads(existing)
+        report = ActivationBaselineReport(
+            organization=document["organization"],
+            activation_id=document["activation_id"],
+            created_ms=document["created_ms"],
+            state_sha256=document["state_sha256"],
+            artifact_sha256=document["artifact_sha256"],
+        )
+        attest_activation_baseline(outbox, report)
+        return
+
+    state_sha256 = compute_privileged_state_sha256(outbox, organization)
+    document = {
+        "version": 1,
+        "kind": "supertable_privileged_activation_baseline",
+        "organization": organization,
+        "activation_id": "characterization-" + hashlib.sha256(
+            organization.encode("utf-8")
+        ).hexdigest()[:32],
+        "created_ms": FIXED_NOW_MS,
+        "state_sha256": state_sha256,
+    }
+    payload = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    pin = hashlib.sha256(payload).hexdigest()
+    descriptor, baseline_path = tempfile.mkstemp(
+        prefix="supertable-characterization-activation-",
+        suffix=".json",
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as baseline_file:
+            baseline_file.write(payload)
+            baseline_file.flush()
+            os.fsync(baseline_file.fileno())
+        report = verify_activation_baseline(
+            baseline_path,
+            expected_sha256=pin,
+            organization=organization,
+        )
+        attest_activation_baseline(outbox, report)
+    finally:
+        try:
+            os.unlink(baseline_path)
+        except FileNotFoundError:
+            pass
 
 
 def reset_engine_singletons() -> None:

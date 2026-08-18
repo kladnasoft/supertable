@@ -115,6 +115,20 @@ DuckDB is the lightweight, transient execution path optimized for small datasets
 - **Single persistent connection**: created lazily and reused across all queries to preserve DuckDB's HTTP metadata cache and external file cache between requests.
 - **No materialized state**: VIEWs are created with unique (hashed) names and dropped in the `finally` block after each query. No TABLE state is retained between queries.
 - **Thread-safe**: a lock guards connection creation and httpfs initialization only. DuckDB allows concurrent reads on the same connection, so query execution runs outside the lock.
+- **Closed SQL capability surface**: the backend reparses the original SQL,
+  requires one read-only statement, rebuilds its table bindings, verifies that
+  every requested relation exists in the authorized reflection, and rejects
+  settings/secret catalogs, filesystem helpers, unknown functions, extension
+  UDFs, qualified function calls, bare DuckDB session/catalog identity tokens,
+  and unbounded collection aggregates. Quoted or table-qualified columns whose
+  names happen to match an identity token remain ordinary data columns.
+- **Protected storage credentials**: explicit S3 credentials live in a named
+  temporary in-memory DuckDB secret. The legacy readable `s3_access_key_id`,
+  `s3_secret_access_key`, and `s3_session_token` settings remain unset. An
+  injected S3/MinIO backend provisions that secret from its own authorization
+  context, never from broader process-global credentials. Opaque injected SDK
+  credentials fail closed for direct `s3://` scans; use presigned-path mode or
+  expose the documented server-side `duckdb_s3_config()` adapter contract.
 
 ### Cache Layers
 
@@ -124,15 +138,25 @@ DuckDB is the lightweight, transient execution path optimized for small datasets
 
 ### Execution Flow
 
-1. Acquire (or create) the persistent connection via `_get_connection()`.
-2. Configure httpfs once per connection lifetime via `_ensure_httpfs()`.
+1. Reparse and validate the original SQL and authorized reflection before
+   opening the DuckDB connection.
+2. Acquire (or create) the persistent connection via `_get_connection()` and
+   configure httpfs/the temporary S3 secret via `_ensure_httpfs()`.
 3. For each table referenced in the query:
    - Generate a hashed table name via `hashed_table_name()`.
    - Create a reflection table or view from the resolved parquet files using `create_reflection_table_with_presign_retry()`.
    - Optionally layer dedup, tombstone, and RBAC views on top.
 4. Rewrite the user's SQL to reference the hashed table names via `rewrite_query_with_hashed_tables()`.
-5. Execute the rewritten SQL, fetch results into a pandas DataFrame.
+5. Disable raw backend profiling, disable secret unredaction/extension
+   autoloading, and execute the rewritten SQL.
 6. Drop all created views/tables in the `finally` block.
+
+Direct DuckDB and `Executor` callers receive phase-only messages for backend
+connection, storage, managed-view, scan, and result-stream failures. Raw
+backend causes are scrubbed before propagation because generated DuckDB SQL can
+contain physical source URLs and RBAC/share predicate columns or literals.
+Parser, authorization, request-limit, timeout, and cancellation failures retain
+their typed public semantics.
 
 ### Connection Recovery
 
@@ -149,6 +173,14 @@ Spark Thrift is the distributed execution path for datasets too large for a sing
 
 - Connects to a Spark Thrift Server via PyHive's HiveServer2 interface.
 - Converts S3/HTTP paths to `s3a://` paths for Spark compatibility via `_to_s3a_path()`.
+- Requires cluster-side workload identity or a Hadoop credential provider.
+  Inline access/secret/session keys and presigned source URLs are rejected.
+- Disables Spark variable substitution and enforces a closed, data-only SQL
+  function allowlist before cluster selection. JVM reflection, source-file
+  metadata, scripts, hints, cluster UDFs, and unbounded output amplifiers fail
+  closed.
+- Persists only credential-safe plans: raw Catalyst plan sections are replaced
+  by a fixed marker before the plan file is written.
 - Creates temporary parquet views using `CREATE OR REPLACE TEMPORARY VIEW ... USING parquet OPTIONS (path ...)`.
 - Batches large file lists: individual file views are created per batch, unioned into batch views, then all batch views are unioned into the final view. Batch size is controlled by `SUPERTABLE_SPARK_BATCH_SIZE`.
 - Intermediate views are kept alive until the final query completes (Spark's lazy view resolution requires this).
@@ -338,7 +370,11 @@ This prevents OOM on large-CPU hosts with small memory limits.
 
 ### httpfs and S3 Configuration
 
-The `configure_httpfs_and_s3()` function loads the httpfs extension and configures S3 credentials, endpoint, region, URL style, SSL, and caches. It reads from settings:
+The `configure_httpfs_and_s3()` function loads the httpfs extension and creates
+or replaces the `supertable_s3` temporary in-memory secret. DuckDB redacts the
+secret/session-token fields in its own catalog; user SQL cannot call that
+catalog or the settings API. The function also configures HTTP/cache controls.
+It reads from settings:
 
 - `STORAGE_ENDPOINT_URL`, `STORAGE_ACCESS_KEY`, `STORAGE_SECRET_KEY`, `STORAGE_SESSION_TOKEN`
 - `STORAGE_REGION`, `STORAGE_FORCE_PATH_STYLE`, `STORAGE_USE_SSL`
@@ -346,6 +382,13 @@ The `configure_httpfs_and_s3()` function loads the httpfs extension and configur
 - `SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE` -- parquet footer caching across queries
 - `SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE` -- enables disk-level data block cache (DuckDB >= 1.3)
 - `SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR` -- cache directory (defaults to `SUPERTABLE_HOME/duckdb_cache`)
+
+Raw DuckDB JSON profiling is disabled on the untrusted path because physical
+filenames can contain presigned bearer URLs. `EXPLAIN ANALYZE` is rejected, and
+plain `EXPLAIN` is rejected whenever a data or deletion-vector source is a
+credential-bearing URL or the query has an RBAC/share row or column policy.
+The latter prevents expanded view plans from disclosing hidden predicate
+columns or literal policy values.
 
 ### SQL Helpers
 
@@ -371,6 +414,7 @@ The `configure_httpfs_and_s3()` function loads the httpfs extension and configur
 | `SUPERTABLE_SPARK_QUERY_TIMEOUT` | Overall Spark query timeout | 300 seconds |
 | `SUPERTABLE_SPARK_STATEMENT_TIMEOUT` | Per-statement Spark timeout | 120 seconds |
 | `SUPERTABLE_SPARK_BATCH_SIZE` | Files per Spark view creation batch | Configurable |
+| `SUPERTABLE_SPARK_PRESIGNED` | Disabled compatibility flag; must remain false | false |
 
 ## Business Context
 

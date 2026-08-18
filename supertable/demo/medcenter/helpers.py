@@ -3,7 +3,6 @@
 import pandas as pd
 import pyarrow as pa
 
-import supertable.config.homedir  # noqa: F401  (resolves the app home)
 from supertable.data_reader import DataReader, engine
 from supertable.data_writer import DataWriter
 from supertable.demo.medcenter.defaults import (

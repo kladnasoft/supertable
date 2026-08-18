@@ -7,6 +7,7 @@ import os
 from supertable.config.settings import settings
 from typing import Any, BinaryIO, Dict, List, Optional
 from pathlib import Path
+from urllib.parse import quote
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -142,6 +143,11 @@ class GCSStorage(StorageInterface):
             expiration=timedelta(seconds=expiry_seconds),
             method="GET",
         )
+
+    def canonical_uri(self, path: str) -> str:
+        """Return the canonical Google Cloud Storage URI."""
+        full_key = self._with_base(path)
+        return f"gs://{self.bucket_name}/{quote(full_key, safe='/=:@+$,;~-._')}"
 
     # -------------------------
     # Helpers
@@ -357,7 +363,7 @@ class GCSStorage(StorageInterface):
         children.sort()
 
         filtered = [c for c in children if fnmatch.fnmatch(c, pattern)]
-        return [prefix + c for c in filtered]
+        return [self._without_base(prefix + c) for c in filtered]
 
     # -------------------------
     # Delete (single or recursive on prefix)
@@ -374,22 +380,55 @@ class GCSStorage(StorageInterface):
             blob.delete()
             return
 
-        # Fall back to prefix recursive delete
+        logical = self._without_base(path)
         prefix = self._normalize_dir_prefix(path)
-        to_delete = list(self.client.list_blobs(self.bucket_name, prefix=prefix))
-
-        if not to_delete:
+        if next(iter(self.client.list_blobs(self.bucket_name, prefix=prefix)), None) is None:
             raise FileNotFoundError(f"File or folder not found: {path}")
-
-        for b in to_delete:
-            b.delete()
+        self.delete_prefix(logical)
 
     def delete_prefix(self, path: str) -> None:
-        """Explicit recursive delete for a prefix."""
-        path = self._with_base(path)
-        prefix = self._normalize_dir_prefix(path) if path else path
-        for blob in self.client.list_blobs(self.bucket_name, prefix=prefix):
-            blob.delete()
+        """Delete and verify a GCS prefix with bounded retry batches."""
+        import itertools
+
+        physical = self._with_base(path)
+        exact = self.bucket.get_blob(physical)
+        if exact is not None:
+            exact.delete()
+        prefix = self._normalize_dir_prefix(physical) if physical else physical
+        previous_batch = None
+        stagnant = 0
+        prior_errors: List[Exception] = []
+        while True:
+            blobs = list(itertools.islice(
+                self.client.list_blobs(self.bucket_name, prefix=prefix), 1000,
+            ))
+            if not blobs:
+                if prior_errors:
+                    raise OSError(
+                        f"GCS reported {len(prior_errors)} failed deletion(s) "
+                        f"under {path!r}"
+                    ) from prior_errors[0]
+                return
+            names = tuple(str(getattr(blob, "name", "")) for blob in blobs)
+            errors: List[Exception] = []
+            for blob in blobs:
+                try:
+                    blob.delete()
+                except Exception as exc:
+                    errors.append(exc)
+            prior_errors = errors
+            stagnant = stagnant + 1 if names == previous_batch else 0
+            previous_batch = names
+            if stagnant >= 3:
+                if prior_errors:
+                    raise OSError(
+                        f"GCS reported {len(prior_errors)} failed deletion(s) "
+                        f"under {path!r}"
+                    ) from prior_errors[0]
+                raise OSError(
+                    f"GCS prefix made no deletion progress: {path!r}; "
+                    f"remaining={names[0]!r}"
+                )
 
     # -------------------------
     # Directory structure (recursive)

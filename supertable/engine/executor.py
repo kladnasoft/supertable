@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import time
 import hashlib
+import math
 import weakref
 from contextlib import nullcontext
 from typing import Callable, Mapping, Optional, Tuple
@@ -52,6 +53,17 @@ _duckdb_singletons: "weakref.WeakValueDictionary[Tuple[str, tuple], DuckDB]" = (
     weakref.WeakValueDictionary()
 )
 _duckdb_lock = __import__("threading").Lock()
+
+
+def _configured_query_timeout_sec() -> float:
+    """Return a finite positive deadline; malformed config fails bounded."""
+    try:
+        value = float(
+            getattr(settings, "SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC", 60.0)
+        )
+    except (TypeError, ValueError, OverflowError):
+        return 60.0
+    return value if math.isfinite(value) and value > 0 else 60.0
 
 
 def _storage_supports_bounded_ranges(storage: Optional[object]) -> bool:
@@ -113,10 +125,12 @@ def _storage_identity(storage: Optional[object]) -> tuple:
             continue
         if value is None or isinstance(value, (str, int, float, bool)):
             parts.append((name, value))
-    # Built-in local storage has no auth state.  Its namespace is the absolute
-    # process working directory because LocalStorage resolves every key there.
+    # Built-in local storage has no auth state, but its explicit root is a hard
+    # namespace boundary.  Never key it by the mutable process CWD: factory
+    # instances are rooted at SUPERTABLE_HOME without changing CWD.
     if module == "supertable.storage.local_storage" and qualname == "LocalStorage":
-        parts.append(("local_root", os.path.realpath(os.getcwd())))
+        root = getattr(storage, "root", os.getcwd())
+        parts.append(("local_root", os.path.realpath(os.fspath(root))))
         return tuple(parts)
 
     # S3/MinIO connection state is completely represented by the route above
@@ -870,6 +884,7 @@ class Executor:
                     engine_config=duckdb_cfg,
                     explain=explain,
                     explain_options=explain_options,
+                    timeout_sec=_configured_query_timeout_sec(),
                 )
                 used = "duckdb"
 
@@ -925,6 +940,7 @@ class Executor:
                         engine_config=duckdb_cfg,
                         explain=explain,
                         explain_options=explain_options,
+                        timeout_sec=_configured_query_timeout_sec(),
                     )
                     used = "duckdb"
 
@@ -968,12 +984,13 @@ class Executor:
         timer: Timer,
         plan_stats: PlanStats,
         log_prefix: str,
+        max_batch_rows: Optional[int] = None,
     ):
-        """Return IslandDB's one-shot Arrow batch stream without pandas.
+        """Return a one-shot Arrow batch stream without pandas.
 
-        DuckDB/Spark still expose their existing materialized facade. AUTO is
-        accepted only when its bounded router chooses IslandDB; callers never
-        receive a silently materialized fallback under a streaming API.
+        DuckDB and IslandDB preserve their query/cache resources until stream
+        close. Spark remains explicit-only and materialized; the streaming API
+        fails instead of silently changing its result-lifetime contract.
         """
         cfgs, routing_policy = resolve_engine_bundle(
             self.organization, self._get_catalog()
@@ -990,10 +1007,77 @@ class Executor:
                 routing_policy=routing_policy,
             )
         )
-        if chosen != Engine.ISLANDDB:
+        if chosen not in {Engine.DUCKDB, Engine.ISLANDDB}:
             raise IslandUnsupportedError(
-                f"streaming Arrow results require IslandDB; router selected {chosen.value}"
+                f"streaming Arrow results do not support {chosen.value}"
             )
+
+        def timer_capture(evt: str):
+            timer.capture_and_reset_timing(evt)
+
+        if chosen is Engine.DUCKDB:
+            # Match materialized DuckDB's hit-only whole-object cache behavior,
+            # but retain every lease for the complete stream lifetime.
+            cache = self._get_file_cache()
+            cache_is_useful = bool(
+                cache is not None and not cache.source_is_local
+            )
+            cache_context = (
+                cache.localized(
+                    reflection,
+                    populate=False,
+                    tolerate_corrupt_hits=True,
+                )
+                if cache_is_useful
+                else nullcontext((reflection, None))
+            )
+            entered = False
+            try:
+                execution_reflection, cache_metrics = cache_context.__enter__()
+                entered = True
+                if cache_metrics is not None:
+                    plan_stats.add_stat(cache_metrics.to_plan_stats())
+                duckdb_stream_kwargs = {}
+                if max_batch_rows is not None:
+                    duckdb_stream_kwargs["max_batch_rows"] = max_batch_rows
+                inner = self.duckdb_exec.execute_stream(
+                    reflection=execution_reflection,
+                    parser=parser,
+                    query_manager=query_manager,
+                    timer_capture=timer_capture,
+                    log_prefix=log_prefix,
+                    engine_config=cfgs["duckdb"],
+                    timeout_sec=_configured_query_timeout_sec(),
+                    **duckdb_stream_kwargs,
+                )
+            except BaseException as exc:
+                if entered:
+                    cache_context.__exit__(type(exc), exc, exc.__traceback__)
+                raise
+
+            def close_duckdb_stream() -> None:
+                try:
+                    inner.close()
+                finally:
+                    cache_context.__exit__(None, None, None)
+
+            stream = ArrowBatchStream(
+                inner.schema,
+                inner,
+                close_callback=close_duckdb_stream,
+            )
+            if engine is Engine.AUTO:
+                plan_stats.add_stat({
+                    "AUTO_ROUTING_OUTCOME": {
+                        "selected_engine": Engine.DUCKDB.value,
+                        "actual_engine": Engine.DUCKDB.value,
+                        "fallback": False,
+                    },
+                })
+            plan_stats.add_stat({"ENGINE": "duckdb"})
+            plan_stats.add_stat({"RESULT_MODE": "arrow_stream"})
+            return stream, "duckdb"
+
         try:
             island_prepared = self.island_exec.prepare_execution(
                 reflection, parser, streaming_result=True,
@@ -1006,9 +1090,6 @@ class Executor:
         self._publish_engine_capability(
             plan_stats, island_prepared.capability,
         )
-
-        def timer_capture(evt: str):
-            timer.capture_and_reset_timing(evt)
 
         # Keep whole-object cache leases alive for the complete lifetime of the
         # result stream. Remote built-in backends normally use IslandDB's range
@@ -1063,6 +1144,9 @@ class Executor:
                 )
             if cache_metrics is not None:
                 plan_stats.add_stat(cache_metrics.to_plan_stats())
+            island_stream_kwargs = {}
+            if max_batch_rows is not None:
+                island_stream_kwargs["max_batch_rows"] = max_batch_rows
             inner = self.island_exec.execute_stream(
                 reflection=execution_reflection,
                 parser=parser,
@@ -1072,6 +1156,7 @@ class Executor:
                 engine_config=cfgs["duckdb"],
                 cache_metrics=cache_metrics,
                 _prepared=island_prepared,
+                **island_stream_kwargs,
             )
         except BaseException as exc:
             if entered:

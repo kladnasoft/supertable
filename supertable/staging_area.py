@@ -10,9 +10,33 @@ import pyarrow as pa
 
 from supertable.config.defaults import logger
 from supertable.storage.storage_factory import get_storage
-from supertable.redis_catalog import RedisCatalog
+from supertable.redis_catalog import DeletionIntentConflictError, RedisCatalog
 from supertable.rbac.access_control import check_write_access, check_meta_access
-from supertable import redis_keys as RK
+
+
+def _safe_path_component(value: str, *, label: str) -> str:
+    """Return one storage path component or reject traversal/absolute forms."""
+    component = str(value or "")
+    if (
+        not component
+        or component in (".", "..")
+        or os.path.isabs(component)
+        or "/" in component
+        or "\\" in component
+        or "\x00" in component
+    ):
+        raise ValueError(f"Invalid {label}: expected one non-empty path component")
+    return component
+
+
+def _join_contained(base: str, *components: str) -> str:
+    """Join components and prove the resulting path remains below ``base``."""
+    candidate = os.path.normpath(os.path.join(base, *components))
+    base_abs = os.path.abspath(os.path.normpath(base))
+    candidate_abs = os.path.abspath(candidate)
+    if os.path.commonpath((base_abs, candidate_abs)) != base_abs:
+        raise ValueError("Staging path escaped its configured namespace")
+    return candidate
 
 
 def _resolve_super_name(super_table: Any) -> Optional[str]:
@@ -85,6 +109,8 @@ class Staging:
         self.storage = get_storage()
         self.catalog = RedisCatalog()
 
+        self._check_deletion_intent_absent()
+
         # Validate supertable existence
         if not self.catalog.root_exists(self.organization, self.super_name):
             raise FileNotFoundError(f"SuperTable does not exist: {self.organization}/{self.super_name}")
@@ -97,8 +123,16 @@ class Staging:
 
         if not self._is_manager:
             # Stage mode paths
-            self.stage_dir = os.path.join(self.base_staging_dir, self.staging_name)  # type: ignore[arg-type]
-            self.files_index_path = os.path.join(self.base_staging_dir, f"{self.staging_name}_files.json")
+            self.staging_name = _safe_path_component(
+                self.staging_name, label="staging_name",  # type: ignore[arg-type]
+            )
+            self._check_deletion_intent_absent(stage=self.staging_name)
+            self.stage_dir = _join_contained(
+                self.base_staging_dir, self.staging_name,
+            )
+            self.files_index_path = _join_contained(
+                self.base_staging_dir, f"{self.staging_name}_files.json",
+            )
             # Construction/open is read-only.  Stage resources are created
             # lazily inside the first authorized write operation; otherwise a
             # caller could mutate storage and Redis without ever presenting a
@@ -107,6 +141,19 @@ class Staging:
             # Manager mode doesn't create anything; just sets placeholders.
             self.stage_dir = None
             self.files_index_path = None
+
+    def _check_deletion_intent_absent(
+            self, *, stage: Optional[str] = None,
+    ) -> None:
+        guard = getattr(
+            type(self.catalog), "check_deletion_intent_absent", None,
+        )
+        if callable(guard):
+            self.catalog.check_deletion_intent_absent(
+                self.organization,
+                self.super_name,
+                stage=stage,
+            )
 
     # --------------------------------------------------------------------- #
     # Manager-mode helpers
@@ -132,14 +179,27 @@ class Staging:
             role_name=role_name,
             table_name=self.super_name,
         )
+        self._check_deletion_intent_absent()
         # Ensure base exists (read-only; no lock)
         base_exists = self.storage.exists(self.base_staging_dir)
         stagings = self.catalog.list_stagings(self.organization, self.super_name)
 
         stages: List[Dict[str, Any]] = []
         for name in sorted(stagings):
-            stage_dir = os.path.join(self.base_staging_dir, name)
-            files_index_path = os.path.join(self.base_staging_dir, f"{name}_files.json")
+            try:
+                safe_name = _safe_path_component(name, label="stored staging_name")
+                self._check_deletion_intent_absent(stage=safe_name)
+            except DeletionIntentConflictError:
+                # A deleting/deleted stage is deliberately non-live even if
+                # stale metadata or a fixed-path index is still present.
+                continue
+            except ValueError as exc:
+                logger.error(f"[staging] ignoring invalid catalog entry {name!r}: {exc}")
+                continue
+            stage_dir = _join_contained(self.base_staging_dir, safe_name)
+            files_index_path = _join_contained(
+                self.base_staging_dir, f"{safe_name}_files.json",
+            )
 
             files: List[str] = []
             if self.storage.exists(files_index_path):
@@ -151,14 +211,14 @@ class Staging:
 
             stages.append(
                 {
-                    "name": name,
+                    "name": safe_name,
                     "path": stage_dir,
                     "exists": bool(self.storage.exists(stage_dir)),
                     "files_index_path": files_index_path,
                     "files_index_exists": bool(self.storage.exists(files_index_path)),
                     "file_count": len(files),
                     "files": files,
-                    "redis_meta": self.catalog.get_staging_meta(self.organization, self.super_name, name) or {},
+                    "redis_meta": self.catalog.get_staging_meta(self.organization, self.super_name, safe_name) or {},
                 }
             )
 
@@ -184,29 +244,42 @@ class Staging:
 
     def _with_lock(self, fn):
         self._require_stage_mode()
-        lock_key = RK.lock_stage(self.organization, self.super_name, self.staging_name)
-        token = uuid.uuid4().hex
-
-        # Acquire lock (30s TTL)
-        acquired = self.catalog.r.set(lock_key, token, nx=True, ex=30)
-        if not acquired:
+        # RedisLocking renews this lease at half-TTL until the ownership-checked
+        # release. Cloud prefix deletion can legitimately take longer than one
+        # lease period; a fixed SET NX EX lock would allow a concurrent save to
+        # enter mid-delete and then be orphaned when metadata is removed.
+        token = self.catalog.acquire_stage_lock(
+            self.organization,
+            self.super_name,
+            self.staging_name,
+            ttl_s=30,
+            timeout_s=30,
+        )
+        if not token:
             raise RuntimeError(f"Stage {self.staging_name} is currently locked by another process.")
 
         try:
-            return fn()
+            return fn(token)
         finally:
-            # Release lock via Lua script
-            lua = """
-            if redis.call("get", KEYS[1]) == ARGV[1] then
-                return redis.call("del", KEYS[1])
-            else
-                return 0
-            end
-            """
-            self.catalog.r.eval(lua, 1, lock_key, token)
+            self.catalog.release_stage_lock(
+                self.organization,
+                self.super_name,
+                self.staging_name,
+                token,
+            )
 
-    def _init_stage(self) -> None:
+    def _init_stage(self, lock_token: str) -> None:
         self._require_stage_mode()
+
+        # A stage lock can expire while its former owner is paused inside an
+        # object-store call.  The no-TTL intent, not lease absence, decides
+        # whether this fixed prefix may be recreated.
+        self.catalog.check_stage_mutation_allowed(
+            self.organization,
+            self.super_name,
+            self.staging_name,  # type: ignore[arg-type]
+            lock_token=lock_token,
+        )
 
         # 1) Create the physical folder (staging/{staging_name})
         if not self.storage.exists(self.stage_dir):
@@ -218,6 +291,7 @@ class Staging:
             self.super_name,
             self.staging_name,  # type: ignore[arg-type]
             meta={"path": self.stage_dir, "created_at_ms": int(time.time() * 1000)},
+            lock_token=lock_token,
         )
 
         # 3) Ensure files index exists in the parent 'staging' folder
@@ -234,12 +308,14 @@ class Staging:
             table_name=self.super_name,
         )
 
-        def _op():
-            self._init_stage()
+        def _op(_lock_token: str):
+            self._init_stage(_lock_token)
             ts_ns = time.time_ns()
-            clean_name = base_file_name.rsplit(".parquet", 1)[0]
-            file_name = f"{clean_name}_{ts_ns}.parquet"
-            file_path = os.path.join(self.stage_dir, file_name)
+            # The caller-supplied display name is metadata only.  Never let it
+            # select a filesystem/object key; a server-generated component also
+            # prevents collisions between concurrent/retried uploads.
+            file_name = f"stage_{ts_ns}_{uuid.uuid4().hex}.parquet"
+            file_path = _join_contained(self.stage_dir, file_name)
 
             self.storage.write_parquet(arrow_table, file_path)
 
@@ -247,9 +323,21 @@ class Staging:
             current_index.append(
                 {"file": file_name, "written_at_ns": ts_ns, "rows": arrow_table.num_rows,
                  "source": source, "duration_ms": round(duration_ms) if duration_ms else None,
-                 "pipe_name": pipe_name or None, "pipe_id": pipe_id or None, "status": "ok"}
+                 "pipe_name": pipe_name or None, "pipe_id": pipe_id or None, "status": "ok",
+                 "original_name": os.path.basename(str(base_file_name or "")) or None}
             )
             self.storage.write_json(self.files_index_path, current_index)
+
+            # Never report success after lease loss or a concurrently-created
+            # delete tombstone. Any objects written by a stale saver remain
+            # non-live behind that terminal tombstone until confirmed recovery
+            # re-deletes the prefix.
+            self.catalog.check_stage_mutation_allowed(
+                self.organization,
+                self.super_name,
+                self.staging_name,  # type: ignore[arg-type]
+                lock_token=_lock_token,
+            )
 
             logger.info(f"[staging] saved {file_name} and updated index at {self.files_index_path}")
             return file_name
@@ -264,12 +352,37 @@ class Staging:
             role_name=role_name,
             table_name=self.super_name,
         )
+        self._check_deletion_intent_absent(stage=self.staging_name)
         if not self.storage.exists(self.files_index_path):
             return []
         data = self.storage.read_json(self.files_index_path) or []
         return [item.get("file") for item in data if isinstance(item, dict) and item.get("file")]
 
-    def delete(self, role_name: str) -> None:
+    def delete(self, role_name: str) -> str:
+        """Start a create-only stage deletion intent and remove the stage."""
+        return self._delete_with_intent(role_name=role_name)
+
+    def recover_delete(
+            self,
+            role_name: str,
+            *,
+            intent_id: str,
+            confirm_previous_owner_stopped: bool = False,
+    ) -> str:
+        """Resume deletion only after proving the old owner cannot resume."""
+        return self._delete_with_intent(
+            role_name=role_name,
+            recovery_intent_id=intent_id,
+            confirm_previous_owner_stopped=confirm_previous_owner_stopped,
+        )
+
+    def _delete_with_intent(
+            self,
+            *,
+            role_name: str,
+            recovery_intent_id: Optional[str] = None,
+            confirm_previous_owner_stopped: bool = False,
+    ) -> str:
         self._require_stage_mode()
         check_write_access(
             super_name=self.super_name,
@@ -278,18 +391,79 @@ class Staging:
             table_name=self.super_name,
         )
 
-        def _op():
-            if self.storage.exists(self.stage_dir):
-                self.storage.delete_recursive(self.stage_dir)
+        def _op(lock_token: str):
+            if recovery_intent_id is None:
+                intent = self.catalog.begin_stage_deletion(
+                    self.organization,
+                    self.super_name,
+                    self.staging_name,  # type: ignore[arg-type]
+                    lock_token=lock_token,
+                )
+            else:
+                intent = self.catalog.recover_stage_deletion(
+                    self.organization,
+                    self.super_name,
+                    self.staging_name,  # type: ignore[arg-type]
+                    expected_intent_id=recovery_intent_id,
+                    lock_token=lock_token,
+                    confirm_previous_owner_stopped=(
+                        confirm_previous_owner_stopped
+                    ),
+                )
+            intent_id = intent.get("intent_id") if isinstance(intent, dict) else None
+            if not intent_id:
+                raise RuntimeError("Catalog returned an invalid staging deletion intent")
+            logger.info(
+                "[deletion] staging cleanup started for %s/%s/%s; "
+                "deletion_intent_id=%s; recovery=%s",
+                self.organization,
+                self.super_name,
+                self.staging_name,
+                intent_id,
+                recovery_intent_id is not None,
+            )
 
-            if self.storage.exists(self.files_index_path):
+            # Physical data is deleted and verified before its index/catalog
+            # pointers.  If any step fails, metadata remains and a retry can
+            # resume without orphaning an undiscoverable prefix.
+            self.storage.delete_prefix(self.stage_dir)
+
+            try:
                 self.storage.delete(self.files_index_path)
+            except FileNotFoundError:
+                pass
+            if self.storage.exists(self.files_index_path):
+                raise OSError(
+                    f"Staging index remains after deletion: {self.files_index_path}"
+                )
 
-            self.catalog.delete_staging_meta(
+            metadata_removed = self.catalog.delete_staging_meta(
                 self.organization,
                 self.super_name,
                 self.staging_name,  # type: ignore[arg-type]
+                lock_token=lock_token,
+                intent_id=intent_id,
             )
-            logger.info(f"[staging] deleted {self.staging_name} folder, index, and redis keys")
+            if metadata_removed is not True:
+                raise RuntimeError(
+                    f"Staging metadata removal was incomplete for "
+                    f"{self.organization}/{self.super_name}/{self.staging_name}"
+                )
+            if recovery_intent_id is not None:
+                self.catalog.clear_stage_deletion_tombstone(
+                    self.organization,
+                    self.super_name,
+                    self.staging_name,  # type: ignore[arg-type]
+                    expected_intent_id=intent_id,
+                    lock_token=lock_token,
+                    confirm_previous_owner_stopped=(
+                        confirm_previous_owner_stopped
+                    ),
+                )
+            logger.info(
+                f"[staging] deleted {self.staging_name} folder and redis keys; "
+                f"deletion_intent_id={intent_id}"
+            )
+            return str(intent_id)
 
-        self._with_lock(_op)
+        return self._with_lock(_op)

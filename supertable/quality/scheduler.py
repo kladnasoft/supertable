@@ -1,10 +1,14 @@
 # route: supertable.quality.scheduler
 # supertable/quality/scheduler.py
 """
-Lightweight background scheduler for Data Quality checks.
+Durable, bounded background scheduler for Data Quality checks.
 
-Runs as a daemon thread inside the FastAPI process — no external service needed.
-Supports cron expressions for quick and deep profiles.
+Runs a coordinator and bounded table-worker pool inside the host process. Cron
+phase/outcomes and ingest/history work are persisted in Redis so a restart does
+not reset scheduling state or acknowledge a lost history row. Each scheduled
+mode runs in a clean spawned process. Deadline, shutdown, and lease-loss fences
+terminate that process group, so a native driver that ignores cancellation
+cannot permanently consume a worker slot.
 
 Post-ingest trigger uses a three-layer protection:
 
@@ -32,10 +36,14 @@ from __future__ import annotations
 import json
 import logging
 import math
+import multiprocessing
+import os
+import signal
 import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -53,6 +61,15 @@ DEFAULT_PENDING_TTL_SECONDS = 600    # pending flag expires after 10 min
 DEFAULT_RUNNING_TTL_SECONDS = 300    # safety: running lock expires after 5 min
 DEFAULT_RETRY_BACKOFF_SECONDS = 60   # failed checks retry separately from success cooldown
 TICK_INTERVAL_SECONDS = 60           # scheduler wakes up every 60s
+DEFAULT_MAX_WORKERS = max(
+    1, min(32, int(os.environ.get("SUPERTABLE_DQ_MAX_WORKERS", "4")))
+)
+DEFAULT_JOB_DEADLINE_SECONDS = max(
+    1, int(os.environ.get("SUPERTABLE_DQ_JOB_DEADLINE_SECONDS", "300"))
+)
+_PROCESS_POLL_SECONDS = 0.02
+_PROCESS_TERMINATE_GRACE_SECONDS = 0.25
+_PROCESS_RESULT_EXIT_GRACE_SECONDS = 0.25
 
 QUALITY_MODES = ("quick", "deep", "custom")
 
@@ -147,6 +164,19 @@ class CheckRunOutcome:
         return self.successful
 
 
+@dataclass(frozen=True)
+class _IsolatedProcessResult:
+    """Terminal state of one killable quality subprocess."""
+
+    state: str
+    payload: Any = None
+    message: str = ""
+    pid: Optional[int] = None
+    exitcode: Optional[int] = None
+    force_terminated: bool = False
+    alive_after_cleanup: bool = False
+
+
 def _success(
     mode: str,
     *,
@@ -178,7 +208,31 @@ def _skipped(mode: str, message: str) -> CheckRunOutcome:
 
 # Singleton state
 _scheduler_thread: Optional[threading.Thread] = None
+_scheduler_executor: Optional[ThreadPoolExecutor] = None
 _scheduler_lock = threading.Lock()
+_scheduler_stop = threading.Event()
+_active_jobs_lock = threading.Lock()
+_active_jobs_condition = threading.Condition(_active_jobs_lock)
+_active_jobs: Dict[str, Any] = {}
+_scheduler_slots: Optional[threading.BoundedSemaphore] = None
+_scheduler_fair_cursor = 0
+_scheduler_stats_lock = threading.Lock()
+_scheduler_stats: Dict[str, Any] = {
+    "running": False,
+    "ticks": 0,
+    "tick_failures": 0,
+    "deadline_exceeded": 0,
+    "jobs_submitted": 0,
+    "jobs_completed": 0,
+    "jobs_failed": 0,
+    "jobs_cancelled": 0,
+    "jobs_force_terminated": 0,
+    "jobs_skipped_active": 0,
+    "jobs_skipped_capacity": 0,
+    "active_jobs": 0,
+    "last_tick_started_at": None,
+    "last_tick_completed_at": None,
+}
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -292,21 +346,478 @@ def notify_ingest(r, org: str, sup: str, table_name: str) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _scheduler_loop() -> None:
-    """Main loop — checks every 60s if any cron expression is due."""
-    # Wait for the app to fully initialize
-    time.sleep(10)
+def _stats_update(**changes: Any) -> None:
+    with _scheduler_stats_lock:
+        for key, value in changes.items():
+            _scheduler_stats[key] = value
 
-    last_quick_run: Dict[str, float] = {}  # "org:sup:table" -> epoch
+
+def _stats_increment(key: str, amount: int = 1) -> None:
+    with _scheduler_stats_lock:
+        _scheduler_stats[key] = int(_scheduler_stats.get(key, 0)) + int(amount)
+
+
+def scheduler_health() -> Dict[str, Any]:
+    """Return a thread-safe operational snapshot for probes and metrics."""
+    with _scheduler_stats_lock:
+        result = dict(_scheduler_stats)
+    with _scheduler_lock:
+        result["thread_alive"] = bool(
+            _scheduler_thread is not None and _scheduler_thread.is_alive()
+        )
+    with _active_jobs_lock:
+        result["active_jobs"] = len(_active_jobs)
+    result["running"] = bool(result["thread_alive"] or result["active_jobs"])
+    result["max_workers"] = DEFAULT_MAX_WORKERS
+    result["job_deadline_seconds"] = DEFAULT_JOB_DEADLINE_SECONDS
+    return result
+
+
+def _job_done(job_key: str, future: Any, slots: threading.BoundedSemaphore) -> None:
+    try:
+        error = future.exception()
+    except Exception as exc:  # cancelled/broken future
+        error = exc
+    with _active_jobs_lock:
+        _active_jobs.pop(job_key, None)
+        active = len(_active_jobs)
+        _active_jobs_condition.notify_all()
+    slots.release()
+    _stats_increment("jobs_completed")
+    if error is not None:
+        _stats_increment("jobs_failed")
+        logger.error(
+            "[dq-scheduler] table job %s failed: %s", job_key, error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+    _stats_update(active_jobs=active)
+
+
+def _submit_table_job(
+    executor: ThreadPoolExecutor,
+    slots: threading.BoundedSemaphore,
+    job_key: str,
+    function,
+    *args: Any,
+) -> bool:
+    """Bound queue growth and suppress duplicate work for one table."""
+    with _active_jobs_lock:
+        if job_key in _active_jobs:
+            _stats_increment("jobs_skipped_active")
+            return False
+        if not slots.acquire(blocking=False):
+            _stats_increment("jobs_skipped_capacity")
+            return False
+        try:
+            future = executor.submit(function, *args)
+        except Exception:
+            slots.release()
+            raise
+        _active_jobs[job_key] = future
+        active = len(_active_jobs)
+    future.add_done_callback(lambda completed: _job_done(job_key, completed, slots))
+    _stats_increment("jobs_submitted")
+    _stats_update(active_jobs=active)
+    return True
+
+
+def _quality_process_context():
+    """Return the only supported execution context for quality isolation.
+
+    The scheduler is already multi-threaded when a check starts.  Forking that
+    process would inherit locks and live Redis/engine connections in an
+    unknowable state, so each check uses a clean ``spawn`` interpreter.
+    """
+
+    return multiprocessing.get_context("spawn")
+
+
+def _isolated_process_bootstrap(send_connection, target, target_args) -> None:
+    """Create a private process group, then invoke an isolated child target."""
+
+    if os.name == "posix":
+        try:
+            os.setsid()
+        except OSError:
+            # Parent-side termination still targets this exact PID.  ``setsid``
+            # only broadens cleanup to any engine descendants the child starts.
+            pass
+    try:
+        target(send_connection, *target_args)
+    except BaseException as exc:
+        try:
+            send_connection.send(("error", f"{type(exc).__name__}: {exc}"))
+        except Exception:
+            pass
+    finally:
+        try:
+            send_connection.close()
+        except Exception:
+            pass
+
+
+def _signal_isolated_process(process, sig: int) -> None:
+    """Signal an exact child, and its private process group when available."""
+
+    pid = process.pid
+    if pid is None:
+        return
+    if os.name == "posix":
+        try:
+            process_group = os.getpgid(pid)
+        except (OSError, ProcessLookupError):
+            return
+        try:
+            if process_group == pid:
+                os.killpg(process_group, sig)
+            else:
+                # The child may not have reached setsid() yet. Never signal the
+                # host's process group; target only the child in that race.
+                os.kill(pid, sig)
+            return
+        except (OSError, ProcessLookupError):
+            return
+    try:
+        if sig == getattr(signal, "SIGKILL", None):
+            process.kill()
+        else:
+            process.terminate()
+    except (OSError, ProcessLookupError):
+        pass
+
+
+def _terminate_isolated_process(process) -> bool:
+    """Bounded TERM/KILL escalation. Return only after observing child exit."""
+
+    if not process.is_alive():
+        process.join(timeout=0)
+        return True
+    _signal_isolated_process(process, signal.SIGTERM)
+    process.join(timeout=_PROCESS_TERMINATE_GRACE_SECONDS)
+    if process.is_alive():
+        hard_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+        _signal_isolated_process(process, hard_signal)
+        process.join(timeout=_PROCESS_TERMINATE_GRACE_SECONDS)
+    return not process.is_alive()
+
+
+def _run_killable_subprocess(
+    target,
+    target_args: Tuple[Any, ...],
+    *,
+    deadline_monotonic: Optional[float],
+    cancel_event: Optional[Any],
+    lease_lost_event: Optional[Any],
+    process_name: str,
+) -> _IsolatedProcessResult:
+    """Run one callable in a spawned process with a hard terminal bound.
+
+    A target sends ``("result", payload)`` on the supplied one-way connection.
+    Deadline, scheduler shutdown, or lease loss terminates the whole private
+    process group.  This function never returns while its child is known alive,
+    so the enclosing ThreadPool slot is genuinely reusable.
+    """
+
+    if deadline_monotonic is None and cancel_event is None:
+        return _IsolatedProcessResult(
+            state="start_failed",
+            message="isolated quality execution requires a deadline or shutdown fence",
+        )
+    context = _quality_process_context()
+    receive_connection, send_connection = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_isolated_process_bootstrap,
+        args=(send_connection, target, target_args),
+        name=process_name[:120],
+        daemon=False,
+    )
+    try:
+        process.start()
+    except Exception as exc:
+        try:
+            receive_connection.close()
+            send_connection.close()
+            process.close()
+        except Exception:
+            pass
+        return _IsolatedProcessResult(
+            state="start_failed",
+            message=f"could not start isolated quality process: {exc}",
+        )
+    finally:
+        # Once started, the parent must not retain the writer end or EOF would
+        # remain hidden after an abnormal child exit.
+        if process.pid is not None:
+            try:
+                send_connection.close()
+            except Exception:
+                pass
+
+    pid = process.pid
+    payload: Any = None
+    payload_received = False
+    child_error = ""
+    payload_received_at: Optional[float] = None
+    terminal_reason: Optional[str] = None
+    force_terminated = False
+
+    def receive_available() -> None:
+        nonlocal payload, payload_received, child_error, payload_received_at
+        try:
+            while receive_connection.poll(0):
+                message = receive_connection.recv()
+                if (
+                    isinstance(message, tuple)
+                    and len(message) == 2
+                    and message[0] == "result"
+                ):
+                    payload = message[1]
+                    payload_received = True
+                    payload_received_at = time.monotonic()
+                elif (
+                    isinstance(message, tuple)
+                    and len(message) == 2
+                    and message[0] == "error"
+                ):
+                    child_error = str(message[1])
+                else:
+                    child_error = "isolated quality process returned an invalid envelope"
+        except (EOFError, OSError):
+            pass
+
+    try:
+        while True:
+            now = time.monotonic()
+            if cancel_event is not None and cancel_event.is_set():
+                terminal_reason = "shutdown"
+                break
+            if deadline_monotonic is not None and now >= deadline_monotonic:
+                terminal_reason = "deadline"
+                break
+            if lease_lost_event is not None and lease_lost_event.is_set():
+                terminal_reason = "lease_lost"
+                break
+
+            receive_available()
+            process.join(timeout=_PROCESS_POLL_SECONDS)
+            if not process.is_alive():
+                receive_available()
+                break
+            if (
+                payload_received_at is not None
+                and time.monotonic() - payload_received_at
+                >= _PROCESS_RESULT_EXIT_GRACE_SECONDS
+            ):
+                # A valid runner result is not permission for leaked child
+                # threads/processes to outlive the bounded worker slot.
+                terminal_reason = "result_cleanup_timeout"
+                break
+
+        if terminal_reason is not None:
+            force_terminated = process.is_alive()
+            exited = _terminate_isolated_process(process)
+            receive_available()
+            if not exited:
+                return _IsolatedProcessResult(
+                    state="termination_failed",
+                    payload=payload if payload_received else None,
+                    message=(
+                        f"isolated quality process did not exit after {terminal_reason}"
+                    ),
+                    pid=pid,
+                    exitcode=process.exitcode,
+                    force_terminated=True,
+                    alive_after_cleanup=True,
+                )
+            if terminal_reason == "result_cleanup_timeout" and payload_received:
+                terminal_reason = "completed"
+
+        exitcode = process.exitcode
+        if terminal_reason in {"deadline", "shutdown", "lease_lost"}:
+            return _IsolatedProcessResult(
+                state=terminal_reason,
+                message=f"isolated quality process stopped after {terminal_reason}",
+                pid=pid,
+                exitcode=exitcode,
+                force_terminated=force_terminated,
+            )
+        if child_error:
+            return _IsolatedProcessResult(
+                state="crashed",
+                message=child_error,
+                pid=pid,
+                exitcode=exitcode,
+                force_terminated=force_terminated,
+            )
+        if not payload_received:
+            return _IsolatedProcessResult(
+                state="crashed",
+                message=(
+                    "isolated quality process exited without a result "
+                    f"(exitcode={exitcode})"
+                ),
+                pid=pid,
+                exitcode=exitcode,
+                force_terminated=force_terminated,
+            )
+        if exitcode not in (0, None) and not force_terminated:
+            return _IsolatedProcessResult(
+                state="crashed",
+                message=f"isolated quality process exited with code {exitcode}",
+                pid=pid,
+                exitcode=exitcode,
+            )
+        return _IsolatedProcessResult(
+            state="completed",
+            payload=payload,
+            pid=pid,
+            exitcode=exitcode,
+            force_terminated=force_terminated,
+        )
+    finally:
+        try:
+            receive_connection.close()
+        except Exception:
+            pass
+        if not process.is_alive():
+            try:
+                process.close()
+            except Exception:
+                pass
+
+
+def _quality_mode_process_entry(
+    send_connection,
+    org: str,
+    sup: str,
+    table_name: str,
+    mode: str,
+    running_key: str,
+    lock_token: str,
+) -> None:
+    """Recreate process-local clients and execute one fenced quality mode."""
+
+    from supertable.quality.config import DQConfig
+    from supertable.redis_connector import (
+        close_all_redis_clients,
+        create_redis_client,
+    )
+
+    outcome: CheckRunOutcome
+    try:
+        redis_client = create_redis_client()
+        config = DQConfig(redis_client, org, sup)
+        guard = _LeaseGuard(redis_client, running_key, lock_token)
+        runners = {
+            "quick": _run_quick_check,
+            "deep": _run_deep_check,
+            "custom": _run_custom_check,
+        }
+        outcome = runners[mode](
+            redis_client,
+            org,
+            sup,
+            table_name,
+            config,
+            lease_guard=guard,
+        )
+    except BaseException as exc:
+        outcome = _failed(
+            mode,
+            f"isolated quality execution failed: {type(exc).__name__}: {exc}",
+        )
+    finally:
+        try:
+            close_all_redis_clients()
+        except Exception:
+            pass
+    send_connection.send(("result", outcome))
+
+
+def _run_isolated_mode_check(
+    *,
+    org: str,
+    sup: str,
+    table_name: str,
+    mode: str,
+    running_key: str,
+    lock_token: str,
+    deadline_monotonic: Optional[float],
+    cancel_event: Optional[Any],
+    lease_guard: _LeaseGuard,
+) -> CheckRunOutcome:
+    """Run one scheduled check behind a killable OS-process boundary."""
+
+    result = _run_killable_subprocess(
+        _quality_mode_process_entry,
+        (org, sup, table_name, mode, running_key, lock_token),
+        deadline_monotonic=deadline_monotonic,
+        cancel_event=cancel_event,
+        lease_lost_event=lease_guard.lost,
+        process_name=f"supertable-dq-{mode}-{table_name}",
+    )
+    if result.force_terminated:
+        _stats_increment("jobs_force_terminated")
+    if result.state == "completed" and isinstance(result.payload, CheckRunOutcome):
+        return result.payload
+    messages = {
+        "deadline": "quality job deadline exceeded",
+        "shutdown": "quality scheduler shut down during execution",
+        "lease_lost": "quality execution lease was lost during execution",
+        "termination_failed": "quality subprocess could not be terminated safely",
+    }
+    return _failed(mode, messages.get(result.state, result.message or result.state))
+
+
+def _scheduler_loop() -> None:
+    """Coordinate bounded fair table jobs until bounded shutdown."""
+    global _scheduler_executor, _scheduler_slots
+    if _scheduler_stop.wait(10.0):
+        return
+    last_quick_run: Dict[str, float] = {}
     last_deep_run: Dict[str, float] = {}
     last_custom_run: Dict[str, float] = {}
-
-    while True:
-        try:
-            _scheduler_tick(last_quick_run, last_deep_run, last_custom_run)
-        except Exception:
-            logger.error(f"[dq-scheduler] Error in tick:\n{traceback.format_exc()}")
-        time.sleep(TICK_INTERVAL_SECONDS)
+    executor = ThreadPoolExecutor(
+        max_workers=DEFAULT_MAX_WORKERS,
+        thread_name_prefix="supertable-dq-job",
+    )
+    slots = threading.BoundedSemaphore(DEFAULT_MAX_WORKERS * 2)
+    with _scheduler_lock:
+        _scheduler_executor = executor
+        _scheduler_slots = slots
+    _stats_update(running=True)
+    try:
+        while not _scheduler_stop.is_set():
+            started = datetime.now(timezone.utc).isoformat()
+            _stats_update(last_tick_started_at=started)
+            _stats_increment("ticks")
+            try:
+                _scheduler_tick(
+                    last_quick_run,
+                    last_deep_run,
+                    last_custom_run,
+                    executor=executor,
+                    slots=slots,
+                )
+            except Exception:
+                _stats_increment("tick_failures")
+                logger.error(
+                    f"[dq-scheduler] Error in tick:\n{traceback.format_exc()}"
+                )
+            _stats_update(
+                last_tick_completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+            if _scheduler_stop.wait(TICK_INTERVAL_SECONDS):
+                break
+    finally:
+        # Queued futures have not acquired a table lease yet and are safe to
+        # cancel. Running checks observe the stop/deadline fence before any
+        # result publication; do not hold host shutdown forever on a driver.
+        executor.shutdown(wait=False, cancel_futures=True)
+        with _scheduler_lock:
+            _scheduler_executor = None
+            _scheduler_slots = None
+        _stats_update(running=False)
 
 
 def start_scheduler() -> bool:
@@ -328,6 +839,23 @@ def start_scheduler() -> bool:
         if _scheduler_thread is not None and _scheduler_thread.is_alive():
             logger.debug("[dq-scheduler] Already running; start_scheduler() is a no-op")
             return False
+        with _active_jobs_lock:
+            if _active_jobs:
+                logger.error(
+                    "[dq-scheduler] Refusing restart while %d prior table job(s) "
+                    "remain active",
+                    len(_active_jobs),
+                )
+                return False
+        _scheduler_stop.clear()
+        with _scheduler_stats_lock:
+            for key in tuple(_scheduler_stats):
+                if key in {"running"}:
+                    _scheduler_stats[key] = False
+                elif key.startswith("last_"):
+                    _scheduler_stats[key] = None
+                else:
+                    _scheduler_stats[key] = 0
         t = threading.Thread(
             target=_scheduler_loop,
             name="supertable-dq-scheduler",
@@ -339,10 +867,50 @@ def start_scheduler() -> bool:
         return True
 
 
+def stop_scheduler(timeout_s: float = 10.0) -> bool:
+    """Request shutdown and await coordinator *and* jobs within ``timeout_s``.
+
+    The return value is deliberately strict: ``True`` means no scheduler table
+    job remains. Scheduled runners that ignore cooperative cancellation are
+    terminated at their process boundary; ``False`` means shutdown could not
+    confirm coordinator/job exit within the caller's bound.
+    """
+    global _scheduler_thread
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
+        raise ValueError("timeout_s must be a non-negative finite number")
+    timeout = float(timeout_s)
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("timeout_s must be a non-negative finite number")
+    deadline = time.monotonic() + timeout
+    _scheduler_stop.set()
+    with _scheduler_lock:
+        thread = _scheduler_thread
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    coordinator_stopped = thread is None or not thread.is_alive()
+    with _active_jobs_condition:
+        while _active_jobs:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _active_jobs_condition.wait(timeout=remaining)
+        jobs_stopped = not _active_jobs
+    stopped = coordinator_stopped and jobs_stopped
+    if stopped:
+        with _scheduler_lock:
+            if _scheduler_thread is thread:
+                _scheduler_thread = None
+    _stats_update(running=not stopped)
+    return stopped
+
+
 def _scheduler_tick(
     last_quick_run: Dict[str, float],
     last_deep_run: Dict[str, float],
     last_custom_run: Dict[str, float],
+    *,
+    executor: Optional[ThreadPoolExecutor] = None,
+    slots: Optional[threading.BoundedSemaphore] = None,
 ) -> None:
     """Single scheduler tick — process cron-based and pending (post-ingest) checks."""
     try:
@@ -363,9 +931,10 @@ def _scheduler_tick(
         return
 
     now = time.time()
-
-    for org, sup in pairs:
+    jobs: List[Tuple[Any, ...]] = []
+    for org, sup in sorted(pairs):
         dqc = DQConfig(r, org, sup)
+        _drain_history_outbox(r, org, sup)
         try:
             schedule = dqc.get_schedule()
             cooldown_sec = int(
@@ -397,157 +966,205 @@ def _scheduler_tick(
                     r, org, sup, table_name, (),
                 )
             continue
-
         for table_name in tables:
-            tkey = f"{org}:{sup}:{table_name}"
+            jobs.append((
+                r, org, sup, table_name, dqc, schedule, cooldown_sec,
+                quick_cron, deep_cron, custom_cron, now,
+                last_quick_run, last_deep_run, last_custom_run,
+            ))
 
-            # Table-specific schedule override
-            try:
-                ts = dqc.get_table_schedule(table_name)
-                table_schedule = ts or {}
-                table_cooldown_sec = int(
-                    table_schedule.get("cooldown_seconds", cooldown_sec)
-                )
-            except (DQConfigReadError, TypeError, ValueError, OverflowError) as exc:
-                _record_tick_config_failure(
-                    r,
-                    org,
-                    sup,
-                    table_name,
-                    dqc,
-                    QUALITY_MODES,
-                    cooldown_sec,
-                    f"Table quality schedule could not be read safely: {exc}",
-                )
-                continue
-            if ts and not ts.get("enabled", True):
-                _resolve_unresolved_pending(
-                    r, org, sup, table_name, (),
-                )
-                continue
-
-            # ── POST-INGEST PENDING CHECKS ───────────────────────
-            # Pending work runs before cron work.  Otherwise the first cron
-            # run in a new process starts with an empty in-memory last-run map,
-            # sets cooldown, and needlessly postpones the ingest generation.
-            post_ingest_modes = _post_ingest_modes(schedule, table_schedule)
-            _resolve_unresolved_pending(
-                r,
-                org,
-                sup,
-                table_name,
-                post_ingest_modes,
+    # Rotate the already pair/table-sorted list every tick. Under sustained
+    # capacity pressure, no tenant/table remains permanently at the tail.
+    global _scheduler_fair_cursor
+    if jobs:
+        offset = _scheduler_fair_cursor % len(jobs)
+        jobs = jobs[offset:] + jobs[:offset]
+        _scheduler_fair_cursor = (offset + 1) % len(jobs)
+    for job in jobs:
+        job_key = f"{job[1]}:{job[2]}:{job[3]}"
+        deadline = time.monotonic() + DEFAULT_JOB_DEADLINE_SECONDS
+        if executor is None:
+            _process_table_job(*job, deadline, None, False)
+        else:
+            if slots is None:
+                raise RuntimeError("bounded scheduler slots are required")
+            _submit_table_job(
+                executor,
+                slots,
+                job_key,
+                _process_table_job,
+                *job,
+                deadline,
+                _scheduler_stop,
+                True,
             )
-            _migrate_legacy_pending(
-                r,
-                org,
-                sup,
-                table_name,
-                post_ingest_modes,
+
+
+def _process_table_job(
+    r,
+    org: str,
+    sup: str,
+    table_name: str,
+    dqc,
+    schedule: Dict[str, Any],
+    cooldown_sec: int,
+    quick_cron: str,
+    deep_cron: str,
+    custom_cron: str,
+    now: float,
+    last_quick_run: Dict[str, float],
+    last_deep_run: Dict[str, float],
+    last_custom_run: Dict[str, float],
+    deadline_monotonic: float,
+    cancel_event: Optional[threading.Event],
+    isolate_runners: bool = False,
+) -> None:
+    """Run one table's serial modes inside the bounded table worker pool."""
+    from supertable.quality.config import DQConfigReadError
+
+    tkey = f"{org}:{sup}:{table_name}"
+    if cancel_event is not None and cancel_event.is_set():
+        _stats_increment("jobs_cancelled")
+        return
+    try:
+        ts = dqc.get_table_schedule(table_name)
+        table_schedule = ts or {}
+        table_cooldown_sec = int(
+            table_schedule.get("cooldown_seconds", cooldown_sec)
+        )
+    except (DQConfigReadError, TypeError, ValueError, OverflowError) as exc:
+        _record_tick_config_failure(
+            r, org, sup, table_name, dqc, QUALITY_MODES, cooldown_sec,
+            f"Table quality schedule could not be read safely: {exc}",
+        )
+        return
+    if ts and not ts.get("enabled", True):
+        _resolve_unresolved_pending(r, org, sup, table_name, ())
+        return
+    timezone_name = str(
+        table_schedule.get("timezone") or schedule.get("timezone") or "UTC"
+    )
+    post_ingest_modes = _post_ingest_modes(schedule, table_schedule)
+    _resolve_unresolved_pending(r, org, sup, table_name, post_ingest_modes)
+    _migrate_legacy_pending(r, org, sup, table_name, post_ingest_modes)
+    pending_generations = {
+        mode: r.get(_pending_key(org, sup, table_name, mode))
+        for mode in QUALITY_MODES
+    }
+    handled_pending = {
+        mode for mode, generation in pending_generations.items()
+        if generation is not None
+    }
+    last_run_maps = {
+        "quick": last_quick_run,
+        "deep": last_deep_run,
+        "custom": last_custom_run,
+    }
+    for mode in QUALITY_MODES:
+        if cancel_event is not None and cancel_event.is_set():
+            _stats_increment("jobs_cancelled")
+            return
+        generation = pending_generations[mode]
+        if generation is None:
+            continue
+        outcome = _try_run_check(
+            r, org, sup, table_name, mode, dqc, table_cooldown_sec,
+            pending_generation=generation,
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+            isolate_runner=isolate_runners,
+        )
+        if outcome.successful:
+            last_run_maps[mode][tkey] = now
+
+    table_quick_cron = (ts or {}).get("quick_cron") or quick_cron
+    quick_due, quick_state = _cron_schedule_state(
+        r, org, sup, table_name, "quick", table_quick_cron,
+        timezone_name, int(now * 1000),
+    )
+    if "quick" not in handled_pending and quick_due:
+        outcome = _try_run_check(
+            r, org, sup, table_name, "quick", dqc, table_cooldown_sec,
+            deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
+            isolate_runner=isolate_runners,
+        )
+        if outcome.executed:
+            _record_cron_outcome(
+                r, org, sup, table_name, "quick", quick_state,
+                outcome, int(time.time() * 1000),
             )
-            pending_generations = {
-                mode: r.get(_pending_key(org, sup, table_name, mode))
-                for mode in QUALITY_MODES
-            }
-            handled_pending = {
-                mode for mode, generation in pending_generations.items()
-                if generation is not None
-            }
+        if outcome.successful:
+            last_quick_run[tkey] = now
 
-            last_run_maps = {
-                "quick": last_quick_run,
-                "deep": last_deep_run,
-                "custom": last_custom_run,
-            }
-            for mode in QUALITY_MODES:
-                generation = pending_generations[mode]
-                if generation is None:
-                    continue
-                outcome = _try_run_check(
-                    r,
-                    org,
-                    sup,
-                    table_name,
-                    mode,
-                    dqc,
-                    table_cooldown_sec,
-                    pending_generation=generation,
+    table_deep_cron = (ts or {}).get("deep_cron") or deep_cron
+    deep_enabled = (ts or {}).get("deep_enabled", True)
+    deep_due, deep_state = _cron_schedule_state(
+        r, org, sup, table_name, "deep", table_deep_cron,
+        timezone_name, int(now * 1000),
+    )
+    if deep_enabled and "deep" not in handled_pending and deep_due:
+        try:
+            eff_config = dqc.get_effective_config(table_name)
+            has_deep = any(
+                value.get("enabled")
+                for key, value in (eff_config.get("checks") or {}).items()
+                if key.startswith("D")
+            )
+            stale_deep = _has_stale_mode_result(dqc, table_name, "deep")
+        except DQConfigReadError as exc:
+            _record_tick_config_failure(
+                r, org, sup, table_name, dqc, ("deep",),
+                table_cooldown_sec,
+                f"Deep quality config could not be read safely: {exc}",
+            )
+            has_deep = stale_deep = False
+        if has_deep or stale_deep:
+            outcome = _try_run_check(
+                r, org, sup, table_name, "deep", dqc, table_cooldown_sec,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+                isolate_runner=isolate_runners,
+            )
+            if outcome.executed:
+                _record_cron_outcome(
+                    r, org, sup, table_name, "deep", deep_state,
+                    outcome, int(time.time() * 1000),
                 )
-                if outcome.successful:
-                    last_run_maps[mode][tkey] = now
+            if outcome.successful:
+                last_deep_run[tkey] = now
 
-            table_quick_cron = (ts or {}).get("quick_cron") or quick_cron
-
-            # ── CRON-BASED QUICK CHECK ────────────────────────────
-            quick_interval = _cron_to_seconds(table_quick_cron)
-            last_q = last_quick_run.get(tkey, 0)
-
-            if "quick" not in handled_pending and now - last_q >= quick_interval:
-                if _try_run_check(r, org, sup, table_name, "quick", dqc, table_cooldown_sec):
-                    last_quick_run[tkey] = now
-
-            # ── CRON-BASED DEEP CHECK ─────────────────────────────
-            table_deep_cron = (ts or {}).get("deep_cron") or deep_cron
-            deep_interval = _cron_to_seconds(table_deep_cron)
-            last_d = last_deep_run.get(tkey, 0)
-            deep_enabled = (ts or {}).get("deep_enabled", True)
-
-            if deep_enabled and "deep" not in handled_pending and now - last_d >= deep_interval:
-                try:
-                    eff_config = dqc.get_effective_config(table_name)
-                    has_deep = any(
-                        v.get("enabled")
-                        for k, v in (eff_config.get("checks") or {}).items()
-                        if k.startswith("D")
-                    )
-                    stale_deep = _has_stale_mode_result(
-                        dqc, table_name, "deep"
-                    )
-                except DQConfigReadError as exc:
-                    _record_tick_config_failure(
-                        r,
-                        org,
-                        sup,
-                        table_name,
-                        dqc,
-                        ("deep",),
-                        table_cooldown_sec,
-                        f"Deep quality config could not be read safely: {exc}",
-                    )
-                    has_deep = False
-                    stale_deep = False
-                if has_deep or stale_deep:
-                    if _try_run_check(r, org, sup, table_name, "deep", dqc, table_cooldown_sec):
-                        last_deep_run[tkey] = now
-
-            # ── CRON-BASED CUSTOM RULES CHECK ─────────────────────
-            table_custom_cron = (ts or {}).get("custom_cron") or custom_cron
-            custom_interval = _cron_to_seconds(table_custom_cron)
-            last_c = last_custom_run.get(tkey, 0)
-            custom_enabled = (ts or {}).get("custom_enabled", True)
-
-            if custom_enabled and "custom" not in handled_pending and now - last_c >= custom_interval:
-                try:
-                    has_rules = bool(dqc.list_rules_for_table(table_name))
-                    stale_custom = _has_stale_mode_result(
-                        dqc, table_name, "custom"
-                    )
-                except DQConfigReadError as exc:
-                    _record_tick_config_failure(
-                        r,
-                        org,
-                        sup,
-                        table_name,
-                        dqc,
-                        ("custom",),
-                        table_cooldown_sec,
-                        f"Custom quality rules could not be read safely: {exc}",
-                    )
-                    has_rules = False
-                    stale_custom = False
-                if has_rules or stale_custom:
-                    if _try_run_check(r, org, sup, table_name, "custom", dqc, table_cooldown_sec):
-                        last_custom_run[tkey] = now
+    table_custom_cron = (ts or {}).get("custom_cron") or custom_cron
+    custom_enabled = (ts or {}).get("custom_enabled", True)
+    custom_due, custom_state = _cron_schedule_state(
+        r, org, sup, table_name, "custom", table_custom_cron,
+        timezone_name, int(now * 1000),
+    )
+    if custom_enabled and "custom" not in handled_pending and custom_due:
+        try:
+            has_rules = bool(dqc.list_rules_for_table(table_name))
+            stale_custom = _has_stale_mode_result(dqc, table_name, "custom")
+        except DQConfigReadError as exc:
+            _record_tick_config_failure(
+                r, org, sup, table_name, dqc, ("custom",),
+                table_cooldown_sec,
+                f"Custom quality rules could not be read safely: {exc}",
+            )
+            has_rules = stale_custom = False
+        if has_rules or stale_custom:
+            outcome = _try_run_check(
+                r, org, sup, table_name, "custom", dqc, table_cooldown_sec,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+                isolate_runner=isolate_runners,
+            )
+            if outcome.executed:
+                _record_cron_outcome(
+                    r, org, sup, table_name, "custom", custom_state,
+                    outcome, int(time.time() * 1000),
+                )
+            if outcome.successful:
+                last_custom_run[tkey] = now
 
 
 def _record_tick_config_failure(
@@ -620,6 +1237,8 @@ def _publish_failure_and_retry(
     lock_token: str,
     lease_guard: _LeaseGuard,
     cooldown_sec: int,
+    *,
+    completion_event: Optional[threading.Event] = None,
 ) -> None:
     """Record a failed attempt when safe, but never overwrite on read doubt."""
 
@@ -653,7 +1272,51 @@ def _publish_failure_and_retry(
         lock_token,
         lease_guard,
         cooldown_sec,
+        completion_event=completion_event,
     )
+
+
+def _expire_job_if_owned(
+    r,
+    *,
+    running_key: str,
+    retry_key: str,
+    lock_token: str,
+    cooldown_sec: int,
+    reason: str,
+) -> bool:
+    """Atomically make an unfinished job replayable and release its lease.
+
+    There is intentionally no GET/DEL compatibility fallback. An ambiguous
+    Redis response must never delete a successor's lease. In that case the
+    current worker is still fenced locally and Redis' running-key TTL remains
+    the final recovery bound.
+    """
+
+    retry_seconds = max(
+        1,
+        min(DEFAULT_RETRY_BACKOFF_SECONDS, max(1, int(cooldown_sec))),
+    )
+    script = """
+    if redis.call('get', KEYS[1]) ~= ARGV[1] then
+        return 0
+    end
+    redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[3])
+    redis.call('del', KEYS[1])
+    return 1
+    """
+    try:
+        return bool(r.eval(
+            script,
+            2,
+            running_key,
+            retry_key,
+            lock_token,
+            f"{_now_iso()}:{reason}",
+            retry_seconds,
+        ))
+    except Exception:
+        return False
 
 
 def _try_run_check(
@@ -667,6 +1330,9 @@ def _try_run_check(
     *,
     pending_generation: Any = None,
     forced_failure: Optional[str] = None,
+    deadline_monotonic: Optional[float] = None,
+    cancel_event: Optional[threading.Event] = None,
+    isolate_runner: bool = False,
 ) -> CheckRunOutcome:
     """
     Attempt to run a quality check with lock + cooldown protection.
@@ -675,6 +1341,19 @@ def _try_run_check(
     """
     if mode not in QUALITY_MODES:
         return _failed(mode, f"unknown quality mode: {mode}")
+    if deadline_monotonic is not None:
+        if (
+            isinstance(deadline_monotonic, bool)
+            or not isinstance(deadline_monotonic, (int, float))
+            or not math.isfinite(float(deadline_monotonic))
+        ):
+            return _failed(mode, "quality job deadline is invalid")
+        if time.monotonic() >= float(deadline_monotonic):
+            _stats_increment("deadline_exceeded")
+            return _failed(mode, "quality job deadline expired before execution")
+    if cancel_event is not None and cancel_event.is_set():
+        _stats_increment("jobs_cancelled")
+        return _failed(mode, "quality scheduler is shutting down")
 
     running_key = _running_key(org, sup, table_name)
     cooldown_key = _cooldown_key(org, sup, table_name, mode)
@@ -715,6 +1394,42 @@ def _try_run_check(
     lease_stop = threading.Event()
     lease_guard = _LeaseGuard(r, running_key, lock_token)
     lease_thread: Optional[threading.Thread] = None
+    completion_event = threading.Event()
+    deadline_fired = threading.Event()
+    deadline_timer: Optional[threading.Timer] = None
+    cancel_watch_stop = threading.Event()
+    cancel_watch_thread: Optional[threading.Thread] = None
+
+    def expire_for(reason: str, *, deadline: bool) -> None:
+        with lease_guard.fence_lock:
+            if completion_event.is_set() or lease_guard.lost.is_set():
+                return
+            released = _expire_job_if_owned(
+                r,
+                running_key=running_key,
+                retry_key=retry_key,
+                lock_token=lock_token,
+                cooldown_sec=cooldown_sec,
+                reason=reason,
+            )
+            # Even an ambiguous Redis response is terminal locally. A late
+            # worker can no longer publish, and the original lease TTL safely
+            # resolves uncertainty without risking a successor lease.
+            lease_guard.lost.set()
+            if deadline:
+                deadline_fired.set()
+                _stats_increment("deadline_exceeded")
+            else:
+                _stats_increment("jobs_cancelled")
+            logger.warning(
+                "[dq-scheduler] %s fenced for %s/%s/%s (%s; lease_released=%s)",
+                mode,
+                org,
+                sup,
+                table_name,
+                reason,
+                released,
+            )
     try:
         lease_thread = threading.Thread(
             target=_renew_running_lease,
@@ -730,9 +1445,43 @@ def _try_run_check(
             daemon=True,
         )
         lease_thread.start()
+        if deadline_monotonic is not None:
+            remaining = max(0.0, float(deadline_monotonic) - time.monotonic())
+            deadline_timer = threading.Timer(
+                remaining,
+                expire_for,
+                kwargs={"reason": "deadline exceeded", "deadline": True},
+            )
+            deadline_timer.name = f"dq-deadline-{mode}-{table_name}"[:120]
+            deadline_timer.daemon = True
+            deadline_timer.start()
+        if cancel_event is not None:
+            def watch_cancellation() -> None:
+                while not cancel_watch_stop.wait(0.05):
+                    if cancel_event.is_set():
+                        expire_for("scheduler shutdown", deadline=False)
+                        return
+
+            cancel_watch_thread = threading.Thread(
+                target=watch_cancellation,
+                name=f"dq-cancel-{mode}-{table_name}"[:120],
+                daemon=True,
+            )
+            cancel_watch_thread.start()
     except Exception as exc:
         # Do not execute without an active renewer: the query may outlive the
         # initial TTL. Release only our token and expose the failed attempt.
+        completion_event.set()
+        if deadline_timer is not None:
+            deadline_timer.cancel()
+        cancel_watch_stop.set()
+        cancel_join = getattr(cancel_watch_thread, "join", None)
+        if callable(cancel_join):
+            cancel_join(timeout=0.2)
+        lease_stop.set()
+        lease_join = getattr(lease_thread, "join", None)
+        if callable(lease_join):
+            lease_join(timeout=1.0)
         outcome = _failed(mode, f"could not start lease renewer: {exc}")
         try:
             _publish_failure_and_retry(
@@ -756,6 +1505,18 @@ def _try_run_check(
 
         if forced_failure is not None:
             outcome = _failed(mode, forced_failure)
+        elif isolate_runner:
+            outcome = _run_isolated_mode_check(
+                org=org,
+                sup=sup,
+                table_name=table_name,
+                mode=mode,
+                running_key=running_key,
+                lock_token=lock_token,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+                lease_guard=lease_guard,
+            )
         else:
             runners = {
                 "quick": _run_quick_check,
@@ -770,6 +1531,17 @@ def _try_run_check(
                 dqc,
                 lease_guard=lease_guard,
             )
+        if cancel_event is not None and cancel_event.is_set():
+            expire_for("scheduler shutdown", deadline=False)
+            return _failed(mode, "quality scheduler shut down during execution")
+        if (
+            deadline_monotonic is not None
+            and time.monotonic() >= float(deadline_monotonic)
+        ):
+            expire_for("deadline exceeded", deadline=True)
+            return _failed(mode, "quality job deadline exceeded")
+        if deadline_fired.is_set():
+            return _failed(mode, "quality job deadline exceeded")
         if not isinstance(outcome, CheckRunOutcome):
             outcome = _failed(
                 mode,
@@ -794,6 +1566,7 @@ def _try_run_check(
                 )
                 _set_retry_if_owned(
                     r, retry_key, lock_token, lease_guard, cooldown_sec,
+                    completion_event=completion_event,
                 )
                 return failed_outcome
 
@@ -812,6 +1585,7 @@ def _try_run_check(
                     if pending_generation is not None else None
                 ),
                 pending_generation=pending_generation,
+                completion_event=completion_event,
             ):
                 lease_guard.mark_lost()
                 return _failed(
@@ -829,6 +1603,7 @@ def _try_run_check(
                 lock_token,
                 lease_guard,
                 cooldown_sec,
+                completion_event=completion_event,
             )
             logger.error(
                 "[dq-scheduler] %s check failed for %s: %s",
@@ -865,6 +1640,7 @@ def _try_run_check(
                 lock_token,
                 lease_guard,
                 cooldown_sec,
+                completion_event=completion_event,
             )
         except _LeaseLostError:
             pass
@@ -874,8 +1650,20 @@ def _try_run_check(
         # Stop renewal before releasing.  Both renewal and release are
         # ownership-checked, so an expired/reacquired lease is never damaged.
         lease_stop.set()
-        if lease_thread is not None:
-            lease_thread.join(timeout=1.0)
+        # Mark all non-deadline terminal paths complete while holding the same
+        # fence used by the timer, then cancel it. This prevents a timer queued
+        # at the boundary from creating a retry after successful finalization.
+        with lease_guard.fence_lock:
+            completion_event.set()
+        if deadline_timer is not None:
+            deadline_timer.cancel()
+        cancel_watch_stop.set()
+        cancel_join = getattr(cancel_watch_thread, "join", None)
+        if callable(cancel_join):
+            cancel_join(timeout=0.2)
+        lease_join = getattr(lease_thread, "join", None)
+        if callable(lease_join):
+            lease_join(timeout=1.0)
         _delete_if_value(r, running_key, lock_token)
 
 
@@ -888,6 +1676,8 @@ def _execute_quality_statement(
     org: str,
     sup: str,
     sql: str,
+    *,
+    allow_bounded_collection_aggregates: bool = False,
 ):
     """Execute through the AUTO certification boundary used by all DQ SQL."""
 
@@ -898,6 +1688,9 @@ def _execute_quality_statement(
         super_name=sup,
         sql=sql,
         role_name="superadmin",
+        allow_bounded_collection_aggregates=(
+            allow_bounded_collection_aggregates
+        ),
     )
 
 
@@ -1648,14 +2441,47 @@ def _write_mode_history(
     elapsed_ms: int,
     *,
     lease_guard: Optional[_LeaseGuard] = None,
-) -> None:
-    """Best-effort history write using only the completed mode's counters."""
+) -> bool:
+    """Durably queue history before attempting the Parquet sink.
+
+    Scheduler calls have a lease (and therefore a Redis client). They may only
+    advance cooldown/pending state after the immutable payload is accepted by
+    the outbox hash. Sink failures leave that payload replayable. Direct/manual
+    calls without a lease retain the historical best-effort behaviour.
+    """
 
     try:
-        from supertable.quality.history import write_history, write_history_via_sql
+        from supertable.quality.history import write_history
 
         history_document = _mode_history_document(latest, mode)
         _assert_lease_owned(lease_guard)
+        history_id = uuid.uuid4().hex
+        payload = {
+            "history_id": history_id,
+            "organization": org,
+            "super_name": sup,
+            "table_name": table_name,
+            "check_type": mode,
+            "latest": history_document,
+            "execution_ms": int(elapsed_ms),
+        }
+        encoded = json.dumps(
+            normalize_json_value(payload),
+            allow_nan=False,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if lease_guard is not None:
+            outbox_key = _history_outbox_key(org, sup)
+            if not _queue_history_outbox_if_owned(
+                lease_guard,
+                outbox_key,
+                history_id,
+                encoded,
+            ):
+                return False
+            _assert_lease_owned(lease_guard)
         wrote = write_history(
             org,
             sup,
@@ -1663,27 +2489,26 @@ def _write_mode_history(
             mode,
             history_document,
             elapsed_ms,
+            history_id=history_id,
         )
         _assert_lease_owned(lease_guard)
-        if not wrote:
-            write_history_via_sql(
-                org,
-                sup,
-                table_name,
-                mode,
-                history_document,
-                elapsed_ms,
+        if wrote and lease_guard is not None:
+            _ack_history_outbox(
+                lease_guard.redis, outbox_key, history_id, encoded,
             )
-            _assert_lease_owned(lease_guard)
+        # A durable queued payload is sufficient for scheduler success; the
+        # replay worker will finish a failed/ambiguous Parquet delivery.
+        return bool(wrote or lease_guard is not None)
     except _LeaseLostError:
         raise
     except Exception as exc:
-        logger.debug(
-            "[dq-scheduler] History write skipped for %s %s: %s",
+        logger.error(
+            "[dq-scheduler] History durability failed for %s %s: %s",
             mode,
             table_name,
             exc,
         )
+        return False
 
 
 def _empty_mode_record(mode: str, checked_at: str) -> Dict[str, Any]:
@@ -2017,7 +2842,7 @@ def _run_quick_check(
 
     # ── Write to __data_quality__ history table ───────────────
     _check_elapsed_ms = int(time.time() * 1000) - _check_start_ms
-    _write_mode_history(
+    if not _write_mode_history(
         org,
         sup,
         table_name,
@@ -2025,7 +2850,8 @@ def _run_quick_check(
         latest,
         _check_elapsed_ms,
         lease_guard=lease_guard,
-    )
+    ):
+        return _failed("quick", "quality history could not be durably queued")
 
     return _success(
         "quick",
@@ -2109,7 +2935,7 @@ def _run_deep_check(
         )
         if latest is None:
             return _failed("deep", f"Could not clear disabled deep result for {table_name}")
-        _write_mode_history(
+        if not _write_mode_history(
             org,
             sup,
             table_name,
@@ -2117,7 +2943,8 @@ def _run_deep_check(
             latest,
             int(time.time() * 1000) - _deep_start_ms,
             lease_guard=lease_guard,
-        )
+        ):
+            return _failed("deep", "quality history could not be durably queued")
         return _success("deep")
 
     try:
@@ -2166,7 +2993,12 @@ def _run_deep_check(
                 if cat == "numeric"
                 else build_deep_string_sql(table_fqn, col_name)
             )
-            execution = _execute_quality_statement(org, sup, sql)
+            execution = _execute_quality_statement(
+                org,
+                sup,
+                sql,
+                allow_bounded_collection_aggregates=True,
+            )
             if not execution.ok:
                 return _failed(
                     "deep",
@@ -2259,7 +3091,7 @@ def _run_deep_check(
 
     # ── Write to __data_quality__ history table ───────────────
     _deep_elapsed_ms = int(time.time() * 1000) - _deep_start_ms
-    _write_mode_history(
+    if not _write_mode_history(
         org,
         sup,
         table_name,
@@ -2267,7 +3099,8 @@ def _run_deep_check(
         latest,
         _deep_elapsed_ms,
         lease_guard=lease_guard,
-    )
+    ):
+        return _failed("deep", "quality history could not be durably queued")
 
     return _success(
         "deep",
@@ -2361,7 +3194,7 @@ def _run_custom_check(
         )
         if latest is None:
             return _failed("custom", f"Could not clear disabled custom result for {table_name}")
-        _write_mode_history(
+        if not _write_mode_history(
             org,
             sup,
             table_name,
@@ -2369,7 +3202,8 @@ def _run_custom_check(
             latest,
             int(time.time() * 1000) - _custom_start_ms,
             lease_guard=lease_guard,
-        )
+        ):
+            return _failed("custom", "quality history could not be durably queued")
         return _success("custom")
 
     validated_sql: List[Tuple[Dict[str, Any], Optional[str]]] = []
@@ -2508,7 +3342,7 @@ def _run_custom_check(
 
     # ── Write to __data_quality__ history table ───────────────
     _custom_elapsed_ms = int(time.time() * 1000) - _custom_start_ms
-    _write_mode_history(
+    if not _write_mode_history(
         org,
         sup,
         table_name,
@@ -2516,7 +3350,8 @@ def _run_custom_check(
         latest,
         _custom_elapsed_ms,
         lease_guard=lease_guard,
-    )
+    ):
+        return _failed("custom", "quality history could not be durably queued")
 
     return _success(
         "custom",
@@ -2569,6 +3404,252 @@ def _cooldown_key(
 
 def _retry_key(org: str, sup: str, table: str, mode: str) -> str:
     return RK.quality_prefix(org, sup) + f"retry:{table}:{mode}"
+
+
+def _history_outbox_key(org: str, sup: str) -> str:
+    return RK.quality_prefix(org, sup) + "history_outbox"
+
+
+def _queue_history_outbox_if_owned(
+    lease_guard: _LeaseGuard,
+    key: str,
+    history_id: str,
+    payload: str,
+) -> bool:
+    """Atomically fence and insert one immutable history payload.
+
+    The lease comparison and ``HSETNX`` must share one Redis linearization
+    point. A pre-check followed by a normal HSET lets a deadline remove the
+    lease between those commands while the expired worker still queues a row.
+    Existing IDs are idempotent only when their exact canonical payload agrees;
+    a collision or attempted overwrite fails closed.
+    """
+
+    script = """
+    if redis.call('get', KEYS[1]) ~= ARGV[1] then
+        return 0
+    end
+    if redis.call('hsetnx', KEYS[2], ARGV[2], ARGV[3]) == 1 then
+        return 1
+    end
+    if redis.call('hget', KEYS[2], ARGV[2]) == ARGV[3] then
+        return 2
+    end
+    return -1
+    """
+    try:
+        result = int(lease_guard.redis.eval(
+            script,
+            2,
+            lease_guard.key,
+            key,
+            lease_guard.token,
+            history_id,
+            payload,
+        ))
+    except Exception as exc:
+        # The script may have committed before an ambiguous transport error.
+        # Fence this worker locally so no cooldown/pending transition follows.
+        lease_guard.mark_lost()
+        raise _LeaseLostError(
+            "quality history outbox ownership could not be verified"
+        ) from exc
+    if result == 0:
+        lease_guard.mark_lost()
+        raise _LeaseLostError(
+            "quality execution lease was lost before history enqueue"
+        )
+    if result not in (1, 2):
+        logger.error(
+            "[dq-scheduler] Refusing conflicting history outbox payload %s",
+            history_id,
+        )
+        return False
+    try:
+        persisted = lease_guard.redis.hget(key, history_id)
+    except Exception as exc:
+        lease_guard.mark_lost()
+        raise _LeaseLostError(
+            "quality history outbox read-back could not be verified"
+        ) from exc
+    if persisted is None or not _redis_values_equal(persisted, payload):
+        lease_guard.mark_lost()
+        raise _LeaseLostError(
+            "quality history outbox read-back did not match its payload"
+        )
+    return True
+
+
+def _ack_history_outbox(r, key: str, history_id: str, payload: str) -> bool:
+    script = """
+    if redis.call('hget', KEYS[1], ARGV[1]) ~= ARGV[2] then
+        return 0
+    end
+    return redis.call('hdel', KEYS[1], ARGV[1])
+    """
+    try:
+        return bool(r.eval(script, 1, key, history_id, payload))
+    except Exception:
+        # Ambiguous acknowledgement deliberately leaves a replayable record.
+        return False
+
+
+def _drain_history_outbox(r, org: str, sup: str, *, limit: int = 100) -> int:
+    """Retry a bounded number of durable history deliveries."""
+
+    from supertable.quality.history import write_history_payload
+
+    key = _history_outbox_key(org, sup)
+    try:
+        _cursor, raw_items = r.hscan(key, cursor=0, count=max(1, min(limit, 1000)))
+    except Exception as exc:
+        logger.warning("[dq-scheduler] history outbox scan failed: %s", exc)
+        return 0
+    delivered = 0
+    for raw_id, raw_payload in list((raw_items or {}).items())[:limit]:
+        history_id = (
+            raw_id.decode("utf-8") if isinstance(raw_id, bytes) else str(raw_id)
+        )
+        encoded = (
+            raw_payload.decode("utf-8")
+            if isinstance(raw_payload, bytes)
+            else str(raw_payload)
+        )
+        try:
+            payload = json.loads(encoded)
+            if not isinstance(payload, dict) or payload.get("history_id") != history_id:
+                raise ValueError("history outbox identity mismatch")
+            if not write_history_payload(payload):
+                continue
+            if _ack_history_outbox(r, key, history_id, encoded):
+                delivered += 1
+        except Exception as exc:
+            logger.error(
+                "[dq-scheduler] history outbox delivery failed for %s: %s",
+                history_id,
+                exc,
+            )
+    return delivered
+
+
+def _cron_state_key(org: str, sup: str, table: str, mode: str) -> str:
+    return RK.quality_prefix(org, sup) + f"cron_state:{table}:{mode}"
+
+
+def _cron_schedule_state(
+    r,
+    org: str,
+    sup: str,
+    table: str,
+    mode: str,
+    expression: str,
+    timezone_name: str,
+    now_ms: int,
+) -> Tuple[bool, Dict[str, Any]]:
+    """Return persisted cron due state, initializing the next phase safely."""
+
+    from supertable.quality.cron import CronSchedule
+
+    schedule = CronSchedule.parse(expression, timezone_name)
+    key = _cron_state_key(org, sup, table, mode)
+    # Cron has minute resolution. If this process first observes a schedule
+    # after its wall-clock boundary within the same minute, execute that phase
+    # once and persist it; otherwise retain the exact next calendar boundary.
+    current_minute_start_ms = now_ms - (now_ms % 60_000)
+    first_due_ms = schedule.next_after_ms(current_minute_start_ms - 1)
+    raw = r.get(key)
+    state: Dict[str, Any]
+    if raw is None:
+        state = {
+            "schema_version": 1,
+            "expression": schedule.expression,
+            "timezone": schedule.timezone_name,
+            "status": "scheduled",
+            "next_due_ms": first_due_ms,
+            "last_scheduled_ms": None,
+            "last_started_ms": None,
+            "last_completed_ms": None,
+            "last_outcome": None,
+        }
+        payload = json.dumps(state, sort_keys=True, separators=(",", ":"))
+        if not r.set(key, payload, nx=True):
+            raw = r.get(key)
+            if raw is None:
+                raise RuntimeError("cron state initialization was not acknowledged")
+        else:
+            return now_ms >= first_due_ms, state
+    if raw is not None:
+        try:
+            state = json.loads(raw)
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise RuntimeError("persisted quality cron state is malformed") from exc
+        if not isinstance(state, dict) or state.get("schema_version") != 1:
+            raise RuntimeError("persisted quality cron state has the wrong shape")
+    if (
+        state.get("expression") != schedule.expression
+        or state.get("timezone") != schedule.timezone_name
+    ):
+        # Configuration changes start a fresh calendar phase. They never reuse
+        # a fixed interval derived from the previous expression/timezone.
+        state = {
+            "schema_version": 1,
+            "expression": schedule.expression,
+            "timezone": schedule.timezone_name,
+            "status": "scheduled",
+            "next_due_ms": first_due_ms,
+            "last_scheduled_ms": None,
+            "last_started_ms": None,
+            "last_completed_ms": None,
+            "last_outcome": None,
+        }
+        if not r.set(key, json.dumps(state, sort_keys=True, separators=(",", ":"))):
+            raise RuntimeError("updated quality cron state was not persisted")
+        return now_ms >= first_due_ms, state
+    next_due = state.get("next_due_ms")
+    if isinstance(next_due, bool) or not isinstance(next_due, int) or next_due < 0:
+        raise RuntimeError("persisted quality cron next_due_ms is invalid")
+    return now_ms >= next_due, state
+
+
+def _record_cron_outcome(
+    r,
+    org: str,
+    sup: str,
+    table: str,
+    mode: str,
+    state: Dict[str, Any],
+    outcome: CheckRunOutcome,
+    now_ms: int,
+) -> None:
+    """Persist the exact phase and last outcome before the next tick."""
+
+    from supertable.quality.cron import CronSchedule
+
+    scheduled_ms = int(state["next_due_ms"])
+    schedule = CronSchedule.parse(
+        str(state["expression"]), str(state["timezone"]),
+    )
+    next_due = schedule.next_after_ms(scheduled_ms)
+    # Coalesce missed phases rather than launching an unbounded catch-up storm.
+    for _ in range(100_000):
+        if next_due > now_ms:
+            break
+        next_due = schedule.next_after_ms(next_due)
+    else:
+        raise RuntimeError("cron catch-up exceeded its safety bound")
+    updated = dict(state)
+    updated.update({
+        "status": "scheduled" if outcome.successful else "retry",
+        "next_due_ms": next_due if outcome.successful else scheduled_ms,
+        "last_scheduled_ms": scheduled_ms,
+        "last_started_ms": updated.get("last_started_ms") or now_ms,
+        "last_completed_ms": now_ms,
+        "last_outcome": outcome.state,
+        "last_message": outcome.message[:4096],
+    })
+    key = _cron_state_key(org, sup, table, mode)
+    if not r.set(key, json.dumps(updated, sort_keys=True, separators=(",", ":"))):
+        raise RuntimeError("quality cron outcome was not persisted")
 
 
 def _post_ingest_modes(
@@ -2695,6 +3776,8 @@ def _set_retry_if_owned(
     _lock_token: str,
     lease_guard: _LeaseGuard,
     cooldown_sec: int,
+    *,
+    completion_event: Optional[threading.Event] = None,
 ) -> bool:
     retry_seconds = max(
         1,
@@ -2729,6 +3812,8 @@ def _set_retry_if_owned(
             raise _LeaseLostError(
                 "quality execution lease was lost before retry publication"
             )
+        if completion_event is not None:
+            completion_event.set()
     return True
 
 
@@ -2741,6 +3826,7 @@ def _finalize_success_if_owned(
     *,
     pending_key: Optional[str] = None,
     pending_generation: Any = None,
+    completion_event: Optional[threading.Event] = None,
 ) -> bool:
     """Atomically fence success bookkeeping and exact-generation consumption."""
 
@@ -2780,7 +3866,9 @@ def _finalize_success_if_owned(
             return False
         if not finalized:
             lease_guard.lost.set()
-    return finalized
+        elif completion_event is not None:
+            completion_event.set()
+        return finalized
 
 
 def _migrate_legacy_pending(
@@ -2915,36 +4003,3 @@ def _list_tables(r, org: str, sup: str) -> List[str]:
     except Exception as e:
         logger.warning(f"[dq-scheduler] list_tables failed: {e}")
     return sorted(set(tables))
-
-
-def _cron_to_seconds(cron_expr: str) -> int:
-    """
-    Simplified cron-to-interval converter.
-    Handles common patterns: */N hours, daily, etc.
-    Falls back to 4 hours for complex expressions.
-    """
-    parts = cron_expr.strip().split()
-    if len(parts) != 5:
-        return 4 * 3600
-
-    minute, hour, dom, month, dow = parts
-
-    if hour.startswith("*/"):
-        try:
-            return int(hour[2:]) * 3600
-        except ValueError:
-            pass
-
-    if minute.startswith("*/"):
-        try:
-            return int(minute[2:]) * 60
-        except ValueError:
-            pass
-
-    if dom == "*" and month == "*" and dow == "*" and not hour.startswith("*"):
-        return 24 * 3600
-
-    if hour == "*/1":
-        return 3600
-
-    return 4 * 3600

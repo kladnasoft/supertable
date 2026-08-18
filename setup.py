@@ -25,7 +25,7 @@ setup(
     long_description_content_type="text/markdown",
     author="Levente Kupas",
     author_email="lkupas@kladnasoft.com",
-    license="Super Table Public Use License (STPUL) v1.0",
+    license="FSL-1.1-ALv2",
     python_requires=">=3.10",
     packages=find_packages(include=["supertable", "supertable.*"]),
     include_package_data=True,
@@ -34,7 +34,7 @@ setup(
         "Programming Language :: Python :: 3",
         "Programming Language :: Python :: 3 :: Only",
         "License :: Other/Proprietary License",
-        "Operating System :: OS Independent",
+        "Operating System :: POSIX",
     ],
     extras_require={
         "s3": ["boto3>=1.34,<2.0"],
@@ -57,6 +57,7 @@ setup(
     entry_points={
         "console_scripts": [
             "supertable-privileged-audit-worker=supertable.audit.privileged_worker:main",
+            "supertable-redis-recovery=supertable.recovery.redis_rebuild:main",
             "supertable-demo-quickstart=supertable.demo.quickstart.controller:main",
             "supertable-demo-webshop-generate=supertable.demo.webshop.generate:main",
             "supertable-demo-webshop-load=supertable.demo.webshop.load:main",

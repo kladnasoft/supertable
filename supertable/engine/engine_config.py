@@ -225,9 +225,60 @@ def _redis_cfg(org: str, catalog: Optional[Any]) -> Dict[str, Any]:
     if not (org and catalog is not None):
         return {}
     try:
-        return catalog.get_engine_config(org) or {}
+        raw = catalog.get_engine_config(org) or {}
+        if not isinstance(raw, dict):
+            return {}
+        return _canonicalize_legacy_24_config(raw)
     except Exception:
         return {}
+
+
+def _canonicalize_legacy_24_config(raw: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return one current-shape view of a 2.4 engine document.
+
+    SuperTable 2.4 persisted DuckDB pragmas below ``lite`` and ``pro``.  The
+    current DuckDB implementation is the renamed Lite execution path, so Lite
+    is the deterministic first choice; Pro is used only for estates that stored
+    no Lite section.  A present current ``duckdb`` section is authoritative,
+    even when empty, so an operator can intentionally clear old overrides.
+
+    This is a storage compatibility read, not a revival of the removed public
+    Lite/Pro engine names.
+    """
+    cfg = dict(raw)
+    if "duckdb" not in cfg:
+        legacy_section = next(
+            (
+                raw.get(name)
+                for name in ("lite", "pro")
+                if isinstance(raw.get(name), Mapping)
+            ),
+            None,
+        )
+        if legacy_section is not None:
+            cfg["duckdb"] = dict(legacy_section)
+
+    if (
+        "engine_island_min_bytes" not in cfg
+        and "engine_lite_max_bytes" in raw
+    ):
+        cfg["engine_island_min_bytes"] = raw["engine_lite_max_bytes"]
+
+    policy = raw.get("auto_policy")
+    if isinstance(policy, (list, tuple)):
+        migrated_policy = []
+        for item in policy:
+            if not isinstance(item, Mapping):
+                migrated_policy.append(item)
+                continue
+            migrated = dict(item)
+            if str(migrated.get("engine", "")).strip().casefold() in {
+                "duckdb_lite", "duckdb_pro", "lite", "pro",
+            }:
+                migrated["engine"] = Engine.DUCKDB.value
+            migrated_policy.append(migrated)
+        cfg["auto_policy"] = migrated_policy
+    return cfg
 
 
 def _effective(stored: Dict[str, Any], key: str, spec: Dict[str, Tuple[str, str]]) -> Tuple[str, str]:

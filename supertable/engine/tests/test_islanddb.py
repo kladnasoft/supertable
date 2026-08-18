@@ -1393,6 +1393,18 @@ def test_binary_scalar_extrema_arrow_stream_retains_canonical_binary(tmp_path):
     assert table["hi"][0].as_py() == b"\xff"
 
 
+def test_empty_lazy_batches_preserve_schema_at_supported_polars_floor():
+    lazy = pl.DataFrame(
+        schema={"id": pl.Int64, "payload": pl.Binary}
+    ).lazy()
+
+    schema, batches = IslandDB._lazy_batches(lazy, batch_rows=2)
+
+    assert schema.names == ["id", "payload"]
+    assert schema.field("payload").type == pa.binary()
+    assert list(batches) == []
+
+
 def test_binary_scalar_extrema_empty_arrow_stream_retains_canonical_binary(
     tmp_path,
 ):
@@ -2454,6 +2466,45 @@ def test_public_executor_arrow_stream_is_batched_and_exact(
     assert telemetry["result_complete"] is True
     assert telemetry["execution_outcome"] == "completed"
     assert telemetry["result_rows"] == 5
+
+
+def test_public_island_stream_bounds_arbitrary_width_at_native_producer(tmp_path):
+    path = tmp_path / "wide-result.parquet"
+    payload = "x" * (5 * 1024 * 1024)
+    pl.DataFrame({
+        "payload": [payload] * 4,
+        "__rowid__": [1, 2, 3, 4],
+        "__timestamp__": [1, 1, 1, 1],
+    }).write_parquet(path, compression="zstd")
+    snapshot = _snapshot(
+        "wide",
+        [path],
+        ["raw/wide-result.parquet"],
+        types={
+            "payload": "String",
+            "__rowid__": "Int64",
+            "__timestamp__": "Int64",
+        },
+    )
+    reflection = _reflection(snapshot)
+    query = "SELECT payload FROM s.wide"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "wide-result-plan.json")
+
+    stream = IslandDB().execute_stream(
+        reflection,
+        parser,
+        manager,
+        lambda _event: None,
+        max_batch_rows=1,
+    )
+    try:
+        first = next(stream)
+        assert first.num_rows == 1
+        assert 5 * 1024 * 1024 <= first.nbytes < 6 * 1024 * 1024
+    finally:
+        stream.close()
 
 
 def test_public_executor_partial_stream_publishes_fallback_when_profile_write_fails(

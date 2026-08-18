@@ -7,7 +7,7 @@ import os
 from supertable.config.settings import settings
 import re
 from typing import Any, BinaryIO, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import boto3
 from botocore.config import Config
@@ -139,6 +139,11 @@ class S3Storage(StorageInterface):
             Params={"Bucket": self.bucket_name, "Key": full_key},
             ExpiresIn=expiry_seconds,
         )
+
+    def canonical_uri(self, path: str) -> str:
+        """Return the canonical S3 URI for one logical object path."""
+        full_key = self._with_base(path)
+        return f"s3://{self.bucket_name}/{quote(full_key, safe='/=:@+$,;~-._')}"
 
     # -------------------------
     # Helpers
@@ -662,7 +667,7 @@ class S3Storage(StorageInterface):
         children = self._list_common_prefixes_and_objects_one_level(path)
         filtered = [c for c in children if fnmatch.fnmatch(c, pattern)]
         filtered.sort()
-        return [path + c for c in filtered]
+        return [self._without_base(path + c) for c in filtered]
 
     # -------------------------
     # Delete
@@ -674,36 +679,94 @@ class S3Storage(StorageInterface):
             self._call("delete_object", Bucket=self.bucket_name, Key=path)
             return
 
-        # prefix recursive — stream pages and delete in batches as they arrive;
-        # never accumulate all keys in memory.
-        prefix = path if path.endswith("/") else f"{path}/"
+        logical = self._without_base(path)
+        if not self._prefix_has_objects(path):
+            raise FileNotFoundError(f"File or folder not found: {path}")
+        # Compatibility single-pass deletion. Destructive table APIs call the
+        # explicit verified ``delete_prefix`` operation below.
+        errors: List[Dict[str, Any]] = []
+        batch: List[Dict[str, str]] = []
+        for key in self._iter_prefix_keys(path):
+            batch.append({"Key": key})
+            if len(batch) == 1000:
+                response = self._call(
+                    "delete_objects", Bucket=self.bucket_name,
+                    Delete={"Objects": batch, "Quiet": True},
+                ) or {}
+                errors.extend(response.get("Errors", []) or [])
+                batch = []
+        if batch:
+            response = self._call(
+                "delete_objects", Bucket=self.bucket_name,
+                Delete={"Objects": batch, "Quiet": True},
+            ) or {}
+            errors.extend(response.get("Errors", []) or [])
+        if errors:
+            first = errors[0]
+            raise OSError(
+                f"S3 partial deletion failure for {logical!r}: "
+                f"{first.get('Code')}: {first.get('Message')}"
+            )
 
+    def _iter_prefix_keys(self, physical_prefix: str):
+        prefix = physical_prefix if physical_prefix.endswith("/") else f"{physical_prefix}/"
         self._ensure_bucket_region()
         paginator = self.client.get_paginator("list_objects_v2")
-        page_it = paginator.paginate(Bucket=self.bucket_name, Prefix=prefix)
-
-        found_any = False
-        batch: List[Dict[str, str]] = []
-
-        for page in page_it:
+        for page in paginator.paginate(Bucket=self.bucket_name, Prefix=prefix):
             for obj in page.get("Contents", []):
-                found_any = True
-                batch.append({"Key": obj["Key"]})
-                if len(batch) >= 1000:
-                    self._call("delete_objects",
-                               Bucket=self.bucket_name,
-                               Delete={"Objects": batch, "Quiet": True},
-                               )
+                key = obj.get("Key")
+                if key:
+                    yield str(key)
+
+    def _prefix_has_objects(self, physical_prefix: str) -> bool:
+        return next(self._iter_prefix_keys(physical_prefix), None) is not None
+
+    def delete_prefix(self, path: str) -> None:
+        """Delete and verify an S3 prefix, retrying partial batch failures."""
+        physical = self._with_base(path)
+        if self._object_exists(physical):
+            self._call("delete_object", Bucket=self.bucket_name, Key=physical)
+
+        last_errors: List[Dict[str, Any]] = []
+        for _attempt in range(3):
+            found = False
+            batch: List[Dict[str, str]] = []
+            last_errors = []
+            for key in self._iter_prefix_keys(physical):
+                found = True
+                batch.append({"Key": key})
+                if len(batch) == 1000:
+                    response = self._call(
+                        "delete_objects", Bucket=self.bucket_name,
+                        Delete={"Objects": batch, "Quiet": True},
+                    ) or {}
+                    last_errors.extend(response.get("Errors", []) or [])
                     batch = []
+            if batch:
+                response = self._call(
+                    "delete_objects", Bucket=self.bucket_name,
+                    Delete={"Objects": batch, "Quiet": True},
+                ) or {}
+                last_errors.extend(response.get("Errors", []) or [])
+            empty_after = not found or not self._prefix_has_objects(physical)
+            if empty_after and not last_errors:
+                return
+            if empty_after and last_errors:
+                first = last_errors[0]
+                raise OSError(
+                    f"S3 reported a partial prefix deletion failure for {path!r}: "
+                    f"{first.get('Code')}: {first.get('Message')}"
+                )
 
-        if batch:
-            self._call("delete_objects",
-                       Bucket=self.bucket_name,
-                       Delete={"Objects": batch, "Quiet": True},
-                       )
-
-        if not found_any:
-            raise FileNotFoundError(f"File or folder not found: {path}")
+        remaining = next(self._iter_prefix_keys(physical), None)
+        detail = ""
+        if last_errors:
+            first = last_errors[0]
+            detail = f"; provider error={first.get('Code')}: {first.get('Message')}"
+        raise OSError(
+            f"S3 prefix is not empty after verified deletion: {path!r}; "
+            f"remaining={remaining!r}{detail}"
+        )
 
     # -------------------------
     # Directory structure

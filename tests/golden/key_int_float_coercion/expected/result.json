@@ -4,17 +4,17 @@
     "amount"
   ],
   "column_types": [
-    "float",
+    "int",
     "float"
   ],
   "row_count": 2,
   "rows": [
     [
-      1.0,
+      1,
       1.5
     ],
     [
-      2.0,
+      2,
       2.5
     ]
   ]

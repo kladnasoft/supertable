@@ -77,6 +77,7 @@ def execute_quality_sql(
     role_name: str = "superadmin",
     engine: Engine | str = Engine.AUTO,
     reader_factory: Optional[Callable[..., DataReader]] = None,
+    allow_bounded_collection_aggregates: bool = False,
 ) -> QualitySQLResult:
     """Execute one complete quality statement through the normal SQL router.
 
@@ -94,12 +95,17 @@ def execute_quality_sql(
     factory = reader_factory or DataReader
 
     try:
-        reader = factory(
+        reader_kwargs = dict(
             super_name=super_name,
             organization=organization,
             query=sql,
             source="quality",
         )
+        if allow_bounded_collection_aggregates:
+            # Narrow internal capability used only by the built-in deep-profile
+            # templates. Public/custom quality SQL never receives it.
+            reader_kwargs["_allow_bounded_collection_aggregates"] = True
+        reader = factory(**reader_kwargs)
         frame, raw_status, message = reader.execute(
             role_name=role_name,
             engine=requested,

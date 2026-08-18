@@ -12,7 +12,6 @@ from typing import List, Optional, Dict, Any, Set, Tuple
 from supertable.errors import SuperTableNotFoundError, TableNotFoundError
 from supertable.rbac.access_control import (
     check_meta_access,
-    resolve_table_policy,
     visible_columns_for_policy,
 )
 from supertable.rbac.permissions import RoleType
@@ -269,13 +268,67 @@ class MetaReader:
             ):
                 key_str = key if isinstance(key, str) else key.decode('utf-8')
                 table_name = key_str.rsplit("meta:leaf:doc:", 1)[-1]
-                if table_name and table_name not in seen:
+                if (
+                    table_name
+                    and not (
+                        table_name.startswith("__")
+                        and table_name.endswith("__")
+                    )
+                    and table_name not in seen
+                ):
                     seen.add(table_name)
                     tables.append(table_name)
             return tables
         except Exception as e:
             logger.error(f"Error getting tables from Redis: {e}")
             return []
+
+    def _authorized_meta_targets(
+        self, table_name: str, role_name: str,
+    ) -> Tuple[Optional[Any], List[Tuple[str, dict]]]:
+        """Authorize children before exposing an aggregate parent.
+
+        Inclusion-only roles commonly have entries for child tables but no
+        synthetic entry named after the SuperTable.  Checking that synthetic
+        parent first therefore denies a valid metadata view.  Resolve each real
+        child independently and expose the aggregate only when at least one
+        child remains visible.
+        """
+        aggregate = (
+            str(table_name).casefold()
+            == str(self.super_table.super_name).casefold()
+        )
+        targets = self._get_all_tables() if aggregate else [table_name]
+        authorized: List[Tuple[str, dict]] = []
+        context = None
+        for target in targets:
+            try:
+                target_context, entry = _checked_meta_context(
+                    super_name=self.super_table.super_name,
+                    organization=self.super_table.organization,
+                    role_name=role_name,
+                    table_name=target,
+                )
+            except PermissionError:
+                continue
+            if context is None:
+                context = target_context
+            authorized.append((target, entry))
+
+        # With no physical children there is nothing to expose, but still run
+        # the role/type META gate so an invalid role is not indistinguishable
+        # from an empty authorized namespace in logs and tests.
+        if aggregate and not targets:
+            try:
+                context, _ = _checked_meta_context(
+                    super_name=self.super_table.super_name,
+                    organization=self.super_table.organization,
+                    role_name=role_name,
+                    table_name=table_name,
+                )
+            except PermissionError:
+                context = None
+        return context, authorized
 
     def get_tables(self, role_name: str) -> List[str]:
         tables = self._get_all_tables()
@@ -291,26 +344,19 @@ class MetaReader:
         return result
 
     def get_table_schema(self, table_name: str, role_name: str) -> Optional[List[Dict[str, Any]]]:
-        try:
-            context, _ = _checked_meta_context(
-                super_name=self.super_table.super_name,
-                organization=self.super_table.organization,
-                role_name=role_name,
-                table_name=table_name,
-            )
-        except PermissionError as e:
+        context, authorized = self._authorized_meta_targets(
+            table_name, role_name,
+        )
+        if context is None or not authorized:
             logger.warning(
-                "[get_table_schema] Access denied for user '%s' on table '%s': %s",
-                role_name, table_name, str(e),
+                "[get_table_schema] No visible metadata for user '%s' on table '%s'",
+                role_name, table_name,
             )
             return None
 
         schema_items: Set[Tuple[str, Any]] = set()
-        targets = (
-            self._get_all_tables()
-            if table_name == self.super_table.super_name
-            else [table_name]
-        )
+        targets = [target for target, _entry in authorized]
+        table_policies = dict(authorized)
         try:
             if len(targets) == 1 and table_name != self.super_table.super_name:
                 raws = [self.catalog.r.get(RK.meta_leaf(
@@ -332,10 +378,7 @@ class MetaReader:
             raws = [None] * len(targets)
 
         for index, target in enumerate(targets):
-            try:
-                entry = resolve_table_policy(context, target, "access META for")
-            except PermissionError:
-                continue
+            entry = table_policies[target]
             try:
                 raw = raws[index] if index < len(raws) else None
                 leaf_meta = _try_parse_leaf_meta(raw)
@@ -385,31 +428,18 @@ class MetaReader:
         schemas.add(schema_tuple)
 
     def get_table_stats(self, table_name: str, role_name: str) -> List[Dict[str, Any]]:
-        try:
-            context, _ = _checked_meta_context(
-                super_name=self.super_table.super_name,
-                organization=self.super_table.organization,
-                role_name=role_name,
-                table_name=table_name,
-            )
-        except PermissionError as e:
+        context, authorized = self._authorized_meta_targets(
+            table_name, role_name,
+        )
+        if context is None or not authorized:
             logger.warning(
-                "[get_table_stats] Access denied for user '%s' on table '%s': %s",
-                role_name, table_name, str(e)
+                "[get_table_stats] No visible metadata for user '%s' on table '%s'",
+                role_name, table_name,
             )
             return []
 
         stats: List[Dict[str, Any]] = []
-        tables = (
-            self._get_all_tables()
-            if table_name == self.super_table.super_name
-            else [table_name]
-        )
-        for table in tables:
-            try:
-                entry = resolve_table_policy(context, table, "access META for")
-            except PermissionError:
-                continue
+        for table, entry in authorized:
             try:
                 st = SimpleTable(
                     self.super_table, table, create_if_missing=False,
@@ -427,17 +457,22 @@ class MetaReader:
         debug_timings = settings.SUPERTABLE_DEBUG_TIMINGS
         t0 = time.perf_counter()
 
-        try:
-            context, _ = _checked_meta_context(
-                super_name=self.super_table.super_name,
-                organization=self.super_table.organization,
-                role_name=role_name,
-                table_name=self.super_table.super_name,
-            )
-        except PermissionError as e:
+        context, authorized = self._authorized_meta_targets(
+            self.super_table.super_name, role_name,
+        )
+        # A SUPERADMIN may inspect an actually empty namespace. Scoped roles
+        # still need at least one visible physical child; this preserves the
+        # inclusion-only aggregate rule without making bootstrap diagnostics
+        # disappear before the first table is created.
+        empty_superadmin = bool(
+            context is not None
+            and context.role_type is RoleType.SUPERADMIN
+            and not authorized
+        )
+        if context is None or (not authorized and not empty_superadmin):
             logger.warning(
-                "[get_super_meta] Access denied for user '%s' on super '%s': %s",
-                role_name, self.super_table.super_name, str(e)
+                "[get_super_meta] No visible metadata for user '%s' on super '%s'",
+                role_name, self.super_table.super_name,
             )
             return None
 
@@ -481,17 +516,9 @@ class MetaReader:
                     return copy.deepcopy(cached_result)
 
         # Get all tables from Redis
-        all_tables = self._get_all_tables()
-        tables = []
-        table_policies: Dict[str, dict] = {}
-        for candidate in all_tables:
-            try:
-                table_policies[candidate] = resolve_table_policy(
-                    context, candidate, "access META for",
-                )
-                tables.append(candidate)
-            except PermissionError:
-                continue
+        all_tables = [table for table, _entry in authorized]
+        tables = list(all_tables)
+        table_policies: Dict[str, dict] = dict(authorized)
         t_scan = time.perf_counter()
 
         # Best-effort bulk fetch leaf metadata in one Redis roundtrip.
@@ -653,16 +680,28 @@ def list_supers(organization: str, role_name: str) -> List[str]:
         if parsed is None:
             continue
         _, super_name = parsed
-        try:
-            check_meta_access(
-                super_name=super_name,
-                organization=organization,
-                role_name=role_name,
-                table_name=super_name,
-            )
-            result.append(super_name)
-        except PermissionError:
-            continue
+        # A supertable name is a synthetic aggregate relation, not a physical
+        # table policy target. Inclusion-only roles therefore discover it via
+        # at least one authorized child rather than a nonexistent parent entry.
+        for leaf_item in _get_redis_items(
+            RK.meta_leaf_pattern(organization, super_name)
+        ):
+            table_name = leaf_item.rsplit("meta:leaf:doc:", 1)[-1]
+            if not table_name or (
+                table_name.startswith("__") and table_name.endswith("__")
+            ):
+                continue
+            try:
+                check_meta_access(
+                    super_name=super_name,
+                    organization=organization,
+                    role_name=role_name,
+                    table_name=table_name,
+                )
+                result.append(super_name)
+                break
+            except PermissionError:
+                continue
 
     return sorted(result)
 
@@ -681,6 +720,8 @@ def list_tables(organization: str, super_name: str, role_name: str) -> List[str]
     items = _get_redis_items(pattern)
     for item in items:
         table_name = item.split(':')[-1]
+        if table_name.startswith("__") and table_name.endswith("__"):
+            continue
         try:
             check_meta_access(
                 super_name=super_name,

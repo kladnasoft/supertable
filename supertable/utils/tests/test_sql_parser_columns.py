@@ -962,7 +962,7 @@ CASES.append({
         SELECT category, ARRAY_AGG(name) AS names
         FROM products GROUP BY category
     """,
-    "expect": {"products": sorted(["category", "name"])},
+    "expect_error": ValueError,
 })
 
 CASES.append({
@@ -973,7 +973,7 @@ CASES.append({
         SELECT dept, STRING_AGG(emp_name, ', ') AS members
         FROM team GROUP BY dept ORDER BY members
     """,
-    "expect": {"team": sorted(["dept", "emp_name"])},
+    "expect_error": ValueError,
 })
 
 
@@ -2811,7 +2811,7 @@ CASES.append({
         SELECT grp, LIST(name ORDER BY name) AS names
         FROM t GROUP BY grp ORDER BY names
     """,
-    "expect": {"t": sorted(["grp", "name"])},
+    "expect_error": ValueError,
 })
 
 CASES.append({
@@ -4446,7 +4446,12 @@ try:
             (build_deep_string_sql("lake.facts", "label"), ["label"]),
         )
         for sql, expected in cases:
-            physical = SQLParser("lake", sql, "duckdb").get_physical_tables()
+            physical = SQLParser(
+                "lake",
+                sql,
+                "duckdb",
+                allow_bounded_collection_aggregates=True,
+            ).get_physical_tables()
             assert [(table.simple_name, table.columns) for table in physical] == [
                 ("facts", expected)
             ]

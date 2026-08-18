@@ -4245,6 +4245,7 @@ class IslandDB:
         cache_metrics=None,
         _defer_reservation_release: bool = False,
         _prepared: Optional[IslandPreparedQuery] = None,
+        max_batch_rows: Optional[int] = None,
     ) -> ArrowBatchStream:
         """Execute natively and yield bounded Arrow batches.
 
@@ -4261,6 +4262,19 @@ class IslandDB:
         ) * 1000.0
         prepared.capability.require()
         plan = prepared.resource_plan
+        if max_batch_rows is not None:
+            if isinstance(max_batch_rows, bool) or not isinstance(
+                max_batch_rows, int
+            ) or max_batch_rows < 1:
+                raise ValueError("max_batch_rows must be a positive integer")
+            # Public JSON responses account bytes only after a batch reaches
+            # Python. Limiting at the native producer prevents several
+            # arbitrary-width values from being materialized ahead of that
+            # guard. One row remains the indivisible memory lower bound.
+            plan = replace(
+                plan,
+                batch_rows=min(max(1, int(plan.batch_rows)), max_batch_rows),
+            )
         if plan.advice in {ExecutionAdvice.ROUTE_DUCKDB, ExecutionAdvice.ROUTE_SPARK}:
             raise IslandUnsupportedError(
                 f"bounded IslandDB plan routes to {plan.advice.value}: {plan.reason}"

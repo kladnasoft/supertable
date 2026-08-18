@@ -5,9 +5,11 @@ from __future__ import annotations
 import signal
 from types import SimpleNamespace
 
+import fakeredis
 import pytest
 
 import supertable.audit.privileged_worker as worker_module
+from supertable import redis_keys as RK
 from supertable.audit.privileged_outbox import (
     ArchiveVerificationError,
     DeliveryPendingError,
@@ -15,13 +17,18 @@ from supertable.audit.privileged_outbox import (
     OutboxRecordError,
 )
 from supertable.audit.privileged_worker import (
+    ActivationBaselineError,
+    ActivationBaselineReport,
     PrivilegedArchiveWorker,
     RedisDurabilityError,
     WorkerConfig,
     WorkerExitCode,
+    attest_activation_baseline,
     build_parser,
+    compute_privileged_state_sha256,
     main,
     verify_redis_durability,
+    verify_activation_baseline,
 )
 
 
@@ -139,9 +146,35 @@ def _config(**overrides):
         "organization": "org",
         "consumer": "worker-1",
         "once": True,
+        # Unit tests below isolate worker scheduling. Operational CLI startup
+        # remains strict by default and has dedicated attestation tests.
+        "require_durable_redis": False,
     }
     values.update(overrides)
     return WorkerConfig(**values)
+
+
+def _baseline_args():
+    return [
+        "--activation-baseline",
+        "baseline.json",
+        "--activation-baseline-sha256",
+        "a" * 64,
+    ]
+
+
+def _baseline_report(*_args, **_kwargs):
+    return SimpleNamespace(
+        organization="org",
+        activation_id="activation-1",
+        created_ms=1_700_000_000_000,
+        state_sha256="b" * 64,
+        artifact_sha256="a" * 64,
+    )
+
+
+def _activation_attestation(*_args, **_kwargs):
+    return False
 
 
 def test_once_archives_one_unit_without_implicit_trim():
@@ -468,11 +501,213 @@ def test_strict_redis_preflight_rejects_unsafe_settings(config, match):
         verify_redis_durability(outbox)
 
 
+def test_pinned_activation_baseline_is_canonical_and_immutable(tmp_path):
+    import hashlib
+    import json
+
+    document = {
+        "version": 1,
+        "kind": "supertable_privileged_activation_baseline",
+        "organization": "org",
+        "activation_id": "cutover-2026-08-18",
+        "created_ms": 1_700_000_000_000,
+        "state_sha256": "b" * 64,
+    }
+    payload = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode()
+    path = tmp_path / "baseline.json"
+    path.write_bytes(payload)
+    pin = hashlib.sha256(payload).hexdigest()
+
+    report = verify_activation_baseline(
+        str(path), expected_sha256=pin, organization="org",
+    )
+    assert report.activation_id == "cutover-2026-08-18"
+    path.write_bytes(payload.replace(b"cutover", b"changed", 1))
+    with pytest.raises(ActivationBaselineError, match="deployment-pinned"):
+        verify_activation_baseline(
+            str(path), expected_sha256=pin, organization="org",
+        )
+
+
+def test_activation_baseline_rejects_unpinned_schema_extensions(tmp_path):
+    import hashlib
+    import json
+
+    document = {
+        "version": 1,
+        "kind": "supertable_privileged_activation_baseline",
+        "organization": "org",
+        "activation_id": "cutover",
+        "created_ms": 1_700_000_000_000,
+        "state_sha256": "b" * 64,
+        "mutable_note": "must not become part of the trust schema",
+    }
+    payload = json.dumps(
+        document, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode()
+    path = tmp_path / "baseline.json"
+    path.write_bytes(payload)
+
+    with pytest.raises(ActivationBaselineError, match="contain exactly"):
+        verify_activation_baseline(
+            str(path),
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+            organization="org",
+        )
+
+
+def _activation_outbox(redis_client):
+    return FakeOutbox(redis=redis_client)
+
+
+def test_live_privileged_state_digest_is_canonical_and_covers_all_namespaces():
+    redis_client = fakeredis.FakeStrictRedis(decode_responses=True)
+    outbox = _activation_outbox(redis_client)
+    role_key = RK.rbac_role_doc("org", "lake", "reader")
+    redis_client.hset(role_key, mapping={"z": "last", "a": "first"})
+    redis_client.sadd(RK.rbac_role_index("org", "lake"), "reader")
+    redis_client.hset(RK.auth_tokens("org"), "token-1", "secret-digest")
+
+    first = compute_privileged_state_sha256(outbox, "org")
+    # Rewriting in a different Redis insertion order cannot move the digest.
+    redis_client.delete(role_key)
+    redis_client.hset(role_key, mapping={"a": "first", "z": "last"})
+    assert compute_privileged_state_sha256(outbox, "org") == first
+
+    redis_client.hset(role_key, "z", "changed")
+    assert compute_privileged_state_sha256(outbox, "org") != first
+
+
+def test_activation_anchor_matches_live_state_once_then_remains_genesis():
+    redis_client = fakeredis.FakeStrictRedis(decode_responses=True)
+    outbox = _activation_outbox(redis_client)
+    redis_client.hset(
+        RK.rbac_role_doc("org", "lake", "reader"),
+        mapping={"role_id": "reader", "doc_version": "1"},
+    )
+    report = ActivationBaselineReport(
+        organization="org",
+        activation_id="cutover-1",
+        created_ms=1_700_000_000_000,
+        state_sha256=compute_privileged_state_sha256(outbox, "org"),
+        artifact_sha256="a" * 64,
+    )
+
+    assert attest_activation_baseline(outbox, report) is True
+    # Normal audited state evolution does not rewrite the immutable genesis.
+    redis_client.hset(
+        RK.rbac_role_doc("org", "lake", "reader"), "doc_version", "2"
+    )
+    assert attest_activation_baseline(outbox, report) is False
+
+    changed_report = ActivationBaselineReport(
+        organization="org",
+        activation_id="different-cutover",
+        created_ms=report.created_ms,
+        state_sha256=report.state_sha256,
+        artifact_sha256="b" * 64,
+    )
+    with pytest.raises(ActivationBaselineError, match="differs from baseline"):
+        attest_activation_baseline(outbox, changed_report)
+
+
+def test_activation_rejects_arbitrary_state_hash_and_preexisting_ledger():
+    redis_client = fakeredis.FakeStrictRedis(decode_responses=True)
+    outbox = _activation_outbox(redis_client)
+    bad_report = ActivationBaselineReport(
+        organization="org",
+        activation_id="cutover-bad",
+        created_ms=1_700_000_000_000,
+        state_sha256="f" * 64,
+        artifact_sha256="a" * 64,
+    )
+    with pytest.raises(ActivationBaselineError, match="does not match live"):
+        attest_activation_baseline(outbox, bad_report)
+    assert not redis_client.exists(RK.audit_privileged_activation("org"))
+
+    valid_report = ActivationBaselineReport(
+        organization="org",
+        activation_id="cutover-valid",
+        created_ms=1_700_000_000_000,
+        state_sha256=compute_privileged_state_sha256(outbox, "org"),
+        artifact_sha256="a" * 64,
+    )
+    redis_client.xadd(
+        RK.audit_privileged_outbox("org"), {"event_json": "legacy-event"}
+    )
+    with pytest.raises(ActivationBaselineError, match="ledger exists"):
+        attest_activation_baseline(outbox, valid_report)
+
+
+def test_worker_reattests_after_transparent_redis_reconnect():
+    first_redis = object()
+    second_redis = object()
+    outbox = FakeOutbox(
+        redis=first_redis,
+        drains=[_result("1-0"), None],
+    )
+    seen = []
+
+    def checker(candidate, **_kwargs):
+        seen.append(candidate._redis)
+        if len(seen) == 1:
+            candidate._redis = second_redis
+        return SimpleNamespace()
+
+    worker = PrivilegedArchiveWorker(
+        outbox,
+        _config(once=False, require_durable_redis=True),
+        durability_checker=checker,
+        wait_for_stop=lambda _delay: True,
+    )
+    assert worker.run() == WorkerExitCode.OK
+    assert seen == [first_redis, second_redis]
+    assert worker.stats.redis_attestations == 2
+
+
+def test_worker_rechecks_baseline_each_unit_and_fails_closed_on_change():
+    outbox = FakeOutbox(drains=[_result("1-0"), None])
+    calls = []
+
+    def checker(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise ActivationBaselineError("baseline replaced")
+        return _baseline_report()
+
+    worker = PrivilegedArchiveWorker(
+        outbox,
+        _config(
+            once=False,
+            activation_baseline_path="baseline.json",
+            activation_baseline_sha256="a" * 64,
+        ),
+        baseline_checker=checker,
+        activation_checker=_activation_attestation,
+    )
+    assert worker.run() == WorkerExitCode.CONFIG
+    assert len(outbox.drain_calls) == 1
+    assert calls == [1, 1]
+
+
+def test_operational_main_requires_pinned_activation_baseline():
+    created = []
+    code = main(
+        ["--organization", "org", "--consumer", "worker", "--health-check"],
+        outbox_factory=lambda _organization: created.append(True),
+    )
+    assert code == WorkerExitCode.CONFIG
+    assert created == []
+
+
 def test_cli_bounds_batch_size_and_keeps_trim_opt_in():
     parser = build_parser()
     args = parser.parse_args(["--organization", "org", "--consumer", "worker"])
     assert args.trim is False
     assert args.verify_max_batches == 10_000
+    assert args.require_durable_redis is True
 
     with pytest.raises(SystemExit) as raised:
         main(
@@ -525,8 +760,12 @@ def test_main_verify_chain_mode_passes_explicit_bounded_walk_limit():
             "--verify-chain",
             "--verify-max-batches",
             "250000",
+            "--no-require-durable-redis",
+            *_baseline_args(),
         ],
         outbox_factory=lambda _organization: outbox,
+        baseline_checker=_baseline_report,
+        activation_checker=_activation_attestation,
     )
 
     assert code == WorkerExitCode.OK
@@ -537,7 +776,7 @@ def test_main_verify_chain_mode_passes_explicit_bounded_walk_limit():
     assert outbox.trim_calls == []
 
 
-def test_main_does_not_request_config_without_strict_flag():
+def test_main_explicit_unsafe_opt_out_does_not_request_redis_config():
     outbox = FakeOutbox(redis=FakeRedis(config_error=AssertionError("CONFIG called")))
 
     code = main(
@@ -547,8 +786,12 @@ def test_main_does_not_request_config_without_strict_flag():
             "--consumer",
             "probe",
             "--health-check",
+            "--no-require-durable-redis",
+            *_baseline_args(),
         ],
         outbox_factory=lambda _organization: outbox,
+        baseline_checker=_baseline_report,
+        activation_checker=_activation_attestation,
     )
 
     assert code == WorkerExitCode.OK
@@ -581,9 +824,12 @@ def test_main_passes_explicit_everysec_opt_in_to_strict_checker():
             "--health-check",
             "--require-durable-redis",
             "--allow-everysec",
+            *_baseline_args(),
         ],
         outbox_factory=lambda _organization: outbox,
         durability_checker=checker,
+        baseline_checker=_baseline_report,
+        activation_checker=_activation_attestation,
     )
 
     assert code == WorkerExitCode.OK
@@ -606,11 +852,14 @@ def test_strict_preflight_failure_exits_before_checkpoint_or_drain():
             "worker",
             "--once",
             "--require-durable-redis",
+            *_baseline_args(),
         ],
         outbox_factory=lambda _organization: outbox,
         durability_checker=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RedisDurabilityError("appendonly must be yes")
         ),
+        baseline_checker=_baseline_report,
+        activation_checker=_activation_attestation,
     )
 
     assert code == WorkerExitCode.CONFIG

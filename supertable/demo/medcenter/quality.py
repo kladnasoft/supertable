@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from supertable.config.homedir import initialize_app_home
 from supertable.demo.medcenter.defaults import (
     category_default,
     category_prefix_rules,
@@ -367,6 +368,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    initialize_app_home(change_cwd=True)
     args = parse_args()
     ok = run_quality(data_dir=None if args.skip_acceptance else args.data_dir)
     if not ok:

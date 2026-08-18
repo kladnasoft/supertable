@@ -147,6 +147,33 @@ class TestPlanExtenderSinkGuard:
         mock_mw.log_metric.assert_called_once()
 
     @patch("supertable.plan_extender.MonitoringWriter")
+    def test_monitoring_backpressure_still_deletes_raw_plan(self, MockMW, tmp_path):
+        from supertable.engine.plan_stats import PlanStats
+        from supertable.monitoring_writer import MonitoringBackpressureError
+        from supertable.plan_extender import extend_execution_plan
+
+        plan_path = tmp_path / "query-profile.json"
+        plan_path.write_text("{}", encoding="utf-8")
+        mock_mw = MagicMock()
+        mock_mw.log_metric.side_effect = MonitoringBackpressureError("spool full")
+        MockMW.return_value.__enter__.return_value = mock_mw
+        qpm = self._build_qpm("orders")
+        qpm.query_plan_path = str(plan_path)
+
+        with pytest.raises(MonitoringBackpressureError):
+            extend_execution_plan(
+                query_plan_manager=qpm,
+                role_name="r",
+                timing={},
+                plan_stats=PlanStats(),
+                status="ok",
+                message="",
+                result_shape=(1, 1),
+            )
+
+        assert not plan_path.exists()
+
+    @patch("supertable.plan_extender.MonitoringWriter")
     def test_unknown_shape_preserves_stream_profile_result_rows(self, MockMW):
         """Display zeros must not overwrite measured streaming counters."""
         import json

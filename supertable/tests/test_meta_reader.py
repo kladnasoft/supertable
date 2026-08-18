@@ -1105,8 +1105,12 @@ class TestGetSuperMeta:
 
         assert result2 == result1
         assert result2 is not result1
-        # scan_leaf_keys should NOT have been called for the cache hit
-        reader.catalog.scan_leaf_keys.assert_not_called()
+        # Aggregate visibility is re-evaluated before serving the cached
+        # payload so a role that lost its final visible child cannot retain
+        # access until the metadata TTL expires.
+        reader.catalog.scan_leaf_keys.assert_called_once_with(
+            "org", "sup", count=1000,
+        )
 
     @patch(_P_CHECK_META)
     def test_cache_miss_on_version_change(self, mock_check):
@@ -1152,15 +1156,27 @@ class TestListSupers:
         # Stub check_meta_access to allow everything so we can verify the
         # parsing/sorting behaviour.
         from supertable.meta_reader import list_supers
-        mock_items.return_value = [
-            "supertable:org:lakes:zeta:meta:root",
-            "supertable:org:lakes:alpha:meta:root",
-            "supertable:org:lakes:mid:meta:root",
+        from supertable import redis_keys as RK
+        roots = [
+            RK.meta_root("org", "zeta"),
+            RK.meta_root("org", "alpha"),
+            RK.meta_root("org", "mid"),
         ]
+
+        def items(pattern):
+            if pattern == RK.meta_root_pattern_for_org("org"):
+                return roots
+            super_name = pattern.split(":lakes:", 1)[1].split(":", 1)[0]
+            return [RK.meta_leaf("org", super_name, "visible")]
+
+        mock_items.side_effect = items
         mock_check.return_value = None
         result = list_supers("org", role_name="superadmin")
         assert result == ["alpha", "mid", "zeta"]
-        mock_items.assert_called_once_with("supertable:org:lakes:*:meta:root")
+        assert mock_items.call_args_list[0].args == (
+            RK.meta_root_pattern_for_org("org"),
+        )
+        assert mock_items.call_count == 4
 
     @patch(f"{_MOD}.check_meta_access")
     @patch(f"{_MOD}._get_redis_items")

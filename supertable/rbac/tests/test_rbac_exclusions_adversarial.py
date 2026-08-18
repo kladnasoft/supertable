@@ -1048,13 +1048,22 @@ def test_superadmin_can_delete_super_table_namespace(monkeypatch):
     table.super_name = SUPER
     table.organization = ORG
     table.storage = MagicMock()
-    table.storage.exists.return_value = False
     table.catalog = MagicMock()
+    table.catalog.acquire_namespace_lock.return_value = "namespace-token"
+    table.catalog.begin_namespace_deletion.return_value = {
+        "intent_id": "delete-intent",
+    }
+    table.catalog.scan_leaf_keys.return_value = iter(())
 
-    table.delete(ROLE)
+    assert table.delete(ROLE) == "delete-intent"
 
-    table.storage.delete.assert_not_called()
-    table.catalog.delete_super_table.assert_called_once_with(ORG, SUPER)
+    table.storage.delete_prefix.assert_called_once_with(f"{ORG}/{SUPER}")
+    table.catalog.delete_super_table.assert_called_once_with(
+        ORG,
+        SUPER,
+        namespace_token="namespace-token",
+        intent_id="delete-intent",
+    )
 
 
 def test_super_table_delete_cannot_bypass_a_denied_child_table(monkeypatch):

@@ -47,6 +47,7 @@ class RedisOptions:
     username: Optional[str] = field(init=False)
     password: Optional[str] = field(init=False)
     use_ssl: bool = field(init=False)
+    ssl_ca_certs: Optional[str] = field(init=False)
     decode_responses: bool = field(default=False)
 
     # Sentinel-related
@@ -63,12 +64,23 @@ class RedisOptions:
         username = settings.SUPERTABLE_REDIS_USERNAME or None
         password = settings.SUPERTABLE_REDIS_PASSWORD or None
         use_ssl = settings.SUPERTABLE_REDIS_SSL
+        ssl_ca_certs = (
+            getattr(settings, "SUPERTABLE_REDIS_SSL_CA_CERTS", "") or ""
+        ).strip() or None
+
+        host = _validate_redis_host(host, field_name="SUPERTABLE_REDIS_HOST")
+        port = _validate_redis_port(port, field_name="SUPERTABLE_REDIS_PORT")
+        db = _validate_redis_db(db, field_name="SUPERTABLE_REDIS_DB")
+        if not isinstance(use_ssl, bool):
+            raise ValueError("SUPERTABLE_REDIS_SSL must be a boolean")
 
         # All Redis data is JSON text — always decode responses to str.
         decode = True
 
         # Sentinel mode configuration
         is_sentinel = settings.SUPERTABLE_REDIS_SENTINEL
+        if not isinstance(is_sentinel, bool):
+            raise ValueError("SUPERTABLE_REDIS_SENTINEL must be a boolean")
         sentinel_raw = settings.SUPERTABLE_REDIS_SENTINELS
         # Sentinel discovery is an authority boundary: when it is enabled an
         # incomplete endpoint list must never degrade into a direct Redis
@@ -100,6 +112,19 @@ class RedisOptions:
                 redis_url
             )
 
+        if ssl_ca_certs is not None:
+            if not use_ssl:
+                raise ValueError(
+                    "SUPERTABLE_REDIS_SSL_CA_CERTS requires Redis TLS"
+                )
+            if (
+                not os.path.isfile(ssl_ca_certs)
+                or not os.access(ssl_ca_certs, os.R_OK)
+            ):
+                raise ValueError(
+                    "SUPERTABLE_REDIS_SSL_CA_CERTS must name a readable CA file"
+                )
+
         # In many deployments the Sentinel and Redis server share the same password.
         # Allow a single-password setup by reusing SUPERTABLE_REDIS_SENTINEL_PASSWORD
         # for Redis auth when SUPERTABLE_REDIS_PASSWORD is not set.
@@ -115,6 +140,7 @@ class RedisOptions:
         object.__setattr__(self, "username", username)
         object.__setattr__(self, "password", password)
         object.__setattr__(self, "use_ssl", use_ssl)
+        object.__setattr__(self, "ssl_ca_certs", ssl_ca_certs)
         object.__setattr__(self, "decode_responses", decode)
 
         object.__setattr__(self, "is_sentinel", is_sentinel)
@@ -122,6 +148,43 @@ class RedisOptions:
         object.__setattr__(self, "sentinel_master", sentinel_master)
         object.__setattr__(self, "sentinel_password", sentinel_password)
         object.__setattr__(self, "sentinel_strict", sentinel_strict)
+
+
+def _validate_redis_host(value: Any, *, field_name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 253
+        or any(
+            character.isspace()
+            or ord(character) < 32
+            or ord(character) == 127
+            for character in value
+        )
+    ):
+        raise ValueError(f"{field_name} must contain a valid non-empty host")
+    return value
+
+
+def _validate_redis_port(value: Any, *, field_name: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= 65535
+    ):
+        raise ValueError(f"{field_name} must be an integer between 1 and 65535")
+    return value
+
+
+def _validate_redis_db(value: Any, *, field_name: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= 2**31 - 1
+    ):
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return value
 
 
 def _validate_sentinel_identity(value: Any, *, field_name: str) -> str:
@@ -259,12 +322,9 @@ def _parse_direct_redis_url(
         port = parsed.port
     except ValueError as exc:
         raise ValueError(f"Invalid SUPERTABLE_REDIS_URL: {exc}") from exc
-    if (
-        not host
-        or host != host.strip()
-        or any(ord(character) < 32 or ord(character) == 127 for character in host)
-    ):
-        raise ValueError("SUPERTABLE_REDIS_URL must contain a valid host")
+    host = _validate_redis_host(
+        host, field_name="SUPERTABLE_REDIS_URL host",
+    )
     if port is None:
         port = 6379
     if not 1 <= port <= 65535:
@@ -279,6 +339,10 @@ def _parse_direct_redis_url(
                 "SUPERTABLE_REDIS_URL path must contain one non-negative database number"
             )
         db = int(raw_db)
+        if db > 2**31 - 1:
+            raise ValueError(
+                "SUPERTABLE_REDIS_URL database number is out of range"
+            )
 
     username = _decode_url_credential(parsed.username, field_name="username")
     password = _decode_url_credential(parsed.password, field_name="password")
@@ -300,6 +364,7 @@ def _options_cache_key(opts: RedisOptions) -> Tuple[Any, ...]:
         opts.username,
         opts.password,
         opts.use_ssl,
+        getattr(opts, "ssl_ca_certs", None),
         opts.is_sentinel,
         tuple(opts.sentinel_hosts),
         opts.sentinel_master,
@@ -327,6 +392,26 @@ def create_redis_client(options: Optional[RedisOptions] = None) -> redis.Redis:
 
 
 def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Redis:
+    if not isinstance(opts.use_ssl, bool):
+        raise ValueError("Redis TLS mode must be a boolean")
+    if not isinstance(opts.is_sentinel, bool):
+        raise ValueError("Redis Sentinel mode must be a boolean")
+    _validate_redis_db(opts.db, field_name="Redis database")
+    if not opts.is_sentinel:
+        _validate_redis_host(opts.host, field_name="Redis host")
+        _validate_redis_port(opts.port, field_name="Redis port")
+    ssl_ca_certs = getattr(opts, "ssl_ca_certs", None)
+    if ssl_ca_certs and not opts.use_ssl:
+        raise ValueError("Redis CA configuration requires TLS")
+
+    tls_kwargs = {"ssl": opts.use_ssl}
+    if opts.use_ssl:
+        tls_kwargs.update({
+            "ssl_cert_reqs": "required",
+            "ssl_check_hostname": True,
+            "ssl_ca_certs": ssl_ca_certs,
+        })
+
     # Decide between standard Redis and Sentinel-based Redis
     if opts.is_sentinel:
         sentinel_hosts = _validated_sentinel_hosts(opts.sentinel_hosts)
@@ -345,13 +430,13 @@ def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Red
                 "username": opts.username,
                 "password": opts.sentinel_password,
                 "decode_responses": decode_responses,
-                "ssl": opts.use_ssl,
+                **tls_kwargs,
             },
             socket_timeout=0.5,
             username=opts.username,
             password=opts.password,
             decode_responses=decode_responses,
-            ssl=opts.use_ssl,
+            **tls_kwargs,
         )
 
         sentinel_client = sentinel.master_for(
@@ -360,7 +445,7 @@ def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Red
             username=opts.username,
             password=opts.password,
             decode_responses=decode_responses,
-            ssl=opts.use_ssl,
+            **tls_kwargs,
         )
 
         # Fail-fast probe: in some deployments (e.g. standalone Redis without Sentinel),
@@ -394,7 +479,7 @@ def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Red
         username=opts.username,
         password=opts.password,
         decode_responses=decode_responses,
-        ssl=opts.use_ssl,
+        **tls_kwargs,
     )
 
 

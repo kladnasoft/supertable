@@ -24,6 +24,7 @@ import io
 import json
 import os
 import hashlib
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Set
 
@@ -312,28 +313,9 @@ def _stable_table_id(organization: str, super_name: str, table_name: str) -> str
 def _binary_copy_if_possible(storage, src_path: str, dst_path: str) -> bool:
     """Copy bytes from src_path to dst_path as efficiently as the backend allows.
 
-    For MinIO, prefer server-side copy_object using CopySource (no download/upload).
-    Falls back to storage.copy(), then read_bytes/write_bytes.
+    The storage adapter owns physical-prefix translation and may implement
+    ``copy`` server-side. Falls back to read_bytes/write_bytes.
     """
-
-    # --- MinIO fast-path (server-side copy) ---------------------------------
-    client = getattr(storage, "client", None)
-    if client is not None and hasattr(client, "copy_object"):
-        bucket = (
-            getattr(storage, "bucket", None)
-            or getattr(storage, "bucket_name", None)
-            or getattr(storage, "_bucket", None)
-            or getattr(storage, "_bucket_name", None)
-        )
-        if isinstance(bucket, str) and bucket:
-            try:
-                from minio.commonconfig import CopySource  # type: ignore
-
-                storage.makedirs(os.path.dirname(dst_path))
-                client.copy_object(bucket, dst_path, CopySource(bucket, src_path))
-                return True
-            except Exception as e:
-                logger.warning(f"[mirror][minio] copy_object failed ({src_path} -> {dst_path}): {e}")
 
     # --- Generic backend copy ------------------------------------------------
     if hasattr(storage, "copy"):
@@ -363,7 +345,9 @@ def _co_locate_or_reuse_path(storage, table_files_dir: str, catalog_file_path: s
     Copy parquet into table_files_dir, return the relative path 'files/<hash>_<basename>'.
     """
     base_name = catalog_file_path.rstrip("/").split("/")[-1]  # robust basename for URIs
-    h = hashlib.md5(catalog_file_path.encode("utf-8")).hexdigest()[:8]
+    h = hashlib.md5(
+        catalog_file_path.encode("utf-8"), usedforsecurity=False,
+    ).hexdigest()[:8]
     rel_name = f"{h}_{base_name}"
     rel_path = "/".join(("files", rel_name))
     dst_path = os.path.join(table_files_dir, rel_name)
@@ -398,6 +382,153 @@ def _list_co_located_paths(storage, table_files_dir: str) -> Set[str]:
         if fn:
             rels.add("/".join(("files", fn)))
     return rels
+
+
+_DELTA_LOG_NAME = re.compile(r"^(\d{20})\.json$")
+
+
+def _list_delta_versions(storage, log_dir: str) -> List[int]:
+    entries = storage.list_files(log_dir, "*.json") or []
+    versions: List[int] = []
+    for entry in entries:
+        match = _DELTA_LOG_NAME.fullmatch(entry.rstrip("/").split("/")[-1])
+        if match:
+            versions.append(int(match.group(1)))
+    versions = sorted(set(versions))
+    if versions and versions != list(range(versions[-1] + 1)):
+        raise RuntimeError(
+            f"Delta log is not contiguous from version zero: {versions!r}"
+        )
+    return versions
+
+
+def _read_delta_actions(storage, log_dir: str, version: int) -> List[Dict[str, Any]]:
+    path = os.path.join(log_dir, f"{_pad_version(version)}.json")
+    raw = storage.read_text(path)
+    actions: List[Dict[str, Any]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        value = json.loads(line)
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Invalid Delta action in {path!r}")
+        actions.append(value)
+    return actions
+
+
+def _delta_commit_version(
+        storage, log_dir: str, versions: List[int], commit_id: str,
+) -> Tuple[Optional[int], Optional[int]]:
+    if not commit_id:
+        return None, None
+    for version in reversed(versions):
+        try:
+            actions = _read_delta_actions(storage, log_dir, version)
+        except Exception:
+            # A post-write read-back failure can leave only the newest object
+            # present but invalid. The durable publication intent and table
+            # lock make that unacknowledged newest generation safe to repair
+            # in place; corruption in older acknowledged history is fatal.
+            if versions and version == versions[-1]:
+                return None, version
+            raise
+        for action in actions:
+            info = action.get("commitInfo")
+            if isinstance(info, dict) and str(info.get("txnId") or "") == commit_id:
+                return version, None
+    return None, None
+
+
+def _expected_co_located_paths(simple_snapshot: Dict[str, Any]) -> Set[str]:
+    expected: Set[str] = set()
+    for resource in simple_snapshot.get("resources", []) or []:
+        source = str(resource.get("file") or "")
+        if not source:
+            continue
+        digest = hashlib.md5(
+            source.encode("utf-8"), usedforsecurity=False,
+        ).hexdigest()[:8]
+        expected.add(f"files/{digest}_{source.rstrip('/').split('/')[-1]}")
+    return expected
+
+
+def verify_delta_table(
+        super_table, table_name: str, simple_snapshot: Dict[str, Any],
+        *, commit_id: str = "",
+) -> None:
+    """Verify the Delta log and active files for an exact core snapshot."""
+    base = os.path.join(
+        super_table.organization, super_table.super_name, "delta", table_name,
+    )
+    log_dir = os.path.join(base, "_delta_log")
+    files_dir = os.path.join(base, "files")
+    versions = _list_delta_versions(super_table.storage, log_dir)
+    if not versions or versions[0] != 0:
+        raise RuntimeError("Delta mirror has no version-zero commit")
+
+    active: Dict[str, Dict[str, Any]] = {}
+    found_commit = not commit_id
+    for version in versions:
+        actions = _read_delta_actions(super_table.storage, log_dir, version)
+        if version == 0:
+            if not any("protocol" in action for action in actions):
+                raise RuntimeError("Delta version zero is missing protocol")
+            if not any("metaData" in action for action in actions):
+                raise RuntimeError("Delta version zero is missing metadata")
+        for action in actions:
+            info = action.get("commitInfo")
+            if isinstance(info, dict) and str(info.get("txnId") or "") == commit_id:
+                found_commit = True
+            add = action.get("add")
+            if isinstance(add, dict) and add.get("path"):
+                active[str(add["path"])] = add
+            remove = action.get("remove")
+            if isinstance(remove, dict) and remove.get("path"):
+                active.pop(str(remove["path"]), None)
+    if not found_commit:
+        raise RuntimeError(f"Delta mirror does not contain commit {commit_id!r}")
+
+    expected = _expected_co_located_paths(simple_snapshot)
+    physical = _list_co_located_paths(super_table.storage, files_dir)
+    if set(active) != expected or physical != expected:
+        raise RuntimeError(
+            "Delta mirror does not match the committed snapshot: "
+            f"log={sorted(active)!r}, files={sorted(physical)!r}, "
+            f"expected={sorted(expected)!r}"
+        )
+    expected_by_path: Dict[str, Dict[str, Any]] = {}
+    for resource in simple_snapshot.get("resources", []) or []:
+        source = str(resource.get("file") or "")
+        if not source:
+            continue
+        digest = hashlib.md5(
+            source.encode("utf-8"), usedforsecurity=False,
+        ).hexdigest()[:8]
+        expected_by_path[
+            f"files/{digest}_{source.rstrip('/').split('/')[-1]}"
+        ] = resource
+    for relative, resource in expected_by_path.items():
+        add = active[relative]
+        expected_size = int(resource.get("file_size") or 0)
+        recorded_size = int(add.get("size") or 0)
+        recorded_digest = str(
+            (add.get("tags") or {}).get("supertable.sha256") or ""
+        )
+        if not recorded_digest:
+            raise RuntimeError(
+                f"Delta add action lacks an artifact digest: {relative!r}"
+            )
+        actual_size, actual_digest = super_table.storage.content_sha256(
+            os.path.join(base, relative)
+        )
+        if (
+            (expected_size and expected_size != recorded_size)
+            or actual_size != recorded_size
+            or actual_digest != recorded_digest
+        ):
+            raise RuntimeError(
+                f"Delta mirrored artifact failed its content seal: {relative!r}"
+            )
 
 
 def _write_checkpoint_if_possible(storage, log_dir: str, version: int, add_paths: List[str]) -> None:
@@ -435,7 +566,12 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
     super_table.storage.makedirs(log_dir)
     super_table.storage.makedirs(files_dir)
 
-    version = int(simple_snapshot.get("snapshot_version", 0))
+    versions = _list_delta_versions(super_table.storage, log_dir)
+    # Delta transaction versions belong to the mirror, not to the source
+    # catalog.  Enabling a mirror for a mature table must still bootstrap at
+    # 000...000.json and then advance contiguously.
+    version = (versions[-1] + 1) if versions else 0
+    mirror_commit_id = str(simple_snapshot.get("_mirror_commit_id") or "")
 
     # Prefer an explicitly provided Spark StructType JSON if caller has one
     schema_string_from_snapshot = (
@@ -477,12 +613,52 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
     path_records: List[Tuple[str, int, Dict[str, Any]]] = []  # (relative path used in add, size, resource)
     for r in resources:
         src_file = r["file"]
-        size = int(r.get("file_size", 0))
+        declared_size = int(r.get("file_size", 0))
         used_rel_path = _co_locate_or_reuse_path(super_table.storage, files_dir, src_file)
+        source_size, source_digest = super_table.storage.content_sha256(src_file)
+        mirror_size, mirror_digest = super_table.storage.content_sha256(
+            os.path.join(base, used_rel_path)
+        )
+        if declared_size and source_size != declared_size:
+            raise RuntimeError(
+                f"Delta source size changed before mirroring: {src_file!r}"
+            )
+        if mirror_size != source_size or mirror_digest != source_digest:
+            raise RuntimeError(
+                f"Delta copy failed its content seal: {src_file!r}"
+            )
+        sealed_resource = dict(r)
+        sealed_resource["_mirror_sha256"] = source_digest
         current_paths.append(used_rel_path)
-        path_records.append((used_rel_path, size, r))
+        path_records.append((used_rel_path, source_size, sealed_resource))
 
     current_set = set(current_paths)
+
+    # A recovery retry may arrive after the Delta commit became durable but
+    # before the Redis outbox was acknowledged.  The stable core commit id in
+    # commitInfo makes that retry a verification/cleanup operation rather than
+    # a second Delta transaction.
+    existing_commit_version, repair_version = _delta_commit_version(
+        super_table.storage, log_dir, versions, mirror_commit_id,
+    )
+    if existing_commit_version is not None:
+        for obsolete in sorted(prev_paths - current_set):
+            target = os.path.join(base, obsolete)
+            try:
+                super_table.storage.delete(target)
+            except FileNotFoundError:
+                pass
+        verify_delta_table(
+            super_table, table_name, simple_snapshot,
+            commit_id=mirror_commit_id,
+        )
+        logger.info(
+            f"[mirror][delta] commit {mirror_commit_id} already published "
+            f"at v{existing_commit_version}"
+        )
+        return
+    if repair_version is not None:
+        version = repair_version
 
     # If schema is still missing, infer it from the first co-located parquet file.
     if not schema_string_from_snapshot and not schema_list and current_paths:
@@ -498,8 +674,10 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
     to_remove = sorted(list(prev_paths - current_set))
     to_add = path_records
 
-    # If nothing changes, don't write a new Delta version
-    if not to_add and not to_remove:
+    # An empty initial table still needs version zero (protocol + metadata).
+    # Once initialized, a direct legacy call without a durable commit id may
+    # remain a no-op when there are no file changes.
+    if versions and not mirror_commit_id and not to_add and not to_remove:
         logger.info(f"[mirror][delta] v{version} no-op (no add/remove); skipping commit")
         return
 
@@ -518,7 +696,11 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
     commit_path = os.path.join(log_dir, _pad_version(version) + ".json")
 
     # Guard: if this exact version file already exists, skip to avoid duplicate writes
-    if hasattr(super_table.storage, "exists") and super_table.storage.exists(commit_path):
+    if (
+        repair_version is None
+        and hasattr(super_table.storage, "exists")
+        and super_table.storage.exists(commit_path)
+    ):
         logger.info(f"[mirror][delta] commit {commit_path} already exists; skipping rewrite")
         return
 
@@ -537,7 +719,7 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
                     "numOutputBytes": str(num_output_bytes),
                 },
                 "engineInfo": "Apache-Spark/3.4.3.5.3.20250511.1 Delta-Lake/2.4.0.24",
-                "txnId": __import__("uuid").uuid4().hex,
+                "txnId": mirror_commit_id or __import__("uuid").uuid4().hex,
             }
         }
         s.write(json.dumps(commit_info, separators=(",", ":")) + "\n")
@@ -598,7 +780,11 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
                     "size": int(size),
                     "modificationTime": add_ts,
                     "dataChange": True,
-                    "tags": {},
+                    "tags": {
+                        "supertable.sha256": str(
+                            res.get("_mirror_sha256") or ""
+                        ),
+                    },
                 }
             }
             if stats_val is not None:
@@ -607,7 +793,13 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
             s.write(json.dumps(add_obj, separators=(",", ":")) + "\n")
 
         # Write the commit atomically
-        super_table.storage.write_bytes(commit_path, s.getvalue().encode("utf-8"))
+        commit_bytes = s.getvalue().encode("utf-8")
+        super_table.storage.write_bytes(commit_path, commit_bytes)
+        visible_bytes = super_table.storage.read_bytes(commit_path)
+        if visible_bytes != commit_bytes:
+            raise RuntimeError(
+                f"Delta commit failed read-after-write verification: {commit_path!r}"
+            )
 
     # Only after the new Delta log is durable may obsolete physical files be
     # removed. Deleting first can permanently break the previously committed

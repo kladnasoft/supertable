@@ -20,6 +20,8 @@ import unittest
 from unittest.mock import MagicMock, patch
 from typing import Any, Dict, List, Optional, Set
 
+import pytest
+
 
 def _rbac_list_role_ids(cat, org: str, sup: str) -> List[str]:
     """RedisCatalog has ``rbac_list_user_ids`` but no symmetric
@@ -123,14 +125,34 @@ class FakeScript:
         append_audit = None
         require_audit_identity = None
         if "privileged_audit_outbox" in self._src:
-            if len(keys) < 2 or len(args) < 3:
+            if len(keys) < 3 or len(args) < 3:
                 raise RuntimeError("missing privileged audit script arguments")
 
-            outbox_key, audit_meta_key = keys[-2:]
+            activation_key, outbox_key, audit_meta_key = keys[-3:]
             audit_org, audit_super, event_json = args[-3:]
-            keys = keys[:-2]
+            keys = keys[:-3]
             args = args[:-3]
 
+            activation = self._store.get(activation_key)
+            if activation is None:
+                raise RuntimeError(
+                    "privileged audit activation baseline is not anchored"
+                )
+            try:
+                activation_document = json.loads(activation)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "privileged audit activation baseline anchor is invalid"
+                ) from exc
+            if (
+                activation_document.get("version") != 1
+                or activation_document.get("kind")
+                != "supertable_privileged_activation_anchor"
+                or activation_document.get("organization") != audit_org
+            ):
+                raise RuntimeError(
+                    "privileged audit activation baseline anchor is invalid"
+                )
             outbox = self._store._data.get(outbox_key)
             if outbox is not None and not isinstance(outbox, _FakeStream):
                 raise RuntimeError("privileged audit outbox has wrong Redis type")
@@ -1136,6 +1158,23 @@ from supertable.rbac.user_manager import UserManager
 
 _shared_fake_redis = FakeRedis()
 
+
+@pytest.fixture(autouse=True)
+def _isolate_redis_connector(monkeypatch):
+    """Keep this module's lightweight Redis double scoped to each test.
+
+    Assigning ``redis_catalog.RedisConnector`` permanently used to poison every
+    later test in the same pytest process.  The connector resolves the current
+    shared fake lazily so ``fresh_catalog`` can still replace it per test.
+    """
+
+    class _FakeConnector:
+        def __init__(self, options=None):
+            self.r = _shared_fake_redis
+
+    monkeypatch.setattr(rc_module, "RedisConnector", _FakeConnector)
+
+
 # ---------------------------------------------------------------------------
 # Helper to get a fresh RedisCatalog + wiped FakeRedis for each test
 # ---------------------------------------------------------------------------
@@ -1144,8 +1183,22 @@ def fresh_catalog() -> RedisCatalog:
     """Return a RedisCatalog backed by a freshly-wiped FakeRedis."""
     global _shared_fake_redis
     _shared_fake_redis = FakeRedis()
-    # Patch the module-level reference so new RedisCatalog instances pick it up
-    rc_module.RedisConnector = type("RC", (), {"__init__": lambda self, o=None: setattr(self, "r", _shared_fake_redis)})
+    _shared_fake_redis.set(
+        RK.audit_privileged_activation(ORG),
+        json.dumps(
+            {
+                "version": 1,
+                "kind": "supertable_privileged_activation_anchor",
+                "organization": ORG,
+                "activation_id": "test-activation",
+                "created_ms": 1_700_000_000_000,
+                "state_sha256": "b" * 64,
+                "artifact_sha256": "a" * 64,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
     return RedisCatalog()
 
 
@@ -3595,6 +3648,23 @@ class TestCrossOrgIsolation(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
+        for organization in ("org_a", "org_b"):
+            self.cat.r.set(
+                RK.audit_privileged_activation(organization),
+                json.dumps(
+                    {
+                        "version": 1,
+                        "kind": "supertable_privileged_activation_anchor",
+                        "organization": organization,
+                        "activation_id": "test-activation",
+                        "created_ms": 1_700_000_000_000,
+                        "state_sha256": "b" * 64,
+                        "artifact_sha256": "a" * 64,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
         self.rm_a = RoleManager(super_name="sup_a", organization="org_a", redis_catalog=self.cat)
         self.rm_b = RoleManager(super_name="sup_b", organization="org_b", redis_catalog=self.cat)
         self.um_a = UserManager(super_name="sup_a", organization="org_a", redis_catalog=self.cat)

@@ -1,11 +1,12 @@
 from datetime import date
 
-import supertable.config.homedir
+from supertable.config.homedir import initialize_app_home
 from supertable.demo.webshop.core import GenerationConfig, WebshopDataGenerator
 from supertable.demo.webshop.defaults import generated_data_dir
 
 
 def main() -> None:
+    initialize_app_home(change_cwd=True)
     config = GenerationConfig(
         output_dir=generated_data_dir,
         seed=42,

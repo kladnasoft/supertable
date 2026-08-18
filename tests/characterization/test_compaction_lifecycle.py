@@ -38,7 +38,6 @@ import uuid
 
 import polars as pl
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 from supertable.data_writer import DataWriter
 from supertable.simple_table import SimpleTable
@@ -88,16 +87,15 @@ def _stats_paths(st, snap) -> set:
     return set(df.get_column("file_path").to_list())
 
 
-def _physical_keys(snap) -> collections.Counter:
+def _physical_keys(st, snap) -> collections.Counter:
     """Multiset of every key PHYSICALLY present across resource files.
 
-    Reads each resource file on its own (``pq.ParquetFile``) so the per-file
-    footer columns surface without tripping the partition-merge quirk that a
-    directory-level read of compacted, hive-partitioned data hits (documented in
-    ``test_tombstone_compact_read_failure.py``)."""
+    Reads each logical resource through its storage backend so the per-file
+    footer columns surface without Hive partition inference."""
     c: collections.Counter = collections.Counter()
     for r in (snap.get("resources") or []):
-        df = pl.from_arrow(pq.ParquetFile(r["file"]).read())
+        table = st.storage.read_parquet(r["file"])
+        df = table if isinstance(table, pl.DataFrame) else pl.from_arrow(table)
         c.update(df.get_column(KEY).to_list())
     return c
 
@@ -155,7 +153,7 @@ def test_tombstone_threshold_drain_clears_vector_and_stats(caplog):
     assert int(snap.get("tombstone_rows") or 0) == 0
 
     # Physically drained: a and c are gone for good; survivors remain.
-    phys = _physical_keys(snap)
+    phys = _physical_keys(st, snap)
     assert phys["a"] == 0 and phys["c"] == 0, f"drained rows still on disk: {dict(phys)}"
     assert phys["b"] == 1 and phys["d"] == 1, f"survivor lost: {dict(phys)}"
 
@@ -178,7 +176,7 @@ def test_tombstone_threshold_drain_clears_vector_and_stats(caplog):
 
     _, snap2 = _snapshot(simple)
     assert snap2.get("tombstone") is None, "append after drain must not resurrect a vector"
-    phys2 = _physical_keys(snap2)
+    phys2 = _physical_keys(st, snap2)
     assert phys2["a"] == 0 and phys2["c"] == 0
     assert phys2["b"] == 1 and phys2["d"] == 1 and phys2["e"] == 1
 

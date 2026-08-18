@@ -8,7 +8,7 @@ The write pipeline is designed around three principles:
 
 1. **Atomicity** -- a write either succeeds completely (new snapshot, updated catalog, optional mirror) or fails without side-effects. A Redis-backed per-table lock serialises concurrent writers.
 2. **Idempotency** -- the `newer_than` parameter lets callers replay the same data safely; stale or duplicate rows are silently dropped.
-3. **Incremental merge** -- only files whose key ranges overlap with incoming data are rewritten. Non-overlapping small files accumulate until a compaction threshold is reached, at which point they are merged toward a compressed-byte output target. Source files are currently decoded whole, so this target is not a hard RAM bound.
+3. **Incremental merge** -- only files whose key ranges overlap with incoming data are rewritten. Non-overlapping small files accumulate until a compaction threshold is reached, at which point they are merged toward a compressed-byte output target. Compaction spills each source object, decodes one physical row at a time, and separately caps decoded bytes, Arrow batches/rows, and pending Polars frames/rows.
 
 ---
 
@@ -142,7 +142,7 @@ When `dedup_on_read` is enabled and `primary_keys` are configured:
 
 For non-delete writes, `process_overlapping_files()` executes a three-phase merge:
 
-**Phase 1 -- Compaction** (`process_files_without_overlap`): Reads all `has_overlap=False` files, concatenates them with schema alignment, and flushes when cumulative compressed source size exceeds `MAX_MEMORY_CHUNK_SIZE`. The legacy setting name is an output-packing target, not a hard decoded-memory bound.
+**Phase 1 -- Compaction**: Sends selected `has_overlap=False` files through the fused compactor. Each source is version-sealed into a disk spill and decoded one physical row at a time. The packer concatenates each slice once and flushes on the compressed-output target, decoded-byte budget, 128-frame cap, or 1,048,576-row cap. A single unusually wide row is the only decoded-byte exception.
 
 **Phase 2 -- Overlap merge** (`process_files_with_overlap`): For each `has_overlap=True` file, performs an anti-join on the composite overwrite key to drop rows being overwritten, then concatenates the survivors with the merged buffer. Uses `2x MAX_MEMORY_CHUNK_SIZE` as the spill threshold. Files where no rows are actually deleted (false positive from stats) are skipped and tracked separately.
 
@@ -356,7 +356,8 @@ Persists table-level configuration in Redis via `catalog.set_table_config()`. Th
 |---|---|---|
 | `primary_keys` | (required) | Column names forming the logical primary key |
 | `dedup_on_read` | `False` | Enables ROW_NUMBER dedup on read and `__timestamp__` injection on write |
-| `max_memory_chunk_size` | 16 MB | Legacy name for the compressed source-byte packing/output target; not a hard decoded-RAM bound (a source file is currently decoded whole) |
+| `max_memory_chunk_size` | 16 MB | Legacy name for the compressed source-byte packing/output target. Decoded memory is governed separately by `max_decoded_compaction_bytes`; one unusually wide row is its indivisible lower bound. Metadata is bounded to 4,096 Arrow batches/65,536 rows per storage emission and 128 Polars frames/1,048,576 rows per concat. |
+| `max_decoded_compaction_bytes` | 16 MB | Total decoded-memory budget apportioned across the coordinator and bounded encoder slots |
 | `max_overlapping_files` | 100 | File-count threshold that triggers compaction of small files |
 | `tombstone_compact_total` | 1000 | Maximum tombstone entries before physical compaction is triggered |
 

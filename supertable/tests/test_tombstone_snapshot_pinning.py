@@ -59,7 +59,7 @@ def test_estimator_pins_tombstone_from_path_only_snapshot(monkeypatch):
     assert len(reflection.supers) == 1
     snapshot = reflection.supers[0]
     assert len(snapshot.files) == 1
-    assert snapshot.files[0].endswith("/data/v4.parquet")
+    assert snapshot.files[0] == "data/v4.parquet"
     assert snapshot.resource_keys == ["data/v4.parquet"]
     assert snapshot.snapshot_path == "snapshots/v4.json"
     assert snapshot.tombstone_key == "tombstone/v4.parquet"

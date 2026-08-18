@@ -6,7 +6,7 @@ import os
 
 from supertable.config.settings import settings
 from typing import Any, BinaryIO, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -188,6 +188,21 @@ class AzureBlobStorage(StorageInterface):
             expiry=expiry_time,
         )
         return f"{blob_client.url}?{sas_token}"
+
+    def canonical_uri(self, path: str) -> str:
+        """Return the canonical ABFSS URI for one logical blob path."""
+        account = str(getattr(self.svc, "account_name", "") or "").strip()
+        if not account:
+            host = urlparse(str(getattr(self.svc, "url", "") or "")).hostname or ""
+            account = host.split(".", 1)[0]
+        if not account:
+            raise RuntimeError("Azure storage account name is unavailable")
+        full_key = self._with_base(path)
+        encoded = quote(full_key, safe="/=:@+$,;~-._")
+        return (
+            f"abfss://{self.container_name}@{account}.dfs.core.windows.net/"
+            f"{encoded}"
+        )
 
     # -------------------------
     # Helpers
@@ -401,7 +416,7 @@ class AzureBlobStorage(StorageInterface):
         children = self._one_level_children(path)
         filtered = [c for c in children if fnmatch.fnmatch(c, pattern)]
         filtered.sort()
-        return [path + c for c in filtered]
+        return [self._without_base(path + c) for c in filtered]
 
     # -------------------------
     # Delete
@@ -413,15 +428,54 @@ class AzureBlobStorage(StorageInterface):
             self.container.delete_blob(path)
             return
 
-        # prefix recursive
+        logical = self._without_base(path)
         prefix = path if path.endswith("/") else f"{path}/"
-        to_delete = [b.name for b in self.container.list_blobs(name_starts_with=prefix)]
-
-        if not to_delete:
+        if next(iter(self.container.list_blobs(name_starts_with=prefix)), None) is None:
             raise FileNotFoundError(f"File or folder not found: {path}")
+        self.delete_prefix(logical)
 
-        for name in to_delete:
-            self.container.delete_blob(name)
+    def delete_prefix(self, path: str) -> None:
+        """Delete and verify an Azure blob prefix with bounded retries."""
+        import itertools
+
+        physical = self._with_base(path)
+        if self._blob_exists(physical):
+            self.container.delete_blob(physical)
+        prefix = physical if physical.endswith("/") else f"{physical}/"
+        previous_batch = None
+        stagnant = 0
+        prior_errors: List[Exception] = []
+        while True:
+            blobs = list(itertools.islice(
+                self.container.list_blobs(name_starts_with=prefix), 1000,
+            ))
+            if not blobs:
+                if prior_errors:
+                    raise OSError(
+                        f"Azure reported {len(prior_errors)} failed deletion(s) "
+                        f"under {path!r}"
+                    ) from prior_errors[0]
+                return
+            names = tuple(str(blob.name) for blob in blobs)
+            errors: List[Exception] = []
+            for blob in blobs:
+                try:
+                    self.container.delete_blob(blob.name)
+                except Exception as exc:
+                    errors.append(exc)
+            prior_errors = errors
+            stagnant = stagnant + 1 if names == previous_batch else 0
+            previous_batch = names
+            if stagnant >= 3:
+                if prior_errors:
+                    raise OSError(
+                        f"Azure reported {len(prior_errors)} failed deletion(s) "
+                        f"under {path!r}"
+                    ) from prior_errors[0]
+                raise OSError(
+                    f"Azure prefix made no deletion progress: {path!r}; "
+                    f"remaining={names[0]!r}"
+                )
 
     # -------------------------
     # Directory structure

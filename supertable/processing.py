@@ -12,9 +12,10 @@ import threading
 import uuid
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, date, timezone
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Set, Tuple, Optional
+from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Set, Tuple, Optional
 
 import polars
 import pyarrow as pa
@@ -25,7 +26,7 @@ from supertable.utils.helper import generate_filename, hourly_partition_subpath
 from supertable.config.defaults import default
 from supertable.config.settings import settings
 from supertable.storage.storage_factory import get_storage
-from supertable.storage.storage_interface import ObjectMetadata
+from supertable.storage.storage_interface import ObjectMetadata, StorageInterface
 from supertable.utils.profiler import Profiler, get_null_profiler
 from supertable.data_classes import (
     IntegerDomainBound,
@@ -488,6 +489,111 @@ def _read_parquet_safe(
         return None
 
 
+_ORIGINAL_READ_PARQUET_SAFE = _read_parquet_safe
+
+
+# Besides decoded bytes, cap the Python/Polars metadata retained before the
+# once-per-output concat.  Very narrow rows otherwise permit millions of tiny
+# frames to fit under a byte-only budget.
+_MAX_COMPACTION_CHUNK_FRAMES = 128
+_MAX_COMPACTION_CHUNK_ROWS = 1_048_576
+
+
+class _OptionalParquetStreamUnavailable(Exception):
+    """An optional maintenance source could not be opened before any rows."""
+
+
+def _iter_parquet_frames_safe(
+        path: str,
+        *,
+        max_decoded_bytes: int,
+        profiler: Optional[Profiler] = None,
+        file_size: int = 0,
+        columns: Optional[List[str]] = None,
+        required: bool = False,
+) -> Optional[Iterator[polars.DataFrame]]:
+    """Stream one Parquet source through a bounded spill/batch reader.
+
+    Built-in storage adapters use ``StorageInterface.iter_parquet_batches``.
+    Compatibility test doubles and third-party adapters retain the whole-file
+    reader, but their decoded frames are sliced before entering the compaction
+    packer.  Once a streamed source yields any rows, a later read failure is
+    fatal even for best-effort maintenance: keeping the original alongside a
+    partial successor would duplicate data.
+    """
+    p = profiler or get_null_profiler()
+    # Respect injected/custom readers.  Besides keeping third-party adapters
+    # compatible, this avoids silently bypassing a caller's integrity wrapper
+    # merely because the built-in storage object also supports streaming.
+    if _read_parquet_safe is not _ORIGINAL_READ_PARQUET_SAFE:
+        frame = _read_parquet_safe(
+            path,
+            profiler=p,
+            file_size=file_size,
+            columns=columns,
+            required=required,
+        )
+        return None if frame is None else iter((frame,))
+    if not _safe_exists(path, profiler=p, strict=required):
+        if required:
+            raise FileNotFoundError(f"Required parquet object is missing: {path}")
+        return None
+    storage = _get_storage()
+
+    stream_capable = False
+    if isinstance(storage, StorageInterface):
+        storage_type = type(storage)
+        stream_capable = (
+            storage_type.iter_parquet_batches
+            is not StorageInterface.iter_parquet_batches
+            or (
+                storage_type.stat_object is not StorageInterface.stat_object
+                and storage_type.download_to_file
+                is not StorageInterface.download_to_file
+            )
+        )
+    if not stream_capable:
+        frame = _read_parquet_safe(
+            path,
+            profiler=p,
+            file_size=file_size,
+            columns=columns,
+            required=required,
+        )
+        return None if frame is None else iter((frame,))
+
+    def _generate() -> Iterator[polars.DataFrame]:
+        yielded = False
+        rows = 0
+        try:
+            with p.span("io.iter_parquet"):
+                for batch in storage.iter_parquet_batches(
+                    path,
+                    max_decoded_bytes=max(1, int(max_decoded_bytes)),
+                    columns=columns,
+                ):
+                    frame = polars.from_arrow(batch)
+                    rows += frame.height
+                    yielded = yielded or frame.height > 0
+                    if frame.height:
+                        yield frame
+            p.add("files_read", 1)
+            p.add("bytes_read", int(file_size))
+            p.add("rows_read", rows)
+        except FileNotFoundError:
+            if required or yielded:
+                raise
+            logging.info(f"[race] file vanished before streaming read: {path}")
+            raise _OptionalParquetStreamUnavailable(path)
+        except Exception as exc:
+            if required or yielded:
+                raise
+            logging.warning(f"[read] failed to stream parquet at {path}: {exc}")
+            raise _OptionalParquetStreamUnavailable(path) from exc
+
+    return _generate()
+
+
 # =========================
 # Original-style merge threshold logic
 # =========================
@@ -677,9 +783,20 @@ def _validate_compaction_source_rowids(
 
 def _prove_safe_compacted_rowids(frame: polars.DataFrame) -> None:
     """Prove that one final output cannot make a future DV over-delete."""
-    _validate_compaction_source_rowids(
-        frame, "compaction output", required=False,
-    )
+    try:
+        _validate_compaction_source_rowids(
+            frame, "compaction output", required=False,
+        )
+    except ValueError as exc:
+        # Keep the long-standing compaction diagnostic: callers and runbooks
+        # need to distinguish unsafe cross-file identity collapse from a
+        # malformed rowid lane in one source file.
+        if "duplicate rowids" in str(exc):
+            raise ValueError(
+                "Compaction would merge duplicate __rowid__ values into one "
+                "file and make future tombstones over-delete live rows"
+            ) from exc
+        raise
 
 
 def _cleanup_compaction_outputs(resources: List[Dict]) -> None:
@@ -689,6 +806,8 @@ def _cleanup_compaction_outputs(resources: List[Dict]) -> None:
     storage lookup, malformed resource entry, delete, or diagnostic logging
     failure may escape and replace that original error.
     """
+    if not resources:
+        return
     try:
         storage = _get_storage()
     except BaseException as cleanup_error:
@@ -739,6 +858,21 @@ def _compact_resources_with_tombstones(
     single highly-compressed or skewed row can still exceed the target.
     """
     p = profiler
+
+    def _profile_span(name: str):
+        span = getattr(p, "span", None)
+        return span(name) if callable(span) else nullcontext()
+
+    def _merge_profile(other: Profiler) -> None:
+        merge = getattr(p, "merge", None)
+        if callable(merge):
+            merge(other)
+            return
+        # ``compact_resources`` historically accepted lightweight profiler
+        # duck types that expose only ``add``. Preserve that contract after
+        # routing ordinary compaction through the fused bounded packer.
+        for name, value in other.emit_counts().items():
+            p.add(name, value)
     tombstone_df = validate_tombstone_frame(
         tombstone_df, source="deletion-vector passed to fused compaction",
     )
@@ -802,12 +936,23 @@ def _compact_resources_with_tombstones(
     removed_rows = 0
     local_footer_cache: Dict = {}
     chunk_parts: List[polars.DataFrame] = []
+    chunk_rows = 0
     chunk_estimated_bytes = 0
+    chunk_decoded_bytes = 0
+    peak_decoded_buffer_bytes = 0
     packing_limit = max_bytes
     observed_expansion = 1.0
     packing_calibrated = False
 
     cfg = table_config or {}
+    try:
+        max_decoded_budget = int(
+            cfg.get("max_decoded_compaction_bytes")
+            or getattr(default, "MAX_MEMORY_CHUNK_SIZE", 16 * 1024 * 1024)
+        )
+    except (TypeError, ValueError):
+        max_decoded_budget = max_bytes
+    max_decoded_budget = max(1, max_decoded_budget)
     try:
         configured_workers = int(
             cfg.get("tombstone_compaction_workers")
@@ -822,6 +967,15 @@ def _compact_resources_with_tombstones(
     executor = (
         ThreadPoolExecutor(max_workers=encode_workers)
         if encode_workers > 1 else None
+    )
+    # Pending encoders retain their input frames.  The coordinator can briefly
+    # hold both the streamed source buffers and the once-concatenated output,
+    # so reserve two decoded-frame slots in addition to every encoder slot.
+    # This is conservative for zero-copy Arrow/Polars slices and prevents
+    # queued writes from multiplying RSS past the configured budget.
+    decoded_chunk_limit = max(
+        1,
+        max_decoded_budget // ((encode_workers + 2) if executor else 2),
     )
     pending_writes: List[Any] = []
     p.add("compact_encode_worker_capacity", encode_workers if executor else 1)
@@ -861,7 +1015,7 @@ def _compact_resources_with_tombstones(
     def _accept_write(result: Tuple[List[Dict], Dict, Profiler, int, int]) -> None:
         nonlocal total_rows, packing_limit, observed_expansion
         resources, footer_cache, sub, rows, estimated = result
-        p.merge(sub)
+        _merge_profile(sub)
         new_resources.extend(resources)
         local_footer_cache.update(footer_cache)
         total_rows += rows
@@ -899,16 +1053,22 @@ def _compact_resources_with_tombstones(
             _harvest_one()
 
     def _flush_chunk() -> None:
-        nonlocal chunk_parts, chunk_estimated_bytes, packing_calibrated
+        nonlocal chunk_parts, chunk_rows
+        nonlocal chunk_estimated_bytes, chunk_decoded_bytes
+        nonlocal packing_calibrated
         if not chunk_parts:
             return
-        with p.span("compact.concat"):
+        with _profile_span("compact.concat"):
             merged = concat_many_with_union(chunk_parts)
         chunk_parts = []
+        chunk_rows = 0
         estimated = chunk_estimated_bytes
         chunk_estimated_bytes = 0
+        decoded = chunk_decoded_bytes
+        chunk_decoded_bytes = 0
         if merged.height == 0:
             return
+        p.add("compact_decoded_bytes_flushed", decoded)
         _prove_safe_compacted_rowids(merged)
         # The first output is an intentional synchronous calibration sample.
         # Subsequent PyArrow-compatible chunks use bounded outer parallelism;
@@ -931,44 +1091,89 @@ def _compact_resources_with_tombstones(
             _accept_write(_write_final_chunk(merged, estimated))
 
     def _pack(frame: polars.DataFrame, estimated_bytes: int) -> None:
-        """Slice one decoded source into proportional target-sized pieces."""
-        nonlocal chunk_estimated_bytes
+        """Pack slices under both encoded-output and decoded-RSS budgets."""
+        nonlocal chunk_rows, chunk_estimated_bytes, chunk_decoded_bytes
+        nonlocal peak_decoded_buffer_bytes
         if frame.height == 0:
             return
         remaining_offset = 0
         remaining_rows = frame.height
         remaining_estimate = max(1, int(estimated_bytes))
+        remaining_decoded = max(1, int(frame.estimated_size()))
         while remaining_rows > 0:
-            capacity = packing_limit - chunk_estimated_bytes
-            if capacity <= 0:
+            if (
+                len(chunk_parts) >= _MAX_COMPACTION_CHUNK_FRAMES
+                or chunk_rows >= _MAX_COMPACTION_CHUNK_ROWS
+            ):
                 _flush_chunk()
-                capacity = packing_limit
+            encoded_capacity = packing_limit - chunk_estimated_bytes
+            decoded_capacity = decoded_chunk_limit - chunk_decoded_bytes
+            if encoded_capacity <= 0 or decoded_capacity <= 0:
+                _flush_chunk()
+                encoded_capacity = packing_limit
+                decoded_capacity = decoded_chunk_limit
 
-            if remaining_estimate <= capacity:
-                take_rows = remaining_rows
-                take_estimate = remaining_estimate
-            else:
-                take_rows = (remaining_rows * capacity) // remaining_estimate
-                if take_rows <= 0:
-                    if chunk_parts:
-                        _flush_chunk()
-                        continue
-                    # One physical row is the indivisible lower bound.
-                    take_rows = 1
-                take_rows = min(remaining_rows, max(1, take_rows))
-                take_estimate = max(
-                    1,
-                    (remaining_estimate * take_rows) // remaining_rows,
+            take_rows = remaining_rows
+            take_rows = min(
+                take_rows,
+                _MAX_COMPACTION_CHUNK_ROWS - chunk_rows,
+            )
+            if remaining_estimate > encoded_capacity:
+                take_rows = min(
+                    take_rows,
+                    (remaining_rows * encoded_capacity) // remaining_estimate,
                 )
+            if remaining_decoded > decoded_capacity:
+                take_rows = min(
+                    take_rows,
+                    (remaining_rows * decoded_capacity) // remaining_decoded,
+                )
+            if take_rows <= 0:
+                if chunk_parts:
+                    _flush_chunk()
+                    continue
+                # One physical row is the indivisible lower bound.
+                take_rows = 1
+            take_rows = min(remaining_rows, max(1, take_rows))
+            take_estimate = max(
+                1, (remaining_estimate * take_rows) // remaining_rows,
+            )
+            piece = frame.slice(remaining_offset, take_rows)
+            piece_decoded = max(1, int(piece.estimated_size()))
+            if chunk_parts and (
+                piece_decoded > decoded_capacity
+                or take_estimate > encoded_capacity
+            ):
+                _flush_chunk()
+                continue
+            if piece_decoded > decoded_chunk_limit:
+                p.add("compact_decoded_oversize_rows", take_rows)
 
-            chunk_parts.append(frame.slice(remaining_offset, take_rows))
+            chunk_parts.append(piece)
+            chunk_rows += take_rows
             chunk_estimated_bytes += take_estimate
+            chunk_decoded_bytes += piece_decoded
+            p.add(
+                "compact_decoded_peak_buffer_bytes",
+                max(0, chunk_decoded_bytes - peak_decoded_buffer_bytes),
+            )
+            peak_decoded_buffer_bytes = max(
+                peak_decoded_buffer_bytes, chunk_decoded_bytes,
+            )
             remaining_offset += take_rows
             remaining_rows -= take_rows
             remaining_estimate = max(
                 0, remaining_estimate - take_estimate,
             )
-            if chunk_estimated_bytes >= packing_limit:
+            remaining_decoded = max(
+                0, remaining_decoded - piece_decoded,
+            )
+            if (
+                chunk_estimated_bytes >= packing_limit
+                or chunk_decoded_bytes >= decoded_chunk_limit
+                or len(chunk_parts) >= _MAX_COMPACTION_CHUNK_FRAMES
+                or chunk_rows >= _MAX_COMPACTION_CHUNK_ROWS
+            ):
                 _flush_chunk()
 
     try:
@@ -1012,6 +1217,54 @@ def _compact_resources_with_tombstones(
                     p.add("tombstone_groups_residual", 1)
                     continue
 
+            if not has_tombstones:
+                # Clean candidates do not need a table-wide anti-join. Stream
+                # them through a version-sealed spill file so compressed size
+                # cannot dictate decoded RSS. Each frame enters the same fused
+                # packer used by DV compaction and is concatenated only once at
+                # flush time.
+                frames = _iter_parquet_frames_safe(
+                    file_path,
+                    max_decoded_bytes=decoded_chunk_limit,
+                    profiler=p,
+                    file_size=file_size,
+                    required=required_reads,
+                )
+                if frames is None:
+                    continue
+                try:
+                    declared_rows = int(resource.get("rows") or 0)
+                except (TypeError, ValueError):
+                    declared_rows = 0
+                streamed_rows = 0
+                try:
+                    for frame in frames:
+                        _validate_compaction_source_rowids(
+                            frame, file_path, required=False,
+                        )
+                        streamed_rows += frame.height
+                        estimated = (
+                            max(
+                                1,
+                                (file_size * frame.height + declared_rows - 1)
+                                // declared_rows,
+                            )
+                            if file_size > 0 and declared_rows > 0
+                            else max(1, int(frame.estimated_size()))
+                        )
+                        _pack(frame, estimated)
+                except _OptionalParquetStreamUnavailable:
+                    # Best-effort maintenance keeps an unreadable source live.
+                    # No frame was yielded, so no successor contains its rows.
+                    continue
+                if declared_rows and streamed_rows != declared_rows:
+                    raise RuntimeError(
+                        f"Parquet row count changed while compacting {file_path!r}: "
+                        f"expected {declared_rows}, streamed {streamed_rows}"
+                    )
+                sunset_files.add(file_path)
+                continue
+
             existing_df = _read_parquet_safe(
                 file_path,
                 profiler=p,
@@ -1039,7 +1292,7 @@ def _compact_resources_with_tombstones(
                     residual_parts.append(file_tombstones)
                     p.add("tombstone_groups_residual", 1)
                     continue
-                with p.span("tombstone.anti_join"):
+                with _profile_span("tombstone.anti_join"):
                     kept_df = existing_df.join(
                         dead_ids, on=ROWID_COL, how="anti",
                     )
@@ -1241,6 +1494,23 @@ def compact_resources(
             profiler=p,
             footer_md_out=footer_md_out,
         )
+    if dead_rowids is None and dead_rowids_by_file is None:
+        # Ordinary legacy compaction shares the fused slice packer with DV
+        # compaction.  An empty canonical vector selects only its clean-file
+        # streaming lane, eliminating pairwise concatenation and whole-object
+        # decode while retaining the historical four-field return shape.
+        compacted = _compact_resources_with_tombstones(
+            snapshot=snapshot,
+            tombstone_df=_empty_tombstone_df(),
+            data_dir=data_dir,
+            compression_level=compression_level,
+            table_config=table_config,
+            small_only=small_only,
+            required_reads=required_reads,
+            profiler=p,
+            footer_md_out=footer_md_out,
+        )
+        return compacted[:4]
     resources = snapshot.get("resources") or []
     if not resources:
         return 0, 0, [], set()

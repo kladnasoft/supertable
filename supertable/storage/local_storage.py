@@ -8,10 +8,10 @@ import shutil
 import tempfile
 import time
 import hashlib
+from pathlib import Path
 
 from typing import Any, BinaryIO, Dict, List, Optional
 
-from supertable.config.homedir import app_home
 from supertable.storage.storage_interface import (
     ObjectIdentityMismatch,
     ObjectMetadata,
@@ -25,12 +25,56 @@ class LocalStorage(StorageInterface):
     A local disk-based implementation of StorageInterface.
     """
 
+    def __init__(self, root: str | os.PathLike[str] | None = None) -> None:
+        # A directly constructed LocalStorage retains its long-standing
+        # caller-CWD namespace.  Production construction through
+        # storage_factory passes the explicitly initialised application home,
+        # so package import never needs to mutate the process CWD.  Absolute
+        # caller paths remain supported for compatibility.
+        if root is None:
+            root = os.getcwd()
+        self.root = os.path.realpath(os.path.abspath(os.fspath(root)))
+
+    def _resolve_path(self, path: str | os.PathLike[str]) -> str:
+        raw = os.fspath(path)
+        if os.path.isabs(raw):
+            return os.path.normpath(raw)
+        physical = os.path.realpath(os.path.join(self.root, raw))
+        try:
+            contained = os.path.commonpath((self.root, physical)) == self.root
+        except ValueError:
+            contained = False
+        if not contained:
+            raise ValueError(f"Local storage path escapes configured root: {raw!r}")
+        return physical
+
+    def canonical_uri(self, path: str) -> str:
+        """Return a canonical absolute ``file:`` URI for a logical path."""
+        return Path(self._resolve_path(path)).as_uri()
+
+    def to_duckdb_path(
+        self,
+        key: str,
+        prefer_httpfs: Optional[bool] = None,
+    ) -> str:
+        """Resolve a logical key to the absolute local path DuckDB opens.
+
+        ``Path.as_uri()`` correctly escapes URI characters, including the
+        equals signs in Hive-style partition directories. DuckDB's Parquet
+        reader treats those escapes literally for local ``file:`` URLs on some
+        versions, however, so its backend boundary uses the absolute path.
+        Catalogs and storage methods continue to expose/accept logical keys.
+        """
+        del prefer_httpfs
+        return self._resolve_path(key)
+
     def read_json(self, path: str) -> Dict[str, Any]:
         """
         Robust JSON reader:
           - fast path: read once
           - if file is empty or decoding fails, retry briefly (handles concurrent atomic replace)
         """
+        path = self._resolve_path(path)
         # quick existence check
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")
@@ -82,6 +126,7 @@ class LocalStorage(StorageInterface):
           - os.replace() to atomically swap into place
           - fsync directory entry
         """
+        path = self._resolve_path(path)
         directory = os.path.dirname(path) or "."
         os.makedirs(directory, exist_ok=True)
 
@@ -115,9 +160,10 @@ class LocalStorage(StorageInterface):
                 pass
 
     def exists(self, path: str) -> bool:
-        return os.path.exists(path)
+        return os.path.exists(self._resolve_path(path))
 
     def size(self, path: str) -> int:
+        path = self._resolve_path(path)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")
         return os.path.getsize(path)
@@ -170,6 +216,7 @@ class LocalStorage(StorageInterface):
         )
 
     def stat_object(self, path: str) -> ObjectMetadata:
+        path = self._resolve_path(path)
         try:
             source = open(path, "rb")
         except FileNotFoundError as e:
@@ -185,6 +232,7 @@ class LocalStorage(StorageInterface):
         expected: ObjectMetadata | None = None,
         chunk_size: int = 8 * 1024 * 1024,
     ) -> int:
+        path = self._resolve_path(path)
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
         try:
@@ -219,6 +267,7 @@ class LocalStorage(StorageInterface):
         *,
         expected: ObjectMetadata | None = None,
     ) -> bytes:
+        path = self._resolve_path(path)
         offset, length = validate_range_request(offset, length, expected)
         try:
             source = open(path, "rb")
@@ -258,15 +307,20 @@ class LocalStorage(StorageInterface):
         return True
 
     def makedirs(self, path: str) -> None:
-        os.makedirs(path, exist_ok=True)
+        os.makedirs(self._resolve_path(path), exist_ok=True)
 
     def list_files(self, path: str, pattern: str = "*") -> List[str]:
         """
         Lists files in 'path' matching the given pattern (non-recursive).
         """
-        if not os.path.isdir(path):
+        logical_input = not os.path.isabs(path)
+        physical_path = self._resolve_path(path)
+        if not os.path.isdir(physical_path):
             return []
-        return sorted(glob.glob(os.path.join(path, pattern)))
+        matches = sorted(glob.glob(os.path.join(physical_path, pattern)))
+        if logical_input:
+            return [os.path.relpath(match, self.root) for match in matches]
+        return matches
 
     def delete(self, path: str) -> None:
         """
@@ -275,6 +329,7 @@ class LocalStorage(StorageInterface):
         For files and symlinks, os.remove() is used.
         For directories, shutil.rmtree() is used to remove the directory and its contents.
         """
+        path = self._resolve_path(path)
         if os.path.isfile(path) or os.path.islink(path):
             os.remove(path)
         elif os.path.isdir(path):
@@ -298,6 +353,7 @@ class LocalStorage(StorageInterface):
           }
         }
         """
+        path = self._resolve_path(path)
         directory_structure = {}
         if not os.path.isdir(path):
             return directory_structure
@@ -323,6 +379,7 @@ class LocalStorage(StorageInterface):
         """
         Writes a PyArrow table to a local Parquet file at 'path'.
         """
+        path = self._resolve_path(path)
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -330,6 +387,7 @@ class LocalStorage(StorageInterface):
         pq.write_table(table, path)
 
     def read_parquet(self, path: str, columns: Optional[List[str]] = None) -> pa.Table:
+        path = self._resolve_path(path)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"Parquet file not found at: {path}")
 
@@ -351,6 +409,7 @@ class LocalStorage(StorageInterface):
             raise RuntimeError(f"Failed to read Parquet file at '{path}': {e}")
 
     def write_bytes(self, path: str, data: bytes) -> None:
+        path = self._resolve_path(path)
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -365,6 +424,7 @@ class LocalStorage(StorageInterface):
         ``os.replace`` gives readers either the previous complete object or the
         new complete object, never a prefix written by a crashed process.
         """
+        path = self._resolve_path(path)
         directory = os.path.dirname(path) or "."
         durability_anchor = self._nearest_existing_directory(directory)
         os.makedirs(directory, exist_ok=True)
@@ -451,6 +511,8 @@ class LocalStorage(StorageInterface):
         rewriting its immutable contents.
         """
 
+        logical_input = not os.path.isabs(path)
+        path = self._resolve_path(path)
         with open(path, "rb") as existing:
             os.fsync(existing.fileno())
         directory = os.path.dirname(path) or "."
@@ -459,16 +521,18 @@ class LocalStorage(StorageInterface):
         # also anchors directory components created by a prior interrupted
         # publication. Absolute paths are treated as pre-provisioned and only
         # their immediate parent is synced.
-        stop = os.getcwd() if not os.path.isabs(path) else directory
+        stop = self.root if logical_input else directory
         self._fsync_directory_chain(directory, stop_directory=stop)
 
     def read_bytes(self, path: str) -> bytes:
+        path = self._resolve_path(path)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")
         with open(path, "rb") as f:
             return f.read()
 
     def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None:
+        path = self._resolve_path(path)
         directory = os.path.dirname(path)
         if directory:
             os.makedirs(directory, exist_ok=True)
@@ -476,12 +540,15 @@ class LocalStorage(StorageInterface):
             f.write(text)
 
     def read_text(self, path: str, encoding: str = "utf-8") -> str:
+        path = self._resolve_path(path)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")
         with open(path, "r", encoding=encoding) as f:
             return f.read()
 
     def copy(self, src_path: str, dst_path: str) -> None:
+        src_path = self._resolve_path(src_path)
+        dst_path = self._resolve_path(dst_path)
         directory = os.path.dirname(dst_path)
         if directory:
             os.makedirs(directory, exist_ok=True)

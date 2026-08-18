@@ -333,7 +333,7 @@ The refresh callback updates the `exp` field of all records whose token appears 
 
 The locking subsystem uses several strategies to prevent deadlocks:
 
-1. **Single-level locking**: The write path acquires exactly one lock per operation (the per-SimpleTable lock). There is no hierarchy of nested locks that could create circular dependencies.
+1. **Fixed hierarchy**: ordinary writes acquire the per-SimpleTable lock. Structural create/delete operations acquire the namespace lock before a child table lock; whole-namespace deletion drains child locks in sorted order. Callers must preserve that order.
 
 2. **Timeout-based acquisition**: Both backends use a bounded timeout (`timeout_s`, default 30 seconds). If a lock cannot be acquired within the timeout, `None` is returned (or `TimeoutError` is raised by the caller). This prevents indefinite blocking.
 
@@ -364,13 +364,18 @@ token = self.catalog.acquire_simple_lock(
 The staging area uses:
 
 ```python
-acquired = self.catalog.r.set(lock_key, token, nx=True, ex=30)  # 30s TTL
+token = self.catalog.acquire_stage_lock(
+    org, super_name, staging_name, ttl_s=30, timeout_s=30
+)
+# RedisLocking renews the lease until release_stage_lock().
 ```
 
-Pipe operations use a shorter TTL:
+Pipe operations share the staging lock and its renewal policy:
 
 ```python
-acquired = self.catalog.r.set(lock_key, token, nx=True, ex=10)  # 10s TTL
+token = self.catalog.acquire_stage_lock(
+    org, super_name, staging_name, ttl_s=30, timeout_s=30
+)
 ```
 
 ### RedisLocking Defaults
@@ -429,25 +434,46 @@ token = self.catalog.acquire_simple_lock(org, super_name, simple_name, ttl_s=30,
 self.catalog.release_simple_lock(org, super_name, simple_name, token)
 ```
 
-### Via Staging Area (Inline Lock)
+### Via Staging Area (RedisCatalog)
 
-The `Staging` and `SuperPipe` classes use inline Redis `SET NX EX` for lighter-weight locking:
+`Staging` and `SuperPipe` use the same auto-renewing `RedisLocking` owner through domain-specific `RedisCatalog` methods. This is required because a verified cloud prefix deletion can exceed the initial lease and pipe publication must share its deletion fence.
 
 ```python
-from supertable import redis_keys as RK
-
-lock_key = RK.lock_stage(org, sup, staging_name)
-# → supertable:{org}:lakes:{sup}:lock:stage:doc:{staging_name}
-token = uuid.uuid4().hex
-acquired = self.catalog.r.set(lock_key, token, nx=True, ex=30)
-# ... operation ...
-# Release via Lua compare-and-delete
-lua = """
-if redis.call("get", KEYS[1]) == ARGV[1] then
-    return redis.call("del", KEYS[1])
-else
-    return 0
-end
-"""
-self.catalog.r.eval(lua, 1, lock_key, token)
+token = self.catalog.acquire_stage_lock(
+    org, sup, staging_name, ttl_s=30, timeout_s=30
+)
+try:
+    # ... stage upload or verified deletion ...
+    pass
+finally:
+    self.catalog.release_stage_lock(org, sup, staging_name, token)
 ```
+
+## Durable Deletion Tombstones
+
+Expiring locks alone cannot make fixed object-store prefixes safe. A process can lose its lease while an already-issued storage request is stalled, then resume after another process has deleted and recreated the same path. SuperTable therefore creates a no-TTL deletion intent atomically while it still owns the required locks.
+
+Successful SimpleTable, SuperTable, and staging deletion changes that exact intent to `status=deleted` but does not remove it. Constructors and every supported publication boundary reject either an active or terminal tombstone. A different caller cannot take over an expired intent, and ordinary recreation remains blocked.
+
+Clearing a tombstone is a deliberate recovery operation. The operator supplies the exact intent ID and `confirm_previous_owner_stopped=True`; recovery reacquires locks, repeats and verifies cleanup, atomically reaches the terminal state, and only then removes the tombstone. The confirmation means all former mutation owners are terminated and their in-flight object-store requests can no longer resume. Lease expiry by itself is not that proof.
+
+```python
+SimpleTable.recover_pending_delete(
+    organization=org,
+    super_name=super_name,
+    simple_name=table_name,
+    role_name=superadmin_role,
+    intent_id=recorded_intent_id,
+    confirm_previous_owner_stopped=True,
+)
+
+SuperTable.recover_pending_delete(
+    organization=org,
+    super_name=super_name,
+    role_name=superadmin_role,
+    intent_id=recorded_intent_id,
+    confirm_previous_owner_stopped=True,
+)
+```
+
+SimpleTable deletion covers the core `tables/{name}` prefix plus its `delta/{name}`, `iceberg/{name}`, and `parquet/{name}` projections. Whole-SuperTable cleanup preserves RBAC state and the deletion/lock keys while scanning, rechecks the owner token for every batch, and can be recovered through `SuperTable.recover_pending_delete(...)` even after the catalog root has already gone.

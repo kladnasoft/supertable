@@ -201,6 +201,144 @@ def test_same_mirror_commit_id_cannot_be_reused_for_another_snapshot():
         )
 
 
+def test_mirror_owner_blocks_stale_a_and_new_c_until_safe_rebind():
+    catalog, fake = _catalog()
+    _seed(fake, token="publisher-a")
+    prepared = catalog.prepare_mirror_publication(
+        "org", "lake", "table", commit_id="commit-5",
+        snapshot_path="snap/5.json", mirrors=["PARQUET"],
+        lock_token="publisher-a", now_ms=120,
+    )
+    assert prepared["publication_owner"] == "publisher-a"
+    assert prepared["publisher_quiesced"] is False
+    assert prepared["owner_generation"] == 0
+    catalog.commit_snapshot(
+        "org", "lake", "table", {}, "snap/5.json",
+        expected_version=4, expected_path="snap/4.json",
+        lock_token="publisher-a", commit_id="commit-5",
+        mirror_publication=True, now_ms=123,
+    )
+
+    # A's renewable lease is lost while its storage call may still resume.
+    # B owns the new Redis lease, but neither B nor a newer C publication may
+    # proceed solely because A's lease expired.
+    fake.set(RK.lock_leaf("org", "lake", "table"), "publisher-b")
+    with pytest.raises(PermissionError, match="previous publisher has stopped"):
+        catalog.claim_mirror_publication(
+            "org", "lake", "table", commit_id="commit-5",
+            expected_previous_owner="publisher-a", lock_token="publisher-b",
+            confirm_previous_owner_stopped=False,
+        )
+    with pytest.raises(SnapshotCommitConflictError, match="intent changed"):
+        catalog.claim_mirror_publication(
+            "org", "lake", "table", commit_id="wrong-commit",
+            expected_previous_owner="publisher-a", lock_token="publisher-b",
+            confirm_previous_owner_stopped=True,
+        )
+    with pytest.raises(SnapshotCommitConflictError, match="owner or status"):
+        catalog.claim_mirror_publication(
+            "org", "lake", "table", commit_id="commit-5",
+            expected_previous_owner="wrong-owner", lock_token="publisher-b",
+            confirm_previous_owner_stopped=True,
+        )
+    with pytest.raises(SnapshotCommitConflictError, match="Unresolved mirror"):
+        catalog.prepare_mirror_publication(
+            "org", "lake", "table", commit_id="commit-6",
+            snapshot_path="snap/6.json", mirrors=["PARQUET"],
+            lock_token="publisher-b",
+        )
+
+    claimed = catalog.claim_mirror_publication(
+        "org", "lake", "table", commit_id="commit-5",
+        expected_previous_owner="publisher-a", lock_token="publisher-b",
+        confirm_previous_owner_stopped=True, now_ms=130,
+    )
+    assert claimed["publication_owner"] == "publisher-b"
+    assert claimed["previous_publication_owner"] == "publisher-a"
+    assert claimed["publisher_quiesced"] is False
+    assert claimed["owner_generation"] == 1
+
+    # Even if stale A somehow presents its old token as a live Redis lock, the
+    # durable owner comparison prevents it from closing B's intent.
+    fake.set(RK.lock_leaf("org", "lake", "table"), "publisher-a")
+    with pytest.raises(SnapshotCommitConflictError, match="another publisher"):
+        catalog.complete_mirror_publication(
+            "org", "lake", "table", commit_id="commit-5",
+            lock_token="publisher-a",
+        )
+
+    # A generic mirror error is still storage-ambiguous, so even its
+    # exact-owner failure transition does not make C safe automatically.
+    fake.set(RK.lock_leaf("org", "lake", "table"), "publisher-b")
+    failed = catalog.fail_mirror_publication(
+        "org", "lake", "table", commit_id="commit-5",
+        lock_token="publisher-b", failure_stage="mirror:PARQUET",
+        error=OSError("copy failed"), now_ms=140,
+    )
+    assert failed["publisher_quiesced"] is False
+    fake.set(RK.lock_leaf("org", "lake", "table"), "publisher-c")
+    with pytest.raises(PermissionError, match="previous publisher has stopped"):
+        catalog.claim_mirror_publication(
+            "org", "lake", "table", commit_id="commit-5",
+            expected_previous_owner="publisher-b", lock_token="publisher-c",
+            confirm_previous_owner_stopped=False, now_ms=150,
+        )
+    reclaimed = catalog.claim_mirror_publication(
+        "org", "lake", "table", commit_id="commit-5",
+        expected_previous_owner="publisher-b", lock_token="publisher-c",
+        confirm_previous_owner_stopped=True, now_ms=150,
+    )
+    assert reclaimed["publication_owner"] == "publisher-c"
+    assert reclaimed["publisher_quiesced"] is False
+    assert reclaimed["owner_generation"] == 2
+    catalog.complete_mirror_publication(
+        "org", "lake", "table", commit_id="commit-5",
+        lock_token="publisher-c", now_ms=160,
+    )
+    next_record = catalog.prepare_mirror_publication(
+        "org", "lake", "table", commit_id="commit-6",
+        snapshot_path="snap/6.json", mirrors=["PARQUET"],
+        lock_token="publisher-c", now_ms=170,
+    )
+    assert next_record["commit_id"] == "commit-6"
+    assert next_record["publication_owner"] == "publisher-c"
+
+
+@pytest.mark.parametrize(
+    "safe_stage", ["core_commit", "recovery:core_not_committed", "outbox_complete"],
+)
+def test_only_provably_non_mirror_io_failures_are_auto_claimable(safe_stage):
+    catalog, fake = _catalog()
+    _seed(fake, token="publisher-a")
+    catalog.prepare_mirror_publication(
+        "org", "lake", "table", commit_id="commit-5",
+        snapshot_path="snap/5.json", mirrors=["PARQUET"],
+        lock_token="publisher-a",
+    )
+    if safe_stage == "outbox_complete":
+        catalog.commit_snapshot(
+            "org", "lake", "table", {}, "snap/5.json",
+            expected_version=4, expected_path="snap/4.json",
+            lock_token="publisher-a", commit_id="commit-5",
+            mirror_publication=True,
+        )
+    failed = catalog.fail_mirror_publication(
+        "org", "lake", "table", commit_id="commit-5",
+        lock_token="publisher-a", failure_stage=safe_stage,
+        error=RuntimeError("safe boundary"),
+    )
+    assert failed["publisher_quiesced"] is True
+
+    fake.set(RK.lock_leaf("org", "lake", "table"), "publisher-b")
+    claimed = catalog.claim_mirror_publication(
+        "org", "lake", "table", commit_id="commit-5",
+        expected_previous_owner="publisher-a", lock_token="publisher-b",
+        confirm_previous_owner_stopped=False,
+    )
+    assert claimed["publication_owner"] == "publisher-b"
+    assert claimed["publisher_quiesced"] is False
+
+
 def test_leaf_initializer_never_overwrites_an_existing_snapshot():
     catalog, fake = _catalog()
     _seed(fake)
@@ -215,6 +353,103 @@ def test_leaf_initializer_never_overwrites_an_existing_snapshot():
         )
 
     assert fake.get(RK.meta_leaf("org", "lake", "table")) == before
+
+
+def test_leaf_initializer_indexes_empty_table_atomically():
+    catalog, fake = _catalog()
+    fake.set(RK.meta_root("org", "lake"), json.dumps({"version": 0, "ts": 1}))
+
+    catalog.set_leaf_payload_cas(
+        "org", "lake", "empty",
+        {"resources": [], "tombstone": None},
+        "snap/bootstrap.json",
+        now_ms=456,
+    )
+
+    assert fake.smembers(RK.meta_table_names("org", "lake")) == {"empty"}
+
+
+def test_simple_delete_atomically_cleans_index_and_recreation_fences():
+    catalog, fake = _catalog()
+    _seed(fake)
+    fake.sadd(RK.meta_table_names("org", "lake"), "table")
+    fake.set(RK.schema("org", "lake", "table"), "{}")
+    fake.set(RK.meta_rowid_seq("org", "lake", "table"), "42")
+    fake.set(RK.meta_table_config("org", "lake", "table"), "{}")
+    catalog.prepare_mirror_publication(
+        "org", "lake", "table", commit_id="stale",
+        snapshot_path="snap/5.json", mirrors=["DELTA"], lock_token="token",
+    )
+    root_before = json.loads(fake.get(RK.meta_root("org", "lake")))
+    fake.set(RK.lock_namespace("org", "lake"), "namespace-token", ex=30)
+    intent = catalog.begin_simple_deletion(
+        "org", "lake", "table",
+        namespace_token="namespace-token",
+        lock_token="token",
+        intent_id="delete-1",
+    )
+
+    assert catalog.delete_simple_table(
+        "org", "lake", "table", lock_token="token",
+        namespace_token="namespace-token", intent_id=intent["intent_id"],
+    )
+
+    assert fake.get(RK.lock_leaf("org", "lake", "table")) == "token"
+    assert not fake.sismember(RK.meta_table_names("org", "lake"), "table")
+    for key in (
+        RK.meta_leaf("org", "lake", "table"),
+        RK.schema("org", "lake", "table"),
+        RK.meta_rowid_seq("org", "lake", "table"),
+        RK.meta_table_config("org", "lake", "table"),
+        RK.meta_mirror_publication("org", "lake", "table"),
+    ):
+        assert not fake.exists(key)
+    terminal = catalog.get_simple_deletion_intent("org", "lake", "table")
+    assert terminal["intent_id"] == "delete-1"
+    assert terminal["status"] == "deleted"
+    root_after = json.loads(fake.get(RK.meta_root("org", "lake")))
+    assert root_after["version"] == root_before["version"] + 1
+
+    # The terminal tombstone prevents ordinary recreation or takeover even
+    # after both original leases expire.
+    fake.delete(RK.lock_leaf("org", "lake", "table"))
+    fake.delete(RK.lock_namespace("org", "lake"))
+    fake.set(RK.lock_leaf("org", "lake", "table"), "new-token", ex=30)
+    fake.set(RK.lock_namespace("org", "lake"), "new-namespace", ex=30)
+    with pytest.raises(RuntimeError, match="durable deletion intent"):
+        catalog.set_leaf_payload_cas(
+            "org", "lake", "table", {}, "new.json",
+            namespace_token="new-namespace",
+        )
+    with pytest.raises(RuntimeError, match="prior deletion intent"):
+        catalog.begin_simple_deletion(
+            "org", "lake", "table",
+            namespace_token="new-namespace",
+            lock_token="new-token",
+            intent_id="delete-2",
+        )
+
+    # Explicit recovery first rebinds and re-finalizes the exact tombstone;
+    # only then may the confirmed operator clear it for recreation.
+    catalog.recover_simple_deletion(
+        "org", "lake", "table",
+        expected_intent_id="delete-1",
+        namespace_token="new-namespace",
+        lock_token="new-token",
+        confirm_previous_owner_stopped=True,
+    )
+    assert catalog.delete_simple_table(
+        "org", "lake", "table", lock_token="new-token",
+        namespace_token="new-namespace", intent_id="delete-1",
+    )
+    catalog.clear_simple_deletion_tombstone(
+        "org", "lake", "table",
+        expected_intent_id="delete-1",
+        namespace_token="new-namespace",
+        lock_token="new-token",
+        confirm_previous_owner_stopped=True,
+    )
+    assert not fake.exists(RK.meta_simple_deletion_intent("org", "lake", "table"))
 
 
 def test_leaf_existence_transport_error_is_unknown_not_absent(monkeypatch):

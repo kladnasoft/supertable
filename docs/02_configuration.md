@@ -8,10 +8,29 @@ SuperTable uses a centralized, immutable configuration system. All settings are 
 
 ## How Configuration Works
 
-1. **`.env` loading** — `python-dotenv` loads the nearest `.env` file at import time (via `find_dotenv(usecwd=True)`). Existing env vars are NOT overridden (`override=False`).
+1. **`.env` loading** — when `supertable.config.settings` is first imported, `python-dotenv` loads the nearest `.env` file (via `find_dotenv(usecwd=True)`). Existing env vars are NOT overridden (`override=False`). Importing the top-level `supertable` package alone does not load settings.
 2. **Type-safe parsing** — Helper functions (`_env_str`, `_env_int`, `_env_bool`, `_env_float`) parse each variable with fallback defaults. Boolean parsing accepts `1/true/yes/y/on` and `0/false/no/n/off`.
 3. **Frozen dataclass** — All values are stored in a `@dataclass(frozen=True)` singleton named `settings`. Immutable after construction.
 4. **Zero internal imports** — The settings module has no imports from `supertable.*`, preventing circular dependencies. It can safely be imported first.
+
+### Application Home and Process CWD
+
+Importing `supertable` or `supertable.config.homedir` does not create the
+configured home directory and never changes the process working directory.
+Library code that needs a writable home calls `get_app_home()`, which resolves
+and creates the directory without changing CWD. Application entry points that
+deliberately need the historical relative-path behavior can opt in explicitly:
+
+```python
+from supertable.config.homedir import initialize_app_home
+
+initialize_app_home(change_cwd=True)
+```
+
+The packaged webshop and medcenter CLI entry points make that explicit call at
+the start of `main()`. The legacy `homedir.app_home` string remains available;
+it is resolved lazily only when that attribute is explicitly accessed and does
+not change CWD.
 
 ### Adding a New Environment Variable
 
@@ -107,6 +126,12 @@ SuperTable uses a centralized, immutable configuration system. All settings are 
 | `SUPERTABLE_SPARK_STATEMENT_TIMEOUT` | int | `120` | Statement timeout (seconds) |
 | `SUPERTABLE_SPARK_CONNECT_TIMEOUT` | int | `30` | Connection timeout (seconds) |
 | `SUPERTABLE_SPARK_BATCH_SIZE` | int | `50` | Result fetch batch size |
+| `SUPERTABLE_SPARK_PRESIGNED` | bool | `false` | Must remain `false`; presigned Spark source URLs are disabled because they are reusable bearer credentials in the user-query session |
+
+Spark object-store authentication must be installed on the cluster through
+workload identity or a Hadoop credential provider. Cluster registrations reject
+`s3_access_key`, `s3_secret_key`, session-token equivalents, and malformed
+endpoint/region values; these values are never installed with session `SET`.
 
 ### Redis
 
@@ -119,6 +144,7 @@ SuperTable uses a centralized, immutable configuration system. All settings are 
 | `SUPERTABLE_REDIS_PASSWORD` | str | _(empty)_ | Redis password |
 | `SUPERTABLE_REDIS_USERNAME` | str | _(empty)_ | Redis username (ACL) |
 | `SUPERTABLE_REDIS_SSL` | bool | `false` | Enable TLS for direct Redis, or for both Sentinel discovery and the resolved Redis master in Sentinel mode |
+| `SUPERTABLE_REDIS_SSL_CA_CERTS` | str | _(system trust store)_ | Optional CA bundle path. TLS always requires certificate and hostname verification. |
 | `SUPERTABLE_REDIS_SENTINEL` | bool | `false` | Enable Sentinel mode |
 | `SUPERTABLE_REDIS_SENTINELS` | str | _(empty)_ | Sentinel addresses (comma-separated) |
 | `SUPERTABLE_REDIS_SENTINEL_MASTER` | str | `mymaster` | Sentinel master name |
@@ -157,6 +183,12 @@ SuperTable uses a centralized, immutable configuration system. All settings are 
 | `SUPERTABLE_DEFAULT_LIMIT` | int | `200` | Default query result limit |
 | `SUPERTABLE_MAX_LIMIT` | int | `5000` | Maximum query result limit |
 | `SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC` | float | `60.0` | Default query timeout |
+| `SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES` | int | `16777216` | Maximum JSON response size before conversion aborts |
+| `SUPERTABLE_RESULT_STREAM_BATCH_ROWS` | int | `256` | DuckDB Arrow result fetch size; clamped to 1–4096 so byte-bounded response consumers never prefetch 64K wide rows |
+| `SUPERTABLE_MAX_QUERY_BYTES` | int | `65536` | Maximum UTF-8 SQL statement size |
+| `SUPERTABLE_MAX_QUERY_AST_NODES` | int | `4096` | Maximum parsed SQL AST nodes |
+| `SUPERTABLE_MAX_QUERY_JOINS` | int | `32` | Maximum joins in one query |
+| `SUPERTABLE_MAX_QUERY_NESTING` | int | `32` | Maximum SQL AST nesting depth |
 | `SUPERTABLE_MAX_CONCURRENCY` | int | `6` | Max concurrent MCP operations |
 | `MCP_SERVER_PATH` | str | `mcp_server.py` | MCP server script path |
 | `MCP_WIRE` | str | `ndjson` | Wire format |
@@ -212,6 +244,15 @@ SuperTable uses a centralized, immutable configuration system. All settings are 
 |----------|------|---------|-------------|
 | `SUPERTABLE_MONITORING_ENABLED` | bool | `true` | Enable monitoring metrics |
 | `SUPERTABLE_MONITOR_CACHE_MAX` | int | `256` | Max monitoring cache entries |
+| `SUPERTABLE_MONITOR_SPOOL_DIR` | absolute path | `<SUPERTABLE_HOME>/monitoring-spool` | Persistent local WAL directory for Redis delivery outages; place it on a durable per-instance volume |
+| `SUPERTABLE_MONITOR_SPOOL_MAX_BYTES` | int | `268435456` | Hard byte cap across pending monitoring WAL records |
+| `SUPERTABLE_MONITOR_SPOOL_MAX_RECORDS` | int | `100000` | Hard record cap across pending monitoring WAL records |
+
+Monitoring is an acknowledged-operation boundary when enabled. Redis outages
+are absorbed by the fsynced local WAL, but an unwritable/full spool raises
+explicit backpressure. Provision the directory on persistent storage and run
+`drain_monitoring_spool()` during application startup; see
+[Monitoring](14_monitoring.md#durable-delivery-backpressure-and-restart-recovery).
 
 ### Rate Limiting
 

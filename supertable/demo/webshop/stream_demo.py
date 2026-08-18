@@ -45,7 +45,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 
-import supertable.config.homedir  # noqa: F401 — side effect: resolve/chdir app home
+from supertable.config.homedir import initialize_app_home
 from supertable.data_reader import DataReader, Status
 from supertable.data_writer import DataWriter
 from supertable.demo.webshop.core import GenerationConfig, WebshopDataGenerator
@@ -696,6 +696,7 @@ start();
 def main() -> None:
     global STREAMER
 
+    initialize_app_home(change_cwd=True)
     ap = argparse.ArgumentParser(description="SuperTable live session-stream demo")
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--host", default=HOST)

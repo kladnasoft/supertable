@@ -10,7 +10,7 @@ from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import argparse
-import supertable.config.homedir
+from supertable.config.homedir import initialize_app_home
 
 from supertable.data_writer import DataWriter
 from supertable.demo.webshop.defaults import organization, super_name, role_name, overwrite_columns, generated_data_dir
@@ -269,6 +269,7 @@ def parse_args():
 # Main
 # -------------------------
 def main() -> None:
+    initialize_app_home(change_cwd=True)
     args = parse_args()
     num_threads = max(1, args.threads or DEFAULT_THREADS)
 

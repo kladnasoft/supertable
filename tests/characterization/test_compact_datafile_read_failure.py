@@ -74,7 +74,6 @@ import collections
 
 import polars as pl
 import pyarrow as pa
-import pyarrow.parquet as pq
 
 import supertable.processing as st_processing
 from supertable.data_writer import DataWriter
@@ -115,17 +114,17 @@ def _dv_rowids(st, snap) -> set:
     return set(dvf.get_column("__rowid__").to_list())
 
 
-def _read_data_file(file_key) -> pl.DataFrame:
+def _read_data_file(st, file_key) -> pl.DataFrame:
     """Read ONE data file's own footer columns with hive partition inference OFF
-    (single-file open sidesteps the post-compaction ``year`` int32-vs-dictionary
-    partition-merge quirk documented in ``test_tombstone_compact_read_failure.py``)."""
-    return pl.from_arrow(pq.ParquetFile(file_key).read())
+    through the storage backend's logical-path contract."""
+    table = st.storage.read_parquet(file_key)
+    return table if isinstance(table, pl.DataFrame) else pl.from_arrow(table)
 
 
-def _physical_key_counts(snap) -> collections.Counter:
+def _physical_key_counts(st, snap) -> collections.Counter:
     c: collections.Counter = collections.Counter()
     for r in (snap.get("resources") or []):
-        c.update(_read_data_file(r["file"]).get_column(KEY).to_list())
+        c.update(_read_data_file(st, r["file"]).get_column(KEY).to_list())
     return c
 
 
@@ -136,7 +135,7 @@ def _live_key_counts(st, snap) -> collections.Counter:
     dv = _dv_rowids(st, snap)
     c: collections.Counter = collections.Counter()
     for r in (snap.get("resources") or []):
-        df = _read_data_file(r["file"])
+        df = _read_data_file(st, r["file"])
         for key, rowid in df.select([KEY, "__rowid__"]).iter_rows():
             if rowid not in dv:
                 c.update([key])
@@ -184,7 +183,7 @@ def test_compact_datafile_read_failure_does_not_resurrect():
 
     # Ground truth pre-compact: 'a' hidden by the vector, still on disk.
     assert _live_key_counts(st, snap) == collections.Counter({"b": 1, "c": 1, "d": 1})
-    assert _physical_key_counts(snap)["a"] == 1
+    assert _physical_key_counts(st, snap)["a"] == 1
     assert target_file in {r["file"] for r in snap["resources"]}, (
         "the vector's __file__ must name a live resource we can target"
     )
@@ -213,7 +212,7 @@ def test_compact_datafile_read_failure_does_not_resurrect():
     # --- invariant: the row deleted before compaction stays gone ----------
     st2, snap2 = _snapshot()
     live_after = _live_key_counts(st2, snap2)
-    phys_after = _physical_key_counts(snap2)
+    phys_after = _physical_key_counts(st2, snap2)
     dv_after = _dv_rowids(st2, snap2)
 
     # The actual resurrection: 'a' is still physically present (Phase A skipped

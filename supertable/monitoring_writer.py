@@ -21,34 +21,44 @@ Your codebase uses multiple access patterns:
 
 See examples/2.4.2. write_monitoring_parallel.py. fileciteturn2file0
 
-Fixes included
---------------
+Delivery contract
+-----------------
 - MonitoringWriter is a proper context manager (__enter__/__exit__)
 - get_monitoring_logger(...) ALWAYS returns an object that:
     - supports context manager
     - has log_metric(payload)
     - has request_flush(...)
     - exposes queue/current_batch/queue_stats/queue_stats_lock for debug/monitor scripts
-- When monitoring is disabled/misconfigured, we return NullMonitoringLogger (no-op)
-  so monitoring never breaks query execution.
+- An explicit ``SUPERTABLE_MONITORING_ENABLED=false`` returns a no-op logger.
+  When monitoring is enabled, construction/cache/delivery failures are
+  surfaced as ``MonitoringDeliveryError``; an outage is never disguised as a
+  successful no-op.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import socket
-from datetime import datetime, timedelta, timezone
-
-from supertable.config.settings import settings
 import queue
+import socket
+import stat
 import threading
 import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Protocol
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterator, Literal, Optional, Protocol
 
-from supertable.config.defaults import logger
+try:  # POSIX interprocess durability boundary; fail clear at logger creation.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on non-POSIX platforms
+    fcntl = None  # type: ignore[assignment]
+
 from supertable import redis_keys as RK
+from supertable.config.defaults import logger
+from supertable.config.settings import settings
 
 # ---------------------------------------------------------------------------
 # Instance identity — stable for the lifetime of this process.
@@ -58,10 +68,10 @@ from supertable import redis_keys as RK
 _MONITORING_INSTANCE_ID: str = f"{socket.gethostname()}:{os.getpid()}"
 
 try:
-    # Optional dependency. If Redis isn't available/configured, we fall back to log-only.
+    # If Redis is unavailable, durable local spooling remains operational.
     from supertable.redis_connector import RedisConnector
 except Exception:  # pragma: no cover
-    RedisConnector = None  # type: ignore
+    RedisConnector = None
 
 
 class MonitoringLogger(Protocol):
@@ -76,6 +86,80 @@ class MonitoringLogger(Protocol):
     current_batch: list
     queue_stats: Dict[str, int]
     queue_stats_lock: threading.Lock
+
+
+class MonitoringDeliveryError(RuntimeError):
+    """The enabled monitoring delivery contract was not fully satisfied."""
+
+
+class MonitoringDurabilityError(MonitoringDeliveryError):
+    """Monitoring could not establish or preserve a durable local record."""
+
+
+class MonitoringBackpressureError(MonitoringDurabilityError):
+    """The bounded monitoring spool cannot durably accept another record."""
+
+
+class MonitoringExpiredRecordError(MonitoringDurabilityError):
+    """A retained record outlived its immutable Redis partition window."""
+
+
+class MonitoringPostCommitError(MonitoringDurabilityError):
+    """Core data committed, but its monitoring event was not durable.
+
+    ``core_committed`` tells callers not to blindly retry the mutation.  The
+    original core result is attached so an API can report the committed
+    outcome while directing an operator to restore spool capacity/durability.
+    """
+
+    def __init__(
+        self,
+        *,
+        organization: str,
+        super_name: str,
+        table_name: str,
+        operation: str,
+        core_result: Any,
+        cause: MonitoringDurabilityError,
+    ) -> None:
+        self.organization = organization
+        self.super_name = super_name
+        self.table_name = table_name
+        self.operation = operation
+        self.core_result = core_result
+        self.core_committed = True
+        self.cause = cause
+        self.mirror_error: Exception | None = None
+        super().__init__(
+            "Core data committed, but the monitoring record could not be "
+            f"durably retained for {organization}/{super_name}/{table_name} "
+            f"({operation}): {cause}. Do not blindly retry the mutation."
+        )
+
+
+class MonitoringPostExecutionError(MonitoringDurabilityError):
+    """A query completed, but its enabled monitoring event was not durable."""
+
+    def __init__(
+        self,
+        *,
+        organization: str,
+        super_name: str,
+        query_id: str,
+        status: str,
+        cause: MonitoringDurabilityError,
+    ) -> None:
+        self.organization = organization
+        self.super_name = super_name
+        self.query_id = query_id
+        self.status = status
+        self.execution_completed = True
+        self.cause = cause
+        super().__init__(
+            "Query execution completed, but its monitoring record could not "
+            f"be durably retained for {organization}/{super_name}; "
+            f"query_id={query_id!r}, status={status!r}: {cause}."
+        )
 
 
 class NullMonitoringLogger:
@@ -103,7 +187,7 @@ class NullMonitoringLogger:
     def __enter__(self) -> "NullMonitoringLogger":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
+    def __exit__(self, exc_type, exc, tb) -> Literal[False]:
         return False
 
 
@@ -150,10 +234,9 @@ class _MonitorKey:
     @property
     def path_key(self) -> str:
         # Matches the log style: "org/monitor_type". Used as the cache
-        # key for the singleton ``_MONITORS`` registry — the partition
-        # date is deliberately NOT part of this key so one logger per
-        # (org, type) handles the daily roll-over by recomputing the
-        # Redis key per push.
+        # key for the singleton ``_MONITORS`` registry. The partition date is
+        # deliberately NOT part of this key; each WAL envelope independently
+        # seals its original date before delivery.
         return f"{self.organization}/{self.monitor_type}"
 
     def redis_list_key_today(self) -> str:
@@ -183,13 +266,671 @@ class _MonitorKey:
         return key, _partition_expire_at(date)
 
 
+_SPOOL_VERSION = 1
+_PRODUCER_RECEIPT_GRACE_DAYS = 1
+
+# KEYS[1] = monitoring LIST; KEYS[2] = producer receipt HASH.
+# ARGV = delivery id, payload digest, canonical payload JSON, partition expiry,
+# receipt expiry.  A reused delivery id is accepted only for the exact payload.
+_IDEMPOTENT_ENQUEUE_LUA = r"""
+local now = redis.call('TIME')
+if tonumber(now[1]) >= tonumber(ARGV[4]) then
+  return -1
+end
+local existing = redis.call('HGET', KEYS[2], ARGV[1])
+if existing then
+  if existing ~= ARGV[2] then
+    return redis.error_reply('monitoring delivery id collision')
+  end
+  redis.call('EXPIREAT', KEYS[2], ARGV[5])
+  return 0
+end
+redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
+redis.call('RPUSH', KEYS[1], ARGV[3])
+redis.call('EXPIREAT', KEYS[1], ARGV[4])
+redis.call('EXPIREAT', KEYS[2], ARGV[5])
+return 1
+"""
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _monitor_spool_dir() -> str:
+    configured = str(settings.SUPERTABLE_MONITOR_SPOOL_DIR or "").strip()
+    if configured:
+        expanded = os.path.expanduser(configured)
+        if not os.path.isabs(expanded):
+            raise MonitoringDurabilityError(
+                "SUPERTABLE_MONITOR_SPOOL_DIR must be an absolute path"
+            )
+        return os.path.abspath(expanded)
+
+    # Resolve/create the application home only when monitoring is actually
+    # instantiated; importing ``supertable`` remains side-effect free.
+    from supertable.config.homedir import get_app_home
+
+    return os.path.join(get_app_home(), "monitoring-spool")
+
+
+@dataclass(frozen=True)
+class _SpoolRecord:
+    path: str
+    envelope: Dict[str, Any]
+    size: int
+
+
+class _DurableMonitoringSpool:
+    """Bounded, crash-durable, process-safe local monitoring WAL.
+
+    One immutable JSON file is published per event.  A process lock protects
+    capacity accounting and filesystem transitions, while Redis delivery is
+    intentionally outside that lock: concurrent retry is harmless because the
+    Redis Lua boundary is idempotent.  No failed event is retained in memory.
+    """
+
+    def __init__(
+        self,
+        root: str,
+        *,
+        max_bytes: int,
+        max_records: int,
+    ) -> None:
+        expanded_root = os.path.expanduser(str(root))
+        if not os.path.isabs(expanded_root):
+            raise MonitoringDurabilityError("monitoring spool path must be absolute")
+        root = os.path.abspath(expanded_root)
+        self.root = root
+        self.max_bytes = int(max_bytes)
+        self.max_records = int(max_records)
+        if self.max_bytes <= 0 or self.max_records <= 0:
+            raise MonitoringDurabilityError(
+                "monitoring spool byte and record limits must be positive"
+            )
+        self._thread_lock = threading.RLock()
+        self._lock_path = os.path.join(self.root, ".spool.lock")
+        self._ensure_secure_root()
+        with self._locked():
+            self._recover_temps_locked()
+
+    @staticmethod
+    def _fsync_directory(path: str) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(path, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _ensure_secure_root(self) -> None:
+        if fcntl is None:
+            raise MonitoringDurabilityError(
+                "durable monitoring spool requires POSIX fcntl locking on this "
+                "release; disable monitoring explicitly on unsupported hosts"
+            )
+        try:
+            # A newly-created directory is not crash-durable until the parent
+            # containing its directory entry has also been fsynced.  Remember
+            # the complete missing chain before makedirs() so nested configured
+            # paths get the same guarantee, all the way back to an ancestor
+            # that already existed.
+            missing_directories: list[str] = []
+            candidate = self.root
+            while not os.path.lexists(candidate):
+                missing_directories.append(candidate)
+                parent = os.path.dirname(candidate)
+                if parent == candidate:  # pragma: no cover - absolute root exists
+                    break
+                candidate = parent
+
+            os.makedirs(self.root, mode=0o700, exist_ok=True)
+            root_stat = os.lstat(self.root)
+            if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+                raise MonitoringDurabilityError(
+                    f"monitoring spool root is not a real directory: {self.root!r}"
+                )
+            if hasattr(os, "geteuid") and root_stat.st_uid != os.geteuid():
+                raise MonitoringDurabilityError(
+                    f"monitoring spool root is not owned by this process user: {self.root!r}"
+                )
+            os.chmod(self.root, 0o700)
+            self._fsync_directory(self.root)
+            # Always persist the root's directory entry as well.  This also
+            # repairs a pre-existing root created by an older process that did
+            # not fsync its parent.  For a newly-created nested path, continue
+            # deepest to shallowest until every new ancestor is reachable.
+            parent_directories = [os.path.dirname(self.root)]
+            parent_directories.extend(
+                os.path.dirname(created_directory)
+                for created_directory in missing_directories[1:]
+            )
+            for parent_directory in dict.fromkeys(parent_directories):
+                self._fsync_directory(parent_directory)
+        except MonitoringDurabilityError:
+            raise
+        except OSError as exc:
+            raise MonitoringDurabilityError(
+                f"could not initialize monitoring spool {self.root!r}: {exc}"
+            ) from exc
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        lock_module = fcntl
+        if lock_module is None:  # pragma: no cover - guarded during init
+            raise MonitoringDurabilityError(
+                "durable monitoring spool requires POSIX fcntl locking"
+            )
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        with self._thread_lock:
+            try:
+                fd = os.open(self._lock_path, flags, 0o600)
+            except OSError as exc:
+                raise MonitoringDurabilityError(
+                    f"could not open monitoring spool lock: {exc}"
+                ) from exc
+            try:
+                lock_stat = os.fstat(fd)
+                if not stat.S_ISREG(lock_stat.st_mode):
+                    raise MonitoringDurabilityError(
+                        "monitoring spool lock is not a regular file"
+                    )
+                os.fchmod(fd, 0o600)
+                lock_module.flock(fd, lock_module.LOCK_EX)
+                yield
+            except MonitoringDeliveryError:
+                raise
+            except OSError as exc:
+                raise MonitoringDurabilityError(
+                    f"monitoring spool lock operation failed: {exc}"
+                ) from exc
+            finally:
+                try:
+                    lock_module.flock(fd, lock_module.LOCK_UN)
+                finally:
+                    os.close(fd)
+
+    @staticmethod
+    def _key_hash(key: _MonitorKey) -> str:
+        return hashlib.sha256(key.path_key.encode("utf-8")).hexdigest()[:24]
+
+    @classmethod
+    def _final_name(cls, envelope: Dict[str, Any]) -> str:
+        key = _MonitorKey(
+            organization=str(envelope["organization"]),
+            monitor_type=str(envelope["monitor_type"]),
+        )
+        created_ns = int(envelope["created_ns"])
+        delivery_id = str(envelope["delivery_id"])
+        if (
+            len(delivery_id) != 32
+            or any(ch not in "0123456789abcdef" for ch in delivery_id)
+        ):
+            raise MonitoringDurabilityError("invalid monitoring delivery id in spool")
+        return (
+            f"{cls._key_hash(key)}-{created_ns:020d}-{delivery_id}.monitor.json"
+        )
+
+    @staticmethod
+    def _is_record_name(name: str) -> bool:
+        return name.endswith(".monitor.json") and not name.startswith(".")
+
+    @staticmethod
+    def _is_temp_name(name: str) -> bool:
+        return name.startswith(".") and name.endswith(".monitor.json.tmp")
+
+    def _safe_path(self, name: str) -> str:
+        if not name or name != os.path.basename(name):
+            raise MonitoringDurabilityError("invalid monitoring spool filename")
+        path = os.path.join(self.root, name)
+        if os.path.commonpath((self.root, path)) != self.root:
+            raise MonitoringDurabilityError("monitoring spool path escaped its root")
+        return path
+
+    def _read_bytes(self, path: str) -> bytes:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags)
+            try:
+                file_stat = os.fstat(fd)
+                if not stat.S_ISREG(file_stat.st_mode):
+                    raise MonitoringDurabilityError(
+                        f"monitoring spool entry is not a regular file: {path!r}"
+                    )
+                if file_stat.st_size <= 0 or file_stat.st_size > self.max_bytes:
+                    raise MonitoringDurabilityError(
+                        f"monitoring spool entry has invalid size: {path!r}"
+                    )
+                chunks: list[bytes] = []
+                remaining = file_stat.st_size
+                while remaining:
+                    chunk = os.read(fd, min(remaining, 1024 * 1024))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                data = b"".join(chunks)
+                if len(data) != file_stat.st_size:
+                    raise MonitoringDurabilityError(
+                        f"monitoring spool entry changed while reading: {path!r}"
+                    )
+                return data
+            finally:
+                os.close(fd)
+        except MonitoringDeliveryError:
+            raise
+        except OSError as exc:
+            raise MonitoringDurabilityError(
+                f"could not read monitoring spool entry {path!r}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _decode_envelope(data: bytes) -> Dict[str, Any]:
+        try:
+            envelope = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise MonitoringDurabilityError(
+                "monitoring spool contains a corrupt record"
+            ) from exc
+        if not isinstance(envelope, dict) or envelope.get("version") != _SPOOL_VERSION:
+            raise MonitoringDurabilityError(
+                "monitoring spool contains an unsupported record"
+            )
+        required = {
+            "delivery_id", "created_ns", "organization", "monitor_type",
+            "partition_date", "partition_key", "partition_expires_at",
+            "receipt_key", "receipt_expires_at", "payload_json",
+            "payload_sha256",
+        }
+        if not required.issubset(envelope):
+            raise MonitoringDurabilityError("monitoring spool record is incomplete")
+        try:
+            key = _MonitorKey(
+                organization=str(envelope["organization"]),
+                monitor_type=str(envelope["monitor_type"]),
+            )
+            date = str(envelope["partition_date"])
+            expected_partition = RK.monitor_partition(
+                key.organization, key.monitor_type, date,
+            )
+            expected_receipt = RK.monitor_partition_producer_receipts(
+                key.organization, key.monitor_type, date,
+            )
+            expires_at = int(envelope["partition_expires_at"])
+            receipt_expires_at = int(envelope["receipt_expires_at"])
+            created_ns = int(envelope["created_ns"])
+        except (TypeError, ValueError, KeyError) as exc:
+            raise MonitoringDurabilityError(
+                "monitoring spool record coordinates are invalid"
+            ) from exc
+        if (
+            envelope["partition_key"] != expected_partition
+            or envelope["receipt_key"] != expected_receipt
+            or expires_at != _partition_expire_at(date)
+            or receipt_expires_at
+            != expires_at + (_PRODUCER_RECEIPT_GRACE_DAYS * 86400)
+            or created_ns <= 0
+        ):
+            raise MonitoringDurabilityError(
+                "monitoring spool record coordinates failed validation"
+            )
+        payload_json = envelope["payload_json"]
+        digest = envelope["payload_sha256"]
+        if not isinstance(payload_json, str) or not isinstance(digest, str):
+            raise MonitoringDurabilityError("monitoring spool payload is invalid")
+        actual_digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        if digest != actual_digest:
+            raise MonitoringDurabilityError(
+                "monitoring spool payload digest failed validation"
+            )
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError as exc:
+            raise MonitoringDurabilityError(
+                "monitoring spool payload JSON is corrupt"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise MonitoringDurabilityError(
+                "monitoring spool payload must be a JSON object"
+            )
+        delivery_id = str(envelope["delivery_id"])
+        if (
+            len(delivery_id) != 32
+            or any(ch not in "0123456789abcdef" for ch in delivery_id)
+        ):
+            raise MonitoringDurabilityError("invalid monitoring delivery id")
+        envelope["payload"] = payload
+        envelope["partition_expires_at"] = expires_at
+        envelope["receipt_expires_at"] = receipt_expires_at
+        envelope["created_ns"] = created_ns
+        return envelope
+
+    def _recover_temps_locked(self) -> None:
+        changed = False
+        for entry in os.scandir(self.root):
+            if not self._is_temp_name(entry.name):
+                continue
+            path = self._safe_path(entry.name)
+            entry_stat = entry.stat(follow_symlinks=False)
+            if not stat.S_ISREG(entry_stat.st_mode):
+                raise MonitoringDurabilityError(
+                    f"unsafe monitoring spool temporary entry: {entry.name!r}"
+                )
+            # A crash before the temporary file was completely written/fsynced
+            # leaves an unacknowledged fragment.  It was never published and
+            # log_metric never returned, so discard that fragment instead of
+            # permanently bricking recovery.  A valid complete temp is the
+            # opposite crash point (after fsync, before replace) and is promoted.
+            if entry_stat.st_size == 0:
+                os.unlink(path)
+                changed = True
+                continue
+            data = self._read_bytes(path)
+            try:
+                envelope = self._decode_envelope(data)
+            except MonitoringDurabilityError:
+                os.unlink(path)
+                changed = True
+                logger.warning(
+                    "[monitor] discarded incomplete unacknowledged spool temp %s",
+                    entry.name,
+                )
+                continue
+            final_path = self._safe_path(self._final_name(envelope))
+            if os.path.lexists(final_path):
+                existing = self._read_bytes(final_path)
+                if existing != data:
+                    raise MonitoringDurabilityError(
+                        "monitoring spool temp/final record conflict"
+                    )
+                os.unlink(path)
+            else:
+                os.replace(path, final_path)
+            changed = True
+        if changed:
+            self._fsync_directory(self.root)
+
+    def _usage_locked(self) -> tuple[int, int]:
+        records = 0
+        total_bytes = 0
+        for entry in os.scandir(self.root):
+            if not (self._is_record_name(entry.name) or self._is_temp_name(entry.name)):
+                continue
+            entry_stat = entry.stat(follow_symlinks=False)
+            if not stat.S_ISREG(entry_stat.st_mode):
+                raise MonitoringDurabilityError(
+                    f"unsafe monitoring spool entry: {entry.name!r}"
+                )
+            records += 1
+            total_bytes += int(entry_stat.st_size)
+        return records, total_bytes
+
+    def enqueue(self, key: _MonitorKey, payload: Dict[str, Any]) -> _SpoolRecord:
+        try:
+            date = _today_utc_date()
+            partition_key = RK.monitor_partition(
+                key.organization, key.monitor_type, date,
+            )
+            receipt_key = RK.monitor_partition_producer_receipts(
+                key.organization, key.monitor_type, date,
+            )
+            expires_at = _partition_expire_at(date)
+            payload_json = _canonical_json(payload)
+            envelope: Dict[str, Any] = {
+                "version": _SPOOL_VERSION,
+                "delivery_id": uuid.uuid4().hex,
+                "created_ns": time.time_ns(),
+                "organization": key.organization,
+                "monitor_type": key.monitor_type,
+                "partition_date": date,
+                "partition_key": partition_key,
+                "partition_expires_at": expires_at,
+                "receipt_key": receipt_key,
+                "receipt_expires_at": (
+                    expires_at + (_PRODUCER_RECEIPT_GRACE_DAYS * 86400)
+                ),
+                "payload_json": payload_json,
+                "payload_sha256": hashlib.sha256(
+                    payload_json.encode("utf-8")
+                ).hexdigest(),
+            }
+            serialized = _canonical_json(envelope).encode("utf-8")
+        except MonitoringDeliveryError:
+            raise
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise MonitoringDurabilityError(
+                f"monitoring payload is not canonical JSON: {exc}"
+            ) from exc
+        if len(serialized) > self.max_bytes:
+            raise MonitoringBackpressureError(
+                "one monitoring record exceeds SUPERTABLE_MONITOR_SPOOL_MAX_BYTES"
+            )
+
+        final_name = self._final_name(envelope)
+        temp_name = f".{final_name}.tmp"
+        final_path = self._safe_path(final_name)
+        temp_path = self._safe_path(temp_name)
+        with self._locked():
+            self._recover_temps_locked()
+            record_count, byte_count = self._usage_locked()
+            if record_count + 1 > self.max_records:
+                raise MonitoringBackpressureError(
+                    "monitoring spool record cap reached; restore Redis delivery "
+                    "or increase SUPERTABLE_MONITOR_SPOOL_MAX_RECORDS"
+                )
+            if byte_count + len(serialized) > self.max_bytes:
+                raise MonitoringBackpressureError(
+                    "monitoring spool byte cap reached; restore Redis delivery "
+                    "or increase SUPERTABLE_MONITOR_SPOOL_MAX_BYTES"
+                )
+            flags = (
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            try:
+                fd = os.open(temp_path, flags, 0o600)
+                try:
+                    with os.fdopen(fd, "wb", closefd=False) as handle:
+                        handle.write(serialized)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                finally:
+                    os.close(fd)
+                os.replace(temp_path, final_path)
+                self._fsync_directory(self.root)
+            except OSError as exc:
+                raise MonitoringDurabilityError(
+                    f"could not durably publish monitoring spool record: {exc}"
+                ) from exc
+        decoded = self._decode_envelope(serialized)
+        return _SpoolRecord(final_path, decoded, len(serialized))
+
+    def pending(
+        self,
+        key: Optional[_MonitorKey] = None,
+        *,
+        limit: Optional[int] = None,
+    ) -> list[_SpoolRecord]:
+        prefix = self._key_hash(key) + "-" if key is not None else ""
+        with self._locked():
+            self._recover_temps_locked()
+            names = sorted(
+                entry.name
+                for entry in os.scandir(self.root)
+                if self._is_record_name(entry.name)
+                and (not prefix or entry.name.startswith(prefix))
+            )
+            if limit is not None:
+                names = names[:max(0, int(limit))]
+            records: list[_SpoolRecord] = []
+            for name in names:
+                path = self._safe_path(name)
+                data = self._read_bytes(path)
+                envelope = self._decode_envelope(data)
+                if self._final_name(envelope) != name:
+                    raise MonitoringDurabilityError(
+                        "monitoring spool filename does not match its record"
+                    )
+                if key is not None and (
+                    envelope["organization"] != key.organization
+                    or envelope["monitor_type"] != key.monitor_type
+                ):
+                    raise MonitoringDurabilityError(
+                        "monitoring spool key-hash collision"
+                    )
+                records.append(_SpoolRecord(path, envelope, len(data)))
+            return records
+
+    def count(self, key: Optional[_MonitorKey] = None) -> int:
+        return len(self.pending(key))
+
+    def delete(self, record: _SpoolRecord) -> None:
+        path = os.path.abspath(record.path)
+        if os.path.dirname(path) != self.root:
+            raise MonitoringDurabilityError("monitoring spool delete escaped its root")
+        with self._locked():
+            if not os.path.lexists(path):
+                # Another process delivered and durably removed this same
+                # idempotent record.
+                return
+            data = self._read_bytes(path)
+            current = self._decode_envelope(data)
+            if current["delivery_id"] != record.envelope["delivery_id"]:
+                raise MonitoringDurabilityError(
+                    "monitoring spool record changed before acknowledgement"
+                )
+            try:
+                os.unlink(path)
+                self._fsync_directory(self.root)
+            except OSError as exc:
+                raise MonitoringDurabilityError(
+                    f"could not durably remove delivered monitoring record: {exc}"
+                ) from exc
+
+
+def _deliver_spool_record(
+    record: _SpoolRecord,
+    redis_connector: Optional["RedisConnector"],
+    *,
+    ship_to_redis: bool,
+) -> bool:
+    """Return ``True`` only after Redis's idempotent Lua boundary replies."""
+    envelope = record.envelope
+    if not ship_to_redis:
+        if time.time() >= int(envelope["partition_expires_at"]):
+            raise MonitoringExpiredRecordError(
+                "monitoring record outlived its original partition retention "
+                f"window ({envelope['partition_date']}); it remains in the "
+                "spool and requires explicit operator disposition"
+            )
+        logger.debug(
+            "[monitor] %s/%s metric: %s",
+            envelope["organization"],
+            envelope["monitor_type"],
+            envelope["payload"],
+        )
+        return True
+    if redis_connector is None:
+        return False
+    try:
+        result = redis_connector.r.eval(
+            _IDEMPOTENT_ENQUEUE_LUA,
+            2,
+            envelope["partition_key"],
+            envelope["receipt_key"],
+            envelope["delivery_id"],
+            envelope["payload_sha256"],
+            envelope["payload_json"],
+            int(envelope["partition_expires_at"]),
+            int(envelope["receipt_expires_at"]),
+        )
+    except Exception as exc:
+        if "monitoring delivery id collision" in str(exc).lower():
+            raise MonitoringDurabilityError(
+                "Redis producer receipt conflicts with the spooled payload"
+            ) from exc
+        return False
+    if int(result) not in (0, 1):
+        if int(result) == -1:
+            raise MonitoringExpiredRecordError(
+                "Redis refused a monitoring record at/after its immutable "
+                f"partition expiry ({envelope['partition_date']}); the record "
+                "remains in the local spool"
+            )
+        raise MonitoringDurabilityError(
+            f"Redis returned an invalid monitoring receipt: {result!r}"
+        )
+    return True
+
+
+def drain_monitoring_spool(
+    *,
+    redis_connector: Optional["RedisConnector"] = None,
+    spool_dir: Optional[str] = None,
+    timeout_s: float = 30.0,
+    batch_max: int = 500,
+) -> int:
+    """Replay every durable monitoring WAL record after process restart.
+
+    This explicit recovery entry point is intentionally independent of the
+    per-tenant logger cache: an application startup/health worker can drain old
+    tenants even when they emit no new metric in the new process.  It returns
+    the number durably acknowledged by Redis and raises when any record remains
+    (network outage) or is corrupt/expired.  No record is deleted on failure.
+    """
+    spool = _DurableMonitoringSpool(
+        spool_dir or _monitor_spool_dir(),
+        max_bytes=settings.SUPERTABLE_MONITOR_SPOOL_MAX_BYTES,
+        max_records=settings.SUPERTABLE_MONITOR_SPOOL_MAX_RECORDS,
+    )
+    connector = redis_connector
+    if connector is None and RedisConnector is not None:
+        try:
+            connector = RedisConnector()
+        except Exception:
+            connector = None
+    deadline = time.time() + max(0.0, float(timeout_s))
+    delivered = 0
+    limit = max(1, int(batch_max))
+    while time.time() <= deadline:
+        records = spool.pending(limit=limit)
+        if not records:
+            return delivered
+        progressed = 0
+        for record in records:
+            if not _deliver_spool_record(
+                record, connector, ship_to_redis=True,
+            ):
+                break
+            spool.delete(record)
+            delivered += 1
+            progressed += 1
+        if progressed == 0:
+            break
+    pending = spool.count()
+    if pending:
+        raise MonitoringDeliveryError(
+            f"{pending} monitoring metric(s) remain durable in "
+            f"the local spool {spool.root!r} but unaccepted by Redis"
+        )
+    return delivered
+
+
 class _AsyncMonitoringLogger:
     """
-    Enqueue-only monitoring logger.
+    Redis-delivering monitoring logger backed by a bounded durable spool.
 
-    - log_metric(payload) -> puts payload into a bounded queue (never blocks)
-    - background thread drains and ships payloads to Redis list if available; else logs debug
-    - request_flush() drains any queued items synchronously (best-effort)
+    - ``log_metric`` returns after durable local acceptance (and opportunistic
+      Redis delivery), never after a volatile in-memory enqueue.
+    - the background thread retries spool records oldest-first.
+    - Redis delivery is idempotent by stable delivery ID + payload digest.
+    - spool-capacity/fsync failures are explicit backpressure, not drops.
     - exposes debug stats/locks/queue fields used by examples
     """
 
@@ -202,6 +943,10 @@ class _AsyncMonitoringLogger:
         ship_to_redis: bool = True,
         batch_max: int = 200,
         batch_wait_s: float = 0.05,
+        spool_dir: Optional[str] = None,
+        spool_max_bytes: Optional[int] = None,
+        spool_max_records: Optional[int] = None,
+        start_worker: bool = True,
     ):
         self._key = key
 
@@ -222,6 +967,19 @@ class _AsyncMonitoringLogger:
         self._ship_lock = threading.Lock()  # prevents request_flush() shipping concurrently with worker
         self._batch_max = int(batch_max)
         self._batch_wait_s = float(batch_wait_s)
+        if self._batch_max <= 0:
+            raise MonitoringDurabilityError("monitoring batch_max must be positive")
+        self._spool = _DurableMonitoringSpool(
+            spool_dir or _monitor_spool_dir(),
+            max_bytes=(
+                settings.SUPERTABLE_MONITOR_SPOOL_MAX_BYTES
+                if spool_max_bytes is None else int(spool_max_bytes)
+            ),
+            max_records=(
+                settings.SUPERTABLE_MONITOR_SPOOL_MAX_RECORDS
+                if spool_max_records is None else int(spool_max_records)
+            ),
+        )
 
         self._ship_to_redis = ship_to_redis
         self._redis = redis_connector
@@ -232,23 +990,16 @@ class _AsyncMonitoringLogger:
                 logger.debug(f"[monitor] redis unavailable for {self._key.path_key}: {e}")
                 self._redis = None
 
-        self._start_worker()
+        if start_worker:
+            self._start_worker()
 
     # --- context manager support ---
     def __enter__(self) -> "_AsyncMonitoringLogger":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        # Best-effort flush so metrics enqueued inside the `with` block
-        # are shipped to Redis before the scope closes.  This is critical
-        # for short-lived processes (CLI, Lambda) where the daemon thread
-        # would be killed on exit before it gets to drain the queue.
-        #
-        # We use _try_flush (non-blocking lock acquire) rather than
-        # request_flush to avoid blocking the caller for up to 50ms when
-        # the worker thread is in its batch-formation window holding
-        # _ship_lock.  If the lock is busy, the worker is actively
-        # shipping — the item will be delivered without our help.
+    def __exit__(self, exc_type, exc, tb) -> Literal[False]:
+        # Opportunistically ship the already-fsynced WAL before a short-lived
+        # scope exits. Skipping this retry cannot lose the metric.
         try:
             self._try_flush()
         except Exception:
@@ -258,8 +1009,16 @@ class _AsyncMonitoringLogger:
     # --- public API ---
     def log_metric(self, payload: Dict[str, Any]) -> None:
         """
-        Enqueue a metric. Never blocks the caller; if queue is full, drop the metric.
+        Durably enqueue a metric.
+
+        Returning means the exact record is durable either in Redis or in the
+        bounded local spool.  Redis outage is therefore safe and does not make
+        a committed data write fail.  If the spool cannot fsync/publish the
+        record or its hard cap is reached, a ``MonitoringDurabilityError`` is
+        raised and mutation callers must surface a post-commit outcome.
         """
+        if not isinstance(payload, dict):
+            raise MonitoringDurabilityError("monitoring payload must be a dict")
         if "recorded_at" not in payload or "instance_id" not in payload:
             payload = dict(payload)
             if "recorded_at" not in payload:
@@ -269,76 +1028,96 @@ class _AsyncMonitoringLogger:
         with self.queue_stats_lock:
             self.queue_stats["total_received"] += 1
 
-        try:
-            self.queue.put_nowait(payload)
-        except queue.Full:
-            with self.queue_stats_lock:
-                self.queue_stats["total_dropped"] += 1
-                self.queue_stats["current_size"] = self.queue.qsize()
-            logger.warning(f"[monitor] queue full; dropping metric for {self._key.path_key}")
-            return
-
-        with self.queue_stats_lock:
-            self.queue_stats["current_size"] = self.queue.qsize()
+        # Publish the WAL entry before any Redis I/O.  This closes the crash
+        # window where Redis could accept a write but its reply is lost, and it
+        # makes retry safe across process restart.
+        with self._ship_lock:
+            try:
+                self._spool.enqueue(self._key, payload)
+                # Oldest-first: a new live event never leaps over an existing
+                # outage backlog.  Network failure simply leaves the WAL intact.
+                self._deliver_pending(max_items=self._batch_max)
+                self._refresh_size()
+            except MonitoringDeliveryError:
+                raise
+            except Exception as exc:
+                # No enabled-monitoring call site may mistake a pre-WAL runtime
+                # failure for optional telemetry.  If publication succeeded,
+                # the record remains durable; if it did not, this explicit
+                # error prevents an acknowledged gap.
+                raise MonitoringDurabilityError(
+                    f"monitoring durable enqueue failed: {exc}"
+                ) from exc
 
     def request_flush(self, timeout_s: float = 2.0) -> None:
         """
-        Best-effort synchronous flush.
+        Synchronously retry this logger's durable backlog.
 
-        Drains the current queue and ships items in the caller thread.
-
-        It does NOT guarantee flushing an item already dequeued by the background worker,
-        but the ship lock ensures we don't double-ship.
+        Raises ``MonitoringDeliveryError`` when Redis remains unavailable;
+        records stay fsynced in the spool.  Durability/corruption/expiry errors
+        are stronger failures and are never converted to best-effort success.
         """
         deadline = time.time() + max(0.0, float(timeout_s))
-
-        # Block worker shipping while we drain & ship queued items.
         with self._ship_lock:
-            batch = self._drain_batch(deadline=deadline, allow_wait=False)
-            if not batch:
-                return
-            self._set_current_batch(batch)
-            try:
-                self._ship_batch(batch)
-            finally:
-                self._clear_current_batch()
+            while time.time() <= deadline:
+                before = self._spool.count(self._key)
+                if before == 0:
+                    self._refresh_size()
+                    return
+                delivered = self._deliver_pending(max_items=self._batch_max)
+                if delivered == 0:
+                    break
+            pending = self._spool.count(self._key)
+            self._refresh_size(pending=pending)
+        if pending:
+            raise MonitoringDeliveryError(
+                f"{pending} monitoring metric(s) for {self._key.path_key} "
+                "remain unaccepted by Redis but durable locally"
+            )
 
-        with self.queue_stats_lock:
-            self.queue_stats["current_size"] = self.queue.qsize()
-
-    def _try_flush(self) -> None:
-        """
-        Low-contention flush used by __exit__.
-
-        Attempts a non-blocking lock acquire first.  If the worker is
-        currently holding _ship_lock, falls back to a short blocking
-        wait (100ms) — just long enough for the worker to finish its
-        current batch without adding meaningful latency to the caller.
-
-        This avoids the two failure modes:
-          - Blocking request_flush(2s) injected 50ms+ latency every call.
-          - Pure non-blocking skip lost metrics in short-lived processes
-            (CLI, Lambda) when the worker held the lock at exit time.
-        """
-        acquired = self._ship_lock.acquire(blocking=True, timeout=0.1)
+    def close_if_idle(self, timeout_s: float = 0.5) -> bool:
+        """Stop this worker only after proving it owns no undelivered data."""
+        acquired = self._ship_lock.acquire(
+            blocking=True, timeout=max(0.0, float(timeout_s)),
+        )
         if not acquired:
-            # Worker is mid-ship and slower than 100ms (e.g., Redis latency).
-            # In a long-lived process the daemon will deliver it.
-            return
+            return False
         try:
-            batch = self._drain_batch(deadline=time.time() + 0.5, allow_wait=False)
-            if not batch:
-                return
-            self._set_current_batch(batch)
-            try:
-                self._ship_batch(batch)
-            finally:
-                self._clear_current_batch()
+            idle = (
+                self._spool.count(self._key) == 0
+                and not self.current_batch
+                and self.queue.empty()
+            )
+            if not idle:
+                return False
+            self._stop.set()
         finally:
             self._ship_lock.release()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, float(timeout_s)))
+        return thread is None or not thread.is_alive()
 
-        with self.queue_stats_lock:
-            self.queue_stats["current_size"] = self.queue.qsize()
+    def close_for_eviction(self, timeout_s: float = 0.5) -> bool:
+        """Stop a cache worker while leaving all pending WAL files durable."""
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, float(timeout_s)))
+        return thread is None or not thread.is_alive()
+
+    def _try_flush(self) -> None:
+        """Low-contention opportunistic retry used by ``__exit__``."""
+        acquired = self._ship_lock.acquire(blocking=True, timeout=0.1)
+        if not acquired:
+            # Unlike the old in-memory queue, skipping here cannot lose an
+            # event: ``log_metric`` already fsynced it before returning.
+            return
+        try:
+            self._deliver_pending(max_items=self._batch_max)
+            self._refresh_size()
+        finally:
+            self._ship_lock.release()
 
     # --- internals ---
     def _start_worker(self) -> None:
@@ -356,66 +1135,79 @@ class _AsyncMonitoringLogger:
         backoff = 0.1
         while not self._stop.is_set():
             try:
-                # Block until we have at least 1 item.
-                first = self.queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            try:
                 with self._ship_lock:
-                    batch = [first]
-                    batch.extend(self._drain_more(max_items=self._batch_max - 1, wait_s=self._batch_wait_s))
-                    self._set_current_batch(batch)
-                    try:
-                        self._ship_batch(batch)
-                    finally:
-                        self._clear_current_batch()
-                backoff = 0.1
+                    pending = self._spool.count(self._key)
+                    delivered = (
+                        self._deliver_pending(max_items=self._batch_max)
+                        if pending else 0
+                    )
+                    self._refresh_size()
+                if not pending:
+                    self._stop.wait(0.1)
+                elif delivered == 0:
+                    logger.warning(
+                        "[monitor] %d metric(s) durable in local spool for %s",
+                        pending, self._key.path_key,
+                    )
+                    self._stop.wait(backoff)
+                    backoff = min(5.0, backoff * 2.0)
+                else:
+                    backoff = 0.1
+            except MonitoringExpiredRecordError as exc:
+                # Never recreate/re-date an old partition after its producer
+                # receipts expire.  The immutable file stays for explicit
+                # operator disposition and naturally applies backpressure.
+                logger.error("[monitor] fail-closed spool record: %s", exc)
+                self._stop.wait(5.0)
             except Exception as e:
-                logger.warning(f"[monitor] ship failed (non-fatal) for {self._key.path_key}: {e}")
-                time.sleep(backoff)
+                self._clear_current_batch()
+                logger.warning(f"[monitor] spool retry failed for {self._key.path_key}: {e}")
+                self._stop.wait(backoff)
                 backoff = min(5.0, backoff * 2.0)
             finally:
-                with self.queue_stats_lock:
-                    self.queue_stats["current_size"] = self.queue.qsize()
-
-    def _drain_more(self, *, max_items: int, wait_s: float) -> list:
-        """
-        Drain additional items (best-effort) up to max_items, waiting briefly to form a batch.
-        """
-        items = []
-        if max_items <= 0:
-            return items
-
-        # Small wait: allows parallel writers to contribute to the same batch.
-        if wait_s > 0:
-            end = time.time() + wait_s
-            while time.time() < end and len(items) < max_items:
                 try:
-                    items.append(self.queue.get_nowait())
-                except queue.Empty:
-                    time.sleep(0.001)
+                    self._refresh_size()
+                except MonitoringDeliveryError:
+                    pass
 
-        while len(items) < max_items:
-            try:
-                items.append(self.queue.get_nowait())
-            except queue.Empty:
-                break
+    @property
+    def _retry_batch(self) -> list[Dict[str, Any]]:
+        """Compatibility debug view backed by disk, never by volatile memory."""
+        return [record.envelope["payload"] for record in self._spool.pending(self._key)]
 
-        return items
+    def _refresh_size(self, *, pending: Optional[int] = None) -> None:
+        if pending is None:
+            pending = self._spool.count(self._key)
+        with self.queue_stats_lock:
+            self.queue_stats["current_size"] = self.queue.qsize() + pending
 
-    def _drain_batch(self, *, deadline: float, allow_wait: bool) -> list:
-        batch = []
-        while time.time() <= deadline:
-            try:
-                batch.append(self.queue.get_nowait())
-            except queue.Empty:
-                break
-            if len(batch) >= self._batch_max:
-                break
-            if allow_wait:
-                time.sleep(0.001)
-        return batch
+    def _deliver_pending(self, *, max_items: int) -> int:
+        records = self._spool.pending(self._key, limit=max_items)
+        if not records:
+            return 0
+        self._set_current_batch([
+            record.envelope["payload"] for record in records
+        ])
+        delivered = 0
+        try:
+            for record in records:
+                accepted = _deliver_spool_record(
+                    record,
+                    self._redis,
+                    ship_to_redis=self._ship_to_redis,
+                )
+                if not accepted:
+                    # Preserve global order: later records cannot leapfrog the
+                    # first Redis-unaccepted record.
+                    break
+                self._spool.delete(record)
+                delivered += 1
+        finally:
+            self._clear_current_batch()
+        if delivered:
+            with self.queue_stats_lock:
+                self.queue_stats["total_processed"] += delivered
+        return delivered
 
     def _set_current_batch(self, batch: list) -> None:
         with self.queue_stats_lock:
@@ -424,69 +1216,6 @@ class _AsyncMonitoringLogger:
     def _clear_current_batch(self) -> None:
         with self.queue_stats_lock:
             self.current_batch = []
-
-    def _ship_batch(self, batch: list) -> None:
-        """
-        Ship a batch.  Only counts items as processed after successful delivery.
-        On total failure (Redis down, fallback also fails), items are counted as
-        dropped so stats remain accurate.
-
-        Each batch resolves the target Redis key fresh via
-        ``_MonitorKey.redis_partition_today()`` — that picks today's
-        partition under the daily-partitioned key layout
-        (``supertable:{org}:monitor:{type}:doc:{YYYY-MM-DD}``). A batch
-        that crosses the UTC day boundary lands on whichever side of
-        midnight the resolution runs; nothing is lost.
-
-        The same call returns the partition's absolute expiry, applied
-        with one ``EXPIREAT`` per batch so every partition self-destructs
-        at most ``_MONITOR_TTL_DAYS`` after its date (idempotent — the
-        timestamp is fixed per date, so re-shipping never extends it).
-        """
-        shipped = 0
-        if self._ship_to_redis and self._redis is not None:
-            try:
-                target_key, expire_at = self._key.redis_partition_today()
-                pipe = self._redis.r.pipeline()
-                for payload in batch:
-                    s = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-                    pipe.rpush(target_key, s)
-                pipe.expireat(target_key, expire_at)
-                pipe.execute()
-                shipped = len(batch)
-            except Exception:
-                # Pipeline failed — fall back to per-item shipping.
-                for payload in batch:
-                    try:
-                        self._ship_one(payload)
-                        shipped += 1
-                    except Exception:
-                        pass
-        else:
-            for payload in batch:
-                try:
-                    self._ship_one(payload)
-                    shipped += 1
-                except Exception:
-                    pass
-
-        failed = len(batch) - shipped
-        with self.queue_stats_lock:
-            self.queue_stats["total_processed"] += shipped
-            if failed > 0:
-                self.queue_stats["total_dropped"] += failed
-
-    def _ship_one(self, payload: Dict[str, Any]) -> None:
-        if not self._ship_to_redis or self._redis is None:
-            logger.debug(f"[monitor] {self._key.path_key} metric: {payload}")
-            return
-
-        s = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        # RedisConnector in your code exposes "r" as the redis client.
-        target_key, expire_at = self._key.redis_partition_today()
-        self._redis.r.rpush(target_key, s)
-        self._redis.r.expireat(target_key, expire_at)
-
 
 # ---- singleton cache (one worker per key) ----
 # Bounded to prevent unbounded thread/Redis-connection growth in multi-tenant
@@ -497,7 +1226,7 @@ _MONITORS_LOCK = threading.Lock()
 _MONITORS_MAX = settings.SUPERTABLE_MONITOR_CACHE_MAX
 
 
-def _evict_oldest_monitor() -> None:
+def _evict_oldest_monitor() -> bool:
     """
     Evict one entry from _MONITORS.  Must be called with _MONITORS_LOCK held.
 
@@ -512,15 +1241,26 @@ def _evict_oldest_monitor() -> None:
     Call supertable.redis_connector.close_all_redis_clients() at process
     shutdown if a clean teardown is required.
     """
-    if not _MONITORS:
-        return
-    oldest_key = next(iter(_MONITORS))
-    evicted = _MONITORS.pop(oldest_key)
-    # Signal the background worker to exit its loop gracefully.
-    stop_event = getattr(evicted, "_stop", None)
-    if stop_event is not None:
-        stop_event.set()
-    logger.debug(f"[monitor] evicted cached logger for {oldest_key}")
+    for oldest_key, candidate in tuple(_MONITORS.items()):
+        close_if_idle = getattr(candidate, "close_if_idle", None)
+        if callable(close_if_idle) and bool(close_if_idle(timeout_s=0.5)):
+            _MONITORS.pop(oldest_key, None)
+            logger.debug(f"[monitor] evicted idle cached logger for {oldest_key}")
+            return True
+        # Pending records are no longer owned by volatile worker memory: they
+        # are immutable files in the shared spool.  It is therefore safe to
+        # stop an old tenant worker under cache pressure; the global recovery
+        # API or a future logger for that key will resume the WAL.
+        close_for_eviction = getattr(candidate, "close_for_eviction", None)
+        if callable(close_for_eviction) and bool(
+            close_for_eviction(timeout_s=0.5)
+        ):
+            _MONITORS.pop(oldest_key, None)
+            logger.debug(
+                f"[monitor] evicted cached logger with durable WAL for {oldest_key}"
+            )
+            return True
+    return False
 
 
 def _monitoring_enabled() -> bool:
@@ -537,7 +1277,9 @@ def get_monitoring_logger(
     """
     Return a monitoring logger (context manager + log_metric + request_flush + debug fields).
 
-    This function never raises; on any failure it returns a NullMonitoringLogger.
+    Disabled monitoring returns a ``NullMonitoringLogger``. With monitoring
+    enabled, invalid configuration, spool durability/capacity failures and an
+    un-stoppable full worker cache raise ``MonitoringDeliveryError``.
 
     Per-supertable attribution is encoded **in the payload**, not in
     the Redis key — callers include a ``supertables: [str]`` field in
@@ -551,20 +1293,34 @@ def get_monitoring_logger(
     cache_key = key.path_key
 
     try:
+        # Validate tenant/type before allocating a thread or touching the cache.
+        key.redis_partition_today()
         with _MONITORS_LOCK:
             existing = _MONITORS.get(cache_key)
             if existing is not None:
+                # Dict order is the bounded cache's LRU order.
+                _MONITORS.pop(cache_key)
+                _MONITORS[cache_key] = existing
                 return existing
-            # Evict oldest entry if cache is at capacity.
-            if len(_MONITORS) >= _MONITORS_MAX:
-                _evict_oldest_monitor()
+            if _MONITORS_MAX <= 0:
+                raise MonitoringBackpressureError(
+                    "SUPERTABLE_MONITOR_CACHE_MAX must be positive when monitoring is enabled"
+                )
+            if len(_MONITORS) >= _MONITORS_MAX and not _evict_oldest_monitor():
+                raise MonitoringBackpressureError(
+                    "monitoring logger cache is full and every candidate owns "
+                    "a worker that could not be stopped; the new metric was not spooled"
+                )
             mon = _AsyncMonitoringLogger(key, redis_connector=redis_connector)
             _MONITORS[cache_key] = mon
             return mon
+    except MonitoringDeliveryError:
+        raise
     except Exception as e:
-        # Keep this string, since you already log/grep for it.
-        logger.warning(f"Monitoring logging failed (non-fatal): {e}")
-        return NullMonitoringLogger()
+        logger.warning(f"Monitoring logging failed: {e}")
+        raise MonitoringDurabilityError(
+            f"could not create monitoring logger for {cache_key}: {e}"
+        ) from e
 
 
 class MonitoringWriter:

@@ -259,6 +259,12 @@ class TestEnforceRetention:
     ) -> None:
         monkeypatch.setattr(retention, "is_legal_hold_active", lambda org: False)
 
+        # Import storage while the complete production settings object is
+        # installed.  This test replaces that singleton below with a focused
+        # retention-only stub; lazy-importing storage afterwards would make
+        # unrelated defaults initialization observe the incomplete stub.
+        import supertable.storage.storage_factory as sf
+
         import supertable.config.settings as settings_module
         monkeypatch.setattr(
             settings_module,
@@ -292,8 +298,6 @@ class TestEnforceRetention:
         class FakeStorage:
             def delete(self, path: str) -> None:
                 deleted_paths.append(path)
-
-        import supertable.storage.storage_factory as sf
 
         monkeypatch.setattr(sf, "get_storage", lambda: FakeStorage(), raising=True)
 
