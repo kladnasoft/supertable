@@ -484,12 +484,9 @@ CASES.append({
     "sql": """
         SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.fk = t.id)
     """,
-    # With multiple tables, unqualified columns are ambiguous.
-    # Qualified columns: t.id via u.fk = t.id (but 'a' is unqualified with multi-table)
-    # sqlglot sees two tables: t, u. unqualified 'a' -> ambiguous -> ignored.
-    # t.id -> table "t", column "id"
-    # u.fk -> table "u", column "fk"
-    "expect": {"t": ["id"], "u": ["fk"]},
+    # Scope-local resolution assigns the outer unqualified projection to its
+    # sole direct source. The correlated predicates remain explicitly bound.
+    "expect": {"t": sorted(["a", "id"]), "u": ["fk"]},
 })
 
 
@@ -817,12 +814,9 @@ CASES.append({
         )
         SELECT a, total FROM summary ORDER BY total DESC
     """,
-    # The outer query references 'summary' which is a CTE.
-    # The inner query references 't' with columns a, b.
-    # NOTE: The parser treats CTE names as tables. With multiple tables
-    # (t + summary), unqualified columns become ambiguous.
-    # The outer SELECT * on 'summary' yields star semantics.
-    "expect": {"summary": [], "t": []},
+    # The CTE body has one direct physical source, so a and b belong to t.
+    # Derived output names remain attached to summary and never reach t.
+    "expect": {"summary": [], "t": sorted(["a", "b"])},
 })
 
 CASES.append({
@@ -836,9 +830,12 @@ CASES.append({
         SELECT category, SUM(amount) AS cat_total
         FROM base GROUP BY category ORDER BY cat_total DESC
     """,
-    # NOTE: Parser treats CTE name 'base' as a table. With multiple tables
-    # (orders + base), unqualified columns are ambiguous -> star semantics.
-    "expect": {"orders": [], "base": []},
+    # The CTE body has one direct physical source. Outer derived columns do
+    # not leak through base into orders.
+    "expect": {
+        "orders": sorted(["amount", "category", "id"]),
+        "base": [],
+    },
 })
 
 
@@ -867,10 +864,9 @@ CASES.append({
         SELECT a, b FROM t
         WHERE b > (SELECT AVG(b) FROM t AS t2 WHERE t2.a = t.a)
     """,
-    # Two aliases for table 't': 't' and 't2'
-    # Inside the subquery AVG(b) is unqualified with two tables -> ambiguous.
-    # Only t2.a and t.a are qualified.
-    "expect": {"t": sorted(["a", "b"]), "t2": ["a"]},
+    # Each SELECT resolves unqualified columns against its sole direct source;
+    # the qualified correlation stays bound to the stated aliases.
+    "expect": {"t": sorted(["a", "b"]), "t2": sorted(["a", "b"])},
 })
 
 CASES.append({
@@ -881,11 +877,12 @@ CASES.append({
         SELECT a, (SELECT MAX(val) FROM scores WHERE scores.ref = t.id) AS max_score
         FROM t ORDER BY max_score DESC
     """,
-    # 'max_score' is an alias — should not be collected.
-    # Qualified refs: scores.ref, t.id
-    # Unqualified: 'a' is ambiguous with two tables -> depends on impl
-    # Actually t is one alias, scores is another -> 2 tables -> unqualified ignored
-    "expect": {"t": ["id"], "scores": ["ref"]},
+    # Each SELECT has one direct source: outer a belongs to t and inner val
+    # belongs to scores. max_score is derived and is not projected from either.
+    "expect": {
+        "t": sorted(["a", "id"]),
+        "scores": sorted(["ref", "val"]),
+    },
 })
 
 
@@ -1017,10 +1014,8 @@ CASES.append({
         UNION ALL
         SELECT c, d FROM t2
     """,
-    # NOTE: Parser sees two tables. With UNION, sqlglot restructures the AST
-    # such that the SELECT on each branch triggers star-like handling for
-    # multiple tables with unqualified columns.
-    "expect": {"t1": [], "t2": []},
+    # Set-operation branches are independent scopes with one direct source each.
+    "expect": {"t1": sorted(["a", "b"]), "t2": sorted(["c", "d"])},
 })
 
 CASES.append({
@@ -1033,8 +1028,8 @@ CASES.append({
         SELECT a, b FROM t2
         ORDER BY a
     """,
-    # NOTE: Same multi-table ambiguity as union_001.
-    "expect": {"t1": [], "t2": []},
+    # Set-operation branches are independent scopes with one direct source each.
+    "expect": {"t1": sorted(["a", "b"]), "t2": sorted(["a", "b"])},
 })
 
 
@@ -1142,11 +1137,9 @@ CASES.append({
         SELECT EXTRACT(YEAR FROM created_at) AS yr, COUNT(*) AS cnt
         FROM t GROUP BY yr ORDER BY cnt DESC
     """,
-    # NOTE: 'yr' in GROUP BY is an alias reference, but the parser's alias-skip
-    # only covers ORDER BY/HAVING/QUALIFY. GROUP BY alias refs (a MySQL/DuckDB
-    # extension) are not filtered — 'yr' is collected as a physical column.
-    # This is a known limitation, not a regression from the fix.
-    "expect": {"t": sorted(["created_at", "yr"])},
+    # DuckDB resolves yr to this Select's derived alias.  It must not become a
+    # Parquet projection; created_at is the alias expression's only leaf.
+    "expect": {"t": ["created_at"]},
 })
 
 CASES.append({
@@ -1218,11 +1211,8 @@ CASES.append({
     # cohort_week and active_week are aliases from expressions -> skip in ORDER BY
     # active_users is alias from COUNT -> skip in ORDER BY
     # Physical columns: first_seen (inside DATE_TRUNC), activity_date, user_id
-    # NOTE: GROUP BY cohort_week, active_week are alias references that the
-    # parser doesn't yet filter (GROUP BY alias-skip not implemented).
     "expect": {
-        "user_activity": sorted(["active_week", "activity_date", "cohort_week",
-                                  "first_seen", "user_id"]),
+        "user_activity": sorted(["activity_date", "first_seen", "user_id"]),
     },
 })
 
@@ -1268,9 +1258,13 @@ CASES.append({
         FROM weekly
         ORDER BY weekly_sales DESC
     """,
-    # NOTE: Parser treats CTE names (daily, weekly) as tables. With three
-    # tables, all unqualified columns become ambiguous -> star semantics.
-    "expect": {"transactions": [], "daily": [], "weekly": []},
+    # Only the leaf CTE body projects physical columns. Derived daily/weekly
+    # output aliases do not flow back into transactions.
+    "expect": {
+        "transactions": sorted(["date", "region", "sales"]),
+        "daily": [],
+        "weekly": [],
+    },
 })
 
 CASES.append({
@@ -1830,13 +1824,9 @@ CASES.append({
             ) inner_q GROUP BY x
         ) outer_q ORDER BY total DESC
     """,
-    # 't' is the only real table found by find_all(Table). Subquery aliases
-    # (inner_q, outer_q) are not registered as tables. With a single table,
-    # all unqualified Column nodes map to 't'. The outer SELECT has no Alias
-    # nodes (x and total are bare Column refs into the subquery), so 'total'
-    # in ORDER BY is not recognized as a SELECT alias — it's collected.
-    # This is a pre-existing parser limitation for deeply nested subqueries.
-    "expect": {"t": sorted(["total", "x", "y"])},
+    # x, y, and total are derived-scope names and must not be projected from
+    # the physical leaf. Their exact leaf dependencies are a and b.
+    "expect": {"t": ["a", "b"]},
 })
 
 CASES.append({
@@ -1874,10 +1864,12 @@ CASES.append({
         SELECT a, b FROM t
         WHERE a IN (SELECT x FROM u WHERE u.y > 10)
     """,
-    # Multi-table: unqualified a, b ambiguous? No — 'a' and 'b' are in main query
-    # but with two tables (t, u), unqualified columns are ambiguous per the parser rules.
-    # u.y is qualified. 'x' is unqualified with two tables -> ambiguous -> skipped.
-    "expect": {"t": [], "u": ["y"]},
+    # Outer a/b resolve to t; inner x and qualified y resolve to u. The two
+    # SELECT scopes do not make their unqualified columns mutually ambiguous.
+    "expect": {
+        "t": sorted(["a", "b"]),
+        "u": sorted(["x", "y"]),
+    },
 })
 
 
@@ -2235,13 +2227,12 @@ CASES.append({
         FROM employees GROUP BY dept
         HAVING avg_sal > (SELECT AVG(salary) FROM employees AS e2)
     """,
-    # Two table aliases: employees (outer), e2 (subquery). The parser's
-    # find_all(Table) sees both but the outer SELECT context has 'employees'
-    # as the first (and contextually only) alias for unqualified columns
-    # in its scope. The subquery's AVG(salary) with 'salary' unqualified
-    # falls through to the single-alias resolution for the outer employees table.
-    # avg_sal in HAVING → alias → skipped.
-    "expect": {"employees": sorted(["dept", "salary"]), "e2": []},
+    # Both SELECT scopes have one direct source. avg_sal is derived and skipped;
+    # the inner unqualified salary belongs to e2 rather than the outer table.
+    "expect": {
+        "employees": sorted(["dept", "salary"]),
+        "e2": ["salary"],
+    },
 })
 
 CASES.append({
@@ -2945,9 +2936,8 @@ CASES.append({
         SELECT DATE_PART('hour', ts) AS hour_of_day, COUNT(*) AS cnt
         FROM events GROUP BY hour_of_day ORDER BY cnt DESC
     """,
-    # NOTE: hour_of_day in GROUP BY is alias ref → parser collects as physical
-    # (GROUP BY alias-skip not implemented). cnt in ORDER BY → alias → skipped.
-    "expect": {"events": sorted(["hour_of_day", "ts"])},
+    # Both clause references are local derived aliases; ts is the only leaf.
+    "expect": {"events": ["ts"]},
 })
 
 CASES.append({
@@ -2958,7 +2948,7 @@ CASES.append({
         SELECT STRFTIME(ts, '%Y-%m') AS month_str, SUM(val) AS total
         FROM t GROUP BY month_str ORDER BY total DESC
     """,
-    "expect": {"t": sorted(["month_str", "ts", "val"])},
+    "expect": {"t": sorted(["ts", "val"])},
 })
 
 CASES.append({
@@ -2971,9 +2961,8 @@ CASES.append({
         GROUP BY day
         ORDER BY daily_count DESC
     """,
-    # 'day' in GROUP BY → collected as physical (GROUP BY alias-skip not impl.)
-    # 'daily_count' in ORDER BY → alias → skipped
-    "expect": {"events": sorted(["created_at", "day"])},
+    # day and daily_count are local derived aliases, never source columns.
+    "expect": {"events": ["created_at"]},
 })
 
 
@@ -3929,11 +3918,9 @@ CASES.append({
         )
         SELECT a, total FROM summary ORDER BY total DESC
     """,
-    # CTE 'summary' is filtered out. Only 't' remains.
-    # Columns from inside the CTE body are collected for 't'.
-    # However, with two "tables" (t + summary) in the parser's view,
-    # unqualified columns become ambiguous -> star semantics -> [].
-    "expect_physical": {"t": []},
+    # CTE 'summary' is filtered out. Its body has one direct physical source,
+    # so the true leaf columns are retained for t.
+    "expect_physical": {"t": sorted(["a", "b"])},
 })
 
 CASES.append({
@@ -3978,9 +3965,9 @@ CASES.append({
         FROM weekly
         ORDER BY weekly_sales DESC
     """,
-    # CTEs 'daily' and 'weekly' excluded. Only 'transactions' remains.
-    # Multi-table ambiguity causes star semantics.
-    "expect_physical": {"transactions": []},
+    # CTEs 'daily' and 'weekly' are excluded. Scope-local resolution retains
+    # only the true columns used by the transactions leaf.
+    "expect_physical": {"transactions": sorted(["date", "region", "sales"])},
 })
 
 CASES.append({
@@ -3995,9 +3982,11 @@ CASES.append({
         FROM orders o
         WHERE o.order_id IN (SELECT order_id FROM top_orders)
     """,
-    # CTE 'top_orders' excluded. 'orders' appears in CTE body AND outer query.
-    # Both aliases ('orders' inside CTE, 'o' outside) point to same table -> merged.
-    "expect_physical": {"orders": []},
+    # CTE 'top_orders' is excluded. The two physical orders references merge
+    # their scope-local columns; the derived CTE order_id does not add another.
+    "expect_physical": {
+        "orders": sorted(["amount", "order_id", "status"]),
+    },
 })
 
 CASES.append({
@@ -4427,6 +4416,57 @@ try:
                 f"  Expected: {expect_physical}\n"
                 f"  Actual:   {actual_physical}"
             )
+
+    def test_read_path_rejects_mutating_cte_recursively():
+        with pytest.raises(ValueError, match="Only read-only"):
+            SQLParser(
+                "lake",
+                "WITH changed AS (DELETE FROM card RETURNING *) "
+                "SELECT * FROM changed",
+                "duckdb",
+            )
+
+    def test_read_path_keeps_scalar_replace_function_available():
+        parser = SQLParser(
+            "lake",
+            "SELECT REPLACE(name, 'a', 'b') FROM card",
+            "duckdb",
+        )
+        assert parser.get_physical_tables()[0].columns == ["name"]
+
+    def test_quality_profile_aliases_never_become_parquet_columns():
+        """Pin the DataEstimator regression on production quality SQL."""
+        from supertable.quality.checker import (
+            build_deep_numeric_sql,
+            build_deep_string_sql,
+        )
+
+        cases = (
+            (build_deep_numeric_sql("lake.facts", "amount", "DOUBLE"), ["amount"]),
+            (build_deep_string_sql("lake.facts", "label"), ["label"]),
+        )
+        for sql, expected in cases:
+            physical = SQLParser("lake", sql, "duckdb").get_physical_tables()
+            assert [(table.simple_name, table.columns) for table in physical] == [
+                ("facts", expected)
+            ]
+
+    def test_qualified_derived_alias_does_not_rebind_to_outer_physical_alias():
+        parser = SQLParser(
+            "lake",
+            "SELECT d.id, (SELECT q.secret FROM "
+            "(SELECT public_value AS secret FROM inner_table) q) "
+            "FROM outer_table d",
+            "duckdb",
+        )
+        physical = {
+            table.simple_name: table.columns
+            for table in parser.get_physical_tables()
+        }
+        assert physical == {
+            "inner_table": ["public_value"],
+            "outer_table": ["id"],
+        }
 except ImportError:
     pass  # pytest not installed — standalone runner still works via __main__
 

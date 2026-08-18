@@ -86,7 +86,7 @@ def _schema_list_from_polars_df(model_df: Any) -> List[Dict[str, Any]]:
             }
         )
     return out
-from supertable.rbac.access_control import check_write_access
+from supertable.rbac.access_control import check_control_access, check_write_access
 
 
 class SimpleTable:
@@ -211,7 +211,7 @@ class SimpleTable:
             )
 
     def delete(self, role_name: str) -> None:
-        check_write_access(
+        check_control_access(
             super_name=self.super_table.super_name,
             organization=self.super_table.organization,
             role_name=role_name,

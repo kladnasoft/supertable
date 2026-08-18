@@ -56,6 +56,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
+            "supertable-privileged-audit-worker=supertable.audit.privileged_worker:main",
             "supertable-demo-quickstart=supertable.demo.quickstart.controller:main",
             "supertable-demo-webshop-generate=supertable.demo.webshop.generate:main",
             "supertable-demo-webshop-load=supertable.demo.webshop.load:main",

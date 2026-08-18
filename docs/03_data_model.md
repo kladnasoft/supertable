@@ -41,7 +41,7 @@ Key responsibilities:
 | **Redis root pointer** | Ensures a `meta:root` key exists via `RedisCatalog.ensure_root()`. |
 | **RBAC scaffolding** | Initializes `RoleManager` and `UserManager` on first creation. |
 | **Snapshot reading** | `read_simple_table_snapshot(path)` reads the heavy JSON from storage. |
-| **Deletion** | `delete(role_name)` removes both storage data and all Redis keys under the supertable prefix. |
+| **Deletion** | `delete(role_name)` removes storage data and data/metadata Redis keys. RBAC role/user state is retained and can only be changed through the mandatory audited RBAC APIs. |
 
 The `identity` field is always `"super"`, used in path construction:
 

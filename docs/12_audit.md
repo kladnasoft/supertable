@@ -1,9 +1,259 @@
 # 12 -- Audit Logging
 
-SuperTable provides an immutable, append-only audit trail for every
-security-relevant action.  The subsystem lives under `supertable.audit` and
-is designed for regulated environments that must satisfy DORA, SOC 2, and
-similar compliance frameworks.
+SuperTable has two audit lanes.  General access and telemetry events use the
+configurable, non-blocking logger described below. Privileged RBAC and
+organization auth-token state changes use a separate mandatory write-ahead
+ledger: they cannot successfully commit without a durable audit record in the
+same Redis transaction.
+
+The subsystem lives under `supertable.audit` and provides the controls needed
+to build regulated DORA, SOC 2, HIPAA, and SOX operating procedures.  External
+WORM/Object-Lock configuration, retention policy, backup, and access to the
+audit storage remain deployment responsibilities.
+
+---
+
+## 12.0  Mandatory Privileged Control-Plane Ledger
+
+Role, user, role-assignment, and organization auth-token mutations do **not**
+use the optional `emit()` queue. All ten catalog mutation boundaries append a
+bounded digest-only record with `XADD` inside the same Lua script that changes
+the security document/index/token record and namespace revision:
+
+* `role_create`, `role_update`, `role_delete`
+* `user_create`, `user_update`, `user_delete`
+* `user_role_assign`, `user_role_remove`
+* `token_create`, `token_delete`
+
+The organization-level keys are:
+
+```text
+supertable:{org}:system:audit:privileged:outbox   # mandatory Redis Stream WAL; no MAXLEN
+supertable:{org}:system:audit:privileged:meta     # exact sequence/head HASH
+supertable:{org}:system:audit:privileged:delivery # verified archive ledger
+supertable:{org}:system:audit:privileged:cascade:doc:{event_id}
+                                                    # role-delete user manifest
+```
+
+This path is always enabled.  `SUPERTABLE_AUDIT_ENABLED=false`, queue
+backpressure, or a disabled general logger cannot suppress it.  A malformed
+record, wrong Redis key type, corrupt/overflowing revision counter, or failed
+`XADD` raises and the privileged operation does not report success.  No-op and
+lost-CAS operations never create false success records.  Instead, public
+manager validation rejections and catalog outcomes known to have made no
+privileged state write use a standalone Lua append that advances the same
+organization ledger without mutating security state. Its explicit outcomes are
+`denied`, `failure`, and `no_change`; the standalone path rejects `success`,
+which remains reserved for the ten transactional mutation scripts. Unknown or
+ambiguous backend exceptions are not relabeled as a definitive
+privileged-operation failure.
+
+A state-dependent `no_change` is appended only when a bounded predicate is
+still true in that same Lua invocation. The public API accepts a closed,
+action-and-cause-specific semantic grammar (resource presence, identity claim,
+assignment membership, or token presence); callers cannot provide Redis keys
+or arbitrary hash fields. The catalog derives every key from the audited
+organization, SuperTable, resource, and assignment identity. If a predicate is
+false, no `no_change` record is written; a separate state-neutral
+`concurrent_modification` failure is durably appended and the caller must
+retry.
+
+Role/user bootstrap initialization is validation-only. An empty namespace does
+not acquire an unaudited meta key or revision. Its first successful mutation
+creates the `version=1` namespace head and the corresponding SYSTEM bootstrap
+record atomically.
+
+### Record contents and privacy
+
+`PrivilegedAuditRecord` includes the immutable actor/session/correlation
+context, action and resource identity, before/after document versions,
+changed field names, assignment deltas, namespace version, cascade count, and
+a strictly monotonic organization ledger sequence.  Large assignment deltas
+store an ordered preview plus the exact total count and SHA-256 of the complete
+role-ID set, so an existing user with many roles remains auditable without an
+unbounded event.  Role policies, row-filter
+literals, tokens, and user documents are never embedded.  The record contains
+canonical SHA-256 digests of the exact pre/post Redis security documents.
+
+For `token_create` and `token_delete`, `resource_id` is the lowercase SHA-256
+token ID. The ledger commits canonical before/after digests of the exact token
+metadata record, but never embeds that metadata JSON or the plaintext token.
+The plaintext token is returned once by creation and never enters Redis or the
+privileged stream.
+
+A role deletion that strips assignments also creates one exact sidecar HASH
+under its event ID in the same Lua boundary.  The parent record's
+`affected_count` is the number of affected users;
+`cascade_assignment_count` is the number of removed role occurrences (these
+can differ for a corrupt legacy list containing duplicates).  Each sidecar row
+contains only the user ID, before/after user-document version, removed
+occurrence count, and before/after role counts.  It never contains usernames,
+role lists, user documents, table policies, filters, or filter literals.  The
+sidecar also binds the before/after user-namespace revision to the parent.
+
+The atomic cascade is capped at **10,000 users**. Before `SMEMBERS` or any
+document scan, Lua bounds both the authoritative user index and username map,
+requires equal cardinality, then proves every indexed ID, username mapping,
+and user document agree before writing a sidecar, event, or RBAC mutation.
+Larger tenants must first use an operator-controlled migration
+or a future fenced/chunked revocation workflow.  This bound limits Redis
+script time and transient evidence footprint; evidence is never truncated to
+make an oversized deletion appear successful.
+
+Redis Lua preserves the validated event template byte-for-byte.  Commit-time
+sequence, namespace revision, and affected count are stored as separate exact
+decimal stream fields, avoiding Redis Lua JSON array coercion and numeric
+rounding above 2^53.  `PrivilegedAuditOutbox` merges and revalidates that
+envelope before returning or archiving an event.
+Before every mutation, Lua also proves that the retained stream head and meta
+head agree; a missing/empty stream with a positive sequence fails closed.
+
+Callers should pass `PrivilegedActionContext` to every `RoleManager` and
+`UserManager` mutation; auth-token create/delete requires the same context at
+its catalog boundary. Missing legacy context is visibly recorded as
+`system/legacy-unattributed`; bootstrap create/repair uses an explicit SYSTEM
+context.
+
+### Retrieval and verified archival
+
+```python
+from supertable.audit import get_privileged_audit_outbox
+
+outbox = get_privileged_audit_outbox("acme")
+events = outbox.query(newest_first=False)
+
+# One bounded cycle for a separately supervised archival worker:
+result = outbox.drain_once(
+    "acme",
+    consumer="audit-worker-01",
+    count=500,
+)
+```
+
+Backend or record errors raise explicit exceptions; `[]` means Redis
+authoritatively returned no events.  Archival uses a deterministic batch ID
+and a dedicated Parquet schema containing both the exact template JSON and
+the fully committed canonical JSON plus indexed fields.  The bytes and rows
+are read back and compared before the delivery ledger is marked and the
+consumer group is acknowledged.  A crash or storage outage leaves entries
+pending; retry converges on the same object.  Local archives use file fsync,
+atomic same-filesystem replace, and bounded directory-chain fsync, so a crash
+cannot publish a partial or unanchored target. Existing-object retries
+re-establish file and directory durability before acknowledging the source.
+
+The delivery ledger advances one organization-wide contiguous sequence
+checkpoint. While a batch is active, its first-sequence claim and exact stream
+membership are atomically created and compare-and-set through
+`writing`/`written_verified`/`delivered`; stale workers cannot regress the
+head or repartition abandoned work. Before delivery, each batch also writes a
+canonical organization-scoped checkpoint manifest under
+`{org}/__audit__/privileged/manifests/`. The manifest commits the exact
+sequence/stream range, parent and cascade paths, byte counts, schemas/codecs,
+SHA-256 hashes, and predecessor checkpoint hash. It is read back before Redis
+delivery is finalized.
+
+After verified source trimming, per-entry markers, completed batch records,
+and obsolete sequence claims are atomically garbage-collected from Redis.
+The immutable manifest/Parquet chain remains authoritative and Redis retains
+only the bounded current head plus active anchor metadata. Reading a batch
+whose Redis index has been collected requires its organization, for example
+`read_archive_batch(batch_id, organization="acme")` or
+`read_archive_cascades(batch_id, organization="acme")`.
+Stream entries may be deleted only after verified delivery markers and
+consumer acknowledgements exist, and the newest entry is retained as a
+sequence/head integrity anchor.
+Role-delete batches additionally write a row-oriented cascade Parquet sidecar.
+Both Parquet objects are byte- and row-verified and their SHA-256 metadata is
+stored in the delivery ledger before the parent stream entry is acknowledged.
+A missing, altered, mis-scoped, or count-inconsistent cascade manifest blocks
+delivery and acknowledgement.  Redis cascade manifests are removed only after
+the archive marker and consumer acknowledgement are verified during trimming;
+archived sidecars remain independently readable.
+
+`verify_checkpoint_head(org)` is the bounded worker heartbeat: it verifies
+the Redis head, latest immutable manifest and immediate predecessor, and the
+latest Parquet artifacts. `verify_checkpoint_chain(org, max_batches=...)`
+performs an explicitly bounded walk through every predecessor to genesis and
+revalidates every artifact; use it for scheduled compliance verification.
+The SHA-256 chain detects alteration but is not a KMS-backed signature and
+does not by itself prevent an administrator from replacing both data and
+hashes. Externally managed WORM/Object Lock, independent credentials, backup,
+and retention are the authoritative immutability boundary.
+
+Run `drain_once()` from a separately supervised worker and alert on outbox
+length, pending age, archive errors, and Redis capacity.  The privileged
+stream intentionally has no `MAXLEN`; configure Redis with durable AOF/replica
+policy and no-eviction capacity appropriate to the maximum archive outage.
+Privileged mutation scripts currently target standalone Redis or Sentinel. Their
+per-SuperTable state keys and organization outbox key do not share a Redis
+Cluster hash slot, so Redis Cluster mode is not supported for this boundary.
+Restrict direct Redis RBAC and auth-token writes with ACLs: applications must
+use the catalog mutation scripts, because an operator with unrestricted
+`HSET`/`HDEL`/`DEL` access can bypass any application-level audit boundary. The
+script service account must be allowed the complete command set used by the
+registered Lua scripts.
+
+### Activation on an existing estate
+
+The mandatory ledger is complete **from its controlled activation point**; it
+cannot reconstruct changes made by an older binary before that point.  Treat
+activation as a security migration, not a rolling feature toggle:
+
+1. Stop and drain every API process, worker, notebook, and maintenance job that
+   can mutate RBAC or organization auth-token state.
+2. Export a bounded, independently signed baseline of every role document,
+   user document, assignment, index, auth-token ID/metadata digest, and
+   namespace revision. Store only the canonical document/metadata hashes,
+   token IDs, and assignment identities in the evidence package; keep it in
+   the same WORM retention domain as the archive.
+3. Give the audited release a distinct Redis ACL username in the authoritative
+   direct `SUPERTABLE_REDIS_URL`, or via `SUPERTABLE_REDIS_USERNAME` when split
+   settings/Sentinel are used. Revoke the legacy user and close its existing
+   connections before accepting another privileged mutation.
+4. Keep normal traffic closed, start one audited writer, and perform one
+   approved, controlled privileged mutation tied to a cutover ticket. Confirm
+   that it produced the expected next ledger sequence.
+5. Archive that queued event with one bounded worker cycle. Omitting `--trim`
+   here is intentional, so the Redis source remains available during cutover
+   validation:
+
+   ```bash
+   supertable-privileged-audit-worker \
+     --organization acme \
+     --consumer audit-cutover \
+     --once \
+     --require-durable-redis
+   ```
+
+6. Verify the complete checkpoint/artifact chain and independently confirm the
+   new objects' WORM/Object-Lock and retention settings through the storage
+   provider control plane:
+
+   ```bash
+   supertable-privileged-audit-worker \
+     --organization acme \
+     --consumer audit-cutover-verifier \
+     --verify-chain \
+     --verify-max-batches 10000 \
+     --require-durable-redis
+   ```
+
+7. Match the mutation's pre/post digest and checkpoint to the signed baseline,
+   then start normal audited writers and the supervised archive worker.
+8. Preserve the baseline, deployment manifest, ACL change evidence, controlled
+   mutation ticket, and first checkpoint together for restore and forensic
+   verification.
+
+Running `--once` against an empty stream does not open or write archive storage
+and is not a storage-credential canary. The controlled event above must be
+present before the validation cycle.
+
+Do not activate exclusion or audit-v2 policies while an older writer still has
+Redis write credentials: old code does not know the new transaction boundary
+and a marker key cannot constrain a client that can directly execute
+`HSET`/`SADD`/`DEL`.  A future built-in genesis/fleet-fence workflow may
+automate the baseline, but credential revocation and a quiescent cutover remain
+the trust boundary.  Greenfield estates begin with an empty signed baseline.
 
 ---
 
@@ -82,6 +332,7 @@ class Outcome(str, Enum):
     SUCCESS = "success"
     FAILURE = "failure"
     DENIED  = "denied"
+    NO_CHANGE = "no_change"  # validated idempotent/state-neutral attempt
 ```
 
 ### 12.2.4  ActorType
@@ -351,12 +602,14 @@ and `spark:`).
   archival worker.
 * External SIEM consumer groups are created on demand (see Section 12.9).
 
-### 12.7.2  Warm/Cold Tier -- Parquet
+### 12.7.2  General-event Warm/Cold Tier -- Parquet
 
 **Module:** `supertable.audit.writer_parquet`
 
-Parquet is the system of record.  Files are append-only, partitioned by date,
-and named with `instance_id` + UUID for safe concurrent writes.
+For the configurable general-event lane, Parquet is the long-term tier. Files
+are append-only, partitioned by date, and named with `instance_id` + UUID for
+safe concurrent writes. Privileged control-plane archival instead uses the
+deterministic verified format in Section 12.0.
 
 **Partition layout:**
 
@@ -544,10 +797,10 @@ requirements:
 
 | Article | Requirement | How SuperTable Satisfies It |
 |---------|-------------|---------------------------|
-| Art. 6(5) | ICT risk management documentation | All security-relevant events are captured with full actor/resource context. |
+| Art. 6(5) | ICT risk management documentation | Mandatory RBAC and organization auth-token state changes are durably recorded; other event classes are recorded when their integration points call the general audit API. |
 | Art. 10 | Detection and monitoring | Real-time Redis Streams with SIEM consumer groups for external monitoring tools. |
 | Art. 11 | Response and recovery | DORA-aligned incident report export. |
-| Art. 12 | Record keeping (5+ year retention) | Default 7-year retention; Parquet cold storage; legal hold prevents accidental deletion. |
+| Art. 12 | Record keeping (5+ year retention) | Parquet cold storage and legal-hold controls support a deployment-defined retention policy; configure and verify the required period operationally. |
 
 ### SOC 2 Type II
 
@@ -555,18 +808,22 @@ requirements:
 |-----------|-------------|---------------------------|
 | CC6.1 | Logical access security | Authentication events (login success/failure, token auth). |
 | CC7.1 | System monitoring | AuditMiddleware captures all auth failures and server errors; background logger provides continuous monitoring. |
-| CC7.3 | Forensic integrity | SHA-256 hash chain with daily Merkle proofs; `verify_batch_chain()` and `verify_merkle_proof()` for tamper detection. |
-| CC8.1 | Change management | CONFIG_CHANGE and RBAC_CHANGE event categories track all configuration and permission changes. |
+| CC7.3 | Forensic integrity | SHA-256/Merkle verification utilities plus privileged-ledger sequence and archive checks; external immutable retention is required for an independent trust anchor. |
+| CC8.1 | Change management | The mandatory ledger tracks committed role, user, assignment, and organization auth-token changes; CONFIG_CHANGE coverage depends on the emitting integration. |
 | A1.2 | Availability | SYSTEM events track service start/stop and health check failures. |
 
 ### Business Context
 
 The audit subsystem provides:
 
-* **Non-repudiation** -- every action is attributed to a specific actor
-  (user, API token, system) with IP address and user agent.
-* **Tamper evidence** -- the SHA-256 hash chain and daily Merkle proofs
-  ensure that any modification to the audit trail is detectable.
+* **Actor evidence** -- privileged callers can bind an immutable actor,
+  session, correlation ID, reason, and ticket to each committed privileged
+  change. Legacy calls without context are explicitly marked
+  `system/legacy-unattributed`; they are not presented as attributed actions.
+* **Tamper checks** -- exact record/file hashes, sequence checkpoints, and
+  read-back verification detect accidental or unprivileged modification.
+  Strong non-repudiation requires deployment-managed WORM/Object Lock and
+  independently controlled signing/retention credentials.
 * **Real-time visibility** -- Redis Streams provide sub-second event
   availability for monitoring dashboards and SIEM integrations.
 * **Long-term archival** -- Parquet files provide efficient columnar storage
@@ -575,8 +832,10 @@ The audit subsystem provides:
 
 ## 12.14  Enable / disable at runtime
 
-Audit is **OFF by default** (`SUPERTABLE_AUDIT_ENABLED=false`).  Each
-organization can be toggled independently from the WebUI:
+General asynchronous audit is **OFF by default**
+(`SUPERTABLE_AUDIT_ENABLED=false`). The privileged control-plane mutation
+ledger in Section 12.0 is mandatory and cannot be disabled by this setting.
+General audit for each organization can be toggled independently from the WebUI:
 
 > **WebUI → /ui/audit → Compliance tab → Audit logging card**
 

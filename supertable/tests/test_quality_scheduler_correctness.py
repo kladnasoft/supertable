@@ -252,6 +252,36 @@ def test_quick_sql_error_status_is_failure_and_never_published(
     assert dqc.latest is None
 
 
+@pytest.mark.parametrize(
+    "runner",
+    [
+        scheduler._run_quick_check,
+        scheduler._run_deep_check,
+        scheduler._run_custom_check,
+    ],
+)
+def test_empty_schema_without_snapshot_remains_missing(
+    redis_client,
+    fake_meta,
+    monkeypatch,
+    runner,
+):
+    FakeMetaReader.schema = {}
+    FakeMetaReader.stats = []
+    executed = []
+    monkeypatch.setattr(
+        scheduler,
+        "_execute_quality_statement",
+        lambda *_args, **_kwargs: executed.append((_args, _kwargs)),
+    )
+
+    outcome = runner(redis_client, ORG, SUPER, TABLE, MemoryDQConfig())
+
+    assert outcome.state == "failed"
+    assert outcome.message == f"No schema for {TABLE}"
+    assert executed == []
+
+
 def test_quick_counts_only_quick_checks_and_preserves_deep_column_data(
     redis_client,
     fake_meta,

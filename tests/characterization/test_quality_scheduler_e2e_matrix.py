@@ -181,10 +181,11 @@ def test_real_write_all_quality_modes_are_truthful_and_auto_certified(
     )
     _add_valid_custom_rules(dqc, table)
 
-    # A real write stores the merge-on-read columns, while quality queries use
-    # the public logical view and must never mention either one.
+    # A real write stores merge-on-read columns physically, but role-scoped
+    # metadata and quality queries expose only the public logical view.
     stored_schema = MetaReader(SUPER, ORG).get_table_schema(table, ROLE)[0]
-    assert {"__rowid__", "__timestamp__"}.issubset(stored_schema)
+    assert {"__rowid__", "__timestamp__"}.isdisjoint(stored_schema)
+    assert set(_rows().column_names).issubset(stored_schema)
 
     mode_keys = {
         mode: scheduler._pending_key(ORG, SUPER, table, mode)

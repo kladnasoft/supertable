@@ -386,6 +386,50 @@ def audit_legal_hold(org: str) -> str:
     return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:audit:legal_hold"
 
 
+def audit_privileged_outbox(org: str) -> str:
+    """Mandatory, untrimmed WAL for committed privileged state changes.
+
+    Unlike the optional high-volume audit stream, this stream is written in
+    the same Redis Lua commit as an RBAC mutation.  It must never be subject
+    to approximate ``MAXLEN`` trimming; archival/retention may remove entries
+    only after a durable delivery record exists.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}"
+        ":audit:privileged:outbox"
+    )
+
+
+def audit_privileged_meta(org: str) -> str:
+    """Sequence/head metadata for the mandatory privileged audit WAL."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}"
+        ":audit:privileged:meta"
+    )
+
+
+def audit_privileged_delivery(org: str) -> str:
+    """Archive-delivery ledger keyed by privileged outbox stream ID."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}"
+        ":audit:privileged:delivery"
+    )
+
+
+def audit_privileged_cascade(org: str, event_id: str) -> str:
+    """Exact affected-user manifest for one cascading role deletion (HASH).
+
+    The manifest is created in the same Lua boundary as the role deletion and
+    remains beside the privileged outbox entry until verified archival.  Its
+    values contain only user identifiers and bounded numeric transition facts;
+    role policies and user documents are never copied into this key.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}"
+        f":audit:privileged:cascade:doc:{_safe('event_id', event_id)}"
+    )
+
+
 # --- Org-level shares ------------------------------------------------------ #
 
 def share_doc(org: str, share_id: str) -> str:
@@ -658,6 +702,18 @@ def lock_stage(org: str, sup: str, stage_name: str) -> str:
 
 # --- RBAC — users ---------------------------------------------------------- #
 
+def rbac_scope(org: str, sup: str) -> str:
+    """Persistent RBAC prefix for one SuperTable (no trailing colon).
+
+    Data-namespace deletion deliberately preserves this security state.  Role
+    and user documents may only be changed through the mandatory audited RBAC
+    mutation boundary, never as an incidental side effect of deleting data.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac"
+    )
+
 def rbac_user_meta(org: str, sup: str) -> str:
     """Users index version + last_updated_ms (HASH)."""
     return (
@@ -731,6 +787,14 @@ def rbac_role_doc(org: str, sup: str, role_id: str) -> str:
     return (
         f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
         f":{_safe('sup', sup)}:rbac:roles:doc:{_safe('role_id', role_id)}"
+    )
+
+
+def rbac_role_doc_prefix(org: str, sup: str) -> str:
+    """Prefix ending in ``doc:`` for Lua role-id lookups."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac:roles:doc:"
     )
 
 

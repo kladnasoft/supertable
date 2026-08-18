@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import os
+import string
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote_to_bytes, urlsplit
 
 
 import redis
@@ -21,9 +23,11 @@ class RedisOptions:
     Reads Redis connection options from environment variables.
 
     Supported:
+      - SUPERTABLE_REDIS_URL (direct mode; redis:// or rediss://; takes precedence)
       - SUPERTABLE_REDIS_HOST (default: localhost)
       - SUPERTABLE_REDIS_PORT (default: 6379)
       - SUPERTABLE_REDIS_DB (default: 0)
+      - SUPERTABLE_REDIS_USERNAME (Redis ACL username; optional)
       - SUPERTABLE_REDIS_PASSWORD
       - SUPERTABLE_REDIS_SSL (default: false)
 
@@ -40,6 +44,7 @@ class RedisOptions:
     host: str = field(init=False)
     port: int = field(init=False)
     db: int = field(init=False)
+    username: Optional[str] = field(init=False)
     password: Optional[str] = field(init=False)
     use_ssl: bool = field(init=False)
     decode_responses: bool = field(default=False)
@@ -55,6 +60,7 @@ class RedisOptions:
         host = settings.SUPERTABLE_REDIS_HOST
         port = settings.SUPERTABLE_REDIS_PORT
         db = settings.SUPERTABLE_REDIS_DB
+        username = settings.SUPERTABLE_REDIS_USERNAME or None
         password = settings.SUPERTABLE_REDIS_PASSWORD or None
         use_ssl = settings.SUPERTABLE_REDIS_SSL
 
@@ -64,21 +70,35 @@ class RedisOptions:
         # Sentinel mode configuration
         is_sentinel = settings.SUPERTABLE_REDIS_SENTINEL
         sentinel_raw = settings.SUPERTABLE_REDIS_SENTINELS
-        sentinels: List[tuple] = []
-        if sentinel_raw:
-            for part in sentinel_raw.split(","):
-                part = part.strip()
-                if not part:
-                    continue
-                try:
-                    h, p = part.split(":")
-                    sentinels.append((h.strip(), int(p)))
-                except ValueError:
-                    logger.warning(f"[redis-options] Invalid sentinel spec: {part}")
+        # Sentinel discovery is an authority boundary: when it is enabled an
+        # incomplete endpoint list must never degrade into a direct Redis
+        # connection.  Ignore an inactive stale list, but validate every
+        # configured endpoint when Sentinel mode is selected.
+        sentinels = (
+            _parse_sentinel_hosts(sentinel_raw)
+            if is_sentinel
+            else []
+        )
 
         sentinel_master = settings.SUPERTABLE_REDIS_SENTINEL_MASTER
+        if is_sentinel:
+            _validate_sentinel_identity(
+                sentinel_master,
+                field_name="SUPERTABLE_REDIS_SENTINEL_MASTER",
+            )
 
         sentinel_password = settings.effective_redis_sentinel_password or None
+
+        # A Redis URL is an authoritative direct-connection identity.  Do not
+        # combine URL credentials or TLS state with split settings: doing so can
+        # silently authenticate to a different endpoint than the operator
+        # configured.  Sentinel discovery keeps its existing split-variable
+        # contract because a single Redis URL cannot describe the Sentinel set.
+        redis_url = (settings.SUPERTABLE_REDIS_URL or "").strip()
+        if redis_url and not is_sentinel:
+            host, port, db, username, password, use_ssl = _parse_direct_redis_url(
+                redis_url
+            )
 
         # In many deployments the Sentinel and Redis server share the same password.
         # Allow a single-password setup by reusing SUPERTABLE_REDIS_SENTINEL_PASSWORD
@@ -92,6 +112,7 @@ class RedisOptions:
         object.__setattr__(self, "host", host)
         object.__setattr__(self, "port", port)
         object.__setattr__(self, "db", db)
+        object.__setattr__(self, "username", username)
         object.__setattr__(self, "password", password)
         object.__setattr__(self, "use_ssl", use_ssl)
         object.__setattr__(self, "decode_responses", decode)
@@ -101,6 +122,167 @@ class RedisOptions:
         object.__setattr__(self, "sentinel_master", sentinel_master)
         object.__setattr__(self, "sentinel_password", sentinel_password)
         object.__setattr__(self, "sentinel_strict", sentinel_strict)
+
+
+def _validate_sentinel_identity(value: Any, *, field_name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 253
+        or any(
+            character.isspace()
+            or ord(character) < 32
+            or ord(character) == 127
+            for character in value
+        )
+    ):
+        raise ValueError(f"{field_name} must contain a valid non-empty name")
+    return value
+
+
+def _parse_sentinel_hosts(value: Any) -> List[Tuple[str, int]]:
+    """Parse an all-or-nothing Sentinel endpoint set without logging its input."""
+
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            "SUPERTABLE_REDIS_SENTINELS must contain at least one host:port "
+            "endpoint when Sentinel mode is enabled"
+        )
+    endpoints: List[Tuple[str, int]] = []
+    for raw_part in value.split(","):
+        part = raw_part.strip()
+        if not part or ":" not in part:
+            raise ValueError(
+                "SUPERTABLE_REDIS_SENTINELS contains a malformed host:port endpoint"
+            )
+        raw_host, raw_port = part.rsplit(":", 1)
+        host = raw_host.strip()
+        port_text = raw_port.strip()
+        # Accept conventional bracketed IPv6 while passing the unbracketed
+        # address expected by redis-py.
+        if host.startswith("[") or host.endswith("]"):
+            if not (host.startswith("[") and host.endswith("]")):
+                raise ValueError(
+                    "SUPERTABLE_REDIS_SENTINELS contains a malformed host:port endpoint"
+                )
+            host = host[1:-1]
+        _validate_sentinel_identity(
+            host, field_name="SUPERTABLE_REDIS_SENTINELS host",
+        )
+        if (
+            not port_text
+            or not port_text.isascii()
+            or not port_text.isdecimal()
+        ):
+            raise ValueError(
+                "SUPERTABLE_REDIS_SENTINELS contains a non-numeric port"
+            )
+        port = int(port_text)
+        if not 1 <= port <= 65535:
+            raise ValueError(
+                "SUPERTABLE_REDIS_SENTINELS port must be between 1 and 65535"
+            )
+        endpoints.append((host, port))
+    return endpoints
+
+
+def _validated_sentinel_hosts(value: Any) -> List[Tuple[str, int]]:
+    """Defence-in-depth for callers that construct options without RedisOptions."""
+
+    if not isinstance(value, (tuple, list)) or not value:
+        raise ValueError(
+            "Redis Sentinel mode requires at least one validated endpoint"
+        )
+    endpoints: List[Tuple[str, int]] = []
+    for endpoint in value:
+        if not isinstance(endpoint, (tuple, list)) or len(endpoint) != 2:
+            raise ValueError("Redis Sentinel endpoint must be a (host, port) pair")
+        host, port = endpoint
+        host = _validate_sentinel_identity(
+            host, field_name="Redis Sentinel host",
+        )
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("Redis Sentinel port must be between 1 and 65535")
+        endpoints.append((host, port))
+    return endpoints
+
+
+def _decode_url_credential(value: Optional[str], *, field_name: str) -> Optional[str]:
+    """Strictly percent-decode one Redis URL credential as UTF-8 text."""
+
+    if value is None:
+        return None
+    index = 0
+    while index < len(value):
+        if value[index] == "%":
+            if (
+                index + 2 >= len(value)
+                or value[index + 1] not in string.hexdigits
+                or value[index + 2] not in string.hexdigits
+            ):
+                raise ValueError(
+                    f"SUPERTABLE_REDIS_URL has an invalid percent escape in {field_name}"
+                )
+            index += 3
+            continue
+        index += 1
+    try:
+        decoded = unquote_to_bytes(value).decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"SUPERTABLE_REDIS_URL {field_name} is not valid UTF-8"
+        ) from exc
+    return decoded or None
+
+
+def _parse_direct_redis_url(
+    value: str,
+) -> Tuple[str, int, int, Optional[str], Optional[str], bool]:
+    """Parse the supported, security-relevant subset of a direct Redis URL."""
+
+    try:
+        parsed = urlsplit(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid SUPERTABLE_REDIS_URL: {exc}") from exc
+    scheme = parsed.scheme.lower()
+    if scheme not in {"redis", "rediss"}:
+        raise ValueError(
+            "SUPERTABLE_REDIS_URL scheme must be 'redis' or 'rediss'"
+        )
+    if parsed.query or parsed.fragment:
+        raise ValueError(
+            "SUPERTABLE_REDIS_URL query parameters and fragments are not supported"
+        )
+    try:
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"Invalid SUPERTABLE_REDIS_URL: {exc}") from exc
+    if (
+        not host
+        or host != host.strip()
+        or any(ord(character) < 32 or ord(character) == 127 for character in host)
+    ):
+        raise ValueError("SUPERTABLE_REDIS_URL must contain a valid host")
+    if port is None:
+        port = 6379
+    if not 1 <= port <= 65535:
+        raise ValueError("SUPERTABLE_REDIS_URL port must be between 1 and 65535")
+
+    if parsed.path in {"", "/"}:
+        db = 0
+    else:
+        raw_db = parsed.path[1:] if parsed.path.startswith("/") else ""
+        if not raw_db.isdecimal():
+            raise ValueError(
+                "SUPERTABLE_REDIS_URL path must contain one non-negative database number"
+            )
+        db = int(raw_db)
+
+    username = _decode_url_credential(parsed.username, field_name="username")
+    password = _decode_url_credential(parsed.password, field_name="password")
+    return host, port, db, username, password, scheme == "rediss"
 
 
 # Process-level cache: identical RedisOptions → identical client (and pool).
@@ -115,6 +297,7 @@ def _options_cache_key(opts: RedisOptions) -> Tuple[Any, ...]:
         opts.host,
         opts.port,
         opts.db,
+        opts.username,
         opts.password,
         opts.use_ssl,
         opts.is_sentinel,
@@ -145,28 +328,39 @@ def create_redis_client(options: Optional[RedisOptions] = None) -> redis.Redis:
 
 def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Redis:
     # Decide between standard Redis and Sentinel-based Redis
-    if opts.is_sentinel and opts.sentinel_hosts:
+    if opts.is_sentinel:
+        sentinel_hosts = _validated_sentinel_hosts(opts.sentinel_hosts)
+        _validate_sentinel_identity(
+            opts.sentinel_master,
+            field_name="Redis Sentinel master",
+        )
         logger.debug(
             f"[redis-catalog] Using Redis Sentinel mode. master={opts.sentinel_master}, "
-            f"sentinels={opts.sentinel_hosts}"
+            f"sentinels={sentinel_hosts}"
         )
         sentinel = Sentinel(
-            opts.sentinel_hosts,
+            sentinel_hosts,
             sentinel_kwargs={
                 "socket_timeout": 0.5,
+                "username": opts.username,
                 "password": opts.sentinel_password,
                 "decode_responses": decode_responses,
+                "ssl": opts.use_ssl,
             },
             socket_timeout=0.5,
+            username=opts.username,
             password=opts.password,
             decode_responses=decode_responses,
+            ssl=opts.use_ssl,
         )
 
         sentinel_client = sentinel.master_for(
             opts.sentinel_master,
             db=opts.db,
+            username=opts.username,
             password=opts.password,
             decode_responses=decode_responses,
+            ssl=opts.use_ssl,
         )
 
         # Fail-fast probe: in some deployments (e.g. standalone Redis without Sentinel),
@@ -185,48 +379,11 @@ def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Red
 
         if sentinel_err is None:
             return sentinel_client
-
-        if opts.sentinel_strict:
-            logger.error(f"[redis-catalog] Sentinel unavailable (strict mode): {sentinel_err}")
-            raise sentinel_err
-
-        logger.warning(
-            "[redis-catalog] Sentinel unavailable; falling back to standard Redis. "
-            f"master={opts.sentinel_master}, sentinels={opts.sentinel_hosts}, "
-            f"fallback={opts.host}:{opts.port}/{opts.db}. err={sentinel_err}"
+        logger.error(
+            f"[redis-catalog] Sentinel unavailable (strict mode): {sentinel_err}"
         )
-        r = redis.Redis(
-            host=opts.host,
-            port=opts.port,
-            db=opts.db,
-            password=opts.password,
-            decode_responses=decode_responses,
-            ssl=opts.use_ssl,
-        )
-        try:
-            r.ping()
-        except (redis.RedisError, OSError) as e:
-            logger.error(f"[redis-catalog] Standard Redis fallback ping failed: {e}")
-            # Both Sentinel and the configured direct Redis fallback are unavailable.
-            # Raise a single actionable error that includes both root causes.
-            raise redis.ConnectionError(
-                "Redis Sentinel is enabled but unavailable, and the configured direct Redis "
-                "fallback is also unreachable. "
-                f"sentinels={opts.sentinel_hosts}, master={opts.sentinel_master}, "
-                f"fallback={opts.host}:{opts.port}/{opts.db}. "
-                f"sentinel_err={sentinel_err!r}. fallback_err={e!r}. "
-                "If you are running the app in Docker, do not use localhost—use the Redis "
-                "service name (e.g. redis-master) or set SUPERTABLE_REDIS_URL accordingly. "
-                "Also ensure your Sentinel containers are actually running Redis Sentinel "
-                "(Bitnami uses a separate redis-sentinel image)."
-            ) from e
-        return r
+        raise sentinel_err
 
-    if opts.is_sentinel and not opts.sentinel_hosts:
-        logger.warning(
-            "[redis-catalog] SUPERTABLE_REDIS_SENTINEL=true but no "
-            "SUPERTABLE_REDIS_SENTINELS set. Falling back to standard Redis."
-        )
     logger.info(
         f"[redis-catalog] Using standard Redis mode. host={opts.host}, port={opts.port}, db={opts.db}"
     )
@@ -234,6 +391,7 @@ def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Red
         host=opts.host,
         port=opts.port,
         db=opts.db,
+        username=opts.username,
         password=opts.password,
         decode_responses=decode_responses,
         ssl=opts.use_ssl,

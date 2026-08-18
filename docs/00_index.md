@@ -55,3 +55,9 @@
 | # | Document | Description |
 |---|----------|-------------|
 | 16 | [Redis Key Layout](16_redis_layout.md) | Canonical key namespace policy: every key starts with `supertable:`, single source of truth in `redis_keys.py` |
+
+## Operations Runbooks
+
+| # | Document | Description |
+|---|----------|-------------|
+| 17 | [Privileged Audit Archive Worker](17_privileged_audit_worker.md) | Supervised deployment, strict Redis preflight, safe trimming, probes, retries, and incident response |

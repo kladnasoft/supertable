@@ -357,6 +357,111 @@ class LocalStorage(StorageInterface):
         with open(path, "wb") as f:
             f.write(data)
 
+    def write_bytes_atomic(self, path: str, data: bytes) -> None:
+        """Durably replace a byte object without exposing a partial target.
+
+        Audit archives use deterministic paths and must be safely retryable
+        after process or host failure.  A same-directory temporary file plus
+        ``os.replace`` gives readers either the previous complete object or the
+        new complete object, never a prefix written by a crashed process.
+        """
+        directory = os.path.dirname(path) or "."
+        durability_anchor = self._nearest_existing_directory(directory)
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".tmp-bytes-", dir=directory)
+        try:
+            with os.fdopen(fd, "wb") as tmpf:
+                write_all(tmpf, data)
+                tmpf.flush()
+                os.fsync(tmpf.fileno())
+            os.replace(tmp_path, path)
+            self._fsync_directory_chain(
+                directory, stop_directory=durability_anchor,
+            )
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _fsync_directory(directory: str) -> None:
+        """Persist a directory-entry update or raise.
+
+        Audit archive publication must not acknowledge a record merely
+        because ``os.replace`` was visible before a crash.  On POSIX the
+        containing directory must also be fsynced; suppressing that error
+        would turn an I/O failure into a false durable-delivery result.
+        """
+
+        directory_flag = getattr(os, "O_DIRECTORY", 0)
+        dir_fd = os.open(directory, os.O_RDONLY | directory_flag)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    @classmethod
+    def _nearest_existing_directory(cls, directory: str) -> str:
+        """Return the closest existing ancestor before a hierarchy is created."""
+
+        current = os.path.abspath(directory)
+        while not os.path.isdir(current):
+            parent = os.path.dirname(current)
+            if parent == current:
+                raise FileNotFoundError(
+                    f"no existing ancestor directory for {directory!r}"
+                )
+            current = parent
+        return current
+
+    @classmethod
+    def _fsync_directory_chain(
+        cls,
+        directory: str,
+        *,
+        stop_directory: str,
+    ) -> None:
+        """Durably anchor a hierarchy, bounded by a known storage ancestor."""
+
+        current = os.path.abspath(directory)
+        stop = os.path.abspath(stop_directory)
+        try:
+            common = os.path.commonpath((current, stop))
+        except ValueError as exc:
+            raise ValueError("directory durability anchor is on another drive") from exc
+        if common != stop:
+            raise ValueError("directory durability anchor is not an ancestor")
+        while True:
+            cls._fsync_directory(current)
+            if current == stop:
+                break
+            parent = os.path.dirname(current)
+            if parent == current:
+                raise ValueError("directory durability anchor was not reached")
+            current = parent
+
+    def ensure_bytes_durable(self, path: str) -> None:
+        """Re-establish durability for an already-visible byte object.
+
+        This is used when a prior process may have completed ``os.replace``
+        but failed before syncing the parent directory.  Retrying the audit
+        delivery can then make the existing exact object durable without
+        rewriting its immutable contents.
+        """
+
+        with open(path, "rb") as existing:
+            os.fsync(existing.fileno())
+        directory = os.path.dirname(path) or "."
+        # Archive paths are relative to the configured LocalStorage working
+        # directory. Re-sync through that bounded namespace root so a retry
+        # also anchors directory components created by a prior interrupted
+        # publication. Absolute paths are treated as pre-provisioned and only
+        # their immediate parent is synced.
+        stop = os.getcwd() if not os.path.isabs(path) else directory
+        self._fsync_directory_chain(directory, stop_directory=stop)
+
     def read_bytes(self, path: str) -> bytes:
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")

@@ -1,4 +1,5 @@
 import os
+import copy
 
 from supertable.config.settings import settings
 import logging
@@ -9,7 +10,12 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any, Set, Tuple
 
 from supertable.errors import SuperTableNotFoundError, TableNotFoundError
-from supertable.rbac.access_control import check_meta_access
+from supertable.rbac.access_control import (
+    check_meta_access,
+    resolve_table_policy,
+    visible_columns_for_policy,
+)
+from supertable.rbac.permissions import RoleType
 from supertable.redis_catalog import RedisCatalog
 from supertable import redis_keys as RK
 
@@ -22,6 +28,15 @@ logger = logging.getLogger(__name__)
 # Small in-process cache to de-duplicate bursty reflection calls.
 _SUPER_META_CACHE: Dict[str, Tuple[int, float, Dict[str, Any]]] = {}
 _SUPER_META_CACHE_LOCK = threading.Lock()
+_SUPER_META_CACHE_MAX_ENTRIES = 256
+
+_HIDDEN_COLUMNS = frozenset({
+    "__rowid__",
+    "__timestamp__",
+    "__file__",
+    "__supertable_source_file__",
+    "__supertable_scan_filename__",
+})
 
 def _super_meta_cache_ttl_s() -> float:
     val = settings.SUPERTABLE_SUPER_META_CACHE_TTL_S
@@ -37,6 +52,97 @@ def _super_meta_cache_ttl_s() -> float:
 def _prune_dict(d: Dict[str, Any], keys_to_remove: Set[str]) -> Dict[str, Any]:
     """Return a shallow copy of d with selected keys removed (non-mutating)."""
     return {k: v for k, v in d.items() if k not in keys_to_remove}
+
+
+def _visible_schema(schema_obj: Any, entry: dict) -> Dict[str, Any]:
+    schema = _schema_to_dict(schema_obj)
+    candidates = [
+        name for name in schema
+        if str(name).casefold() not in _HIDDEN_COLUMNS
+    ]
+    visible = set(visible_columns_for_policy(entry, candidates))
+    return {name: schema[name] for name in schema if name in visible}
+
+
+def _sanitize_snapshot_stats(snapshot: Dict[str, Any], entry: dict) -> Dict[str, Any]:
+    """Remove column-policy leaks while retaining useful table/file metrics."""
+    result = _prune_dict(
+        snapshot,
+        {"previous_snapshot", "schema", "schemaString", "location"},
+    )
+    schema = _schema_to_dict(snapshot.get("schema", {}))
+    visible_schema = _visible_schema(schema, entry)
+    visible_folded = {name.casefold() for name in visible_schema}
+
+    resources = result.get("resources")
+    if isinstance(resources, list):
+        cleaned_resources = []
+        for resource in resources:
+            if not isinstance(resource, dict):
+                continue
+            cleaned = dict(resource)
+            raw_columns = cleaned.get("columns")
+            if isinstance(raw_columns, list):
+                kept = []
+                for item in raw_columns:
+                    name = item.get("name") if isinstance(item, dict) else item
+                    if isinstance(name, str) and name.casefold() in visible_folded:
+                        kept.append(item)
+                cleaned["columns"] = kept
+            elif "columns" in cleaned:
+                # A numeric count cannot be reduced without revealing the
+                # hidden-column count. Omit it instead of inventing a value.
+                cleaned.pop("columns", None)
+            for field in ("column_max_value_bytes", "integer_domain_bounds"):
+                value = cleaned.get(field)
+                if isinstance(value, dict):
+                    cleaned[field] = {
+                        name: payload for name, payload in value.items()
+                        if str(name).casefold() in visible_folded
+                    }
+            cleaned_resources.append(cleaned)
+        result["resources"] = cleaned_resources
+
+    for field in ("column_max_value_bytes", "integer_domain_bounds"):
+        value = result.get(field)
+        if isinstance(value, dict):
+            result[field] = {
+                name: payload for name, payload in value.items()
+                if str(name).casefold() in visible_folded
+            }
+    return result
+
+
+def _checked_meta_context(
+    *, super_name: str, organization: str, role_name: str, table_name: str,
+) -> Tuple[Any, dict]:
+    """Run the public META gate and reuse its validated policy context.
+
+    Older integrations (and test doubles) return ``None`` from the gate.  That
+    return shape predates column policies; treating an already-successful
+    legacy gate as unrestricted is backwards-compatible.  Production's gate
+    now returns the exact context+entry, so no real request can take this path.
+    """
+    resolved = check_meta_access(
+        super_name=super_name,
+        organization=organization,
+        role_name=role_name,
+        table_name=table_name,
+    )
+    if (
+        isinstance(resolved, tuple)
+        and len(resolved) == 2
+        and hasattr(resolved[0], "role_type")
+        and isinstance(resolved[1], dict)
+    ):
+        return resolved
+    context = type("LegacyMetaContext", (), {
+        "role_type": RoleType.SUPERADMIN,
+        "role_info": {"role_id": role_name},
+        "tables": {"*": {"columns": ["*"], "filters": ["*"]}},
+        "fingerprint": "legacy-meta-gate",
+    })()
+    return context, {"columns": ["*"], "filters": ["*"]}
 
 def _get_redis_items(pattern) -> List[str]:
     """
@@ -185,78 +291,74 @@ class MetaReader:
         return result
 
     def get_table_schema(self, table_name: str, role_name: str) -> Optional[List[Dict[str, Any]]]:
-            try:
-                check_meta_access(
-                    super_name=self.super_table.super_name,
-                    organization=self.super_table.organization,
-                    role_name=role_name,
-                    table_name=table_name,
-                )
-            except PermissionError as e:
-                logger.warning(
-                    "[get_table_schema] Access denied for user '%s' on table '%s': %s",
-                    role_name, table_name, str(e)
-                )
-                return None
+        try:
+            context, _ = _checked_meta_context(
+                super_name=self.super_table.super_name,
+                organization=self.super_table.organization,
+                role_name=role_name,
+                table_name=table_name,
+            )
+        except PermissionError as e:
+            logger.warning(
+                "[get_table_schema] Access denied for user '%s' on table '%s': %s",
+                role_name, table_name, str(e),
+            )
+            return None
 
-            schema_items: Set[Tuple[str, Any]] = set()
-
-            if table_name == self.super_table.super_name:
-                # Aggregate schema across all simple tables (prefer Redis leaf payload; fallback to storage).
-                tables = self._get_all_tables()
-                leaf_keys: List[str] = [
-                    RK.meta_leaf(self.super_table.organization, self.super_table.super_name, t)
-                    for t in tables
-                ]
-                try:
-                    raws = self.catalog.r.mget(leaf_keys) if leaf_keys else []
-                except Exception:
-                    raws = []
-
-                for t, raw in zip(tables, raws):
-                    try:
-                        leaf_meta = _try_parse_leaf_meta(raw)
-                        st_data = _leaf_to_snapshot_like(leaf_meta or {}) if isinstance(leaf_meta, dict) else None
-                        if st_data is None:
-                            simple_table = SimpleTable(
-                                self.super_table, t, create_if_missing=False,
-                            )
-                            st_data, _ = simple_table.get_simple_table_snapshot()
-
-                        schema = _schema_to_dict((st_data or {}).get("schema", {}))
-                        for key, value in schema.items():
-                            schema_items.add((key, value))
-                    except (FileNotFoundError, KeyError, TableNotFoundError) as e:
-                        logger.debug("Failed to read schema for table %s: %s", t, e)
-                        continue
+        schema_items: Set[Tuple[str, Any]] = set()
+        targets = (
+            self._get_all_tables()
+            if table_name == self.super_table.super_name
+            else [table_name]
+        )
+        try:
+            if len(targets) == 1 and table_name != self.super_table.super_name:
+                raws = [self.catalog.r.get(RK.meta_leaf(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    targets[0],
+                ))]
             else:
-                # Single table (prefer Redis leaf payload; fallback to storage).
-                try:
-                    raw = self.catalog.r.get(
-                        RK.meta_leaf(self.super_table.organization, self.super_table.super_name, table_name)
+                leaf_keys = [
+                    RK.meta_leaf(
+                        self.super_table.organization,
+                        self.super_table.super_name,
+                        target,
                     )
-                    leaf_meta = _try_parse_leaf_meta(raw)
-                    st_data = _leaf_to_snapshot_like(leaf_meta or {}) if isinstance(leaf_meta, dict) else None
+                    for target in targets
+                ]
+                raws = self.catalog.r.mget(leaf_keys) if leaf_keys else []
+        except Exception:
+            raws = [None] * len(targets)
 
-                    if st_data is None:
-                        simple_table = SimpleTable(
-                            self.super_table, table_name, create_if_missing=False,
-                        )
-                        st_data, _ = simple_table.get_simple_table_snapshot()
+        for index, target in enumerate(targets):
+            try:
+                entry = resolve_table_policy(context, target, "access META for")
+            except PermissionError:
+                continue
+            try:
+                raw = raws[index] if index < len(raws) else None
+                leaf_meta = _try_parse_leaf_meta(raw)
+                st_data = (
+                    _leaf_to_snapshot_like(leaf_meta or {})
+                    if isinstance(leaf_meta, dict) else None
+                )
+                if st_data is None:
+                    simple_table = SimpleTable(
+                        self.super_table, target, create_if_missing=False,
+                    )
+                    st_data, _ = simple_table.get_simple_table_snapshot()
+                schema = _visible_schema((st_data or {}).get("schema", {}), entry)
+                schema_items.update(schema.items())
+            except (FileNotFoundError, KeyError, TableNotFoundError) as e:
+                logger.debug("Failed to read schema for table %s: %s", target, e)
+                continue
 
-                    schema = _schema_to_dict((st_data or {}).get("schema", {}))
-                    for key, value in schema.items():
-                        schema_items.add((key, value))
-                except (FileNotFoundError, KeyError, TableNotFoundError) as e:
-                    logger.debug("Failed to read schema for table %s: %s", table_name, e)
-                    return [{}]
-
-            distinct_schema = dict(sorted(schema_items))
-            return [distinct_schema]
+        return [dict(sorted(schema_items))]
 
     def collect_simple_table_schema(self, schemas: set, table_name: str, role_name: str) -> None:
         try:
-            check_meta_access(
+            context, entry = _checked_meta_context(
                 super_name=self.super_table.super_name,
                 organization=self.super_table.organization,
                 role_name=role_name,
@@ -278,13 +380,13 @@ class MetaReader:
             logger.debug("Simple table snapshot missing for %s", table_name)
             return
 
-        schema = simple_table_data.get("schema", {}) or {}
+        schema = _visible_schema(simple_table_data.get("schema", {}) or {}, entry)
         schema_tuple = tuple(sorted(schema.items()))
         schemas.add(schema_tuple)
 
     def get_table_stats(self, table_name: str, role_name: str) -> List[Dict[str, Any]]:
         try:
-            check_meta_access(
+            context, _ = _checked_meta_context(
                 super_name=self.super_table.super_name,
                 organization=self.super_table.organization,
                 role_name=role_name,
@@ -297,33 +399,26 @@ class MetaReader:
             )
             return []
 
-        keys_to_remove = {"previous_snapshot", "schema", "location"}
         stats: List[Dict[str, Any]] = []
-
-        if table_name == self.super_table.super_name:
-            # Get all tables and their stats
-            tables = self._get_all_tables()
-            for table in tables:
-                try:
-                    st = SimpleTable(
-                        self.super_table, table, create_if_missing=False,
-                    )
-                    st_data, _ = st.get_simple_table_snapshot()
-                    stats.append(_prune_dict(st_data, keys_to_remove))
-                except (FileNotFoundError, KeyError, TableNotFoundError):
-                    logger.debug("Simple table snapshot missing for %s", table)
-                    continue
-        else:
-            # Single table
+        tables = (
+            self._get_all_tables()
+            if table_name == self.super_table.super_name
+            else [table_name]
+        )
+        for table in tables:
+            try:
+                entry = resolve_table_policy(context, table, "access META for")
+            except PermissionError:
+                continue
             try:
                 st = SimpleTable(
-                    self.super_table, table_name, create_if_missing=False,
+                    self.super_table, table, create_if_missing=False,
                 )
                 st_data, _ = st.get_simple_table_snapshot()
-                stats.append(_prune_dict(st_data, keys_to_remove))
+                stats.append(_sanitize_snapshot_stats(st_data, entry))
             except (FileNotFoundError, KeyError, TableNotFoundError):
-                logger.debug("Simple table snapshot missing for %s", table_name)
-                return []
+                logger.debug("Simple table snapshot missing for %s", table)
+                continue
 
         return stats
 
@@ -333,8 +428,7 @@ class MetaReader:
         t0 = time.perf_counter()
 
         try:
-            # Checking meta access for the super table itself
-            check_meta_access(
+            context, _ = _checked_meta_context(
                 super_name=self.super_table.super_name,
                 organization=self.super_table.organization,
                 role_name=role_name,
@@ -354,7 +448,11 @@ class MetaReader:
 
         ttl_s = _super_meta_cache_ttl_s()
         root_version = (root or {}).get("version", 0) if isinstance(root, dict) else 0
-        cache_key = f"{self.super_table.organization}:{self.super_table.super_name}:{role_name}"
+        role_id = str(context.role_info.get("role_id", role_name)).casefold()
+        cache_key = (
+            f"{self.super_table.organization}:{self.super_table.super_name}:"
+            f"{role_id}:{context.fingerprint}"
+        )
         if ttl_s > 0:
             now = time.monotonic()
             with _SUPER_META_CACHE_LOCK:
@@ -380,25 +478,39 @@ class MetaReader:
                             self.super_table.super_name,
                             role_name[:12],
                         )
-                    return cached_result
+                    return copy.deepcopy(cached_result)
 
         # Get all tables from Redis
-        tables = self._get_all_tables()
+        all_tables = self._get_all_tables()
+        tables = []
+        table_policies: Dict[str, dict] = {}
+        for candidate in all_tables:
+            try:
+                table_policies[candidate] = resolve_table_policy(
+                    context, candidate, "access META for",
+                )
+                tables.append(candidate)
+            except PermissionError:
+                continue
         t_scan = time.perf_counter()
 
         # Best-effort bulk fetch leaf metadata in one Redis roundtrip.
         leaf_payloads: List[Optional[Dict[str, Any]]] = []
         leaf_keys: List[str] = [
             RK.meta_leaf(self.super_table.organization, self.super_table.super_name, t)
-            for t in tables
+            for t in all_tables
         ]
         t_mget0 = time.perf_counter()
         try:
             raws = self.catalog.r.mget(leaf_keys) if leaf_keys else []
             leaf_payloads = [_try_parse_leaf_meta(r) for r in raws]
         except Exception:
-            leaf_payloads = [None for _ in tables]
+            leaf_payloads = [None for _ in all_tables]
         t_mget1 = time.perf_counter()
+        leaf_by_table = {
+            table: leaf_payloads[index] if index < len(leaf_payloads) else None
+            for index, table in enumerate(all_tables)
+        }
 
         simple_table_info = []
         total_files = 0
@@ -412,7 +524,8 @@ class MetaReader:
 
         for idx, table in enumerate(tables):
             try:
-                leaf_meta = leaf_payloads[idx] if idx < len(leaf_payloads) else None
+                entry = table_policies[table]
+                leaf_meta = leaf_by_table.get(table)
                 st_data = _leaf_to_snapshot_like(leaf_meta or {}) if isinstance(leaf_meta, dict) else None
 
                 if st_data is None:
@@ -443,21 +556,13 @@ class MetaReader:
                 table_rows = max(0, table_rows - int(tombstone_rows or 0))
                 table_size = sum(res.get("file_size", 0) for res in resources if isinstance(res, dict))
 
-                # Column count: count distinct column names across all resources
-                _col_names = set()
-                _col_int_max = 0
-                for res in resources:
-                    if isinstance(res, dict):
-                        _cols = res.get("columns")
-                        if isinstance(_cols, list):
-                            for cn in _cols:
-                                if isinstance(cn, str):
-                                    _col_names.add(cn)
-                                elif isinstance(cn, dict) and cn.get("name"):
-                                    _col_names.add(cn["name"])
-                        elif isinstance(_cols, (int, float)) and int(_cols) > _col_int_max:
-                            _col_int_max = int(_cols)
-                table_cols = len(_col_names) if _col_names else _col_int_max
+                # Count only role-visible columns. Resource-level integer
+                # counts cannot be safely adjusted for exclusions, while the
+                # pinned logical schema provides exact names.
+                visible_schema = _visible_schema(
+                    (st_data or {}).get("schema", {}), entry,
+                )
+                table_cols = len(visible_schema)
 
                 simple_table_info.append({
                     "name": table,
@@ -494,7 +599,18 @@ class MetaReader:
         if ttl_s > 0:
             expires_at = time.monotonic() + ttl_s
             with _SUPER_META_CACHE_LOCK:
-                _SUPER_META_CACHE[cache_key] = (root_version, expires_at, result)
+                now = time.monotonic()
+                expired = [
+                    key for key, (_, deadline, _) in _SUPER_META_CACHE.items()
+                    if deadline <= now
+                ]
+                for key in expired:
+                    _SUPER_META_CACHE.pop(key, None)
+                while len(_SUPER_META_CACHE) >= _SUPER_META_CACHE_MAX_ENTRIES:
+                    _SUPER_META_CACHE.pop(next(iter(_SUPER_META_CACHE)))
+                _SUPER_META_CACHE[cache_key] = (
+                    root_version, expires_at, copy.deepcopy(result),
+                )
 
         t_end = time.perf_counter()
         if debug_timings:

@@ -7,7 +7,9 @@ import re
 import time
 import hashlib
 import secrets
-from typing import Any, Dict, Iterator, List, Optional
+import functools
+import inspect
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 
 import redis
 from supertable.config.defaults import logger
@@ -24,6 +26,477 @@ from supertable import redis_keys as RK
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+class RbacAuditAttemptError(RuntimeError):
+    """A non-mutating RBAC attempt could not be durably appended."""
+
+
+class RbacAuditConditionConflict(ValueError):
+    """The state justifying a no-change attempt changed before its append."""
+
+
+class RbacDecisionError(ValueError):
+    """A typed, non-ambiguous RBAC decision that requires audit evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome: str,
+        cause: str,
+        conditions: Optional[Sequence[Mapping[str, Any]]] = None,
+        before_document: Optional[Mapping[str, Any]] = None,
+        before_version: int = 0,
+        severity: str = "warning",
+    ) -> None:
+        super().__init__(message)
+        if outcome not in {"failure", "denied", "no_change"}:
+            raise ValueError("typed RBAC decision has an invalid outcome")
+        if outcome == "no_change" and not conditions:
+            raise ValueError("typed RBAC no-change decisions require conditions")
+        self.outcome = outcome
+        self.cause = cause
+        self.conditions = tuple(conditions or ())
+        self.before_document = before_document
+        self.before_version = before_version
+        self.severity = severity
+
+
+class RbacDuplicateIdentityError(RbacDecisionError):
+    """A duplicate identity claim whose durable no-change event already exists."""
+
+
+class RbacIntegrityError(RuntimeError):
+    """Persisted RBAC state failed a deterministic integrity check."""
+
+
+_RBAC_ATTEMPT_IDENTITIES = {
+    "role_create": ("role", "role"),
+    "role_update": ("role", "role"),
+    "role_delete": ("role", "role"),
+    "user_create": ("user", "user"),
+    "user_update": ("user", "user"),
+    "user_delete": ("user", "user"),
+    "user_role_assign": ("user_role_assignment", "user"),
+    "user_role_remove": ("user_role_assignment", "user"),
+    "token_create": ("auth_token", "token"),
+    "token_delete": ("auth_token", "token"),
+}
+
+# State-dependent ``no_change`` evidence has a deliberately closed grammar.
+# The public append API accepts only these semantic predicates; it derives all
+# Redis keys from the audited scope/resource and converts them to the small
+# low-level predicate language understood by Lua.  Exact ordered shapes keep a
+# caller from combining individually valid predicates into a different claim.
+_RBAC_NO_CHANGE_CONDITION_SHAPES = {
+    ("role_create", "resource_already_exists"): {
+        ("resource_exists",),
+    },
+    ("role_create", "identity_claim_unchanged"): {
+        ("identity_claim",),
+    },
+    ("role_create", "idempotent_replay"): {
+        ("identity_claim", "resource_fields"),
+    },
+    ("role_update", "resource_missing"): {
+        ("resource_absent",),
+    },
+    ("role_update", "resource_disappeared"): {
+        ("resource_absent",),
+    },
+    ("role_update", "identity_claim_unchanged"): {
+        ("identity_claim",),
+    },
+    ("role_delete", "resource_missing"): {
+        ("resource_absent",),
+    },
+    ("role_delete", "resource_disappeared"): {
+        ("resource_absent",),
+    },
+    ("user_create", "resource_already_exists"): {
+        ("resource_exists",),
+    },
+    ("user_create", "identity_claim_unchanged"): {
+        ("identity_claim",),
+    },
+    ("user_create", "idempotent_replay"): {
+        ("identity_claim", "resource_fields", "user_roles_equal"),
+    },
+    ("user_create", "resource_missing"): {
+        ("role_absent",),
+    },
+    ("user_update", "resource_missing"): {
+        ("resource_absent",),
+        ("role_absent",),
+    },
+    ("user_update", "resource_disappeared"): {
+        ("resource_absent",),
+    },
+    ("user_update", "identity_claim_unchanged"): {
+        ("identity_claim",),
+    },
+    ("user_update", "empty_update"): {
+        ("resource_fields",),
+    },
+    ("user_delete", "resource_missing"): {
+        ("resource_absent",),
+    },
+    ("user_delete", "resource_disappeared"): {
+        ("resource_absent",),
+    },
+    ("user_role_assign", "user_missing"): {
+        ("assignment_user_absent",),
+    },
+    ("user_role_assign", "resource_missing"): {
+        ("assignment_role_absent",),
+    },
+    ("user_role_assign", "role_already_assigned"): {
+        ("assignment_membership",),
+    },
+    ("user_role_assign", "assignment_not_changed"): {
+        ("assignment_membership",),
+    },
+    ("user_role_remove", "user_missing"): {
+        ("assignment_user_absent",),
+    },
+    ("user_role_remove", "role_not_assigned"): {
+        ("assignment_membership",),
+    },
+    ("user_role_remove", "assignment_not_changed"): {
+        ("assignment_membership",),
+    },
+    ("token_create", "token_identity_collision"): {
+        ("token_present",),
+    },
+    ("token_delete", "resource_missing"): {
+        ("token_absent",),
+    },
+    ("token_delete", "resource_disappeared"): {
+        ("token_absent",),
+    },
+}
+
+_AUTH_AUDIT_SUPER_NAME = "_organization_"
+_AUTH_TOKEN_VERSION_FIELD = "version"
+_AUTH_TOKEN_META_FIELDS = frozenset({
+    _AUTH_TOKEN_VERSION_FIELD,
+    "last_updated_ms",
+    "initialized",
+    "_audit_initialized",
+})
+_AUTH_TOKEN_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+_RBAC_DETERMINISTIC_INTEGRITY_MARKERS = (
+    "RBAC commit key has wrong Redis type",
+    "RBAC/audit revision counter is corrupt",
+    "RBAC/audit revision counter cannot be incremented safely",
+    "RBAC namespace revision head is missing",
+    "RBAC namespace revision counter is corrupt",
+    "RBAC namespace revision counter is out of range",
+    "RBAC user namespace revision counter is corrupt",
+    "RBAC user namespace revision counter is out of range",
+    "auth token audit marker is corrupt",
+    "WRONGTYPE Operation against a key",
+)
+
+
+def _safe_rbac_audit_resource_id(*parts: Any, fallback: str) -> str:
+    """Return a bounded, log-safe resource identity without leaking input."""
+
+    try:
+        value = ":".join(str(part) for part in parts)
+    except Exception:
+        return fallback
+    if not value:
+        return fallback
+    if len(value) <= 512 and not any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    ):
+        return value
+    digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+    return f"{fallback}:sha256:{digest}"
+
+
+def _rbac_decision(error: BaseException) -> tuple[
+    str,
+    str,
+    Optional[Sequence[Mapping[str, Any]]],
+    Optional[Mapping[str, Any]],
+    int,
+    str,
+]:
+    """Return trusted audit metadata without inspecting exception messages."""
+
+    if isinstance(error, RbacDecisionError):
+        return (
+            error.outcome,
+            error.cause,
+            error.conditions or None,
+            error.before_document,
+            error.before_version,
+            error.severity,
+        )
+    if isinstance(error, RbacIntegrityError):
+        return "failure", "state_integrity_error", None, None, 0, "critical"
+    if isinstance(error, PermissionError):
+        return "denied", "authorization_denied", None, None, 0, "warning"
+    return "denied", "request_rejected", None, None, 0, "warning"
+
+
+def _rbac_absent_decision(
+    message: str,
+    *,
+    cause: str = "resource_missing",
+) -> RbacDecisionError:
+    return RbacDecisionError(
+        message,
+        outcome="no_change",
+        cause=cause,
+        conditions=[{"kind": "resource_absent"}],
+    )
+
+
+def _rbac_role_absent_decision(
+    message: str,
+    role_id: str,
+    *,
+    cause: str = "resource_missing",
+) -> RbacDecisionError:
+    return RbacDecisionError(
+        message,
+        outcome="no_change",
+        cause=cause,
+        conditions=[{"kind": "role_absent", "role_id": role_id}],
+    )
+
+
+def _rbac_assignment_role_absent_decision(
+    message: str,
+    user_id: str,
+    role_id: str,
+) -> RbacDecisionError:
+    return RbacDecisionError(
+        message,
+        outcome="no_change",
+        cause="resource_missing",
+        conditions=[{
+            "kind": "assignment_role_absent",
+            "user_id": user_id,
+            "role_id": role_id,
+        }],
+    )
+
+
+def _rbac_identity_decision(
+    message: str,
+    name: str,
+    identity_id: str,
+) -> RbacDecisionError:
+    return RbacDecisionError(
+        message,
+        outcome="no_change",
+        cause="identity_claim_unchanged",
+        conditions=[{
+            "kind": "identity_claim",
+            "name": name,
+            "identity_id": identity_id,
+        }],
+    )
+
+
+def _rbac_failure_decision(
+    message: str,
+    *,
+    cause: str = "concurrent_modification",
+    severity: str = "warning",
+) -> RbacDecisionError:
+    return RbacDecisionError(
+        message,
+        outcome="failure",
+        cause=cause,
+        severity=severity,
+    )
+
+
+def _rbac_denied_decision(
+    message: str,
+    *,
+    cause: str,
+    severity: str = "warning",
+) -> RbacDecisionError:
+    return RbacDecisionError(
+        message,
+        outcome="denied",
+        cause=cause,
+        severity=severity,
+    )
+
+
+def _audit_catalog_rejections(
+    *,
+    action: str,
+    resource_type: str,
+    namespace: str,
+    resource_fields: tuple[str, ...],
+):
+    """Durably audit known catalog request failures, never backend ambiguity."""
+
+    def decorate(function):
+        signature = inspect.signature(function)
+
+        @functools.wraps(function)
+        def guarded(self, *args, **kwargs):
+            try:
+                bound = signature.bind(self, *args, **kwargs)
+            except TypeError:
+                # Without a reliably bound organization/super-table scope no
+                # durable tenant ledger can be selected.  Preserve Python's
+                # normal call-contract error instead of guessing a scope.
+                return function(self, *args, **kwargs)
+            try:
+                return function(self, *args, **kwargs)
+            except redis.exceptions.ResponseError as error:
+                if not any(
+                    marker in str(error)
+                    for marker in _RBAC_DETERMINISTIC_INTEGRITY_MARKERS
+                ):
+                    raise
+                integrity_error = RbacIntegrityError(
+                    "Persisted RBAC state failed an atomic integrity preflight"
+                )
+                resource_id = _safe_rbac_audit_resource_id(
+                    *(bound.arguments.get(name, "") for name in resource_fields),
+                    fallback=f"pending-{resource_type}",
+                )
+                try:
+                    self.rbac_append_attempt(
+                        bound.arguments["org"],
+                        bound.arguments["sup"],
+                        action=action,
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        namespace=namespace,
+                        outcome="failure",
+                        cause="state_integrity_error",
+                        action_context=bound.arguments.get("action_context"),
+                        severity="critical",
+                    )
+                except Exception as audit_error:
+                    raise audit_error from error
+                self._rbac_mark_attempt_recorded(integrity_error)
+                raise integrity_error from error
+            except (
+                RbacIntegrityError,
+                ValueError,
+                TypeError,
+                PermissionError,
+            ) as error:
+                if self.rbac_attempt_was_recorded(error):
+                    raise
+                (
+                    outcome,
+                    cause,
+                    conditions,
+                    before_document,
+                    before_version,
+                    severity,
+                ) = _rbac_decision(error)
+                resource_id = _safe_rbac_audit_resource_id(
+                    *(bound.arguments.get(name, "") for name in resource_fields),
+                    fallback=f"pending-{resource_type}",
+                )
+                try:
+                    self.rbac_append_attempt(
+                        bound.arguments["org"],
+                        bound.arguments["sup"],
+                        action=action,
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        namespace=namespace,
+                        outcome=outcome,
+                        cause=cause,
+                        action_context=bound.arguments.get("action_context"),
+                        before_document=before_document,
+                        before_version=before_version,
+                        severity=severity,
+                        conditions=conditions,
+                    )
+                except Exception as audit_error:
+                    raise audit_error from error
+                self._rbac_mark_attempt_recorded(error)
+                raise
+
+        return guarded
+
+    return decorate
+
+
+def audit_rbac_manager_rejections(
+    *,
+    action: str,
+    resource_type: str,
+    namespace: str,
+    resource_fields: tuple[str, ...] = (),
+):
+    """Guard public manager validation without duplicating catalog evidence."""
+
+    def decorate(function):
+        signature = inspect.signature(function)
+
+        @functools.wraps(function)
+        def guarded(self, *args, **kwargs):
+            try:
+                bound = signature.bind(self, *args, **kwargs)
+            except TypeError:
+                return function(self, *args, **kwargs)
+            try:
+                return function(self, *args, **kwargs)
+            except (
+                RbacIntegrityError,
+                ValueError,
+                TypeError,
+                PermissionError,
+            ) as error:
+                catalog = self._catalog
+                if catalog.rbac_attempt_was_recorded(error):
+                    raise
+                (
+                    outcome,
+                    cause,
+                    conditions,
+                    before_document,
+                    before_version,
+                    severity,
+                ) = _rbac_decision(error)
+                resource_id = _safe_rbac_audit_resource_id(
+                    *(bound.arguments.get(name, "") for name in resource_fields),
+                    fallback=f"pending-{resource_type}",
+                )
+                try:
+                    catalog.rbac_append_attempt(
+                        self.organization,
+                        self.super_name,
+                        action=action,
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        namespace=namespace,
+                        outcome=outcome,
+                        cause=cause,
+                        action_context=bound.arguments.get("action_context"),
+                        before_document=before_document,
+                        before_version=before_version,
+                        severity=severity,
+                        conditions=conditions,
+                    )
+                except Exception as audit_error:
+                    raise audit_error from error
+                catalog._rbac_mark_attempt_recorded(error)
+                raise
+
+        return guarded
+
+    return decorate
 
 
 # ---------------------------------------------------------------------------
@@ -48,8 +521,10 @@ def validate_role_name(role_name: str) -> None:
     and absent names skip the lookup index. Only non-empty names get
     validated.
     """
-    if not role_name:
+    if role_name is None or role_name == "":
         return
+    if not isinstance(role_name, str):
+        raise ValueError("role_name must be a string")
     if not SAFE_ROLE_NAME_RE.fullmatch(role_name):
         raise ValueError(
             f"Invalid role_name: {role_name!r}. Must be 1-127 characters, "
@@ -91,6 +566,80 @@ def validate_username(username: str) -> None:
         )
 
 
+def _decode_role_json_field(value: Any, *, field: str) -> Any:
+    """Decode one catalog role field or reject corrupt persisted JSON."""
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"role field {field!r} is not valid UTF-8") from exc
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(f"role field {field!r} is not valid JSON") from exc
+    return value
+
+
+def _canonicalize_role_document(
+    role_data: Dict[str, Any],
+    *,
+    default_if_empty: bool,
+) -> Dict[str, Any]:
+    """Validate/canonicalise policy fields while preserving catalog metadata.
+
+    Imported lazily to keep the low-level catalog module independent during
+    package bootstrap.  Invalid persisted policies raise and are omitted by
+    read methods, making corruption a denial rather than an implicit grant.
+    """
+    from supertable.rbac.row_column_security import (
+        RowColumnSecurity,
+        canonicalize_role_tables,
+    )
+
+    if not isinstance(role_data, dict):
+        raise ValueError("role document must be an object")
+    document = dict(role_data)
+
+    role_type = document.get("role")
+    if isinstance(role_type, bytes):
+        try:
+            role_type = role_type.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("role type is not valid UTF-8") from exc
+
+    raw_tables = document.get("tables")
+    if isinstance(raw_tables, (str, bytes)):
+        raw_tables = _decode_role_json_field(raw_tables, field="tables")
+    tables = canonicalize_role_tables(
+        raw_tables,
+        default_if_empty=default_if_empty,
+        allow_legacy_list=True,
+    )
+
+    rcs = RowColumnSecurity(role=role_type, tables=tables)
+    # Do not call prepare(): its public creation compatibility default would
+    # turn a read-time empty policy into wildcard access.
+    rcs.tables = tables
+    rcs.create_content_hash()
+    document["role"] = rcs.role.value
+    document["tables"] = tables
+    document["content_hash"] = rcs.content_hash
+
+    role_name = document.get("role_name", "")
+    if isinstance(role_name, bytes):
+        try:
+            role_name = role_name.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("role_name is not valid UTF-8") from exc
+        document["role_name"] = role_name
+    validate_role_name(role_name)
+    if role_name and role_name.casefold() == "superadmin":
+        if rcs.role.value != "superadmin":
+            raise ValueError("The reserved 'superadmin' name requires superadmin type")
+    return document
+
+
 # All Redis key strings are constructed via `supertable.redis_keys` (RK).
 # This module deliberately contains no `f"supertable:..."` string literals;
 # any new key must be added to redis_keys.py first.
@@ -105,6 +654,13 @@ class RedisCatalog:
       * lock:leaf:{simple} -> token (SET NX EX)
       * lock:stat -> token (SET NX EX)  # for monitoring stats updates
     """
+
+    # One role deletion is deliberately bounded so Redis is not blocked by an
+    # unbounded evidence fan-out.  Larger revocations must be split by an
+    # operator-controlled migration before the role can be deleted.
+    _RBAC_CASCADE_MANIFEST_USER_LIMIT = 10_000
+    _RBAC_ATTEMPT_CONDITION_LIMIT = 16
+    _RBAC_ATTEMPT_CONDITION_BYTES_LIMIT = 16_384
 
     # ------------- Lua sources -------------
     _LUA_LEAF_CAS_SET = """
@@ -439,19 +995,959 @@ return {cur, new_value}
 
     # ------------- RBAC Lua scripts ------------- #
 
-    _LUA_RBAC_BUMP_META = """
-local key = KEYS[1]
-local now = ARGV[1]
-local v = redis.call('HINCRBY', key, 'version', 1)
-redis.call('HSET', key, 'last_updated_ms', now)
-return v
+    # Mandatory privileged-audit WAL support shared by every RBAC mutation.
+    #
+    # The final two KEYS are always the organization-level privileged outbox
+    # STREAM and its sequence/meta HASH; the final ARGV is a validated event
+    # template JSON produced by ``audit.privileged``.  The append happens only
+    # after all data-dependent validation and immediately before deterministic
+    # commit commands.  Audit configuration is deliberately irrelevant here:
+    # a privileged state transition cannot succeed without its durable record.
+    #
+    # Redis Lua does not roll back commands preceding a runtime error, so this
+    # preamble validates the two audit key types, sequence value, event shape,
+    # and size before any mutation script performs a write.
+    _LUA_RBAC_AUDIT_PREAMBLE = """
+local privileged_audit_outbox = KEYS[#KEYS - 1]
+local privileged_audit_meta = KEYS[#KEYS]
+local privileged_audit_json = ARGV[#ARGV]
+local privileged_audit_org = ARGV[#ARGV - 2]
+local privileged_audit_super = ARGV[#ARGV - 1]
+
+local function normalized_type(key)
+    local value = redis.call('TYPE', key)
+    if type(value) == 'table' then value = value['ok'] end
+    return tostring(value)
+end
+
+local function require_key_type(key, expected, allow_none)
+    local actual = normalized_type(key)
+    if actual ~= expected and not (allow_none and actual == 'none') then
+        error(
+            'RBAC commit key has wrong Redis type: expected '
+            .. expected .. ', got ' .. actual
+        )
+    end
+end
+
+local function normalized_decimal(value)
+    local normalized = string.gsub(value, '^0+', '')
+    return (normalized == '') and '0' or normalized
+end
+
+local function increment_decimal(value)
+    value = normalized_decimal(value)
+    if string.len(value) > 19
+        or (string.len(value) == 19 and value > '9223372036854775806') then
+        error('RBAC/audit revision counter cannot be incremented safely')
+    end
+    local carry = 1
+    local output = ''
+    for index = string.len(value), 1, -1 do
+        local digit = tonumber(string.sub(value, index, index))
+        local next_digit = digit + carry
+        if next_digit >= 10 then
+            next_digit = next_digit - 10
+            carry = 1
+        else
+            carry = 0
+        end
+        output = tostring(next_digit) .. output
+    end
+    if carry == 1 then output = '1' .. output end
+    return output
+end
+
+local function incrementable_hash_counter(key, field)
+    local value = redis.call('HGET', key, field) or '0'
+    if value ~= '0' and not string.match(value, '^[1-9]%d*$') then
+        error('RBAC/audit revision counter is corrupt')
+    end
+    return increment_decimal(value)
+end
+
+local function incrementable_namespace_counter(key, field)
+    local value = redis.call('HGET', key, field)
+    if value == false then
+        local key_type = normalized_type(key)
+        if key_type == 'hash' and redis.call('HLEN', key) > 0 then
+            error('RBAC namespace revision head is missing')
+        end
+        value = '0'
+    end
+    if value ~= '0' and not string.match(value, '^[1-9]%d*$') then
+        error('RBAC/audit revision counter is corrupt')
+    end
+    return increment_decimal(value)
+end
+
+local function require_namespace_head_for_state(key, has_state)
+    if has_state and redis.call('HGET', key, 'version') == false then
+        error('RBAC namespace revision head is missing')
+    end
+end
+
+local outbox_type = normalized_type(privileged_audit_outbox)
+if outbox_type ~= 'none' and outbox_type ~= 'stream' then
+    return redis.error_reply('privileged audit outbox has wrong Redis type')
+end
+local audit_meta_type = normalized_type(privileged_audit_meta)
+if audit_meta_type ~= 'none' and audit_meta_type ~= 'hash' then
+    return redis.error_reply('privileged audit meta has wrong Redis type')
+end
+local outbox_length = 0
+if outbox_type == 'stream' then
+    outbox_length = redis.call('XLEN', privileged_audit_outbox)
+end
+local stored_audit_sequence = redis.call(
+    'HGET', privileged_audit_meta, 'sequence'
+)
+if stored_audit_sequence == false then
+    -- Once either side of the ledger exists, losing its monotonic head is an
+    -- integrity failure, never permission to silently start again at 1.
+    local meta_fields = 0
+    if audit_meta_type == 'hash' then
+        meta_fields = redis.call('HLEN', privileged_audit_meta)
+    end
+    if outbox_length > 0 or meta_fields > 0 then
+        return redis.error_reply('privileged audit sequence head is missing')
+    end
+end
+local current_audit_sequence = stored_audit_sequence or '0'
+if current_audit_sequence ~= '0'
+    and not string.match(current_audit_sequence, '^[1-9]%d*$') then
+    return redis.error_reply('privileged audit sequence is corrupt')
+end
+if outbox_type == 'none' and current_audit_sequence ~= '0' then
+    return redis.error_reply('privileged audit stream is missing')
+end
+if outbox_type == 'stream'
+    and outbox_length == 0
+    and current_audit_sequence ~= '0' then
+    return redis.error_reply('privileged audit stream head is missing')
+end
+if outbox_length > 0 then
+    if current_audit_sequence == '0' then
+        return redis.error_reply('privileged audit stream has a zero sequence head')
+    end
+    local latest = redis.call(
+        'XREVRANGE', privileged_audit_outbox, '+', '-', 'COUNT', 1
+    )
+    if #latest ~= 1 then
+        return redis.error_reply('privileged audit stream head is unreadable')
+    end
+    local latest_id = latest[1][1]
+    local latest_sequence = nil
+    local latest_event_id = nil
+    local latest_payload_hash = nil
+    local latest_fields = latest[1][2]
+    for index = 1, #latest_fields, 2 do
+        if latest_fields[index] == 'ledger_sequence' then
+            latest_sequence = latest_fields[index + 1]
+        elseif latest_fields[index] == 'event_id' then
+            latest_event_id = latest_fields[index + 1]
+        elseif latest_fields[index] == 'payload_hash' then
+            latest_payload_hash = latest_fields[index + 1]
+        end
+    end
+    local stored_stream_id = redis.call(
+        'HGET', privileged_audit_meta, 'last_stream_id'
+    )
+    local stored_event_id = redis.call(
+        'HGET', privileged_audit_meta, 'last_event_id'
+    )
+    local stored_payload_hash = redis.call(
+        'HGET', privileged_audit_meta, 'last_payload_hash'
+    )
+    if stored_stream_id == false
+        or stored_stream_id ~= latest_id
+        or latest_sequence == nil
+        or latest_sequence ~= current_audit_sequence
+        or stored_event_id == false
+        or stored_event_id ~= latest_event_id
+        or stored_payload_hash == false
+        or stored_payload_hash ~= latest_payload_hash then
+        return redis.error_reply('privileged audit stream/meta heads disagree')
+    end
+end
+local next_audit_sequence = increment_decimal(current_audit_sequence)
+if string.len(privileged_audit_json) > 65536 then
+    return redis.error_reply('privileged audit record exceeds 65536 bytes')
+end
+local audit_ok, privileged_audit_event = pcall(
+    cjson.decode, privileged_audit_json
+)
+if not audit_ok or type(privileged_audit_event) ~= 'table' then
+    return redis.error_reply('invalid privileged audit record')
+end
+if privileged_audit_event['organization'] ~= privileged_audit_org
+    or privileged_audit_event['super_name'] ~= privileged_audit_super then
+    return redis.error_reply('privileged audit scope does not match RBAC commit')
+end
+for _, required_field in ipairs({
+    'event_id', 'mutation_id', 'organization', 'super_name', 'action',
+    'actor_type', 'actor_id', 'resource_type', 'resource_id', 'payload_hash'
+}) do
+    local value = privileged_audit_event[required_field]
+    if value == nil or type(value) ~= 'string' or value == '' then
+        return redis.error_reply(
+            'privileged audit record missing ' .. required_field
+        )
+    end
+end
+local privileged_audit_outcome = privileged_audit_event['outcome']
+if privileged_audit_event['schema_version'] ~= 1
+    or (
+        privileged_audit_outcome ~= 'success'
+        and privileged_audit_outcome ~= 'failure'
+        and privileged_audit_outcome ~= 'denied'
+        and privileged_audit_outcome ~= 'no_change'
+    )
+    or privileged_audit_event['ledger_sequence'] ~= 0
+    or privileged_audit_event['namespace_version'] ~= 0
+    or privileged_audit_event['affected_count'] ~= 0
+    or privileged_audit_event['cascade_assignment_count'] ~= 0
+    or privileged_audit_event['user_namespace_version_before'] ~= 0
+    or privileged_audit_event['user_namespace_version_after'] ~= 0 then
+    return redis.error_reply('privileged audit template has invalid commit fields')
+end
+
+local function require_audit_identity(action, resource_type, resource_id)
+    if privileged_audit_outcome ~= 'success'
+        or privileged_audit_event['action'] ~= action
+        or privileged_audit_event['resource_type'] ~= resource_type
+        or privileged_audit_event['resource_id'] ~= resource_id then
+        error('privileged audit identity does not match RBAC commit')
+    end
+end
+local privileged_cascade_manifest_id = privileged_audit_event[
+    'cascade_manifest_id'
+]
+if type(privileged_cascade_manifest_id) ~= 'string' then
+    return redis.error_reply('privileged audit cascade manifest ID is invalid')
+end
+if privileged_audit_outcome == 'success'
+    and privileged_audit_event['action'] == 'role_delete' then
+    if privileged_cascade_manifest_id ~= privileged_audit_event['event_id'] then
+        return redis.error_reply(
+            'role deletion cascade manifest must equal its event ID'
+        )
+    end
+elseif privileged_cascade_manifest_id ~= '' then
+    return redis.error_reply(
+        'only successful role deletion may reference a cascade manifest'
+    )
+end
+if string.len(privileged_audit_event['payload_hash']) ~= 64
+    or not string.match(privileged_audit_event['payload_hash'], '^[0-9a-f]+$') then
+    return redis.error_reply('privileged audit payload hash is invalid')
+end
+
+local function append_privileged_audit(extra_fields)
+    local sequence = next_audit_sequence
+    local namespace_version = '0'
+    local affected_count = '0'
+    local cascade_assignment_count = '0'
+    local user_namespace_version_before = '0'
+    local user_namespace_version_after = '0'
+    if extra_fields and extra_fields['namespace_version'] ~= nil then
+        namespace_version = tostring(extra_fields['namespace_version'])
+    end
+    if extra_fields and extra_fields['affected_count'] ~= nil then
+        affected_count = tostring(extra_fields['affected_count'])
+    end
+    if extra_fields and extra_fields['cascade_assignment_count'] ~= nil then
+        cascade_assignment_count = tostring(
+            extra_fields['cascade_assignment_count']
+        )
+    end
+    if extra_fields and extra_fields['user_namespace_version_before'] ~= nil then
+        user_namespace_version_before = tostring(
+            extra_fields['user_namespace_version_before']
+        )
+    end
+    if extra_fields and extra_fields['user_namespace_version_after'] ~= nil then
+        user_namespace_version_after = tostring(
+            extra_fields['user_namespace_version_after']
+        )
+    end
+    local stream_id = redis.call(
+        'XADD', privileged_audit_outbox, '*',
+        -- Preserve the Python-validated template byte-for-byte.  Redis cjson
+        -- cannot round-trip empty arrays or integers above 2^53 reliably.
+        -- Exact commit-assigned decimals therefore live in the immutable
+        -- stream envelope and are merged by PrivilegedAuditOutbox.
+        'event_json', privileged_audit_json,
+        'event_id', privileged_audit_event['event_id'],
+        'mutation_id', privileged_audit_event['mutation_id'],
+        'action', privileged_audit_event['action'],
+        'resource_type', privileged_audit_event['resource_type'],
+        'resource_id', privileged_audit_event['resource_id'],
+        'organization', privileged_audit_event['organization'],
+        'super_name', privileged_audit_event['super_name'],
+        'ledger_sequence', tostring(sequence),
+        'namespace_version', namespace_version,
+        'affected_count', affected_count,
+        'cascade_manifest_id', privileged_audit_event['cascade_manifest_id'],
+        'cascade_assignment_count', cascade_assignment_count,
+        'user_namespace_version_before', user_namespace_version_before,
+        'user_namespace_version_after', user_namespace_version_after,
+        'payload_hash', privileged_audit_event['payload_hash']
+    )
+    redis.call(
+        'HSET', privileged_audit_meta,
+        'sequence', sequence,
+        'last_stream_id', stream_id,
+        'last_event_id', privileged_audit_event['event_id'],
+        'last_payload_hash', privileged_audit_event['payload_hash'],
+        'updated_ms', tostring(privileged_audit_event['timestamp_ms'] or '')
+    )
+    return stream_id
+end
+"""
+
+    # Append a rejected/failed/no-change privileged attempt without touching
+    # RBAC state.  The relevant namespace revision is sampled inside the same
+    # Lua invocation as XADD so the evidence cannot claim a revision observed
+    # before or after some unrelated race.  Successful mutations are rejected
+    # here; they must use one of the transactional mutation scripts above.
+    # KEYS: namespace meta, optional condition keys, privileged outbox,
+    #       privileged audit meta
+    # ARGV: optional condition JSON, organization, super table, validated
+    #       event template JSON
+    _LUA_RBAC_APPEND_ATTEMPT = _LUA_RBAC_AUDIT_PREAMBLE + """
+if privileged_audit_outcome == 'success' then
+    return redis.error_reply(
+        'successful privileged events require an RBAC mutation script'
+    )
+end
+local attempt_action = privileged_audit_event['action']
+local attempt_resource_type = privileged_audit_event['resource_type']
+local valid_attempt_identity = (
+    (
+        attempt_action == 'role_create'
+        or attempt_action == 'role_update'
+        or attempt_action == 'role_delete'
+    )
+    and attempt_resource_type == 'role'
+) or (
+    (
+        attempt_action == 'user_create'
+        or attempt_action == 'user_update'
+        or attempt_action == 'user_delete'
+    )
+    and attempt_resource_type == 'user'
+) or (
+    (
+        attempt_action == 'user_role_assign'
+        or attempt_action == 'user_role_remove'
+    )
+    and attempt_resource_type == 'user_role_assignment'
+) or (
+    (
+        attempt_action == 'token_create'
+        or attempt_action == 'token_delete'
+    )
+    and attempt_resource_type == 'auth_token'
+)
+if not valid_attempt_identity then
+    return redis.error_reply('invalid privileged RBAC attempt identity')
+end
+local namespace_type = normalized_type(KEYS[1])
+local namespace_version = '0'
+if privileged_audit_outcome == 'failure'
+    and namespace_type ~= 'none'
+    and namespace_type ~= 'hash' then
+    -- A deterministic state-key integrity failure must still be recordable
+    -- when the organization audit stream/meta boundary itself is healthy.
+    namespace_version = '0'
+else
+    require_key_type(KEYS[1], 'hash', true)
+    local stored_namespace_version = redis.call('HGET', KEYS[1], 'version')
+    if stored_namespace_version == false then
+        if namespace_type == 'hash' and redis.call('HLEN', KEYS[1]) > 0 then
+            if privileged_audit_outcome ~= 'failure' then
+                return redis.error_reply('RBAC namespace revision head is missing')
+            end
+        else
+            namespace_version = '0'
+        end
+    else
+        namespace_version = stored_namespace_version
+    end
+end
+if namespace_version ~= '0'
+    and not string.match(namespace_version, '^[1-9]%d*$') then
+    if privileged_audit_outcome == 'failure' then
+        namespace_version = '0'
+    else
+        return redis.error_reply('RBAC namespace revision counter is corrupt')
+    end
+end
+if string.len(namespace_version) > 19
+    or (
+        string.len(namespace_version) == 19
+        and namespace_version > '9223372036854775807'
+    ) then
+    if privileged_audit_outcome == 'failure' then
+        namespace_version = '0'
+    else
+        return redis.error_reply('RBAC namespace revision counter is out of range')
+    end
+end
+
+-- A state-dependent no-op is evidence only while the state that justified it
+-- is still true.  Conditions are generated internally, strictly bounded, and
+-- evaluated in this same script as XADD.  A miss returns 0 without advancing
+-- the ledger; the caller must surface a concurrent-state retry.
+if #ARGV ~= 3 and #ARGV ~= 4 then
+    return redis.error_reply('invalid privileged RBAC attempt arguments')
+end
+if privileged_audit_outcome == 'no_change' and #ARGV ~= 4 then
+    return redis.error_reply('no-change RBAC attempts require conditions')
+end
+if #ARGV == 4 then
+    if privileged_audit_outcome ~= 'no_change' then
+        return redis.error_reply('only no-change attempts may be conditional')
+    end
+    local condition_json = ARGV[1]
+    if string.len(condition_json) == 0
+        or string.len(condition_json) > 16384
+        or string.sub(condition_json, 1, 1) ~= '['
+        or string.sub(condition_json, -1) ~= ']' then
+        return redis.error_reply('invalid RBAC attempt condition envelope')
+    end
+    local decoded_ok, conditions = pcall(cjson.decode, condition_json)
+    if not decoded_ok or type(conditions) ~= 'table'
+        or #conditions == 0 or #conditions > 16
+        or #conditions ~= (#KEYS - 3) then
+        return redis.error_reply('invalid RBAC attempt conditions')
+    end
+    for condition_index, condition in ipairs(conditions) do
+        if type(condition) ~= 'table' or type(condition['kind']) ~= 'string' then
+            return redis.error_reply('invalid RBAC attempt condition')
+        end
+        local condition_key = KEYS[condition_index + 1]
+        local condition_kind = condition['kind']
+        local actual_type = normalized_type(condition_key)
+        if condition_kind == 'absent' then
+            if actual_type ~= 'none' then return 0 end
+        elseif condition_kind == 'exists' then
+            if actual_type == 'none' then return 0 end
+        elseif condition_kind == 'hash_fields' then
+            local fields = condition['fields']
+            if actual_type ~= 'hash' or type(fields) ~= 'table'
+                or #fields == 0 or #fields > 16 then
+                return 0
+            end
+            for _, field in ipairs(fields) do
+                if type(field) ~= 'table'
+                    or type(field['name']) ~= 'string'
+                    or type(field['value']) ~= 'string' then
+                    return redis.error_reply('invalid RBAC hash condition')
+                end
+                if redis.call('HSTRLEN', condition_key, field['name'])
+                    ~= string.len(field['value'])
+                    or redis.call('HGET', condition_key, field['name'])
+                        ~= field['value'] then
+                    return 0
+                end
+            end
+        elseif condition_kind == 'hash_field_absent' then
+            if type(condition['field']) ~= 'string'
+                or condition['field'] == '' then
+                return redis.error_reply('invalid RBAC absent-hash-field condition')
+            end
+            if actual_type == 'hash'
+                and redis.call('HEXISTS', condition_key, condition['field']) == 1 then
+                return 0
+            elseif actual_type ~= 'hash' and actual_type ~= 'none' then
+                return 0
+            end
+        elseif condition_kind == 'json_array_membership' then
+            if actual_type ~= 'hash'
+                or type(condition['field']) ~= 'string'
+                or type(condition['item']) ~= 'string'
+                or type(condition['present']) ~= 'boolean'
+                or type(condition['version']) ~= 'string' then
+                return 0
+            end
+            local roles_json = redis.call(
+                'HGET', condition_key, condition['field']
+            )
+            local actual_version = redis.call(
+                'HGET', condition_key, 'doc_version'
+            ) or '0'
+            if not roles_json or actual_version ~= condition['version'] then
+                return 0
+            end
+            if string.len(roles_json) > 65536 then
+                return redis.error_reply('RBAC assignment list exceeds audit limit')
+            end
+            if string.sub(roles_json, 1, 1) ~= '['
+                or string.sub(roles_json, -1) ~= ']' then
+                return redis.error_reply('RBAC assignment list is corrupt')
+            end
+            local roles_ok, roles = pcall(cjson.decode, roles_json)
+            if not roles_ok or type(roles) ~= 'table' then
+                return redis.error_reply('RBAC assignment list is corrupt')
+            end
+            local found = false
+            for _, assigned_id in ipairs(roles) do
+                if type(assigned_id) ~= 'string' then
+                    return redis.error_reply('RBAC assignment list is corrupt')
+                end
+                if assigned_id == condition['item'] then found = true end
+            end
+            if found ~= condition['present'] then return 0 end
+        elseif condition_kind == 'json_array_equals' then
+            if actual_type ~= 'hash'
+                or type(condition['field']) ~= 'string'
+                or type(condition['items']) ~= 'table'
+                or type(condition['version']) ~= 'string' then
+                return 0
+            end
+            local actual_json = redis.call(
+                'HGET', condition_key, condition['field']
+            )
+            local actual_version = redis.call(
+                'HGET', condition_key, 'doc_version'
+            ) or '0'
+            if not actual_json or actual_version ~= condition['version'] then
+                return 0
+            end
+            if string.len(actual_json) > 65536
+                or string.sub(actual_json, 1, 1) ~= '['
+                or string.sub(actual_json, -1) ~= ']' then
+                return redis.error_reply('RBAC assignment list is corrupt')
+            end
+            local actual_ok, actual_items = pcall(cjson.decode, actual_json)
+            if not actual_ok or type(actual_items) ~= 'table'
+                or #actual_items ~= #condition['items'] then
+                return 0
+            end
+            for _, item in ipairs(actual_items) do
+                if type(item) ~= 'string' then
+                    return redis.error_reply('RBAC assignment list is corrupt')
+                end
+            end
+            for _, item in ipairs(condition['items']) do
+                if type(item) ~= 'string' then
+                    return redis.error_reply('invalid RBAC array condition')
+                end
+            end
+            table.sort(actual_items)
+            table.sort(condition['items'])
+            for index, item in ipairs(actual_items) do
+                if item ~= condition['items'][index] then return 0 end
+            end
+        elseif condition_kind == 'set_cardinality' then
+            if type(condition['count']) ~= 'string'
+                or (actual_type ~= 'set' and actual_type ~= 'none') then
+                return 0
+            end
+            local actual_count = '0'
+            if actual_type == 'set' then
+                actual_count = tostring(redis.call('SCARD', condition_key))
+            end
+            if actual_count ~= condition['count'] then return 0 end
+        else
+            return redis.error_reply('unknown RBAC attempt condition')
+        end
+    end
+end
+append_privileged_audit({namespace_version=namespace_version})
+return 1
+"""
+
+    # Validate one RBAC namespace without changing it.  The first audited
+    # mutation creates its revision metadata in the same Lua transaction as
+    # the security document and success event; bootstrap validation must not
+    # manufacture an unaudited namespace revision.
+    # KEYS: namespace meta HASH, authoritative ID SET, identity-name HASH
+    _LUA_RBAC_VALIDATE_META = """
+local function normalized_type(key)
+    local reply = redis.call('TYPE', key)
+    if type(reply) == 'table' then return reply['ok'] end
+    return reply
+end
+local meta_type = normalized_type(KEYS[1])
+local index_type = normalized_type(KEYS[2])
+local name_type = normalized_type(KEYS[3])
+if (meta_type ~= 'none' and meta_type ~= 'hash')
+    or (index_type ~= 'none' and index_type ~= 'set')
+    or (name_type ~= 'none' and name_type ~= 'hash') then
+    return -2
+end
+if meta_type == 'none' then
+    local indexed = index_type == 'set' and redis.call('SCARD', KEYS[2]) or 0
+    local named = name_type == 'hash' and redis.call('HLEN', KEYS[3]) or 0
+    if indexed ~= 0 or named ~= 0 then return -1 end
+    return 0
+end
+local version = redis.call('HGET', KEYS[1], 'version')
+if version == false then return -1 end
+if version ~= '0' and not string.match(version, '^[1-9]%d*$') then return -1 end
+if string.len(version) > 19
+    or (string.len(version) == 19 and version > '9223372036854775807') then
+    return -1
+end
+return 0
+"""
+
+    # Atomically claim the case-insensitive role name and publish every role
+    # index together with the document and revision.  Client-side uniqueness
+    # checks remain useful for friendly errors, but cannot close a concurrent
+    # check-then-create race on their own.
+    # KEYS: document, role index, type index, name map, role meta
+    # ARGV: role_id, role_type, lower-name, serialized-field-map JSON, now_ms
+    _LUA_RBAC_CREATE_ROLE = _LUA_RBAC_AUDIT_PREAMBLE + """
+local role_id = ARGV[1]
+local role_type = ARGV[2]
+local role_name_lower = ARGV[3]
+local role_document_json = ARGV[4]
+local now_ms = ARGV[5]
+require_audit_identity('role_create', 'role', role_id)
+
+require_key_type(KEYS[2], 'set', true)
+require_key_type(KEYS[3], 'set', true)
+require_key_type(KEYS[4], 'hash', true)
+require_key_type(KEYS[5], 'hash', true)
+
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    return -1
+end
+if role_name_lower ~= '' and redis.call('HEXISTS', KEYS[4], role_name_lower) == 1 then
+    return -2
+end
+
+local ok, document = pcall(cjson.decode, role_document_json)
+if not ok or type(document) ~= 'table' then
+    return redis.error_reply('invalid canonical role document')
+end
+require_namespace_head_for_state(
+    KEYS[5], redis.call('SCARD', KEYS[2]) > 0
+        or redis.call('HLEN', KEYS[4]) > 0
+)
+local next_role_namespace_version = incrementable_namespace_counter(
+    KEYS[5], 'version'
+)
+append_privileged_audit({namespace_version=next_role_namespace_version})
+for field, value in pairs(document) do
+    redis.call('HSET', KEYS[1], field, value)
+end
+redis.call('SADD', KEYS[2], role_id)
+redis.call('SADD', KEYS[3], role_id)
+if role_name_lower ~= '' then
+    redis.call('HSET', KEYS[4], role_name_lower, role_id)
+end
+redis.call('HINCRBY', KEYS[5], 'version', 1)
+redis.call('HSET', KEYS[5], 'last_updated_ms', now_ms)
+redis.call('HSET', KEYS[5], 'initialized', 'true')
+return 1
+"""
+
+    # Same atomic uniqueness/publication boundary for users.  In particular,
+    # concurrent process bootstrap must not mint two default superuser docs
+    # and leave only one reachable through the name map.
+    # KEYS: document, user index, name map, user meta
+    # ARGV: user_id, lower-name, serialized-field-map JSON, now_ms
+    _LUA_RBAC_CREATE_USER = _LUA_RBAC_AUDIT_PREAMBLE + """
+local user_id = ARGV[1]
+local username_lower = ARGV[2]
+local user_document_json = ARGV[3]
+local now_ms = ARGV[4]
+local role_doc_key_prefix = ARGV[5]
+require_audit_identity('user_create', 'user', user_id)
+
+require_key_type(KEYS[2], 'set', true)
+require_key_type(KEYS[3], 'hash', true)
+require_key_type(KEYS[4], 'hash', true)
+
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    return -1
+end
+if redis.call('HEXISTS', KEYS[3], username_lower) == 1 then
+    return -2
+end
+local ok, document = pcall(cjson.decode, user_document_json)
+if not ok or type(document) ~= 'table' then
+    return redis.error_reply('invalid canonical user document')
+end
+local roles_ok, roles = pcall(cjson.decode, document['roles'] or '[]')
+if not roles_ok or type(roles) ~= 'table' then return -3 end
+for _, assigned_role_id in ipairs(roles) do
+    local assigned_type = redis.call(
+        'HGET', role_doc_key_prefix .. assigned_role_id, 'role'
+    )
+    if assigned_type ~= 'superadmin'
+        and assigned_type ~= 'admin'
+        and assigned_type ~= 'writer'
+        and assigned_type ~= 'reader'
+        and assigned_type ~= 'meta' then
+        return -3
+    end
+end
+require_namespace_head_for_state(
+    KEYS[4], redis.call('SCARD', KEYS[2]) > 0
+        or redis.call('HLEN', KEYS[3]) > 0
+)
+local next_user_namespace_version = incrementable_namespace_counter(
+    KEYS[4], 'version'
+)
+append_privileged_audit({namespace_version=next_user_namespace_version})
+for field, value in pairs(document) do
+    redis.call('HSET', KEYS[1], field, value)
+end
+redis.call('SADD', KEYS[2], user_id)
+redis.call('HSET', KEYS[3], username_lower, user_id)
+redis.call('HINCRBY', KEYS[4], 'version', 1)
+redis.call('HSET', KEYS[4], 'last_updated_ms', now_ms)
+redis.call('HSET', KEYS[4], 'initialized', 'true')
+return 1
+"""
+
+    # Compare-and-set role update.  Validation happens in Python, while this
+    # script closes the interval between that read and the commit: a delete or
+    # another update cannot be silently overwritten, and a renamed role claims
+    # its case-insensitive name in the same transaction as the document.
+    # KEYS: document, role index, old type index, new type index, name map, meta
+    # ARGV: id, expected role/name/tables, new role/name, field-map JSON, now
+    _LUA_RBAC_UPDATE_ROLE = _LUA_RBAC_AUDIT_PREAMBLE + """
+local role_id = ARGV[1]
+local expected_role = ARGV[2]
+local expected_name = ARGV[3]
+local expected_tables = ARGV[4]
+local expected_modified = ARGV[5]
+local expected_doc_version = ARGV[6]
+local new_role = ARGV[7]
+local new_name = ARGV[8]
+local role_update_document_json = ARGV[9]
+local now_ms = ARGV[10]
+require_audit_identity('role_update', 'role', role_id)
+
+require_key_type(KEYS[1], 'hash', true)
+require_key_type(KEYS[2], 'set', true)
+require_key_type(KEYS[3], 'set', true)
+require_key_type(KEYS[4], 'set', true)
+require_key_type(KEYS[5], 'hash', true)
+require_key_type(KEYS[6], 'hash', true)
+
+if redis.call('EXISTS', KEYS[1]) == 0 then return -1 end
+local current_role = redis.call('HGET', KEYS[1], 'role') or ''
+local current_name = redis.call('HGET', KEYS[1], 'role_name') or ''
+local current_tables = redis.call('HGET', KEYS[1], 'tables') or ''
+local current_modified = redis.call('HGET', KEYS[1], 'modified_ms') or ''
+local current_doc_version = redis.call('HGET', KEYS[1], 'doc_version') or '0'
+if current_role ~= expected_role
+    or current_name ~= expected_name
+    or current_tables ~= expected_tables
+    or current_modified ~= expected_modified
+    or current_doc_version ~= expected_doc_version then
+    return -3
+end
+local stored_id = redis.call('HGET', KEYS[1], 'role_id')
+if stored_id and stored_id ~= role_id then return -6 end
+
+local bootstrap_id = redis.call('HGET', KEYS[5], 'superadmin')
+local is_bootstrap = string.lower(current_name) == 'superadmin'
+    or bootstrap_id == role_id
+if (current_role == 'superadmin' or is_bootstrap)
+    and new_role ~= 'superadmin' then
+    return -4
+end
+if is_bootstrap and string.lower(new_name) ~= 'superadmin' then return -5 end
+
+local new_name_lower = string.lower(new_name)
+if new_name_lower ~= '' then
+    local mapped = redis.call('HGET', KEYS[5], new_name_lower)
+    if mapped and mapped ~= role_id then return -2 end
+end
+
+local ok, document = pcall(cjson.decode, role_update_document_json)
+if not ok or type(document) ~= 'table' then
+    return redis.error_reply('invalid canonical role update document')
+end
+require_namespace_head_for_state(KEYS[6], true)
+local next_role_namespace_version = incrementable_namespace_counter(
+    KEYS[6], 'version'
+)
+append_privileged_audit({namespace_version=next_role_namespace_version})
+for field, value in pairs(document) do
+    redis.call('HSET', KEYS[1], field, value)
+end
+redis.call('HINCRBY', KEYS[1], 'doc_version', 1)
+redis.call('SADD', KEYS[2], role_id)
+if current_role ~= new_role then redis.call('SREM', KEYS[3], role_id) end
+redis.call('SADD', KEYS[4], role_id)
+
+local current_name_lower = string.lower(current_name)
+if current_name_lower ~= new_name_lower and current_name_lower ~= '' then
+    local mapped_old = redis.call('HGET', KEYS[5], current_name_lower)
+    if mapped_old == role_id then redis.call('HDEL', KEYS[5], current_name_lower) end
+end
+if new_name_lower ~= '' then
+    redis.call('HSET', KEYS[5], new_name_lower, role_id)
+end
+redis.call('HINCRBY', KEYS[6], 'version', 1)
+redis.call('HSET', KEYS[6], 'last_updated_ms', now_ms)
+redis.call('HSET', KEYS[6], 'initialized', 'true')
+return 1
+"""
+
+    # CAS user update used by both partial updates and rename.  The final
+    # superuser checks intentionally live here, beside the mutation.
+    # KEYS: document, user index, name map, user meta
+    # ARGV: id, expected username/roles, new username, resulting roles JSON,
+    #       field-map JSON, now, role-document prefix
+    _LUA_RBAC_UPDATE_USER = _LUA_RBAC_AUDIT_PREAMBLE + """
+local user_id = ARGV[1]
+local expected_username = ARGV[2]
+local expected_roles = ARGV[3]
+local expected_modified = ARGV[4]
+local expected_doc_version = ARGV[5]
+local new_username = ARGV[6]
+local resulting_roles_json = ARGV[7]
+local user_update_document_json = ARGV[8]
+local now_ms = ARGV[9]
+local role_doc_key_prefix = ARGV[10]
+require_audit_identity('user_update', 'user', user_id)
+
+require_key_type(KEYS[1], 'hash', true)
+require_key_type(KEYS[2], 'set', true)
+require_key_type(KEYS[3], 'hash', true)
+require_key_type(KEYS[4], 'hash', true)
+
+if redis.call('EXISTS', KEYS[1]) == 0 then return -1 end
+local current_username = redis.call('HGET', KEYS[1], 'username') or ''
+local current_roles = redis.call('HGET', KEYS[1], 'roles') or ''
+local current_modified = redis.call('HGET', KEYS[1], 'modified_ms') or ''
+local current_doc_version = redis.call('HGET', KEYS[1], 'doc_version') or '0'
+if current_username ~= expected_username
+    or current_roles ~= expected_roles
+    or current_modified ~= expected_modified
+    or current_doc_version ~= expected_doc_version then
+    return -3
+end
+local stored_id = redis.call('HGET', KEYS[1], 'user_id')
+if stored_id and stored_id ~= user_id then return -7 end
+
+local new_username_lower = string.lower(new_username)
+local mapped_new = redis.call('HGET', KEYS[3], new_username_lower)
+if mapped_new and mapped_new ~= user_id then return -2 end
+
+local protected_id = redis.call('HGET', KEYS[3], 'superuser')
+local is_protected = string.lower(current_username) == 'superuser'
+    or protected_id == user_id
+if is_protected and new_username_lower ~= 'superuser' then return -4 end
+
+local roles_ok, resulting_roles = pcall(cjson.decode, resulting_roles_json)
+if not roles_ok or type(resulting_roles) ~= 'table' then return -6 end
+local has_superadmin = false
+for _, assigned_role_id in ipairs(resulting_roles) do
+    local assigned_type = redis.call(
+        'HGET', role_doc_key_prefix .. assigned_role_id, 'role'
+    )
+    if assigned_type ~= 'superadmin'
+        and assigned_type ~= 'admin'
+        and assigned_type ~= 'writer'
+        and assigned_type ~= 'reader'
+        and assigned_type ~= 'meta' then
+        return -8
+    end
+    if assigned_type == 'superadmin' then has_superadmin = true end
+end
+if (is_protected or new_username_lower == 'superuser')
+    and not has_superadmin then
+    return -5
+end
+
+local ok, document = pcall(cjson.decode, user_update_document_json)
+if not ok or type(document) ~= 'table' then
+    return redis.error_reply('invalid canonical user update document')
+end
+require_namespace_head_for_state(KEYS[4], true)
+local next_user_namespace_version = incrementable_namespace_counter(
+    KEYS[4], 'version'
+)
+append_privileged_audit({namespace_version=next_user_namespace_version})
+for field, value in pairs(document) do
+    redis.call('HSET', KEYS[1], field, value)
+end
+redis.call('HINCRBY', KEYS[1], 'doc_version', 1)
+redis.call('SADD', KEYS[2], user_id)
+local current_username_lower = string.lower(current_username)
+if current_username_lower ~= new_username_lower and current_username_lower ~= '' then
+    local mapped_old = redis.call('HGET', KEYS[3], current_username_lower)
+    if mapped_old == user_id then
+        redis.call('HDEL', KEYS[3], current_username_lower)
+    end
+end
+redis.call('HSET', KEYS[3], new_username_lower, user_id)
+redis.call('HINCRBY', KEYS[4], 'version', 1)
+redis.call('HSET', KEYS[4], 'last_updated_ms', now_ms)
+redis.call('HSET', KEYS[4], 'initialized', 'true')
+return 1
+"""
+
+    # CAS user deletion keeps document, index, name map, and revision in one
+    # commit and repeats the reserved-superuser decision inside that commit.
+    # KEYS: document, user index, name map, user meta
+    # ARGV: id, expected username, expected roles, now
+    _LUA_RBAC_DELETE_USER = _LUA_RBAC_AUDIT_PREAMBLE + """
+local user_id = ARGV[1]
+local expected_username = ARGV[2]
+local expected_roles = ARGV[3]
+local expected_modified = ARGV[4]
+local expected_doc_version = ARGV[5]
+local now_ms = ARGV[6]
+require_audit_identity('user_delete', 'user', user_id)
+
+require_key_type(KEYS[1], 'hash', true)
+require_key_type(KEYS[2], 'set', true)
+require_key_type(KEYS[3], 'hash', true)
+require_key_type(KEYS[4], 'hash', true)
+
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+local current_username = redis.call('HGET', KEYS[1], 'username') or ''
+local current_roles = redis.call('HGET', KEYS[1], 'roles') or ''
+local current_modified = redis.call('HGET', KEYS[1], 'modified_ms') or ''
+local current_doc_version = redis.call('HGET', KEYS[1], 'doc_version') or '0'
+if current_username ~= expected_username
+    or current_roles ~= expected_roles
+    or current_modified ~= expected_modified
+    or current_doc_version ~= expected_doc_version then
+    return -2
+end
+local stored_id = redis.call('HGET', KEYS[1], 'user_id')
+if stored_id and stored_id ~= user_id then return -3 end
+local protected_id = redis.call('HGET', KEYS[3], 'superuser')
+if string.lower(current_username) == 'superuser' or protected_id == user_id then
+    return -1
+end
+
+require_namespace_head_for_state(KEYS[4], true)
+local next_user_namespace_version = incrementable_namespace_counter(
+    KEYS[4], 'version'
+)
+append_privileged_audit({namespace_version=next_user_namespace_version})
+
+local username_lower = string.lower(current_username)
+local mapped = redis.call('HGET', KEYS[3], username_lower)
+if mapped == user_id then redis.call('HDEL', KEYS[3], username_lower) end
+redis.call('DEL', KEYS[1])
+redis.call('SREM', KEYS[2], user_id)
+redis.call('HINCRBY', KEYS[4], 'version', 1)
+redis.call('HSET', KEYS[4], 'last_updated_ms', now_ms)
+redis.call('HSET', KEYS[4], 'initialized', 'true')
+return 1
 """
 
     # ARGV layout:
     #   ARGV[1] role_id
     #   ARGV[2] now_ms (string)
-    #   ARGV[3] role_name_lower (or "")
-    #   ARGV[4] user_doc_key_prefix  (e.g. "supertable:{org}:lakes:{sup}:rbac:users:doc:")
+    #   ARGV[3:5] expected role, role_name, and raw tables JSON
+    #   ARGV[6] user_doc_key_prefix
     # KEYS layout:
     #   KEYS[1] role_doc_key
     #   KEYS[2] role_index_key
@@ -459,39 +1955,264 @@ return v
     #   KEYS[4] role_meta_key
     #   KEYS[5] user_index_key
     #   KEYS[6] rolename_to_id_key
-    _LUA_RBAC_DELETE_ROLE = """
+    #   KEYS[7] user_meta_key
+    #   KEYS[8] immutable cascade evidence HASH (unique event ID)
+    #   KEYS[9] username_to_id_key
+    _LUA_RBAC_DELETE_ROLE = _LUA_RBAC_AUDIT_PREAMBLE + """
 local role_id              = ARGV[1]
 local now_ms               = ARGV[2]
-local role_name_lower      = ARGV[3]
-local user_doc_key_prefix  = ARGV[4]
+local expected_role        = ARGV[3]
+local expected_name        = ARGV[4]
+local expected_tables      = ARGV[5]
+local expected_modified    = ARGV[6]
+local expected_doc_version = ARGV[7]
+local user_doc_key_prefix  = ARGV[8]
+local cascade_manifest_key = ARGV[9]
+local requested_cascade_limit = ARGV[10]
+if not string.match(requested_cascade_limit, '^[1-9]%d*$')
+    or string.len(requested_cascade_limit) > 5
+    or tonumber(requested_cascade_limit) > 10000 then
+    return redis.error_reply('invalid role deletion cascade manifest limit')
+end
+local max_cascade_manifest_users = tonumber(requested_cascade_limit)
+require_audit_identity('role_delete', 'role', role_id)
 
+require_key_type(KEYS[1], 'hash', true)
+require_key_type(KEYS[2], 'set', true)
+require_key_type(KEYS[3], 'set', true)
+require_key_type(KEYS[4], 'hash', true)
+require_key_type(KEYS[5], 'set', true)
+require_key_type(KEYS[6], 'hash', true)
+require_key_type(KEYS[7], 'hash', true)
+require_key_type(KEYS[9], 'hash', true)
+
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+local current_role = redis.call('HGET', KEYS[1], 'role') or ''
+local current_name = redis.call('HGET', KEYS[1], 'role_name') or ''
+local current_tables = redis.call('HGET', KEYS[1], 'tables') or ''
+local current_modified = redis.call('HGET', KEYS[1], 'modified_ms') or ''
+local current_doc_version = redis.call('HGET', KEYS[1], 'doc_version') or '0'
+if current_role ~= expected_role
+    or current_name ~= expected_name
+    or current_tables ~= expected_tables
+    or current_modified ~= expected_modified
+    or current_doc_version ~= expected_doc_version then
+    return -2
+end
+local stored_id = redis.call('HGET', KEYS[1], 'role_id')
+if stored_id and stored_id ~= role_id then return -3 end
+local bootstrap_id = redis.call('HGET', KEYS[6], 'superadmin')
+if current_role == 'superadmin'
+    or string.lower(current_name) == 'superadmin'
+    or bootstrap_id == role_id then
+    return -1
+end
+if cascade_manifest_key ~= KEYS[8]
+    or privileged_audit_event['cascade_manifest_id']
+        ~= privileged_audit_event['event_id'] then
+    return redis.error_reply('role deletion cascade manifest identity mismatch')
+end
+require_key_type(KEYS[8], 'hash', true)
+if redis.call('EXISTS', KEYS[8]) ~= 0 then
+    return redis.error_reply('role deletion cascade manifest already exists')
+end
+
+-- Bound the authoritative index before materialising or scanning it.  A cap
+-- on affected users alone would still let an unrelated million-user tenant
+-- monopolise Redis while proving that a role has no assignments.
+local indexed_user_count = redis.call('SCARD', KEYS[5])
+local named_user_count = redis.call('HLEN', KEYS[9])
+if indexed_user_count > max_cascade_manifest_users
+    or named_user_count > max_cascade_manifest_users then
+    return -5
+end
+if indexed_user_count ~= named_user_count then return -6 end
 local user_ids = redis.call('SMEMBERS', KEYS[5])
+local encoded_roles_by_uid = {}
+local cascade_rows = {}
+local affected_user_count = 0
+local removed_assignment_count = 0
 for _, uid in ipairs(user_ids) do
+    -- User IDs are Redis-key segments at every supported write boundary.
+    -- Re-check the invariant before copying an identity to durable evidence,
+    -- so a corrupt index cannot produce an unarchivable manifest.
+    local plain_uid = string.match(uid, '^[a-z0-9][a-z0-9_-]*$')
+    local internal_uid = string.match(uid, '^__[a-z0-9][a-z0-9_-]*__$')
+    if string.len(uid) > 64 or (not plain_uid and not internal_uid) then
+        return -4
+    end
     local ukey = user_doc_key_prefix .. uid
+    if redis.call('EXISTS', ukey) ~= 1 then return -6 end
+    require_key_type(ukey, 'hash', false)
+    local stored_uid = redis.call('HGET', ukey, 'user_id')
+    local stored_username = redis.call('HGET', ukey, 'username')
+    if stored_uid ~= uid
+        or not stored_username or stored_username == ''
+        or redis.call('HGET', KEYS[9], string.lower(stored_username)) ~= uid then
+        return -6
+    end
     local roles_json = redis.call('HGET', ukey, 'roles')
-    if roles_json then
-        local ok, roles = pcall(cjson.decode, roles_json)
-        if ok and type(roles) == 'table' then
-            local new_roles = {}
-            local changed = false
-            for _, r in ipairs(roles) do
-                if r == role_id then
-                    changed = true
-                else
-                    new_roles[#new_roles + 1] = r
-                end
-            end
-            if changed then
-                redis.call('HSET', ukey, 'roles', cjson.encode(new_roles))
-                redis.call('HSET', ukey, 'modified_ms', now_ms)
+    if not roles_json then return -4 end
+    if not string.match(roles_json, '^%s*%[')
+        or not string.match(roles_json, '%]%s*$') then
+        return -4
+    end
+    local ok, roles = pcall(cjson.decode, roles_json)
+    if not ok or type(roles) ~= 'table' then return -4 end
+    local role_count = 0
+    for index, assigned_role_id in pairs(roles) do
+        if type(index) ~= 'number'
+            or index < 1
+            or index ~= math.floor(index)
+            or type(assigned_role_id) ~= 'string' then
+            return -4
+        end
+        role_count = role_count + 1
+    end
+    if role_count ~= #roles then return -4 end
+    local new_roles = {}
+    local removed_occurrences = 0
+    for _, assigned_role_id in ipairs(roles) do
+        if assigned_role_id == role_id then
+            removed_occurrences = removed_occurrences + 1
+        else
+            new_roles[#new_roles + 1] = assigned_role_id
+        end
+    end
+    if removed_occurrences > 0 then
+        local before_doc_version = redis.call(
+            'HGET', ukey, 'doc_version'
+        ) or '0'
+        local after_doc_version = incrementable_hash_counter(
+            ukey, 'doc_version'
+        )
+        affected_user_count = affected_user_count + 1
+        if affected_user_count > max_cascade_manifest_users then
+            return -5
+        end
+        removed_assignment_count = removed_assignment_count
+            + removed_occurrences
+        encoded_roles_by_uid[uid] = (#new_roles == 0) and '[]'
+            or cjson.encode(new_roles)
+        cascade_rows[#cascade_rows + 1] = {
+            field='user:' .. uid,
+            value=before_doc_version .. '|' .. after_doc_version .. '|'
+                .. tostring(removed_occurrences) .. '|'
+                .. tostring(role_count) .. '|' .. tostring(#new_roles)
+        }
+    end
+end
+for _, mapped_uid in ipairs(redis.call('HVALS', KEYS[9])) do
+    if redis.call('SISMEMBER', KEYS[5], mapped_uid) ~= 1 then return -6 end
+end
+require_namespace_head_for_state(KEYS[4], true)
+require_namespace_head_for_state(KEYS[7], indexed_user_count > 0)
+local next_role_namespace_version = incrementable_namespace_counter(
+    KEYS[4], 'version'
+)
+local user_namespace_version_before = redis.call(
+    'HGET', KEYS[7], 'version'
+) or '0'
+if user_namespace_version_before ~= '0'
+    and not string.match(user_namespace_version_before, '^[1-9]%d*$') then
+    return redis.error_reply('RBAC user namespace revision counter is corrupt')
+end
+if string.len(user_namespace_version_before) > 19
+    or (
+        string.len(user_namespace_version_before) == 19
+        and user_namespace_version_before > '9223372036854775807'
+    ) then
+    return redis.error_reply('RBAC user namespace revision counter is out of range')
+end
+local user_namespace_version_after = user_namespace_version_before
+if affected_user_count > 0 then
+    user_namespace_version_after = incrementable_namespace_counter(
+        KEYS[7], 'version'
+    )
+end
+
+-- Create exact, bounded-per-row evidence before the success event.  A Redis
+-- command error can leave only an unreferenced manifest, never a committed
+-- role deletion whose parent event lacks its affected identities.
+local manifest_header = {
+    'schema_version', '1',
+    'event_id', privileged_audit_event['event_id'],
+    'mutation_id', privileged_audit_event['mutation_id'],
+    'organization', privileged_audit_org,
+    'super_name', privileged_audit_super,
+    'role_id', role_id,
+    'user_count', tostring(affected_user_count),
+    'removed_assignment_count', tostring(removed_assignment_count),
+    'user_namespace_version_before', user_namespace_version_before,
+    'user_namespace_version_after', user_namespace_version_after,
+    'created_ms', now_ms
+}
+local header_result = redis.pcall('HSET', KEYS[8], unpack(manifest_header))
+if type(header_result) == 'table' and header_result['err'] then
+    redis.call('DEL', KEYS[8])
+    return redis.error_reply('could not create role deletion cascade manifest')
+end
+for _, row in ipairs(cascade_rows) do
+    local row_result = redis.pcall(
+        'HSET', KEYS[8], row['field'], row['value']
+    )
+    if type(row_result) == 'table' and row_result['err'] then
+        redis.call('DEL', KEYS[8])
+        return redis.error_reply('could not populate role deletion cascade manifest')
+    end
+end
+if redis.call('HLEN', KEYS[8]) ~= 11 + affected_user_count then
+    redis.call('DEL', KEYS[8])
+    return redis.error_reply('role deletion cascade manifest is incomplete')
+end
+local append_ok, append_error = pcall(append_privileged_audit, {
+    namespace_version=next_role_namespace_version,
+    affected_count=affected_user_count,
+    cascade_assignment_count=removed_assignment_count,
+    user_namespace_version_before=user_namespace_version_before,
+    user_namespace_version_after=user_namespace_version_after
+})
+if not append_ok then
+    -- If XADD itself failed, remove the now-unreferenced sidecar.  If XADD
+    -- succeeded but the subsequent meta update failed, retain its manifest:
+    -- the stream is intentionally left fail-closed for operator recovery.
+    local referenced = false
+    local latest = redis.call(
+        'XREVRANGE', privileged_audit_outbox, '+', '-', 'COUNT', 1
+    )
+    if #latest == 1 then
+        local latest_fields = latest[1][2]
+        for index = 1, #latest_fields, 2 do
+            if latest_fields[index] == 'event_id'
+                and latest_fields[index + 1]
+                    == privileged_audit_event['event_id'] then
+                referenced = true
             end
         end
+    end
+    if not referenced then redis.call('DEL', KEYS[8]) end
+    return redis.error_reply(
+        'could not append role deletion privileged audit record: '
+        .. tostring(append_error)
+    )
+end
+for _, uid in ipairs(user_ids) do
+    local ukey = user_doc_key_prefix .. uid
+    local encoded_roles = encoded_roles_by_uid[uid]
+    if encoded_roles then
+        redis.call('HSET', ukey, 'roles', encoded_roles)
+        redis.call('HSET', ukey, 'modified_ms', now_ms)
+        redis.call('HINCRBY', ukey, 'doc_version', 1)
     end
 end
 
 -- Clean up role_name → role_id mapping atomically
-if role_name_lower and role_name_lower ~= '' then
-    redis.call('HDEL', KEYS[6], role_name_lower)
+local role_name_lower = string.lower(current_name)
+if role_name_lower ~= '' then
+    local mapped_role_id = redis.call('HGET', KEYS[6], role_name_lower)
+    if mapped_role_id == role_id then
+        redis.call('HDEL', KEYS[6], role_name_lower)
+    end
 end
 
 redis.call('DEL', KEYS[1])
@@ -499,17 +2220,59 @@ redis.call('SREM', KEYS[2], role_id)
 redis.call('SREM', KEYS[3], role_id)
 redis.call('HINCRBY', KEYS[4], 'version', 1)
 redis.call('HSET', KEYS[4], 'last_updated_ms', now_ms)
+redis.call('HSET', KEYS[4], 'initialized', 'true')
+if affected_user_count > 0 then
+    redis.call('HINCRBY', KEYS[7], 'version', 1)
+    redis.call('HSET', KEYS[7], 'last_updated_ms', now_ms)
+    redis.call('HSET', KEYS[7], 'initialized', 'true')
+end
 return 1
 """
 
-    _LUA_RBAC_REMOVE_ROLE_FROM_USER = """
+    _LUA_RBAC_REMOVE_ROLE_FROM_USER = _LUA_RBAC_AUDIT_PREAMBLE + """
 local role_id = ARGV[1]
 local now_ms  = ARGV[2]
+local protected_username = ARGV[3]
+local role_doc_key_prefix = ARGV[4]
+local user_id = ARGV[5]
+local expected_roles = ARGV[6]
+local expected_doc_version = ARGV[7]
+require_audit_identity(
+    'user_role_remove', 'user_role_assignment', user_id .. ':' .. role_id
+)
+require_key_type(KEYS[1], 'hash', true)
+require_key_type(KEYS[2], 'hash', true)
+require_key_type(KEYS[3], 'hash', true)
 local roles_json = redis.call('HGET', KEYS[1], 'roles')
 if not roles_json then return 0 end
+local current_doc_version = redis.call('HGET', KEYS[1], 'doc_version') or '0'
+if roles_json ~= expected_roles
+    or current_doc_version ~= expected_doc_version then
+    return -2
+end
 
 local ok, roles = pcall(cjson.decode, roles_json)
 if not ok or type(roles) ~= 'table' then return 0 end
+
+local username = redis.call('HGET', KEYS[1], 'username') or ''
+local protected_user_id = redis.call('HGET', KEYS[3], protected_username)
+if string.lower(username) == protected_username or protected_user_id == user_id then
+    local target_type = redis.call('HGET', role_doc_key_prefix .. role_id, 'role')
+    if target_type == 'superadmin' then
+        local other_superadmins = 0
+        for _, assigned_role_id in ipairs(roles) do
+            if assigned_role_id ~= role_id then
+                local assigned_type = redis.call(
+                    'HGET', role_doc_key_prefix .. assigned_role_id, 'role'
+                )
+                if assigned_type == 'superadmin' then
+                    other_superadmins = other_superadmins + 1
+                end
+            end
+        end
+        if other_superadmins == 0 then return -1 end
+    end
+end
 
 local new_roles = {}
 local changed = false
@@ -522,18 +2285,49 @@ for _, r in ipairs(roles) do
 end
 if not changed then return 0 end
 
-redis.call('HSET', KEYS[1], 'roles', cjson.encode(new_roles))
+incrementable_hash_counter(KEYS[1], 'doc_version')
+require_namespace_head_for_state(KEYS[2], true)
+local next_user_namespace_version = incrementable_namespace_counter(
+    KEYS[2], 'version'
+)
+append_privileged_audit({namespace_version=next_user_namespace_version})
+local encoded_roles = (#new_roles == 0) and '[]' or cjson.encode(new_roles)
+redis.call('HSET', KEYS[1], 'roles', encoded_roles)
 redis.call('HSET', KEYS[1], 'modified_ms', now_ms)
+redis.call('HINCRBY', KEYS[1], 'doc_version', 1)
 redis.call('HINCRBY', KEYS[2], 'version', 1)
 redis.call('HSET', KEYS[2], 'last_updated_ms', now_ms)
+redis.call('HSET', KEYS[2], 'initialized', 'true')
 return 1
 """
 
-    _LUA_RBAC_ADD_ROLE_TO_USER = """
+    _LUA_RBAC_ADD_ROLE_TO_USER = _LUA_RBAC_AUDIT_PREAMBLE + """
 local role_id = ARGV[1]
 local now_ms  = ARGV[2]
+local user_id = ARGV[3]
+local expected_roles = ARGV[4]
+local expected_doc_version = ARGV[5]
+require_audit_identity(
+    'user_role_assign', 'user_role_assignment', user_id .. ':' .. role_id
+)
+require_key_type(KEYS[1], 'hash', true)
+require_key_type(KEYS[2], 'hash', true)
+require_key_type(KEYS[3], 'hash', true)
 local roles_json = redis.call('HGET', KEYS[1], 'roles')
 if not roles_json then return 0 end
+local current_doc_version = redis.call('HGET', KEYS[1], 'doc_version') or '0'
+if roles_json ~= expected_roles
+    or current_doc_version ~= expected_doc_version then
+    return -2
+end
+local assigned_type = redis.call('HGET', KEYS[3], 'role')
+if assigned_type ~= 'superadmin'
+    and assigned_type ~= 'admin'
+    and assigned_type ~= 'writer'
+    and assigned_type ~= 'reader'
+    and assigned_type ~= 'meta' then
+    return -1
+end
 
 local ok, roles = pcall(cjson.decode, roles_json)
 if not ok or type(roles) ~= 'table' then return 0 end
@@ -543,10 +2337,107 @@ for _, r in ipairs(roles) do
 end
 
 roles[#roles + 1] = role_id
+incrementable_hash_counter(KEYS[1], 'doc_version')
+require_namespace_head_for_state(KEYS[2], true)
+local next_user_namespace_version = incrementable_namespace_counter(
+    KEYS[2], 'version'
+)
+append_privileged_audit({namespace_version=next_user_namespace_version})
 redis.call('HSET', KEYS[1], 'roles', cjson.encode(roles))
 redis.call('HSET', KEYS[1], 'modified_ms', now_ms)
+redis.call('HINCRBY', KEYS[1], 'doc_version', 1)
 redis.call('HINCRBY', KEYS[2], 'version', 1)
 redis.call('HSET', KEYS[2], 'last_updated_ms', now_ms)
+redis.call('HSET', KEYS[2], 'initialized', 'true')
+return 1
+"""
+
+    # Create/delete organization login-token records at the same atomic
+    # boundary as their privileged audit evidence.  Token plaintext never
+    # enters Redis or the ledger; resource identity is the SHA-256 token ID.
+    # KEYS: token HASH, token namespace meta HASH, audit outbox, audit meta
+    # ARGV: token_id, metadata JSON, now_ms, organization, scope, audit JSON
+    _LUA_AUTH_CREATE_TOKEN = _LUA_RBAC_AUDIT_PREAMBLE + """
+local token_id = ARGV[1]
+local metadata_json = ARGV[2]
+local now_ms = ARGV[3]
+require_audit_identity('token_create', 'auth_token', token_id)
+require_key_type(KEYS[1], 'hash', true)
+require_key_type(KEYS[2], 'hash', true)
+if not string.match(token_id, '^[0-9a-f]+$') or string.len(token_id) ~= 64 then
+    return redis.error_reply('invalid auth token identity')
+end
+if string.len(metadata_json) == 0 or string.len(metadata_json) > 16384 then
+    return redis.error_reply('invalid auth token metadata')
+end
+local metadata_ok, metadata = pcall(cjson.decode, metadata_json)
+if not metadata_ok or type(metadata) ~= 'table'
+    or metadata['token_id'] ~= token_id then
+    return redis.error_reply('invalid auth token metadata')
+end
+if redis.call('HEXISTS', KEYS[1], token_id) == 1 then return -1 end
+local token_audit_initialized = redis.call(
+    'HGET', KEYS[1], '_audit_initialized'
+)
+if token_audit_initialized and token_audit_initialized ~= 'true' then
+    return redis.error_reply('auth token audit marker is corrupt')
+end
+if redis.call('HGET', KEYS[2], 'version') == false
+    and token_audit_initialized == 'true' then
+    return redis.error_reply('RBAC namespace revision head is missing')
+end
+local next_token_namespace_version = incrementable_namespace_counter(
+    KEYS[2], 'version'
+)
+append_privileged_audit({namespace_version=next_token_namespace_version})
+redis.call('HSET', KEYS[1], token_id, metadata_json)
+redis.call('HSET', KEYS[1], '_audit_initialized', 'true')
+redis.call('HINCRBY', KEYS[2], 'version', 1)
+redis.call(
+    'HSET', KEYS[2],
+    'last_updated_ms', now_ms,
+    'initialized', 'true'
+)
+return 1
+"""
+
+    # ARGV: token_id, expected metadata JSON, now_ms, organization, scope,
+    #       audit JSON
+    _LUA_AUTH_DELETE_TOKEN = _LUA_RBAC_AUDIT_PREAMBLE + """
+local token_id = ARGV[1]
+local expected_metadata = ARGV[2]
+local now_ms = ARGV[3]
+require_audit_identity('token_delete', 'auth_token', token_id)
+require_key_type(KEYS[1], 'hash', true)
+require_key_type(KEYS[2], 'hash', true)
+if not string.match(token_id, '^[0-9a-f]+$') or string.len(token_id) ~= 64 then
+    return redis.error_reply('invalid auth token identity')
+end
+local current_metadata = redis.call('HGET', KEYS[1], token_id)
+if current_metadata == false then return 0 end
+if current_metadata ~= expected_metadata then return -1 end
+local token_audit_initialized = redis.call(
+    'HGET', KEYS[1], '_audit_initialized'
+)
+if token_audit_initialized and token_audit_initialized ~= 'true' then
+    return redis.error_reply('auth token audit marker is corrupt')
+end
+if redis.call('HGET', KEYS[2], 'version') == false
+    and token_audit_initialized == 'true' then
+    return redis.error_reply('RBAC namespace revision head is missing')
+end
+local next_token_namespace_version = incrementable_namespace_counter(
+    KEYS[2], 'version'
+)
+append_privileged_audit({namespace_version=next_token_namespace_version})
+redis.call('HDEL', KEYS[1], token_id)
+redis.call('HSET', KEYS[1], '_audit_initialized', 'true')
+redis.call('HINCRBY', KEYS[2], 'version', 1)
+redis.call(
+    'HSET', KEYS[2],
+    'last_updated_ms', now_ms,
+    'initialized', 'true'
+)
 return 1
 """
 
@@ -572,10 +2463,26 @@ return 1
         self._locker = RedisLocking(self.r)
 
         # RBAC Lua scripts
-        self._rbac_bump_meta = self.r.register_script(self._LUA_RBAC_BUMP_META)
+        self._rbac_validate_meta = self.r.register_script(
+            self._LUA_RBAC_VALIDATE_META
+        )
+        self._rbac_append_attempt = self.r.register_script(
+            self._LUA_RBAC_APPEND_ATTEMPT
+        )
+        self._rbac_create_role = self.r.register_script(self._LUA_RBAC_CREATE_ROLE)
+        self._rbac_create_user = self.r.register_script(self._LUA_RBAC_CREATE_USER)
+        self._rbac_update_role = self.r.register_script(self._LUA_RBAC_UPDATE_ROLE)
+        self._rbac_update_user = self.r.register_script(self._LUA_RBAC_UPDATE_USER)
+        self._rbac_delete_user = self.r.register_script(self._LUA_RBAC_DELETE_USER)
         self._rbac_delete_role = self.r.register_script(self._LUA_RBAC_DELETE_ROLE)
         self._rbac_remove_role_from_user = self.r.register_script(self._LUA_RBAC_REMOVE_ROLE_FROM_USER)
         self._rbac_add_role_to_user = self.r.register_script(self._LUA_RBAC_ADD_ROLE_TO_USER)
+        self._auth_create_token = self.r.register_script(
+            self._LUA_AUTH_CREATE_TOKEN
+        )
+        self._auth_delete_token = self.r.register_script(
+            self._LUA_AUTH_DELETE_TOKEN
+        )
 
     # ------------- Health check -------------
 
@@ -1208,6 +3115,45 @@ return 1
     def _decode_member(m) -> str:
         return m if isinstance(m, str) else m.decode("utf-8")
 
+    @classmethod
+    def _decode_user_roles(cls, value: Any) -> List[str]:
+        """Decode persisted user roles without treating corruption as no roles."""
+        value = cls._rbac_text(value)
+        try:
+            roles = json.loads(value)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RbacIntegrityError(
+                "Persisted user roles are not valid JSON"
+            ) from exc
+        if not isinstance(roles, list) or not all(
+            isinstance(role_id, str) and role_id
+            for role_id in roles
+        ):
+            raise RbacIntegrityError(
+                "Persisted user roles must be a list of non-empty role IDs"
+            )
+        return roles
+
+    @classmethod
+    def _canonical_persisted_role(
+        cls, raw: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Canonicalize one stored role and verify its persisted digest."""
+        try:
+            canonical = _canonicalize_role_document(
+                dict(raw), default_if_empty=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RbacIntegrityError(
+                "Persisted role document is invalid"
+            ) from exc
+        stored_hash = cls._rbac_text(raw.get("content_hash"))
+        if stored_hash and stored_hash != canonical["content_hash"]:
+            raise RbacIntegrityError(
+                "Persisted role content hash does not match its policy"
+            )
+        return canonical
+
     def get_users(self, org: str, sup: str) -> List[Dict[str, Any]]:
         """Get all users for organization (pipeline batch, not N+1 reads)."""
         users: List[Dict[str, Any]] = []
@@ -1222,15 +3168,29 @@ return 1
                     pipe.hgetall(RK.rbac_user_doc(org, sup, uid))
                 results = pipe.execute()
             for uid, raw in zip(uids, results):
-                if raw:
-                    data: Dict[str, Any] = dict(raw)
-                    data.setdefault("user_id", uid)
-                    if "roles" in data:
-                        try:
-                            data["roles"] = json.loads(data["roles"])
-                        except (json.JSONDecodeError, TypeError):
-                            data["roles"] = []
-                    users.append(data)
+                if not raw:
+                    raise RbacIntegrityError(
+                        "RBAC user index references a missing document"
+                    )
+                data: Dict[str, Any] = dict(raw)
+                stored_id = self._rbac_text(data.get("user_id"))
+                if stored_id and stored_id != uid:
+                    raise RbacIntegrityError(
+                        "Persisted user identity does not match its index"
+                    )
+                data.setdefault("user_id", uid)
+                try:
+                    validate_username(self._rbac_text(data.get("username")))
+                except (TypeError, ValueError) as exc:
+                    raise RbacIntegrityError(
+                        "Persisted username is invalid"
+                    ) from exc
+                if "roles" not in data:
+                    raise RbacIntegrityError(
+                        "Persisted user document is missing roles"
+                    )
+                data["roles"] = self._decode_user_roles(data["roles"])
+                users.append(data)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_users error: {e}")
         return users
@@ -1249,16 +3209,18 @@ return 1
                     pipe.hgetall(RK.rbac_role_doc(org, sup, rid))
                 results = pipe.execute()
             for rid, raw in zip(rids, results):
-                if raw:
-                    data: Dict[str, Any] = dict(raw)
-                    data.setdefault("role_id", rid)
-                    for field in ("tables", "columns", "filters"):
-                        if field in data:
-                            try:
-                                data[field] = json.loads(data[field])
-                            except (json.JSONDecodeError, TypeError):
-                                pass
-                    roles.append(data)
+                if not raw:
+                    raise RbacIntegrityError(
+                        "RBAC role index references a missing document"
+                    )
+                data = self._canonical_persisted_role(raw)
+                stored_id = self._rbac_text(data.get("role_id"))
+                if stored_id and stored_id != rid:
+                    raise RbacIntegrityError(
+                        "Persisted role identity does not match its index"
+                    )
+                data.setdefault("role_id", rid)
+                roles.append(data)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_roles error: {e}")
         return roles
@@ -1269,18 +3231,12 @@ return 1
             raw = self.r.hgetall(RK.rbac_role_doc(org, sup, role_id))
             if not raw:
                 return None
-            data: Dict[str, Any] = dict(raw)
+            data = self._canonical_persisted_role(raw)
             data.setdefault("role_id", role_id)
-            for field in ("tables", "columns", "filters"):
-                if field in data:
-                    try:
-                        data[field] = json.loads(data[field])
-                    except (json.JSONDecodeError, TypeError):
-                        pass
             return data
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_role_details error: {e}")
-        return None
+            raise
 
     def get_user_details(self, org: str, sup: str, user_id: str) -> Optional[Dict[str, Any]]:
         """Get detailed user information by user_id."""
@@ -1289,16 +3245,27 @@ return 1
             if not raw:
                 return None
             data: Dict[str, Any] = dict(raw)
+            stored_id = self._rbac_text(data.get("user_id"))
+            if stored_id and stored_id != user_id:
+                raise RbacIntegrityError(
+                    "Persisted user identity does not match its storage key"
+                )
             data.setdefault("user_id", user_id)
-            if "roles" in data:
-                try:
-                    data["roles"] = json.loads(data["roles"])
-                except (json.JSONDecodeError, TypeError):
-                    data["roles"] = []
+            try:
+                validate_username(self._rbac_text(data.get("username")))
+            except (TypeError, ValueError) as exc:
+                raise RbacIntegrityError(
+                    "Persisted username is invalid"
+                ) from exc
+            if "roles" not in data:
+                raise RbacIntegrityError(
+                    "Persisted user document is missing roles"
+                )
+            data["roles"] = self._decode_user_roles(data["roles"])
             return data
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_user_details error: {e}")
-        return None
+            raise
 
     # ------------- RBAC write operations ------------- #
 
@@ -1311,75 +3278,1111 @@ return 1
             return str(value).lower()
         return str(value)
 
-    def _rbac_bump(self, meta_key: str) -> int:
-        """Atomically increment version and update timestamp on an RBAC meta key."""
-        return int(self._rbac_bump_meta(keys=[meta_key], args=[str(_now_ms())]) or 0)
+    @staticmethod
+    def _rbac_text(value: Any) -> str:
+        """Return the exact text Redis uses for a CAS comparison."""
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            try:
+                return value.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError("RBAC document contains invalid UTF-8") from exc
+        return str(value)
+
+    @classmethod
+    def _rbac_doc_version(cls, raw: Dict[str, Any]) -> str:
+        """Return a validated Redis integer version; legacy documents are 0."""
+        value = cls._rbac_text(raw.get("doc_version"))
+        if value == "":
+            return "0"
+        if (
+            not value.isdigit()
+            or (value != "0" and value.startswith("0"))
+            or int(value) > 9_223_372_036_854_775_806
+        ):
+            raise RbacIntegrityError(
+                "Persisted RBAC document has an invalid doc_version"
+            )
+        return value
+
+    @classmethod
+    def _rbac_string_document(cls, raw: Mapping[str, Any]) -> Dict[str, str]:
+        """Return the exact text representation of one Redis RBAC HASH.
+
+        Privileged audit records retain only the canonical SHA-256 of this
+        representation, never policy/filter contents.  Using Redis text here
+        makes the before/after digests describe the exact document committed
+        by the Lua script instead of a lossy business-object projection.
+        """
+        if not isinstance(raw, Mapping):
+            raise RbacIntegrityError("Persisted RBAC document must be a mapping")
+        document: Dict[str, str] = {}
+        for key, value in raw.items():
+            text_key = cls._rbac_text(key)
+            if not text_key:
+                raise RbacIntegrityError(
+                    "Persisted RBAC document contains an empty field name"
+                )
+            document[text_key] = cls._rbac_text(value)
+        return document
+
+    @staticmethod
+    def _rbac_audit_keys(org: str) -> List[str]:
+        return [
+            RK.audit_privileged_outbox(org),
+            RK.audit_privileged_meta(org),
+        ]
+
+    @staticmethod
+    def _auth_token_meta_key(org: str) -> str:
+        """Return the private revision key for the organization token HASH."""
+        return f"{RK.auth_tokens(org)}:audit_meta"
+
+    @staticmethod
+    def _rbac_audit_json(
+        *,
+        action_context: Any,
+        org: str,
+        sup: str,
+        action: str,
+        resource_type: str,
+        resource_id: str,
+        before_document: Optional[Mapping[str, Any]],
+        after_document: Optional[Mapping[str, Any]],
+        before_version: int,
+        after_version: int,
+        changed_fields: Any = (),
+        role_ids_added: Any = (),
+        role_ids_removed: Any = (),
+        timestamp_ms: Optional[int] = None,
+        severity: str = "warning",
+        outcome: str = "success",
+        cause: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> str:
+        """Build a bounded, digest-only record for the transactional WAL."""
+        from supertable.audit.privileged import build_record
+
+        record = build_record(
+            context=action_context,
+            organization=org,
+            super_name=sup,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            before_document=before_document,
+            after_document=after_document,
+            before_version=before_version,
+            after_version=after_version,
+            changed_fields=changed_fields,
+            role_ids_added=role_ids_added,
+            role_ids_removed=role_ids_removed,
+            timestamp_ms=timestamp_ms,
+            severity=severity,
+            outcome=outcome,
+            cause=cause,
+            reason=reason,
+        )
+        return record.to_json()
+
+    @staticmethod
+    def rbac_attempt_was_recorded(error: BaseException) -> bool:
+        """Return whether ``error`` already has durable attempt evidence."""
+
+        return bool(getattr(error, "_supertable_rbac_attempt_recorded", False))
+
+    @staticmethod
+    def _rbac_mark_attempt_recorded(error: BaseException) -> BaseException:
+        try:
+            setattr(error, "_supertable_rbac_attempt_recorded", True)
+        except Exception:
+            # Built-in RBAC exceptions currently allow attributes.  Keep the
+            # marker defensive for custom exception implementations.
+            pass
+        return error
+
+    @staticmethod
+    def _rbac_condition_identifier(
+        value: Any,
+        label: str,
+        *,
+        allow_colon: bool = True,
+    ) -> str:
+        """Return one bounded identifier safe for a derived condition key."""
+
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"RBAC attempt {label} is invalid")
+        if len(value.encode("utf-8")) > 512 or any(
+            ord(character) < 32 or ord(character) == 127
+            for character in value
+        ):
+            raise ValueError(f"RBAC attempt {label} is invalid")
+        if not allow_colon and ":" in value:
+            raise ValueError(f"RBAC attempt {label} is invalid")
+        return value
+
+    @classmethod
+    def _rbac_condition_version(cls, value: Any) -> str:
+        version = cls._rbac_text(value)
+        if (
+            not version.isdigit()
+            or (version != "0" and version.startswith("0"))
+            or len(version) > 19
+            or (
+                len(version) == 19
+                and version > "9223372036854775807"
+            )
+        ):
+            raise ValueError("RBAC attempt condition version is invalid")
+        return version
+
+    @staticmethod
+    def _rbac_require_condition_fields(
+        condition: Mapping[str, Any],
+        expected: set[str],
+    ) -> None:
+        if set(condition) != expected:
+            raise ValueError("RBAC attempt condition fields are invalid")
+
+    def _rbac_normalize_attempt_conditions(
+        self,
+        org: str,
+        sup: str,
+        *,
+        action: str,
+        resource_type: str,
+        resource_id: str,
+        cause: str,
+        conditions: Sequence[Mapping[str, Any]],
+    ) -> tuple[List[str], str]:
+        """Compile keyless, action-bound predicates for the Lua append.
+
+        The descriptors are intentionally semantic.  No caller-controlled
+        Redis key, hash field name, or unrelated resource selector crosses
+        this boundary.
+        """
+
+        if isinstance(conditions, (str, bytes)) or not isinstance(
+            conditions, Sequence
+        ):
+            raise ValueError("RBAC attempt conditions must be a sequence")
+        if not 1 <= len(conditions) <= self._RBAC_ATTEMPT_CONDITION_LIMIT:
+            raise ValueError("RBAC attempt condition count is out of range")
+        if any(not isinstance(condition, Mapping) for condition in conditions):
+            raise ValueError("RBAC attempt condition must be an object")
+
+        kinds = tuple(condition.get("kind") for condition in conditions)
+        if not all(isinstance(kind, str) for kind in kinds):
+            raise ValueError("RBAC attempt condition kind is invalid")
+        allowed_shapes = _RBAC_NO_CHANGE_CONDITION_SHAPES.get((action, cause))
+        if not allowed_shapes or kinds not in allowed_shapes:
+            raise ValueError(
+                "RBAC attempt conditions do not match the action and cause"
+            )
+
+        resource_id = self._rbac_condition_identifier(
+            resource_id, "resource_id"
+        )
+        if resource_type == "role":
+            resource_key = RK.rbac_role_doc(org, sup, resource_id)
+        elif resource_type == "user":
+            resource_key = RK.rbac_user_doc(org, sup, resource_id)
+        else:
+            resource_key = ""
+
+        condition_keys: List[str] = []
+        normalized_conditions: List[Dict[str, Any]] = []
+        for condition, kind in zip(conditions, kinds):
+            if kind in {"resource_absent", "resource_exists"}:
+                self._rbac_require_condition_fields(condition, {"kind"})
+                if not resource_key:
+                    raise ValueError(
+                        "RBAC resource condition has no derived document key"
+                    )
+                condition_keys.append(resource_key)
+                normalized_conditions.append({
+                    "kind": (
+                        "absent" if kind == "resource_absent" else "exists"
+                    ),
+                })
+                continue
+
+            if kind == "identity_claim":
+                self._rbac_require_condition_fields(
+                    condition, {"kind", "name", "identity_id"}
+                )
+                name = condition["name"]
+                identity_id = self._rbac_condition_identifier(
+                    condition["identity_id"], "identity_id"
+                )
+                if resource_type == "role":
+                    validate_role_name(name)
+                    if not name:
+                        raise ValueError("RBAC role identity name is invalid")
+                    condition_key = RK.rbac_rolename_to_id(org, sup)
+                elif resource_type == "user":
+                    validate_username(name)
+                    condition_key = RK.rbac_username_to_id(org, sup)
+                else:
+                    raise ValueError("RBAC identity condition is invalid")
+                if cause == "idempotent_replay" and identity_id != resource_id:
+                    raise ValueError(
+                        "RBAC replay identity does not match the audited resource"
+                    )
+                condition_keys.append(condition_key)
+                normalized_conditions.append({
+                    "kind": "hash_fields",
+                    "fields": [{
+                        "name": name.casefold(),
+                        "value": identity_id,
+                    }],
+                })
+                continue
+
+            if kind == "resource_fields":
+                self._rbac_require_condition_fields(
+                    condition, {"kind", "fields"}
+                )
+                fields = condition["fields"]
+                if not isinstance(fields, Mapping):
+                    raise ValueError("RBAC resource condition fields are invalid")
+                if action == "role_create":
+                    expected_fields = {"role", "content_hash", "doc_version"}
+                elif action in {"user_create", "user_update"}:
+                    expected_fields = {"username", "doc_version"}
+                else:
+                    raise ValueError("RBAC resource field condition is invalid")
+                if set(fields) != expected_fields:
+                    raise ValueError("RBAC resource condition fields are invalid")
+                normalized_fields = []
+                for name in sorted(expected_fields):
+                    value = self._rbac_text(fields[name])
+                    if len(value.encode("utf-8")) > 4096:
+                        raise ValueError(
+                            "RBAC resource condition value is too large"
+                        )
+                    if name == "doc_version":
+                        value = self._rbac_condition_version(value)
+                    normalized_fields.append({"name": name, "value": value})
+                condition_keys.append(resource_key)
+                normalized_conditions.append({
+                    "kind": "hash_fields",
+                    "fields": normalized_fields,
+                })
+                continue
+
+            if kind == "role_absent":
+                self._rbac_require_condition_fields(
+                    condition, {"kind", "role_id"}
+                )
+                role_id = self._rbac_condition_identifier(
+                    condition["role_id"], "role_id"
+                )
+                condition_keys.append(RK.rbac_role_doc(org, sup, role_id))
+                normalized_conditions.append({"kind": "absent"})
+                continue
+
+            if kind == "user_roles_equal":
+                self._rbac_require_condition_fields(
+                    condition, {"kind", "role_ids", "version"}
+                )
+                role_ids = condition["role_ids"]
+                if (
+                    not isinstance(role_ids, Sequence)
+                    or isinstance(role_ids, (str, bytes))
+                    or len(role_ids) > 1024
+                ):
+                    raise ValueError("RBAC role array condition is invalid")
+                normalized_role_ids = [
+                    self._rbac_condition_identifier(role_id, "role_id")
+                    for role_id in role_ids
+                ]
+                condition_keys.append(resource_key)
+                normalized_conditions.append({
+                    "kind": "json_array_equals",
+                    "field": "roles",
+                    "items": normalized_role_ids,
+                    "version": self._rbac_condition_version(
+                        condition["version"]
+                    ),
+                })
+                continue
+
+            if kind in {
+                "assignment_user_absent",
+                "assignment_role_absent",
+                "assignment_membership",
+            }:
+                expected_fields = {"kind", "user_id", "role_id"}
+                if kind == "assignment_membership":
+                    expected_fields |= {"present", "version"}
+                self._rbac_require_condition_fields(condition, expected_fields)
+                user_id = self._rbac_condition_identifier(
+                    condition["user_id"], "user_id", allow_colon=False
+                )
+                role_id = self._rbac_condition_identifier(
+                    condition["role_id"], "role_id", allow_colon=False
+                )
+                if resource_id != f"{user_id}:{role_id}":
+                    raise ValueError(
+                        "RBAC assignment condition does not match the audited resource"
+                    )
+                if kind == "assignment_user_absent":
+                    condition_keys.append(
+                        RK.rbac_user_doc(org, sup, user_id)
+                    )
+                    normalized_conditions.append({"kind": "absent"})
+                elif kind == "assignment_role_absent":
+                    condition_keys.append(
+                        RK.rbac_role_doc(org, sup, role_id)
+                    )
+                    normalized_conditions.append({"kind": "absent"})
+                else:
+                    present = condition["present"]
+                    if not isinstance(present, bool):
+                        raise ValueError(
+                            "RBAC assignment membership condition is invalid"
+                        )
+                    condition_keys.append(
+                        RK.rbac_user_doc(org, sup, user_id)
+                    )
+                    normalized_conditions.append({
+                        "kind": "json_array_membership",
+                        "field": "roles",
+                        "item": role_id,
+                        "present": present,
+                        "version": self._rbac_condition_version(
+                            condition["version"]
+                        ),
+                    })
+                continue
+
+            if kind == "token_present":
+                self._rbac_require_condition_fields(
+                    condition, {"kind", "metadata_json"}
+                )
+                if not _AUTH_TOKEN_ID_RE.fullmatch(resource_id):
+                    raise ValueError("RBAC token condition resource is invalid")
+                metadata_json = self._rbac_text(condition["metadata_json"])
+                if len(metadata_json.encode("utf-8")) > 4096:
+                    raise ValueError("RBAC token condition is too large")
+                condition_keys.append(RK.auth_tokens(org))
+                normalized_conditions.append({
+                    "kind": "hash_fields",
+                    "fields": [{
+                        "name": resource_id,
+                        "value": metadata_json,
+                    }],
+                })
+                continue
+
+            if kind == "token_absent":
+                self._rbac_require_condition_fields(condition, {"kind"})
+                if not _AUTH_TOKEN_ID_RE.fullmatch(resource_id):
+                    raise ValueError("RBAC token condition resource is invalid")
+                condition_keys.append(RK.auth_tokens(org))
+                normalized_conditions.append({
+                    "kind": "hash_field_absent",
+                    "field": resource_id,
+                })
+                continue
+
+            raise ValueError("Unknown RBAC attempt condition")
+
+        condition_json = json.dumps(
+            normalized_conditions, sort_keys=True, separators=(",", ":")
+        )
+        if (
+            len(condition_json.encode("utf-8"))
+            > self._RBAC_ATTEMPT_CONDITION_BYTES_LIMIT
+        ):
+            raise ValueError("RBAC attempt conditions are too large")
+        return condition_keys, condition_json
+
+    def rbac_append_attempt(
+        self,
+        org: str,
+        sup: str,
+        *,
+        action: str,
+        resource_type: str,
+        resource_id: str,
+        namespace: str,
+        outcome: str,
+        cause: str,
+        action_context: Any = None,
+        before_document: Optional[Mapping[str, Any]] = None,
+        before_version: int = 0,
+        severity: str = "warning",
+        conditions: Optional[Sequence[Mapping[str, Any]]] = None,
+    ) -> None:
+        """Durably append a state-neutral privileged RBAC attempt.
+
+        This path is deliberately incapable of recording ``success``.  It
+        samples the role/user namespace counter and advances the shared audit
+        ledger atomically, while making no write to any RBAC key.  A
+        state-dependent ``no_change`` supplies bounded conditions; Redis
+        verifies them in the same Lua invocation as the stream append.
+        """
+
+        if not isinstance(outcome, str) or outcome not in {
+            "failure", "denied", "no_change",
+        }:
+            raise ValueError(
+                "RBAC attempt outcome must be failure, denied, or no_change"
+            )
+        if not all(
+            isinstance(value, str) and bool(value)
+            for value in (action, resource_type, resource_id, namespace, cause)
+        ):
+            raise ValueError("RBAC attempt identity and cause must be strings")
+        expected_identity = _RBAC_ATTEMPT_IDENTITIES.get(action)
+        if expected_identity != (resource_type, namespace):
+            raise ValueError("Invalid RBAC attempt action/resource/namespace")
+        if namespace == "role":
+            namespace_key = RK.rbac_role_meta(org, sup)
+        elif namespace == "user":
+            namespace_key = RK.rbac_user_meta(org, sup)
+        elif namespace == "token":
+            if sup != _AUTH_AUDIT_SUPER_NAME:
+                raise ValueError("Token audit attempts require organization scope")
+            namespace_key = self._auth_token_meta_key(org)
+        else:
+            raise ValueError("RBAC attempt namespace must be role, user, or token")
+        condition_keys: List[str] = []
+        condition_json: Optional[str] = None
+        if outcome == "no_change" and not conditions:
+            raise ValueError("No-change RBAC attempts require state conditions")
+        if conditions is not None:
+            if outcome != "no_change":
+                raise ValueError("Only no-change RBAC attempts may be conditional")
+            condition_keys, condition_json = (
+                self._rbac_normalize_attempt_conditions(
+                    org,
+                    sup,
+                    action=action,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    cause=cause,
+                    conditions=conditions,
+                )
+            )
+        try:
+            now_ms = _now_ms()
+            audit_json = self._rbac_audit_json(
+                action_context=action_context,
+                org=org,
+                sup=sup,
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                before_document=before_document,
+                after_document=before_document,
+                before_version=before_version,
+                after_version=before_version,
+                timestamp_ms=now_ms,
+                severity=severity,
+                outcome=outcome,
+                cause=cause,
+            )
+            keys = [namespace_key] + condition_keys + self._rbac_audit_keys(org)
+            args = [org, sup, audit_json]
+            if condition_json is not None:
+                args.insert(0, condition_json)
+            result = int(self._rbac_append_attempt(keys=keys, args=args) or 0)
+            if result == 0 and condition_json is not None:
+                # The no-change claim was disproved inside Redis.  Preserve a
+                # complete attempt trail with a state-neutral failure record;
+                # it needs no optimistic document claim and is safe to append
+                # against the namespace revision sampled by its own script.
+                self.rbac_append_attempt(
+                    org,
+                    sup,
+                    action=action,
+                    resource_type=resource_type,
+                    resource_id=resource_id,
+                    namespace=namespace,
+                    outcome="failure",
+                    cause="concurrent_modification",
+                    action_context=action_context,
+                    severity=severity,
+                )
+                conflict = RbacAuditConditionConflict(
+                    "RBAC state changed concurrently before the no-change "
+                    "audit append; retry"
+                )
+                self._rbac_mark_attempt_recorded(conflict)
+                raise conflict
+            if result != 1:
+                raise RuntimeError(
+                    "Privileged RBAC attempt was not durably recorded"
+                )
+        except (RbacAuditAttemptError, RbacAuditConditionConflict):
+            raise
+        except Exception as error:
+            raise RbacAuditAttemptError(
+                "Privileged RBAC attempt could not be durably recorded"
+            ) from error
 
     # -- Role meta init --
 
     def rbac_init_role_meta(self, org: str, sup: str) -> None:
-        """Ensure the RBAC role meta HASH exists. Idempotent."""
-        key = RK.rbac_role_meta(org, sup)
-        if not self.r.exists(key):
-            self.r.hset(key, mapping={
-                "version": "0",
-                "last_updated_ms": str(_now_ms()),
-                "initialized": "true",
-            })
+        """Validate role namespace metadata without mutating it."""
+        result = int(self._rbac_validate_meta(
+            keys=[
+                RK.rbac_role_meta(org, sup),
+                RK.rbac_role_index(org, sup),
+                RK.rbac_rolename_to_id(org, sup),
+            ],
+            args=[],
+        ) or 0)
+        if result in {-1, -2}:
+            raise RbacIntegrityError(
+                "RBAC role namespace metadata cannot be safely initialized"
+            )
+        if result != 0:
+            raise RuntimeError("Atomic RBAC role metadata validation failed")
 
     # -- Role CRUD --
 
-    def rbac_create_role(self, org: str, sup: str, role_id: str, role_data: Dict[str, Any]) -> None:
+    def _rbac_is_bootstrap_superadmin(
+        self,
+        org: str,
+        sup: str,
+        role_id: str,
+        *,
+        role_name: str = "",
+    ) -> bool:
+        """Identify the bootstrap role despite one corrupt identity source."""
+        if str(role_name).casefold() == "superadmin":
+            return True
+        mapped_id = self.r.hget(
+            RK.rbac_rolename_to_id(org, sup), "superadmin",
+        )
+        return (
+            mapped_id is not None
+            and self._decode_member(mapped_id) == str(role_id)
+        )
+
+    @_audit_catalog_rejections(
+        action="role_create",
+        resource_type="role",
+        namespace="role",
+        resource_fields=("role_id",),
+    )
+    def rbac_create_role(
+        self,
+        org: str,
+        sup: str,
+        role_id: str,
+        role_data: Dict[str, Any],
+        *,
+        action_context: Any = None,
+    ) -> None:
         """Persist a new role document and update indexes.
 
         Validates ``role_name`` against :data:`SAFE_ROLE_NAME_RE` before
         writing — direct callers (tests, admin scripts, migrations) can't
         bypass the rule by skipping ``RoleManager.create_role``.
         """
-        validate_role_name(role_data.get("role_name", ""))
-        key = RK.rbac_role_doc(org, sup, role_id)
-        redis_data = {k: self._rbac_serialize(v) for k, v in role_data.items()}
-        pipe = self.r.pipeline()
-        pipe.hset(key, mapping=redis_data)
-        pipe.sadd(RK.rbac_role_index(org, sup), role_id)
-        role_type = role_data.get("role", "")
-        if role_type:
-            pipe.sadd(RK.rbac_role_type_index(org, sup, role_type), role_id)
-        role_name = role_data.get("role_name", "")
-        if role_name:
-            pipe.hset(RK.rbac_rolename_to_id(org, sup), role_name.lower(), role_id)
-        pipe.execute()
-        self._rbac_bump(RK.rbac_role_meta(org, sup))
+        if not isinstance(role_data, dict):
+            raise ValueError("role document must be an object")
+        supplied_role_id = role_data.get("role_id")
+        if supplied_role_id is not None and str(supplied_role_id) != str(role_id):
+            raise ValueError("role document role_id does not match the storage key")
 
-    def rbac_update_role(self, org: str, sup: str, role_id: str, fields: Dict[str, Any]) -> None:
+        canonical = _canonicalize_role_document(
+            role_data, default_if_empty=True,
+        )
+        canonical["role_id"] = role_id
+        canonical["doc_version"] = "1"
+        key = RK.rbac_role_doc(org, sup, role_id)
+        existing_raw = self.r.hgetall(key)
+        if existing_raw:
+            existing_document = self._canonical_persisted_role(existing_raw)
+            stored_id = self._rbac_text(existing_document.get("role_id"))
+            if stored_id and stored_id != role_id:
+                raise RbacIntegrityError(
+                    "Persisted role identity does not match its storage key"
+                )
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="role_create",
+                resource_type="role",
+                resource_id=role_id,
+                namespace="role",
+                outcome="no_change",
+                cause="resource_already_exists",
+                action_context=action_context,
+                conditions=[{"kind": "resource_exists"}],
+            )
+            error = RbacDuplicateIdentityError(
+                f"Role {role_id} already exists",
+                outcome="no_change",
+                cause="resource_already_exists",
+                conditions=[{"kind": "resource_exists"}],
+            )
+            self._rbac_mark_attempt_recorded(error)
+            raise error
+        role_name = canonical.get("role_name", "")
+        if role_name:
+            existing_id = self.r.hget(
+                RK.rbac_rolename_to_id(org, sup), role_name.lower(),
+            )
+            if existing_id is not None:
+                existing_id = self._decode_member(existing_id)
+                if existing_id != role_id:
+                    existing_document = self.get_role_details(
+                        org, sup, existing_id,
+                    )
+                    if (
+                        not existing_document
+                        or str(existing_document.get("role_name", "")).casefold()
+                        != role_name.casefold()
+                    ):
+                        raise RbacIntegrityError(
+                            "RBAC role name map and document are inconsistent"
+                        )
+                    self.rbac_append_attempt(
+                        org,
+                        sup,
+                        action="role_create",
+                        resource_type="role",
+                        resource_id=role_id,
+                        namespace="role",
+                        outcome="no_change",
+                        cause="identity_claim_unchanged",
+                        action_context=action_context,
+                        conditions=[{
+                            "kind": "identity_claim",
+                            "name": role_name,
+                            "identity_id": existing_id,
+                        }],
+                    )
+                    error = RbacDuplicateIdentityError(
+                        f"Role name {role_name!r} is already assigned to "
+                        f"role {existing_id}",
+                        outcome="no_change",
+                        cause="identity_claim_unchanged",
+                        conditions=[{
+                            "kind": "identity_claim",
+                            "name": role_name,
+                            "identity_id": existing_id,
+                        }],
+                    )
+                    self._rbac_mark_attempt_recorded(error)
+                    raise error
+        role_type = canonical.get("role", "")
+        redis_data = {k: self._rbac_serialize(v) for k, v in canonical.items()}
+        now_ms = _now_ms()
+        audit_json = self._rbac_audit_json(
+            action_context=action_context,
+            org=org,
+            sup=sup,
+            action="role_create",
+            resource_type="role",
+            resource_id=role_id,
+            before_document=None,
+            after_document=redis_data,
+            before_version=0,
+            after_version=1,
+            changed_fields=redis_data.keys(),
+            timestamp_ms=now_ms,
+        )
+        result = int(self._rbac_create_role(
+            keys=[
+                key,
+                RK.rbac_role_index(org, sup),
+                RK.rbac_role_type_index(org, sup, role_type),
+                RK.rbac_rolename_to_id(org, sup),
+                RK.rbac_role_meta(org, sup),
+            ] + self._rbac_audit_keys(org),
+            args=[
+                role_id,
+                role_type,
+                role_name.lower() if role_name else "",
+                json.dumps(redis_data, sort_keys=True, separators=(",", ":")),
+                str(now_ms),
+                org,
+                sup,
+                audit_json,
+            ],
+        ) or 0)
+        if result == -1:
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="role_create",
+                resource_type="role",
+                resource_id=role_id,
+                namespace="role",
+                outcome="no_change",
+                cause="resource_already_exists",
+                action_context=action_context,
+                conditions=[{"kind": "resource_exists"}],
+            )
+            error = RbacDuplicateIdentityError(
+                f"Role {role_id} already exists",
+                outcome="no_change",
+                cause="resource_already_exists",
+                conditions=[{"kind": "resource_exists"}],
+            )
+            self._rbac_mark_attempt_recorded(error)
+            raise error
+        if result == -2:
+            winner = self.r.hget(
+                RK.rbac_rolename_to_id(org, sup), role_name.lower(),
+            )
+            if winner is None:
+                raise _rbac_failure_decision(
+                    "Role name claim changed concurrently; retry creation"
+                )
+            winner = self._decode_member(winner)
+            winner_document = self.get_role_details(org, sup, winner)
+            if (
+                not winner_document
+                or str(winner_document.get("role_name", "")).casefold()
+                != role_name.casefold()
+            ):
+                raise RbacIntegrityError(
+                    "RBAC role name map and document are inconsistent"
+                )
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="role_create",
+                resource_type="role",
+                resource_id=role_id,
+                namespace="role",
+                outcome="no_change",
+                cause="identity_claim_unchanged",
+                action_context=action_context,
+                conditions=[{
+                    "kind": "identity_claim",
+                    "name": role_name,
+                    "identity_id": winner,
+                }],
+            )
+            error = RbacDuplicateIdentityError(
+                f"Role name {role_name!r} is already assigned to role {winner}",
+                outcome="no_change",
+                cause="identity_claim_unchanged",
+                conditions=[{
+                    "kind": "identity_claim",
+                    "name": role_name,
+                    "identity_id": winner,
+                }],
+            )
+            self._rbac_mark_attempt_recorded(error)
+            raise error
+        if result != 1:
+            raise RuntimeError("Atomic role creation did not commit")
+
+    @_audit_catalog_rejections(
+        action="role_update",
+        resource_type="role",
+        namespace="role",
+        resource_fields=("role_id",),
+    )
+    def rbac_update_role(
+        self,
+        org: str,
+        sup: str,
+        role_id: str,
+        fields: Dict[str, Any],
+        *,
+        action_context: Any = None,
+    ) -> None:
         """Update specific fields of an existing role in-place.
 
         Validates ``role_name`` (when the update touches it) so direct
         callers can't introduce unsafe names via a partial update either.
         """
-        if "role_name" in fields:
-            validate_role_name(fields.get("role_name", ""))
+        if not isinstance(fields, dict):
+            raise ValueError("role update fields must be an object")
+        if "role_id" in fields and str(fields["role_id"]) != str(role_id):
+            raise ValueError("role_id cannot be changed")
+        if "doc_version" in fields:
+            raise ValueError("doc_version cannot be changed")
         key = RK.rbac_role_doc(org, sup, role_id)
         if not self.r.exists(key):
-            raise ValueError(f"Role {role_id} does not exist")
-        redis_data = {k: self._rbac_serialize(v) for k, v in fields.items()}
-        redis_data["modified_ms"] = str(_now_ms())
-        self.r.hset(key, mapping=redis_data)
-        self._rbac_bump(RK.rbac_role_meta(org, sup))
+            raise _rbac_absent_decision(
+                f"Role {role_id} does not exist",
+            )
 
-    def rbac_delete_role(self, org: str, sup: str, role_id: str) -> bool:
+        # Validate the complete effective document, not merely the partial
+        # patch.  This prevents a direct caller from preserving or combining
+        # malformed stored policy with a superficially valid update.
+        current_raw = self.r.hgetall(key)
+        if not current_raw:
+            raise _rbac_absent_decision(
+                f"Role {role_id} does not exist",
+            )
+        self._canonical_persisted_role(current_raw)
+        expected_tables = self._rbac_text(current_raw.get("tables"))
+        expected_modified = self._rbac_text(current_raw.get("modified_ms"))
+        expected_doc_version = self._rbac_doc_version(current_raw)
+        current: Dict[str, Any] = dict(current_raw or {})
+        if "tables" in current:
+            try:
+                current["tables"] = _decode_role_json_field(
+                    current["tables"], field="tables",
+                )
+            except (TypeError, ValueError) as exc:
+                raise RbacIntegrityError(
+                    "Persisted role policy is invalid"
+                ) from exc
+
+        current_role = current.get("role", "")
+        if isinstance(current_role, bytes):
+            current_role = current_role.decode("utf-8")
+        current_name = current.get("role_name", "")
+        if isinstance(current_name, bytes):
+            current_name = current_name.decode("utf-8")
+        current_name = current_name or ""
+        is_bootstrap = self._rbac_is_bootstrap_superadmin(
+            org, sup, role_id, role_name=current_name,
+        )
+        requested_role = fields.get("role", current_role)
+        requested_name = fields.get("role_name", current_name) or ""
+        if (
+            current_role == "superadmin"
+            or is_bootstrap
+        ) and requested_role != "superadmin":
+            raise ValueError("A superadmin role cannot be demoted.")
+        if (
+            is_bootstrap
+            and str(requested_name).casefold() != "superadmin"
+        ):
+            raise ValueError("The bootstrap superadmin role cannot be renamed.")
+
+        merged = dict(current)
+        merged.update(fields)
+        canonical = _canonicalize_role_document(
+            merged, default_if_empty=False,
+        )
+
+        old_role = current.get("role", "")
+        if isinstance(old_role, bytes):
+            old_role = old_role.decode("utf-8")
+        new_role = canonical["role"]
+        old_name = current.get("role_name", "")
+        if isinstance(old_name, bytes):
+            old_name = old_name.decode("utf-8")
+        old_name = old_name or ""
+        if (old_role == "superadmin" or is_bootstrap) and new_role != "superadmin":
+            raise ValueError("A superadmin role cannot be demoted.")
+
+        new_name = canonical.get("role_name", old_name) or ""
+        if is_bootstrap:
+            if new_name.casefold() != "superadmin":
+                raise ValueError("The bootstrap superadmin role cannot be renamed.")
+        if new_name and new_name.casefold() != old_name.casefold():
+            conflicting_id = self.r.hget(
+                RK.rbac_rolename_to_id(org, sup), new_name.lower(),
+            )
+            if conflicting_id is not None:
+                conflicting_id = self._decode_member(conflicting_id)
+                if conflicting_id != role_id:
+                    conflicting_document = self.get_role_details(
+                        org, sup, conflicting_id,
+                    )
+                    if (
+                        not conflicting_document
+                        or str(conflicting_document.get("role_name", "")).casefold()
+                        != new_name.casefold()
+                    ):
+                        raise RbacIntegrityError(
+                            "RBAC role name map and document are inconsistent"
+                        )
+                    raise _rbac_identity_decision(
+                        f"Role name {new_name!r} is already assigned to "
+                        f"role {conflicting_id}",
+                        new_name,
+                        conflicting_id,
+                    )
+
+        # Persist requested metadata fields plus the complete canonical policy
+        # and its matching hash.  Normalising all policy fields closes the
+        # direct-catalog bypass without overwriting unrelated document data.
+        write_fields = dict(fields)
+        write_fields.update({
+            "role": new_role,
+            "tables": canonical["tables"],
+            "content_hash": canonical["content_hash"],
+        })
+        redis_data = {k: self._rbac_serialize(v) for k, v in write_fields.items()}
+        now_ms = _now_ms()
+        redis_data["modified_ms"] = str(now_ms)
+        before_document = self._rbac_string_document(current_raw)
+        after_document = dict(before_document)
+        after_document.update(redis_data)
+        after_document["doc_version"] = str(int(expected_doc_version) + 1)
+        audit_json = self._rbac_audit_json(
+            action_context=action_context,
+            org=org,
+            sup=sup,
+            action="role_update",
+            resource_type="role",
+            resource_id=role_id,
+            before_document=before_document,
+            after_document=after_document,
+            before_version=int(expected_doc_version),
+            after_version=int(expected_doc_version) + 1,
+            changed_fields=set(redis_data) | {"doc_version"},
+            timestamp_ms=now_ms,
+        )
+
+        result = int(self._rbac_update_role(
+            keys=[
+                key,
+                RK.rbac_role_index(org, sup),
+                RK.rbac_role_type_index(org, sup, old_role),
+                RK.rbac_role_type_index(org, sup, new_role),
+                RK.rbac_rolename_to_id(org, sup),
+                RK.rbac_role_meta(org, sup),
+            ] + self._rbac_audit_keys(org),
+            args=[
+                role_id,
+                old_role,
+                old_name,
+                expected_tables,
+                expected_modified,
+                expected_doc_version,
+                new_role,
+                new_name,
+                json.dumps(redis_data, sort_keys=True, separators=(",", ":")),
+                str(now_ms),
+                org,
+                sup,
+                audit_json,
+            ],
+        ) or 0)
+        if result == -1:
+            raise _rbac_absent_decision(
+                f"Role {role_id} does not exist",
+            )
+        if result == -2:
+            winner = self.r.hget(
+                RK.rbac_rolename_to_id(org, sup), new_name.lower(),
+            )
+            if winner is None:
+                raise _rbac_failure_decision(
+                    "Role name claim changed concurrently; retry the update"
+                )
+            winner_id = self._decode_member(winner)
+            winner_document = self.get_role_details(org, sup, winner_id)
+            if (
+                not winner_document
+                or str(winner_document.get("role_name", "")).casefold()
+                != new_name.casefold()
+            ):
+                raise RbacIntegrityError(
+                    "RBAC role name map and document are inconsistent"
+                )
+            raise _rbac_identity_decision(
+                f"Role name {new_name!r} is already assigned",
+                new_name,
+                winner_id,
+            )
+        if result == -3:
+            raise _rbac_failure_decision(
+                f"Role {role_id} changed concurrently; retry the update"
+            )
+        if result == -4:
+            raise _rbac_denied_decision(
+                "A superadmin role cannot be demoted.",
+                cause="protected_identity",
+            )
+        if result == -5:
+            raise _rbac_denied_decision(
+                "The bootstrap superadmin role cannot be renamed.",
+                cause="protected_identity",
+            )
+        if result == -6:
+            raise RbacIntegrityError(
+                "Persisted role identity does not match its storage key"
+            )
+        if result != 1:
+            raise RuntimeError("Atomic role update did not commit")
+
+    @_audit_catalog_rejections(
+        action="role_delete",
+        resource_type="role",
+        namespace="role",
+        resource_fields=("role_id",),
+    )
+    def rbac_delete_role(
+        self,
+        org: str,
+        sup: str,
+        role_id: str,
+        *,
+        action_context: Any = None,
+    ) -> bool:
         """Atomically delete a role, strip from users, and clean name→id mapping."""
         key = RK.rbac_role_doc(org, sup, role_id)
-        if not self.r.exists(key):
+        raw = self.r.hgetall(key)
+        if not raw:
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="role_delete",
+                resource_type="role",
+                resource_id=_safe_rbac_audit_resource_id(
+                    role_id, fallback="pending-role"
+                ),
+                namespace="role",
+                outcome="no_change",
+                cause="resource_missing",
+                action_context=action_context,
+                conditions=[{"kind": "resource_absent"}],
+            )
             return False
-        role_type = self.r.hget(key, "role") or ""
-        if isinstance(role_type, bytes):
-            role_type = role_type.decode("utf-8")
-        role_name = self.r.hget(key, "role_name") or ""
-        if isinstance(role_name, bytes):
-            role_name = role_name.decode("utf-8")
+        role_type = self._rbac_text(raw.get("role"))
+        if role_type == "superadmin":
+            raise _rbac_denied_decision(
+                "A superadmin role cannot be deleted.",
+                cause="protected_identity",
+                severity="critical",
+            )
+        role_name = self._rbac_text(raw.get("role_name"))
+        expected_tables = self._rbac_text(raw.get("tables"))
+        expected_modified = self._rbac_text(raw.get("modified_ms"))
+        expected_doc_version = self._rbac_doc_version(raw)
+        if self._rbac_is_bootstrap_superadmin(
+            org, sup, role_id, role_name=role_name,
+        ):
+            raise _rbac_denied_decision(
+                "The bootstrap superadmin role cannot be deleted.",
+                cause="protected_identity",
+                severity="critical",
+            )
         # The Lua script appends each user_id to this prefix.
         user_doc_key_prefix = RK.rbac_user_doc_prefix(org, sup)
+        now_ms = _now_ms()
+        before_document = self._rbac_string_document(raw)
+        audit_json = self._rbac_audit_json(
+            action_context=action_context,
+            org=org,
+            sup=sup,
+            action="role_delete",
+            resource_type="role",
+            resource_id=role_id,
+            before_document=before_document,
+            after_document=None,
+            before_version=int(expected_doc_version),
+            after_version=0,
+            changed_fields=set(before_document) | {"user.roles"},
+            timestamp_ms=now_ms,
+            severity="critical",
+        )
+        cascade_manifest_id = json.loads(audit_json)["cascade_manifest_id"]
+        cascade_manifest_key = RK.audit_privileged_cascade(
+            org, cascade_manifest_id,
+        )
         result = self._rbac_delete_role(
             keys=[
                 key,
@@ -1388,15 +4391,77 @@ return 1
                 RK.rbac_role_meta(org, sup),
                 RK.rbac_user_index(org, sup),
                 RK.rbac_rolename_to_id(org, sup),
-            ],
+                RK.rbac_user_meta(org, sup),
+                cascade_manifest_key,
+                RK.rbac_username_to_id(org, sup),
+            ] + self._rbac_audit_keys(org),
             args=[
                 role_id,
-                str(_now_ms()),
-                role_name.lower() if role_name else "",
+                str(now_ms),
+                role_type,
+                role_name,
+                expected_tables,
+                expected_modified,
+                expected_doc_version,
                 user_doc_key_prefix,
+                cascade_manifest_key,
+                str(self._RBAC_CASCADE_MANIFEST_USER_LIMIT),
+                org,
+                sup,
+                audit_json,
             ],
         )
-        return int(result or 0) == 1
+        result = int(result or 0)
+        if result == -1:
+            raise _rbac_denied_decision(
+                "A superadmin role cannot be deleted.",
+                cause="protected_identity",
+                severity="critical",
+            )
+        if result == -2:
+            raise _rbac_failure_decision(
+                f"Role {role_id} changed concurrently; retry the delete",
+                severity="critical",
+            )
+        if result == -3:
+            raise RbacIntegrityError(
+                "Persisted role identity does not match its storage key"
+            )
+        if result == -4:
+            raise RbacIntegrityError(
+                "Persisted user role assignments are corrupt"
+            )
+        if result == -5:
+            raise _rbac_denied_decision(
+                "role deletion must scan more than the "
+                f"{self._RBAC_CASCADE_MANIFEST_USER_LIMIT}-user atomic audit limit",
+                cause="operation_limit_exceeded",
+                severity="critical",
+            )
+        if result == -6:
+            raise RbacIntegrityError(
+                "RBAC user index, identity map, and documents are inconsistent"
+            )
+        if result not in (0, 1):
+            raise RuntimeError("Atomic role deletion did not commit")
+        if result == 0:
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="role_delete",
+                resource_type="role",
+                resource_id=_safe_rbac_audit_resource_id(
+                    role_id, fallback="pending-role"
+                ),
+                namespace="role",
+                outcome="no_change",
+                cause="resource_disappeared",
+                action_context=action_context,
+                before_document=before_document,
+                before_version=int(expected_doc_version),
+                conditions=[{"kind": "resource_absent"}],
+            )
+        return result == 1
 
     def rbac_role_exists(self, org: str, sup: str, role_id: str) -> bool:
         return bool(self.r.exists(RK.rbac_role_doc(org, sup, role_id)))
@@ -1422,36 +4487,333 @@ return 1
     # -- User meta init --
 
     def rbac_init_user_meta(self, org: str, sup: str) -> None:
-        """Ensure the RBAC user meta HASH exists. Idempotent."""
-        key = RK.rbac_user_meta(org, sup)
-        if not self.r.exists(key):
-            self.r.hset(key, mapping={
-                "version": "0",
-                "last_updated_ms": str(_now_ms()),
-                "initialized": "true",
-            })
+        """Validate user namespace metadata without mutating it."""
+        result = int(self._rbac_validate_meta(
+            keys=[
+                RK.rbac_user_meta(org, sup),
+                RK.rbac_user_index(org, sup),
+                RK.rbac_username_to_id(org, sup),
+            ],
+            args=[],
+        ) or 0)
+        if result in {-1, -2}:
+            raise RbacIntegrityError(
+                "RBAC user namespace metadata cannot be safely initialized"
+            )
+        if result != 0:
+            raise RuntimeError("Atomic RBAC user metadata validation failed")
 
     # -- User CRUD --
 
-    def rbac_create_user(self, org: str, sup: str, user_id: str, user_data: Dict[str, Any]) -> None:
+    def _rbac_is_default_superuser(
+        self,
+        org: str,
+        sup: str,
+        user_id: str,
+        *,
+        username: str = "",
+    ) -> bool:
+        """Identify the recovery user despite one corrupt identity source."""
+        if str(username).casefold() == "superuser":
+            return True
+        mapped_id = self.r.hget(
+            RK.rbac_username_to_id(org, sup), "superuser",
+        )
+        return (
+            mapped_id is not None
+            and self._decode_member(mapped_id) == str(user_id)
+        )
+
+    def _rbac_roles_include_superadmin(
+        self, org: str, sup: str, role_ids: Any,
+    ) -> bool:
+        if not isinstance(role_ids, list):
+            return False
+        for role_id in role_ids:
+            if not isinstance(role_id, str):
+                continue
+            role_type = self.r.hget(
+                RK.rbac_role_doc(org, sup, role_id), "role",
+            )
+            if isinstance(role_type, bytes):
+                role_type = role_type.decode("utf-8")
+            if role_type == "superadmin":
+                return True
+        return False
+
+    @_audit_catalog_rejections(
+        action="user_create",
+        resource_type="user",
+        namespace="user",
+        resource_fields=("user_id",),
+    )
+    def rbac_create_user(
+        self,
+        org: str,
+        sup: str,
+        user_id: str,
+        user_data: Dict[str, Any],
+        *,
+        action_context: Any = None,
+    ) -> None:
         """Persist a new user document and update indexes.
 
         Validates ``username`` against :data:`SAFE_USERNAME_RE` before
         writing — direct callers (tests, admin scripts, migrations) can't
         bypass the rule by skipping ``UserManager.create_user``.
         """
+        if not isinstance(user_data, dict):
+            raise ValueError("user document must be an object")
+        supplied_user_id = user_data.get("user_id")
+        if supplied_user_id is not None and str(supplied_user_id) != str(user_id):
+            raise ValueError("user document user_id does not match the storage key")
+        if "username" not in user_data:
+            raise ValueError("username is required")
         username = user_data["username"]
         validate_username(username)
+        roles = user_data.get("roles", [])
+        if not isinstance(roles, list) or not all(
+            isinstance(role_id, str) and role_id for role_id in roles
+        ):
+            raise ValueError("roles must be a list of role IDs")
+        for role_id in roles:
+            role_key = RK.rbac_role_doc(org, sup, role_id)
+            assigned_type = self.r.hget(role_key, "role")
+            if assigned_type is None:
+                raise _rbac_role_absent_decision(
+                    f"Role {role_id} does not exist", role_id,
+                )
+            assigned_type = self._rbac_text(assigned_type)
+            if assigned_type not in {
+                "superadmin", "admin", "writer", "reader", "meta",
+            }:
+                raise RbacIntegrityError(
+                    "Persisted role document has an invalid role type"
+                )
+        if (
+            username.casefold() == "superuser"
+            and not self._rbac_roles_include_superadmin(org, sup, roles)
+        ):
+            raise ValueError("The default superuser must retain a superadmin role")
         key = RK.rbac_user_doc(org, sup, user_id)
+        existing_raw = self.r.hgetall(key)
+        if existing_raw:
+            stored_id = self._rbac_text(existing_raw.get("user_id"))
+            if stored_id and stored_id != user_id:
+                raise RbacIntegrityError(
+                    "Persisted user identity does not match its storage key"
+                )
+            persisted_username = self._rbac_text(existing_raw.get("username"))
+            try:
+                validate_username(persisted_username)
+            except (TypeError, ValueError) as exc:
+                raise RbacIntegrityError(
+                    "Persisted username is invalid"
+                ) from exc
+            self._decode_user_roles(existing_raw.get("roles"))
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="user_create",
+                resource_type="user",
+                resource_id=user_id,
+                namespace="user",
+                outcome="no_change",
+                cause="resource_already_exists",
+                action_context=action_context,
+                conditions=[{"kind": "resource_exists"}],
+            )
+            error = RbacDuplicateIdentityError(
+                f"User {user_id} already exists",
+                outcome="no_change",
+                cause="resource_already_exists",
+                conditions=[{"kind": "resource_exists"}],
+            )
+            self._rbac_mark_attempt_recorded(error)
+            raise error
+        existing_id = self.r.hget(
+            RK.rbac_username_to_id(org, sup), username.lower(),
+        )
+        if existing_id is not None and self._decode_member(existing_id) != user_id:
+            winner = self._decode_member(existing_id)
+            winner_document = self.get_user_details(org, sup, winner)
+            if (
+                not winner_document
+                or str(winner_document.get("username", "")).casefold()
+                != username.casefold()
+            ):
+                raise RbacIntegrityError(
+                    "RBAC username map and document are inconsistent"
+                )
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="user_create",
+                resource_type="user",
+                resource_id=user_id,
+                namespace="user",
+                outcome="no_change",
+                cause="identity_claim_unchanged",
+                action_context=action_context,
+                conditions=[{
+                    "kind": "identity_claim",
+                    "name": username,
+                    "identity_id": winner,
+                }],
+            )
+            error = RbacDuplicateIdentityError(
+                f"Username {username!r} is already assigned",
+                outcome="no_change",
+                cause="identity_claim_unchanged",
+                conditions=[{
+                    "kind": "identity_claim",
+                    "name": username,
+                    "identity_id": winner,
+                }],
+            )
+            self._rbac_mark_attempt_recorded(error)
+            raise error
+        user_data = dict(user_data)
+        user_data["user_id"] = user_id
+        user_data["roles"] = roles
+        user_data["doc_version"] = "1"
         redis_data = {k: self._rbac_serialize(v) for k, v in user_data.items()}
-        pipe = self.r.pipeline()
-        pipe.hset(key, mapping=redis_data)
-        pipe.sadd(RK.rbac_user_index(org, sup), user_id)
-        pipe.hset(RK.rbac_username_to_id(org, sup), username.lower(), user_id)
-        pipe.execute()
-        self._rbac_bump(RK.rbac_user_meta(org, sup))
+        now_ms = _now_ms()
+        audit_json = self._rbac_audit_json(
+            action_context=action_context,
+            org=org,
+            sup=sup,
+            action="user_create",
+            resource_type="user",
+            resource_id=user_id,
+            before_document=None,
+            after_document=redis_data,
+            before_version=0,
+            after_version=1,
+            changed_fields=redis_data.keys(),
+            role_ids_added=roles,
+            timestamp_ms=now_ms,
+        )
+        result = int(self._rbac_create_user(
+            keys=[
+                key,
+                RK.rbac_user_index(org, sup),
+                RK.rbac_username_to_id(org, sup),
+                RK.rbac_user_meta(org, sup),
+            ] + self._rbac_audit_keys(org),
+            args=[
+                user_id,
+                username.lower(),
+                json.dumps(redis_data, sort_keys=True, separators=(",", ":")),
+                str(now_ms),
+                RK.rbac_role_doc_prefix(org, sup),
+                org,
+                sup,
+                audit_json,
+            ],
+        ) or 0)
+        if result == -1:
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="user_create",
+                resource_type="user",
+                resource_id=user_id,
+                namespace="user",
+                outcome="no_change",
+                cause="resource_already_exists",
+                action_context=action_context,
+                conditions=[{"kind": "resource_exists"}],
+            )
+            error = RbacDuplicateIdentityError(
+                f"User {user_id} already exists",
+                outcome="no_change",
+                cause="resource_already_exists",
+                conditions=[{"kind": "resource_exists"}],
+            )
+            self._rbac_mark_attempt_recorded(error)
+            raise error
+        if result == -2:
+            winner = self.r.hget(
+                RK.rbac_username_to_id(org, sup), username.lower(),
+            )
+            if winner is None:
+                raise _rbac_failure_decision(
+                    "Username claim changed concurrently; retry creation"
+                )
+            winner = self._decode_member(winner)
+            winner_document = self.get_user_details(org, sup, winner)
+            if (
+                not winner_document
+                or str(winner_document.get("username", "")).casefold()
+                != username.casefold()
+            ):
+                raise RbacIntegrityError(
+                    "RBAC username map and document are inconsistent"
+                )
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="user_create",
+                resource_type="user",
+                resource_id=user_id,
+                namespace="user",
+                outcome="no_change",
+                cause="identity_claim_unchanged",
+                action_context=action_context,
+                conditions=[{
+                    "kind": "identity_claim",
+                    "name": username,
+                    "identity_id": winner,
+                }],
+            )
+            error = RbacDuplicateIdentityError(
+                f"Username {username!r} is already assigned to user {winner}",
+                outcome="no_change",
+                cause="identity_claim_unchanged",
+                conditions=[{
+                    "kind": "identity_claim",
+                    "name": username,
+                    "identity_id": winner,
+                }],
+            )
+            self._rbac_mark_attempt_recorded(error)
+            raise error
+        if result == -3:
+            for role_id in roles:
+                role_key = RK.rbac_role_doc(org, sup, role_id)
+                assigned_type = self.r.hget(role_key, "role")
+                if assigned_type is None:
+                    raise _rbac_role_absent_decision(
+                        f"Role {role_id} does not exist", role_id,
+                    )
+                if self._rbac_text(assigned_type) not in {
+                    "superadmin", "admin", "writer", "reader", "meta",
+                }:
+                    raise RbacIntegrityError(
+                        "Persisted role document has an invalid role type"
+                    )
+            raise _rbac_failure_decision(
+                "User role assignment validation changed concurrently"
+            )
+        if result != 1:
+            raise RuntimeError("Atomic user creation did not commit")
 
-    def rbac_update_user(self, org: str, sup: str, user_id: str, fields: Dict[str, Any]) -> None:
+    @_audit_catalog_rejections(
+        action="user_update",
+        resource_type="user",
+        namespace="user",
+        resource_fields=("user_id",),
+    )
+    def rbac_update_user(
+        self,
+        org: str,
+        sup: str,
+        user_id: str,
+        fields: Dict[str, Any],
+        *,
+        action_context: Any = None,
+    ) -> None:
         """Update specific fields of an existing user in-place.
 
         Values are serialized the same way as ``rbac_create_user`` — callers
@@ -1459,46 +4821,424 @@ return 1
         ``username`` (when present in the update) so partial updates can't
         slip an unsafe name past the rule.
         """
+        if not isinstance(fields, dict):
+            raise ValueError("user update fields must be an object")
+        fields = dict(fields)
+        if "user_id" in fields and str(fields["user_id"]) != str(user_id):
+            raise ValueError("user_id cannot be changed")
+        if "doc_version" in fields:
+            raise ValueError("doc_version cannot be changed")
         if "username" in fields:
             validate_username(fields.get("username", ""))
         key = RK.rbac_user_doc(org, sup, user_id)
-        if not self.r.exists(key):
-            raise ValueError(f"User {user_id} does not exist")
-        fields["modified_ms"] = str(_now_ms())
-        redis_data = {k: self._rbac_serialize(v) for k, v in fields.items()}
-        self.r.hset(key, mapping=redis_data)
-        self._rbac_bump(RK.rbac_user_meta(org, sup))
+        raw = self.r.hgetall(key) or {}
+        if not raw:
+            raise _rbac_absent_decision(
+                f"User {user_id} does not exist",
+            )
+        self._rbac_commit_user_update(
+            org,
+            sup,
+            user_id,
+            raw,
+            fields,
+            action_context=action_context,
+        )
 
-    def rbac_rename_user(self, org: str, sup: str, user_id: str, old_username: str, new_username: str) -> None:
+    def _rbac_commit_user_update(
+        self,
+        org: str,
+        sup: str,
+        user_id: str,
+        raw: Dict[str, Any],
+        fields: Dict[str, Any],
+        *,
+        action_context: Any = None,
+    ) -> None:
+        """CAS one validated user snapshot into its complete index boundary."""
+        old_username = self._rbac_text(raw.get("username"))
+        expected_roles = self._rbac_text(raw.get("roles"))
+        expected_modified = self._rbac_text(raw.get("modified_ms"))
+        expected_doc_version = self._rbac_doc_version(raw)
+        try:
+            validate_username(old_username)
+        except (TypeError, ValueError) as exc:
+            raise RbacIntegrityError(
+                "Persisted username is invalid"
+            ) from exc
+        current_roles = self._decode_user_roles(expected_roles)
+
+        new_username = fields.get("username", old_username)
+        validate_username(new_username)
+        resulting_roles = fields.get("roles", current_roles)
+        if not isinstance(resulting_roles, list) or not all(
+            isinstance(role_id, str) and role_id for role_id in resulting_roles
+        ):
+            raise ValueError("roles must be a list of role IDs")
+        for role_id in resulting_roles:
+            role_key = RK.rbac_role_doc(org, sup, role_id)
+            assigned_type = self.r.hget(role_key, "role")
+            if assigned_type is None:
+                raise _rbac_role_absent_decision(
+                    f"Role {role_id} does not exist", role_id,
+                )
+            if self._rbac_text(assigned_type) not in {
+                "superadmin", "admin", "writer", "reader", "meta",
+            }:
+                raise RbacIntegrityError(
+                    "Persisted role document has an invalid role type"
+                )
+        is_default_superuser = self._rbac_is_default_superuser(
+            org, sup, user_id, username=old_username,
+        )
+        if (
+            is_default_superuser
+            and new_username.casefold() != "superuser"
+        ):
+            raise _rbac_denied_decision(
+                "The default superuser cannot be renamed",
+                cause="protected_identity",
+            )
+        if (
+            is_default_superuser
+            and not self._rbac_roles_include_superadmin(
+                org, sup, resulting_roles,
+            )
+        ):
+            raise _rbac_denied_decision(
+                "The default superuser must retain a superadmin role",
+                cause="protected_identity",
+            )
+        if new_username.casefold() != old_username.casefold():
+            existing_id = self.r.hget(
+                RK.rbac_username_to_id(org, sup), new_username.lower(),
+            )
+            if (
+                existing_id is not None
+                and self._decode_member(existing_id) != user_id
+            ):
+                winner = self._decode_member(existing_id)
+                winner_document = self.get_user_details(org, sup, winner)
+                if (
+                    not winner_document
+                    or str(winner_document.get("username", "")).casefold()
+                    != new_username.casefold()
+                ):
+                    raise RbacIntegrityError(
+                        "RBAC username map and document are inconsistent"
+                    )
+                raise _rbac_identity_decision(
+                    f"Username {new_username!r} is already assigned",
+                    new_username,
+                    winner,
+                )
+
+        now_ms = _now_ms()
+        fields = dict(fields)
+        fields["modified_ms"] = str(now_ms)
+        redis_data = {k: self._rbac_serialize(v) for k, v in fields.items()}
+        before_document = self._rbac_string_document(raw)
+        after_document = dict(before_document)
+        after_document.update(redis_data)
+        after_document["doc_version"] = str(int(expected_doc_version) + 1)
+        previous_roles = set(current_roles)
+        next_roles = set(resulting_roles)
+        audit_json = self._rbac_audit_json(
+            action_context=action_context,
+            org=org,
+            sup=sup,
+            action="user_update",
+            resource_type="user",
+            resource_id=user_id,
+            before_document=before_document,
+            after_document=after_document,
+            before_version=int(expected_doc_version),
+            after_version=int(expected_doc_version) + 1,
+            changed_fields=set(redis_data) | {"doc_version"},
+            role_ids_added=next_roles - previous_roles,
+            role_ids_removed=previous_roles - next_roles,
+            timestamp_ms=now_ms,
+        )
+        result = int(self._rbac_update_user(
+            keys=[
+                RK.rbac_user_doc(org, sup, user_id),
+                RK.rbac_user_index(org, sup),
+                RK.rbac_username_to_id(org, sup),
+                RK.rbac_user_meta(org, sup),
+            ] + self._rbac_audit_keys(org),
+            args=[
+                user_id,
+                old_username,
+                expected_roles,
+                expected_modified,
+                expected_doc_version,
+                new_username,
+                json.dumps(resulting_roles, separators=(",", ":")),
+                json.dumps(redis_data, sort_keys=True, separators=(",", ":")),
+                str(now_ms),
+                RK.rbac_role_doc_prefix(org, sup),
+                org,
+                sup,
+                audit_json,
+            ],
+        ) or 0)
+        if result == -1:
+            raise _rbac_absent_decision(
+                f"User {user_id} does not exist",
+            )
+        if result == -2:
+            winner = self.r.hget(
+                RK.rbac_username_to_id(org, sup), new_username.lower(),
+            )
+            if winner is None:
+                raise _rbac_failure_decision(
+                    "Username claim changed concurrently; retry the update"
+                )
+            winner_id = self._decode_member(winner)
+            winner_document = self.get_user_details(org, sup, winner_id)
+            if (
+                not winner_document
+                or str(winner_document.get("username", "")).casefold()
+                != new_username.casefold()
+            ):
+                raise RbacIntegrityError(
+                    "RBAC username map and document are inconsistent"
+                )
+            raise _rbac_identity_decision(
+                f"Username {new_username!r} is already assigned",
+                new_username,
+                winner_id,
+            )
+        if result == -3:
+            raise _rbac_failure_decision(
+                f"User {user_id} changed concurrently; retry the update"
+            )
+        if result == -4:
+            raise _rbac_denied_decision(
+                "The default superuser cannot be renamed",
+                cause="protected_identity",
+            )
+        if result == -5:
+            raise _rbac_denied_decision(
+                "The default superuser must retain a superadmin role",
+                cause="protected_identity",
+            )
+        if result == -6:
+            raise RbacIntegrityError("Persisted user roles are invalid")
+        if result == -7:
+            raise RbacIntegrityError(
+                "Persisted user identity does not match its storage key"
+            )
+        if result == -8:
+            for role_id in resulting_roles:
+                role_key = RK.rbac_role_doc(org, sup, role_id)
+                assigned_type = self.r.hget(role_key, "role")
+                if assigned_type is None:
+                    raise _rbac_role_absent_decision(
+                        f"Role {role_id} does not exist", role_id,
+                    )
+                if self._rbac_text(assigned_type) not in {
+                    "superadmin", "admin", "writer", "reader", "meta",
+                }:
+                    raise RbacIntegrityError(
+                        "Persisted role document has an invalid role type"
+                    )
+            raise _rbac_failure_decision(
+                "User role assignment validation changed concurrently"
+            )
+        if result != 1:
+            raise RuntimeError("Atomic user update did not commit")
+
+    @_audit_catalog_rejections(
+        action="user_update",
+        resource_type="user",
+        namespace="user",
+        resource_fields=("user_id",),
+    )
+    def rbac_rename_user(
+        self,
+        org: str,
+        sup: str,
+        user_id: str,
+        old_username: str,
+        new_username: str,
+        *,
+        action_context: Any = None,
+    ) -> None:
         """Atomically update the username → user_id mapping.
 
         Validates ``new_username`` — this is the third write path that can
         touch the username index, so it must enforce the same rule as
         ``rbac_create_user`` and ``rbac_update_user``.
         """
+        validate_username(old_username)
         validate_username(new_username)
-        mapping_key = RK.rbac_username_to_id(org, sup)
-        pipe = self.r.pipeline()
-        pipe.hdel(mapping_key, old_username.lower())
-        pipe.hset(mapping_key, new_username.lower(), user_id)
-        pipe.execute()
+        key = RK.rbac_user_doc(org, sup, user_id)
+        raw = self.r.hgetall(key)
+        if not raw:
+            raise _rbac_absent_decision(
+                f"User {user_id} does not exist",
+            )
+        actual_username = self._rbac_text(raw.get("username"))
+        if actual_username.casefold() != old_username.casefold():
+            raise _rbac_failure_decision(
+                "old_username does not match the user document",
+                cause="stale_identity",
+            )
+        if self._rbac_is_default_superuser(
+            org, sup, user_id, username=actual_username,
+        ):
+            raise _rbac_denied_decision(
+                "The default superuser cannot be renamed",
+                cause="protected_identity",
+            )
+        conflict = self.r.hget(
+            RK.rbac_username_to_id(org, sup), new_username.lower(),
+        )
+        if conflict is not None and self._decode_member(conflict) != user_id:
+            conflict_id = self._decode_member(conflict)
+            conflict_document = self.get_user_details(org, sup, conflict_id)
+            if (
+                not conflict_document
+                or str(conflict_document.get("username", "")).casefold()
+                != new_username.casefold()
+            ):
+                raise RbacIntegrityError(
+                    "RBAC username map and document are inconsistent"
+                )
+            raise _rbac_identity_decision(
+                f"Username {new_username!r} is already assigned",
+                new_username,
+                conflict_id,
+            )
+        self._rbac_commit_user_update(
+            org,
+            sup,
+            user_id,
+            raw,
+            {"username": new_username},
+            action_context=action_context,
+        )
 
-    def rbac_delete_user(self, org: str, sup: str, user_id: str) -> None:
+    @_audit_catalog_rejections(
+        action="user_delete",
+        resource_type="user",
+        namespace="user",
+        resource_fields=("user_id",),
+    )
+    def rbac_delete_user(
+        self,
+        org: str,
+        sup: str,
+        user_id: str,
+        *,
+        action_context: Any = None,
+    ) -> None:
         """Delete a user document and remove from all indexes."""
         key = RK.rbac_user_doc(org, sup, user_id)
         raw = self.r.hgetall(key)
         if not raw:
-            raise ValueError(f"User {user_id} does not exist")
-        username = raw.get("username", "")
-        if isinstance(username, bytes):
-            username = username.decode("utf-8")
-        pipe = self.r.pipeline()
-        pipe.delete(key)
-        pipe.srem(RK.rbac_user_index(org, sup), user_id)
-        if username:
-            pipe.hdel(RK.rbac_username_to_id(org, sup), username.lower())
-        pipe.execute()
-        self._rbac_bump(RK.rbac_user_meta(org, sup))
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="user_delete",
+                resource_type="user",
+                resource_id=_safe_rbac_audit_resource_id(
+                    user_id, fallback="pending-user"
+                ),
+                namespace="user",
+                outcome="no_change",
+                cause="resource_missing",
+                action_context=action_context,
+                conditions=[{"kind": "resource_absent"}],
+            )
+            error = ValueError(f"User {user_id} does not exist")
+            self._rbac_mark_attempt_recorded(error)
+            raise error
+        username = self._rbac_text(raw.get("username"))
+        expected_roles = self._rbac_text(raw.get("roles"))
+        expected_modified = self._rbac_text(raw.get("modified_ms"))
+        expected_doc_version = self._rbac_doc_version(raw)
+        if self._rbac_is_default_superuser(
+            org, sup, user_id, username=username,
+        ):
+            raise _rbac_denied_decision(
+                "The default superuser cannot be deleted",
+                cause="protected_identity",
+                severity="critical",
+            )
+        now_ms = _now_ms()
+        before_document = self._rbac_string_document(raw)
+        current_roles = self._decode_user_roles(expected_roles)
+        audit_json = self._rbac_audit_json(
+            action_context=action_context,
+            org=org,
+            sup=sup,
+            action="user_delete",
+            resource_type="user",
+            resource_id=user_id,
+            before_document=before_document,
+            after_document=None,
+            before_version=int(expected_doc_version),
+            after_version=0,
+            changed_fields=before_document.keys(),
+            role_ids_removed=current_roles,
+            timestamp_ms=now_ms,
+            severity="critical",
+        )
+        result = int(self._rbac_delete_user(
+            keys=[
+                key,
+                RK.rbac_user_index(org, sup),
+                RK.rbac_username_to_id(org, sup),
+                RK.rbac_user_meta(org, sup),
+            ] + self._rbac_audit_keys(org),
+            args=[
+                user_id, username, expected_roles, expected_modified,
+                expected_doc_version,
+                str(now_ms),
+                org,
+                sup,
+                audit_json,
+            ],
+        ) or 0)
+        if result == 0:
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="user_delete",
+                resource_type="user",
+                resource_id=_safe_rbac_audit_resource_id(
+                    user_id, fallback="pending-user"
+                ),
+                namespace="user",
+                outcome="no_change",
+                cause="resource_disappeared",
+                action_context=action_context,
+                before_document=before_document,
+                before_version=int(expected_doc_version),
+                conditions=[{"kind": "resource_absent"}],
+            )
+            error = ValueError(f"User {user_id} does not exist")
+            self._rbac_mark_attempt_recorded(error)
+            raise error
+        if result == -1:
+            raise _rbac_denied_decision(
+                "The default superuser cannot be deleted",
+                cause="protected_identity",
+                severity="critical",
+            )
+        if result == -2:
+            raise _rbac_failure_decision(
+                f"User {user_id} changed concurrently; retry the delete",
+                severity="critical",
+            )
+        if result == -3:
+            raise RbacIntegrityError(
+                "Persisted user identity does not match its storage key"
+            )
+        if result != 1:
+            raise RuntimeError("Atomic user deletion did not commit")
 
 
     def rbac_get_user_id_by_username(self, org: str, sup: str, username: str) -> Optional[str]:
@@ -1515,27 +5255,351 @@ return 1
 
     # -- Atomic role ↔ user mutations --
 
-    def rbac_add_role_to_user(self, org: str, sup: str, user_id: str, role_id: str) -> bool:
+    @_audit_catalog_rejections(
+        action="user_role_assign",
+        resource_type="user_role_assignment",
+        namespace="user",
+        resource_fields=("user_id", "role_id"),
+    )
+    def rbac_add_role_to_user(
+        self,
+        org: str,
+        sup: str,
+        user_id: str,
+        role_id: str,
+        *,
+        action_context: Any = None,
+    ) -> bool:
         """Atomically add a role to a user's role list (no-op if already present)."""
-        return int(self._rbac_add_role_to_user(
+        user_key = RK.rbac_user_doc(org, sup, user_id)
+        raw = self.r.hgetall(user_key) or {}
+        if not raw:
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="user_role_assign",
+                resource_type="user_role_assignment",
+                resource_id=_safe_rbac_audit_resource_id(
+                    user_id, role_id, fallback="pending-user-role-assignment"
+                ),
+                namespace="user",
+                outcome="no_change",
+                cause="user_missing",
+                action_context=action_context,
+                conditions=[{
+                    "kind": "assignment_user_absent",
+                    "user_id": user_id,
+                    "role_id": role_id,
+                }],
+            )
+            return False
+        role_key = RK.rbac_role_doc(org, sup, role_id)
+        assigned_type = self.r.hget(role_key, "role")
+        if assigned_type is None:
+            raise _rbac_assignment_role_absent_decision(
+                f"Role {role_id} does not exist", user_id, role_id,
+            )
+        if self._rbac_text(assigned_type) not in {
+            "superadmin", "admin", "writer", "reader", "meta",
+        }:
+            raise RbacIntegrityError(
+                "Persisted role document has an invalid role type"
+            )
+        expected_roles = self._rbac_text(raw.get("roles"))
+        expected_doc_version = self._rbac_doc_version(raw)
+        roles = self._decode_user_roles(expected_roles)
+        if role_id in roles:
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="user_role_assign",
+                resource_type="user_role_assignment",
+                resource_id=_safe_rbac_audit_resource_id(
+                    user_id, role_id, fallback="pending-user-role-assignment"
+                ),
+                namespace="user",
+                outcome="no_change",
+                cause="role_already_assigned",
+                action_context=action_context,
+                before_document=self._rbac_string_document(raw),
+                before_version=int(expected_doc_version),
+                conditions=[{
+                    "kind": "assignment_membership",
+                    "user_id": user_id,
+                    "role_id": role_id,
+                    "present": True,
+                    "version": expected_doc_version,
+                }],
+            )
+            return False
+        now_ms = _now_ms()
+        before_document = self._rbac_string_document(raw)
+        after_document = dict(before_document)
+        after_document["roles"] = json.dumps(
+            roles + [role_id], separators=(",", ":"),
+        )
+        after_document["modified_ms"] = str(now_ms)
+        after_document["doc_version"] = str(int(expected_doc_version) + 1)
+        audit_json = self._rbac_audit_json(
+            action_context=action_context,
+            org=org,
+            sup=sup,
+            action="user_role_assign",
+            resource_type="user_role_assignment",
+            resource_id=f"{user_id}:{role_id}",
+            before_document=before_document,
+            after_document=after_document,
+            before_version=int(expected_doc_version),
+            after_version=int(expected_doc_version) + 1,
+            changed_fields=("roles", "modified_ms", "doc_version"),
+            role_ids_added=(role_id,),
+            timestamp_ms=now_ms,
+        )
+        result = int(self._rbac_add_role_to_user(
             keys=[
-                RK.rbac_user_doc(org, sup, user_id),
+                user_key,
                 RK.rbac_user_meta(org, sup),
+                RK.rbac_role_doc(org, sup, role_id),
+            ] + self._rbac_audit_keys(org),
+            args=[
+                role_id,
+                str(now_ms),
+                user_id,
+                expected_roles,
+                expected_doc_version,
+                org,
+                sup,
+                audit_json,
             ],
-            args=[role_id, str(_now_ms())],
-        ) or 0) == 1
+        ) or 0)
+        if result == -1:
+            assigned_type = self.r.hget(role_key, "role")
+            if assigned_type is None:
+                raise _rbac_assignment_role_absent_decision(
+                    f"Role {role_id} does not exist", user_id, role_id,
+                )
+            if self._rbac_text(assigned_type) not in {
+                "superadmin", "admin", "writer", "reader", "meta",
+            }:
+                raise RbacIntegrityError(
+                    "Persisted role document has an invalid role type"
+                )
+            raise _rbac_failure_decision(
+                "Role validation changed concurrently; retry the assignment"
+            )
+        if result == -2:
+            raise _rbac_failure_decision(
+                f"User {user_id} changed concurrently; retry the assignment"
+            )
+        if result == 0:
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="user_role_assign",
+                resource_type="user_role_assignment",
+                resource_id=_safe_rbac_audit_resource_id(
+                    user_id, role_id, fallback="pending-user-role-assignment"
+                ),
+                namespace="user",
+                outcome="no_change",
+                cause="assignment_not_changed",
+                action_context=action_context,
+                before_document=before_document,
+                before_version=int(expected_doc_version),
+                conditions=[{
+                    "kind": "assignment_membership",
+                    "user_id": user_id,
+                    "role_id": role_id,
+                    "present": True,
+                    "version": expected_doc_version,
+                }],
+            )
+        return result == 1
 
-    def rbac_remove_role_from_user(self, org: str, sup: str, user_id: str, role_id: str) -> bool:
+    @_audit_catalog_rejections(
+        action="user_role_remove",
+        resource_type="user_role_assignment",
+        namespace="user",
+        resource_fields=("user_id", "role_id"),
+    )
+    def rbac_remove_role_from_user(
+        self,
+        org: str,
+        sup: str,
+        user_id: str,
+        role_id: str,
+        *,
+        action_context: Any = None,
+    ) -> bool:
         """Atomically remove a role from a user's role list."""
-        return int(self._rbac_remove_role_from_user(
+        user_key = RK.rbac_user_doc(org, sup, user_id)
+        raw = self.r.hgetall(user_key) or {}
+        if not raw:
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="user_role_remove",
+                resource_type="user_role_assignment",
+                resource_id=_safe_rbac_audit_resource_id(
+                    user_id, role_id, fallback="pending-user-role-assignment"
+                ),
+                namespace="user",
+                outcome="no_change",
+                cause="user_missing",
+                action_context=action_context,
+                conditions=[{
+                    "kind": "assignment_user_absent",
+                    "user_id": user_id,
+                    "role_id": role_id,
+                }],
+            )
+            return False
+        expected_roles = self._rbac_text(raw.get("roles"))
+        expected_doc_version = self._rbac_doc_version(raw)
+        roles = self._decode_user_roles(expected_roles)
+        if role_id not in roles:
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="user_role_remove",
+                resource_type="user_role_assignment",
+                resource_id=_safe_rbac_audit_resource_id(
+                    user_id, role_id, fallback="pending-user-role-assignment"
+                ),
+                namespace="user",
+                outcome="no_change",
+                cause="role_not_assigned",
+                action_context=action_context,
+                before_document=self._rbac_string_document(raw),
+                before_version=int(expected_doc_version),
+                conditions=[{
+                    "kind": "assignment_membership",
+                    "user_id": user_id,
+                    "role_id": role_id,
+                    "present": False,
+                    "version": expected_doc_version,
+                }],
+            )
+            return False
+        now_ms = _now_ms()
+        resulting_roles = [assigned_id for assigned_id in roles if assigned_id != role_id]
+        before_document = self._rbac_string_document(raw)
+        after_document = dict(before_document)
+        after_document["roles"] = json.dumps(
+            resulting_roles, separators=(",", ":"),
+        )
+        after_document["modified_ms"] = str(now_ms)
+        after_document["doc_version"] = str(int(expected_doc_version) + 1)
+        audit_json = self._rbac_audit_json(
+            action_context=action_context,
+            org=org,
+            sup=sup,
+            action="user_role_remove",
+            resource_type="user_role_assignment",
+            resource_id=f"{user_id}:{role_id}",
+            before_document=before_document,
+            after_document=after_document,
+            before_version=int(expected_doc_version),
+            after_version=int(expected_doc_version) + 1,
+            changed_fields=("roles", "modified_ms", "doc_version"),
+            role_ids_removed=(role_id,),
+            timestamp_ms=now_ms,
+        )
+        result = int(self._rbac_remove_role_from_user(
             keys=[
-                RK.rbac_user_doc(org, sup, user_id),
+                user_key,
                 RK.rbac_user_meta(org, sup),
+                RK.rbac_username_to_id(org, sup),
+            ] + self._rbac_audit_keys(org),
+            args=[
+                role_id,
+                str(now_ms),
+                "superuser",
+                RK.rbac_role_doc_prefix(org, sup),
+                user_id,
+                expected_roles,
+                expected_doc_version,
+                org,
+                sup,
+                audit_json,
             ],
-            args=[role_id, str(_now_ms())],
-        ) or 0) == 1
+        ) or 0)
+        if result == -1:
+            raise _rbac_denied_decision(
+                "The default superuser must retain a superadmin role",
+                cause="protected_identity",
+            )
+        if result == -2:
+            raise _rbac_failure_decision(
+                f"User {user_id} changed concurrently; retry the assignment removal"
+            )
+        if result == 0:
+            self.rbac_append_attempt(
+                org,
+                sup,
+                action="user_role_remove",
+                resource_type="user_role_assignment",
+                resource_id=_safe_rbac_audit_resource_id(
+                    user_id, role_id, fallback="pending-user-role-assignment"
+                ),
+                namespace="user",
+                outcome="no_change",
+                cause="assignment_not_changed",
+                action_context=action_context,
+                before_document=before_document,
+                before_version=int(expected_doc_version),
+                conditions=[{
+                    "kind": "assignment_membership",
+                    "user_id": user_id,
+                    "role_id": role_id,
+                    "present": False,
+                    "version": expected_doc_version,
+                }],
+            )
+        return result == 1
 
     # ------------- Organization auth tokens (login tokens) -------------
+
+    def _auth_token_commit(
+        self,
+        script: Any,
+        *,
+        keys: Sequence[str],
+        args: Sequence[Any],
+        org: str,
+        action: str,
+        token_id: str,
+        action_context: Any,
+    ) -> int:
+        """Run one token mutation and evidence deterministic preflight faults."""
+        try:
+            return int(script(keys=list(keys), args=list(args)) or 0)
+        except redis.exceptions.ResponseError as error:
+            if not any(
+                marker in str(error)
+                for marker in _RBAC_DETERMINISTIC_INTEGRITY_MARKERS
+            ):
+                raise
+            integrity_error = RbacIntegrityError(
+                "Persisted auth-token state failed an atomic integrity preflight"
+            )
+            try:
+                self.rbac_append_attempt(
+                    org,
+                    _AUTH_AUDIT_SUPER_NAME,
+                    action=action,
+                    resource_type="auth_token",
+                    resource_id=token_id,
+                    namespace="token",
+                    outcome="failure",
+                    cause="state_integrity_error",
+                    action_context=action_context,
+                    severity="critical",
+                )
+            except Exception as audit_error:
+                raise audit_error from error
+            self._rbac_mark_attempt_recorded(integrity_error)
+            raise integrity_error from error
 
     def list_auth_tokens(self, org: str) -> List[Dict[str, Any]]:
         """List auth tokens for an organization (tokens are stored hashed; only token_id is returned)."""
@@ -1545,20 +5609,34 @@ return 1
             raw_map = self.r.hgetall(key) or {}
             for token_id, raw in raw_map.items():
                 token_id_str = token_id if isinstance(token_id, str) else token_id.decode('utf-8')
+                if token_id_str in _AUTH_TOKEN_META_FIELDS:
+                    continue
+                if not _AUTH_TOKEN_ID_RE.fullmatch(token_id_str):
+                    raise RbacIntegrityError(
+                        "Persisted auth-token identity is invalid"
+                    )
                 try:
                     meta = json.loads(raw) if raw else {}
-                except Exception:
-                    if isinstance(raw, bytes):
-                        meta = {"value": raw.decode('utf-8', errors='replace')}
-                    else:
-                        meta = {"value": raw}
-                if isinstance(meta, dict):
-                    meta = dict(meta)
-                else:
-                    meta = {"value": meta}
+                except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
+                    raise RbacIntegrityError(
+                        "Persisted auth-token metadata is invalid"
+                    ) from exc
+                if not isinstance(meta, dict) or meta.get("token_id") != token_id_str:
+                    raise RbacIntegrityError(
+                        "Persisted auth-token metadata does not match its identity"
+                    )
+                meta = dict(meta)
                 meta.setdefault("token_id", token_id_str)
                 out.append(meta)
-            out.sort(key=lambda x: int(x.get("created_ms") or 0), reverse=True)
+            try:
+                out.sort(
+                    key=lambda x: int(x.get("created_ms") or 0),
+                    reverse=True,
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise RbacIntegrityError(
+                    "Persisted auth-token creation timestamp is invalid"
+                ) from exc
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] list_auth_tokens error: {e}")
         return out
@@ -1572,6 +5650,8 @@ return 1
             username: str = "",
             user_id: str = "",
             expires_ms: Optional[int] = None,
+            *,
+            action_context: Any,
     ) -> Dict[str, Any]:
         """Create a new auth token.
 
@@ -1584,34 +5664,284 @@ return 1
         means the token never expires by time alone — it can still be
         disabled via ``enabled=False``.
         """
-        token = secrets.token_urlsafe(24)
-        token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        meta = {
-            "token_id": token_id,
-            "created_ms": _now_ms(),
-            "created_by": str(created_by or ""),
-            "label": (str(label).strip() if label is not None else ""),
-            "enabled": bool(enabled),
-            "username": str(username or ""),
-            "user_id": str(user_id or ""),
-            "expires_ms": int(expires_ms) if expires_ms else 0,
-        }
+        normalized_context: Any = None
+        context_error = False
         try:
-            self.r.hset(RK.auth_tokens(org), token_id, json.dumps(meta))
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] create_auth_token error: {e}")
+            token = secrets.token_urlsafe(24)
+            token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            from supertable.audit.privileged import PrivilegedActionContext
+
+            try:
+                normalized_context = PrivilegedActionContext.coerce(
+                    action_context
+                )
+                if normalized_context.context_missing:
+                    raise ValueError(
+                        "auth-token mutations require explicit actor context"
+                    )
+            except (TypeError, ValueError):
+                context_error = True
+                raise
+            now_ms = _now_ms()
+            meta = {
+                "token_id": token_id,
+                "created_ms": now_ms,
+                "created_by": str(created_by or ""),
+                "label": (str(label).strip() if label is not None else ""),
+                "enabled": bool(enabled),
+                "username": str(username or ""),
+                "user_id": str(user_id or ""),
+                "expires_ms": int(expires_ms) if expires_ms else 0,
+            }
+            metadata_json = json.dumps(
+                meta, sort_keys=True, separators=(",", ":"),
+            )
+            audit_json = self._rbac_audit_json(
+                action_context=normalized_context,
+                org=org,
+                sup=_AUTH_AUDIT_SUPER_NAME,
+                action="token_create",
+                resource_type="auth_token",
+                resource_id=token_id,
+                before_document=None,
+                after_document={
+                    "token_id": token_id,
+                    "metadata_json": metadata_json,
+                },
+                before_version=0,
+                after_version=1,
+                changed_fields=("token",),
+                timestamp_ms=now_ms,
+                severity="critical",
+            )
+        except (TypeError, ValueError) as error:
+            resource_id = locals().get("token_id", "pending-auth-token")
+            try:
+                self.rbac_append_attempt(
+                    org,
+                    _AUTH_AUDIT_SUPER_NAME,
+                    action="token_create",
+                    resource_type="auth_token",
+                    resource_id=resource_id,
+                    namespace="token",
+                    outcome="denied",
+                    cause=(
+                        "missing_actor_context"
+                        if context_error else "request_rejected"
+                    ),
+                    action_context=(
+                        None if context_error else normalized_context
+                    ),
+                    severity="critical",
+                )
+            except Exception as audit_error:
+                raise RbacAuditAttemptError(
+                    "Auth-token creation rejection could not be durably recorded"
+                ) from audit_error
             raise
+        result = self._auth_token_commit(
+            self._auth_create_token,
+            keys=[
+                RK.auth_tokens(org),
+                self._auth_token_meta_key(org),
+            ] + self._rbac_audit_keys(org),
+            args=[
+                token_id,
+                metadata_json,
+                str(now_ms),
+                org,
+                _AUTH_AUDIT_SUPER_NAME,
+                audit_json,
+            ],
+            org=org,
+            action="token_create",
+            token_id=token_id,
+            action_context=normalized_context,
+        )
+        if result == -1:
+            existing = self.r.hget(RK.auth_tokens(org), token_id)
+            if existing is None:
+                raise RbacAuditConditionConflict(
+                    "Auth-token identity collision changed concurrently; retry"
+                )
+            existing_text = self._rbac_text(existing)
+            self.rbac_append_attempt(
+                org,
+                _AUTH_AUDIT_SUPER_NAME,
+                action="token_create",
+                resource_type="auth_token",
+                resource_id=token_id,
+                namespace="token",
+                outcome="no_change",
+                cause="token_identity_collision",
+                action_context=normalized_context,
+                severity="critical",
+                conditions=[{
+                    "kind": "token_present",
+                    "metadata_json": existing_text,
+                }],
+            )
+            error = RbacDuplicateIdentityError(
+                "Generated auth-token identity already exists",
+                outcome="no_change",
+                cause="token_identity_collision",
+                conditions=[{
+                    "kind": "token_present",
+                    "metadata_json": existing_text,
+                }],
+            )
+            self._rbac_mark_attempt_recorded(error)
+            raise error
+        if result != 1:
+            raise RuntimeError("Atomic auth-token creation did not commit")
         return {"token": token, **meta}
 
-    def delete_auth_token(self, org: str, token_id: str) -> bool:
+    def delete_auth_token(
+        self,
+        org: str,
+        token_id: str,
+        *,
+        action_context: Any,
+    ) -> bool:
         """Delete an auth token by token_id (sha256)."""
-        if not token_id:
-            return False
+        from supertable.audit.privileged import PrivilegedActionContext
+
         try:
-            return bool(self.r.hdel(RK.auth_tokens(org), token_id))
-        except redis.RedisError as e:
-            logger.error(f"[redis-catalog] delete_auth_token error: {e}")
+            normalized_context = PrivilegedActionContext.coerce(action_context)
+            if normalized_context.context_missing:
+                raise ValueError(
+                    "auth-token mutations require explicit actor context"
+                )
+        except (TypeError, ValueError) as error:
+            self.rbac_append_attempt(
+                org,
+                _AUTH_AUDIT_SUPER_NAME,
+                action="token_delete",
+                resource_type="auth_token",
+                resource_id=_safe_rbac_audit_resource_id(
+                    token_id, fallback="pending-auth-token"
+                ),
+                namespace="token",
+                outcome="denied",
+                cause="missing_actor_context",
+                action_context=None,
+                severity="critical",
+            )
+            self._rbac_mark_attempt_recorded(error)
+            raise
+        if not isinstance(token_id, str) or not _AUTH_TOKEN_ID_RE.fullmatch(token_id):
+            error = ValueError("token_id must be a lowercase SHA-256 digest")
+            self.rbac_append_attempt(
+                org,
+                _AUTH_AUDIT_SUPER_NAME,
+                action="token_delete",
+                resource_type="auth_token",
+                resource_id=_safe_rbac_audit_resource_id(
+                    token_id, fallback="pending-auth-token"
+                ),
+                namespace="token",
+                outcome="denied",
+                cause="request_rejected",
+                action_context=normalized_context,
+                severity="critical",
+            )
+            self._rbac_mark_attempt_recorded(error)
+            raise error
+        key = RK.auth_tokens(org)
+        raw = self.r.hget(key, token_id)
+        if raw is None:
+            self.rbac_append_attempt(
+                org,
+                _AUTH_AUDIT_SUPER_NAME,
+                action="token_delete",
+                resource_type="auth_token",
+                resource_id=token_id,
+                namespace="token",
+                outcome="no_change",
+                cause="resource_missing",
+                action_context=normalized_context,
+                severity="critical",
+                conditions=[{"kind": "token_absent"}],
+            )
             return False
+        expected_metadata = self._rbac_text(raw)
+        now_ms = _now_ms()
+        audit_json = self._rbac_audit_json(
+            action_context=normalized_context,
+            org=org,
+            sup=_AUTH_AUDIT_SUPER_NAME,
+            action="token_delete",
+            resource_type="auth_token",
+            resource_id=token_id,
+            before_document={
+                "token_id": token_id,
+                "metadata_json": expected_metadata,
+            },
+            after_document=None,
+            before_version=1,
+            after_version=0,
+            changed_fields=("token",),
+            timestamp_ms=now_ms,
+            severity="critical",
+        )
+        result = self._auth_token_commit(
+            self._auth_delete_token,
+            keys=[
+                key,
+                self._auth_token_meta_key(org),
+            ] + self._rbac_audit_keys(org),
+            args=[
+                token_id,
+                expected_metadata,
+                str(now_ms),
+                org,
+                _AUTH_AUDIT_SUPER_NAME,
+                audit_json,
+            ],
+            org=org,
+            action="token_delete",
+            token_id=token_id,
+            action_context=normalized_context,
+        )
+        if result == 0:
+            self.rbac_append_attempt(
+                org,
+                _AUTH_AUDIT_SUPER_NAME,
+                action="token_delete",
+                resource_type="auth_token",
+                resource_id=token_id,
+                namespace="token",
+                outcome="no_change",
+                cause="resource_disappeared",
+                action_context=normalized_context,
+                severity="critical",
+                conditions=[{"kind": "token_absent"}],
+            )
+            return False
+        if result == -1:
+            error = RbacDecisionError(
+                "Auth-token metadata changed concurrently; retry deletion",
+                outcome="failure",
+                cause="concurrent_modification",
+                severity="critical",
+            )
+            self.rbac_append_attempt(
+                org,
+                _AUTH_AUDIT_SUPER_NAME,
+                action="token_delete",
+                resource_type="auth_token",
+                resource_id=token_id,
+                namespace="token",
+                outcome="failure",
+                cause="concurrent_modification",
+                action_context=normalized_context,
+                severity="critical",
+            )
+            self._rbac_mark_attempt_recorded(error)
+            raise error
+        if result != 1:
+            raise RuntimeError("Atomic auth-token deletion did not commit")
+        return True
 
     def validate_auth_token(self, org: str, token: str) -> bool:
         """Validate a plaintext auth token."""
@@ -1783,7 +6113,12 @@ return 1
             return False
 
     def delete_super_table(self, org: str, sup: str, count: int = 1000) -> int:
-        """Delete **all** Redis keys for a given supertable (meta + locks + RBAC, etc).
+        """Delete data/metadata keys for a SuperTable, preserving RBAC state.
+
+        Role, user, and assignment state is security-control data.  Removing it
+        through this generic SCAN path would bypass the mandatory privileged
+        audit ledger.  It therefore survives data-namespace deletion and can
+        only be changed through the audited RBAC APIs.
 
         This is implemented via SCAN to avoid blocking Redis.
         Returns the number of keys deleted (best-effort).
@@ -1791,16 +6126,37 @@ return 1
         if not (org and sup):
             return 0
         pattern = RK.super_table_pattern(org, sup)
-        return self._delete_by_scan(pattern=pattern, count=count)
+        return self._delete_by_scan(
+            pattern=pattern,
+            count=count,
+            preserve_prefixes=(RK.rbac_scope(org, sup) + ":",),
+        )
 
-    def _delete_by_scan(self, pattern: str, count: int = 1000) -> int:
+    def _delete_by_scan(
+        self,
+        pattern: str,
+        count: int = 1000,
+        *,
+        preserve_prefixes: tuple[str, ...] = (),
+    ) -> int:
         deleted = 0
         cursor = 0
         try:
             while True:
                 cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=max(1, int(count)))
                 # redis-py may return list[str] or list[bytes]
-                str_keys = [k if isinstance(k, str) else k.decode("utf-8") for k in (keys or [])]
+                str_keys = [
+                    k if isinstance(k, str) else k.decode("utf-8")
+                    for k in (keys or [])
+                ]
+                if preserve_prefixes:
+                    str_keys = [
+                        key
+                        for key in str_keys
+                        if not any(
+                            key.startswith(prefix) for prefix in preserve_prefixes
+                        )
+                    ]
                 if str_keys:
                     try:
                         with self.r.pipeline() as p:

@@ -341,9 +341,18 @@ class RbacViewDef:
 
     - allowed_columns: columns the role can see, or ["*"] for unrestricted.
     - where_clause: SQL WHERE predicate from role filters, or "" if none.
+    - excluded_columns: case-insensitive deny list applied after
+      ``allowed_columns``.  This trailing field keeps older positional
+      construction compatible while allowing a wildcard role to expose every
+      current/future column except an explicit sensitive set.
+    - filter_spec: validated structured filter retained so each executor can
+      render identifiers using its own SQL dialect. ``where_clause`` remains
+      the backwards-compatible DuckDB representation.
     """
     allowed_columns: List[str] = field(default_factory=lambda: ["*"])
     where_clause: str = ""
+    excluded_columns: List[str] = field(default_factory=list)
+    filter_spec: object = None
 
 
 @dataclass

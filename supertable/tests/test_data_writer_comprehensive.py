@@ -303,6 +303,7 @@ def writer(fake_storage, fake_catalog, fake_monitor):
     with (
         patch("supertable.data_writer.SuperTable") as MockSuperTable,
         patch("supertable.data_writer.RedisCatalog", return_value=fake_catalog),
+        patch("supertable.data_writer.check_create_access"),
         patch("supertable.data_writer.check_write_access"),
         patch("supertable.data_writer.SimpleTable") as MockSimpleTable,
         patch("supertable.data_writer.find_overlapping_files", return_value=set()),
@@ -310,6 +311,8 @@ def writer(fake_storage, fake_catalog, fake_monitor):
         patch("supertable.data_writer.resolve_overwrite_writes") as mock_resolve,
         patch("supertable.data_writer.identify_all_rowids") as mock_delete_all,
         patch("supertable.data_writer.build_tombstone_file") as mock_build_tombstone,
+        patch("supertable.data_writer.extract_stats_rows", return_value=pl.DataFrame()),
+        patch("supertable.data_writer.build_stats_file", return_value=(None, None)),
         # MonitoringWriter is used as `with MonitoringWriter(...) as mon:` —
         # so the in-block monitor is the __enter__ return value.
         patch("supertable.data_writer.MonitoringWriter") as MockMonitorCls,

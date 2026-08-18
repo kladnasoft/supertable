@@ -23,6 +23,7 @@ class RedisOptions:
     host: str           # SUPERTABLE_REDIS_HOST (default: localhost)
     port: int           # SUPERTABLE_REDIS_PORT (default: 6379)
     db: int             # SUPERTABLE_REDIS_DB (default: 0)
+    username: Optional[str]  # SUPERTABLE_REDIS_USERNAME (Redis ACL identity)
     password: Optional[str]  # SUPERTABLE_REDIS_PASSWORD
     use_ssl: bool       # SUPERTABLE_REDIS_SSL (default: false)
     decode_responses: bool  # Always True (JSON text)
@@ -39,30 +40,43 @@ All fields are populated from environment variables via the `settings` object. T
 
 ### Mode 1: Direct Connection (Default)
 
-When Sentinel is not enabled, `create_redis_client()` creates a standard `redis.Redis` connection:
+When Sentinel is not enabled, `create_redis_client()` creates a standard `redis.Redis` connection. If `SUPERTABLE_REDIS_URL` is set, its `redis://` or `rediss://` scheme, host, port, database path, and percent-decoded ACL credentials are authoritative; split host/port/DB/username/password/SSL settings are ignored. Unsupported schemes, malformed credentials, non-numeric database paths, and URL query/fragment options fail closed during connector construction.
 
 ```python
 redis.Redis(
     host=opts.host,
     port=opts.port,
     db=opts.db,
+    username=opts.username,
     password=opts.password,
     decode_responses=True,
     ssl=opts.use_ssl,
 )
 ```
 
-**Environment variables**: `SUPERTABLE_REDIS_HOST`, `SUPERTABLE_REDIS_PORT`, `SUPERTABLE_REDIS_DB`, `SUPERTABLE_REDIS_PASSWORD`, `SUPERTABLE_REDIS_SSL`.
+**Environment variables**: `SUPERTABLE_REDIS_URL`, or `SUPERTABLE_REDIS_HOST`, `SUPERTABLE_REDIS_PORT`, `SUPERTABLE_REDIS_DB`, `SUPERTABLE_REDIS_USERNAME`, `SUPERTABLE_REDIS_PASSWORD`, `SUPERTABLE_REDIS_SSL`.
 
 ### Mode 2: Redis Sentinel (High Availability)
 
-When `SUPERTABLE_REDIS_SENTINEL=true` and sentinel hosts are configured:
+When `SUPERTABLE_REDIS_SENTINEL=true`, at least one well-formed Sentinel
+`host:port` endpoint and a non-empty master name are mandatory. Empty,
+partially malformed, or out-of-range endpoint lists fail configuration before
+any client is created; Sentinel mode never falls back to a standalone Redis
+endpoint.
+
+With valid Sentinel configuration:
 
 1. Creates a `Sentinel` object with the configured sentinel nodes.
-2. Obtains a master connection via `sentinel.master_for()`.
+2. Obtains a master connection via `sentinel.master_for()`, forwarding the
+   configured Redis ACL username and password.
 3. Performs a fail-fast probe with a 3-second deadline (repeated `ping()` calls with 200 ms sleep between retries).
 4. If the probe succeeds, returns the sentinel-backed client.
 5. If the probe fails and `sentinel_strict=True` (always), raises the error immediately.
+
+`SUPERTABLE_REDIS_URL` applies only to direct mode. Sentinel discovery and its master connection retain the split Sentinel/Redis variable contract.
+`SUPERTABLE_REDIS_SSL=true` enables TLS for both the Sentinel discovery
+connections and the resolved Redis master. The configured Redis ACL username
+is also used with the Sentinel password when authenticating to Sentinel nodes.
 
 **Sentinel environment variables**: `SUPERTABLE_REDIS_SENTINELS`, `SUPERTABLE_REDIS_SENTINEL_MASTER`, `SUPERTABLE_REDIS_SENTINEL_PASSWORD`.
 
@@ -238,7 +252,7 @@ On initialization, the catalog:
 | `update_root_flags` | `(org, sup, flags) -> bool` | Merges flags (e.g., `read_only`, `cloned_from`) into the root document. |
 | `find_readonly_clones` | `(org, source_sup) -> List[str]` | Scans all roots to find SuperTables that are read-only clones of the source. |
 | `bump_root` | `(org, sup, now_ms=None) -> int` | Atomically increments the root version via Lua script. Returns new version. |
-| `delete_super_table` | `(org, sup, count=1000) -> int` | Deletes ALL Redis keys matching `supertable:{org}:lakes:{sup}:*` via SCAN. Returns count deleted. |
+| `delete_super_table` | `(org, sup, count=1000) -> int` | Deletes data/metadata keys matching `supertable:{org}:lakes:{sup}:*` via SCAN while retaining the `:rbac:` security namespace. RBAC state can only be changed through mandatory audited mutations. Returns count deleted. |
 
 ---
 
@@ -281,7 +295,7 @@ On initialization, the catalog:
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `rbac_init_role_meta` | `(org, sup) -> None` | Ensures the role meta HASH exists. Idempotent. |
+| `rbac_init_role_meta` | `(org, sup) -> None` | Validates the role namespace/index/name-map types and revision integrity without writing. The first audited role mutation creates the meta HASH atomically with its event. |
 | `rbac_create_role` | `(org, sup, role_id, role_data) -> None` | Persists a new role document, updates index SET and name-to-id HASH. Bumps role meta version. |
 | `rbac_update_role` | `(org, sup, role_id, fields) -> None` | Updates specific fields of an existing role in-place. |
 | `rbac_delete_role` | `(org, sup, role_id) -> bool` | Atomically deletes a role via Lua: strips from all users, removes from indexes and name-to-id map. |
@@ -298,7 +312,7 @@ On initialization, the catalog:
 
 | Method | Signature | Description |
 |--------|-----------|-------------|
-| `rbac_init_user_meta` | `(org, sup) -> None` | Ensures the user meta HASH exists. Idempotent. |
+| `rbac_init_user_meta` | `(org, sup) -> None` | Validates the user namespace/index/name-map types and revision integrity without writing. The first audited user mutation creates the meta HASH atomically with its event. |
 | `rbac_create_user` | `(org, sup, user_id, user_data) -> None` | Persists a new user document, updates index SET and username-to-id HASH. |
 | `rbac_update_user` | `(org, sup, user_id, fields) -> None` | Updates specific fields of an existing user in-place. |
 | `rbac_rename_user` | `(org, sup, user_id, old_username, new_username) -> None` | Atomically updates the username-to-id mapping. |
@@ -324,8 +338,8 @@ On initialization, the catalog:
 | Method | Signature | Description |
 |--------|-----------|-------------|
 | `list_auth_tokens` | `(org) -> List[Dict]` | Lists all auth tokens for an org. Sorted by `created_ms` descending. Tokens are stored hashed. |
-| `create_auth_token` | `(org, created_by, label=None, enabled=True, username="", user_id="") -> Dict` | Creates a new token. Returns the plaintext token ONLY once. Redis stores `sha256(token)` as the key. |
-| `delete_auth_token` | `(org, token_id) -> bool` | Deletes a token by its token_id (sha256 hash). |
+| `create_auth_token` | `(org, created_by, label=None, enabled=True, username="", user_id="", expires_ms=None, *, action_context) -> Dict` | Atomically creates a token and its mandatory privileged-audit record. Returns plaintext only once; Redis and audit use the SHA-256 token ID. A validated actor context is required. |
+| `delete_auth_token` | `(org, token_id, *, action_context) -> bool` | Atomically deletes a token with mandatory privileged-audit evidence. A missing token produces a durable conditional `no_change`; malformed IDs are durably denied. |
 | `validate_auth_token` | `(org, token) -> bool` | Validates a plaintext token by hashing and checking existence. |
 | `validate_auth_token_full` | `(org, token) -> Optional[Dict]` | Validates and returns full token metadata (including linked username/user_id). |
 
@@ -440,7 +454,8 @@ Same as above, but also embeds a `payload` field containing the full snapshot da
 
 | Script | Purpose |
 |--------|---------|
-| `_LUA_RBAC_BUMP_META` | Atomically increments the version field and updates `last_updated_ms` on an RBAC meta HASH. |
+| `_LUA_RBAC_VALIDATE_META` | Validates namespace metadata and authoritative indexes without mutating them; it refuses live state with a missing revision head. |
+| `_LUA_RBAC_APPEND_ATTEMPT` | Appends a non-success attempt. Conditional `no_change` predicates use a closed action/cause grammar and catalog-derived keys only. |
 | `_LUA_RBAC_DELETE_ROLE` | Atomically deletes a role document, strips the role_id from all user documents, removes from index SET, type SET, and name-to-id HASH. All in a single atomic operation. |
 | `_LUA_RBAC_REMOVE_ROLE_FROM_USER` | Atomically removes a role_id from a single user's roles JSON array, updates timestamps and meta version. |
 | `_LUA_RBAC_ADD_ROLE_TO_USER` | Atomically adds a role_id to a user's roles JSON array (no-op if already present), updates timestamps and meta version. |

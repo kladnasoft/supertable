@@ -873,6 +873,21 @@ def test_spark_active_tombstone_rejected_until_composite_identity_exists():
         _spark_create_tombstone_view(cursor, "src", "live", tomb)
 
 
+def test_spark_protected_projection_quotes_embedded_backtick_column():
+    cursor = MagicMock()
+    cursor.fetchall.return_value = [
+        ("odd`name", "string"),
+        ("__rowid__", "bigint"),
+        ("__timestamp__", "timestamp"),
+    ]
+
+    _spark_create_tombstone_view(cursor, "src", "live", None)
+
+    sql = cursor.execute.call_args_list[-1].args[0]
+    assert "SELECT src.`odd``name` FROM src AS src" in sql
+    assert "odd`name" not in sql.replace("odd``name", "")
+
+
 def test_reserved_rowid_case_variant_fails_closed_in_duckdb_and_spark(tmp_path):
     con = duckdb.connect()
     con.execute('CREATE TABLE bad (id INTEGER, "__ROWID__" BIGINT)')

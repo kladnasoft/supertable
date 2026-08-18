@@ -65,7 +65,12 @@ class TestEnums:
         assert Severity.CRITICAL.value == "critical"
 
     def test_outcome_values(self) -> None:
-        assert {o.value for o in Outcome} == {"success", "failure", "denied"}
+        assert {o.value for o in Outcome} == {
+            "success",
+            "failure",
+            "denied",
+            "no_change",
+        }
 
     def test_actor_type_values(self) -> None:
         assert {a.value for a in ActorType} == {

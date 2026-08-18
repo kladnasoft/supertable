@@ -476,7 +476,7 @@ class TestWriteHappyPath:
 
         mock_check_write.assert_called_once_with(
             super_name="s1", organization="o1",
-            role_name="admin", table_name="my_tbl",
+            role_name="admin", table_name="my_tbl", columns=["id", "val"],
         )
         mock_cat.acquire_simple_lock.assert_called_once()
         mock_cat.release_simple_lock.assert_called_once()
@@ -1305,6 +1305,7 @@ class TestWriteAccessControl:
             organization="my_o",
             role_name="writer_role",
             table_name="target_tbl",
+            columns=["id"],
         )
 
 
@@ -1398,6 +1399,8 @@ class TestWriteSnapshotRead:
 
 class TestWriteMonitoringPayload:
 
+    @patch(_PATCH_BUILD_STATS, return_value=(None, None))
+    @patch(_PATCH_EXTRACT_STATS, return_value=MagicMock())
     @patch(_PATCH_BUILD_TOMBSTONE)
     @patch(_PATCH_RESOLVE)
     @patch(_PATCH_GET_MON_LOGGER)
@@ -1413,7 +1416,7 @@ class TestWriteMonitoringPayload:
         self,
         MockST, MockCat, mock_from_arrow, mock_check_write,
         MockSimple, mock_find_overlap, mock_process, MockMirror, mock_get_mon,
-        mock_resolve, mock_build_tomb,
+        mock_resolve, mock_build_tomb, mock_extract_stats, mock_build_stats,
     ):
         mock_st = MagicMock(super_name="sup", organization="org")
         MockST.return_value = mock_st

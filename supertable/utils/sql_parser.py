@@ -275,12 +275,15 @@ class SQLParser:
 
     Rules / behavior:
         - Qualified columns (t_alias.col):
-            - Resolved via the table alias from FROM/JOIN.
+            - Resolved via the nearest SELECT scope's FROM/JOIN bindings.
+            - Correlated references may resolve through parent scopes.
+            - A CTE/derived binding is authoritative and is never rebound to
+              a same-named physical alias in another scope.
         - Unqualified columns:
-            - If there is exactly one table in the query, they are attributed
-              to that table.
-            - If multiple tables exist, unqualified columns are ignored
-              as ambiguous.
+            - If there is exactly one direct physical source in the current
+              SELECT scope, they are attributed to that source.
+            - If the current scope has multiple or derived sources, they are
+              ignored as ambiguous; physical leaf scopes remain exact.
         - For SELECT projections with aliases, e.g. "o.id AS order_id":
             - We record "id" for alias "o".
         - Star handling:
@@ -315,6 +318,28 @@ class SQLParser:
                 "Only read-only SELECT/WITH/set-operation queries are allowed "
                 "on the supertable read path"
             )
+        # A read-only root is not sufficient: sqlglot can represent a SELECT
+        # whose CTE contains DML (for example ``WITH x AS (DELETE ...)") as a
+        # Query.  Reject mutating nodes recursively so a future backend cannot
+        # turn today's syntax error into an RBAC bypass.
+        mutating_types = tuple(
+            expression_type
+            for name in (
+                "Insert", "Update", "Delete", "Merge", "Create", "Drop",
+                "Alter", "Command", "Copy", "Transaction", "Commit",
+                "Rollback", "Grant", "Revoke", "TruncateTable",
+            )
+            if isinstance(
+                (expression_type := getattr(exp, name, None)), type
+            )
+        )
+        if mutating_types and any(
+            isinstance(node, mutating_types) for node in self._parsed.walk()
+        ):
+            raise ValueError(
+                "Only read-only SELECT/WITH/set-operation queries are allowed "
+                "on the supertable read path"
+            )
         self._reject_unmanaged_table_sources()
 
         # Predicate and join pruning analyses consume the same sqlglot scope
@@ -329,6 +354,10 @@ class SQLParser:
         # alias -> ordered unique list of column names
         # (or [] if meaning "all columns" due to * or t.*)
         self._alias_to_columns: Dict[str, List[str]] = {}
+        self._cte_reference_node_ids: Set[int] = (
+            self._collect_cte_reference_node_ids()
+        )
+        self._physical_aliases: Set[str] = set()
 
         self._extract_tables()
         self._cte_names: Set[str] = self._collect_cte_names()
@@ -470,6 +499,27 @@ class SQLParser:
             self._pruning_scopes = tuple(traverse_scope(self._parsed))
         return self._pruning_scopes
 
+    def _collect_cte_reference_node_ids(self) -> Set[int]:
+        """Return Table-node identities that sqlglot scope binds to a CTE.
+
+        Name-only CTE detection is unsafe.  In ``WITH x AS (SELECT * FROM x)``
+        DuckDB resolves the inner ``x`` to an existing catalog table while the
+        outer ``x`` is the CTE.  Treating both nodes as the CTE would leave the
+        physical source outside snapshot/RBAC rewriting.  The scope graph
+        distinguishes them: a real source resolves to ``exp.Table`` and a CTE
+        reference resolves to a child ``Scope``.
+        """
+        references: Set[int] = set()
+        for scope in self._get_pruning_scopes():
+            for selected in scope.selected_sources.values():
+                try:
+                    node, source = selected
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(node, exp.Table) and not isinstance(source, exp.Table):
+                    references.add(id(node))
+        return references
+
     # ---------------- Table extraction ----------------
 
     def _extract_tables(self) -> None:
@@ -502,6 +552,8 @@ class SQLParser:
                 )
             alias_bindings[folded_alias] = physical
             alias_to_table[alias] = physical
+            if id(table) not in self._cte_reference_node_ids:
+                self._physical_aliases.add(alias)
 
         if not alias_to_table:
             raise ValueError("No tables found in SQL query.")
@@ -530,19 +582,11 @@ class SQLParser:
     # ---------------- Column extraction helpers ----------------
 
     @staticmethod
-    def _is_direct_alias_projection_column(col: exp.Column) -> bool:
-        """
-        True if this Column is the direct value of an Alias in SELECT
-        (e.g. "o.id AS order_id"), so we don't double-count it.
-        """
-        parent = col.parent
-        return isinstance(parent, exp.Alias) and parent.this is col
-
-    @staticmethod
     def _is_inside_alias_scope(col: exp.Column) -> bool:
         """
         True if this Column lives inside a clause where SELECT alias
-        references are legal in standard SQL: ORDER BY, HAVING, or QUALIFY.
+        references are legal in the supported dialects: GROUP BY, ORDER BY,
+        HAVING, or QUALIFY.
 
         Walking up the AST from the Column node, if we hit one of these
         clause types before reaching the Select node, the column is in
@@ -551,10 +595,10 @@ class SQLParser:
         """
         node = col.parent
         while node is not None:
-            if isinstance(node, (exp.Order, exp.Having, exp.Qualify)):
+            if isinstance(node, (exp.Group, exp.Order, exp.Having, exp.Qualify)):
                 return True
             if isinstance(node, exp.Select):
-                # Reached the SELECT without passing through ORDER/HAVING/QUALIFY
+                # Reached SELECT without passing through an alias-aware clause.
                 return False
             node = node.parent
         return False
@@ -582,161 +626,145 @@ class SQLParser:
             alias: set() for alias in self._alias_to_table
         }
 
-        # Determine if we can safely assign unqualified columns
-        unique_tables = set(self._alias_to_table.values())
-        single_alias_for_unqualified: Optional[str] = None
-        if len(unique_tables) == 1:
-            # All aliases refer to the same physical table -> unqualified columns OK.
-            single_alias_for_unqualified = next(iter(self._alias_to_table.keys()))
+        # Bind columns through the nearest sqlglot Scope, never through a
+        # query-global alias map.  The same spelling can denote a physical
+        # table in one scope and a CTE/derived relation in another.  A global
+        # lookup would therefore project derived names such as ``finite_value``
+        # or ``freq`` from an unrelated Parquet leaf.
+        aliases_by_fold = {alias.casefold(): alias for alias in self._alias_to_table}
+        scopes_by_select: Dict[int, object] = {}
+        bindings_by_scope: Dict[int, Dict[str, Optional[str]]] = {}
+        owner_by_select: Dict[int, str] = {}
+        for scope in self._get_pruning_scopes():
+            if not isinstance(scope.expression, exp.Select):
+                continue
+            scopes_by_select[id(scope.expression)] = scope
+            bindings: Dict[str, Optional[str]] = {}
+            for source_alias, selected in scope.selected_sources.items():
+                try:
+                    source = selected[1]
+                except (TypeError, IndexError):
+                    continue
+                folded = str(source_alias).casefold()
+                # A Scope source is a CTE or derived table.  Store the binding
+                # explicitly as None so a same-named outer physical alias can
+                # never capture its qualified columns.
+                bindings[folded] = (
+                    aliases_by_fold.get(folded)
+                    if isinstance(source, exp.Table)
+                    else None
+                )
+            bindings_by_scope[id(scope)] = bindings
 
-        select_expr = self._parsed.find(exp.Select)
+            # Unqualified columns are attributable only when this scope has
+            # exactly one source and that source is physical.  Counting only
+            # physical sources is unsafe for a physical+derived join because
+            # the unqualified name may belong to the derived relation.
+            if len(bindings) == 1:
+                sole_owner = next(iter(bindings.values()))
+                if sole_owner is not None:
+                    owner_by_select[id(scope.expression)] = sole_owner
 
-        # ---------------- Detect * and t.* in SELECT ----------------
+        def _nearest_scope(column: exp.Column):
+            nearest_select = column.find_ancestor(exp.Select)
+            if nearest_select is None:
+                return None
+            return scopes_by_select.get(id(nearest_select))
 
-        global_star = False
+        def _resolve_qualified(column: exp.Column) -> Optional[str]:
+            """Resolve a qualifier locally, climbing only for correlation."""
+            qualifier = column.table.casefold()
+            scope = _nearest_scope(column)
+            while scope is not None:
+                bindings = bindings_by_scope.get(id(scope), {})
+                if qualifier in bindings:
+                    # None is an authoritative derived-source binding.  Do not
+                    # climb and accidentally rebind it to an outer table.
+                    return bindings[qualifier]
+                scope = getattr(scope, "parent", None)
+            return None
+
+        def _resolve_column(column: exp.Column) -> Optional[str]:
+            if column.table:
+                return _resolve_qualified(column)
+            nearest_select = column.find_ancestor(exp.Select)
+            if nearest_select is None:
+                return None
+            return owner_by_select.get(id(nearest_select))
+
+        # SELECT aliases are local to their Select.  Keep one alias set per
+        # Select so an inner GROUP/ORDER alias cannot be confused with an
+        # outer projection (or vice versa).
+        select_alias_names: Dict[int, Set[str]] = {}
         table_star_aliases: Set[str] = set()
-
-        if select_expr is not None:
-            for proj in select_expr.expressions:
-                # Case 1: explicit Star node
-                if isinstance(proj, exp.Star):
-                    # SELECT *  -> proj.this is None
-                    # SELECT t.* -> proj.this holds the qualifier
-                    if proj.this is None:
-                        global_star = True
-                        break
-                    else:
-                        # t.* case via Star(this=...)
-                        table_ref = proj.this
-                        table_alias: Optional[str] = None
-
-                        if isinstance(table_ref, exp.Identifier):
-                            table_alias = table_ref.name
-                        elif hasattr(table_ref, "name"):
-                            table_alias = table_ref.name
-
-                        if table_alias and table_alias in self._alias_to_table:
-                            table_star_aliases.add(table_alias)
-
-                # Case 2: some sqlglot versions may represent t.* as Column(name="*", table="t")
-                elif isinstance(proj, exp.Column) and proj.name == "*":
-                    table_alias = proj.table
-                    if table_alias:
-                        if table_alias in self._alias_to_table:
-                            table_star_aliases.add(table_alias)
-                    else:
-                        # Bare "*" as Column fallback -> treat as global star
-                        global_star = True
-                        break
-
-        # Global * overrides everything: all tables => all columns ([])
-        if global_star:
-            self._alias_to_columns = {alias: [] for alias in self._alias_to_table}
-            return
-
-        # ---------------- Normal column extraction (no global *) ----------------
-
-        if select_expr is not None:
-            for proj in select_expr.expressions:
-                # We already interpreted all star forms above; skip them here
-                if isinstance(proj, exp.Star):
-                    continue
-                if isinstance(proj, exp.Column) and proj.name == "*":
-                    # Star-like Column already handled in detection; skip.
-                    continue
-
-                if isinstance(proj, exp.Alias):
-                    # Aliased projection: e.g. "o.id AS order_id"
-                    value_expr = proj.this
-                    if isinstance(value_expr, exp.Column):
-                        col = value_expr
-                        col_name = col.name
-                        if not col_name or col_name == "*":
-                            # Ignore bogus or star-like columns here.
-                            continue
-
-                        table_alias = col.table
-                        resolved_alias: Optional[str] = None
-
-                        if table_alias and table_alias in alias_to_columns:
-                            resolved_alias = table_alias
-                        elif not table_alias and single_alias_for_unqualified:
-                            resolved_alias = single_alias_for_unqualified
-
-                        if (
-                            resolved_alias
-                            and col_name not in seen_per_alias[resolved_alias]
-                            and resolved_alias not in table_star_aliases
-                        ):
-                            seen_per_alias[resolved_alias].add(col_name)
-                            alias_to_columns[resolved_alias].append(col_name)
-                    # Non-Column expressions in aliases are ignored.
-                else:
-                    # Non-aliased projections: capture Column children
-                    for col in proj.find_all(exp.Column):
-                        col_name = col.name
-                        if not col_name or col_name == "*":
-                            # Do not treat "*" as a real column.
-                            continue
-
-                        table_alias = col.table
-                        resolved_alias: Optional[str] = None
-
-                        if table_alias and table_alias in alias_to_columns:
-                            resolved_alias = table_alias
-                        elif not table_alias and single_alias_for_unqualified:
-                            resolved_alias = single_alias_for_unqualified
-
-                        if (
-                            resolved_alias
-                            and col_name not in seen_per_alias[resolved_alias]
-                            and resolved_alias not in table_star_aliases
-                        ):
-                            seen_per_alias[resolved_alias].add(col_name)
-                            alias_to_columns[resolved_alias].append(col_name)
-
-        # 2) Handle remaining Column nodes (WHERE, JOIN, GROUP BY, ORDER BY, etc.)
-        #
-        # Collect SELECT-list alias names so we can recognise references to
-        # computed columns in ORDER BY / HAVING / QUALIFY.  These aliases are
-        # NOT physical table columns and must not be added to the column set.
-        select_alias_names: Set[str] = set()
-        if select_expr is not None:
+        for scope in self._get_pruning_scopes():
+            select_expr = scope.expression
+            if not isinstance(select_expr, exp.Select):
+                continue
+            projection_aliases: Set[str] = set()
             for proj in select_expr.expressions:
                 if isinstance(proj, exp.Alias):
                     alias_ident = proj.args.get("alias")
                     if isinstance(alias_ident, exp.Identifier) and alias_ident.name:
-                        select_alias_names.add(alias_ident.name.lower())
+                        projection_aliases.add(alias_ident.name.casefold())
 
+                # Case 1: explicit Star node
+                if isinstance(proj, exp.Star):
+                    # A bare star expands every direct source in this scope.
+                    # Derived sources already contribute their leaf columns in
+                    # their own scopes; direct physical sources require all.
+                    if proj.this is None:
+                        for owner in bindings_by_scope.get(id(scope), {}).values():
+                            if owner is not None:
+                                table_star_aliases.add(owner)
+                    else:
+                        table_ref = proj.this
+                        qualifier: Optional[str] = None
+                        if isinstance(table_ref, exp.Identifier):
+                            qualifier = table_ref.name
+                        elif hasattr(table_ref, "name"):
+                            qualifier = table_ref.name
+                        if qualifier:
+                            owner = bindings_by_scope.get(id(scope), {}).get(
+                                qualifier.casefold()
+                            )
+                            if owner is not None:
+                                table_star_aliases.add(owner)
+
+                # Case 2: some sqlglot versions may represent t.* as Column(name="*", table="t")
+                elif isinstance(proj, exp.Column) and proj.name == "*":
+                    owner = _resolve_column(proj)
+                    if owner is not None:
+                        table_star_aliases.add(owner)
+            select_alias_names[id(select_expr)] = projection_aliases
+
+        # Attribute every non-star column exactly once.  Direct Alias values
+        # are normal source expressions and are intentionally included; only a
+        # reference to the alias from an alias-aware clause is suppressed.
         for col in self._parsed.find_all(exp.Column):
             col_name = col.name
             if not col_name or col_name == "*":
-                # Skip stars; they are handled via star logic.
                 continue
 
-            if self._is_direct_alias_projection_column(col):
-                # Already counted from SELECT list.
-                continue
-
-            # Skip references to SELECT aliases in clauses where alias
-            # references are legal (ORDER BY, HAVING, QUALIFY).  These are
-            # not physical table columns.
+            nearest_select = col.find_ancestor(exp.Select)
+            local_aliases = (
+                select_alias_names.get(id(nearest_select), set())
+                if nearest_select is not None
+                else set()
+            )
             if (
-                col_name.lower() in select_alias_names
+                col_name.casefold() in local_aliases
                 and not col.table
                 and self._is_inside_alias_scope(col)
             ):
                 continue
 
-            table_alias = col.table
-            resolved_alias: Optional[str] = None
-
-            if table_alias and table_alias in alias_to_columns:
-                resolved_alias = table_alias
-            elif not table_alias and single_alias_for_unqualified:
-                resolved_alias = single_alias_for_unqualified
-            else:
-                # Ambiguous unqualified column with multiple tables -> ignore.
+            resolved_alias = _resolve_column(col)
+            if not resolved_alias:
+                # Derived-only and ambiguous scopes deliberately contribute no
+                # guessed projection.  Their physical leaf scopes still record
+                # their own exact dependencies; an untouched [] remains the
+                # existing conservative "all columns" sentinel.
                 continue
 
             if (
@@ -747,11 +775,11 @@ class SQLParser:
                 seen_per_alias[resolved_alias].add(col_name)
                 alias_to_columns[resolved_alias].append(col_name)
 
-        # 3) Apply t.* semantics: any alias with t.* means "all columns"
+        # Apply star semantics after collection: star always wins.
         for alias in table_star_aliases:
             alias_to_columns[alias] = []
 
-        # 4) Sort columns for aliases that are not "all columns"
+        # Sort columns for aliases that are not "all columns".
         for alias, cols in alias_to_columns.items():
             if cols:  # leave [] as special "all columns"
                 alias_to_columns[alias] = sorted(cols)
@@ -823,8 +851,9 @@ class SQLParser:
         merged: Dict[Tuple[str, str], List[str]] = {}
 
         for alias, (super_name, table_name) in self._alias_to_table.items():
-            # Skip CTE aliases — they are not physical tables.
-            if table_name in self._cte_names:
+            # Skip aliases that the scope graph proves are only CTE
+            # references. A same-named physical source inside a CTE remains.
+            if alias not in self._physical_aliases:
                 continue
 
             key = (super_name, table_name)

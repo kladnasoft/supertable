@@ -41,8 +41,9 @@ class TestFormatColumnList(unittest.TestCase):
         result = format_column_list(["a", "b", "c"])
         self.assertEqual(result, '"a" as "a","b" as "b","c" as "c"')
 
-    def test_empty_list(self):
-        self.assertEqual(format_column_list([]), "")
+    def test_empty_list_rejected(self):
+        with self.assertRaises(ValueError):
+            format_column_list([])
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -199,8 +200,8 @@ class TestRangeFilters(unittest.TestCase):
             {"operation": "<=", "value": "max_price", "type": "reference"},
         ]}}}
         fb = FilterBuilder("t1", ["*"], role_info)
-        # The LHS column is quoted; reference values stay unquoted.
-        self.assertIn('"price" >= min_price AND "price" <= max_price', fb.filter_query)
+        # Both identifiers are validated and quoted.
+        self.assertIn('"price" >= "min_price" AND "price" <= "max_price"', fb.filter_query)
 
     def test_single_bound_range(self):
         role_info = {"filters": {"score": {"range": [
@@ -242,8 +243,8 @@ class TestReferenceType(unittest.TestCase):
             "start_date": {"operation": "<", "value": "end_date", "type": "reference"},
         }}
         fb = FilterBuilder("t1", ["*"], role_info)
-        # LHS column is quoted; reference RHS stays unquoted (literal SQL).
-        self.assertIn('"start_date" < end_date', fb.filter_query)
+        # Both identifiers are validated and quoted; the RHS is not a literal.
+        self.assertIn('"start_date" < "end_date"', fb.filter_query)
         # Reference should NOT be string-literal quoted
         self.assertNotIn("'end_date'", fb.filter_query)
 
@@ -270,12 +271,12 @@ class TestIlikeEscape(unittest.TestCase):
         self.assertIn('"name" ILIKE \'%test%\'', fb.filter_query)
         self.assertNotIn("ESCAPE", fb.filter_query)
 
-    def test_non_ilike_ignores_escape_key(self):
+    def test_non_ilike_rejects_escape_key(self):
         role_info = {"filters": {
             "name": {"operation": "=", "value": "test", "type": "value", "escape": "\\"},
         }}
-        fb = FilterBuilder("t1", ["*"], role_info)
-        self.assertNotIn("ESCAPE", fb.filter_query)
+        with self.assertRaisesRegex(ValueError, "unsupported fields"):
+            FilterBuilder("t1", ["*"], role_info)
 
 
 # ═══════════════════════════════════════════════════════════════════════════ #
@@ -353,13 +354,13 @@ class TestNestedCombinations(unittest.TestCase):
 
 class TestEdgeCases(unittest.TestCase):
 
-    def test_empty_dict_filter_no_where(self):
-        fb = FilterBuilder("t1", ["*"], {"filters": {}})
-        self.assertNotIn("WHERE", fb.filter_query)
+    def test_empty_dict_filter_rejected(self):
+        with self.assertRaises(ValueError):
+            FilterBuilder("t1", ["*"], {"filters": {}})
 
-    def test_empty_list_filter_no_where(self):
-        fb = FilterBuilder("t1", ["*"], {"filters": []})
-        self.assertNotIn("WHERE", fb.filter_query)
+    def test_empty_list_filter_rejected(self):
+        with self.assertRaises(ValueError):
+            FilterBuilder("t1", ["*"], {"filters": []})
 
     def test_query_starts_with_select(self):
         fb = FilterBuilder("t1", ["a"], {"filters": ["*"]})

@@ -42,11 +42,18 @@ dataisland:                                    ── platform / dataisland-core
 supertable:                                    ── SuperTable SDK state
   {org}:                                       ── organization scope
     system:                                    ── org-level system namespace
-      auth:tokens                              HASH    org login tokens
+      auth:tokens                              HASH    org login tokens + audit-init marker
+      auth:tokens:audit_meta                   HASH    token namespace revision head
       audit:
         stream                                 STREAM  audit events
         chain_head:doc:{instance_id}           HASH    per-instance chain state
         config                                 HASH    runtime audit toggle
+        privileged:
+          outbox                               STREAM  mandatory RBAC mutation WAL
+          meta                                 HASH    exact sequence/head metadata
+          delivery                             HASH    verified archive ledger
+          cascade:
+            doc:{event_id}                     HASH    exact role-delete user manifest
       shares:
         doc:{share_id}                         STRING  share definition
         index                                  SET     share IDs
@@ -78,12 +85,14 @@ supertable:                                    ── SuperTable SDK state
             doc:{stage_name}                   STRING  per-staging lock token
         rbac:
           users:
-            meta                               HASH    version, last_updated_ms
+            meta                               HASH    version, last_updated_ms, initialized
+                                                       (created by first audited user mutation)
             index                              SET     all user_ids
             name_to_id                         HASH    username → user_id
             doc:{user_id}                      HASH    user document
           roles:
-            meta                               HASH    version, last_updated_ms
+            meta                               HASH    version, last_updated_ms, initialized
+                                                       (created by first audited role mutation)
             index                              SET     all role_ids
             name_to_id                         HASH    role_name → role_id
             doc:{role_id}                      HASH    role document
@@ -201,7 +210,7 @@ segment against `^\d{4}-\d{2}-\d{2}$` (`_DATE_RE`) — anything else is
 rejected at key-build time so a malformed value can't land in storage
 as a key the parser cannot recover.
 
-## 16.5  Audit toggle (runtime)
+## 16.5  General audit toggle (runtime)
 
 Audit is **OFF by default** (`SUPERTABLE_AUDIT_ENABLED=false`). A
 per-organization runtime override is persisted in
@@ -216,6 +225,10 @@ siem_enabled  "true" | "false"
 updated_ms    str(int)
 updated_by    str
 ```
+
+This switch controls only the non-blocking general-event lane.  The
+`audit:privileged:*` RBAC mutation ledger is mandatory and is never disabled
+by this configuration.
 
 Read/write via `supertable.audit.admin.{get,set}_audit_config`, which
 is exposed over HTTP at `GET / POST /api/v1/audit/config` and bound

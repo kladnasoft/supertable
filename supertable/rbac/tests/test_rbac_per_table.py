@@ -18,11 +18,18 @@ import types
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # Stub modules when running outside the project tree
 # ---------------------------------------------------------------------------
 try:
-    from supertable.rbac.row_column_security import RowColumnSecurity
+    from supertable.rbac.row_column_security import (
+        MAX_ROLE_COLUMNS_PER_TABLE,
+        MAX_ROLE_TABLES,
+        RowColumnSecurity,
+        canonicalize_role_tables,
+    )
     from supertable.rbac.filter_builder import FilterBuilder
     from supertable.utils.sql_parser import SQLParser
     from supertable.data_classes import TableDefinition, RbacViewDef
@@ -196,6 +203,103 @@ def test_rcs_content_hash_differs_for_different_content():
     rcs2.prepare()
 
     assert rcs1.content_hash != rcs2.content_hash
+
+
+def test_rcs_canonicalizes_table_and_column_exclusions():
+    rcs = RowColumnSecurity(
+        role="reader",
+        tables={
+            "*": {"columns": ["*"], "filters": ["*"]},
+            "account": {"access": "deny"},
+            "card": {
+                "columns": ["*"],
+                "exclude_columns": ["pan", "cvv", "pan"],
+            },
+        },
+    )
+    rcs.prepare()
+
+    assert rcs.tables["account"] == {"access": "deny"}
+    assert rcs.tables["card"] == {
+        "columns": ["*"],
+        "exclude_columns": ["cvv", "pan"],
+        "filters": ["*"],
+    }
+
+
+def test_rcs_exclusion_changes_content_hash_deterministically():
+    first = RowColumnSecurity(
+        role="reader",
+        tables={"card": {"columns": ["*"], "exclude_columns": ["pan", "cvv"]}},
+    )
+    second = RowColumnSecurity(
+        role="reader",
+        tables={"card": {"exclude_columns": ["cvv", "pan"], "columns": ["*"]}},
+    )
+    without_exclusion = RowColumnSecurity(
+        role="reader", tables={"card": {"columns": ["*"]}},
+    )
+    for policy in (first, second, without_exclusion):
+        policy.prepare()
+
+    assert first.content_hash == second.content_hash
+    assert first.content_hash != without_exclusion.content_hash
+
+
+def test_rcs_omits_new_semantic_defaults_from_canonical_hash():
+    legacy = RowColumnSecurity(role="reader", tables={"card": {}})
+    explicit = RowColumnSecurity(
+        role="reader",
+        tables={"card": {"access": "allow", "exclude_columns": []}},
+    )
+    legacy.prepare()
+    explicit.prepare()
+    assert explicit.tables == legacy.tables
+    assert explicit.content_hash == legacy.content_hash
+
+
+@pytest.mark.parametrize(
+    "tables",
+    [
+        {"Card": {}, "card": {"access": "deny"}},
+        {"card": {"columns": ["CVV", "cvv"]}},
+        {"card": {"exclude_columns": ["CVV", "cvv"]}},
+        {"card": {"columns": ["*", "id"]}},
+        {"card": {"exclude_columns": ["*"]}},
+        {"card": {"access": "deny", "columns": ["id"]}},
+        {"card": {"access": True}},
+        {"card": {"exclude_column": ["cvv"]}},
+    ],
+)
+def test_rcs_rejects_ambiguous_or_malformed_exclusions(tables):
+    with pytest.raises(ValueError):
+        RowColumnSecurity(role="reader", tables=tables).prepare()
+
+
+def test_read_time_canonicalizer_is_fail_closed_for_empty_policy():
+    assert canonicalize_role_tables({}) == {}
+    with pytest.raises(ValueError, match="missing"):
+        canonicalize_role_tables(None)
+
+
+def test_read_time_canonicalizer_accepts_legacy_table_list_only_when_requested():
+    assert canonicalize_role_tables(["card"]) == {
+        "card": {"columns": ["*"], "filters": ["*"]},
+    }
+    with pytest.raises(ValueError, match="legacy"):
+        canonicalize_role_tables(["card"], allow_legacy_list=False)
+
+
+def test_rcs_input_budgets_reject_before_persistence():
+    too_many_tables = {f"t{i}": {} for i in range(MAX_ROLE_TABLES + 1)}
+    with pytest.raises(ValueError, match="entry limit"):
+        RowColumnSecurity(role="reader", tables=too_many_tables).prepare()
+
+    too_many_columns = [f"c{i}" for i in range(MAX_ROLE_COLUMNS_PER_TABLE + 1)]
+    with pytest.raises(ValueError, match="column limit"):
+        RowColumnSecurity(
+            role="reader", tables={"card": {"columns": too_many_columns}},
+        ).prepare()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

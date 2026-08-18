@@ -48,7 +48,7 @@ import pytest
 # ---------------------------------------------------------------------------
 _MOD = "supertable.simple_table"
 _P_REDIS_CAT = f"{_MOD}.RedisCatalog"
-_P_CHECK_WRITE = f"{_MOD}.check_write_access"
+_P_CHECK_CONTROL = f"{_MOD}.check_control_access"
 _P_GEN_FILENAME = f"{_MOD}.generate_filename"
 _P_COLLECT_SCHEMA = f"{_MOD}.collect_schema"
 
@@ -425,7 +425,7 @@ class TestInitSimpleTable:
 
 class TestSimpleTableDelete:
 
-    @patch(_P_CHECK_WRITE)
+    @patch(_P_CHECK_CONTROL)
     def test_rbac_checked(self, mock_check):
         obj = _make_simple("events", "org", "sup")
         obj.storage.exists.return_value = False
@@ -439,7 +439,7 @@ class TestSimpleTableDelete:
             table_name="events",
         )
 
-    @patch(_P_CHECK_WRITE)
+    @patch(_P_CHECK_CONTROL)
     def test_rbac_denied_propagates(self, mock_check):
         mock_check.side_effect = PermissionError("denied")
         obj = _make_simple()
@@ -450,7 +450,7 @@ class TestSimpleTableDelete:
         obj.storage.exists.assert_not_called()
         obj.catalog.delete_simple_table.assert_not_called()
 
-    @patch(_P_CHECK_WRITE)
+    @patch(_P_CHECK_CONTROL)
     def test_happy_path_deletes_storage_and_redis(self, mock_check):
         obj = _make_simple("events", "org", "sup")
         obj.storage.exists.return_value = True
@@ -461,7 +461,7 @@ class TestSimpleTableDelete:
         obj.storage.delete.assert_called_once_with("org/sup/tables/events")
         obj.catalog.delete_simple_table.assert_called_once_with("org", "sup", "events")
 
-    @patch(_P_CHECK_WRITE)
+    @patch(_P_CHECK_CONTROL)
     def test_storage_not_exists_still_deletes_redis(self, mock_check):
         obj = _make_simple("events", "org", "sup")
         obj.storage.exists.return_value = False
@@ -471,7 +471,7 @@ class TestSimpleTableDelete:
         obj.storage.delete.assert_not_called()
         obj.catalog.delete_simple_table.assert_called_once()
 
-    @patch(_P_CHECK_WRITE)
+    @patch(_P_CHECK_CONTROL)
     def test_storage_file_not_found_swallowed(self, mock_check):
         obj = _make_simple("events", "org", "sup")
         obj.storage.exists.return_value = True
@@ -481,7 +481,7 @@ class TestSimpleTableDelete:
 
         obj.catalog.delete_simple_table.assert_called_once()
 
-    @patch(_P_CHECK_WRITE)
+    @patch(_P_CHECK_CONTROL)
     def test_storage_other_exception_propagates(self, mock_check):
         obj = _make_simple("events", "org", "sup")
         obj.storage.exists.return_value = True
@@ -493,7 +493,7 @@ class TestSimpleTableDelete:
         # Redis should NOT be deleted when storage raises non-FileNotFoundError
         obj.catalog.delete_simple_table.assert_not_called()
 
-    @patch(_P_CHECK_WRITE)
+    @patch(_P_CHECK_CONTROL)
     def test_delete_folder_path_matches_simple_dir(self, mock_check):
         """delete builds its own path from org/sup/identity/simple — matches simple_dir."""
         obj = _make_simple("my_tbl", "my_org", "my_sup")

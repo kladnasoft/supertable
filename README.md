@@ -170,6 +170,8 @@ See [docs/00_index.md](docs/00_index.md) for the full table of contents.
 | 13 | [Table Mirroring](docs/13_mirroring.md) | Delta Lake, Iceberg, Parquet export |
 | 14 | [Monitoring](docs/14_monitoring.md) | Metrics writer, structured logging |
 | 15 | [Python SDK](docs/15_python_sdk.md) | Core classes, demos, example index |
+| 16 | [Redis Key Layout](docs/16_redis_layout.md) | Canonical key namespaces and validation rules |
+| 17 | [Privileged Audit Worker](docs/17_privileged_audit_worker.md) | Supervised deployment, durability preflight, safe trimming, probes, failure policy |
 
 ---
 

@@ -54,7 +54,10 @@ from supertable.processing import (
     ROWID_COL,
     TOMBSTONE_FILE_COL,
 )
-from supertable.rbac.access_control import check_write_access  # noqa: F401
+from supertable.rbac.access_control import (  # noqa: F401
+    check_create_access,
+    check_write_access,
+)
 from supertable.redis_catalog import RedisCatalog
 from supertable.mirroring.mirror_formats import (
     MirrorFormats,
@@ -707,12 +710,30 @@ class DataWriter:
             logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level}, newer_than={newer_than}, delete_only={delete_only})"))
 
             # --- Access control ------------------------------------------------
-            check_write_access(
-                 super_name=self.super_table.super_name,
-                 organization=self.super_table.organization,
-                 role_name=role_name,
-                 table_name=simple_name,
+            policy_columns = list(getattr(data, "column_names", ()) or ())
+            if isinstance(overwrite_columns, (list, tuple)):
+                policy_columns.extend(overwrite_columns)
+            if isinstance(newer_than, str):
+                policy_columns.append(newer_than)
+            # Preserve first spelling/order while keeping policy work bounded
+            # to the actual mutation dependencies.
+            policy_columns = list(dict.fromkeys(str(c) for c in policy_columns))
+            access_args = dict(
+                super_name=self.super_table.super_name,
+                organization=self.super_table.organization,
+                role_name=role_name,
+                table_name=simple_name,
+                columns=policy_columns,
             )
+            target_existed = self.catalog.leaf_exists(
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple_name,
+            )
+            if target_existed:
+                check_write_access(**access_args)
+            else:
+                check_create_access(**access_args)
             mark("access")
 
             # --- Convert input -------------------------------------------------
@@ -759,7 +780,14 @@ class DataWriter:
             mark("lock")
 
             # --- Read last snapshot (via leaf pointer) ------------------------
-            simple_table = SimpleTable(self.super_table, simple_name)
+            # A target that existed at authorization time must not be
+            # implicitly recreated if another actor deletes it before we take
+            # the table lock.  Such a recreation requires CREATE, not WRITE.
+            simple_table = SimpleTable(
+                self.super_table,
+                simple_name,
+                create_if_missing=not target_existed,
+            )
             last_simple_table, last_simple_table_path = simple_table.get_simple_table_snapshot()
             # A current deletion-vector is immutable correctness metadata.  Do
             # not let a mutation bless a legacy/unsealed pointer into a new

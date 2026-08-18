@@ -14,6 +14,8 @@ from supertable.storage.storage_factory import get_storage
 from supertable.storage.storage_interface import StorageInterface
 from supertable.redis_catalog import RedisCatalog
 from supertable.redis_keys import is_reserved_super_name, RESERVED_SUPER_NAMES
+from supertable.rbac.access_control import resolve_role_access_context
+from supertable.rbac.permissions import Permission, RoleType
 
 
 class SuperTable:
@@ -118,10 +120,33 @@ class SuperTable:
 
     # ------------------------------------------------------------------ delete
     def delete(self, role_name) -> None:
-        """Delete this SuperTable's Redis metadata and underlying storage folder.
+        """Delete this SuperTable's data metadata and storage folder.
 
         WARNING: This is destructive and intended for admin flows.
+
+        RBAC role/user state is intentionally retained.  It is security
+        control data and may only be removed through its dedicated mandatory
+        audit boundary; recreating the same SuperTable therefore cannot reset
+        or silently widen its prior access policy.
         """
+        # Deleting the namespace also deletes every child table.  A scoped
+        # ADMIN could otherwise authorize the parent through ``*`` and erase a
+        # child that has an exact ``access: deny`` override.  There is no root
+        # structural lock that can make a per-child preflight race-free, so the
+        # parent destructive operation is reserved for the trusted SUPERADMIN
+        # control plane.  SimpleTable.delete remains table-policy aware.
+        context = resolve_role_access_context(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            permission=Permission.CONTROL,
+            label="delete this SuperTable",
+        )
+        if context.role_type is not RoleType.SUPERADMIN:
+            raise PermissionError(
+                "Only SUPERADMIN can delete an entire SuperTable namespace."
+            )
+
         base_dir = os.path.join(self.organization, self.super_name)
 
         # Delete storage first; if this fails (other than missing), do not remove Redis meta.
@@ -132,5 +157,7 @@ class SuperTable:
             # Missing storage is fine; still delete Redis meta
             pass
 
-        # Best-effort delete all Redis keys under this supertable prefix
+        # Best-effort delete data/meta keys under the SuperTable prefix.  The
+        # catalog deliberately preserves RBAC keys so this generic namespace
+        # cleanup cannot bypass the privileged mutation ledger.
         self.catalog.delete_super_table(self.organization, self.super_name)

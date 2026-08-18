@@ -66,6 +66,10 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         ("audit_chain_head",             RK.audit_chain_head(ORG, INSTANCE),   f"{sys_pre}:audit:chain_head:doc:{INSTANCE}"),
         ("audit_config",                 RK.audit_config(ORG),                 f"{sys_pre}:audit:config"),
         ("audit_legal_hold",             RK.audit_legal_hold(ORG),             f"{sys_pre}:audit:legal_hold"),
+        ("audit_privileged_outbox",      RK.audit_privileged_outbox(ORG),      f"{sys_pre}:audit:privileged:outbox"),
+        ("audit_privileged_meta",        RK.audit_privileged_meta(ORG),        f"{sys_pre}:audit:privileged:meta"),
+        ("audit_privileged_delivery",    RK.audit_privileged_delivery(ORG),    f"{sys_pre}:audit:privileged:delivery"),
+        ("audit_privileged_cascade",     RK.audit_privileged_cascade(ORG, "event-1"), f"{sys_pre}:audit:privileged:cascade:doc:event-1"),
         ("share_doc",                    RK.share_doc(ORG, SHARE),             f"{sys_pre}:shares:doc:{SHARE}"),
         ("share_index",                  RK.share_index(ORG),                  f"{sys_pre}:shares:index"),
         ("engine_thrifts",               RK.engine_thrifts(ORG),               f"{sys_pre}:engine:thrifts"),
@@ -105,6 +109,7 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         ("lock_stage",                   RK.lock_stage(ORG, SUP, STAGING),     f"{lake_pre}:lock:stage:doc:{STAGING}"),
 
         # ---- RBAC — users ----------------------------------------------
+        ("rbac_scope",                   RK.rbac_scope(ORG, SUP),              f"{lake_pre}:rbac"),
         ("rbac_user_meta",               RK.rbac_user_meta(ORG, SUP),          f"{lake_pre}:rbac:users:meta"),
         ("rbac_user_index",              RK.rbac_user_index(ORG, SUP),         f"{lake_pre}:rbac:users:index"),
         ("rbac_username_to_id",          RK.rbac_username_to_id(ORG, SUP),     f"{lake_pre}:rbac:users:name_to_id"),

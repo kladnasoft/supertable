@@ -3,36 +3,22 @@
 import uuid
 from typing import Dict, List, Optional
 
-from supertable.rbac.row_column_security import RowColumnSecurity
+from supertable.rbac.row_column_security import (
+    RowColumnSecurity,
+    canonicalize_role_tables,
+)
 from supertable.config.defaults import logger
-from supertable.redis_catalog import RedisCatalog, SAFE_ROLE_NAME_RE, validate_role_name
+from supertable.redis_catalog import (
+    RedisCatalog,
+    RbacDecisionError,
+    RbacDuplicateIdentityError,
+    RbacIntegrityError,
+    SAFE_ROLE_NAME_RE,
+    audit_rbac_manager_rejections,
+    validate_role_name,
+)
 from supertable import redis_keys as RK
-
-try:
-    from supertable.audit import emit as _audit_emit, EventCategory, Actions, Severity, make_detail
-    _audit_available = True
-except ImportError:
-    _audit_available = False
-
-
-def _audit_rbac(organization: str, super_name: str, action, resource_id: str,
-                severity=None, **detail_kwargs) -> None:
-    """Emit an RBAC audit event.  Never raises."""
-    if not _audit_available:
-        return
-    try:
-        _audit_emit(
-            category=EventCategory.RBAC_CHANGE,
-            action=action,
-            organization=organization,
-            super_name=super_name,
-            resource_type="role",
-            resource_id=resource_id,
-            severity=severity or Severity.WARNING,
-            detail=make_detail(**detail_kwargs),
-        )
-    except Exception:
-        pass
+from supertable.audit.privileged import PrivilegedActionContext
 
 
 class RoleManager:
@@ -86,7 +72,13 @@ class RoleManager:
                         "role_name": "superadmin",
                         "tables": {"*": {"columns": ["*"], "filters": ["*"]}},
                     }
-                    role_id = self.create_role(sysadmin_data)
+                    role_id = self.create_role(
+                        sysadmin_data,
+                        action_context=PrivilegedActionContext.system(
+                            "Create the bootstrap superadmin role",
+                            cause="rbac_bootstrap",
+                        ),
+                    )
                     logger.info(f"Default superadmin role created: {role_id}")
             finally:
                 if lock_token:
@@ -103,7 +95,41 @@ class RoleManager:
     # for the canonical check.
     _SAFE_ROLE_NAME_RE = SAFE_ROLE_NAME_RE
 
-    def create_role(self, data: dict) -> str:
+    @staticmethod
+    def _prepare_role_content(
+        data: dict,
+        *,
+        default_if_empty: bool = True,
+    ) -> RowColumnSecurity:
+        """Validate the public role-policy payload and return canonical content."""
+        if not isinstance(data, dict):
+            raise ValueError("role data must be an object")
+        unknown = set(data) - {"role", "role_name", "tables"}
+        if unknown:
+            raise ValueError(f"Unknown role fields: {sorted(str(k) for k in unknown)}")
+        if "role" not in data:
+            raise ValueError("role is required")
+        tables = canonicalize_role_tables(
+            data.get("tables"),
+            default_if_empty=default_if_empty,
+            allow_legacy_list=False,
+        )
+        rcs = RowColumnSecurity(role=data["role"], tables=tables)
+        rcs.tables = tables
+        rcs.create_content_hash()
+        return rcs
+
+    @audit_rbac_manager_rejections(
+        action="role_create",
+        resource_type="role",
+        namespace="role",
+    )
+    def create_role(
+        self,
+        data: dict,
+        *,
+        action_context=None,
+    ) -> str:
         """
         Create a new role and return its ``role_id`` (UUID).
 
@@ -123,6 +149,8 @@ class RoleManager:
                 }
             }
         """
+        if not isinstance(data, dict):
+            raise ValueError("role data must be an object")
         org, sup = self.organization, self.super_name
         role_name = data.get("role_name")
 
@@ -132,14 +160,69 @@ class RoleManager:
         # this is the user-facing contract.
         validate_role_name(role_name)
 
+        # Validate before the idempotent-name fast path.  Otherwise a caller
+        # could submit a malformed or over-budget policy and receive a success
+        # response merely because the name already existed.
+        rcs = self._prepare_role_content(data)
+
         # If role_name given, check uniqueness (idempotent: return existing)
         if role_name:
             existing_id = self._catalog.rbac_get_role_id_by_name(org, sup, role_name)
             if existing_id:
-                return existing_id
-
-        rcs = RowColumnSecurity(**{k: v for k, v in data.items() if k != "role_name"})
-        rcs.prepare()
+                existing = self._catalog.get_role_details(org, sup, existing_id)
+                if (
+                    not existing
+                    or str(existing.get("role_name", "")).casefold()
+                    != role_name.casefold()
+                ):
+                    raise RbacIntegrityError(
+                        "RBAC role name map and document are inconsistent"
+                    )
+                if (
+                    existing
+                    and existing.get("role") == rcs.role.value
+                    and existing.get("content_hash") == rcs.content_hash
+                ):
+                    self._catalog.rbac_append_attempt(
+                        org,
+                        sup,
+                        action="role_create",
+                        resource_type="role",
+                        resource_id=existing_id,
+                        namespace="role",
+                        outcome="no_change",
+                        cause="idempotent_replay",
+                        action_context=action_context,
+                        conditions=[
+                            {
+                                "kind": "identity_claim",
+                                "name": role_name,
+                                "identity_id": existing_id,
+                            },
+                            {
+                                "kind": "resource_fields",
+                                "fields": {
+                                    "role": existing.get("role", ""),
+                                    "content_hash": existing.get(
+                                        "content_hash", ""
+                                    ),
+                                    "doc_version": existing.get("doc_version", "0"),
+                                },
+                            },
+                        ],
+                    )
+                    return existing_id
+                raise RbacDecisionError(
+                    f"Role name {role_name!r} already exists with different content; "
+                    "use update_role() explicitly",
+                    outcome="no_change",
+                    cause="identity_claim_unchanged",
+                    conditions=[{
+                        "kind": "identity_claim",
+                        "name": role_name,
+                        "identity_id": existing_id,
+                    }],
+                )
 
         role_id = uuid.uuid4().hex
 
@@ -149,11 +232,51 @@ class RoleManager:
         if role_name:
             role_doc["role_name"] = role_name
 
-        self._catalog.rbac_create_role(org, sup, role_id, role_doc)
+        try:
+            self._catalog.rbac_create_role(
+                org,
+                sup,
+                role_id,
+                role_doc,
+                action_context=action_context,
+            )
+        except RbacDuplicateIdentityError:
+            # A concurrent named create can win after the optimistic lookup
+            # above but before the catalog's atomic name claim.  Preserve the
+            # public idempotency contract only when that winner has exactly
+            # the content we already validated; never turn a different policy
+            # into a successful create response.
+            if role_name:
+                winner_id = self._catalog.rbac_get_role_id_by_name(
+                    org, sup, role_name,
+                )
+                winner = (
+                    self._catalog.get_role_details(org, sup, winner_id)
+                    if winner_id else None
+                )
+                if (
+                    winner
+                    and winner.get("role") == rcs.role.value
+                    and winner.get("content_hash") == rcs.content_hash
+                ):
+                    return winner_id
+            raise
         logger.debug(f"Role created: {role_id} ({rcs.role.value})")
         return role_id
 
-    def update_role(self, role_id: str, data: dict) -> str:
+    @audit_rbac_manager_rejections(
+        action="role_update",
+        resource_type="role",
+        namespace="role",
+        resource_fields=("role_id",),
+    )
+    def update_role(
+        self,
+        role_id: str,
+        data: dict,
+        *,
+        action_context=None,
+    ) -> str:
         """
         Update a role's content in-place.  Returns the new content_hash.
 
@@ -161,10 +284,21 @@ class RoleManager:
         ``role_id`` remains stable.  If ``role_name`` is being changed,
         validates format and checks uniqueness.
         """
+        if not isinstance(data, dict):
+            raise ValueError("role data must be an object")
+        unknown = set(data) - {"role", "role_name", "tables"}
+        if unknown:
+            raise ValueError(f"Unknown role fields: {sorted(str(k) for k in unknown)}")
+
         org, sup = self.organization, self.super_name
         existing = self._catalog.get_role_details(org, sup, role_id)
         if not existing:
-            raise ValueError(f"Role {role_id} does not exist")
+            raise RbacDecisionError(
+                f"Role {role_id} does not exist",
+                outcome="no_change",
+                cause="resource_missing",
+                conditions=[{"kind": "resource_absent"}],
+            )
 
         # Handle role_name rename
         new_name = data.get("role_name")
@@ -177,7 +311,27 @@ class RoleManager:
             if new_name:
                 conflicting_id = self._catalog.rbac_get_role_id_by_name(org, sup, new_name)
                 if conflicting_id and conflicting_id != role_id:
-                    raise ValueError(f"Role name '{new_name}' is already taken by role {conflicting_id}")
+                    conflicting = self._catalog.get_role_details(
+                        org, sup, conflicting_id,
+                    )
+                    if (
+                        not conflicting
+                        or str(conflicting.get("role_name", "")).casefold()
+                        != new_name.casefold()
+                    ):
+                        raise RbacIntegrityError(
+                            "RBAC role name map and document are inconsistent"
+                        )
+                    raise RbacDecisionError(
+                        f"Role name '{new_name}' is already taken by role {conflicting_id}",
+                        outcome="no_change",
+                        cause="identity_claim_unchanged",
+                        conditions=[{
+                            "kind": "identity_claim",
+                            "name": new_name,
+                            "identity_id": conflicting_id,
+                        }],
+                    )
 
         default_tables = {"*": {"columns": ["*"], "filters": ["*"]}}
 
@@ -186,32 +340,52 @@ class RoleManager:
             "tables": data.get("tables", existing.get("tables", default_tables)),
         }
 
-        rcs = RowColumnSecurity(**merged)
-        rcs.prepare()
+        if existing.get("role") == "superadmin" and merged["role"] != "superadmin":
+            raise ValueError("A superadmin role cannot be demoted.")
+        if (
+            existing.get("role") == "superadmin"
+            and str(old_name).casefold() == "superadmin"
+            and new_name is not None
+            and str(new_name).casefold() != "superadmin"
+        ):
+            raise ValueError("The bootstrap superadmin role cannot be renamed.")
+
+        rcs = self._prepare_role_content(
+            merged,
+            # Preserve the historical explicit update API where tables={}
+            # means wildcard, but never widen an already persisted empty
+            # (fail-closed) policy during an unrelated partial update.
+            default_if_empty="tables" in data,
+        )
 
         update_fields = rcs.to_json()
         update_fields["content_hash"] = rcs.content_hash
 
-        # If role_name changed, update the name_to_id mapping
+        # RedisCatalog updates the role document, name map, type indexes, and
+        # RBAC version in one transaction.  Keeping the rename in that boundary
+        # avoids a window where the name resolves to content that was not yet
+        # committed (or no longer resolves after a failed document update).
         if new_name is not None and new_name != old_name:
             update_fields["role_name"] = new_name
-            name_key = RK.rbac_rolename_to_id(org, sup)
-            pipe = self._catalog.r.pipeline()
-            if old_name:
-                pipe.hdel(name_key, old_name.lower())
-            if new_name:
-                pipe.hset(name_key, new_name.lower(), role_id)
-            pipe.execute()
 
-        self._catalog.rbac_update_role(org, sup, role_id, update_fields)
+        self._catalog.rbac_update_role(
+            org,
+            sup,
+            role_id,
+            update_fields,
+            action_context=action_context,
+        )
         logger.debug(f"Role updated: {role_id}")
-
-        _audit_rbac(org, sup, Actions.ROLE_UPDATE, role_id,
-                     role_name=new_name or old_name, role_type=merged.get("role", ""))
 
         return rcs.content_hash
 
-    def delete_role(self, role_id: str) -> bool:
+    @audit_rbac_manager_rejections(
+        action="role_delete",
+        resource_type="role",
+        namespace="role",
+        resource_fields=("role_id",),
+    )
+    def delete_role(self, role_id: str, *, action_context=None) -> bool:
         """
         Delete a role and atomically strip it from all users.
 
@@ -221,12 +395,14 @@ class RoleManager:
         existing = self._catalog.get_role_details(org, sup, role_id)
         if existing and existing.get("role") == "superadmin":
             raise ValueError("The superadmin role cannot be deleted.")
-        role_name = existing.get("role_name", "") if existing else ""
-        result = self._catalog.rbac_delete_role(org, sup, role_id)
+        result = self._catalog.rbac_delete_role(
+            org,
+            sup,
+            role_id,
+            action_context=action_context,
+        )
         if result:
             logger.debug(f"Role deleted: {role_id}")
-            _audit_rbac(org, sup, Actions.ROLE_DELETE, role_id,
-                         severity=Severity.CRITICAL, role_name=role_name)
         return result
 
     def get_role(self, role_id: str) -> Dict:

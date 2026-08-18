@@ -51,6 +51,7 @@ class Outcome(str, Enum):
     SUCCESS = "success"
     FAILURE = "failure"
     DENIED = "denied"
+    NO_CHANGE = "no_change"
 
 
 class ActorType(str, Enum):

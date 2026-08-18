@@ -188,6 +188,11 @@ def _resolve_spark_file(
 # Spark SQL helpers
 # =========================================================
 
+def _spark_quote_identifier(value: object) -> str:
+    """Return one safely backtick-quoted Spark SQL identifier."""
+    return "`" + str(value).replace("`", "``") + "`"
+
+
 def _spark_table_name(super_name: str, simple_name: str, version: int) -> str:
     """Generate a deterministic Spark temp table name."""
     key = f"{super_name}_{simple_name}"
@@ -195,13 +200,30 @@ def _spark_table_name(super_name: str, simple_name: str, version: int) -> str:
     return f"spark_{digest}_v{version}"
 
 
-def _spark_create_parquet_view(cursor, table_name: str, files: List[str]) -> List[str]:
+def _spark_create_parquet_view_impl(
+        cursor,
+        table_name: str,
+        files: List[str],
+        column_types: Optional[Dict[str, str]] = None,
+        *,
+        _created_names: List[str],
+) -> List[str]:
     """Register parquet files as a Spark temp view via Thrift.
 
-    For a single file, uses ``USING parquet OPTIONS (path ...)`` directly.
-    For multiple files, batches them: each batch creates individual temp
-    views via ``USING parquet OPTIONS``, unions them into a batch view.
-    Finally all batch views are unioned into the target view.
+    Spark SQL's ``UNION ALL`` is positional.  Raw ``SELECT *`` unions are
+    therefore unsafe for schema-evolving parquet files: if one file stores
+    ``(id, cvv)`` and another stores ``(cvv, id)``, the second file's sensitive
+    ``cvv`` values are relabelled as ``id`` before the RBAC view gets a chance
+    to exclude them.  Each file is consequently described and projected into
+    one canonical, quoted column order before any batch/final positional union.
+
+    ``column_types`` is the schema pinned from the same snapshot as ``files``.
+    When present it defines the logical target set/order (the writer's
+    last-schema-wins contract); fields absent from an older file become NULL
+    and fields absent from the current schema are not resurrected.  The
+    no-schema fallback derives a deterministic first-seen union for legacy
+    callers.  Any describe ambiguity or case-colliding source name fails
+    closed rather than risking a wrong binding.
 
     **Important**: intermediate views (part views and batch views) are NOT
     dropped here.  In Spark SQL, ``CREATE VIEW X AS SELECT * FROM Y`` stores
@@ -211,27 +233,41 @@ def _spark_create_parquet_view(cursor, table_name: str, files: List[str]) -> Lis
     Returns a list of all intermediate view names created, so the caller
     can drop them during cleanup.
     """
-    intermediate_views: List[str] = []
+    if not files:
+        raise ValueError(f"No files provided for Spark reflection {table_name!r}")
 
-    if len(files) == 1:
-        sql = (
-            f"CREATE OR REPLACE TEMPORARY VIEW {table_name} "
-            f"USING parquet "
-            f"OPTIONS (path '{escape_parquet_path(files[0])}')"
-        )
-        cursor.execute(sql)
-        return intermediate_views
+    snapshot_schema = dict(column_types or {})
+    snapshot_by_fold: Dict[str, tuple[str, str]] = {}
+    for raw_name, raw_type in snapshot_schema.items():
+        if not isinstance(raw_name, str) or not raw_name:
+            raise RuntimeError("Pinned Spark schema contains an invalid column name")
+        folded = raw_name.casefold()
+        if folded in snapshot_by_fold:
+            raise RuntimeError(
+                "Pinned Spark schema contains case-colliding columns"
+            )
+        # Validate persisted types through the closed snapshot type grammar
+        # before creating any view.  It is used below when a current-schema
+        # column is absent from every surviving historical file.
+        safe_type = snapshot_spark_type(raw_type)
+        snapshot_by_fold[folded] = (raw_name, safe_type)
+
+    intermediate_views: List[str] = []
 
     batch_size = settings.SUPERTABLE_SPARK_BATCH_SIZE
     batches = [files[i:i + batch_size] for i in range(0, len(files), batch_size)]
 
-    all_batch_views: List[str] = []
+    part_batches: List[List[str]] = []
+    part_columns: Dict[str, Dict[str, str]] = {}
+    source_spelling: Dict[str, str] = {}
 
     for batch_idx, batch in enumerate(batches):
-        # Create individual file views within this batch
         part_views: List[str] = []
         for file_idx, f in enumerate(batch):
             part_name = f"__{table_name}_b{batch_idx}p{file_idx}__"
+            # Record before execution: a lost Thrift response is ambiguous and
+            # may mean Spark created the view even though execute raised.
+            _created_names.append(part_name)
             cursor.execute(
                 f"CREATE OR REPLACE TEMPORARY VIEW {part_name} "
                 f"USING parquet "
@@ -240,9 +276,106 @@ def _spark_create_parquet_view(cursor, table_name: str, files: List[str]) -> Lis
             part_views.append(part_name)
             intermediate_views.append(part_name)
 
+            try:
+                cursor.execute(f"DESCRIBE {part_name}")
+                described = cursor.fetchall()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Cannot resolve a parquet source schema for safe Spark union"
+                ) from exc
+
+            if not isinstance(described, (list, tuple)):
+                raise RuntimeError(
+                    "Spark returned an invalid parquet source schema"
+                )
+
+            columns: Dict[str, str] = {}
+            for row in described:
+                if not isinstance(row, (list, tuple)) or not row:
+                    raise RuntimeError(
+                        "Spark returned an invalid parquet source schema row"
+                    )
+                if row[0] is None:
+                    continue
+                name = str(row[0])
+                # Spark can append partition-information rows to DESCRIBE.
+                if not name or name.startswith("#"):
+                    continue
+                folded = name.casefold()
+                if folded in columns:
+                    raise RuntimeError(
+                        "Spark parquet source contains duplicate or "
+                        "case-colliding columns"
+                    )
+                prior_spelling = source_spelling.get(folded)
+                if prior_spelling is not None and prior_spelling != name:
+                    raise RuntimeError(
+                        "Spark parquet sources contain case-colliding columns"
+                    )
+                source_spelling[folded] = name
+                columns[folded] = name
+            if not columns:
+                raise RuntimeError(
+                    "Cannot resolve any parquet columns for safe Spark union"
+                )
+            part_columns[part_name] = columns
+
+        part_batches.append(part_views)
+
+    if snapshot_by_fold:
+        target_columns = [
+            (
+                folded,
+                pinned_name,
+                safe_type,
+            )
+            for folded, (pinned_name, safe_type) in snapshot_by_fold.items()
+        ]
+    else:
+        # Dict insertion order follows the deterministic file/DESCRIBE order.
+        target_columns = [
+            (folded, spelling, None)
+            for folded, spelling in source_spelling.items()
+        ]
+
+    if not target_columns:
+        raise RuntimeError("Cannot construct a Spark reflection with no columns")
+
+    def _aligned_select(part_name: str) -> str:
+        available = part_columns[part_name]
+        expressions = []
+        for folded, output_name, fallback_type in target_columns:
+            source_name = available.get(folded)
+            if source_name is not None:
+                expressions.append(
+                    f"{_spark_quote_identifier(source_name)} AS "
+                    f"{_spark_quote_identifier(output_name)}"
+                )
+            elif folded in source_spelling:
+                # At least one sibling file supplies the concrete type.  Spark
+                # safely coerces its NULL type during the aligned union.
+                expressions.append(
+                    f"NULL AS {_spark_quote_identifier(output_name)}"
+                )
+            else:
+                # The current schema can legitimately be wider than every
+                # pruned survivor.  Retain its safe persisted type.
+                expressions.append(
+                    f"CAST(NULL AS {fallback_type}) AS "
+                    f"{_spark_quote_identifier(output_name)}"
+                )
+        return f"SELECT {', '.join(expressions)} FROM {part_name}"
+
+    all_batch_views: List[str] = []
+
+    for batch_idx, part_views in enumerate(part_batches):
+
         # Union all parts into one batch view
         batch_view = f"__{table_name}_batch{batch_idx}__"
-        union_sql = " UNION ALL ".join(f"SELECT * FROM {p}" for p in part_views)
+        union_sql = " UNION ALL ".join(
+            _aligned_select(part_name) for part_name in part_views
+        )
+        _created_names.append(batch_view)
         cursor.execute(
             f"CREATE OR REPLACE TEMPORARY VIEW {batch_view} AS {union_sql}"
         )
@@ -258,6 +391,7 @@ def _spark_create_parquet_view(cursor, table_name: str, files: List[str]) -> Lis
     else:
         union_sql = " UNION ALL ".join(f"SELECT * FROM {v}" for v in all_batch_views)
 
+    _created_names.append(table_name)
     cursor.execute(
         f"CREATE OR REPLACE TEMPORARY VIEW {table_name} AS {union_sql}"
     )
@@ -265,6 +399,44 @@ def _spark_create_parquet_view(cursor, table_name: str, files: List[str]) -> Lis
     # Do NOT drop batch views — the target view references them lazily.
     # Return them so the caller drops them after the query completes.
     return intermediate_views
+
+
+def _spark_create_parquet_view(
+        cursor,
+        table_name: str,
+        files: List[str],
+        column_types: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Create one schema-aligned Spark reflection with failure cleanup.
+
+    The implementation must create lazy intermediate views before it can
+    DESCRIBE and align them.  If any later proof or CREATE fails, it cannot
+    return those names to the executor's normal cleanup path.  Track every
+    possibly-created name up front and drop it here without masking the
+    original security/correctness failure.
+    """
+    created_names: List[str] = []
+    try:
+        return _spark_create_parquet_view_impl(
+            cursor,
+            table_name,
+            files,
+            column_types=column_types,
+            _created_names=created_names,
+        )
+    except Exception:
+        seen = set()
+        for name in reversed(created_names):
+            if name in seen:
+                continue
+            seen.add(name)
+            try:
+                cursor.execute(
+                    f"DROP VIEW IF EXISTS {_spark_quote_identifier(name)}"
+                )
+            except Exception:
+                pass
+        raise
 
 
 def _spark_create_empty_view(cursor, table_name: str, column_types: Dict[str, str]) -> None:
@@ -277,7 +449,7 @@ def _spark_create_empty_view(cursor, table_name: str, column_types: Dict[str, st
     for name, raw_type in column_types.items():
         type_name = snapshot_spark_type(raw_type)
         expressions.append(
-            f"CAST(NULL AS {type_name}) AS `{str(name).replace('`', '``')}`"
+            f"CAST(NULL AS {type_name}) AS {_spark_quote_identifier(name)}"
         )
     cursor.execute(
         f"CREATE OR REPLACE TEMPORARY VIEW {table_name} AS SELECT "
@@ -293,16 +465,79 @@ def _spark_create_rbac_view(
         rbac_view_def: RbacViewDef,
 ) -> None:
     """Create an RBAC-filtered view on top of a Spark table."""
+    excluded = {
+        str(c).casefold()
+        for c in (getattr(rbac_view_def, "excluded_columns", None) or [])
+    }
+    actual_columns = None
+
+    def _actual_columns() -> List[str]:
+        nonlocal actual_columns
+        if actual_columns is None:
+            try:
+                cursor.execute(f"DESCRIBE {base_table_name}")
+                described = cursor.fetchall()
+            except Exception as exc:
+                raise RuntimeError(
+                    "Cannot resolve source schema for RBAC exclusions"
+                ) from exc
+            actual_columns = [
+                str(row[0]) for row in described
+                if row and str(row[0]).strip() and not str(row[0]).startswith("#")
+            ]
+            folded = [name.casefold() for name in actual_columns]
+            if len(set(folded)) != len(folded):
+                raise RuntimeError(
+                    "Cannot apply RBAC to a relation with case-colliding columns"
+                )
+        return actual_columns
+
     if rbac_view_def.allowed_columns == ["*"]:
-        select_cols = "*"
+        if excluded:
+            visible = [
+                name for name in _actual_columns()
+                if name.casefold() not in excluded
+            ]
+            if not visible:
+                raise PermissionError("RBAC policy excludes every visible column")
+            select_cols = ", ".join(
+                _spark_quote_identifier(c) for c in visible
+            )
+        else:
+            select_cols = "*"
     else:
+        allowed = {str(c).casefold() for c in rbac_view_def.allowed_columns}
+        visible = [
+            name for name in _actual_columns()
+            if name.casefold() in allowed and name.casefold() not in excluded
+        ]
+        if not visible:
+            raise PermissionError("RBAC policy excludes every allowed column")
         select_cols = ", ".join(
-            f"`{c}`" for c in rbac_view_def.allowed_columns
+            _spark_quote_identifier(c) for c in visible
         )
 
+    where_clause = rbac_view_def.where_clause
+    if where_clause:
+        # The clause may contain both a structured role predicate and a linked
+        # share predicate merged by DataReader. Transpile the complete secured
+        # expression as one AST so Spark identifier quoting is correct and no
+        # conjunct can be discarded by regenerating only ``filter_spec``.
+        try:
+            import sqlglot
+            secured = sqlglot.parse_one(
+                f"SELECT 1 WHERE {where_clause}", dialect="duckdb",
+            )
+            where_expr = secured.args.get("where")
+            if where_expr is None:
+                raise ValueError("missing WHERE expression")
+            where_clause = where_expr.this.sql(dialect="spark")
+        except Exception as exc:
+            raise RuntimeError("Unable to transpile protected Spark predicate") from exc
+
     where_sql = ""
-    if rbac_view_def.where_clause:
-        where_sql = f" WHERE {rbac_view_def.where_clause}"
+    if where_clause:
+        where_sql = f" WHERE {where_clause}"
 
     sql = (
         f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
@@ -344,10 +579,12 @@ def _spark_create_tombstone_view(
         src_cols = []
 
     tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
-    if tomb_path and describe_error is not None:
-        # Failing open here used to skip the anti-join and return deleted rows.
+    if describe_error is not None:
+        # Schema introspection is the security boundary for both deletion
+        # vectors and stripping storage-only columns.  Falling back to ``*``
+        # would expose reserved columns even on a table with no tombstones.
         raise RuntimeError(
-            f"Cannot validate source schema for deletion-vector filtering: {describe_error}"
+            f"Cannot validate source schema for protected projection: {describe_error}"
         ) from describe_error
 
     canonical_reserved = {
@@ -387,10 +624,11 @@ def _spark_create_tombstone_view(
 
     user_cols = [c for c in src_cols if c not in _SPARK_SYSTEM_COLS]
     if user_cols:
-        select_cols = ", ".join(f"src.`{c}`" for c in user_cols)
+        select_cols = ", ".join(
+            f"src.{_spark_quote_identifier(c)}" for c in user_cols
+        )
     else:
-        # Can't introspect — fall back to SELECT * (system columns may leak).
-        select_cols = "src.*"
+        raise RuntimeError("Protected Spark relation has no visible columns")
 
     has_rowid = "__rowid__" in src_cols
 
@@ -404,12 +642,12 @@ def _spark_create_tombstone_view(
         # same access method — direct s3a:// by default, presigned when
         # SUPERTABLE_SPARK_PRESIGNED is on — instead of a bare key or a
         # DuckDB-shaped presigned URL.
-        escaped = _resolve_spark_file(
+        resolved_path = _resolve_spark_file(
             storage,
             tomb_path,
             raw_key=getattr(tombstone_def, "cache_key", None),
-        ).replace("'", "''")
-        relation = f"parquet.`{escaped}`"
+        )
+        relation = f"parquet.{_spark_quote_identifier(resolved_path)}"
 
         # Validate the immutable DV before exposing a view.  The engine cannot
         # safely use DV.__file__ for a composite join yet: Spark sees an s3a or
@@ -609,7 +847,7 @@ def _ts_to_timestamp_expr(col_name: str, unit: str) -> str:
     the source unit.  Nanoseconds have no Spark timestamp type, so they are
     reduced to microseconds with integer division (``DIV 1000``) first.
     """
-    q = f"`{col_name}`"
+    q = _spark_quote_identifier(col_name)
     if unit == "s":
         expr = f"timestamp_seconds({q})"
     elif unit == "ms":
@@ -657,13 +895,14 @@ def _build_tscast_select(desc_rows, ts_units: Optional[Dict[str, str]]):
             select_parts.append(_ts_to_timestamp_expr(col_name, ts_units[col_name]))
             cast_cols.append(col_name)
         else:
-            select_parts.append(f"`{col_name}`")
+            select_parts.append(_spark_quote_identifier(col_name))
     return select_parts, cast_cols
 
 
 def _spark_rewrite_query(
         original_sql: str,
         alias_to_table: Dict[str, str],
+        parsed_expression=None,
 ) -> str:
     """Rewrite table references and transpile SQL to Spark dialect.
 
@@ -675,10 +914,14 @@ def _spark_rewrite_query(
        (``"col"``) to backticks (`` `col` ``), and adapts other syntax
        differences (e.g. INTERVAL literals, type names).
 
-    Falls back to a simple double-quote → backtick replacement if sqlglot
-    transpilation fails for any reason.
+    Any rewrite/transpile ambiguity fails closed. Executing the original
+    catalog names would bypass the request-private reflection/RBAC views.
     """
-    rewritten = rewrite_query_with_hashed_tables(original_sql, alias_to_table)
+    rewritten = rewrite_query_with_hashed_tables(
+        original_sql,
+        alias_to_table,
+        parsed_expression=parsed_expression,
+    )
 
     try:
         import sqlglot
@@ -692,13 +935,9 @@ def _spark_rewrite_query(
         )
         if transpiled and transpiled[0]:
             return transpiled[0]
-    except Exception as e:
-        logger.debug(f"[spark.thrift] sqlglot transpile failed, using quote fallback: {e}")
-
-    # Fallback: replace double-quoted identifiers with backtick-quoted ones.
-    # This handles the common case where sqlglot can't parse the rewritten SQL
-    # but the only issue is identifier quoting style.
-    return _double_quotes_to_backticks(rewritten)
+    except Exception as exc:
+        raise RuntimeError("Unable to transpile protected query for Spark") from exc
+    raise RuntimeError("Unable to transpile protected query for Spark")
 
 
 def _double_quotes_to_backticks(sql: str) -> str:
@@ -1081,7 +1320,12 @@ class SparkThriftExecutor:
                 )
                 if files:
                     intermediates = _spark_create_parquet_view(
-                        cursor, table_name, files,
+                        cursor,
+                        table_name,
+                        files,
+                        column_types=dict(
+                            getattr(sup, "column_types", {}) or {}
+                        ),
                     )
                 else:
                     _spark_create_empty_view(
@@ -1200,7 +1444,9 @@ class SparkThriftExecutor:
 
             # 6. Rewrite and execute
             executing_query = _spark_rewrite_query(
-                parser.original_query, query_alias_to_name,
+                parser.original_query,
+                query_alias_to_name,
+                parsed_expression=getattr(parser, "_parsed", None),
             )
             parser.executing_query = executing_query
 

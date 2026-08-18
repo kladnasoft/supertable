@@ -2,9 +2,16 @@
 """
 Audit logging module for Data Island Core.
 
-Provides an immutable, append-only audit trail for every security-relevant
-action. Dual-tier storage (Redis Streams + Parquet), tamper-evident hash
-chaining, and external SIEM integration via consumer groups.
+Provides two deliberately different audit lanes:
+
+* general security/telemetry events use the non-blocking, configurable logger;
+* RBAC role, user, and assignment mutations plus organization auth-token
+  create/delete use a mandatory Redis outbox committed atomically with the
+  state change and a verified Parquet archive. Token IDs and metadata digests,
+  never plaintext tokens, enter this ledger.
+
+The second lane is never disabled by general audit configuration and never
+silently drops a privileged state transition.
 
 Quick start:
 
@@ -48,6 +55,18 @@ from supertable.audit.logger import (
     get_audit_logger,
     shutdown_all,
 )
+from supertable.audit.privileged import (
+    PrivilegedActionContext,
+    PrivilegedAuditRecord,
+    build_record as build_privileged_record,
+    verify_records as verify_privileged_records,
+)
+from supertable.audit.privileged_outbox import (
+    CascadeEvidenceRow,
+    CascadeManifest,
+    PrivilegedAuditOutbox,
+    PrivilegedOutboxError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +82,45 @@ __all__ = [
     "ActorType",
     "Actions",
     "make_detail",
+    "PrivilegedActionContext",
+    "PrivilegedAuditRecord",
+    "PrivilegedAuditOutbox",
+    "CascadeEvidenceRow",
+    "CascadeManifest",
+    "PrivilegedOutboxError",
+    "build_privileged_record",
+    "verify_privileged_records",
+    "get_privileged_audit_outbox",
 ]
+
+
+def get_privileged_audit_outbox(
+    organization: str,
+    *,
+    redis_client=None,
+    storage=None,
+) -> PrivilegedAuditOutbox:
+    """Construct the mandatory privileged control-plane WAL reader/archiver.
+
+    This is intentionally separate from :func:`get_audit_logger`: runtime
+    audit configuration can disable the best-effort event logger, but it can
+    never disable or redirect the privileged mutation ledger.
+    """
+    if not organization:
+        raise ValueError("organization is required")
+    if redis_client is None:
+        from supertable.redis_connector import RedisConnector
+
+        redis_client = RedisConnector().r
+    from supertable import redis_keys as RK
+    from supertable.audit.writer_parquet import ParquetAuditWriter
+
+    return PrivilegedAuditOutbox(
+        redis_client,
+        stream_key=RK.audit_privileged_outbox(organization),
+        delivery_ledger_key=RK.audit_privileged_delivery(organization),
+        parquet_writer=ParquetAuditWriter(storage=storage),
+    )
 
 
 # ---------------------------------------------------------------------------

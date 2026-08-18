@@ -82,6 +82,7 @@ from supertable.engine.duckdb_engine import DuckDB
 
 from supertable.engine.islanddb import IslandUnsupportedError
 from supertable.engine.spark_thrift import (
+    _spark_quote_identifier,
     _spark_table_name,
     _spark_create_parquet_view,
     _spark_create_rbac_view,
@@ -445,11 +446,11 @@ class TestRewriteQuery:
         )
         assert "st_xyz" in result
 
-    def test_unknown_alias_untouched(self):
-        result = rewrite_query_with_hashed_tables(
-            "SELECT * FROM keep_me", {"other": "st_abc"}
-        )
-        assert "keep_me" in result
+    def test_unknown_alias_fails_closed(self):
+        with pytest.raises(RuntimeError, match="not replaced"):
+            rewrite_query_with_hashed_tables(
+                "SELECT * FROM keep_me", {"other": "st_abc"}
+            )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1773,28 +1774,175 @@ class TestSparkTableName:
     def test_different_version(self):
         assert _spark_table_name("s", "t", 1) != _spark_table_name("s", "t", 2)
 
+    def test_identifier_quote_escapes_columns_and_relation_paths(self):
+        assert _spark_quote_identifier("odd`name") == "`odd``name`"
+        assert _spark_quote_identifier("s3a://bucket/a'`b.parquet") == (
+            "`s3a://bucket/a'``b.parquet`"
+        )
+
 
 class TestSparkCreateParquetView:
 
     def test_single_file(self):
         cursor = MagicMock()
+        cursor.fetchall.return_value = [("id", "bigint")]
         _spark_create_parquet_view(cursor, "tbl", ["/data/f.parquet"])
-        cursor.execute.assert_called_once()
-        sql = cursor.execute.call_args[0][0]
-        assert "CREATE OR REPLACE TEMPORARY VIEW tbl" in sql
-        assert "USING parquet" in sql
+        all_sql = [call.args[0] for call in cursor.execute.call_args_list]
+        assert any("USING parquet" in sql for sql in all_sql)
+        assert all_sql[-1].startswith("CREATE OR REPLACE TEMPORARY VIEW tbl AS")
 
     def test_multiple_files_creates_union(self):
         cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [("id", "bigint"), ("value", "string")],
+            [("id", "bigint"), ("value", "string")],
+        ]
         _spark_create_parquet_view(cursor, "tbl", ["/a.parquet", "/b.parquet"])
         all_sql = [c[0][0] for c in cursor.execute.call_args_list]
         assert any("UNION ALL" in s for s in all_sql)
 
     def test_multiple_files_returns_intermediates(self):
         cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [("id", "bigint")],
+            [("id", "bigint")],
+        ]
         intermediates = _spark_create_parquet_view(cursor, "tbl", ["/a.parquet", "/b.parquet"])
         # Intermediate views are returned for caller cleanup, not dropped inline
         assert len(intermediates) >= 2
+
+    def test_reordered_columns_are_aligned_by_name_before_union(self):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [("id", "string"), ("cvv", "string")],
+            [("cvv", "string"), ("id", "string")],
+        ]
+
+        _spark_create_parquet_view(
+            cursor,
+            "tbl",
+            ["/old.parquet", "/new.parquet"],
+            column_types={"id": "string", "cvv": "string"},
+        )
+
+        union_sql = next(
+            call.args[0]
+            for call in cursor.execute.call_args_list
+            if "CREATE OR REPLACE TEMPORARY VIEW __tbl_batch0__ AS" in call.args[0]
+        )
+        assert (
+            "SELECT `id` AS `id`, `cvv` AS `cvv` FROM __tbl_b0p0__"
+            in union_sql
+        )
+        assert (
+            "SELECT `id` AS `id`, `cvv` AS `cvv` FROM __tbl_b0p1__"
+            in union_sql
+        )
+        assert "SELECT * FROM __tbl_b0p" not in union_sql
+
+    def test_missing_and_obsolete_columns_follow_pinned_snapshot_schema(self):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [("id", "bigint"), ("obsolete", "string")],
+            [("id", "bigint"), ("label", "string")],
+        ]
+
+        _spark_create_parquet_view(
+            cursor,
+            "tbl",
+            ["/old.parquet", "/new.parquet"],
+            column_types={"id": "long", "label": "string", "future": "string"},
+        )
+
+        union_sql = next(
+            call.args[0]
+            for call in cursor.execute.call_args_list
+            if "CREATE OR REPLACE TEMPORARY VIEW __tbl_batch0__ AS" in call.args[0]
+        )
+        aligned_union = union_sql.split(" AS ", 1)[1]
+        old_select, new_select = aligned_union.split(" UNION ALL ")
+        assert old_select == (
+            "SELECT `id` AS `id`, NULL AS `label`, "
+            "CAST(NULL AS string) AS `future` FROM __tbl_b0p0__"
+        )
+        assert new_select == (
+            "SELECT `id` AS `id`, `label` AS `label`, "
+            "CAST(NULL AS string) AS `future` FROM __tbl_b0p1__"
+        )
+        assert "obsolete" not in union_sql
+
+    def test_alignment_quotes_embedded_backticks(self):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [("odd`name", "string")],
+            [("odd`name", "string")],
+        ]
+
+        _spark_create_parquet_view(
+            cursor,
+            "tbl",
+            ["/a.parquet", "/b.parquet"],
+            column_types={"odd`name": "string"},
+        )
+
+        union_sql = next(
+            call.args[0]
+            for call in cursor.execute.call_args_list
+            if "CREATE OR REPLACE TEMPORARY VIEW __tbl_batch0__ AS" in call.args[0]
+        )
+        assert "`odd``name` AS `odd``name`" in union_sql
+
+    def test_pinned_schema_controls_output_spelling_and_order(self):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = [
+            [("ID", "bigint"), ("Label", "string")],
+            [("ID", "bigint"), ("Label", "string")],
+        ]
+
+        _spark_create_parquet_view(
+            cursor,
+            "tbl",
+            ["/a.parquet", "/b.parquet"],
+            column_types={"label": "string", "id": "long"},
+        )
+
+        union_sql = next(
+            call.args[0]
+            for call in cursor.execute.call_args_list
+            if "CREATE OR REPLACE TEMPORARY VIEW __tbl_batch0__ AS" in call.args[0]
+        )
+        assert (
+            "SELECT `Label` AS `label`, `ID` AS `id` FROM __tbl_b0p0__"
+            in union_sql
+        )
+
+    @pytest.mark.parametrize(
+        "descriptions",
+        [
+            [[("ID", "bigint"), ("id", "bigint")], [("id", "bigint")]],
+            [[("ID", "bigint")], [("id", "bigint")]],
+        ],
+    )
+    def test_case_colliding_source_columns_fail_closed(self, descriptions):
+        cursor = MagicMock()
+        cursor.fetchall.side_effect = descriptions
+
+        with pytest.raises(RuntimeError, match="case-colliding"):
+            _spark_create_parquet_view(
+                cursor, "tbl", ["/a.parquet", "/b.parquet"]
+            )
+
+    def test_describe_failure_fails_closed(self):
+        cursor = MagicMock()
+        cursor.execute.side_effect = [None, RuntimeError("describe unavailable")]
+
+        with pytest.raises(RuntimeError, match="safe Spark union"):
+            _spark_create_parquet_view(
+                cursor, "tbl", ["/a.parquet", "/b.parquet"]
+            )
+        assert cursor.execute.call_args_list[-1].args[0] == (
+            "DROP VIEW IF EXISTS `__tbl_b0p0__`"
+        )
 
 
 class TestSparkCreateRbacView:
@@ -1806,6 +1954,9 @@ class TestSparkCreateRbacView:
 
     def test_specific_columns_with_where(self):
         cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            ("id", "bigint"), ("name", "string"), ("org", "bigint"),
+        ]
         _spark_create_rbac_view(
             cursor, "base", "rbac_v",
             RbacViewDef(allowed_columns=["id", "name"], where_clause="org = 1"),
@@ -1899,7 +2050,8 @@ class TestSparkThriftExecutor:
         mock_cluster.return_value = {"cluster_id": "c1", "thrift_host": "h"}
         fake_cursor = MagicMock()
         fake_cursor.description = []
-        fake_cursor.fetchall.return_value = []
+        # Protected projection requires an authoritative DESCRIBE result.
+        fake_cursor.fetchall.return_value = [("id", "bigint")]
         fake_conn = MagicMock()
         fake_conn.cursor.return_value = fake_cursor
         mock_conn.return_value = fake_conn
@@ -2009,6 +2161,18 @@ class TestSparkTimestampCast:
         parts, cast = _build_tscast_select(desc, {"__timestamp__": "ns"})
         assert cast == ["__timestamp__"]
         assert parts == ["timestamp_micros(`__timestamp__` DIV 1000) AS `__timestamp__`"]
+
+    def test_timestamp_wrapper_quotes_embedded_backticks(self):
+        desc = [("odd`name", "string"), ("__timestamp__", "bigint")]
+        parts, cast = _build_tscast_select(desc, {"__timestamp__": "ns"})
+        assert cast == ["__timestamp__"]
+        assert parts == [
+            "`odd``name`",
+            "timestamp_micros(`__timestamp__` DIV 1000) AS `__timestamp__`",
+        ]
+        assert _ts_to_timestamp_expr("odd`ts", "us") == (
+            "timestamp_micros(`odd``ts`) AS `odd``ts`"
+        )
 
     def test_ts_expr_helper_units(self):
         assert _ts_to_timestamp_expr("x", "s") == "timestamp_seconds(`x`) AS `x`"

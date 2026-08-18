@@ -99,7 +99,10 @@ class Staging:
             # Stage mode paths
             self.stage_dir = os.path.join(self.base_staging_dir, self.staging_name)  # type: ignore[arg-type]
             self.files_index_path = os.path.join(self.base_staging_dir, f"{self.staging_name}_files.json")
-            self._with_lock(self._init_stage)
+            # Construction/open is read-only.  Stage resources are created
+            # lazily inside the first authorized write operation; otherwise a
+            # caller could mutate storage and Redis without ever presenting a
+            # role.
         else:
             # Manager mode doesn't create anything; just sets placeholders.
             self.stage_dir = None
@@ -232,6 +235,7 @@ class Staging:
         )
 
         def _op():
+            self._init_stage()
             ts_ns = time.time_ns()
             clean_name = base_file_name.rsplit(".parquet", 1)[0]
             file_name = f"{clean_name}_{ts_ns}.parquet"

@@ -690,8 +690,8 @@ class TestGetTableSchema:
 
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_META)
-    def test_super_level_mget_exception_returns_empty_schema(self, mock_check, MockST):
-        """mget fails → raws=[] → zip produces no iterations → empty schema."""
+    def test_super_level_mget_exception_falls_back_to_snapshot(self, mock_check, MockST):
+        """A metadata-cache outage falls back to the authoritative snapshot."""
         reader = _make_reader("sup", "org")
         _wire_catalog_scan(
             reader.catalog,
@@ -707,9 +707,8 @@ class TestGetTableSchema:
         MockST.return_value = mock_st_inst
 
         result = reader.get_table_schema("sup", "admin")
-        # mget exception → raws=[] → zip(tables, []) → 0 iterations → no fallback
-        assert result == [{}]
-        MockST.assert_not_called()
+        assert result == [{"col": "float"}]
+        MockST.assert_called_once()
 
     @patch(_P_CHECK_META)
     def test_schema_result_is_sorted(self, mock_check):
@@ -1104,7 +1103,8 @@ class TestGetSuperMeta:
         with patch.dict(os.environ, {"SUPERTABLE_SUPER_META_CACHE_TTL_S": "60"}):
             result2 = reader.get_super_meta("admin")
 
-        assert result2 is result1
+        assert result2 == result1
+        assert result2 is not result1
         # scan_leaf_keys should NOT have been called for the cache hit
         reader.catalog.scan_leaf_keys.assert_not_called()
 

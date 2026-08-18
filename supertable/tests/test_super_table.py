@@ -26,9 +26,12 @@ Covers:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
 import pytest
+
+from supertable.rbac.permissions import Permission, RoleType
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +42,7 @@ _P_GET_STORAGE = f"{_MOD}.get_storage"
 _P_REDIS_CAT = f"{_MOD}.RedisCatalog"
 _P_ROLE_MGR = f"{_MOD}.RoleManager"
 _P_USER_MGR = f"{_MOD}.UserManager"
+_P_RESOLVE_ROLE_CONTEXT = f"{_MOD}.resolve_role_access_context"
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +301,16 @@ class TestReadSimpleTableSnapshot:
 
 class TestDelete:
 
+    @pytest.fixture(autouse=True)
+    def _superadmin_context(self):
+        """Patch the symbol imported by super_table; never consult real Redis."""
+        with patch(_P_RESOLVE_ROLE_CONTEXT) as resolver:
+            resolver.return_value = SimpleNamespace(
+                role_type=RoleType.SUPERADMIN,
+            )
+            self.resolve_role_context = resolver
+            yield
+
     def test_happy_path_deletes_storage_and_redis(self):
         st = _make_super("sup", "org")
         st.storage.exists.return_value = True
@@ -306,6 +320,13 @@ class TestDelete:
         st.storage.exists.assert_called_once_with("org/sup")
         st.storage.delete.assert_called_once_with("org/sup")
         st.catalog.delete_super_table.assert_called_once_with("org", "sup")
+        self.resolve_role_context.assert_called_once_with(
+            super_name="sup",
+            organization="org",
+            role_name="admin",
+            permission=Permission.CONTROL,
+            label="delete this SuperTable",
+        )
 
     def test_storage_not_exists_still_deletes_redis(self):
         st = _make_super("sup", "org")
@@ -363,11 +384,17 @@ class TestDelete:
         with pytest.raises(ConnectionError, match="redis down"):
             st.delete(role_name="admin")
 
-    def test_role_name_parameter_accepted(self):
-        """delete() accepts role_name param (used by caller for RBAC, not enforced here)."""
+    def test_non_superadmin_is_denied_before_mutation(self):
+        """ADMIN has CONTROL generally but cannot delete a whole namespace."""
         st = _make_super()
         st.storage.exists.return_value = False
+        self.resolve_role_context.return_value = SimpleNamespace(
+            role_type=RoleType.ADMIN,
+        )
 
-        # Should not raise
-        st.delete(role_name="some_role")
-        st.catalog.delete_super_table.assert_called_once()
+        with pytest.raises(PermissionError, match="Only SUPERADMIN"):
+            st.delete(role_name="admin")
+
+        st.storage.exists.assert_not_called()
+        st.storage.delete.assert_not_called()
+        st.catalog.delete_super_table.assert_not_called()

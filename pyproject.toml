@@ -38,6 +38,7 @@ all = ["supertable[all-cloud]"]
 Homepage = "https://github.com/kladnasoft/supertable"
 
 [project.scripts]
+supertable-privileged-audit-worker = "supertable.audit.privileged_worker:main"
 supertable-demo-quickstart       = "supertable.demo.quickstart.controller:main"
 supertable-demo-webshop-generate = "supertable.demo.webshop.generate:main"
 supertable-demo-webshop-load     = "supertable.demo.webshop.load:main"
@@ -57,3 +58,6 @@ include = ["supertable", "supertable.*"]
 
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+  "integration: requires an explicitly configured disposable external service",
+]

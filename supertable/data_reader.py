@@ -9,6 +9,9 @@ from typing import Optional, Tuple, Any, List, Dict
 from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
+import polars as pl
+import sqlglot
+from sqlglot import exp
 
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
@@ -51,6 +54,45 @@ _DUCKDB_JOIN_PRUNING_LANES = frozenset({
 _COMMON_JOIN_PRUNING_LANES = frozenset({"numeric"})
 
 _URL_IN_ERROR_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+
+
+def _validated_share_row_filter(raw_filter: object) -> str:
+    """Return one canonical, table-local DuckDB predicate or fail closed.
+
+    Linked-share filters are persisted SQL rather than the structured RBAC
+    filter grammar.  They still execute inside the protected view, so they may
+    not contain statement separators, subqueries, table sources, or mutation
+    nodes.  Parsing the complete wrapper also makes later Spark transpilation
+    operate on an AST-derived predicate instead of concatenated raw text.
+    """
+    if not isinstance(raw_filter, str) or not raw_filter.strip():
+        raise RuntimeError("Linked-share row filter is invalid")
+    if len(raw_filter.encode("utf-8")) > 64 * 1024:
+        raise RuntimeError("Linked-share row filter exceeds the size limit")
+    try:
+        statements = sqlglot.parse(
+            f"SELECT 1 WHERE {raw_filter}", read="duckdb"
+        )
+    except Exception as exc:
+        raise RuntimeError("Linked-share row filter is invalid") from exc
+    if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+        raise RuntimeError("Linked-share row filter is invalid")
+    select = statements[0]
+    where = select.args.get("where")
+    if not isinstance(where, exp.Where):
+        raise RuntimeError("Linked-share row filter is invalid")
+    forbidden = tuple(
+        node_type
+        for name in (
+            "Table", "Subquery", "Insert", "Update", "Delete", "Merge",
+            "Create", "Drop", "Alter", "Command", "Copy", "Transaction",
+            "Grant", "TruncateTable",
+        )
+        if isinstance((node_type := getattr(exp, name, None)), type)
+    )
+    if forbidden and any(isinstance(node, forbidden) for node in where.walk()):
+        raise RuntimeError("Linked-share row filter must be table-local")
+    return where.this.sql(dialect="duckdb")
 
 
 def _redact_storage_credentials(message: object) -> str:
@@ -237,11 +279,11 @@ class DataReader:
     def _execute_show_stats(
         self, command, role_name: str,
     ) -> Tuple[pd.DataFrame, Status, Optional[str]]:
-        """Return the raw contents of a table's latest statistics parquet.
+        """Return role-visible rows from a table's latest statistics parquet.
 
         Reads-never-create and table-level RBAC are enforced (the same gates a
-        SELECT hits); the statistics rows/columns themselves are returned
-        unfiltered. When the table exists but has no stats artifact yet, an empty
+        SELECT hits); rows for hidden or denied columns are removed before the
+        frame leaves this method. When the table exists but has no stats artifact, an empty
         frame with the stats schema columns is returned (success, not error).
         """
         from supertable.data_classes import TableDefinition
@@ -267,10 +309,9 @@ class DataReader:
             logger.warning(self._lp(f"[show-stats] target missing: {e}"))
             return pd.DataFrame(), Status.ERROR, str(e)
 
-        # Table-level RBAC: raises PermissionError if the role cannot read the
-        # table at all. columns=[] means "all columns", which skips column-level
-        # denial — we don't filter the stats output, only gate table access.
-        restrict_read_access(
+        # RBAC raises when the table is denied and returns the effective view
+        # definition used below to remove column-level statistics.
+        views = restrict_read_access(
             super_name=super_name,
             organization=self.organization,
             role_name=role_name,
@@ -298,6 +339,33 @@ class DataReader:
 
         if stats_df is None:
             return pd.DataFrame(columns=list(STATS_SCHEMA.keys())), Status.OK, None
+        view_def = views.get(simple_name) if isinstance(views, dict) else None
+        allowed = ["*"] if view_def is None else list(view_def.allowed_columns)
+        excluded = {
+            "__rowid__",
+            "__timestamp__",
+            "__file__",
+            "__supertable_source_file__",
+            "__supertable_scan_filename__",
+        }
+        if view_def is not None:
+            excluded.update(
+                str(name).casefold() for name in view_def.excluded_columns
+            )
+        actual_names = [
+            str(name) for name in stats_df.get_column("column_name").unique()
+            if name is not None
+        ]
+        allowed_folded = (
+            None if allowed == ["*"]
+            else {str(name).casefold() for name in allowed}
+        )
+        visible_names = [
+            name for name in actual_names
+            if name.casefold() not in excluded
+            and (allowed_folded is None or name.casefold() in allowed_folded)
+        ]
+        stats_df = stats_df.filter(pl.col("column_name").is_in(visible_names))
         return stats_df.to_pandas(), Status.OK, None
 
     def execute(
@@ -549,6 +617,9 @@ class DataReader:
                 # Linked-share policy is pinned alongside the same resources.
                 share_row_filter = getattr(sup, "share_row_filter", None)
                 if share_row_filter:
+                    share_row_filter = _validated_share_row_filter(
+                        share_row_filter
+                    )
                     existing_rbac = reflection.rbac_views.get(td.alias)
                     if existing_rbac:
                         if existing_rbac.where_clause:

@@ -112,18 +112,17 @@ SuperTable uses a centralized, immutable configuration system. All settings are 
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `SUPERTABLE_REDIS_URL` | str | _(empty)_ | Redis URL (takes precedence) |
+| `SUPERTABLE_REDIS_URL` | str | _(empty)_ | Direct Redis URL (`redis://` or `rediss://`); its endpoint, ACL credentials, DB, and TLS mode take precedence over split Redis variables. Sentinel mode uses the split Sentinel/Redis variables instead. |
 | `SUPERTABLE_REDIS_HOST` | str | `localhost` | Redis host |
 | `SUPERTABLE_REDIS_PORT` | int | `6379` | Redis port |
 | `SUPERTABLE_REDIS_DB` | int | `0` | Redis database number |
 | `SUPERTABLE_REDIS_PASSWORD` | str | _(empty)_ | Redis password |
 | `SUPERTABLE_REDIS_USERNAME` | str | _(empty)_ | Redis username (ACL) |
-| `SUPERTABLE_REDIS_SSL` | bool | `false` | Enable Redis SSL/TLS |
+| `SUPERTABLE_REDIS_SSL` | bool | `false` | Enable TLS for direct Redis, or for both Sentinel discovery and the resolved Redis master in Sentinel mode |
 | `SUPERTABLE_REDIS_SENTINEL` | bool | `false` | Enable Sentinel mode |
 | `SUPERTABLE_REDIS_SENTINELS` | str | _(empty)_ | Sentinel addresses (comma-separated) |
 | `SUPERTABLE_REDIS_SENTINEL_MASTER` | str | `mymaster` | Sentinel master name |
 | `SUPERTABLE_REDIS_SENTINEL_PASSWORD` | str | _(empty)_ | Sentinel password |
-| `SUPERTABLE_REDIS_SENTINEL_STRICT` | str | _(empty)_ | Strict Sentinel mode |
 | `SUPERTABLE_REFLECTION_REDIS_URL` | str | _(empty)_ | Override Redis URL for UI/reflection |
 
 ### API Server

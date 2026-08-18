@@ -16,6 +16,7 @@ from urllib.parse import urlparse, urlsplit, urlunsplit
 import duckdb
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.scope import traverse_scope
 
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
@@ -1070,10 +1071,34 @@ def rewrite_query_with_hashed_tables(
         try:
             parsed = sqlglot.parse_one(original_sql)
         except Exception as e:
-            logger.warning(f"[duckdb] Failed to parse SQL for rewrite; using original. Error: {e}")
-            return original_sql
+            raise RuntimeError(
+                "Unable to rewrite protected query table references"
+            ) from e
+
+    folded_targets: Dict[str, tuple[str, str]] = {}
+    for alias, physical in alias_to_table.items():
+        folded = str(alias).casefold()
+        if folded in folded_targets:
+            raise RuntimeError("Ambiguous protected query table aliases")
+        folded_targets[folded] = (str(alias), physical)
+    cte_reference_ids: set[int] = set()
+    try:
+        for scope in traverse_scope(parsed):
+            for selected in scope.selected_sources.values():
+                node, source = selected
+                if isinstance(node, exp.Table) and not isinstance(source, exp.Table):
+                    cte_reference_ids.add(id(node))
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to prove protected query table bindings"
+        ) from exc
+    rewritten: set[str] = set()
 
     for table in parsed.find_all(exp.Table):
+        if id(table) in cte_reference_ids:
+            # Query-local CTE reference; its physical leaf sources are handled
+            # independently below/by their own Table nodes.
+            continue
         alias_expr = table.args.get("alias")
         alias_name = None
 
@@ -1085,8 +1110,10 @@ def rewrite_query_with_hashed_tables(
         if not alias_name:
             alias_name = table.name
 
-        if alias_name in alias_to_table:
-            new_physical = alias_to_table[alias_name]
+        target = folded_targets.get(str(alias_name).casefold())
+        if target is not None:
+            canonical_alias, new_physical = target
+            rewritten.add(canonical_alias.casefold())
             table.set("this", exp.to_identifier(new_physical))
             table.set("db", None)
             # Ensure the alias is always present so qualified column references
@@ -1099,6 +1126,16 @@ def rewrite_query_with_hashed_tables(
                     "alias",
                     exp.TableAlias(this=exp.to_identifier(alias_name)),
                 )
+        else:
+            raise RuntimeError(
+                "Protected query contains a physical table source that was "
+                "not replaced by the catalog reflection"
+            )
+
+    if rewritten != set(folded_targets):
+        raise RuntimeError(
+            "Protected query reflection map did not match every physical source"
+        )
 
     return parsed.sql(dialect="duckdb")
 
@@ -1685,13 +1722,53 @@ def create_rbac_view(
         view_name: the view name to create (query will reference this)
         rbac_view_def: RbacViewDef with allowed_columns and where_clause
     """
-    # Column filter
+    # Resolve the deny list against the actual post-tombstone relation on
+    # every query.  This avoids dialect-specific ``EXCLUDE`` syntax, keeps an
+    # absent excluded column harmless, and automatically hides it if schema
+    # evolution introduces it later.  Case-colliding source names are
+    # ambiguous under DuckDB's identifier rules and therefore fail closed.
+    def _quote_policy_column(name: str) -> str:
+        return '"' + str(name).replace('"', '""') + '"'
+
+    excluded = {
+        str(c).casefold()
+        for c in (getattr(rbac_view_def, "excluded_columns", None) or [])
+    }
+    described = None
+    actual_columns = None
+
+    def _actual_columns() -> List[str]:
+        nonlocal described, actual_columns
+        if actual_columns is None:
+            described = _describe_relation(con, quote_if_needed(base_table_name))
+            actual_columns = [str(row[0]) for row in described]
+            folded = [name.casefold() for name in actual_columns]
+            if len(set(folded)) != len(folded):
+                raise RuntimeError(
+                    "Cannot apply RBAC to a relation with case-colliding columns"
+                )
+        return actual_columns
+
     if rbac_view_def.allowed_columns == ["*"]:
-        select_cols = "*"
+        if excluded:
+            visible = [
+                name for name in _actual_columns()
+                if name.casefold() not in excluded
+            ]
+            if not visible:
+                raise PermissionError("RBAC policy excludes every visible column")
+            select_cols = ", ".join(_quote_policy_column(c) for c in visible)
+        else:
+            select_cols = "*"
     else:
-        select_cols = ", ".join(
-            quote_if_needed(c) for c in rbac_view_def.allowed_columns
-        )
+        allowed = {str(c).casefold() for c in rbac_view_def.allowed_columns}
+        visible = [
+            name for name in _actual_columns()
+            if name.casefold() in allowed and name.casefold() not in excluded
+        ]
+        if not visible:
+            raise PermissionError("RBAC policy excludes every allowed column")
+        select_cols = ", ".join(_quote_policy_column(c) for c in visible)
 
     # Row filter
     where_sql = ""

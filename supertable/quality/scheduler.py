@@ -1258,29 +1258,31 @@ def _quick_profile_outcomes(
     return outcomes
 
 
-def _table_snapshot_metadata(
+def _table_snapshot_metadata_with_presence(
     mr,
     table_name: str,
-) -> Tuple[Any, Optional[int], Optional[int]]:
+) -> Tuple[bool, Any, Optional[int], Optional[int]]:
     """Return sealed snapshot timestamp, physical bytes, and live rows.
 
     Size and row completeness are independent.  In particular, a valid table
     may have no public columns, so its row count must come from the pinned
     resource metadata rather than from an invalid empty-column SQL view.  A
     deletion vector is subtracted only when its persisted row-count seal is
-    complete and internally consistent.
+    complete and internally consistent.  The leading flag distinguishes a
+    real table with an empty public schema from a missing table; both have an
+    empty schema mapping after metadata sanitization.
     """
 
     try:
         records = mr.get_table_stats(table_name, "superadmin") or []
     except Exception:
-        return None, None, None
+        return False, None, None, None
     if not records or not isinstance(records[0], dict):
-        return None, None, None
+        return False, None, None, None
     snapshot = records[0]
     resources = snapshot.get("resources")
     if not isinstance(resources, list):
-        return snapshot.get("last_updated_ms"), None, None
+        return True, snapshot.get("last_updated_ms"), None, None
 
     total_size = 0
     total_rows = 0
@@ -1330,10 +1332,23 @@ def _table_snapshot_metadata(
             rows_complete = False
 
     return (
+        True,
         snapshot.get("last_updated_ms"),
         total_size if size_complete else None,
         total_rows if rows_complete else None,
     )
+
+
+def _table_snapshot_metadata(
+    mr,
+    table_name: str,
+) -> Tuple[Any, Optional[int], Optional[int]]:
+    """Compatibility view of sealed metadata without the presence flag."""
+
+    _, modified, size, rows = _table_snapshot_metadata_with_presence(
+        mr, table_name,
+    )
+    return modified, size, rows
 
 
 def _table_metadata(mr, table_name: str) -> Tuple[Any, Optional[int]]:
@@ -1839,15 +1854,18 @@ def _run_quick_check(
     try:
         mr = MetaReader(super_name=sup, organization=org)
         schema_raw = mr.get_table_schema(table_name, "superadmin")
-        if not schema_raw or not schema_raw[0]:
+        if not schema_raw:
             return _failed("quick", f"No schema for {table_name}")
         schema_dict = schema_raw[0]
         columns = filter_visible_columns(list(schema_dict.items()))
         (
+            snapshot_exists,
             last_modified_at,
             current_size_bytes,
             metadata_row_count,
-        ) = _table_snapshot_metadata(mr, table_name)
+        ) = _table_snapshot_metadata_with_presence(mr, table_name)
+        if not schema_dict and not snapshot_exists:
+            return _failed("quick", f"No schema for {table_name}")
     except Exception as e:
         return _failed("quick", f"Schema read failed for {table_name}: {e}")
 
@@ -2053,9 +2071,14 @@ def _run_deep_check(
     try:
         mr = MetaReader(super_name=sup, organization=org)
         schema_raw = mr.get_table_schema(table_name, "superadmin")
-        if not schema_raw or not schema_raw[0]:
+        if not schema_raw:
             return _failed("deep", f"No schema for {table_name}")
         schema_dict = schema_raw[0]
+        if (
+            not schema_dict
+            and not _table_snapshot_metadata_with_presence(mr, table_name)[0]
+        ):
+            return _failed("deep", f"No schema for {table_name}")
         columns = filter_visible_columns(list(schema_dict.items()))
     except Exception as e:
         return _failed("deep", f"Deep schema read failed for {table_name}: {e}")
@@ -2292,12 +2315,18 @@ def _run_custom_check(
     try:
         mr = MetaReader(super_name=sup, organization=org)
         schema_raw = mr.get_table_schema(table_name, "superadmin")
-        if not schema_raw or not schema_raw[0]:
+        if not schema_raw:
             return _failed("custom", f"No schema for {table_name}")
-        columns = filter_visible_columns(list(schema_raw[0].items()))
-        _last_modified, _table_size, metadata_row_count = (
-            _table_snapshot_metadata(mr, table_name)
-        )
+        schema_dict = schema_raw[0]
+        columns = filter_visible_columns(list(schema_dict.items()))
+        (
+            snapshot_exists,
+            _last_modified,
+            _table_size,
+            metadata_row_count,
+        ) = _table_snapshot_metadata_with_presence(mr, table_name)
+        if not schema_dict and not snapshot_exists:
+            return _failed("custom", f"No schema for {table_name}")
     except Exception as exc:
         return _failed("custom", f"Custom-rule schema read failed for {table_name}: {exc}")
 

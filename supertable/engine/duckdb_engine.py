@@ -166,6 +166,12 @@ class DuckDB:
                 continue
 
             cols = list(td.columns or [])
+            # Row/share filters may depend on columns that the user did not
+            # project.  Load the complete pinned relation for those queries;
+            # the RBAC view reapplies the column policy before user SQL runs.
+            view_def = (getattr(reflection, "rbac_views", None) or {}).get(td.alias)
+            if view_def is not None and getattr(view_def, "where_clause", ""):
+                cols = []
 
             # When specific columns are requested, also pull the system
             # columns (__rowid__/__timestamp__) so the tombstone view can
@@ -268,7 +274,9 @@ class DuckDB:
                         query_alias_to_name[alias] = view
 
             executing_query = rewrite_query_with_hashed_tables(
-                parser.original_query, query_alias_to_name,
+                parser.original_query,
+                query_alias_to_name,
+                parsed_expression=getattr(parser, "_parsed", None),
             )
             # EXPLAIN [ANALYZE] wrapper: ask DuckDB for the plan of the rewritten
             # query (over the reflection/tombstone/RBAC view chain) instead of
