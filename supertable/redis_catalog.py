@@ -38,7 +38,16 @@ def _now_ms() -> int:
 
 _ROOT_CLONE_TYPES = frozenset({"readonly", "replica"})
 _REDIS_LUA_MAX_SAFE_INTEGER = (1 << 53) - 1
+# Redis embeds Lua CJSON with a fixed maximum of 14 significant digits.  Any
+# catalog identity that a Lua mutation decodes and re-encodes must therefore
+# stay within 14 decimal digits.  Lua can compare larger integers exactly, and
+# row-ID allocation deliberately retains that separate 2**53 bound.
+_REDIS_JSON_MAX_EXACT_INTEGER = 99_999_999_999_999
 _UNPINNED_MIRROR_CONFIG = object()
+
+
+class _RedisJSONEncodingError(ValueError):
+    """A Python JSON value cannot cross the Redis Lua CJSON boundary."""
 
 
 class _PreparedTableMutationLeaf:
@@ -92,27 +101,46 @@ class _PreparedTableMutationLeaf:
         )
 
 
-def _lua_safe_integer(
+def _redis_json_safe_integer(
         value: Any, *, field: str, minimum: int = 0,
 ) -> int:
-    """Return an integer that Redis Lua can compare without precision loss."""
+    """Return an integer Redis Lua CJSON can round-trip without precision loss."""
     if (
         type(value) is not int
         or value < minimum
-        or value > _REDIS_LUA_MAX_SAFE_INTEGER
+        or value > _REDIS_JSON_MAX_EXACT_INTEGER
     ):
         raise ValueError(
             f"{field} must be an integer from {minimum} through "
-            f"{_REDIS_LUA_MAX_SAFE_INTEGER}"
+            f"{_REDIS_JSON_MAX_EXACT_INTEGER}"
         )
     return value
 
 
 def _publication_timestamp(now_ms: Optional[int]) -> int:
-    return _lua_safe_integer(
+    return _redis_json_safe_integer(
         _now_ms() if now_ms is None else now_ms,
         field="publication timestamp",
     )
+
+
+def _redis_json_dumps(document: Any) -> str:
+    """Serialize JSON that is safe to splice into a Redis Lua document.
+
+    Python's default encoder permits non-finite numbers and lone UTF-16
+    surrogates that Redis Lua CJSON rejects.  A raw-splice optimization must
+    preserve that rejection boundary before any atomic catalog mutation.
+    ``ensure_ascii=False`` leaves every surrogate visible to the strict UTF-8
+    encoder while valid Unicode scalar values remain lossless.
+    """
+    encoded = json.dumps(document, allow_nan=False, ensure_ascii=False)
+    try:
+        encoded.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise _RedisJSONEncodingError(
+            "catalog JSON contains an invalid Unicode surrogate",
+        ) from exc
+    return encoded
 
 
 def persist_unresolved_quality_generation(
@@ -151,17 +179,17 @@ def persist_unresolved_quality_generation(
     local leaf_ok, leaf = pcall(cjson.decode, leaf_payload)
     if not root_ok or type(root) ~= 'table'
         or type(root['version']) ~= 'number' or root['version'] < 0
-        or root['version'] > 9007199254740991
+        or root['version'] > 99999999999999
         or root['version'] ~= math.floor(root['version'])
         or type(root['ts']) ~= 'number' or root['ts'] < 0
-        or root['ts'] > 9007199254740991
+        or root['ts'] > 99999999999999
         or root['ts'] ~= math.floor(root['ts'])
         or not leaf_ok or type(leaf) ~= 'table'
         or type(leaf['version']) ~= 'number' or leaf['version'] < 0
-        or leaf['version'] > 9007199254740991
+        or leaf['version'] > 99999999999999
         or leaf['version'] ~= math.floor(leaf['version'])
         or type(leaf['ts']) ~= 'number' or leaf['ts'] < 0
-        or leaf['ts'] > 9007199254740991
+        or leaf['ts'] > 99999999999999
         or leaf['ts'] ~= math.floor(leaf['ts'])
         or type(leaf['path']) ~= 'string' or leaf['path'] == '' then
         return 0
@@ -187,7 +215,8 @@ def persist_unresolved_quality_generation(
 # validates the full persisted lifecycle contract and returns 0 for a valid
 # but non-writable root at the same atomic boundary as the mutation.
 _LUA_ROOT_DOCUMENT_GUARD = r"""
-local ROOT_MAX_SAFE_INTEGER = 9007199254740991
+local ROOT_MAX_SAFE_INTEGER = 99999999999999
+local LUA_MAX_SAFE_INTEGER = 9007199254740991
 
 local function root_safe_segment(value)
   if type(value) ~= 'string'
@@ -271,10 +300,10 @@ def _validate_root_document(
         not isinstance(document, dict)
         or type(document.get("version")) is not int
         or document["version"] < 0
-        or document["version"] > _REDIS_LUA_MAX_SAFE_INTEGER
+        or document["version"] > _REDIS_JSON_MAX_EXACT_INTEGER
         or type(document.get("ts")) is not int
         or document["ts"] < 0
-        or document["ts"] > _REDIS_LUA_MAX_SAFE_INTEGER
+        or document["ts"] > _REDIS_JSON_MAX_EXACT_INTEGER
     ):
         raise ValueError("invalid root identity fields")
     if "read_only" in document and type(document["read_only"]) is not bool:
@@ -297,7 +326,7 @@ def _validate_root_document(
     if clone_ts is not None and (
         type(clone_ts) is not int
         or clone_ts < 0
-        or clone_ts > _REDIS_LUA_MAX_SAFE_INTEGER
+        or clone_ts > _REDIS_JSON_MAX_EXACT_INTEGER
     ):
         raise ValueError("invalid root clone timestamp")
 
@@ -337,10 +366,10 @@ def _validate_leaf_document(document: Any) -> Dict[str, Any]:
     if (
         type(document.get("version")) is not int
         or document["version"] < 0
-        or document["version"] > _REDIS_LUA_MAX_SAFE_INTEGER
+        or document["version"] > _REDIS_JSON_MAX_EXACT_INTEGER
         or type(document.get("ts")) is not int
         or document["ts"] < 0
-        or document["ts"] > _REDIS_LUA_MAX_SAFE_INTEGER
+        or document["ts"] > _REDIS_JSON_MAX_EXACT_INTEGER
         or not isinstance(document.get("path"), str)
         or not document["path"]
     ):
@@ -1255,7 +1284,7 @@ return removed
 """
 
     _LUA_ROOT_ENSURE = """
-local ROOT_MAX_SAFE_INTEGER = 9007199254740991
+local ROOT_MAX_SAFE_INTEGER = 99999999999999
 local root_key = KEYS[1]
 local namespace_lock = KEYS[2]
 local namespace_delete = KEYS[3]
@@ -1995,7 +2024,7 @@ else
         and tombstone_ok
         and type(raw_floor) == 'number'
         and raw_floor >= 0
-        and raw_floor <= ROOT_MAX_SAFE_INTEGER
+        and raw_floor <= LUA_MAX_SAFE_INTEGER
         and raw_floor == math.floor(raw_floor) then
       floor_available = true
       floor = string.format('%.0f', raw_floor)
@@ -2865,8 +2894,10 @@ if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
   return {-13, 0, 0}
 end
 
-local early_held_token = redis.call('GET', lock_key)
-if not early_held_token or early_held_token ~= lock_token then
+-- Redis runs the script atomically, so this one ownership read fences every
+-- validation and write below; the token cannot change mid-script.
+local held_token = redis.call('GET', lock_key)
+if not held_token or held_token ~= lock_token then
   return {-2, 0, 0}
 end
 
@@ -2891,10 +2922,6 @@ else
   return {-15, 0, 0}
 end
 
-local held_token = redis.call('GET', lock_key)
-if not held_token or held_token ~= lock_token then
-  return {-2, 0, 0}
-end
 if redis.call('EXISTS', namespace_lock) == 1 then
   return {-7, 0, 0}
 end
@@ -2948,14 +2975,6 @@ if old_version ~= expected_version or old_path ~= expected_path then
   return {-1, old_version, 0}
 end
 
-local okp, payload = pcall(cjson.decode, payload_json)
-if not okp or type(payload) ~= 'table' then
-  return {-4, 0, 0}
-end
-local oks, schema = pcall(cjson.decode, schema_json)
-if not oks or type(schema) ~= 'table' then
-  return {-4, 0, 0}
-end
 if old_version >= ROOT_MAX_SAFE_INTEGER
     or root_version >= ROOT_MAX_SAFE_INTEGER then
   return {-13, 0, 0}
@@ -2963,18 +2982,22 @@ end
 
 local new_leaf_version = old_version + 1
 local new_root_version = root_version + 1
-local leaf = {
-  version = new_leaf_version,
-  ts = now_ms,
-  path = new_path,
-  payload = payload,
-  commit_id = commit_id
-}
+-- Python constructed both JSON arguments from dictionaries with non-finite
+-- values disabled.  Splice the already validated payload into the leaf once
+-- instead of decoding and re-encoding a growing snapshot inside Redis.  The
+-- scalar strings still come from Redis' ARGV and are JSON-escaped here; exact
+-- integer formatting avoids Lua CJSON's scientific-notation shortcut at the
+-- persisted catalog-identity ceiling.
+local leaf_json = '{"version":' .. string.format('%.0f', new_leaf_version)
+    .. ',"ts":' .. string.format('%.0f', now_ms)
+    .. ',"path":' .. cjson.encode(new_path)
+    .. ',"payload":' .. payload_json
+    .. ',"commit_id":' .. cjson.encode(commit_id) .. '}'
 root['version'] = new_root_version
 root['ts'] = now_ms
 root['commit_id'] = commit_id
 
-redis.call('SET', leaf_key, cjson.encode(leaf))
+redis.call('SET', leaf_key, leaf_json)
 redis.call('SET', root_key, cjson.encode(root))
 redis.call('SET', schema_key, schema_json)
 redis.call('SADD', table_names, simple_name)
@@ -5159,7 +5182,7 @@ return 1
                 not isinstance(formats, list)
                 or type(timestamp) is not int
                 or timestamp < 0
-                or timestamp > _REDIS_LUA_MAX_SAFE_INTEGER
+                or timestamp > _REDIS_JSON_MAX_EXACT_INTEGER
             ):
                 raise ValueError(
                     f"Mirror configuration is invalid for {org}/{sup}"
@@ -6278,14 +6301,18 @@ return 1
         if not lock_token:
             raise LockLostError("snapshot publication requires a fencing lock token")
         timestamp = _publication_timestamp(now_ms)
-        base_version = _lua_safe_integer(
+        base_version = _redis_json_safe_integer(
             expected_version,
             field="expected snapshot version",
             minimum=-1,
         )
         try:
             payload = snapshot_cache_payload(payload)
-            payload_json = json.dumps(payload)
+            payload_json = _redis_json_dumps(payload)
+        except _RedisJSONEncodingError as exc:
+            raise ValueError(
+                "snapshot payload contains an invalid Unicode surrogate",
+            ) from exc
         except Exception as exc:
             raise ValueError("snapshot payload is not JSON serializable") from exc
 
@@ -6340,7 +6367,7 @@ return 1
                     or pinned_document.get("formats") != []
                     or type(pinned_document.get("ts")) is not int
                     or pinned_document["ts"] < 0
-                    or pinned_document["ts"] > _REDIS_LUA_MAX_SAFE_INTEGER
+                    or pinned_document["ts"] > _REDIS_JSON_MAX_EXACT_INTEGER
                 ):
                     raise ValueError(
                         "expected_mirror_pin is not an empty mirror configuration"
@@ -6348,7 +6375,9 @@ return 1
                 mirror_pin_present = True
                 mirror_pin_raw = expected_mirror_pin
         try:
-            schema_json = json.dumps(self._snapshot_schema_document(payload))
+            schema_json = _redis_json_dumps(
+                self._snapshot_schema_document(payload),
+            )
             if use_no_mirror_path:
                 raw = self._snapshot_commit_no_mirrors(
                     keys=[
@@ -7214,7 +7243,7 @@ return 1
             if (
                 type(obj.get("ts")) is not int
                 or obj["ts"] < 0
-                or obj["ts"] > _REDIS_LUA_MAX_SAFE_INTEGER
+                or obj["ts"] > _REDIS_JSON_MAX_EXACT_INTEGER
             ):
                 raise ValueError("Mirror configuration timestamp is invalid")
             formats = obj.get("formats")

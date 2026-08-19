@@ -206,10 +206,13 @@ def test_configure_table_linearizes_at_lock_after_same_name_recreation():
 
 
 @pytest.mark.parametrize("field", ["version", "ts"])
-def test_root_identity_above_lua_exact_range_is_rejected_without_mutation(field):
+@pytest.mark.parametrize("invalid", [100_000_000_000_000, 1 << 53])
+def test_root_identity_above_json_exact_range_is_rejected_without_mutation(
+    field, invalid,
+):
     catalog, client = _catalog()
     document = {"version": 1, "ts": 1}
-    document[field] = 1 << 53
+    document[field] = invalid
     raw = json.dumps(document)
     key = RK.meta_root("acme", "lake")
     client.set(key, raw)
@@ -220,10 +223,10 @@ def test_root_identity_above_lua_exact_range_is_rejected_without_mutation(field)
     assert client.get(key) == raw
 
 
-def test_root_version_at_lua_exact_ceiling_cannot_be_incremented():
+def test_root_version_at_redis_json_exact_ceiling_cannot_be_incremented():
     catalog, client = _catalog()
     key = RK.meta_root("acme", "lake")
-    raw = json.dumps({"version": (1 << 53) - 1, "ts": 1})
+    raw = json.dumps({"version": 99_999_999_999_999, "ts": 1})
     client.set(key, raw)
 
     with pytest.raises(RuntimeError, match="numeric identity is exhausted"):
@@ -232,8 +235,10 @@ def test_root_version_at_lua_exact_ceiling_cannot_be_incremented():
     assert client.get(key) == raw
 
 
-@pytest.mark.parametrize("invalid", [True, -1, 1 << 53])
-def test_public_lifecycle_writers_reject_non_lua_safe_timestamps(invalid):
+@pytest.mark.parametrize(
+    "invalid", [True, -1, 100_000_000_000_000, 1 << 53],
+)
+def test_public_lifecycle_writers_reject_non_json_safe_timestamps(invalid):
     catalog, client = _catalog()
     _seed_root(client)
     namespace_token = catalog.acquire_namespace_lock(
@@ -260,12 +265,15 @@ def test_public_lifecycle_writers_reject_non_lua_safe_timestamps(invalid):
 
 
 @pytest.mark.parametrize("field", ["version", "ts"])
-def test_snapshot_commit_rejects_leaf_identity_above_lua_exact_range(field):
+@pytest.mark.parametrize("invalid", [100_000_000_000_000, 1 << 53])
+def test_snapshot_commit_rejects_leaf_identity_above_json_exact_range(
+    field, invalid,
+):
     catalog, client = _catalog()
     _seed_root(client)
     leaf_key = RK.meta_leaf("acme", "lake", "orders")
     leaf = {"version": 0, "ts": 1, "path": "snapshots/v0.json"}
-    leaf[field] = 1 << 53
+    leaf[field] = invalid
     leaf_raw = json.dumps(leaf)
     root_raw = client.get(RK.meta_root("acme", "lake"))
     client.set(leaf_key, leaf_raw)
@@ -286,10 +294,10 @@ def test_snapshot_commit_rejects_leaf_identity_above_lua_exact_range(field):
     assert client.get(RK.meta_root("acme", "lake")) == root_raw
 
 
-def test_snapshot_commit_cannot_increment_root_at_lua_exact_ceiling():
+def test_snapshot_commit_cannot_increment_root_at_redis_json_exact_ceiling():
     catalog, client = _catalog()
     root_key = RK.meta_root("acme", "lake")
-    root_raw = json.dumps({"version": (1 << 53) - 1, "ts": 1})
+    root_raw = json.dumps({"version": 99_999_999_999_999, "ts": 1})
     leaf_key = RK.meta_leaf("acme", "lake", "orders")
     leaf_raw = json.dumps({
         "version": 0,

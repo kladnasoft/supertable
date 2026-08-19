@@ -171,6 +171,189 @@ def test_pinned_empty_mirror_document_uses_small_commit_path(monkeypatch):
     general_commit.assert_not_called()
 
 
+def test_no_mirror_commit_reloads_after_fakeredis_script_cache_reset():
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token",
+    )
+
+    # A promoted replica or restarted primary has an empty script cache even
+    # when its catalog data survived. redis-py's registered Script must recover
+    # from NOSCRIPT without a fake-only warm-up call.
+    fake.script_flush()
+
+    assert catalog.commit_snapshot(
+        "org", "lake", "table", {"resources": []}, "snap/5.json",
+        expected_version=4,
+        expected_path="snap/4.json",
+        lock_token="token",
+        commit_id="commit-5",
+        expected_mirrors=context["mirrors"],
+        expected_mirror_pin=context["mirror_pin"],
+        now_ms=123,
+    ) == (5, 10)
+    assert fake.script_exists(catalog._snapshot_commit_no_mirrors.sha) == [True]
+
+
+def test_no_mirror_commit_fails_closed_after_fakeredis_data_reset():
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token",
+    )
+    fake.flushdb()
+
+    with pytest.raises(LockLostError):
+        catalog.commit_snapshot(
+            "org", "lake", "table", {"resources": []}, "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            commit_id="commit-5",
+            expected_mirrors=context["mirrors"],
+            expected_mirror_pin=context["mirror_pin"],
+            now_ms=123,
+        )
+
+    assert not fake.exists(RK.meta_leaf("org", "lake", "table"))
+    assert not fake.exists(RK.meta_root("org", "lake"))
+
+
+def test_no_mirror_commit_raw_splice_escapes_scalars_and_rejects_nan():
+    catalog, fake = _catalog()
+    _seed(fake, version=4, path="snap/4.json")
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+
+    with pytest.raises(ValueError, match="not JSON serializable"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", {"bad": float("nan")}, "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            commit_id="commit-5",
+            expected_mirrors=[],
+            expected_mirror_pin=None,
+            now_ms=123,
+        )
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+
+    for invalid_unicode in ("\ud800", {"\udfff": "value"}):
+        with pytest.raises(ValueError, match="invalid Unicode surrogate"):
+            catalog.commit_snapshot(
+                "org",
+                "lake",
+                "table",
+                {"resources": [], "invalid": invalid_unicode},
+                "snap/5.json",
+                expected_version=4,
+                expected_path="snap/4.json",
+                lock_token="token",
+                commit_id="commit-5",
+                expected_mirrors=[],
+                expected_mirror_pin=None,
+                now_ms=123,
+            )
+        assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+        assert fake.get(RK.meta_root("org", "lake")) == before_root
+
+    hostile_path = 'snap/quote"-slash\\-snowman-☃.json'
+    hostile_commit = 'commit"-slash\\-snowman-☃'
+    assert catalog.commit_snapshot(
+        "org", "lake", "table", {"resources": [], "label": "☃"},
+        hostile_path,
+        expected_version=4,
+        expected_path="snap/4.json",
+        lock_token="token",
+        commit_id=hostile_commit,
+        expected_mirrors=[],
+        expected_mirror_pin=None,
+        now_ms=123,
+    ) == (5, 10)
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    assert leaf["path"] == hostile_path
+    assert leaf["commit_id"] == hostile_commit
+    assert leaf["payload"]["label"] == "☃"
+
+
+def test_no_mirror_commit_formats_redis_json_integer_ceiling_exactly():
+    catalog, fake = _catalog()
+    ceiling = 99_999_999_999_999
+    _seed(fake, version=ceiling - 1, path="snap/max-1.json")
+    fake.set(
+        RK.meta_root("org", "lake"),
+        json.dumps({"version": ceiling - 1, "ts": 1, "read_only": False}),
+    )
+
+    assert catalog.commit_snapshot(
+        "org", "lake", "table", {"resources": []}, "snap/max.json",
+        expected_version=ceiling - 1,
+        expected_path="snap/max-1.json",
+        lock_token="token",
+        commit_id="commit-max",
+        expected_mirrors=[],
+        expected_mirror_pin=None,
+        now_ms=ceiling,
+    ) == (ceiling, ceiling)
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    root = json.loads(fake.get(RK.meta_root("org", "lake")))
+    assert type(leaf["version"]) is int
+    assert type(leaf["ts"]) is int
+    assert type(root["version"]) is int
+    assert type(root["ts"]) is int
+    assert leaf["version"] == ceiling
+    assert leaf["ts"] == ceiling
+    assert root["version"] == ceiling
+    assert root["ts"] == ceiling
+
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+    with pytest.raises(ValueError, match="publication timestamp"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", {"resources": []}, "snap/overflow.json",
+            expected_version=ceiling,
+            expected_path="snap/max.json",
+            lock_token="token",
+            commit_id="commit-overflow",
+            expected_mirrors=[],
+            expected_mirror_pin=None,
+            now_ms=ceiling + 1,
+        )
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+
+
+def test_no_mirror_commit_preserves_int64_payload_beyond_lua_exact_range():
+    catalog, fake = _catalog()
+    _seed(fake, version=4, path="snap/4.json")
+    int64_max = (1 << 63) - 1
+
+    assert catalog.commit_snapshot(
+        "org",
+        "lake",
+        "table",
+        {
+            "resources": [],
+            "rowid_high_watermark": int64_max,
+            "lineage": {"exact_integer": int64_max},
+        },
+        "snap/5.json",
+        expected_version=4,
+        expected_path="snap/4.json",
+        lock_token="token",
+        commit_id="commit-int64",
+        expected_mirrors=[],
+        expected_mirror_pin=None,
+        now_ms=123,
+    ) == (5, 10)
+
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    assert leaf["payload"]["rowid_high_watermark"] == int64_max
+    assert leaf["payload"]["lineage"]["exact_integer"] == int64_max
+
+
 def test_pinned_no_mirror_commit_rejects_concurrent_enable():
     catalog, fake = _catalog()
     _seed_current_snapshot(fake)
