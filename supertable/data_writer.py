@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from datetime import datetime, timezone
 import re
 from typing import Any
@@ -15,7 +16,12 @@ from polars import DataFrame
 
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
-from supertable.errors import SuperTableNotFoundError, TableNotFoundError
+from supertable.errors import (
+    LockLostError,
+    SnapshotCommitConflictError,
+    SuperTableNotFoundError,
+    TableNotFoundError,
+)
 from supertable.monitoring.partitions import MONITORING_SINK_TABLES
 from supertable.monitoring_writer import (
     MonitoringDurabilityError,
@@ -320,6 +326,7 @@ class DataWriter:
         mirror_pin_available: bool = False,
         mirror_pin: str | None = None,
         notify_quality: bool = False,
+        durability_batch: Any | None = None,
     ) -> None:
         """Publish a snapshot through the fenced atomic catalog primitive.
 
@@ -392,6 +399,12 @@ class DataWriter:
             if atomic_quality:
                 commit_kwargs["quality_generation"] = commit_id
             try:
+                if durability_batch is not None:
+                    # The directory barrier is complete at this point.  Mark
+                    # the exact ambiguity boundary immediately before the
+                    # atomic catalog call: failures from here onward may mean
+                    # Redis committed, so rollback must retain durable files.
+                    durability_batch.catalog_commit_started()
                 self.catalog.commit_snapshot(
                     self.super_table.organization,
                     self.super_table.super_name,
@@ -400,7 +413,16 @@ class DataWriter:
                     path,
                     **commit_kwargs,
                 )
+                if durability_batch is not None:
+                    durability_batch.catalog_commit_succeeded()
             except Exception as exc:
+                if durability_batch is not None and isinstance(
+                    exc, (SnapshotCommitConflictError, LockLostError),
+                ):
+                    # These typed responses prove the fenced Lua transaction
+                    # rejected the commit. Unlike a transport timeout, cleanup
+                    # is therefore safe and should remove its exact orphans.
+                    durability_batch.catalog_commit_rejected()
                 if mirror_formats:
                     try:
                         self.catalog.fail_mirror_publication(
@@ -811,6 +833,7 @@ class DataWriter:
         mirror_error: Exception | None = None
         mirror_snapshot_path: str | None = None
         monitoring_error: MonitoringDurabilityError | None = None
+        durability_batch = None
 
         try:
             logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level}, newer_than={newer_than}, delete_only={delete_only})"))
@@ -978,6 +1001,13 @@ class DataWriter:
             prior_tombstone_rows = self._declared_tombstone_rows(last_simple_table)
             prior_tombstone_digest = self._declared_tombstone_digest(last_simple_table)
             mark("snapshot")
+
+            batch_factory = getattr(
+                self.super_table.storage, "durability_batch", None,
+            )
+            if callable(batch_factory):
+                durability_batch = batch_factory()
+                durability_batch.__enter__()
 
             if mutation_context is not None:
                 enabled_mirrors = list(mutation_context.get("mirrors") or [])
@@ -1386,8 +1416,12 @@ class DataWriter:
                 tombstone_work = bool(not delete_all and new_delete_pairs)
                 if do_insert and tombstone_work:
                     with ThreadPoolExecutor(max_workers=2) as _ex:
-                        _f_data = _ex.submit(_write_data_branch)
-                        _f_tomb = _ex.submit(_write_tombstone_branch)
+                        _f_data = _ex.submit(
+                            copy_context().run, _write_data_branch,
+                        )
+                        _f_tomb = _ex.submit(
+                            copy_context().run, _write_tombstone_branch,
+                        )
                         # .result() re-raises in the parent: a failure in either
                         # PUT aborts the write before any snapshot commit, exactly
                         # as the former sequential path did (an orphaned immutable
@@ -1963,6 +1997,11 @@ class DataWriter:
 
                 payload = new_snapshot_dict
 
+                if durability_batch is not None:
+                    # No catalog pointer may reference a rename until every
+                    # immutable file and its deduplicated directory ancestry is
+                    # durable. A barrier failure aborts before Redis is touched.
+                    durability_batch.barrier()
                 with profiler.span("redis.set_leaf"):
                     self._publish_snapshot(
                         simple_table=simple_table,
@@ -1983,6 +2022,7 @@ class DataWriter:
                             simple_name.startswith("__")
                             and simple_name.endswith("__")
                         ),
+                        durability_batch=durability_batch,
                     )
                 if prev_tombstone_path and prev_tombstone_path != tombstone_path:
                     evict_tombstone(
@@ -2108,16 +2148,27 @@ class DataWriter:
             logger.error(lp(f"write() failed: {e!s}"))
             raise
         finally:
-            # Release per-simple lock first
-            if token:
+            try:
+                # Before the catalog ambiguity boundary, remove only paths this
+                # mutation newly created and fsync those removals. After commit
+                # starts, abort() intentionally retains all durable objects.
+                if durability_batch is not None:
+                    durability_batch.abort()
+            finally:
                 try:
-                    ok = self.catalog.release_simple_lock(
-                        self.super_table.organization, self.super_table.super_name, simple_name, token
-                    )
-                    if not ok:
-                        logger.debug(lp("Lock release skipped (token mismatch or already expired)."))
-                except Exception:
-                    pass
+                    if durability_batch is not None:
+                        durability_batch.close()
+                finally:
+                    # Release per-simple lock after rollback/durability cleanup.
+                    if token:
+                        try:
+                            ok = self.catalog.release_simple_lock(
+                                self.super_table.organization, self.super_table.super_name, simple_name, token
+                            )
+                            if not ok:
+                                logger.debug(lp("Lock release skipped (token mismatch or already expired)."))
+                        except Exception:
+                            pass
 
         # ---------- LOCK IS RELEASED HERE ----------
         # Monitoring enqueue + flush is fully outside any data locks.

@@ -1197,8 +1197,21 @@ def test_snapshot_commit_rejects_lost_fencing_lock_without_changing_catalog():
 
 
 def test_ambiguous_atomic_commit_error_is_never_retried_as_path_only():
+    events = []
+
+    class Batch:
+        def catalog_commit_started(self):
+            events.append("commit_started")
+
+        def catalog_commit_succeeded(self):
+            events.append("commit_succeeded")
+
+        def catalog_commit_rejected(self):
+            events.append("commit_rejected")
+
     class Catalog:
         def commit_snapshot(self, *args, **kwargs):
+            events.append("redis")
             raise TimeoutError("reply lost after Redis commit")
 
         set_leaf_payload_cas = MagicMock()
@@ -1220,11 +1233,52 @@ def test_ambiguous_atomic_commit_error_is_never_retried_as_path_only():
             lock_token="token",
             commit_id="commit-5",
             now_ms=123,
+            durability_batch=Batch(),
         )
 
+    assert events == ["commit_started", "redis"]
     writer.catalog.set_leaf_payload_cas.assert_not_called()
     writer.catalog.set_leaf_path_cas.assert_not_called()
     writer.catalog.bump_root.assert_not_called()
+
+
+def test_typed_catalog_rejection_returns_batch_to_safe_orphan_cleanup():
+    events = []
+
+    class Batch:
+        def catalog_commit_started(self):
+            events.append("commit_started")
+
+        def catalog_commit_succeeded(self):
+            events.append("commit_succeeded")
+
+        def catalog_commit_rejected(self):
+            events.append("commit_rejected")
+
+    class Catalog:
+        def commit_snapshot(self, *args, **kwargs):
+            events.append("redis")
+            raise SnapshotCommitConflictError("stale base")
+
+    writer = DataWriter.__new__(DataWriter)
+    writer.super_table = SimpleNamespace(organization="org", super_name="lake")
+    writer.catalog = Catalog()
+    table = SimpleNamespace(_last_snapshot_leaf={"version": 4, "path": "snap/4.json"})
+
+    with pytest.raises(SnapshotCommitConflictError, match="stale base"):
+        writer._publish_snapshot(
+            simple_table=table,
+            simple_name="table",
+            payload={"resources": []},
+            path="snap/5.json",
+            base_path="snap/4.json",
+            lock_token="token",
+            commit_id="commit-5",
+            now_ms=123,
+            durability_batch=Batch(),
+        )
+
+    assert events == ["commit_started", "redis", "commit_rejected"]
 
 
 def test_writer_passes_pinned_empty_mirror_generation_to_capable_catalog():

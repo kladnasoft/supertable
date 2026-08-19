@@ -14,6 +14,7 @@ import uuid
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import datetime, date, timezone
 from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Set, Tuple, Optional, cast
@@ -1303,7 +1304,12 @@ def _compact_resources_with_tombstones(
             if len(pending_writes) >= encode_workers:
                 _harvest_one()
             pending_writes.append(
-                executor.submit(_write_final_chunk, merged, estimated)
+                executor.submit(
+                    copy_context().run,
+                    _write_final_chunk,
+                    merged,
+                    estimated,
+                )
             )
         else:
             # Do not overlap a native/global-pool encode with queued PyArrow
@@ -7483,7 +7489,9 @@ def compact_tombstones(
         try:
             for item in items:
                 try:
-                    futures.append(executor.submit(_drain_group, item))
+                    futures.append(
+                        executor.submit(copy_context().run, _drain_group, item)
+                    )
                 except BaseException as error:
                     _remember_failure(error)
                     break

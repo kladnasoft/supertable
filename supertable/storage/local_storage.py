@@ -2,6 +2,7 @@
 import json
 import os
 import fnmatch
+import contextvars
 import pyarrow as pa
 import pyarrow.parquet as pq
 import shutil
@@ -86,6 +87,249 @@ class _DirectoryHandle:
             pass
 
 
+class _BatchedPublication:
+    """One newly-created immutable object owned by a durability batch."""
+
+    __slots__ = (
+        "path",
+        "directory",
+        "device",
+        "inode",
+        "fd",
+        "published",
+    )
+
+    def __init__(self, path: str, directory: str) -> None:
+        self.path = os.path.abspath(path)
+        self.directory = os.path.abspath(directory)
+        self.device: int | None = None
+        self.inode: int | None = None
+        self.fd: int | None = None
+        self.published = False
+
+    def pin_published_file(self, published_fd: int | None = None) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = (
+            os.dup(published_fd)
+            if published_fd is not None
+            else os.open(self.path, flags)
+        )
+        try:
+            observed = os.fstat(fd)
+            if not stat.S_ISREG(observed.st_mode):
+                raise OSError(f"published object is not a regular file: {self.path}")
+            self.device = int(observed.st_dev)
+            self.inode = int(observed.st_ino)
+            self.fd = fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def path_still_names_published_file(self) -> bool:
+        if self.fd is None or self.device is None or self.inode is None:
+            return False
+        try:
+            current = os.stat(self.path, follow_symlinks=False)
+            pinned = os.fstat(self.fd)
+        except (FileNotFoundError, NotADirectoryError, OSError):
+            return False
+        expected = (self.device, self.inode)
+        return (
+            stat.S_ISREG(current.st_mode)
+            and stat.S_ISREG(pinned.st_mode)
+            and (int(current.st_dev), int(current.st_ino)) == expected
+            and (int(pinned.st_dev), int(pinned.st_ino)) == expected
+        )
+
+    def close(self) -> None:
+        fd, self.fd = self.fd, None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+_ACTIVE_DURABILITY_BATCH: contextvars.ContextVar[Optional["_DurabilityBatch"]] = (
+    contextvars.ContextVar("supertable_local_durability_batch", default=None)
+)
+
+
+class _DurabilityBatch:
+    """Write-scoped directory durability barrier for immutable objects.
+
+    File contents are flushed before each rename exactly as in the ordinary
+    LocalStorage path.  Only the directory-entry flush is coalesced.  A batch
+    is context-local (and explicitly propagated to writer worker threads), so
+    independent writers sharing one LocalStorage root cannot steal each
+    other's publication scope.
+    """
+
+    __slots__ = (
+        "storage",
+        "root",
+        "pid",
+        "_lock",
+        "_publications",
+        "_state",
+        "_token",
+    )
+
+    def __init__(self, storage: "LocalStorage") -> None:
+        self.storage = storage
+        self.root = storage.root
+        self.pid = os.getpid()
+        self._lock = threading.RLock()
+        self._publications: list[_BatchedPublication] = []
+        self._state = "new"
+        self._token = None
+
+    def __enter__(self) -> "_DurabilityBatch":
+        with self._lock:
+            if self._state != "new":
+                raise RuntimeError("durability batch cannot be re-entered")
+            if _ACTIVE_DURABILITY_BATCH.get() is not None:
+                raise RuntimeError("nested LocalStorage durability batches are not supported")
+            self._token = _ACTIVE_DURABILITY_BATCH.set(self)
+            self._state = "open"
+        return self
+
+    def accepts(self, storage: "LocalStorage") -> bool:
+        return (
+            self.pid == os.getpid()
+            and self.root == storage.root
+            and self._state == "open"
+        )
+
+    def publish_new_immutable(
+        self,
+        *,
+        tmp_path: str,
+        path: str,
+        directory: str,
+        published_fd: int | None = None,
+    ) -> bool:
+        """Rename and pin a new target, or return False for replacement writes."""
+
+        with self._lock:
+            if self._state != "open":
+                raise RuntimeError("cannot publish after the durability barrier")
+            # DataWriter paths are UUID-named immutable objects.  A caller that
+            # intentionally replaces an existing object retains the ordinary
+            # per-call fsync semantics and is never enrolled in rollback.
+            if os.path.lexists(path):
+                return False
+            publication = _BatchedPublication(path, directory)
+            self._publications.append(publication)
+            os.replace(tmp_path, path)
+            publication.published = True
+            publication.pin_published_file(published_fd)
+            return True
+
+    def _verify_publications_locked(self) -> None:
+        for publication in self._publications:
+            if (
+                publication.published
+                and not publication.path_still_names_published_file()
+            ):
+                raise OSError(
+                    "immutable object changed before durability barrier: "
+                    f"{publication.path}"
+                )
+
+    def barrier(self) -> None:
+        """Make every enrolled rename durable before catalog publication."""
+
+        with self._lock:
+            if self._state != "open":
+                raise RuntimeError("durability barrier may run exactly once")
+            self._verify_publications_locked()
+            directories = {
+                publication.directory
+                for publication in self._publications
+                if publication.published
+            }
+            if directories:
+                self.storage._fsync_logical_publications(directories)
+            # Detect directory replacement, path substitution, or unlink races
+            # both before and after the directory durability operation.
+            self._verify_publications_locked()
+            self._state = "durable"
+
+    def catalog_commit_started(self) -> None:
+        """Mark the point after which a Redis failure can be ambiguous."""
+
+        with self._lock:
+            if self._state != "durable":
+                raise RuntimeError("catalog commit requires a completed durability barrier")
+            self._state = "commit_started"
+
+    def catalog_commit_succeeded(self) -> None:
+        with self._lock:
+            if self._state != "commit_started":
+                raise RuntimeError("catalog commit was not started")
+            self._state = "committed"
+
+    def catalog_commit_rejected(self) -> None:
+        """Record a typed, definite CAS/lease rejection (not an ambiguity)."""
+
+        with self._lock:
+            if self._state != "commit_started":
+                raise RuntimeError("catalog commit was not started")
+            self._state = "commit_rejected"
+
+    def abort(self) -> None:
+        """Remove only still-identical new paths when Redis was never attempted."""
+
+        with self._lock:
+            if self._state in {"aborted", "committed", "commit_started", "closed"}:
+                return
+            cleanup_directories: set[str] = set()
+            first_error: BaseException | None = None
+            for publication in reversed(self._publications):
+                if not publication.published:
+                    continue
+                if not publication.path_still_names_published_file():
+                    continue
+                try:
+                    os.unlink(publication.path)
+                    cleanup_directories.add(publication.directory)
+                except FileNotFoundError:
+                    continue
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+            try:
+                if cleanup_directories:
+                    self.storage._fsync_logical_publications(cleanup_directories)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            self._state = "aborted"
+            if first_error is not None:
+                raise first_error
+
+    def close(self) -> None:
+        with self._lock:
+            for publication in self._publications:
+                publication.close()
+            if self._token is not None and self.pid == os.getpid():
+                _ACTIVE_DURABILITY_BATCH.reset(self._token)
+                self._token = None
+            if self._state not in {"aborted", "committed", "commit_started"}:
+                self._state = "closed"
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            if exc_type is not None:
+                self.abort()
+            elif self._state != "committed":
+                raise RuntimeError("durability batch exited without a catalog commit")
+        finally:
+            self.close()
+        return False
+
+
 class LocalStorage(StorageInterface):
     """
     A local disk-based implementation of StorageInterface.
@@ -118,6 +362,67 @@ class LocalStorage(StorageInterface):
         self._durable_directory_limit = 256
         self._trusted_durability_anchors = self._open_existing_ancestor_chain(
             self._logical_durability_anchor,
+        )
+
+    def durability_batch(self) -> _DurabilityBatch:
+        """Create a write-scoped immutable-publication durability batch.
+
+        Callers must complete :meth:`_DurabilityBatch.barrier` before starting
+        their catalog transaction, then mark that transaction started/succeeded.
+        Ordinary LocalStorage callers that do not enter this scope retain the
+        existing per-object file+directory fsync boundary.
+        """
+
+        return _DurabilityBatch(self)
+
+    def _active_durability_batch(
+        self,
+        *,
+        logical_input: bool,
+    ) -> Optional[_DurabilityBatch]:
+        # Absolute paths are a compatibility escape hatch that may live outside
+        # this storage namespace; never enroll them in a root-scoped batch.
+        if not logical_input:
+            return None
+        batch = _ACTIVE_DURABILITY_BATCH.get()
+        if batch is not None and batch.accepts(self):
+            return batch
+        return None
+
+    def _publish_completed_temp(
+        self,
+        *,
+        tmp_path: str,
+        path: str,
+        directory: str,
+        logical_input: bool,
+        durability_anchor: str,
+        published_fd: int | None = None,
+    ) -> os.stat_result:
+        """Install one file, deferring only a new immutable entry if scoped."""
+
+        batch = self._active_durability_batch(logical_input=logical_input)
+        if batch is not None and batch.publish_new_immutable(
+            tmp_path=tmp_path,
+            path=path,
+            directory=directory,
+            published_fd=published_fd,
+        ):
+            return (
+                os.fstat(published_fd)
+                if published_fd is not None
+                else os.stat(path, follow_symlinks=False)
+            )
+        os.replace(tmp_path, path)
+        self._fsync_published_directory(
+            directory,
+            logical_input=logical_input,
+            stop_directory=durability_anchor,
+        )
+        return (
+            os.fstat(published_fd)
+            if published_fd is not None
+            else os.stat(path, follow_symlinks=False)
         )
 
     def _resolve_path(self, path: str | os.PathLike[str]) -> str:
@@ -232,18 +537,17 @@ class LocalStorage(StorageInterface):
                 json.dump(data, tmpf, indent=2, ensure_ascii=False)
                 tmpf.flush()
                 os.fsync(tmpf.fileno())
-
-            # atomic replace
-            os.replace(tmp_path, path)
-
-            # Persist the rename before acknowledging success. This helper uses
-            # O_DIRECTORY when available and propagates I/O failures; swallowing
-            # them can publish a Redis pointer to a rename lost on host crash.
-            self._fsync_published_directory(
-                directory,
-                logical_input=logical_input,
-                stop_directory=durability_anchor,
-            )
+                # Persist immediately for ordinary callers. A DataWriter
+                # immutable batch defers only the directory flush to its
+                # pre-catalog barrier and pins this already-open exact inode.
+                self._publish_completed_temp(
+                    tmp_path=tmp_path,
+                    path=path,
+                    directory=directory,
+                    logical_input=logical_input,
+                    durability_anchor=durability_anchor,
+                    published_fd=tmpf.fileno(),
+                )
         finally:
             # if something failed before replace(), make sure temp is gone
             try:
@@ -606,12 +910,14 @@ class LocalStorage(StorageInterface):
             pq.write_table(table, tmp_path)
             with open(tmp_path, "rb") as completed:
                 os.fsync(completed.fileno())
-            os.replace(tmp_path, path)
-            self._fsync_published_directory(
-                directory,
-                logical_input=logical_input,
-                stop_directory=durability_anchor,
-            )
+                self._publish_completed_temp(
+                    tmp_path=tmp_path,
+                    path=path,
+                    directory=directory,
+                    logical_input=logical_input,
+                    durability_anchor=durability_anchor,
+                    published_fd=completed.fileno(),
+                )
         finally:
             try:
                 if os.path.exists(tmp_path):
@@ -691,16 +997,14 @@ class LocalStorage(StorageInterface):
                 write_all(tmpf, data)
                 tmpf.flush()
                 os.fsync(tmpf.fileno())
-                os.replace(tmp_path, path)
-                self._fsync_published_directory(
-                    directory,
+                published_state = self._publish_completed_temp(
+                    tmp_path=tmp_path,
+                    path=path,
+                    directory=directory,
                     logical_input=logical_input,
-                    stop_directory=durability_anchor,
+                    durability_anchor=durability_anchor,
+                    published_fd=tmpf.fileno(),
                 )
-                # Capture after rename + directory fsync while the exact
-                # published inode is still held open. A later path replacement
-                # cannot acquire this cache identity.
-                published_state = os.fstat(tmpf.fileno())
         finally:
             try:
                 if os.path.exists(tmp_path):
@@ -988,6 +1292,76 @@ class LocalStorage(StorageInterface):
                 for handle in handles:
                     handle.close()
                 raise
+
+    def _fsync_logical_publications(self, directories: Sequence[str]) -> None:
+        """Fsync a set of publication directories and each ancestor once.
+
+        This is the barrier counterpart of ``_fsync_logical_publication``.  It
+        computes every required chain before installing any new cache proof,
+        deduplicates shared ancestors, flushes children before parents, and
+        validates all pinned inode identities before caching the result.
+        """
+
+        currents = {
+            os.path.abspath(directory)
+            for directory in directories
+        }
+        if not currents:
+            return
+        with self._durability_lock:
+            expected_anchors: Dict[str, tuple[int, int]] = {}
+            required: set[str] = set()
+            for current in currents:
+                anchor = self._deepest_durable_anchor_locked(current)
+                if anchor is None:
+                    raise OSError(
+                        f"no inode-validated durability anchor remains for {current!r}"
+                    )
+                expected = self._valid_durable_handle_locked(anchor)
+                if expected is None:
+                    raise OSError(
+                        f"durability anchor changed before publication: {anchor}"
+                    )
+                expected_anchors[anchor] = expected.identity
+                required.update(
+                    self._directory_chain(current, stop_directory=anchor)
+                )
+
+            # Directory contents must reach stable storage before the parent
+            # entry that links a newly-created directory into its own parent.
+            ordered = sorted(
+                required,
+                key=lambda value: (value.count(os.sep), len(value), value),
+                reverse=True,
+            )
+            handles: list[_DirectoryHandle] = []
+            by_path: Dict[str, _DirectoryHandle] = {}
+            complete_identity_set = True
+            try:
+                for current in ordered:
+                    handle = self._fsync_directory(current)
+                    if isinstance(handle, _DirectoryHandle):
+                        handles.append(handle)
+                        by_path[current] = handle
+                    else:
+                        # Preserve unit-test compatibility with recording stubs,
+                        # matching the single-publication helper's behaviour.
+                        complete_identity_set = False
+                if not complete_identity_set:
+                    return
+                for anchor, expected_identity in expected_anchors.items():
+                    synced = by_path.get(anchor)
+                    if synced is None or synced.identity != expected_identity:
+                        raise OSError(
+                            f"durability anchor changed during publication: {anchor}"
+                        )
+                if any(not handle.matches_path() for handle in handles):
+                    raise OSError("directory hierarchy changed during publication")
+                self._cache_durable_handles_locked(handles)
+                handles = []
+            finally:
+                for handle in handles:
+                    handle.close()
 
     def _fsync_published_directory(
         self,

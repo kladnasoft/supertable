@@ -15,8 +15,11 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from pathlib import Path
 from unittest import mock
 from unittest.mock import MagicMock, PropertyMock, patch, call
@@ -794,6 +797,204 @@ class TestLocalStorage(unittest.TestCase):
         ):
             self.storage.write_bytes(p, b"complete")
         self.assertEqual(self.storage.read_bytes(p), b"complete")
+
+    def test_durability_batch_fsyncs_files_then_each_directory_once(self):
+        storage = LocalStorage(self.tmpdir)
+        directory = self._path("batch")
+        os.makedirs(directory)
+        # Establish the directory's ancestry before counting this mutation.
+        storage.write_bytes("batch/seed", b"seed")
+        calls = []
+        real_fsync = os.fsync
+
+        def recording_fsync(fd):
+            calls.append("directory" if os.path.isdir(f"/proc/self/fd/{fd}") else "file")
+            return real_fsync(fd)
+
+        with patch(
+            "supertable.storage.local_storage.os.fsync",
+            side_effect=recording_fsync,
+        ):
+            with storage.durability_batch() as batch:
+                storage.write_bytes("batch/a", b"a")
+                storage.write_bytes("batch/b", b"b")
+                storage.write_bytes("batch/c", b"c")
+                self.assertEqual(calls, ["file", "file", "file"])
+                batch.barrier()
+                batch.catalog_commit_started()
+                batch.catalog_commit_succeeded()
+
+        self.assertEqual(calls.count("file"), 3)
+        self.assertEqual(calls.count("directory"), 1)
+
+    def test_durability_batch_file_fsync_failure_never_renames(self):
+        storage = LocalStorage(self.tmpdir)
+        target = self._path("batch-file-fsync")
+        with (
+            patch(
+                "supertable.storage.local_storage.os.fsync",
+                side_effect=OSError("file fsync crash"),
+            ),
+            self.assertRaisesRegex(OSError, "file fsync crash"),
+        ):
+            with storage.durability_batch():
+                storage.write_bytes("batch-file-fsync", b"payload")
+        self.assertFalse(os.path.lexists(target))
+
+    def test_durability_batch_rename_failure_leaves_no_target(self):
+        storage = LocalStorage(self.tmpdir)
+        target = self._path("batch-rename")
+        with (
+            patch(
+                "supertable.storage.local_storage.os.replace",
+                side_effect=OSError("rename crash"),
+            ),
+            self.assertRaisesRegex(OSError, "rename crash"),
+        ):
+            with storage.durability_batch():
+                storage.write_bytes("batch-rename", b"payload")
+        self.assertFalse(os.path.lexists(target))
+
+    def test_durability_batch_barrier_failure_cleans_and_fsyncs_orphan(self):
+        storage = LocalStorage(self.tmpdir)
+        target = self._path("batch-barrier")
+        real_barrier = storage._fsync_logical_publications
+        calls = 0
+
+        def fail_first(directories):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("barrier crash")
+            return real_barrier(directories)
+
+        with (
+            patch.object(
+                storage,
+                "_fsync_logical_publications",
+                side_effect=fail_first,
+            ),
+            self.assertRaisesRegex(OSError, "barrier crash"),
+        ):
+            with storage.durability_batch() as batch:
+                storage.write_bytes("batch-barrier", b"payload")
+                batch.barrier()
+
+        self.assertFalse(os.path.lexists(target))
+        self.assertEqual(calls, 2, "cleanup must have its own durability barrier")
+
+    def test_durability_batch_ambiguous_catalog_failure_retains_durable_object(self):
+        storage = LocalStorage(self.tmpdir)
+        target = self._path("batch-redis-boundary")
+        with self.assertRaisesRegex(TimeoutError, "ambiguous Redis timeout"):
+            with storage.durability_batch() as batch:
+                storage.write_bytes("batch-redis-boundary", b"payload")
+                batch.barrier()
+                batch.catalog_commit_started()
+                raise TimeoutError("ambiguous Redis timeout")
+        self.assertEqual(Path(target).read_bytes(), b"payload")
+
+    def test_durability_batch_abort_never_removes_replacement(self):
+        storage = LocalStorage(self.tmpdir)
+        storage.write_bytes("existing", b"old")
+        orphan = self._path("new-orphan")
+        with self.assertRaisesRegex(RuntimeError, "abort mutation"):
+            with storage.durability_batch():
+                # Replacement writes retain ordinary immediate durability and
+                # are deliberately excluded from batch rollback.
+                storage.write_bytes("existing", b"new")
+                storage.write_bytes("new-orphan", b"orphan")
+                raise RuntimeError("abort mutation")
+        self.assertEqual(storage.read_bytes("existing"), b"new")
+        self.assertFalse(os.path.lexists(orphan))
+
+    def test_durability_batch_detects_symlink_substitution_without_unlinking_it(self):
+        storage = LocalStorage(self.tmpdir)
+        victim = self._path("victim")
+        Path(victim).write_bytes(b"keep")
+        target = self._path("substituted")
+        with self.assertRaisesRegex(OSError, "immutable object changed"):
+            with storage.durability_batch() as batch:
+                storage.write_bytes("substituted", b"published")
+                os.unlink(target)
+                os.symlink(victim, target)
+                batch.barrier()
+        self.assertTrue(os.path.islink(target))
+        self.assertEqual(Path(victim).read_bytes(), b"keep")
+
+    def test_durability_batch_detects_directory_replacement(self):
+        storage = LocalStorage(self.tmpdir)
+        os.makedirs(self._path("live"))
+        moved = self._path("moved")
+        with self.assertRaisesRegex(OSError, "immutable object changed"):
+            with storage.durability_batch() as batch:
+                storage.write_bytes("live/object", b"published")
+                os.rename(self._path("live"), moved)
+                os.makedirs(self._path("live"))
+                batch.barrier()
+        # Rollback never follows the replacement hierarchy or deletes an
+        # object through a path whose inode proof no longer matches.
+        self.assertEqual(Path(moved, "object").read_bytes(), b"published")
+        self.assertEqual(os.listdir(self._path("live")), [])
+
+    def test_durability_batches_are_isolated_between_concurrent_writers(self):
+        storage = LocalStorage(self.tmpdir)
+        rendezvous = threading.Barrier(2)
+
+        def write_one(name):
+            with storage.durability_batch() as batch:
+                storage.write_bytes(name, name.encode())
+                rendezvous.wait(timeout=5)
+                self.assertEqual(len(batch._publications), 1)
+                batch.barrier()
+                batch.catalog_commit_started()
+                batch.catalog_commit_succeeded()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(write_one, name) for name in ("writer-a", "writer-b")]
+            for future in futures:
+                future.result()
+        self.assertEqual(storage.read_bytes("writer-a"), b"writer-a")
+        self.assertEqual(storage.read_bytes("writer-b"), b"writer-b")
+
+    def test_durability_batch_can_be_explicitly_propagated_to_worker(self):
+        storage = LocalStorage(self.tmpdir)
+        with storage.durability_batch() as batch:
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(
+                    copy_context().run,
+                    storage.write_bytes,
+                    "worker-object",
+                    b"worker",
+                )
+                future.result()
+            self.assertEqual(len(batch._publications), 1)
+            batch.barrier()
+            batch.catalog_commit_started()
+            batch.catalog_commit_succeeded()
+        self.assertEqual(storage.read_bytes("worker-object"), b"worker")
+
+    @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
+    def test_durability_batch_is_not_inherited_as_active_after_fork(self):
+        storage = LocalStorage(self.tmpdir)
+        with storage.durability_batch() as batch:
+            pid = os.fork()
+            if pid == 0:  # pragma: no cover - assertions run in parent
+                try:
+                    storage.write_bytes("child-object", b"child")
+                except BaseException:
+                    os._exit(1)
+                os._exit(0)
+            waited, status = os.waitpid(pid, 0)
+            self.assertEqual(waited, pid)
+            self.assertEqual(os.waitstatus_to_exitcode(status), 0)
+            self.assertEqual(batch._publications, [])
+            storage.write_bytes("parent-object", b"parent")
+            batch.barrier()
+            batch.catalog_commit_started()
+            batch.catalog_commit_succeeded()
+        self.assertEqual(storage.read_bytes("child-object"), b"child")
+        self.assertEqual(storage.read_bytes("parent-object"), b"parent")
 
     def test_logical_write_retry_anchors_previously_created_ancestors(self):
         storage = LocalStorage(self.tmpdir)
