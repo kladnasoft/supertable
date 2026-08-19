@@ -1531,6 +1531,11 @@ class TestWriteErrorPropagation:
         assert simple_call.kwargs["create_if_missing"] is False
         assert simple_call.kwargs["_live_leaf_verified"] is True
         writer._mocks["simple_inst"].get_simple_table_snapshot.assert_not_called()
+        initial_base = writer._mocks["simple_inst"].update.call_args.kwargs[
+            "last_snapshot"
+        ]
+        assert initial_base["snapshot_version"] == 0
+        assert initial_base["previous_snapshot"] is None
         assert commit_calls[0]["expected_version"] == -1
         assert commit_calls[0]["expected_path"] == ""
 

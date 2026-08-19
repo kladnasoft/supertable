@@ -13,7 +13,11 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 
 import redis
 from supertable.config.defaults import logger
-from supertable.errors import LockLostError, SnapshotCommitConflictError
+from supertable.errors import (
+    DefiniteCatalogCommitRejection,
+    LockLostError,
+    SnapshotCommitConflictError,
+)
 
 try:
     from .redis_connector import RedisConnector, RedisOptions
@@ -517,12 +521,32 @@ class RbacIntegrityError(RuntimeError):
     """Persisted RBAC state failed a deterministic integrity check."""
 
 
-class DeletionIntentConflictError(RuntimeError):
+class DeletionIntentConflictError(
+        DefiniteCatalogCommitRejection, RuntimeError,
+):
     """A durable delete intent fences ordinary creation or mutation."""
 
 
-class ReadOnlyCatalogError(PermissionError):
+class ReadOnlyCatalogError(DefiniteCatalogCommitRejection, PermissionError):
     """The atomic catalog boundary observed a non-writable root."""
+
+
+class _SnapshotCommitRejectedError(
+        DefiniteCatalogCommitRejection, RuntimeError,
+):
+    """A completed snapshot Lua command rejected publication."""
+
+
+class _SnapshotCommitPayloadRejectedError(
+        DefiniteCatalogCommitRejection, ValueError,
+):
+    """A completed snapshot Lua command rejected its proposed payload."""
+
+
+class _SnapshotCommitNamespaceNotFoundError(
+        DefiniteCatalogCommitRejection, FileNotFoundError,
+):
+    """A completed snapshot Lua command observed no parent namespace."""
 
 
 _RBAC_ATTEMPT_IDENTITIES = {
@@ -2893,6 +2917,11 @@ return removed_meta + removed_index + 1
     #  -9  durable SimpleTable deletion intent exists
     # -10  mirror publication is owned by another publisher
     # -11  SuperTable root no longer exists
+    # -12  SuperTable root is read-only
+    # -13  leaf/root numeric identity is invalid or exhausted
+    # -14  mirror configuration changed after the writer pinned it
+    # -15  mirror configuration is corrupt
+    # -16  payload snapshot_version mismatches the fenced successor
     _LUA_SNAPSHOT_COMMIT = (
         _LUA_ROOT_DOCUMENT_GUARD + _LUA_SNAPSHOT_TOMBSTONE_GUARD + """
 local leaf_key = KEYS[1]
@@ -2919,6 +2948,7 @@ local schema_json = ARGV[10]
 local expected_mirrors_json = ARGV[11]
 local quality_generation = ARGV[12]
 local expected_v2_prefix = ARGV[13]
+local payload_digest = ARGV[14]
 
 if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or now_ms ~= math.floor(now_ms)
@@ -2926,6 +2956,10 @@ if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or expected_version > ROOT_MAX_SAFE_INTEGER
     or expected_version ~= math.floor(expected_version) then
   return {-13, 0, 0}
+end
+if string.len(payload_digest) ~= 64
+    or not string.match(payload_digest, '^[0-9a-f]+$') then
+  return {-4, 0, 0}
 end
 
 local early_held_token = redis.call('GET', lock_key)
@@ -3005,7 +3039,12 @@ local held_token = redis.call('GET', lock_key)
 if not held_token or held_token ~= lock_token then
   return {-2, 0, 0}
 end
-if redis.call('EXISTS', namespace_lock) == 1 then
+-- A waiting first-time creator may hold the namespace lock while blocked on
+-- this writer's leaf lease.  It must not wound the current expected-absent
+-- publisher.  A real delete linearizes by persisting namespace_delete before
+-- draining this lease; that durable intent remains an unconditional fence.
+if expected_version ~= -1
+    and redis.call('EXISTS', namespace_lock) == 1 then
   return {-7, 0, 0}
 end
 if redis.call('EXISTS', namespace_delete) == 1 then
@@ -3060,11 +3099,15 @@ end
 
 local okp, payload = pcall(cjson.decode, payload_json)
 if not okp or type(payload) ~= 'table'
-    or type(payload['snapshot_version']) ~= 'number'
-    or payload['snapshot_version'] ~= math.floor(payload['snapshot_version'])
-    or payload['snapshot_version'] ~= old_version + 1
     or not snapshot_tombstone_state_ok(payload, expected_v2_prefix) then
   return {-4, 0, 0}
+end
+local new_leaf_version = old_version + 1
+if old_version == -1 then new_leaf_version = 1 end
+if type(payload['snapshot_version']) ~= 'number'
+    or payload['snapshot_version'] ~= math.floor(payload['snapshot_version'])
+    or payload['snapshot_version'] ~= new_leaf_version then
+  return {-16, 0, 0}
 end
 local oks, schema = pcall(cjson.decode, schema_json)
 if not oks or type(schema) ~= 'table' then
@@ -3113,13 +3156,13 @@ if old_version >= ROOT_MAX_SAFE_INTEGER
     or root_version >= ROOT_MAX_SAFE_INTEGER then
   return {-13, 0, 0}
 end
-local new_leaf_version = old_version + 1
 local new_root_version = root_version + 1
 local leaf = {
   version = new_leaf_version,
   ts = now_ms,
   path = new_path,
   payload = payload,
+  payload_digest = payload_digest,
   commit_id = commit_id
 }
 root['version'] = new_root_version
@@ -3184,6 +3227,7 @@ local quality_generation = ARGV[10]
 local mirror_pin_present = ARGV[11]
 local expected_mirror_raw = ARGV[12]
 local expected_v2_prefix = ARGV[13]
+local payload_digest = ARGV[14]
 
 if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or now_ms ~= math.floor(now_ms)
@@ -3191,6 +3235,10 @@ if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or expected_version > ROOT_MAX_SAFE_INTEGER
     or expected_version ~= math.floor(expected_version) then
   return {-13, 0, 0}
+end
+if string.len(payload_digest) ~= 64
+    or not string.match(payload_digest, '^[0-9a-f]+$') then
+  return {-4, 0, 0}
 end
 
 local early_held_token = redis.call('GET', lock_key)
@@ -3223,7 +3271,10 @@ local held_token = redis.call('GET', lock_key)
 if not held_token or held_token ~= lock_token then
   return {-2, 0, 0}
 end
-if redis.call('EXISTS', namespace_lock) == 1 then
+-- Do not let a waiting creator's namespace lock wound the current first
+-- publisher.  Namespace deletion is still fenced by its durable intent below.
+if expected_version ~= -1
+    and redis.call('EXISTS', namespace_lock) == 1 then
   return {-7, 0, 0}
 end
 if redis.call('EXISTS', namespace_delete) == 1 then
@@ -3278,11 +3329,15 @@ end
 
 local okp, payload = pcall(cjson.decode, payload_json)
 if not okp or type(payload) ~= 'table'
-    or type(payload['snapshot_version']) ~= 'number'
-    or payload['snapshot_version'] ~= math.floor(payload['snapshot_version'])
-    or payload['snapshot_version'] ~= old_version + 1
     or not snapshot_tombstone_state_ok(payload, expected_v2_prefix) then
   return {-4, 0, 0}
+end
+local new_leaf_version = old_version + 1
+if old_version == -1 then new_leaf_version = 1 end
+if type(payload['snapshot_version']) ~= 'number'
+    or payload['snapshot_version'] ~= math.floor(payload['snapshot_version'])
+    or payload['snapshot_version'] ~= new_leaf_version then
+  return {-16, 0, 0}
 end
 local oks, schema = pcall(cjson.decode, schema_json)
 if not oks or type(schema) ~= 'table' then
@@ -3293,13 +3348,13 @@ if old_version >= ROOT_MAX_SAFE_INTEGER
   return {-13, 0, 0}
 end
 
-local new_leaf_version = old_version + 1
 local new_root_version = root_version + 1
 local leaf = {
   version = new_leaf_version,
   ts = now_ms,
   path = new_path,
   payload = payload,
+  payload_digest = payload_digest,
   commit_id = commit_id
 }
 root['version'] = new_root_version
@@ -6641,6 +6696,9 @@ return 1
 
         ``expected_version`` and ``expected_path`` identify the exact leaf
         snapshot from which the writer derived its immutable successor.
+        An expected-absent base (``-1``/empty path) publishes the first visible
+        snapshot as version one, preserving the legacy generation after its
+        removed empty version-zero bootstrap.
         ``lock_token`` must still own the per-table Redis lock when the Lua
         script executes.  The comparison, fencing check, leaf update, and root
         invalidation happen in one Redis transaction, so readers can never
@@ -6678,7 +6736,7 @@ return 1
             raise ValueError(
                 "snapshot payload must carry an explicit deletion-vector state"
             )
-        successor_version = base_version + 1
+        successor_version = 1 if base_version == -1 else base_version + 1
         if (
             type(payload.get("snapshot_version")) is not int
             or payload["snapshot_version"] != successor_version
@@ -6730,9 +6788,24 @@ return 1
             )
         try:
             payload = snapshot_cache_payload(payload)
+            payload_version = payload.get("snapshot_version")
+            if payload_version is not None and (
+                type(payload_version) is not int
+                or payload_version != successor_version
+            ):
+                raise _SnapshotCommitPayloadRejectedError(
+                    "Snapshot payload generation does not match its fenced "
+                    f"successor: expected {successor_version}, got "
+                    f"{payload_version!r}"
+                )
             payload_json = json.dumps(payload)
+        except _SnapshotCommitPayloadRejectedError:
+            raise
         except Exception as exc:
-            raise ValueError("snapshot payload is not JSON serializable") from exc
+            raise _SnapshotCommitPayloadRejectedError(
+                "snapshot payload is not JSON serializable"
+            ) from exc
+        payload_digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
 
         if mirror_publication and not commit_id:
             raise ValueError(
@@ -6824,6 +6897,7 @@ return 1
                         "1" if mirror_pin_present else "0",
                         mirror_pin_raw,
                         tombstone_prefix,
+                        payload_digest,
                     ],
                 )
             else:
@@ -6857,6 +6931,7 @@ return 1
                         json.dumps(normalized_mirrors),
                         quality_generation,
                         tombstone_prefix,
+                        payload_digest,
                     ],
                 )
         except redis.RedisError as exc:
@@ -6869,10 +6944,10 @@ return 1
                 org,
                 sup,
                 simple,
-                payload=payload,
                 path=path,
                 expected_version=base_version,
                 commit_id=cid,
+                payload_digest=payload_digest,
             )
             if reconciled is not None:
                 logger.warning(
@@ -6904,21 +6979,25 @@ return 1
                 f"Lost fencing lock before publishing {org}/{sup}/{simple}"
             )
         if code == -3:
-            raise RuntimeError(f"Corrupt Redis catalog JSON for {org}/{sup}/{simple}")
+            raise _SnapshotCommitRejectedError(
+                f"Corrupt Redis catalog JSON for {org}/{sup}/{simple}"
+            )
         if code == -4:
-            raise ValueError("Redis rejected invalid snapshot payload JSON")
+            raise _SnapshotCommitPayloadRejectedError(
+                "Redis rejected invalid snapshot payload JSON"
+            )
         if code == -5:
-            raise RuntimeError(
+            raise _SnapshotCommitRejectedError(
                 f"Missing or mismatched mirror publication intent for "
                 f"{org}/{sup}/{simple} commit {cid}"
             )
         if code == -6:
-            raise RuntimeError(
+            raise _SnapshotCommitRejectedError(
                 f"Mirror publication intent is not prepared for "
                 f"{org}/{sup}/{simple} commit {cid}"
             )
         if code == -7:
-            raise RuntimeError(
+            raise _SnapshotCommitRejectedError(
                 f"SuperTable namespace is fenced for deletion: {org}/{sup}"
             )
         if code in (-8, -9):
@@ -6931,7 +7010,7 @@ return 1
                 f"{org}/{sup}/{simple} commit {cid}"
             )
         if code == -11:
-            raise FileNotFoundError(
+            raise _SnapshotCommitNamespaceNotFoundError(
                 f"SuperTable does not exist: {org}/{sup}"
             )
         if code == -12:
@@ -6939,7 +7018,7 @@ return 1
                 f"SuperTable is read-only: {org}/{sup}"
             )
         if code == -13:
-            raise RuntimeError(
+            raise _SnapshotCommitRejectedError(
                 f"Redis snapshot numeric identity is exhausted or invalid: "
                 f"{org}/{sup}/{simple}"
             )
@@ -6949,9 +7028,14 @@ return 1
                 f"{org}/{sup}/{simple}"
             )
         if code == -15:
-            raise RuntimeError(
+            raise _SnapshotCommitRejectedError(
                 f"Corrupt mirror configuration during snapshot publication: "
                 f"{org}/{sup}/{simple}"
+            )
+        if code == -16:
+            raise _SnapshotCommitPayloadRejectedError(
+                "Snapshot payload generation does not match its fenced "
+                f"successor for {org}/{sup}/{simple}"
             )
         raise RuntimeError(f"Unknown snapshot commit status {code}")
 
@@ -6961,16 +7045,19 @@ return 1
             sup: str,
             simple: str,
             *,
-            payload: Dict[str, Any],
             path: str,
             expected_version: int,
             commit_id: str,
+            payload_digest: str,
     ) -> Optional[tuple[int, int]]:
         """Return committed versions when an ambiguous reply actually landed.
 
-        The exact leaf commit id, path, successor version, and normalized cache
-        payload are sufficient proof: the Redis script writes the leaf, root,
-        schema/index, and quality marker atomically.  The root may already have
+        The exact leaf commit id, path, successor version, and digest of the
+        original payload JSON are sufficient proof: the Redis script writes
+        that digest with the leaf, root, schema/index, and quality marker
+        atomically.  Comparing the digest rather than Lua's decoded/re-encoded
+        cache stays exact for Int64 values beyond Lua's numeric range and for
+        empty JSON object/array normalization.  The root may already have
         advanced because a different table has its own lock, so only require a
         structurally valid current root.
         Any read ambiguity or mismatch returns ``None`` and preserves the
@@ -6987,12 +7074,12 @@ return 1
             root = _validate_root_document(
                 json.loads(raw_root), org=org, sup=sup,
             )
-            successor = expected_version + 1
+            successor = 1 if expected_version == -1 else expected_version + 1
             if (
                 leaf.get("commit_id") != commit_id
                 or leaf.get("path") != path
                 or leaf.get("version") != successor
-                or leaf.get("payload") != snapshot_cache_payload(payload)
+                or leaf.get("payload_digest") != payload_digest
                 or root.get("version", -1) < 0
             ):
                 return None

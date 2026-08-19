@@ -745,9 +745,10 @@ class SimpleTable:
             last_simple_table["resources"] = updated_resources
 
         # Update metadata
-        # An expected-absent one-shot write uses an in-memory version -1 base
-        # and an empty CAS path.  Its first durable snapshot has no predecessor;
-        # ordinary updates retain the exact immutable predecessor pointer.
+        # An expected-absent one-shot write uses an in-memory compatibility
+        # version-zero base and an empty CAS path. Its first durable snapshot is
+        # version one but has no predecessor object; ordinary updates retain the
+        # exact immutable predecessor pointer.
         last_simple_table["previous_snapshot"] = last_simple_table_path or None
         last_simple_table["last_updated_ms"] = int(datetime.now().timestamp() * 1000)
         last_simple_table["snapshot_version"] = int(last_simple_table.get("snapshot_version", 0)) + 1

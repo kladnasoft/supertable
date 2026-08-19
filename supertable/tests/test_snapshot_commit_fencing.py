@@ -1,4 +1,6 @@
+import hashlib
 import json
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -8,13 +10,18 @@ import redis
 
 from supertable import redis_keys as RK
 from supertable.data_writer import DataWriter
-from supertable.errors import LockLostError, SnapshotCommitConflictError
+from supertable.errors import (
+    DefiniteCatalogCommitRejection,
+    LockLostError,
+    SnapshotCommitConflictError,
+)
 from supertable.redis_catalog import (
     DeletionIntentConflictError,
     ReadOnlyCatalogError,
     RedisCatalog,
 )
 from supertable.tombstone_manifest_v2 import MAX_JSON_EXACT_INTEGER
+from supertable.storage.local_storage import LocalStorage
 
 
 def _catalog():
@@ -91,6 +98,8 @@ def _explicit_v2_payload(snapshot_version, *, active):
 def test_snapshot_commit_atomically_updates_leaf_and_root():
     catalog, fake = _catalog()
     _seed(fake)
+    expected_payload = _snapshot_payload(resources=[{"file": "f"}])
+    expected_payload["_row_filter"] = None
 
     assert catalog.commit_snapshot(
         "org", "lake", "table",
@@ -105,14 +114,10 @@ def test_snapshot_commit_atomically_updates_leaf_and_root():
         "version": 5,
         "ts": 123,
         "path": "snap/5.json",
-        "payload": {
-            "snapshot_version": 5,
-            "resources": [{"file": "f"}],
-            "tombstone": None,
-            "tombstone_rows": 0,
-            "tombstone_digest": None,
-            "_row_filter": None,
-        },
+        "payload": expected_payload,
+        "payload_digest": hashlib.sha256(
+            json.dumps(expected_payload).encode("utf-8")
+        ).hexdigest(),
         "commit_id": "commit-5",
     }
     assert root["version"] == 10
@@ -496,7 +501,8 @@ def test_expected_absent_commit_publishes_complete_first_snapshot_atomically():
     )
     fake.set(RK.lock_leaf("org", "lake", "table"), "token", ex=30)
     payload = {
-        "snapshot_version": 0,
+        "snapshot_version": 1,
+        "previous_snapshot": None,
         "schema": {"id": "Int64"},
         "resources": [{"file": "data/first.parquet", "rows": 3}],
         "tombstone": None,
@@ -520,11 +526,11 @@ def test_expected_absent_commit_publishes_complete_first_snapshot_atomically():
         expected_mirror_pin=None,
         quality_generation="first-commit",
         now_ms=123,
-    ) == (0, 10)
+    ) == (1, 10)
 
     leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
     root = json.loads(fake.get(RK.meta_root("org", "lake")))
-    assert leaf["version"] == 0
+    assert leaf["version"] == 1
     assert leaf["path"] == "snap/first.json"
     assert leaf["payload"] == payload
     assert root["version"] == 10
@@ -536,6 +542,219 @@ def test_expected_absent_commit_publishes_complete_first_snapshot_atomically():
     assert fake.get(catalog._quality_key(
         "org", "lake", "pending_unresolved", "table",
     )) == "first-commit"
+    assert fake.get(RK.meta_mirrors("org", "lake")) is None
+
+
+def test_one_shot_bootstrap_and_successor_keep_pinned_no_mirror_fast_path(
+    monkeypatch,
+):
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "lake"),
+        json.dumps({"version": 9, "ts": 1, "read_only": False}),
+    )
+    fake.set(RK.lock_leaf("org", "lake", "table"), "token", ex=30)
+    fast_commit = MagicMock(wraps=catalog._snapshot_commit_no_mirrors)
+    general_commit = MagicMock(
+        side_effect=AssertionError("general mirror commit path used"),
+    )
+    monkeypatch.setattr(catalog, "_snapshot_commit_no_mirrors", fast_commit)
+    monkeypatch.setattr(catalog, "_snapshot_commit", general_commit)
+    first_payload = {
+        "snapshot_version": 1,
+        "previous_snapshot": None,
+        "schema": {"id": "Int64"},
+        "resources": [{"file": "data/first.parquet", "rows": 3}],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "rowid_high_watermark": 3,
+        "_row_filter": None,
+    }
+
+    assert catalog.commit_snapshot(
+        "org", "lake", "table", first_payload, "snap/first.json",
+        expected_version=-1,
+        expected_path="",
+        lock_token="token",
+        commit_id="first",
+        expected_mirrors=[],
+        expected_mirror_pin=None,
+        now_ms=123,
+    ) == (1, 10)
+
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token",
+    )
+    assert context["leaf"]["version"] == 1
+    assert context["leaf"]["payload"]["snapshot_version"] == 1
+    assert context["mirrors"] == []
+    assert context["mirror_pin"] is None
+
+    successor = dict(first_payload)
+    successor.update({
+        "snapshot_version": 2,
+        "previous_snapshot": "snap/first.json",
+    })
+    assert catalog.commit_snapshot(
+        "org", "lake", "table", successor, "snap/second.json",
+        expected_version=1,
+        expected_path="snap/first.json",
+        lock_token="token",
+        commit_id="second",
+        expected_mirrors=context["mirrors"],
+        expected_mirror_pin=context["mirror_pin"],
+        now_ms=124,
+    ) == (2, 11)
+
+    assert fast_commit.call_count == 2
+    general_commit.assert_not_called()
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    assert leaf["version"] == leaf["payload"]["snapshot_version"] == 2
+
+
+def test_expected_absent_reply_loss_reconciles_compatibility_generation(
+    monkeypatch,
+):
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "lake"),
+        json.dumps({"version": 9, "ts": 1, "read_only": False}),
+    )
+    fake.set(RK.lock_leaf("org", "lake", "table"), "token", ex=30)
+    real_commit = catalog._snapshot_commit_no_mirrors
+
+    def commit_then_lose_reply(*args, **kwargs):
+        real_commit(*args, **kwargs)
+        raise redis.TimeoutError("reply lost after commit")
+
+    monkeypatch.setattr(
+        catalog, "_snapshot_commit_no_mirrors", commit_then_lose_reply,
+    )
+    payload = {
+        "snapshot_version": 1,
+        "previous_snapshot": None,
+        "schema": {"id": "Int64"},
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "rowid_high_watermark": 0,
+        "_row_filter": None,
+    }
+
+    assert catalog.commit_snapshot(
+        "org", "lake", "table", payload, "snap/first.json",
+        expected_version=-1,
+        expected_path="",
+        lock_token="token",
+        commit_id="first",
+        expected_mirrors=[],
+        expected_mirror_pin=None,
+        now_ms=123,
+    ) == (1, 10)
+
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    assert leaf["version"] == leaf["payload"]["snapshot_version"] == 1
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_reply_loss_reconciliation_uses_exact_pre_lua_payload_digest(
+        pinned_no_mirrors, monkeypatch,
+):
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "lake"),
+        json.dumps({"version": 9, "ts": 1, "read_only": False}),
+    )
+    fake.set(RK.lock_leaf("org", "lake", "table"), "token", ex=30)
+    script_name = (
+        "_snapshot_commit_no_mirrors"
+        if pinned_no_mirrors
+        else "_snapshot_commit"
+    )
+    real_commit = getattr(catalog, script_name)
+
+    def commit_then_lose_reply(*args, **kwargs):
+        real_commit(*args, **kwargs)
+        raise redis.TimeoutError("reply lost after commit")
+
+    monkeypatch.setattr(catalog, script_name, commit_then_lose_reply)
+    payload = {
+        "snapshot_version": 1,
+        "previous_snapshot": None,
+        # Exercise both known Lua cjson identity hazards: empty object shape
+        # and an exact Python Int64 above Redis Lua's numeric range.
+        "schema": {},
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "rowid_high_watermark": (1 << 53) + 1,
+        "_row_filter": None,
+    }
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    assert catalog.commit_snapshot(
+        "org", "lake", "table", payload, "snap/first.json",
+        expected_version=-1,
+        expected_path="",
+        lock_token="token",
+        commit_id="first",
+        now_ms=123,
+        **kwargs,
+    ) == (1, 10)
+
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    assert leaf["payload"] != payload
+    assert leaf["payload_digest"] == hashlib.sha256(
+        json.dumps(payload).encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "expected_version,expected_path,payload_version",
+    [(-1, "", 0), (4, "snap/4.json", 6)],
+)
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_snapshot_commit_rejects_payload_generation_mismatch_before_redis(
+        expected_version, expected_path, payload_version, pinned_no_mirrors,
+        monkeypatch,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    if expected_version == -1:
+        fake.delete(RK.meta_leaf("org", "lake", "table"))
+    general = MagicMock(side_effect=AssertionError("Redis should not run"))
+    fast = MagicMock(side_effect=AssertionError("Redis should not run"))
+    monkeypatch.setattr(catalog, "_snapshot_commit", general)
+    monkeypatch.setattr(catalog, "_snapshot_commit_no_mirrors", fast)
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    with pytest.raises(
+        ValueError, match="payload generation does not match",
+    ) as raised:
+        catalog.commit_snapshot(
+            "org", "lake", "table",
+            {"snapshot_version": payload_version, "resources": []},
+            "snap/new.json",
+            expected_version=expected_version,
+            expected_path=expected_path,
+            lock_token="token",
+            **kwargs,
+        )
+
+    assert isinstance(raised.value, DefiniteCatalogCommitRejection)
+    general.assert_not_called()
+    fast.assert_not_called()
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
 
 
 def test_expected_absent_commit_loses_to_concurrent_creator_without_overwrite():
@@ -561,25 +780,19 @@ def test_expected_absent_commit_loses_to_concurrent_creator_without_overwrite():
     assert fake.get(RK.meta_root("org", "lake")) == before_root
 
 
-@pytest.mark.parametrize("fence", ["namespace-lock", "namespace-intent"])
-def test_expected_absent_commit_is_blocked_by_namespace_deletion(fence):
+def test_expected_absent_commit_is_blocked_by_durable_namespace_deletion():
     catalog, fake = _catalog()
     fake.set(
         RK.meta_root("org", "lake"),
         json.dumps({"version": 9, "ts": 1, "read_only": False}),
     )
     fake.set(RK.lock_leaf("org", "lake", "table"), "token", ex=30)
-    if fence == "namespace-lock":
-        fake.set(RK.lock_namespace("org", "lake"), "deleter", ex=30)
-        expected_error = RuntimeError
-    else:
-        fake.set(
-            RK.meta_namespace_deletion_intent("org", "lake"),
-            json.dumps({"intent_id": "delete-1"}),
-        )
-        expected_error = DeletionIntentConflictError
+    fake.set(
+        RK.meta_namespace_deletion_intent("org", "lake"),
+        json.dumps({"intent_id": "delete-1"}),
+    )
 
-    with pytest.raises(expected_error):
+    with pytest.raises(DeletionIntentConflictError):
         catalog.commit_snapshot(
             "org",
             "lake",
@@ -595,6 +808,107 @@ def test_expected_absent_commit_is_blocked_by_namespace_deletion(fence):
     assert fake.get(RK.meta_leaf("org", "lake", "table")) is None
     assert not fake.sismember(RK.meta_table_names("org", "lake"), "table")
     assert fake.get(RK.schema("org", "lake", "table")) is None
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_waiting_first_creator_does_not_wound_current_publisher(
+        pinned_no_mirrors,
+):
+    fake = fakeredis.FakeStrictRedis(decode_responses=True)
+    connector = SimpleNamespace(r=fake)
+    with patch("supertable.redis_catalog.RedisConnector", return_value=connector):
+        current = RedisCatalog()
+        waiter = RedisCatalog()
+    fake.set(
+        RK.meta_root("org", "lake"),
+        json.dumps({"version": 9, "ts": 1, "read_only": False}),
+    )
+
+    current_namespace = current.acquire_namespace_lock(
+        "org", "lake", ttl_s=30, timeout_s=1,
+    )
+    current_leaf = current.acquire_simple_lock(
+        "org", "lake", "table", ttl_s=30, timeout_s=1,
+    )
+    assert current_namespace and current_leaf
+    context = current.begin_table_mutation(
+        "org", "lake", "table",
+        lock_token=current_leaf,
+        namespace_token=current_namespace,
+        reserve_count=3,
+    )
+    assert context["leaf"] is None
+    assert current.release_namespace_lock(
+        "org", "lake", current_namespace,
+    )
+
+    waiter_has_namespace = threading.Event()
+    acquired = {}
+
+    def wait_for_leaf():
+        namespace_token = waiter.acquire_namespace_lock(
+            "org", "lake", ttl_s=30, timeout_s=2,
+        )
+        acquired["namespace"] = namespace_token
+        waiter_has_namespace.set()
+        if namespace_token:
+            acquired["leaf"] = waiter.acquire_simple_lock(
+                "org", "lake", "table", ttl_s=30, timeout_s=2,
+            )
+
+    waiting = threading.Thread(target=wait_for_leaf)
+    waiting.start()
+    assert waiter_has_namespace.wait(timeout=2)
+    assert acquired["namespace"]
+    assert fake.get(RK.lock_namespace("org", "lake")) == acquired["namespace"]
+
+    payload = {
+        "snapshot_version": 1,
+        "previous_snapshot": None,
+        "schema": {"id": "Int64"},
+        "resources": [{"file": "data/first.parquet", "rows": 3}],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "rowid_high_watermark": 3,
+        "_row_filter": None,
+    }
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+    try:
+        assert current.commit_snapshot(
+            "org", "lake", "table", payload, "snap/first.json",
+            expected_version=-1,
+            expected_path="",
+            lock_token=current_leaf,
+            commit_id="current",
+            now_ms=123,
+            **kwargs,
+        ) == (1, 10)
+    finally:
+        current.release_simple_lock(
+            "org", "lake", "table", current_leaf,
+        )
+
+    waiting.join(timeout=3)
+    assert not waiting.is_alive()
+    assert acquired.get("leaf")
+    try:
+        successor_context = waiter.begin_table_mutation(
+            "org", "lake", "table",
+            lock_token=acquired["leaf"],
+            namespace_token=acquired["namespace"],
+        )
+        assert successor_context["leaf"]["version"] == 1
+        assert successor_context["leaf"]["payload"] == payload
+    finally:
+        waiter.release_simple_lock(
+            "org", "lake", "table", acquired["leaf"],
+        )
+        waiter.release_namespace_lock(
+            "org", "lake", acquired["namespace"],
+        )
 
 
 def test_pinned_absent_mirrors_use_small_atomic_commit_path(monkeypatch):
@@ -1816,6 +2130,65 @@ def test_typed_catalog_rejection_returns_batch_to_safe_orphan_cleanup(
         )
 
     assert events == ["commit_started", "redis", "commit_rejected"]
+
+
+def test_durable_delete_rejection_removes_first_write_objects(tmp_path):
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "lake"),
+        json.dumps({"version": 9, "ts": 1, "read_only": False}),
+    )
+    fake.set(RK.lock_leaf("org", "lake", "table"), "token", ex=30)
+    fake.set(
+        RK.meta_namespace_deletion_intent("org", "lake"),
+        json.dumps({"intent_id": "delete-1"}),
+    )
+    storage = LocalStorage(root=tmp_path)
+    writer = DataWriter.__new__(DataWriter)
+    writer.super_table = SimpleNamespace(
+        organization="org", super_name="lake",
+    )
+    writer.catalog = catalog
+    table = SimpleNamespace(
+        _last_snapshot_leaf={"version": -1, "path": ""},
+    )
+    data_path = "org/lake/tables/table/data/first.parquet"
+    snapshot_path = "org/lake/tables/table/snapshots/first.json"
+    payload = {
+        "snapshot_version": 1,
+        "previous_snapshot": None,
+        "schema": {"id": "Int64"},
+        "resources": [{"file": data_path, "rows": 3}],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "rowid_high_watermark": 3,
+        "_row_filter": None,
+    }
+
+    with pytest.raises(DeletionIntentConflictError):
+        with storage.durability_batch() as batch:
+            storage.write_bytes(data_path, b"parquet")
+            storage.write_json(snapshot_path, payload)
+            batch.barrier()
+            writer._publish_snapshot(
+                simple_table=table,
+                simple_name="table",
+                payload=payload,
+                path=snapshot_path,
+                base_path="",
+                lock_token="token",
+                commit_id="first",
+                now_ms=123,
+                mirrors=[],
+                mirror_pin_available=True,
+                mirror_pin=None,
+                durability_batch=batch,
+            )
+
+    assert not storage.exists(data_path)
+    assert not storage.exists(snapshot_path)
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) is None
 
 
 def test_writer_passes_pinned_empty_mirror_generation_to_capable_catalog():

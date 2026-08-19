@@ -18,8 +18,7 @@ from polars import DataFrame
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.errors import (
-    LockLostError,
-    SnapshotCommitConflictError,
+    DefiniteCatalogCommitRejection,
     SuperTableNotFoundError,
     TableNotFoundError,
 )
@@ -72,8 +71,6 @@ from supertable.rbac.access_control import (  # noqa: F401
     check_write_access,
 )
 from supertable.redis_catalog import (
-    DeletionIntentConflictError,
-    ReadOnlyCatalogError,
     RedisCatalog,
     persist_unresolved_quality_generation,
 )
@@ -232,9 +229,11 @@ class DataWriter:
         return {
             "simple_name": simple_table.simple_name,
             "location": simple_table.simple_dir,
-            # SimpleTable.update advances this synthetic base to version zero,
-            # matching the expected-absent Redis leaf version.
-            "snapshot_version": -1,
+            # Preserve the legacy first *visible* snapshot generation without
+            # materializing its empty version-zero predecessor.  update()
+            # advances this synthetic base to version one; the expected-absent
+            # catalog commit publishes that same compatibility generation.
+            "snapshot_version": 0,
             "last_updated_ms": int(datetime.now(timezone.utc).timestamp() * 1000),
             "previous_snapshot": None,
             "schema": [],
@@ -450,13 +449,16 @@ class DataWriter:
             )
 
         snapshot_version = payload.get("snapshot_version")
+        successor_version = (
+            1 if expected_version == -1 else expected_version + 1
+        )
         if (
             type(snapshot_version) is not int
-            or snapshot_version != expected_version + 1
+            or snapshot_version != successor_version
         ):
             raise ValueError(
-                "Snapshot publication version must advance the pinned base "
-                "version by exactly one"
+                "Snapshot publication version must match the exact fenced "
+                "successor generation"
             )
 
         normalized_format = validate_snapshot_tombstone_state(
@@ -532,7 +534,8 @@ class DataWriter:
                 raise RuntimeError("Current leaf has an invalid version") from exc
             if (
                 type(leaf.get("version")) is not int
-                or expected_version < 0
+                or expected_version < -1
+                or (expected_version == -1 and expected_path)
             ):
                 raise RuntimeError("Current leaf has an invalid version")
             self._validate_snapshot_for_publish(
@@ -608,13 +611,7 @@ class DataWriter:
                     durability_batch.catalog_commit_succeeded()
             except Exception as exc:
                 if durability_batch is not None and isinstance(
-                    exc,
-                    (
-                        SnapshotCommitConflictError,
-                        LockLostError,
-                        DeletionIntentConflictError,
-                        ReadOnlyCatalogError,
-                    ),
+                    exc, DefiniteCatalogCommitRejection,
                 ):
                     # These typed responses prove the fenced Lua transaction
                     # rejected the commit. Unlike a transport timeout, cleanup
