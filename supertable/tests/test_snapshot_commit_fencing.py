@@ -64,6 +64,184 @@ def test_snapshot_commit_atomically_updates_leaf_and_root():
     assert root["read_only"] is False
 
 
+def test_snapshot_commit_atomically_persists_unresolved_quality_generation():
+    catalog, fake = _catalog()
+    _seed(fake)
+    unresolved_key = catalog._quality_key(
+        "org", "lake", "pending_unresolved", "table",
+    )
+
+    catalog.commit_snapshot(
+        "org", "lake", "table", {"resources": []}, "snap/5.json",
+        expected_version=4,
+        expected_path="snap/4.json",
+        lock_token="token",
+        commit_id="commit-5",
+        quality_generation="commit-5",
+        now_ms=123,
+    )
+
+    assert fake.get(unresolved_key) == "commit-5"
+    assert fake.ttl(unresolved_key) == -1
+
+
+@pytest.mark.parametrize("failure", ["stale", "lost_lock", "deleting"])
+def test_failed_snapshot_commit_never_publishes_quality_generation(failure):
+    catalog, fake = _catalog()
+    _seed(fake)
+    unresolved_key = catalog._quality_key(
+        "org", "lake", "pending_unresolved", "table",
+    )
+    fake.set(unresolved_key, "newer-generation")
+    expected_version = 4
+    lock_token = "token"
+    expected_error = SnapshotCommitConflictError
+    if failure == "stale":
+        expected_version = 3
+    elif failure == "lost_lock":
+        lock_token = "old-owner"
+        fake.set(RK.lock_leaf("org", "lake", "table"), "new-owner")
+        expected_error = LockLostError
+    else:
+        fake.set(
+            RK.meta_simple_deletion_intent("org", "lake", "table"),
+            json.dumps({"intent_id": "delete-1"}),
+        )
+        expected_error = DeletionIntentConflictError
+
+    with pytest.raises(expected_error):
+        catalog.commit_snapshot(
+            "org", "lake", "table", {}, "snap/5.json",
+            expected_version=expected_version,
+            expected_path="snap/4.json",
+            lock_token=lock_token,
+            commit_id="stale-generation",
+            quality_generation="stale-generation",
+        )
+
+    assert fake.get(unresolved_key) == "newer-generation"
+
+
+def test_reply_loss_after_atomic_commit_cannot_lose_quality_generation(
+    monkeypatch,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    unresolved_key = catalog._quality_key(
+        "org", "lake", "pending_unresolved", "table",
+    )
+    original_commit = catalog._snapshot_commit
+
+    def commit_then_lose_reply(*args, **kwargs):
+        original_commit(*args, **kwargs)
+        raise redis.TimeoutError("reply lost after commit")
+
+    monkeypatch.setattr(catalog, "_snapshot_commit", commit_then_lose_reply)
+    with pytest.raises(redis.TimeoutError, match="reply lost"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", {}, "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            commit_id="commit-5",
+            quality_generation="commit-5",
+        )
+
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    assert leaf["commit_id"] == "commit-5"
+    assert fake.get(unresolved_key) == "commit-5"
+
+
+def test_disabled_then_enabled_resolution_preserves_committed_generation():
+    from supertable.quality import scheduler
+
+    catalog, fake = _catalog()
+    _seed(fake)
+    catalog.commit_snapshot(
+        "org", "lake", "table", {}, "snap/5.json",
+        expected_version=4,
+        expected_path="snap/4.json",
+        lock_token="token",
+        commit_id="commit-5",
+        quality_generation="commit-5",
+    )
+    admission = scheduler._snapshot_pending_lifecycle_admission(
+        fake, "org", "lake", "table",
+    )
+    assert admission is not None
+    scheduler._resolve_unresolved_pending(
+        fake, "org", "lake", "table", (), admission,
+    )
+    unresolved_key = scheduler._unresolved_pending_key(
+        "org", "lake", "table",
+    )
+    assert fake.get(unresolved_key) == "commit-5"
+
+    scheduler._resolve_unresolved_pending(
+        fake, "org", "lake", "table", ("quick",), admission,
+    )
+    assert fake.get(unresolved_key) is None
+    assert fake.get(
+        scheduler._pending_key("org", "lake", "table", "quick")
+    ) == "commit-5"
+
+
+def test_concurrent_resolver_cannot_consume_newer_committed_generation():
+    from supertable.quality import scheduler
+
+    catalog, fake = _catalog()
+    _seed(fake)
+    catalog.commit_snapshot(
+        "org", "lake", "table", {}, "snap/5.json",
+        expected_version=4,
+        expected_path="snap/4.json",
+        lock_token="token",
+        commit_id="commit-5",
+        quality_generation="commit-5",
+    )
+    admission = scheduler._snapshot_pending_lifecycle_admission(
+        fake, "org", "lake", "table",
+    )
+    assert admission is not None
+
+    class CommitBeforeResolverCAS:
+        def __init__(self, inner):
+            self.inner = inner
+            self.committed = False
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def eval(self, script, *args):
+            if (
+                not self.committed
+                and "atomically resolve deferred ingest work" in script
+            ):
+                self.committed = True
+                catalog.commit_snapshot(
+                    "org", "lake", "table", {}, "snap/6.json",
+                    expected_version=5,
+                    expected_path="snap/5.json",
+                    lock_token="token",
+                    commit_id="commit-6",
+                    quality_generation="commit-6",
+                )
+            return self.inner.eval(script, *args)
+
+    raced = CommitBeforeResolverCAS(fake)
+    scheduler._resolve_unresolved_pending(
+        raced, "org", "lake", "table", ("quick",), admission,
+    )
+
+    assert raced.committed
+    assert fake.get(
+        scheduler._unresolved_pending_key("org", "lake", "table")
+    ) == "commit-6"
+    assert fake.get(
+        scheduler._pending_key("org", "lake", "table", "quick")
+    ) is None
+
+
 def test_mirror_intent_and_core_commit_transition_are_durable_and_atomic():
     catalog, fake = _catalog()
     _seed(fake)
@@ -803,6 +981,76 @@ def test_ambiguous_atomic_commit_error_is_never_retried_as_path_only():
     writer.catalog.set_leaf_payload_cas.assert_not_called()
     writer.catalog.set_leaf_path_cas.assert_not_called()
     writer.catalog.bump_root.assert_not_called()
+
+
+def test_legacy_catalog_adapter_uses_lightweight_quality_fallback():
+    fake = fakeredis.FakeStrictRedis(decode_responses=True)
+    _seed(fake)
+
+    class LegacyAtomicCatalog:
+        def __init__(self):
+            self.r = fake
+
+        # Deliberately no quality_generation keyword: the capability flag is
+        # absent, so DataWriter must retain adapter compatibility.
+        def commit_snapshot(
+            self,
+            org,
+            sup,
+            simple,
+            payload,
+            path,
+            *,
+            expected_version,
+            expected_path,
+            lock_token,
+            commit_id=None,
+            mirror_publication=False,
+            expected_mirrors=None,
+            now_ms=None,
+        ):
+            assert expected_version == 4
+            assert expected_path == "snap/4.json"
+            assert lock_token == "token"
+            fake.set(
+                RK.meta_leaf(org, sup, simple),
+                json.dumps({
+                    "version": 5,
+                    "ts": now_ms,
+                    "path": path,
+                    "payload": payload,
+                    "commit_id": commit_id,
+                }),
+            )
+            fake.set(
+                RK.meta_root(org, sup),
+                json.dumps({"version": 10, "ts": now_ms}),
+            )
+            return 5, 10
+
+    writer = DataWriter.__new__(DataWriter)
+    writer.super_table = SimpleNamespace(organization="org", super_name="lake")
+    writer.catalog = LegacyAtomicCatalog()
+    table = SimpleNamespace(
+        _last_snapshot_leaf={"version": 4, "path": "snap/4.json"},
+    )
+
+    writer._publish_snapshot(
+        simple_table=table,
+        simple_name="table",
+        payload={"resources": []},
+        path="snap/5.json",
+        base_path="snap/4.json",
+        lock_token="token",
+        commit_id="commit-5",
+        now_ms=123,
+        notify_quality=True,
+    )
+
+    unresolved = RedisCatalog._quality_key(
+        "org", "lake", "pending_unresolved", "table",
+    )
+    assert fake.get(unresolved) == "commit-5"
 
 
 def test_catalog_without_atomic_fenced_commit_is_rejected():

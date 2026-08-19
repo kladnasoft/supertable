@@ -62,7 +62,10 @@ from supertable.rbac.access_control import (  # noqa: F401
     check_create_access,
     check_write_access,
 )
-from supertable.redis_catalog import RedisCatalog
+from supertable.redis_catalog import (
+    RedisCatalog,
+    persist_unresolved_quality_generation,
+)
 from supertable.mirroring.mirror_formats import (
     MirrorFormats,
     MirrorPublicationError,
@@ -314,6 +317,7 @@ class DataWriter:
             commit_id: str,
             now_ms: int,
             mirrors: list[str] | None = None,
+            notify_quality: bool = False,
     ) -> None:
         """Publish a snapshot through the fenced atomic catalog primitive.
 
@@ -366,6 +370,16 @@ class DataWriter:
             }
             if mirror_formats:
                 commit_kwargs["mirror_publication"] = True
+            atomic_quality = bool(
+                notify_quality
+                and getattr(
+                    self.catalog,
+                    "supports_atomic_quality_generation",
+                    False,
+                ) is True
+            )
+            if atomic_quality:
+                commit_kwargs["quality_generation"] = commit_id
             try:
                 self.catalog.commit_snapshot(
                     self.super_table.organization,
@@ -393,6 +407,40 @@ class DataWriter:
                             f"{simple_name}: {state_exc}"
                         )
                 raise
+            if notify_quality and not atomic_quality:
+                # Compatibility for catalog adapters that predate atomic DQ
+                # hand-off. Keep this path lightweight (one fenced Lua call,
+                # no scheduler/config imports) and best-effort, matching the
+                # historical post-commit notification contract.
+                try:
+                    adapter_notify = getattr(
+                        self.catalog, "persist_quality_generation", None,
+                    )
+                    if callable(adapter_notify):
+                        adapter_notify(
+                            self.super_table.organization,
+                            self.super_table.super_name,
+                            simple_name,
+                            commit_id,
+                        )
+                    else:
+                        redis_client = getattr(self.catalog, "r", None)
+                        if redis_client is None:
+                            raise RuntimeError(
+                                "catalog adapter cannot persist DQ generations"
+                            )
+                        persist_unresolved_quality_generation(
+                            redis_client,
+                            self.super_table.organization,
+                            self.super_table.super_name,
+                            simple_name,
+                            commit_id,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Post-commit data-quality notification was deferred: %s",
+                        exc,
+                    )
             return
 
         raise RuntimeError(
@@ -1832,6 +1880,10 @@ class DataWriter:
                         commit_id=qid,
                         now_ms=now_ms,
                         mirrors=enabled_mirrors,
+                        notify_quality=not (
+                            simple_name.startswith("__")
+                            and simple_name.endswith("__")
+                        ),
                     )
                 if prev_tombstone_path and prev_tombstone_path != tombstone_path:
                     evict_tombstone(
@@ -1996,26 +2048,6 @@ class DataWriter:
             logger.error(lp(f"monitoring durability/backpressure failure: {me}"))
         except Exception as me:
             logger.error(lp(f"monitoring enqueue failed: {me}"))
-
-        # ---------- DATA QUALITY: notify scheduler of new data ----------
-        # Producer side of the DQ pipeline: set a debounced "pending" flag in
-        # Redis so the background scheduler (started via
-        # ``supertable.quality.start_scheduler``) picks this table up on its
-        # next tick, respecting debounce + lock + cooldown.  ``notify_ingest``
-        # has its own internal guard and never raises; the outer guard here
-        # only covers an unexpected import-time failure so a write can never
-        # fail due to quality scheduling.  We log (not silently ``pass``) so a
-        # future packaging regression is visible instead of a dead no-op.
-        try:
-            from supertable.quality.scheduler import notify_ingest
-            notify_ingest(
-                self.catalog.r,
-                self.super_table.organization,
-                self.super_table.super_name,
-                simple_name,
-            )
-        except Exception as qe:
-            logger.warning(lp(f"data-quality notify_ingest skipped: {qe}"))
 
         # ---------- AUDIT LOG ----------
         try:

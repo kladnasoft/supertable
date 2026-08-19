@@ -60,6 +60,72 @@ def _publication_timestamp(now_ms: Optional[int]) -> int:
     )
 
 
+def persist_unresolved_quality_generation(
+        redis_client: Any,
+        org: str,
+        sup: str,
+        simple: str,
+        generation: str,
+) -> bool:
+    """Persist one post-ingest generation under a live catalog incarnation.
+
+    Production ``RedisCatalog.commit_snapshot`` performs this write inside its
+    snapshot transaction.  This single-round-trip helper is the compatibility
+    path for catalog adapters that implement the fenced snapshot contract but
+    do not yet advertise atomic quality-generation support.
+    """
+    if not isinstance(generation, str) or not generation:
+        raise ValueError("quality generation must be a non-empty string")
+    root_key = RK.meta_root(org, sup)
+    leaf_key = RK.meta_leaf(org, sup, simple)
+    simple_intent_key = RK.meta_simple_deletion_intent(org, sup, simple)
+    namespace_intent_key = RK.meta_namespace_deletion_intent(org, sup)
+    unresolved_key = (
+        RK.quality_prefix(org, sup) + f"pending_unresolved:{simple}"
+    )
+    script = """
+    -- persist a compatibility ingest generation under one live incarnation
+    if redis.call('exists', KEYS[3]) == 1
+        or redis.call('exists', KEYS[4]) == 1 then
+        return 0
+    end
+    local root_payload = redis.call('get', KEYS[1])
+    local leaf_payload = redis.call('get', KEYS[2])
+    if not root_payload or not leaf_payload then return 0 end
+    local root_ok, root = pcall(cjson.decode, root_payload)
+    local leaf_ok, leaf = pcall(cjson.decode, leaf_payload)
+    if not root_ok or type(root) ~= 'table'
+        or type(root['version']) ~= 'number' or root['version'] < 0
+        or root['version'] > 9007199254740991
+        or root['version'] ~= math.floor(root['version'])
+        or type(root['ts']) ~= 'number' or root['ts'] < 0
+        or root['ts'] > 9007199254740991
+        or root['ts'] ~= math.floor(root['ts'])
+        or not leaf_ok or type(leaf) ~= 'table'
+        or type(leaf['version']) ~= 'number' or leaf['version'] < 0
+        or leaf['version'] > 9007199254740991
+        or leaf['version'] ~= math.floor(leaf['version'])
+        or type(leaf['ts']) ~= 'number' or leaf['ts'] < 0
+        or leaf['ts'] > 9007199254740991
+        or leaf['ts'] ~= math.floor(leaf['ts'])
+        or type(leaf['path']) ~= 'string' or leaf['path'] == '' then
+        return 0
+    end
+    redis.call('set', KEYS[5], ARGV[1])
+    return 1
+    """
+    return bool(redis_client.eval(
+        script,
+        5,
+        root_key,
+        leaf_key,
+        simple_intent_key,
+        namespace_intent_key,
+        unresolved_key,
+        generation,
+    ))
+
+
 # Every mutation script that consumes ``meta:root`` prepends this helper.  A
 # Python authorization preflight is not a write fence: root flags can change
 # before the final Redis publication.  ``root_document_state`` therefore
@@ -872,6 +938,10 @@ class RedisCatalog:
     _QUALITY_DYNAMIC_SCAN_COUNT = 256
     _QUALITY_DYNAMIC_KEY_LIMIT = 100_000
     _QUALITY_DYNAMIC_SCAN_CALL_LIMIT = 100_000
+    # DataWriter may pass ``quality_generation`` to ``commit_snapshot`` only
+    # when a catalog advertises this capability.  Third-party/test adapters
+    # without it retain the post-commit compatibility path.
+    supports_atomic_quality_generation = True
     _STAGE_LOCK_SCAN_COUNT = 256
     _STAGE_LOCK_DRAIN_LIMIT = 10_000
     _STAGE_LOCK_SCAN_CALL_LIMIT = 100_000
@@ -2271,6 +2341,7 @@ local table_names = KEYS[6]
 local namespace_delete = KEYS[7]
 local simple_delete = KEYS[8]
 local schema_key = KEYS[9]
+local quality_unresolved_key = KEYS[11]
 
 local payload_json = ARGV[1]
 local new_path = ARGV[2]
@@ -2283,6 +2354,7 @@ local mirror_required = ARGV[8]
 local simple_name = ARGV[9]
 local schema_json = ARGV[10]
 local expected_mirrors_json = ARGV[11]
+local quality_generation = ARGV[12]
 
 if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or now_ms ~= math.floor(now_ms)
@@ -2502,6 +2574,11 @@ redis.call('SET', schema_key, schema_json)
 redis.call('SADD', table_names, simple_name)
 if mirror ~= nil then
   redis.call('SET', mirror_key, cjson.encode(mirror))
+end
+if quality_generation ~= '' then
+  -- The scheduler resolves this persistent generation into configured modes.
+  -- Publication here is atomic with root/leaf commit and all lifecycle fences.
+  redis.call('SET', quality_unresolved_key, quality_generation)
 end
 return {1, new_leaf_version, new_root_version}
 """
@@ -5479,6 +5556,7 @@ return 1
             commit_id: Optional[str] = None,
             mirror_publication: bool = False,
             expected_mirrors: Optional[Sequence[str]] = None,
+            quality_generation: Optional[str] = None,
             now_ms: Optional[int] = None,
     ) -> tuple[int, int]:
         """Atomically publish one fenced table snapshot and bump its root.
@@ -5494,6 +5572,11 @@ return 1
         immutable ``commit_id`` stored in both documents lets a caller or
         operator reconcile whether such a commit reached Redis; retrying as a
         different, payload-less write would be unsafe.
+
+        ``quality_generation``, when present, must be this commit's opaque ID.
+        The same transaction persists it as unresolved post-ingest work.  The
+        scheduler later expands it into configured modes under exact root/leaf
+        lifecycle pins, so schedule reads never delay the writer.
         """
         if not lock_token:
             raise LockLostError("snapshot publication requires a fencing lock token")
@@ -5514,6 +5597,12 @@ return 1
                 "mirror-tracked snapshot publication requires an explicit commit_id"
             )
         cid = commit_id or secrets.token_hex(16)
+        if quality_generation is None:
+            quality_generation = ""
+        elif quality_generation != cid:
+            raise ValueError(
+                "quality_generation must equal the snapshot commit_id"
+            )
         if expected_mirrors is None:
             expected_mirrors = self.get_mirrors(org, sup)
         if isinstance(expected_mirrors, (str, bytes)):
@@ -5540,6 +5629,9 @@ return 1
                     RK.meta_simple_deletion_intent(org, sup, simple),
                     RK.schema(org, sup, simple),
                     RK.meta_mirrors(org, sup),
+                    self._quality_key(
+                        org, sup, "pending_unresolved", simple,
+                    ),
                 ],
                 args=[
                     payload_json,
@@ -5553,6 +5645,7 @@ return 1
                     simple,
                     json.dumps(self._snapshot_schema_document(payload)),
                     json.dumps(normalized_mirrors),
+                    quality_generation,
                 ],
             )
         except redis.RedisError as exc:

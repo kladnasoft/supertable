@@ -7,15 +7,15 @@ Regression seal for a latent bug.  The writer used to do::
 — a module path that *never existed* — wrapped in ``except Exception: pass``.
 The ``ModuleNotFoundError`` was swallowed silently, so the post-ingest DQ
 trigger was a dead no-op everywhere.  The quality package now lives inside the
-library (``supertable.quality``) and the writer imports it natively, logging
-(not silently ``pass``-ing) if the import ever breaks again.
+library (``supertable.quality``); DataWriter hands off a durable unresolved
+generation inside the snapshot commit, while the direct producer API remains
+available from that package.
 
 These tests prove, end to end against the hermetic fake Redis (see
 ``tests/conftest.py``):
 
-  * the exact module path the writer imports resolves (canary for the bug);
-  * a real write sets the debounced "pending" flag for that table (the
-    producer side genuinely fires now);
+  * the public producer module path resolves (canary for the original bug);
+  * a real write commits durable unresolved work for that table;
   * ``notify_ingest`` stays a no-op for system tables and when post-ingest /
     quality is disabled (so it never floods Redis or blocks a write);
   * ``start_scheduler`` is idempotent — one daemon thread, re-entrant-safe.
@@ -31,7 +31,12 @@ import pyarrow as pa
 from supertable.data_writer import DataWriter
 from supertable.quality import scheduler as dq_scheduler
 from supertable.quality.config import DQConfig
-from supertable.quality.scheduler import _pending_key, notify_ingest, start_scheduler
+from supertable.quality.scheduler import (
+    _pending_key,
+    _unresolved_pending_key,
+    notify_ingest,
+    start_scheduler,
+)
 from supertable.super_table import SuperTable
 
 ORG = "kladna-soft"
@@ -44,9 +49,8 @@ def _rows(keys) -> pa.Table:
     return pa.table({KEY: list(keys), "amount": [0] * len(keys)})
 
 
-def test_writer_import_path_resolves():
-    """Canary: the exact module the writer imports must exist and expose
-    ``notify_ingest``.
+def test_public_ingest_notification_path_resolves():
+    """Canary: the public module path must exist and expose ``notify_ingest``.
 
     This is the specific path that was broken (``supertable.services.quality``)
     and silently swallowed for so long.  ``supertable.quality`` re-exports it
@@ -57,9 +61,8 @@ def test_writer_import_path_resolves():
     assert pkg.notify_ingest is mod.notify_ingest
 
 
-def test_write_sets_pending_flag(hermetic_fakeredis):
-    """A real append sets the table's debounced pending flag — proof the
-    producer side of the DQ pipeline actually fires from the write path."""
+def test_write_sets_durable_unresolved_generation(hermetic_fakeredis):
+    """A real append atomically leaves durable scheduler work behind."""
     fake = hermetic_fakeredis
     simple = f"dq_wire_{uuid.uuid4().hex[:8]}"
     SuperTable(SUPER, ORG)  # bootstrap super + default superadmin role
@@ -67,34 +70,41 @@ def test_write_sets_pending_flag(hermetic_fakeredis):
     # The writer must be talking to the same fake Redis we inspect.
     assert dw.catalog.r is fake
 
-    key = _pending_key(ORG, SUPER, simple)
-    assert fake.get(key) is None, "no pending flag before any write"
+    key = _unresolved_pending_key(ORG, SUPER, simple)
+    assert fake.get(key) is None, "no unresolved generation before any write"
 
     dw.write(role_name=ROLE, simple_name=simple, data=_rows(["a", "b"]),
              overwrite_columns=[])
 
-    assert fake.get(key) is not None, "write must set the DQ pending flag"
-    # Debounced, not persistent: bounded TTL so a quiet table self-clears.
-    ttl = fake.ttl(key)
-    assert 0 < ttl <= dq_scheduler.DEFAULT_PENDING_TTL_SECONDS, ttl
+    generation = fake.get(key)
+    assert generation is not None, "write must persist unresolved DQ work"
+    assert generation == dw.catalog.get_leaf(ORG, SUPER, simple)["commit_id"]
+    # This marker is the crash-safe hand-off. The scheduler later resolves it
+    # into TTL-bounded scalar/per-mode pending keys after reading configuration.
+    assert fake.ttl(key) == -1
 
 
-def test_repeated_writes_keep_single_pending_flag(hermetic_fakeredis):
-    """Debounce: many writes collapse to one pending flag (the whole point of
-    the producer/consumer split — 1000 writes ≠ 1000 checks)."""
+def test_repeated_writes_keep_single_unresolved_generation(hermetic_fakeredis):
+    """Debounce: many writes collapse to one overwrite-only generation."""
     fake = hermetic_fakeredis
     simple = f"dq_debounce_{uuid.uuid4().hex[:8]}"
     SuperTable(SUPER, ORG)
     dw = DataWriter(super_name=SUPER, organization=ORG)
-    key = _pending_key(ORG, SUPER, simple)
+    key = _unresolved_pending_key(ORG, SUPER, simple)
 
+    generations = []
     for k in ["a", "b", "c", "d", "e"]:
         dw.write(role_name=ROLE, simple_name=simple, data=_rows([k]),
                  overwrite_columns=[])
+        generations.append(fake.get(key))
 
-    # One scalar key for the table — not one per write.
-    matches = fake.keys(_pending_key(ORG, SUPER, "*"))
+    # One unresolved key for the table — not one per write.
+    matches = fake.keys(_unresolved_pending_key(ORG, SUPER, "*"))
     assert matches == [key], matches
+    assert len(set(generations)) == 5
+    assert generations[-1] == dw.catalog.get_leaf(
+        ORG, SUPER, simple,
+    )["commit_id"]
 
 
 def test_system_table_is_skipped(hermetic_fakeredis):
@@ -103,6 +113,20 @@ def test_system_table_is_skipped(hermetic_fakeredis):
     fake = hermetic_fakeredis
     notify_ingest(fake, ORG, SUPER, "__data_quality__")
     assert fake.get(_pending_key(ORG, SUPER, "__data_quality__")) is None
+
+
+def test_system_table_write_does_not_commit_unresolved_work(hermetic_fakeredis):
+    fake = hermetic_fakeredis
+    table = f"__dq_{uuid.uuid4().hex[:8]}__"
+    SuperTable(SUPER, ORG)
+    DataWriter(super_name=SUPER, organization=ORG).write(
+        role_name=ROLE,
+        simple_name=table,
+        data=_rows(["a"]),
+        overwrite_columns=[],
+    )
+
+    assert fake.get(_unresolved_pending_key(ORG, SUPER, table)) is None
 
 
 def test_disabled_post_ingest_skips(hermetic_fakeredis):
