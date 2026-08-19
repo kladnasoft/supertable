@@ -114,6 +114,9 @@ class SimpleTable:
             table lease and have just verified the exact live leaf plus both
             deletion-intent fences. It is valid only with
             ``create_if_missing=False``.
+        _pinned_leaf: Exact leaf document returned by the writer's atomic
+            mutation-context read. It is consumed by
+            :meth:`get_simple_table_snapshot` without another catalog lookup.
     """
 
     def __init__(
@@ -124,6 +127,7 @@ class SimpleTable:
         create_if_missing: bool = True,
         catalog: Optional[RedisCatalog] = None,
         _live_leaf_verified: bool = False,
+        _pinned_leaf: Optional[Dict[str, Any]] = None,
     ):
         # ``super == simple`` is the public aggregate relation that unions the
         # parent's children.  A physical child with that name is therefore
@@ -154,6 +158,17 @@ class SimpleTable:
             raise ValueError(
                 "_live_leaf_verified requires create_if_missing=False"
             )
+        if _pinned_leaf is not None and not _live_leaf_verified:
+            raise ValueError("_pinned_leaf requires _live_leaf_verified=True")
+        if _pinned_leaf is not None and (
+            not isinstance(_pinned_leaf, dict)
+            or not isinstance(_pinned_leaf.get("path"), str)
+            or not _pinned_leaf["path"]
+        ):
+            raise ValueError("_pinned_leaf must be a valid leaf document")
+        self._pinned_leaf = (
+            dict(_pinned_leaf) if _pinned_leaf is not None else None
+        )
         if not _live_leaf_verified:
             deletion_guard = getattr(
                 type(self.catalog), "check_deletion_intent_absent", None,
@@ -509,7 +524,13 @@ class SimpleTable:
 
         If the Redis leaf stores a snapshot payload, use it to avoid storage reads.
         """
-        ptr = self.catalog.get_leaf(self.super_table.organization, self.super_table.super_name, self.simple_name)
+        ptr = getattr(self, "_pinned_leaf", None)
+        if ptr is None:
+            ptr = self.catalog.get_leaf(
+                self.super_table.organization,
+                self.super_table.super_name,
+                self.simple_name,
+            )
         if not ptr or not ptr.get("path"):
             raise FileNotFoundError("No path found in simple table leaf pointer.")
         # Preserve the exact leaf document that selected this snapshot.  The

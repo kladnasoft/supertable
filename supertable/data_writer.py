@@ -872,36 +872,47 @@ class DataWriter:
             if not token:
                 raise TimeoutError(f"Could not acquire lock for simple '{simple_name}'")
             mark("lock")
-            mutation_fence = getattr(
-                type(self.catalog), "check_table_mutation_allowed", None,
+            reserve_count = 0 if delete_only else incoming_rows
+            begin_mutation = getattr(
+                type(self.catalog), "begin_table_mutation", None,
             )
-            if callable(mutation_fence):
-                self.catalog.check_table_mutation_allowed(
+            mutation_context: dict[str, Any] | None = None
+            if callable(begin_mutation):
+                mutation_context = self.catalog.begin_table_mutation(
                     self.super_table.organization,
                     self.super_table.super_name,
                     simple_name,
                     lock_token=token,
+                    reserve_count=reserve_count,
+                )
+                locked_target_exists = mutation_context.get("leaf") is not None
+            else:
+                mutation_fence = getattr(
+                    type(self.catalog), "check_table_mutation_allowed", None,
+                )
+                if callable(mutation_fence):
+                    self.catalog.check_table_mutation_allowed(
+                        self.super_table.organization,
+                        self.super_table.super_name,
+                        simple_name,
+                        lock_token=token,
+                    )
+
+                # Compatibility path for catalog adapters without the fused
+                # mutation-context primitive.
+                locked_target_exists = self.catalog.leaf_exists(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    simple_name,
                 )
 
             # Pin the create-vs-update authorization decision at the table
             # lease boundary.  A concurrent creator can publish the leaf after
             # our optimistic preflight but before this writer acquires the
             # lease; CREATE permission must never authorize mutation of that
-            # newly-existing table.  Conversely, a table that existed at
-            # preflight is deliberately not recreated if it disappeared while
-            # we waited (``create_if_missing`` remains false below).
-            locked_target_exists = self.catalog.leaf_exists(
-                self.super_table.organization,
-                self.super_table.super_name,
-                simple_name,
-            )
+            # newly-existing table.
             if not target_existed and locked_target_exists:
                 check_write_access(**access_args)
-
-            # Configuration updates use this same lease.  Refresh only after
-            # acquiring it so a write cannot read an old configuration, pause,
-            # then resume after a newer configuration has been acknowledged.
-            table_config = self._get_table_config(simple_name)
 
             # --- Read last snapshot (via leaf pointer) ------------------------
             # A target that existed at authorization time must not be
@@ -913,7 +924,42 @@ class DataWriter:
                 create_if_missing=not locked_target_exists,
                 catalog=self.catalog,
                 _live_leaf_verified=bool(locked_target_exists),
+                _pinned_leaf=(
+                    mutation_context.get("leaf")
+                    if mutation_context is not None and locked_target_exists
+                    else None
+                ),
             )
+            if mutation_context is not None and not locked_target_exists:
+                # Initialization publishes the first exact leaf under the
+                # namespace fence. Re-enter the single atomic context boundary
+                # after it releases that fence so the first write can pin and
+                # reserve from the initialized snapshot too.
+                mutation_context = self.catalog.begin_table_mutation(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    simple_name,
+                    lock_token=token,
+                    reserve_count=reserve_count,
+                )
+                pinned_leaf = mutation_context.get("leaf")
+                if not isinstance(pinned_leaf, dict):
+                    raise RuntimeError(
+                        "Initialized table has no pinned Redis leaf"
+                    )
+                simple_table._pinned_leaf = dict(pinned_leaf)
+
+            # Configuration updates use this same lease.  The fused context
+            # reads it at the exact leaf boundary; adapters retain the strict
+            # authoritative read under the lease.
+            if mutation_context is not None:
+                table_config = dict(
+                    mutation_context.get("table_config") or {}
+                )
+                self._table_config_cache[simple_name] = dict(table_config)
+            else:
+                table_config = self._get_table_config(simple_name)
+
             last_simple_table, last_simple_table_path = simple_table.get_simple_table_snapshot()
             # A current deletion-vector is immutable correctness metadata.  Do
             # not let a mutation bless a legacy/unsealed pointer into a new
@@ -922,27 +968,52 @@ class DataWriter:
             prior_tombstone_digest = self._declared_tombstone_digest(last_simple_table)
             mark("snapshot")
 
-            enabled_mirrors = self._get_enabled_mirrors("this mutation")
+            if mutation_context is not None:
+                enabled_mirrors = list(mutation_context.get("mirrors") or [])
+            else:
+                enabled_mirrors = self._get_enabled_mirrors("this mutation")
 
             # Reserve only after acquiring the table lock and pinning the exact
             # base snapshot.  The immutable high-watermark recovers safely when
             # Redis is flushed/restored and prevents a new row from reusing an ID
             # still referenced by data or a deletion-vector.
-            reserve_count = 0 if delete_only else incoming_rows
             delete_all = bool(delete_only and not overwrite_columns)
             # A targeted delete allocates no new IDs but can publish a deletion
             # vector and keeps physical resources alive.  Legacy snapshots must
             # therefore derive and persist their exact global floor now.  Only
             # delete-all may skip the one-time scan because its successor keeps
             # no physical rows and emits no vector.
-            start_rowid, rowid_high_watermark = self._reserve_snapshot_rowids(
-                snapshot=last_simple_table,
-                simple_name=simple_name,
-                count=reserve_count,
-                profiler=profiler,
-                lock_token=token,
-                require_floor=not delete_all,
+            pinned_floor = (
+                mutation_context.get("rowid_floor")
+                if mutation_context is not None else None
             )
+            pinned_reservation = (
+                mutation_context.get("rowid_reservation")
+                if mutation_context is not None else None
+            )
+            snapshot_floor = last_simple_table.get("rowid_high_watermark")
+            if (
+                type(pinned_floor) is int
+                and type(snapshot_floor) is int
+                and pinned_floor == snapshot_floor
+                and (
+                    (reserve_count > 0 and pinned_reservation is not None)
+                    or reserve_count == 0
+                )
+            ):
+                if reserve_count > 0:
+                    start_rowid, rowid_high_watermark = pinned_reservation
+                else:
+                    start_rowid, rowid_high_watermark = 0, pinned_floor
+            else:
+                start_rowid, rowid_high_watermark = self._reserve_snapshot_rowids(
+                    snapshot=last_simple_table,
+                    simple_name=simple_name,
+                    count=reserve_count,
+                    profiler=profiler,
+                    lock_token=token,
+                    require_floor=not delete_all,
+                )
             if rowid_high_watermark is not None:
                 last_simple_table["rowid_high_watermark"] = rowid_high_watermark
             if reserve_count > 0:

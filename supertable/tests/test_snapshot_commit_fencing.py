@@ -37,6 +37,24 @@ def _seed(fake, *, token="token", version=4, path="snap/4.json"):
     fake.set(RK.lock_leaf("org", "lake", "table"), token, ex=30)
 
 
+def _seed_current_snapshot(
+        fake, *, floor=100, token="token", version=4,
+):
+    _seed(fake, token=token, version=version)
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    leaf["payload"] = {
+        "snapshot_version": version,
+        "schema": [],
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "rowid_high_watermark": floor,
+        "_row_filter": None,
+    }
+    fake.set(RK.meta_leaf("org", "lake", "table"), json.dumps(leaf))
+
+
 def test_snapshot_commit_atomically_updates_leaf_and_root():
     catalog, fake = _catalog()
     _seed(fake)
@@ -1094,6 +1112,191 @@ def test_rowid_reservation_recovers_above_snapshot_high_watermark():
         "org", "lake", "table", count=2, floor=50,
         lock_token="token",
     ) == (104, 105)
+
+
+def test_begin_table_mutation_pins_context_and_reserves_in_one_boundary():
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    fake.set(
+        RK.meta_table_config("org", "lake", "table"),
+        json.dumps({"primary_keys": ["id"], "modified_ms": 7}),
+    )
+    fake.set(
+        RK.meta_mirrors("org", "lake"),
+        json.dumps({"formats": ["DELTA", "PARQUET"], "ts": 8}),
+    )
+    fake.set(RK.meta_rowid_seq("org", "lake", "table"), 3)
+
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token", reserve_count=4,
+    )
+
+    assert context["leaf"]["version"] == 4
+    assert context["leaf"]["path"] == "snap/4.json"
+    assert context["leaf"]["payload"]["rowid_high_watermark"] == 100
+    assert context["table_config"] == {
+        "primary_keys": ["id"], "modified_ms": 7,
+    }
+    assert context["mirrors"] == ["DELTA", "PARQUET"]
+    assert context["rowid_floor"] == 100
+    assert context["rowid_reservation"] == (101, 104)
+    assert fake.get(RK.meta_rowid_seq("org", "lake", "table")) == "104"
+
+
+def test_begin_table_mutation_returns_absent_leaf_without_creating_state():
+    catalog, fake = _catalog()
+    _seed(fake)
+    fake.delete(RK.meta_leaf("org", "lake", "table"))
+
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token", reserve_count=4,
+    )
+
+    assert context == {
+        "leaf": None,
+        "table_config": {},
+        "mirrors": [],
+        "rowid_floor": None,
+        "rowid_reservation": None,
+    }
+    assert not fake.exists(RK.meta_rowid_seq("org", "lake", "table"))
+
+
+@pytest.mark.parametrize(
+    "mutation,error_type",
+    [
+        ("lost-lock", LockLostError),
+        ("namespace-delete", DeletionIntentConflictError),
+        ("simple-delete", DeletionIntentConflictError),
+        ("missing-root", FileNotFoundError),
+        ("corrupt-root", RuntimeError),
+        ("read-only", PermissionError),
+    ],
+)
+def test_begin_table_mutation_fails_before_rowid_side_effects(
+        mutation, error_type,
+):
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    if mutation == "lost-lock":
+        fake.set(RK.lock_leaf("org", "lake", "table"), "new-owner")
+    elif mutation == "namespace-delete":
+        fake.set(RK.meta_namespace_deletion_intent("org", "lake"), "pending")
+    elif mutation == "simple-delete":
+        fake.set(
+            RK.meta_simple_deletion_intent("org", "lake", "table"),
+            "pending",
+        )
+    elif mutation == "missing-root":
+        fake.delete(RK.meta_root("org", "lake"))
+    elif mutation == "corrupt-root":
+        fake.set(RK.meta_root("org", "lake"), "[]")
+    elif mutation == "read-only":
+        fake.set(
+            RK.meta_root("org", "lake"),
+            json.dumps({
+                "version": 9,
+                "ts": 1,
+                "read_only": True,
+                "clone_type": "readonly",
+                "cloned_from": "source",
+            }),
+        )
+    with pytest.raises(error_type):
+        catalog.begin_table_mutation(
+            "org", "lake", "table", lock_token="token", reserve_count=4,
+        )
+
+    assert not fake.exists(RK.meta_rowid_seq("org", "lake", "table"))
+
+
+@pytest.mark.parametrize("corruption", ["leaf", "config", "mirrors", "snapshot"])
+def test_begin_table_mutation_rejects_corruption_without_allocating_ids(
+        corruption,
+):
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    if corruption == "leaf":
+        fake.set(RK.meta_leaf("org", "lake", "table"), "[]")
+    elif corruption == "config":
+        fake.set(RK.meta_table_config("org", "lake", "table"), "[]")
+    elif corruption == "mirrors":
+        fake.set(
+            RK.meta_mirrors("org", "lake"),
+            json.dumps({"formats": ["DELTA", "DELTA"], "ts": 1}),
+        )
+    else:
+        leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+        leaf["payload"]["tombstone_rows"] = -1
+        fake.set(RK.meta_leaf("org", "lake", "table"), json.dumps(leaf))
+
+    if corruption == "snapshot":
+        # The leaf identity remains valid, so the conservative fast path falls
+        # back without trusting or mutating from its corrupt cache floor.
+        context = catalog.begin_table_mutation(
+            "org", "lake", "table", lock_token="token", reserve_count=4,
+        )
+        assert context["rowid_floor"] is None
+        assert context["rowid_reservation"] is None
+    else:
+        with pytest.raises((RuntimeError, ValueError)):
+            catalog.begin_table_mutation(
+                "org", "lake", "table", lock_token="token", reserve_count=4,
+            )
+    assert not fake.exists(RK.meta_rowid_seq("org", "lake", "table"))
+
+
+def test_begin_table_mutation_large_int64_floor_uses_exact_fallback():
+    catalog, fake = _catalog()
+    floor = (1 << 53) + 17
+    _seed_current_snapshot(fake, floor=floor)
+
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token", reserve_count=3,
+    )
+
+    assert context["leaf"]["payload"]["rowid_high_watermark"] == floor
+    assert context["rowid_floor"] is None
+    assert context["rowid_reservation"] is None
+    assert not fake.exists(RK.meta_rowid_seq("org", "lake", "table"))
+    assert catalog.reserve_rowids_at_least(
+        "org", "lake", "table", count=3, floor=floor,
+        lock_token="token",
+    ) == (floor + 1, floor + 3)
+
+
+def test_begin_table_mutation_observes_one_atomic_race_winner(monkeypatch):
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake, floor=10)
+    original = catalog._begin_table_mutation
+
+    def race_then_begin(*, keys, args):
+        leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+        leaf["version"] = 5
+        leaf["path"] = "snap/5.json"
+        leaf["payload"]["snapshot_version"] = 5
+        leaf["payload"]["rowid_high_watermark"] = 20
+        fake.set(RK.meta_leaf("org", "lake", "table"), json.dumps(leaf))
+        fake.set(
+            RK.meta_table_config("org", "lake", "table"),
+            json.dumps({"primary_keys": ["new"]}),
+        )
+        fake.set(
+            RK.meta_mirrors("org", "lake"),
+            json.dumps({"formats": ["ICEBERG"], "ts": 2}),
+        )
+        return original(keys=keys, args=args)
+
+    monkeypatch.setattr(catalog, "_begin_table_mutation", race_then_begin)
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token", reserve_count=2,
+    )
+
+    assert context["leaf"]["version"] == 5
+    assert context["leaf"]["path"] == "snap/5.json"
+    assert context["table_config"] == {"primary_keys": ["new"]}
+    assert context["mirrors"] == ["ICEBERG"]
+    assert context["rowid_reservation"] == (21, 22)
 
 
 def test_rowid_reservation_is_exact_above_double_precision_boundary():

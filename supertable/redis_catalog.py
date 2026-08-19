@@ -26,7 +26,10 @@ from supertable.utils.spark_security import (
     spark_storage_credential_keys,
     validate_spark_storage_config,
 )
-from supertable.utils.snapshot import snapshot_cache_payload
+from supertable.utils.snapshot import (
+    complete_snapshot_payload,
+    snapshot_cache_payload,
+)
 
 
 def _now_ms() -> int:
@@ -1801,6 +1804,176 @@ local root_state = root_document_state(root, nil)
 if root_state == -1 then return -5 end
 if root_state == 0 then return -6 end
 return 1
+"""
+
+    _LUA_BEGIN_TABLE_MUTATION = _LUA_ROOT_DOCUMENT_GUARD + """
+local leaf_lock = KEYS[1]
+local namespace_intent = KEYS[2]
+local simple_intent = KEYS[3]
+local root_key = KEYS[4]
+local leaf_key = KEYS[5]
+local config_key = KEYS[6]
+local mirrors_key = KEYS[7]
+local rowid_key = KEYS[8]
+local leaf_token = ARGV[1]
+local reserve_count = ARGV[2]
+
+if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
+  return {-1}
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return {-2} end
+if redis.call('EXISTS', simple_intent) == 1 then return {-3} end
+
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return {-4} end
+if root_type ~= 'string' then return {-5} end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return {-5} end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return {-5} end
+if root_state == 0 then return {-6} end
+
+local config_raw = redis.call('GET', config_key) or ''
+if config_raw ~= '' then
+  local config_ok, config = pcall(cjson.decode, config_raw)
+  if not string.match(config_raw, '^%s*{')
+      or not config_ok or type(config) ~= 'table' then return {-8} end
+end
+
+-- Validate the mirror document at the same linearization point as the leaf.
+-- The final snapshot CAS compares this exact set again, because mirror config
+-- intentionally remains mutable while a table lease is held.
+local mirrors_raw = redis.call('GET', mirrors_key) or ''
+if mirrors_raw ~= '' then
+  local mirrors_ok, mirrors = pcall(cjson.decode, mirrors_raw)
+  if not string.match(mirrors_raw, '^%s*{')
+      or not mirrors_ok or type(mirrors) ~= 'table'
+      or type(mirrors['formats']) ~= 'table'
+      or type(mirrors['ts']) ~= 'number'
+      or mirrors['ts'] < 0
+      or mirrors['ts'] > ROOT_MAX_SAFE_INTEGER
+      or mirrors['ts'] ~= math.floor(mirrors['ts']) then return {-9} end
+  local seen = {}
+  local physical_count = 0
+  for key, value in pairs(mirrors['formats']) do
+    if type(key) ~= 'number' or key < 1 or key ~= math.floor(key)
+        or type(value) ~= 'string' then return {-9} end
+    physical_count = physical_count + 1
+    local normalized = string.upper(value)
+    if normalized ~= 'DELTA' and normalized ~= 'ICEBERG'
+        and normalized ~= 'PARQUET' then return {-9} end
+    if seen[normalized] then return {-9} end
+    seen[normalized] = true
+  end
+  if physical_count ~= #mirrors['formats'] then return {-9} end
+end
+
+local leaf_type = redis.call('TYPE', leaf_key)
+if type(leaf_type) == 'table' then leaf_type = leaf_type['ok'] end
+if leaf_type == 'none' then
+  return {0, '', config_raw, mirrors_raw, '0', '', '0', '', ''}
+end
+if leaf_type ~= 'string' then return {-7} end
+local leaf_raw = redis.call('GET', leaf_key)
+local leaf_ok, leaf = pcall(cjson.decode, leaf_raw)
+if not leaf_ok or type(leaf) ~= 'table'
+    or type(leaf['version']) ~= 'number'
+    or leaf['version'] < 0
+    or leaf['version'] > ROOT_MAX_SAFE_INTEGER
+    or leaf['version'] ~= math.floor(leaf['version'])
+    or type(leaf['ts']) ~= 'number'
+    or leaf['ts'] < 0
+    or leaf['ts'] > ROOT_MAX_SAFE_INTEGER
+    or leaf['ts'] ~= math.floor(leaf['ts'])
+    or type(leaf['path']) ~= 'string'
+    or leaf['path'] == '' then return {-7} end
+
+-- A current Redis payload is an atomic cache of the immutable snapshot.  Use
+-- its floor only when it satisfies the same conservative shape needed by the
+-- Python cache validator and is exactly representable by Redis Lua.  Legacy,
+-- incomplete, corrupt, or >2^53 floors deliberately take the existing
+-- storage-derived exact-Int64 fallback after this call.
+local floor_available = false
+local floor = ''
+local payload = leaf['payload']
+if type(payload) == 'table' and payload['_row_filter'] ~= nil then
+  local candidate = payload
+  if type(candidate['resources']) ~= 'table'
+      and type(payload['snapshot']) == 'table' then
+    candidate = payload['snapshot']
+  end
+  local pointer = candidate['tombstone']
+  local tombstone_rows = candidate['tombstone_rows']
+  local digest = candidate['tombstone_digest']
+  local tombstone_ok = false
+  if pointer == cjson.null and type(tombstone_rows) == 'number'
+      and tombstone_rows == 0 and digest == cjson.null then
+    tombstone_ok = true
+  elseif type(pointer) == 'string' and pointer ~= ''
+      and type(tombstone_rows) == 'number'
+      and tombstone_rows > 0
+      and tombstone_rows == math.floor(tombstone_rows)
+      and type(digest) == 'string' and string.len(digest) == 64
+      and string.match(digest, '^[0-9a-f]+$') then
+    tombstone_ok = true
+  end
+  local raw_floor = candidate['rowid_high_watermark']
+  if type(candidate['snapshot_version']) == 'number'
+      and candidate['snapshot_version'] == leaf['version']
+      and candidate['snapshot_version'] == math.floor(candidate['snapshot_version'])
+      and type(candidate['schema']) == 'table'
+      and type(candidate['resources']) == 'table'
+      and tombstone_ok
+      and type(raw_floor) == 'number'
+      and raw_floor >= 0
+      and raw_floor <= ROOT_MAX_SAFE_INTEGER
+      and raw_floor == math.floor(raw_floor) then
+    floor_available = true
+    floor = string.format('%.0f', raw_floor)
+  end
+end
+
+local reserved = '0'
+local previous = ''
+local new_value = ''
+if floor_available and reserve_count ~= '0' then
+  local cur = redis.call('GET', rowid_key) or '0'
+  local function normalize_decimal(value)
+    local normalized = string.gsub(value, '^0+', '')
+    if normalized == '' then return '0' end
+    return normalized
+  end
+  local function decimal_lt(a, b)
+    a = normalize_decimal(a)
+    b = normalize_decimal(b)
+    if string.len(a) ~= string.len(b) then
+      return string.len(a) < string.len(b)
+    end
+    return a < b
+  end
+  if not string.match(cur, '^%d+$')
+      or not string.match(floor, '^%d+$')
+      or not string.match(reserve_count, '^%d+$') then
+    return redis.error_reply('invalid non-negative rowid sequence')
+  end
+  cur = normalize_decimal(cur)
+  floor = normalize_decimal(floor)
+  if decimal_lt(cur, floor) then
+    cur = floor
+    redis.call('SET', rowid_key, cur)
+  end
+  redis.call('INCRBY', rowid_key, reserve_count)
+  previous = cur
+  new_value = redis.call('GET', rowid_key)
+  reserved = '1'
+end
+
+return {
+  1, leaf_raw, config_raw, mirrors_raw,
+  floor_available and '1' or '0', floor, reserved,
+  previous, new_value
+}
 """
 
     _LUA_ASSERT_INITIALIZATION_ALLOWED = """
@@ -4397,6 +4570,9 @@ return 1
         self._assert_table_mutation_allowed = self.r.register_script(
             self._LUA_ASSERT_TABLE_MUTATION_ALLOWED
         )
+        self._begin_table_mutation = self.r.register_script(
+            self._LUA_BEGIN_TABLE_MUTATION
+        )
         self._assert_initialization_allowed = self.r.register_script(
             self._LUA_ASSERT_INITIALIZATION_ALLOWED
         )
@@ -4610,6 +4786,187 @@ return 1
             )
         if result != 1:
             raise RuntimeError(f"Invalid mutation fence result: {result}")
+
+    def begin_table_mutation(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            *,
+            lock_token: str,
+            reserve_count: int = 0,
+    ) -> Dict[str, Any]:
+        """Pin one write context and reserve ordinary row IDs atomically.
+
+        The returned leaf is the exact document observed together with the
+        authoritative table and mirror configurations.  For current cached
+        snapshots whose row-ID floor is exactly representable by Redis Lua,
+        ``reserve_count`` is allocated in this same command.  Legacy,
+        incomplete, or large-Int64 floors return no reservation so the writer
+        can use :meth:`reserve_rowids_at_least` after deriving the immutable
+        storage floor.
+
+        This is an early optimization boundary, not the publication boundary:
+        :meth:`commit_snapshot` still repeats the live lock, root/deletion,
+        mirror-generation, and exact leaf version/path CAS invariants.
+        """
+        if type(reserve_count) is not int:
+            raise TypeError("rowid count must be an integer")
+        if reserve_count < 0:
+            raise ValueError("rowid count must be non-negative")
+        if reserve_count > (1 << 63) - 1:
+            raise OverflowError("rowid reservation exceeds signed Int64")
+        raw = self._begin_table_mutation(
+            keys=[
+                RK.lock_leaf(org, sup, simple),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.meta_simple_deletion_intent(org, sup, simple),
+                RK.meta_root(org, sup),
+                RK.meta_leaf(org, sup, simple),
+                RK.meta_table_config(org, sup, simple),
+                RK.meta_mirrors(org, sup),
+                RK.meta_rowid_seq(org, sup, simple),
+            ],
+            args=[lock_token or "", str(reserve_count)],
+        )
+        if not isinstance(raw, (list, tuple)) or not raw:
+            raise RuntimeError(f"Invalid table mutation context: {raw!r}")
+        try:
+            status = int(raw[0])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid table mutation context: {raw!r}") from exc
+        if status == -1:
+            raise LockLostError(
+                f"Lost fencing lock before mutating {org}/{sup}/{simple}"
+            )
+        if status in (-2, -3):
+            raise DeletionIntentConflictError(
+                f"Table has a durable deletion intent: {org}/{sup}/{simple}"
+            )
+        if status == -4:
+            raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+        if status == -5:
+            raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}")
+        if status == -6:
+            raise ReadOnlyCatalogError(f"SuperTable is read-only: {org}/{sup}")
+        if status == -7:
+            raise RuntimeError(
+                f"Corrupt Redis leaf JSON for {org}/{sup}/{simple}"
+            )
+        if status == -8:
+            raise RuntimeError(
+                f"Corrupt table configuration for {org}/{sup}/{simple}"
+            )
+        if status == -9:
+            raise ValueError(
+                f"Mirror configuration is invalid for {org}/{sup}"
+            )
+        if status not in (0, 1) or len(raw) != 9:
+            raise RuntimeError(f"Invalid table mutation context: {raw!r}")
+
+        def decode_json(value: Any, *, field: str) -> Any:
+            if value in (None, "", b""):
+                return None
+            try:
+                return json.loads(value)
+            except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
+                raise RuntimeError(
+                    f"Corrupt {field} for {org}/{sup}/{simple}"
+                ) from exc
+
+        config = decode_json(raw[2], field="table configuration")
+        if config is not None and not isinstance(config, dict):
+            raise RuntimeError(
+                f"Corrupt table configuration for {org}/{sup}/{simple}"
+            )
+
+        mirrors_document = decode_json(raw[3], field="mirror configuration")
+        mirrors: List[str] = []
+        if mirrors_document is not None:
+            if not isinstance(mirrors_document, dict):
+                raise ValueError(
+                    f"Mirror configuration is invalid for {org}/{sup}"
+                )
+            formats = mirrors_document.get("formats")
+            timestamp = mirrors_document.get("ts")
+            if (
+                not isinstance(formats, list)
+                or type(timestamp) is not int
+                or timestamp < 0
+                or timestamp > _REDIS_LUA_MAX_SAFE_INTEGER
+            ):
+                raise ValueError(
+                    f"Mirror configuration is invalid for {org}/{sup}"
+                )
+            for value in formats:
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"Mirror configuration is invalid for {org}/{sup}"
+                    )
+                normalized = value.upper()
+                if normalized not in ("DELTA", "ICEBERG", "PARQUET"):
+                    raise ValueError(
+                        f"Mirror configuration is invalid for {org}/{sup}"
+                    )
+                if normalized in mirrors:
+                    raise ValueError(
+                        f"Mirror configuration is invalid for {org}/{sup}"
+                    )
+                mirrors.append(normalized)
+
+        leaf: Optional[Dict[str, Any]] = None
+        rowid_floor: Optional[int] = None
+        rowid_reservation: Optional[tuple[int, int]] = None
+        if status == 1:
+            leaf_document = decode_json(raw[1], field="Redis leaf JSON")
+            try:
+                leaf = _validate_leaf_document(leaf_document)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Corrupt Redis leaf JSON for {org}/{sup}/{simple}"
+                ) from exc
+
+            payload = complete_snapshot_payload(
+                leaf.get("payload"),
+                expected_version=leaf["version"],
+                require_policy_marker=True,
+            )
+            floor_available = str(raw[4]) == "1"
+            if floor_available and payload is not None:
+                candidate_floor = payload.get("rowid_high_watermark")
+                if (
+                    type(candidate_floor) is int
+                    and 0 <= candidate_floor <= _REDIS_LUA_MAX_SAFE_INTEGER
+                    and str(candidate_floor) == str(raw[5])
+                ):
+                    rowid_floor = candidate_floor
+                    if str(raw[6]) == "1":
+                        try:
+                            previous = int(raw[7])
+                            new_high = int(raw[8])
+                        except (TypeError, ValueError) as exc:
+                            raise RuntimeError(
+                                f"Invalid rowid reservation result: {raw!r}"
+                            ) from exc
+                        start = previous + 1
+                        if (
+                            reserve_count <= 0
+                            or start <= candidate_floor
+                            or new_high != previous + reserve_count
+                            or new_high > (1 << 63) - 1
+                        ):
+                            raise RuntimeError(
+                                f"Unsafe rowid reservation result: {raw!r}"
+                            )
+                        rowid_reservation = (start, new_high)
+
+        return {
+            "leaf": leaf,
+            "table_config": dict(config or {}),
+            "mirrors": mirrors,
+            "rowid_floor": rowid_floor,
+            "rowid_reservation": rowid_reservation,
+        }
 
     def check_initialization_allowed(
             self,
