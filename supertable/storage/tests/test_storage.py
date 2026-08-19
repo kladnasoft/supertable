@@ -806,40 +806,85 @@ class TestLocalStorage(unittest.TestCase):
         storage.write_bytes("batch/seed", b"seed")
         calls = []
         real_fsync = os.fsync
+        real_fdatasync = os.fdatasync
 
         def recording_fsync(fd):
-            calls.append("directory" if os.path.isdir(f"/proc/self/fd/{fd}") else "file")
+            calls.append("directory")
             return real_fsync(fd)
 
-        with patch(
-            "supertable.storage.local_storage.os.fsync",
-            side_effect=recording_fsync,
+        def recording_fdatasync(fd):
+            calls.append("file")
+            return real_fdatasync(fd)
+
+        with (
+            patch(
+                "supertable.storage.local_storage.os.fsync",
+                side_effect=recording_fsync,
+            ),
+            patch(
+                "supertable.storage.local_storage.os.fdatasync",
+                side_effect=recording_fdatasync,
+            ),
         ):
             with storage.durability_batch() as batch:
                 storage.write_bytes("batch/a", b"a")
                 storage.write_bytes("batch/b", b"b")
                 storage.write_bytes("batch/c", b"c")
-                self.assertEqual(calls, ["file", "file", "file"])
                 batch.barrier()
                 batch.catalog_commit_started()
                 batch.catalog_commit_succeeded()
 
         self.assertEqual(calls.count("file"), 3)
         self.assertEqual(calls.count("directory"), 1)
+        self.assertLess(
+            max(i for i, value in enumerate(calls) if value == "file"),
+            calls.index("directory"),
+            "every exact inode must be durable before its directory entry",
+        )
 
-    def test_durability_batch_file_fsync_failure_never_renames(self):
+    def test_durability_batch_file_sync_failure_rolls_back_before_catalog(self):
         storage = LocalStorage(self.tmpdir)
         target = self._path("batch-file-fsync")
         with (
             patch(
-                "supertable.storage.local_storage.os.fsync",
+                "supertable.storage.local_storage.os.fdatasync",
                 side_effect=OSError("file fsync crash"),
             ),
             self.assertRaisesRegex(OSError, "file fsync crash"),
         ):
-            with storage.durability_batch():
+            with storage.durability_batch() as batch:
                 storage.write_bytes("batch-file-fsync", b"payload")
+                # The final path is intentionally available to metadata and
+                # compaction work, but no catalog transaction can start until
+                # this exact inode's failed sync is observed at the barrier.
+                self.assertEqual(Path(target).read_bytes(), b"payload")
+                batch.barrier()
         self.assertFalse(os.path.lexists(target))
+
+    def test_durability_batch_keeps_final_path_readable_while_file_sync_runs(self):
+        storage = LocalStorage(self.tmpdir)
+        target = self._path("batch-readable")
+        started = threading.Event()
+        release = threading.Event()
+        real_fdatasync = os.fdatasync
+
+        def blocked_fdatasync(fd):
+            started.set()
+            self.assertTrue(release.wait(timeout=5))
+            return real_fdatasync(fd)
+
+        with patch(
+            "supertable.storage.local_storage.os.fdatasync",
+            side_effect=blocked_fdatasync,
+        ):
+            with storage.durability_batch() as batch:
+                storage.write_bytes("batch-readable", b"payload")
+                self.assertTrue(started.wait(timeout=5))
+                self.assertEqual(Path(target).read_bytes(), b"payload")
+                release.set()
+                batch.barrier()
+                batch.catalog_commit_started()
+                batch.catalog_commit_succeeded()
 
     def test_durability_batch_rename_failure_leaves_no_target(self):
         storage = LocalStorage(self.tmpdir)
@@ -977,23 +1022,46 @@ class TestLocalStorage(unittest.TestCase):
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
     def test_durability_batch_is_not_inherited_as_active_after_fork(self):
         storage = LocalStorage(self.tmpdir)
+        # Materialize the process-global sync pool before fork. The child must
+        # discard those vanished parent threads and be able to create its own
+        # durability batch rather than hanging on inherited executor state.
+        with storage.durability_batch() as seed_batch:
+            storage.write_bytes("seed-object", b"seed")
+            seed_batch.barrier()
+            seed_batch.catalog_commit_started()
+            seed_batch.catalog_commit_succeeded()
         with storage.durability_batch() as batch:
+            storage.write_bytes("parent-before-fork", b"parent-before")
             pid = os.fork()
             if pid == 0:  # pragma: no cover - assertions run in parent
                 try:
-                    storage.write_bytes("child-object", b"child")
+                    # An inherited batch must neither wait on vanished parent
+                    # workers nor unlink the parent's shared filesystem path.
+                    batch.abort()
+                    batch.close()
+                    with storage.durability_batch() as child_batch:
+                        storage.write_bytes("child-object", b"child")
+                        child_batch.barrier()
+                        child_batch.catalog_commit_started()
+                        child_batch.catalog_commit_succeeded()
                 except BaseException:
                     os._exit(1)
                 os._exit(0)
             waited, status = os.waitpid(pid, 0)
             self.assertEqual(waited, pid)
             self.assertEqual(os.waitstatus_to_exitcode(status), 0)
-            self.assertEqual(batch._publications, [])
+            self.assertEqual(
+                storage.read_bytes("parent-before-fork"), b"parent-before",
+            )
+            self.assertEqual(len(batch._publications), 1)
             storage.write_bytes("parent-object", b"parent")
             batch.barrier()
             batch.catalog_commit_started()
             batch.catalog_commit_succeeded()
         self.assertEqual(storage.read_bytes("child-object"), b"child")
+        self.assertEqual(
+            storage.read_bytes("parent-before-fork"), b"parent-before",
+        )
         self.assertEqual(storage.read_bytes("parent-object"), b"parent")
 
     def test_logical_write_retry_anchors_previously_created_ancestors(self):

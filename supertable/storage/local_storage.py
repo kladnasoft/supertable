@@ -12,6 +12,7 @@ import threading
 import time
 import hashlib
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,6 +25,30 @@ from supertable.storage.storage_interface import (
     validate_range_request,
     write_all,
 )
+
+
+_FILE_SYNC_LOCK = threading.Lock()
+_FILE_SYNC_EXECUTOR: ThreadPoolExecutor | None = None
+_FILE_SYNC_EXECUTOR_PID: int | None = None
+
+
+def _reset_file_sync_pool_after_fork() -> None:
+    """Discard parent-only worker bookkeeping in a forked child."""
+
+    global _FILE_SYNC_LOCK, _FILE_SYNC_EXECUTOR, _FILE_SYNC_EXECUTOR_PID
+    # No executor thread survives fork, and its inherited locks may have been
+    # held by a vanished thread. Do not call shutdown in the child; replace the
+    # state outright while the parent's independent memory remains untouched.
+    _FILE_SYNC_LOCK = threading.Lock()
+    _FILE_SYNC_EXECUTOR = None
+    _FILE_SYNC_EXECUTOR_PID = None
+    inherited_batch = globals().get("_ACTIVE_DURABILITY_BATCH")
+    if inherited_batch is not None:
+        inherited_batch.set(None)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_file_sync_pool_after_fork)
 
 
 @dataclass(frozen=True)
@@ -96,6 +121,7 @@ class _BatchedPublication:
         "device",
         "inode",
         "fd",
+        "sync_future",
         "published",
     )
 
@@ -105,14 +131,20 @@ class _BatchedPublication:
         self.device: int | None = None
         self.inode: int | None = None
         self.fd: int | None = None
+        self.sync_future: Future[None] | None = None
         self.published = False
 
-    def pin_published_file(self, published_fd: int | None = None) -> None:
+    def pin_published_file(
+        self,
+        published_fd: int | None = None,
+        *,
+        source_path: str | None = None,
+    ) -> None:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         fd = (
             os.dup(published_fd)
             if published_fd is not None
-            else os.open(self.path, flags)
+            else os.open(source_path or self.path, flags)
         )
         try:
             observed = os.fstat(fd)
@@ -158,11 +190,17 @@ _ACTIVE_DURABILITY_BATCH: contextvars.ContextVar[Optional["_DurabilityBatch"]] =
 class _DurabilityBatch:
     """Write-scoped directory durability barrier for immutable objects.
 
-    File contents are flushed before each rename exactly as in the ordinary
-    LocalStorage path.  Only the directory-entry flush is coalesced.  A batch
-    is context-local (and explicitly propagated to writer worker threads), so
-    independent writers sharing one LocalStorage root cannot steal each
-    other's publication scope.
+    Each complete temporary file is atomically renamed immediately, keeping
+    the final path available to pre-commit compaction and metadata work.  The
+    exact renamed inode remains pinned while a bounded storage-wide pool runs
+    ``fdatasync``.  The barrier waits for every file, verifies every pathname,
+    and only then flushes the deduplicated directory ancestry.  Consequently a
+    catalog pointer cannot become visible before both file bytes/size and its
+    name are durable, while file latency overlaps the rest of the write.
+
+    A batch is context-local (and explicitly propagated to writer worker
+    threads), so independent writers sharing one LocalStorage root cannot
+    steal each other's publication scope.
     """
 
     __slots__ = (
@@ -186,6 +224,7 @@ class _DurabilityBatch:
 
     def __enter__(self) -> "_DurabilityBatch":
         with self._lock:
+            self._require_owner_locked()
             if self._state != "new":
                 raise RuntimeError("durability batch cannot be re-entered")
             if _ACTIVE_DURABILITY_BATCH.get() is not None:
@@ -201,6 +240,10 @@ class _DurabilityBatch:
             and self._state == "open"
         )
 
+    def _require_owner_locked(self) -> None:
+        if self.pid != os.getpid():
+            raise RuntimeError("durability batch cannot cross a fork boundary")
+
     def publish_new_immutable(
         self,
         *,
@@ -209,9 +252,10 @@ class _DurabilityBatch:
         directory: str,
         published_fd: int | None = None,
     ) -> bool:
-        """Rename and pin a new target, or return False for replacement writes."""
+        """Rename, pin and enqueue a new target, or decline replacements."""
 
         with self._lock:
+            self._require_owner_locked()
             if self._state != "open":
                 raise RuntimeError("cannot publish after the durability barrier")
             # DataWriter paths are UUID-named immutable objects.  A caller that
@@ -221,10 +265,42 @@ class _DurabilityBatch:
                 return False
             publication = _BatchedPublication(path, directory)
             self._publications.append(publication)
+            # Pin the exact completed temp inode before exposing its final
+            # pathname.  A dup remains valid after the caller closes its
+            # stream and cannot be redirected by a later path substitution.
+            publication.pin_published_file(
+                published_fd,
+                source_path=tmp_path,
+            )
             os.replace(tmp_path, path)
             publication.published = True
-            publication.pin_published_file(published_fd)
+            if not publication.path_still_names_published_file():
+                raise OSError(
+                    "immutable object changed during publication: "
+                    f"{publication.path}"
+                )
+            if publication.fd is None:  # pragma: no cover - pin proves this
+                raise RuntimeError("published immutable object has no pinned fd")
+            publication.sync_future = self.storage._submit_file_sync(
+                publication.fd,
+            )
             return True
+
+    def _await_file_syncs_locked(self, *, propagate: bool) -> None:
+        """Drain every submitted sync before an owned descriptor can close."""
+
+        first_error: BaseException | None = None
+        for publication in self._publications:
+            future = publication.sync_future
+            if future is None:
+                continue
+            try:
+                future.result()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if propagate and first_error is not None:
+            raise first_error
 
     def _verify_publications_locked(self) -> None:
         for publication in self._publications:
@@ -241,8 +317,14 @@ class _DurabilityBatch:
         """Make every enrolled rename durable before catalog publication."""
 
         with self._lock:
+            self._require_owner_locked()
             if self._state != "open":
                 raise RuntimeError("durability barrier may run exactly once")
+            self._verify_publications_locked()
+            # fdatasync persists the bytes and metadata required to retrieve
+            # them (notably file size).  Directory entries are deliberately
+            # flushed only after every exact inode completed successfully.
+            self._await_file_syncs_locked(propagate=True)
             self._verify_publications_locked()
             directories = {
                 publication.directory
@@ -260,12 +342,14 @@ class _DurabilityBatch:
         """Mark the point after which a Redis failure can be ambiguous."""
 
         with self._lock:
+            self._require_owner_locked()
             if self._state != "durable":
                 raise RuntimeError("catalog commit requires a completed durability barrier")
             self._state = "commit_started"
 
     def catalog_commit_succeeded(self) -> None:
         with self._lock:
+            self._require_owner_locked()
             if self._state != "commit_started":
                 raise RuntimeError("catalog commit was not started")
             self._state = "committed"
@@ -274,6 +358,7 @@ class _DurabilityBatch:
         """Record a typed, definite CAS/lease rejection (not an ambiguity)."""
 
         with self._lock:
+            self._require_owner_locked()
             if self._state != "commit_started":
                 raise RuntimeError("catalog commit was not started")
             self._state = "commit_rejected"
@@ -282,8 +367,14 @@ class _DurabilityBatch:
         """Remove only still-identical new paths when Redis was never attempted."""
 
         with self._lock:
+            if self.pid != os.getpid():
+                return
             if self._state in {"aborted", "committed", "commit_started", "closed"}:
                 return
+            # An application failure can race an already-running sync. Drain
+            # it before closing/reusing the pinned descriptor. Its result does
+            # not matter once the uncommitted name is durably removed.
+            self._await_file_syncs_locked(propagate=False)
             cleanup_directories: set[str] = set()
             first_error: BaseException | None = None
             for publication in reversed(self._publications):
@@ -311,6 +402,16 @@ class _DurabilityBatch:
 
     def close(self) -> None:
         with self._lock:
+            if self.pid != os.getpid():
+                # Futures refer to parent-only threads and must never be
+                # awaited in the forked child. Closing the child's copies of
+                # descriptors cannot affect the parent's open-file table.
+                for publication in self._publications:
+                    publication.close()
+                self._token = None
+                self._state = "closed"
+                return
+            self._await_file_syncs_locked(propagate=False)
             for publication in self._publications:
                 publication.close()
             if self._token is not None and self.pid == os.getpid():
@@ -375,6 +476,35 @@ class LocalStorage(StorageInterface):
 
         return _DurabilityBatch(self)
 
+    @staticmethod
+    def _fdatasync_file(fd: int) -> None:
+        """Persist file data and the metadata required to read it back."""
+
+        fdatasync = getattr(os, "fdatasync", None)
+        if fdatasync is None:  # pragma: no cover - POSIX platforms provide it
+            os.fsync(fd)
+        else:
+            fdatasync(fd)
+
+    def _submit_file_sync(self, fd: int) -> Future[None]:
+        """Submit one exact-inode sync to a process-local bounded pool."""
+
+        global _FILE_SYNC_EXECUTOR, _FILE_SYNC_EXECUTOR_PID
+        pid = os.getpid()
+        with _FILE_SYNC_LOCK:
+            # Worker threads do not survive fork. Never submit into the
+            # inherited bookkeeping of a parent process's executor.
+            if (
+                _FILE_SYNC_EXECUTOR is None
+                or _FILE_SYNC_EXECUTOR_PID != pid
+            ):
+                _FILE_SYNC_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=4,
+                    thread_name_prefix="supertable-fdatasync",
+                )
+                _FILE_SYNC_EXECUTOR_PID = pid
+            return _FILE_SYNC_EXECUTOR.submit(self._fdatasync_file, fd)
+
     def _active_durability_batch(
         self,
         *,
@@ -399,7 +529,7 @@ class LocalStorage(StorageInterface):
         durability_anchor: str,
         published_fd: int | None = None,
     ) -> os.stat_result:
-        """Install one file, deferring only a new immutable entry if scoped."""
+        """Install one file, overlapping durability only for scoped immutables."""
 
         batch = self._active_durability_batch(logical_input=logical_input)
         if batch is not None and batch.publish_new_immutable(
@@ -413,6 +543,14 @@ class LocalStorage(StorageInterface):
                 if published_fd is not None
                 else os.stat(path, follow_symlinks=False)
             )
+        # Replacements and ordinary callers keep their established synchronous
+        # file-before-rename ordering. Only UUID-named DataWriter objects are
+        # allowed to defer this work to the pre-catalog batch barrier.
+        if published_fd is None:
+            with open(tmp_path, "rb") as completed:
+                os.fsync(completed.fileno())
+        else:
+            os.fsync(published_fd)
         os.replace(tmp_path, path)
         self._fsync_published_directory(
             directory,
@@ -536,10 +674,9 @@ class LocalStorage(StorageInterface):
             with os.fdopen(fd, "w", encoding="utf-8") as tmpf:
                 json.dump(data, tmpf, indent=2, ensure_ascii=False)
                 tmpf.flush()
-                os.fsync(tmpf.fileno())
                 # Persist immediately for ordinary callers. A DataWriter
-                # immutable batch defers only the directory flush to its
-                # pre-catalog barrier and pins this already-open exact inode.
+                # immutable batch overlaps exact-inode fdatasync and defers the
+                # directory flush to its pre-catalog barrier.
                 self._publish_completed_temp(
                     tmp_path=tmp_path,
                     path=path,
@@ -909,7 +1046,6 @@ class LocalStorage(StorageInterface):
             # directory so readers can never observe a partial footer.
             pq.write_table(table, tmp_path)
             with open(tmp_path, "rb") as completed:
-                os.fsync(completed.fileno())
                 self._publish_completed_temp(
                     tmp_path=tmp_path,
                     path=path,
@@ -996,7 +1132,6 @@ class LocalStorage(StorageInterface):
             with os.fdopen(fd, "wb") as tmpf:
                 write_all(tmpf, data)
                 tmpf.flush()
-                os.fsync(tmpf.fileno())
                 published_state = self._publish_completed_temp(
                     tmp_path=tmp_path,
                     path=path,
