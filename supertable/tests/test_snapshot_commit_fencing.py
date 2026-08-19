@@ -1463,6 +1463,175 @@ def test_begin_table_mutation_pins_context_and_reserves_in_one_boundary():
     assert fake.get(RK.meta_rowid_seq("org", "lake", "table")) == "104"
 
 
+def test_prepared_mutation_leaf_reuses_exact_validated_payload(monkeypatch):
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    pin = catalog.prepare_table_mutation_leaf("org", "lake", "table")
+    assert pin is not None
+
+    # An exact pin must return the object already validated while preparing
+    # the leaf, rather than validating the resource tree again.
+    monkeypatch.setattr(
+        "supertable.redis_catalog.complete_snapshot_payload",
+        MagicMock(side_effect=AssertionError("prepared snapshot validated twice")),
+    )
+    context = catalog.begin_table_mutation(
+        "org",
+        "lake",
+        "table",
+        lock_token="token",
+        reserve_count=4,
+        prepared_leaf=pin,
+    )
+
+    assert context["leaf"]["path"] == "snap/4.json"
+    assert context["validated_snapshot"] is context["leaf"]["payload"]
+    assert context["rowid_reservation"] == (101, 104)
+
+
+def test_prepared_mutation_leaf_falls_back_on_any_raw_leaf_change():
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake, floor=100)
+    pin = catalog.prepare_table_mutation_leaf("org", "lake", "table")
+    assert pin is not None
+
+    replacement = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    replacement["version"] = 5
+    replacement["path"] = "snap/5.json"
+    replacement["payload"]["snapshot_version"] = 5
+    replacement["payload"]["rowid_high_watermark"] = 500
+    # Different whitespace alone is sufficient to defeat the byte pin; the
+    # semantic changes prove that the ordinary validator selected live state.
+    fake.set(
+        RK.meta_leaf("org", "lake", "table"),
+        json.dumps(replacement, indent=2, sort_keys=True),
+    )
+
+    context = catalog.begin_table_mutation(
+        "org",
+        "lake",
+        "table",
+        lock_token="token",
+        reserve_count=4,
+        prepared_leaf=pin,
+    )
+
+    assert context["leaf"]["version"] == 5
+    assert context["leaf"]["path"] == "snap/5.json"
+    assert context["rowid_floor"] == 500
+    assert context["rowid_reservation"] == (501, 504)
+
+
+def test_prepared_mutation_leaf_is_owner_bound_and_one_shot():
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    other, _other_fake = _catalog()
+    pin = catalog.prepare_table_mutation_leaf("org", "lake", "table")
+    assert pin is not None
+
+    with pytest.raises(ValueError, match="another catalog"):
+        other.begin_table_mutation(
+            "org", "lake", "table", lock_token="token", prepared_leaf=pin,
+        )
+
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token", prepared_leaf=pin,
+    )
+    assert context["leaf"]["version"] == 4
+    with pytest.raises(ValueError, match="already been consumed"):
+        catalog.begin_table_mutation(
+            "org", "lake", "table", lock_token="token", prepared_leaf=pin,
+        )
+
+
+def test_prepared_mutation_leaf_reply_loss_cannot_be_replayed(monkeypatch):
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    pin = catalog.prepare_table_mutation_leaf("org", "lake", "table")
+    assert pin is not None
+    original = catalog._begin_table_mutation
+
+    def commit_then_lose_reply(*, keys, args):
+        original(keys=keys, args=args)
+        raise redis.ConnectionError("reply lost after rowid reservation")
+
+    monkeypatch.setattr(
+        catalog, "_begin_table_mutation", commit_then_lose_reply,
+    )
+    with pytest.raises(redis.ConnectionError, match="reply lost"):
+        catalog.begin_table_mutation(
+            "org",
+            "lake",
+            "table",
+            lock_token="token",
+            reserve_count=4,
+            prepared_leaf=pin,
+        )
+    assert fake.get(RK.meta_rowid_seq("org", "lake", "table")) == "104"
+
+    monkeypatch.setattr(catalog, "_begin_table_mutation", original)
+    with pytest.raises(ValueError, match="already been consumed"):
+        catalog.begin_table_mutation(
+            "org",
+            "lake",
+            "table",
+            lock_token="token",
+            reserve_count=4,
+            prepared_leaf=pin,
+        )
+    assert fake.get(RK.meta_rowid_seq("org", "lake", "table")) == "104"
+
+
+def test_prepared_mutation_leaf_keeps_large_int64_floor_on_exact_fallback():
+    catalog, fake = _catalog()
+    floor = (1 << 53) + 17
+    _seed_current_snapshot(fake, floor=floor)
+    pin = catalog.prepare_table_mutation_leaf("org", "lake", "table")
+    assert pin is not None
+
+    context = catalog.begin_table_mutation(
+        "org",
+        "lake",
+        "table",
+        lock_token="token",
+        reserve_count=3,
+        prepared_leaf=pin,
+    )
+
+    assert context["validated_snapshot"]["rowid_high_watermark"] == floor
+    assert context["rowid_floor"] is None
+    assert context["rowid_reservation"] is None
+    assert not fake.exists(RK.meta_rowid_seq("org", "lake", "table"))
+    assert catalog.reserve_rowids_at_least(
+        "org", "lake", "table", count=3, floor=floor,
+        lock_token="token",
+    ) == (floor + 1, floor + 3)
+
+
+def test_prepared_mutation_leaf_never_trusts_corrupt_cached_floor():
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake, floor=100)
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    leaf["payload"]["tombstone_rows"] = -1
+    fake.set(RK.meta_leaf("org", "lake", "table"), json.dumps(leaf))
+    pin = catalog.prepare_table_mutation_leaf("org", "lake", "table")
+    assert pin is not None
+
+    context = catalog.begin_table_mutation(
+        "org",
+        "lake",
+        "table",
+        lock_token="token",
+        reserve_count=3,
+        prepared_leaf=pin,
+    )
+
+    assert "validated_snapshot" not in context
+    assert context["rowid_floor"] is None
+    assert context["rowid_reservation"] is None
+    assert not fake.exists(RK.meta_rowid_seq("org", "lake", "table"))
+
+
 def test_begin_table_mutation_returns_absent_leaf_without_creating_state():
     catalog, fake = _catalog()
     _seed(fake)

@@ -128,6 +128,7 @@ class SimpleTable:
         catalog: Optional[RedisCatalog] = None,
         _live_leaf_verified: bool = False,
         _pinned_leaf: Optional[Dict[str, Any]] = None,
+        _pinned_snapshot: Optional[Dict[str, Any]] = None,
     ):
         # ``super == simple`` is the public aggregate relation that unions the
         # parent's children.  A physical child with that name is therefore
@@ -160,6 +161,8 @@ class SimpleTable:
             )
         if _pinned_leaf is not None and not _live_leaf_verified:
             raise ValueError("_pinned_leaf requires _live_leaf_verified=True")
+        if _pinned_snapshot is not None and _pinned_leaf is None:
+            raise ValueError("_pinned_snapshot requires _pinned_leaf")
         if _pinned_leaf is not None and (
             not isinstance(_pinned_leaf, dict)
             or not isinstance(_pinned_leaf.get("path"), str)
@@ -169,6 +172,7 @@ class SimpleTable:
         self._pinned_leaf = (
             dict(_pinned_leaf) if _pinned_leaf is not None else None
         )
+        self._pinned_snapshot = _pinned_snapshot
         if not _live_leaf_verified:
             deletion_guard = getattr(
                 type(self.catalog), "check_deletion_intent_absent", None,
@@ -540,11 +544,13 @@ class SimpleTable:
         self._last_snapshot_leaf = dict(ptr)
         path = ptr["path"]
 
-        payload = complete_snapshot_payload(
-            ptr.get("payload") if isinstance(ptr, dict) else None,
-            expected_version=ptr.get("version") if isinstance(ptr, dict) else None,
-            require_policy_marker=True,
-        )
+        payload = getattr(self, "_pinned_snapshot", None)
+        if payload is None:
+            payload = complete_snapshot_payload(
+                ptr.get("payload") if isinstance(ptr, dict) else None,
+                expected_version=ptr.get("version") if isinstance(ptr, dict) else None,
+                require_policy_marker=True,
+            )
         if payload is not None:
             return payload, path
 

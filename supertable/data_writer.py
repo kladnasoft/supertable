@@ -854,11 +854,23 @@ class DataWriter:
                 table_name=simple_name,
                 columns=policy_columns,
             )
-            target_existed = self.catalog.leaf_exists(
-                self.super_table.organization,
-                self.super_table.super_name,
-                simple_name,
+            prepared_mutation_leaf = None
+            prepare_mutation_leaf = getattr(
+                type(self.catalog), "prepare_table_mutation_leaf", None,
             )
+            if callable(prepare_mutation_leaf):
+                prepared_mutation_leaf = self.catalog.prepare_table_mutation_leaf(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    simple_name,
+                )
+                target_existed = prepared_mutation_leaf is not None
+            else:
+                target_existed = self.catalog.leaf_exists(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    simple_name,
+                )
             if target_existed:
                 check_write_access(**access_args)
             else:
@@ -912,12 +924,17 @@ class DataWriter:
             )
             mutation_context: dict[str, Any] | None = None
             if callable(begin_mutation):
+                begin_kwargs: dict[str, Any] = {
+                    "lock_token": token,
+                    "reserve_count": reserve_count,
+                }
+                if prepared_mutation_leaf is not None:
+                    begin_kwargs["prepared_leaf"] = prepared_mutation_leaf
                 mutation_context = self.catalog.begin_table_mutation(
                     self.super_table.organization,
                     self.super_table.super_name,
                     simple_name,
-                    lock_token=token,
-                    reserve_count=reserve_count,
+                    **begin_kwargs,
                 )
                 locked_target_exists = mutation_context.get("leaf") is not None
             else:
@@ -960,6 +977,11 @@ class DataWriter:
                 _live_leaf_verified=bool(locked_target_exists),
                 _pinned_leaf=(
                     mutation_context.get("leaf")
+                    if mutation_context is not None and locked_target_exists
+                    else None
+                ),
+                _pinned_snapshot=(
+                    mutation_context.get("validated_snapshot")
                     if mutation_context is not None and locked_target_exists
                     else None
                 ),

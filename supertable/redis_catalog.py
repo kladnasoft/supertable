@@ -41,6 +41,57 @@ _REDIS_LUA_MAX_SAFE_INTEGER = (1 << 53) - 1
 _UNPINNED_MIRROR_CONFIG = object()
 
 
+class _PreparedTableMutationLeaf:
+    """One-shot parsed leaf tied to its exact Redis representation.
+
+    The object is deliberately private and owner-bound.  A writer prepares it
+    only after taking the table lease, then :meth:`begin_table_mutation`
+    consumes it exactly once.  Lua still compares ``raw_leaf`` byte-for-byte
+    with the live key before trusting the already-validated scalar row-ID
+    floor.  A changed key therefore takes the ordinary full-validation path.
+    """
+
+    __slots__ = (
+        "_consumed",
+        "_leaf",
+        "_owner",
+        "_raw_leaf",
+        "_rowid_floor",
+        "_snapshot_payload",
+    )
+
+    def __init__(
+            self,
+            *,
+            owner: "RedisCatalog",
+            raw_leaf: str,
+            leaf: Dict[str, Any],
+            snapshot_payload: Optional[Dict[str, Any]],
+            rowid_floor: Optional[int],
+    ) -> None:
+        self._owner = owner
+        self._raw_leaf = raw_leaf
+        self._leaf = leaf
+        self._snapshot_payload = snapshot_payload
+        self._rowid_floor = rowid_floor
+        self._consumed = False
+
+    def take(
+            self, owner: "RedisCatalog",
+    ) -> tuple[str, Dict[str, Any], Optional[Dict[str, Any]], Optional[int]]:
+        if owner is not self._owner:
+            raise ValueError("prepared mutation leaf belongs to another catalog")
+        if self._consumed:
+            raise ValueError("prepared mutation leaf has already been consumed")
+        self._consumed = True
+        return (
+            self._raw_leaf,
+            self._leaf,
+            self._snapshot_payload,
+            self._rowid_floor,
+        )
+
+
 def _lua_safe_integer(
         value: Any, *, field: str, minimum: int = 0,
 ) -> int:
@@ -1821,6 +1872,8 @@ local mirrors_key = KEYS[7]
 local rowid_key = KEYS[8]
 local leaf_token = ARGV[1]
 local reserve_count = ARGV[2]
+local expected_leaf_raw = ARGV[3]
+local prepared_floor = ARGV[4]
 
 if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
   return {-1}
@@ -1876,22 +1929,27 @@ end
 local leaf_type = redis.call('TYPE', leaf_key)
 if type(leaf_type) == 'table' then leaf_type = leaf_type['ok'] end
 if leaf_type == 'none' then
-  return {0, '', config_raw, mirrors_raw, '0', '', '0', '', ''}
+  return {0, '', config_raw, mirrors_raw, '0', '', '0', '', '', '0'}
 end
 if leaf_type ~= 'string' then return {-7} end
 local leaf_raw = redis.call('GET', leaf_key)
-local leaf_ok, leaf = pcall(cjson.decode, leaf_raw)
-if not leaf_ok or type(leaf) ~= 'table'
-    or type(leaf['version']) ~= 'number'
-    or leaf['version'] < 0
-    or leaf['version'] > ROOT_MAX_SAFE_INTEGER
-    or leaf['version'] ~= math.floor(leaf['version'])
-    or type(leaf['ts']) ~= 'number'
-    or leaf['ts'] < 0
-    or leaf['ts'] > ROOT_MAX_SAFE_INTEGER
-    or leaf['ts'] ~= math.floor(leaf['ts'])
-    or type(leaf['path']) ~= 'string'
-    or leaf['path'] == '' then return {-7} end
+local prepared_match = expected_leaf_raw ~= '' and leaf_raw == expected_leaf_raw
+local leaf = nil
+if not prepared_match then
+  local leaf_ok
+  leaf_ok, leaf = pcall(cjson.decode, leaf_raw)
+  if not leaf_ok or type(leaf) ~= 'table'
+      or type(leaf['version']) ~= 'number'
+      or leaf['version'] < 0
+      or leaf['version'] > ROOT_MAX_SAFE_INTEGER
+      or leaf['version'] ~= math.floor(leaf['version'])
+      or type(leaf['ts']) ~= 'number'
+      or leaf['ts'] < 0
+      or leaf['ts'] > ROOT_MAX_SAFE_INTEGER
+      or leaf['ts'] ~= math.floor(leaf['ts'])
+      or type(leaf['path']) ~= 'string'
+      or leaf['path'] == '' then return {-7} end
+end
 
 -- A current Redis payload is an atomic cache of the immutable snapshot.  Use
 -- its floor only when it satisfies the same conservative shape needed by the
@@ -1900,41 +1958,48 @@ if not leaf_ok or type(leaf) ~= 'table'
 -- storage-derived exact-Int64 fallback after this call.
 local floor_available = false
 local floor = ''
-local payload = leaf['payload']
-if type(payload) == 'table' and payload['_row_filter'] ~= nil then
-  local candidate = payload
-  if type(candidate['resources']) ~= 'table'
-      and type(payload['snapshot']) == 'table' then
-    candidate = payload['snapshot']
-  end
-  local pointer = candidate['tombstone']
-  local tombstone_rows = candidate['tombstone_rows']
-  local digest = candidate['tombstone_digest']
-  local tombstone_ok = false
-  if pointer == cjson.null and type(tombstone_rows) == 'number'
-      and tombstone_rows == 0 and digest == cjson.null then
-    tombstone_ok = true
-  elseif type(pointer) == 'string' and pointer ~= ''
-      and type(tombstone_rows) == 'number'
-      and tombstone_rows > 0
-      and tombstone_rows == math.floor(tombstone_rows)
-      and type(digest) == 'string' and string.len(digest) == 64
-      and string.match(digest, '^[0-9a-f]+$') then
-    tombstone_ok = true
-  end
-  local raw_floor = candidate['rowid_high_watermark']
-  if type(candidate['snapshot_version']) == 'number'
-      and candidate['snapshot_version'] == leaf['version']
-      and candidate['snapshot_version'] == math.floor(candidate['snapshot_version'])
-      and type(candidate['schema']) == 'table'
-      and type(candidate['resources']) == 'table'
-      and tombstone_ok
-      and type(raw_floor) == 'number'
-      and raw_floor >= 0
-      and raw_floor <= ROOT_MAX_SAFE_INTEGER
-      and raw_floor == math.floor(raw_floor) then
+if prepared_match then
+  if prepared_floor ~= '' then
     floor_available = true
-    floor = string.format('%.0f', raw_floor)
+    floor = prepared_floor
+  end
+else
+  local payload = leaf['payload']
+  if type(payload) == 'table' and payload['_row_filter'] ~= nil then
+    local candidate = payload
+    if type(candidate['resources']) ~= 'table'
+        and type(payload['snapshot']) == 'table' then
+      candidate = payload['snapshot']
+    end
+    local pointer = candidate['tombstone']
+    local tombstone_rows = candidate['tombstone_rows']
+    local digest = candidate['tombstone_digest']
+    local tombstone_ok = false
+    if pointer == cjson.null and type(tombstone_rows) == 'number'
+        and tombstone_rows == 0 and digest == cjson.null then
+      tombstone_ok = true
+    elseif type(pointer) == 'string' and pointer ~= ''
+        and type(tombstone_rows) == 'number'
+        and tombstone_rows > 0
+        and tombstone_rows == math.floor(tombstone_rows)
+        and type(digest) == 'string' and string.len(digest) == 64
+        and string.match(digest, '^[0-9a-f]+$') then
+      tombstone_ok = true
+    end
+    local raw_floor = candidate['rowid_high_watermark']
+    if type(candidate['snapshot_version']) == 'number'
+        and candidate['snapshot_version'] == leaf['version']
+        and candidate['snapshot_version'] == math.floor(candidate['snapshot_version'])
+        and type(candidate['schema']) == 'table'
+        and type(candidate['resources']) == 'table'
+        and tombstone_ok
+        and type(raw_floor) == 'number'
+        and raw_floor >= 0
+        and raw_floor <= ROOT_MAX_SAFE_INTEGER
+        and raw_floor == math.floor(raw_floor) then
+      floor_available = true
+      floor = string.format('%.0f', raw_floor)
+    end
   end
 end
 
@@ -1974,9 +2039,9 @@ if floor_available and reserve_count ~= '0' then
 end
 
 return {
-  1, leaf_raw, config_raw, mirrors_raw,
+  1, prepared_match and '' or leaf_raw, config_raw, mirrors_raw,
   floor_available and '1' or '0', floor, reserved,
-  previous, new_value
+  previous, new_value, prepared_match and '1' or '0'
 }
 """
 
@@ -4961,6 +5026,7 @@ return 1
             *,
             lock_token: str,
             reserve_count: int = 0,
+            prepared_leaf: Optional[_PreparedTableMutationLeaf] = None,
     ) -> Dict[str, Any]:
         """Pin one write context and reserve ordinary row IDs atomically.
 
@@ -4982,6 +5048,20 @@ return 1
             raise ValueError("rowid count must be non-negative")
         if reserve_count > (1 << 63) - 1:
             raise OverflowError("rowid reservation exceeds signed Int64")
+        prepared_raw = ""
+        prepared_document: Optional[Dict[str, Any]] = None
+        prepared_snapshot: Optional[Dict[str, Any]] = None
+        prepared_floor: Optional[int] = None
+        if prepared_leaf is not None:
+            if type(prepared_leaf) is not _PreparedTableMutationLeaf:
+                raise TypeError("prepared_leaf is not a catalog mutation pin")
+            (
+                prepared_raw,
+                prepared_document,
+                prepared_snapshot,
+                prepared_floor,
+            ) = prepared_leaf.take(self)
+
         raw = self._begin_table_mutation(
             keys=[
                 RK.lock_leaf(org, sup, simple),
@@ -4993,7 +5073,12 @@ return 1
                 RK.meta_mirrors(org, sup),
                 RK.meta_rowid_seq(org, sup, simple),
             ],
-            args=[lock_token or "", str(reserve_count)],
+            args=[
+                lock_token or "",
+                str(reserve_count),
+                prepared_raw,
+                "" if prepared_floor is None else str(prepared_floor),
+            ],
         )
         if not isinstance(raw, (list, tuple)) or not raw:
             raise RuntimeError(f"Invalid table mutation context: {raw!r}")
@@ -5027,7 +5112,7 @@ return 1
             raise ValueError(
                 f"Mirror configuration is invalid for {org}/{sup}"
             )
-        if status not in (0, 1) or len(raw) != 9:
+        if status not in (0, 1) or len(raw) != 10:
             raise RuntimeError(f"Invalid table mutation context: {raw!r}")
 
         def decode_json(value: Any, *, field: str) -> Any:
@@ -5096,22 +5181,33 @@ return 1
                 mirrors.append(normalized)
 
         leaf: Optional[Dict[str, Any]] = None
+        validated_snapshot: Optional[Dict[str, Any]] = None
         rowid_floor: Optional[int] = None
         rowid_reservation: Optional[tuple[int, int]] = None
         if status == 1:
-            leaf_document = decode_json(raw[1], field="Redis leaf JSON")
-            try:
-                leaf = _validate_leaf_document(leaf_document)
-            except ValueError as exc:
-                raise RuntimeError(
-                    f"Corrupt Redis leaf JSON for {org}/{sup}/{simple}"
-                ) from exc
+            prepared_match = str(raw[9]) == "1"
+            if prepared_match:
+                if prepared_document is None:
+                    raise RuntimeError(
+                        "Redis accepted a missing prepared mutation leaf"
+                    )
+                leaf = prepared_document
+                payload = prepared_snapshot
+            else:
+                leaf_document = decode_json(raw[1], field="Redis leaf JSON")
+                try:
+                    leaf = _validate_leaf_document(leaf_document)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"Corrupt Redis leaf JSON for {org}/{sup}/{simple}"
+                    ) from exc
 
-            payload = complete_snapshot_payload(
-                leaf.get("payload"),
-                expected_version=leaf["version"],
-                require_policy_marker=True,
-            )
+                payload = complete_snapshot_payload(
+                    leaf.get("payload"),
+                    expected_version=leaf["version"],
+                    require_policy_marker=True,
+                )
+            validated_snapshot = payload
             floor_available = str(raw[4]) == "1"
             if floor_available and payload is not None:
                 candidate_floor = payload.get("rowid_high_watermark")
@@ -5141,7 +5237,7 @@ return 1
                             )
                         rowid_reservation = (start, new_high)
 
-        return {
+        context = {
             "leaf": leaf,
             "table_config": dict(config or {}),
             "mirrors": mirrors,
@@ -5149,6 +5245,61 @@ return 1
             "rowid_floor": rowid_floor,
             "rowid_reservation": rowid_reservation,
         }
+        if validated_snapshot is not None:
+            context["validated_snapshot"] = validated_snapshot
+        return context
+
+    def prepare_table_mutation_leaf(
+            self, org: str, sup: str, simple: str,
+    ) -> Optional[_PreparedTableMutationLeaf]:
+        """Parse one leaf once for an immediately-following fenced begin.
+
+        Callers must already hold the table lease.  The returned object is not
+        itself authority: ``begin_table_mutation`` consumes it once and Lua
+        compares its exact raw JSON with the live Redis value before skipping
+        the expensive recursive cjson materialization.
+        """
+        try:
+            raw = self.r.get(RK.meta_leaf(org, sup, simple))
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] prepare mutation leaf error: %s", exc)
+            raise
+        if not raw:
+            return None
+        if isinstance(raw, bytes):
+            try:
+                raw = raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise RuntimeError(
+                    f"Corrupt Redis leaf JSON for {org}/{sup}/{simple}"
+                ) from exc
+        if not isinstance(raw, str):
+            raise RuntimeError(
+                f"Corrupt Redis leaf JSON for {org}/{sup}/{simple}"
+            )
+        try:
+            leaf = _validate_leaf_document(json.loads(raw))
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Corrupt Redis leaf JSON for {org}/{sup}/{simple}"
+            ) from exc
+        snapshot = complete_snapshot_payload(
+            leaf.get("payload"),
+            expected_version=leaf["version"],
+            require_policy_marker=True,
+        )
+        floor: Optional[int] = None
+        if snapshot is not None:
+            candidate = snapshot.get("rowid_high_watermark")
+            if type(candidate) is int and 0 <= candidate <= _REDIS_LUA_MAX_SAFE_INTEGER:
+                floor = candidate
+        return _PreparedTableMutationLeaf(
+            owner=self,
+            raw_leaf=raw,
+            leaf=leaf,
+            snapshot_payload=snapshot,
+            rowid_floor=floor,
+        )
 
     def check_initialization_allowed(
             self,
