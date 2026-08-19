@@ -17,8 +17,10 @@ tie-break.  No result row or result batch survives beyond the next batch.
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import os
+import platform
 import struct
 import time
 import traceback
@@ -45,6 +47,9 @@ from .runner import (
 
 DIGEST_FORMAT_VERSION = 1
 ORDER_KEYS = ("metric", "id")
+GIB = 1024**3
+MIB = 1024**2
+DEFAULT_SPILL_CAP_BYTES = 28 * GIB
 
 
 class RealSpillWorkerError(RuntimeError):
@@ -296,8 +301,22 @@ def _quote_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _duckdb_size(value: int) -> str:
+    if value <= 0:
+        raise RealSpillWorkerError("DuckDB byte limit must be positive")
+    if value % GIB == 0:
+        return f"{value // GIB}GiB"
+    if value % MIB == 0:
+        return f"{value // MIB}MiB"
+    return f"{value}B"
+
+
 def _duckdb_batches(
     plan: Mapping[str, Any],
+    *,
+    threads: int,
+    memory_limit_bytes: int,
+    spill_cap_bytes: int,
 ) -> tuple[Iterable[pa.RecordBatch], Any, Path]:
     """Start a raw DuckDB Arrow stream with an explicit bounded temp store."""
     import duckdb
@@ -306,10 +325,15 @@ def _duckdb_batches(
     spill_root.mkdir(parents=True, exist_ok=True)
     profile_path = Path("/bench/profile.json")
     connection = duckdb.connect(database=":memory:")
-    connection.execute("SET threads=4")
-    connection.execute("SET memory_limit='2GiB'")
+    connection.execute(f"SET threads={threads}")
+    connection.execute(
+        f"SET memory_limit={_quote_literal(_duckdb_size(memory_limit_bytes))}"
+    )
     connection.execute(f"SET temp_directory={_quote_literal(str(spill_root))}")
-    connection.execute("SET max_temp_directory_size='28GiB'")
+    connection.execute(
+        "SET max_temp_directory_size="
+        f"{_quote_literal(_duckdb_size(spill_cap_bytes))}"
+    )
     connection.execute("SET enable_external_file_cache=false")
     connection.execute("SET preserve_insertion_order=false")
 
@@ -398,10 +422,30 @@ def run_worker(request: Mapping[str, Any]) -> dict[str, Any]:
         raise RealSpillWorkerError("worker accepts only real_spill_sort")
     if int(request.get("warm_repeats") or 0) != 0:
         raise RealSpillWorkerError("real-spill worker executes one cold query")
-    if int(request.get("threads") or 0) != 4:
-        raise RealSpillWorkerError("real-spill worker requires four threads")
-    if int(request.get("memory_limit_bytes") or 0) != 2 * 1024**3:
-        raise RealSpillWorkerError("real-spill worker requires a 2-GiB workspace")
+    configured_threads = int(request.get("threads") or 0)
+    if configured_threads < 1 or configured_threads > 4:
+        raise RealSpillWorkerError("real-spill worker threads must be in [1, 4]")
+    contract = plan.get("real_spill_contract")
+    if not isinstance(contract, Mapping):
+        raise RealSpillWorkerError("real-spill plan has no sealed resource contract")
+    memory_limit_bytes = int(request.get("memory_limit_bytes") or 0)
+    if memory_limit_bytes < 64 * MIB or memory_limit_bytes > 2 * GIB:
+        raise RealSpillWorkerError(
+            "real-spill worker memory must be in [64 MiB, 2 GiB]"
+        )
+    if int(contract.get("engine_memory_bytes") or 0) != memory_limit_bytes:
+        raise RealSpillWorkerError(
+            "request memory differs from the sealed real-spill contract"
+        )
+    if int(contract.get("engine_threads") or configured_threads) != configured_threads:
+        raise RealSpillWorkerError(
+            "request threads differ from the sealed real-spill contract"
+        )
+    spill_cap_bytes = int(
+        contract.get("spill_cap_bytes") or DEFAULT_SPILL_CAP_BYTES
+    )
+    if spill_cap_bytes < memory_limit_bytes or spill_cap_bytes > DEFAULT_SPILL_CAP_BYTES:
+        raise RealSpillWorkerError("real-spill temp cap is outside the sealed bounds")
 
     columns = parse_result_contract(plan)
     cgroup_before = _cgroup_v2_memory_telemetry()
@@ -417,7 +461,12 @@ def run_worker(request: Mapping[str, Any]) -> dict[str, Any]:
     with _PeakRSS() as rss:
         digest = StreamingResultDigest(columns)
         if engine_name == ENGINE_DUCKDB:
-            batches, connection, profile_path = _duckdb_batches(plan)
+            batches, connection, profile_path = _duckdb_batches(
+                plan,
+                threads=configured_threads,
+                memory_limit_bytes=memory_limit_bytes,
+                spill_cap_bytes=spill_cap_bytes,
+            )
             close_owner = connection
             try:
                 for batch in batches:
@@ -502,13 +551,32 @@ def run_worker(request: Mapping[str, Any]) -> dict[str, Any]:
             "result_value_bytes": result["logical_value_bytes"],
         }],
         "execution_context": {
-            "configured_threads": 4,
-            "configured_memory_limit_bytes": 2 * 1024**3,
+            "configured_threads": configured_threads,
+            "configured_memory_limit_bytes": memory_limit_bytes,
+            "configured_spill_cap_bytes": spill_cap_bytes,
             "cgroup_v2": cgroup_after,
             "cgroup_v2_before": cgroup_before,
             "cgroup_memory_event_delta": event_delta,
             "cold_advice": cold_advice,
             "python_pid": os.getpid(),
+            "cpu_affinity": sorted(os.sched_getaffinity(0)),
+            "runtime": {
+                "python": platform.python_version(),
+                "platform": platform.platform(),
+                "dependencies": {
+                    name: importlib.metadata.version(name)
+                    for name in (
+                        "duckdb",
+                        "numpy",
+                        "pandas",
+                        "polars",
+                        "pyarrow",
+                        "redis",
+                        "sqlglot",
+                        "supertable",
+                    )
+                },
+            },
         },
     }
 

@@ -514,8 +514,11 @@ def _validate_worker_response(
         raise RealSpillGateError(f"{engine} did not retain the 4-GiB cgroup")
     if cgroup.get("swap_max_bytes") != 0:
         raise RealSpillGateError(f"{engine} exposed usable swap")
-    if int(context.get("configured_threads") or 0) != CONTAINER_CPUS:
-        raise RealSpillGateError(f"{engine} did not retain four threads")
+    expected_threads = int(inputs.request.get("threads") or 0)
+    if int(context.get("configured_threads") or 0) != expected_threads:
+        raise RealSpillGateError(
+            f"{engine} did not retain {expected_threads} configured threads"
+        )
     events = context.get("cgroup_memory_event_delta") or {}
     if any(int(events.get(key) or 0) for key in ("oom", "oom_kill", "oom_group_kill")):
         raise RealSpillGateError(f"{engine} recorded OOM events: {events}")

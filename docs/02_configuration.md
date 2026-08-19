@@ -107,6 +107,8 @@ not change CWD.
 | `SUPERTABLE_DUCKDB_MATERIALIZE` | str | `view` | Materialization mode (`view` or `table`) |
 | `SUPERTABLE_DUCKDB_PRESIGNED` | bool | `false` | Use presigned URLs for DuckDB access |
 | `SUPERTABLE_DUCKDB_USE_HTTPFS` | bool | `false` | Use HTTP(S) URLs instead of native protocol |
+| `SUPERTABLE_DUCKDB_WRITE_PROBE` | bool | `false` | Force the DuckDB overwrite/delete probe on every storage backend; `false` leaves remote storage on Polars and does not disable the local-auto lane |
+| `SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO` | bool | `true` | Automatically use the DuckDB overwrite/delete probe for LocalStorage candidate sets of at least 8 files and 128 KiB of projected key/version/row-ID chunks; set `false` to disable local auto-selection |
 | `SUPERTABLE_DEBUG_TIMINGS` | bool | `false` | Enable debug timing output |
 
 ### Engine Routing

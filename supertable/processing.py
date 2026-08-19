@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import io
+import stat
 import struct
 import time
 import threading
@@ -15,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, date, timezone
-from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Set, Tuple, Optional
+from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Set, Tuple, Optional, cast
 
 import polars
 import pyarrow as pa
@@ -255,6 +256,48 @@ def _encode_parquet_pyarrow(
     return buf.getvalue()
 
 
+def _encode_system_parquet_polars(
+        write_df: polars.DataFrame,
+        compression_level: int,
+) -> bytes:
+    """Encode an internal metadata frame without unused footer statistics.
+
+    Deletion vectors and the external statistics artifact are consumed as
+    complete objects.  No read or write decision consults *their own* Parquet
+    min/max statistics, so the data-file compatibility gate for NaNs, long
+    strings, and nested values does not apply.  In particular, system frames
+    contain long immutable object keys by construction; scanning every key
+    only to route the frame through PyArrow was pure overhead.
+    """
+    buf = io.BytesIO()
+    write_df.write_parquet(
+        buf,
+        compression="zstd",
+        compression_level=int(compression_level),
+        statistics=False,
+        row_group_size=_PARQUET_ROW_GROUP_SIZE,
+    )
+    return buf.getvalue()
+
+
+def _encode_system_parquet_pyarrow(
+        arrow_tbl: pa.Table,
+        compression_level: int,
+) -> bytes:
+    """Compatibility encoder for internal metadata objects."""
+    buf = io.BytesIO()
+    pq.write_table(
+        arrow_tbl,
+        buf,
+        compression="zstd",
+        compression_level=int(compression_level),
+        use_dictionary=True,
+        write_statistics=False,
+        row_group_size=_PARQUET_ROW_GROUP_SIZE,
+    )
+    return buf.getvalue()
+
+
 def _record_parquet_codec(
         profiler: Profiler,
         codec: str,
@@ -427,11 +470,20 @@ def concat_many_with_union(frames: List[polars.DataFrame]) -> polars.DataFrame:
 # Safe storage I/O helpers
 # =========================
 
-def _safe_exists(path: str, profiler: Optional[Profiler] = None, strict: bool = False) -> bool:
+def _safe_exists(
+        path: str,
+        profiler: Optional[Profiler] = None,
+        strict: bool = False,
+        storage: Optional[object] = None,
+) -> bool:
     p = profiler or get_null_profiler()
     try:
         with p.span("io.exists"):
-            return _get_storage().exists(path)
+            active_storage = cast(
+                StorageInterface,
+                storage if storage is not None else _get_storage(),
+            )
+            return active_storage.exists(path)
     except Exception:
         # A failed existence probe is normally treated as "absent" (lenient).
         # *strict* callers (carry-forward reads) must not mistake a backend
@@ -447,6 +499,7 @@ def _read_parquet_safe(
         file_size: int = 0,
         columns: Optional[List[str]] = None,
         required: bool = False,
+        storage: Optional[object] = None,
 ) -> Optional[polars.DataFrame]:
     """Read a parquet object into polars, or ``None`` when it is absent.
 
@@ -457,19 +510,35 @@ def _read_parquet_safe(
     the default mode and continue to receive ``None`` for absence/failure.
     """
     p = profiler or get_null_profiler()
-    if not _safe_exists(path, profiler=p, strict=required):
+    if storage is not None:
+        # Keep the caller-pinned backend through both EXISTS and GET. Besides
+        # preventing a probe fallback from switching storage namespaces, this
+        # also prevents a factory/config change between the two operations.
+        exists = _safe_exists(
+            path,
+            profiler=profiler,
+            strict=required,
+            storage=storage,
+        )
+    else:
+        exists = _safe_exists(path, profiler=p, strict=required)
+    if not exists:
         logging.info(f"[race] file already sunset by another writer: {path}")
         if required:
             raise FileNotFoundError(f"Required parquet object is missing: {path}")
         return None
     try:
+        active_storage = cast(
+            StorageInterface,
+            storage if storage is not None else _get_storage(),
+        )
         with p.span("io.read_parquet"):
             # Project to *columns* when given so only those column chunks are
             # read (memory-bound fallback); gated so storages/test doubles that
             # only accept ``path`` keep working on the unprojected paths.
             tbl = (
-                _get_storage().read_parquet(path, columns=columns)
-                if columns else _get_storage().read_parquet(path)
+                active_storage.read_parquet(path, columns=columns)
+                if columns else active_storage.read_parquet(path)
             )  # -> pyarrow.Table
         with p.span("io.arrow_to_polars"):
             df = polars.from_arrow(tbl)
@@ -497,6 +566,150 @@ _ORIGINAL_READ_PARQUET_SAFE = _read_parquet_safe
 # frames to fit under a byte-only budget.
 _MAX_COMPACTION_CHUNK_FRAMES = 128
 _MAX_COMPACTION_CHUNK_ROWS = 1_048_576
+
+# ``max_memory_chunk_size`` is an encoded-output target, while the packer
+# retains decoded Polars frames.  A one-to-one default makes a 16 MiB target
+# impossible to reach for ordinary compressible data, especially after the
+# total budget is apportioned across pending encoders and the coordinator.
+# The audited corpus reaches 11.64 decoded bytes per encoded byte. Reserve
+# twelve decoded bytes per target byte by default, but keep the implicit
+# process-wide frame budget finite. Workloads outside this envelope can set
+# ``max_decoded_compaction_bytes`` explicitly; that value remains authoritative.
+_DEFAULT_COMPACTION_DECODED_EXPANSION = 12
+_DEFAULT_COMPACTION_DECODED_BUDGET_CAP = 1024 * 1024 * 1024
+_DEFAULT_COMPACTION_MEMORY_FRACTION_DENOMINATOR = 4
+_DEFAULT_COMPACTION_UNKNOWN_MEMORY_CAP = 128 * 1024 * 1024
+
+
+def _host_physical_memory_bytes() -> Optional[int]:
+    """Return installed host RAM using only bounded stdlib observations."""
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        total = pages * page_size
+        return total if total > 0 else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _detect_compaction_hard_memory_bytes(
+        *,
+        proc_cgroup_path: str = "/proc/self/cgroup",
+        cgroup_root: str = "/sys/fs/cgroup",
+) -> Optional[int]:
+    """Return the smaller positive host/cgroup-v2 hard-memory boundary.
+
+    The cgroup path is resolved beneath the configured mount root and rejected
+    if it escapes.  Missing, malformed, or unlimited cgroup state never invents
+    a boundary; host RAM remains the fallback observation.
+    """
+    host_total = _host_physical_memory_bytes()
+    cgroup_limit: Optional[int] = None
+    try:
+        with open(proc_cgroup_path, "r", encoding="utf-8") as handle:
+            cgroup_lines = handle.read().splitlines()
+    except (OSError, UnicodeError):
+        cgroup_lines = []
+
+    relative = None
+    for line in cgroup_lines:
+        fields = line.split(":", 2)
+        if len(fields) == 3 and fields[0] == "0" and fields[1] == "":
+            relative = fields[2].lstrip("/")
+            break
+
+    root = os.path.realpath(os.path.abspath(cgroup_root))
+    candidates = []
+    if relative is not None:
+        directory = os.path.realpath(os.path.join(root, relative))
+        try:
+            contained = os.path.commonpath((root, directory)) == root
+        except ValueError:
+            contained = False
+        if contained:
+            while True:
+                candidates.append(directory)
+                if directory == root:
+                    break
+                parent = os.path.dirname(directory)
+                if parent == directory:
+                    break
+                directory = parent
+    if root not in candidates:
+        candidates.append(root)
+    seen = set()
+    for directory in candidates:
+        if directory in seen:
+            continue
+        seen.add(directory)
+        try:
+            if os.path.commonpath((root, directory)) != root:
+                continue
+        except ValueError:
+            continue
+        try:
+            with open(
+                os.path.join(directory, "memory.max"),
+                "r",
+                encoding="ascii",
+            ) as handle:
+                raw = handle.read().strip()
+        except (OSError, UnicodeError):
+            continue
+        if raw == "max":
+            continue
+        try:
+            parsed = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            cgroup_limit = (
+                parsed if cgroup_limit is None else min(cgroup_limit, parsed)
+            )
+
+    observed = [
+        value for value in (host_total, cgroup_limit)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0
+    ]
+    return min(observed) if observed else None
+
+
+def _resolve_compaction_decoded_budget(
+        table_config: Optional[dict],
+        *,
+        encoded_target_bytes: int,
+        retained_frame_slots: int,
+) -> Tuple[int, bool, bool]:
+    """Return ``(budget, defaulted, capped)`` for decoded compaction frames.
+
+    An explicit per-table budget is used exactly (apart from the historical
+    one-byte lower bound).  When it is absent or malformed, derive a bounded
+    budget that gives every retained frame slot enough room for a typically
+    12:1-compressed target-sized output instead of dividing the encoded target
+    itself among all slots.
+    """
+    cfg = table_config or {}
+    configured = cfg.get("max_decoded_compaction_bytes")
+    if configured is not None:
+        try:
+            return max(1, int(configured)), False, False
+        except (TypeError, ValueError):
+            # Direct processing callers may bypass DataWriter's configuration
+            # validation.  Preserve the established safe-fallback behaviour.
+            pass
+
+    target = max(1, int(encoded_target_bytes))
+    slots = max(1, int(retained_frame_slots))
+    desired = target * _DEFAULT_COMPACTION_DECODED_EXPANSION * slots
+    hard_memory = _detect_compaction_hard_memory_bytes()
+    memory_cap = (
+        max(1, hard_memory // _DEFAULT_COMPACTION_MEMORY_FRACTION_DENOMINATOR)
+        if hard_memory is not None
+        else _DEFAULT_COMPACTION_UNKNOWN_MEMORY_CAP
+    )
+    implicit_cap = min(_DEFAULT_COMPACTION_DECODED_BUDGET_CAP, memory_cap)
+    budget = min(desired, implicit_cap)
+    return max(1, budget), True, desired > budget
 
 
 class _OptionalParquetStreamUnavailable(Exception):
@@ -946,14 +1159,6 @@ def _compact_resources_with_tombstones(
 
     cfg = table_config or {}
     try:
-        max_decoded_budget = int(
-            cfg.get("max_decoded_compaction_bytes")
-            or getattr(default, "MAX_MEMORY_CHUNK_SIZE", 16 * 1024 * 1024)
-        )
-    except (TypeError, ValueError):
-        max_decoded_budget = max_bytes
-    max_decoded_budget = max(1, max_decoded_budget)
-    try:
         configured_workers = int(
             cfg.get("tombstone_compaction_workers")
             or getattr(default, "TOMBSTONE_COMPACTION_WORKERS", 2)
@@ -971,14 +1176,30 @@ def _compact_resources_with_tombstones(
     # Pending encoders retain their input frames.  The coordinator can briefly
     # hold both the streamed source buffers and the once-concatenated output,
     # so reserve two decoded-frame slots in addition to every encoder slot.
-    # This is conservative for zero-copy Arrow/Polars slices and prevents
-    # queued writes from multiplying RSS past the configured budget.
+    # An explicit decoded budget remains a hard shared frame bound.  The
+    # derived default, however, is based on the encoded target *per slot*;
+    # dividing the encoded target itself here was what produced hundreds of
+    # sub-megabyte files from an otherwise 16-MiB packing campaign.
+    retained_frame_slots = (encode_workers + 2) if executor else 2
+    (
+        max_decoded_budget,
+        decoded_budget_defaulted,
+        decoded_budget_capped,
+    ) = _resolve_compaction_decoded_budget(
+        cfg,
+        encoded_target_bytes=max_bytes,
+        retained_frame_slots=retained_frame_slots,
+    )
     decoded_chunk_limit = max(
         1,
-        max_decoded_budget // ((encode_workers + 2) if executor else 2),
+        max_decoded_budget // retained_frame_slots,
     )
     pending_writes: List[Any] = []
     p.add("compact_encode_worker_capacity", encode_workers if executor else 1)
+    p.add("compact_decoded_budget_bytes", max_decoded_budget)
+    p.add("compact_decoded_chunk_limit_bytes", decoded_chunk_limit)
+    p.add("compact_decoded_budget_defaulted", int(decoded_budget_defaulted))
+    p.add("compact_decoded_budget_capped", int(decoded_budget_capped))
     encode_state_lock = threading.Lock()
     active_encodes = 0
     max_active_encodes = 0
@@ -1880,7 +2101,10 @@ def _write_single_parquet_file_attempt(
         try:
             with p.span("write.parquet_encode"):
                 data = _encode_parquet_polars(write_df, compression_level)
-            _record_parquet_codec(p, "polars")
+            # This branch has no fallback reason, so recording the counter
+            # directly is equivalent to _record_parquet_codec and accepts the
+            # no-op profiler returned when instrumentation is disabled.
+            p.add("parquet_codec_polars", 1)
         except Exception as exc:
             # No bytes have been uploaded yet. Falling back here is atomic and
             # preserves support for a dtype newly rejected by Polars' writer.
@@ -2012,9 +2236,17 @@ def _write_single_parquet_file_attempt(
             "checksum_sha256": object_seal.checksum_sha256,
         }
     if footer_md is not None:
-        exact_stats_rows = _stats_rows_for_metadata(new_parquet_path, footer_md)
+        footer_sha256 = parquet_footer_sha256(footer_md)
+        exact_stats_rows = _stats_rows_for_metadata(
+            new_parquet_path,
+            footer_md,
+            footer_sha256=footer_sha256,
+        )
         seal = stats_seal_for_metadata(
-            new_parquet_path, footer_md, rows=exact_stats_rows,
+            new_parquet_path,
+            footer_md,
+            rows=exact_stats_rows,
+            footer_sha256=footer_sha256,
         )
         resource.update({
             "footer_sha256": seal.footer_sha256,
@@ -2048,6 +2280,7 @@ def filter_stale_incoming_rows(
         read_columns: Optional[List[str]] = None,
         required: bool = False,
         dead_rowids_by_file: Optional[Dict[str, polars.Series]] = None,
+        storage: Optional[object] = None,
 ) -> polars.DataFrame:
     """
     Remove rows from *incoming_df* that are stale or already present in existing data.
@@ -2082,13 +2315,23 @@ def filter_stale_incoming_rows(
     # Read and collect relevant rows from overlapping files
     existing_parts: List[polars.DataFrame] = []
     for file_path, file_size in overlap_true_files:
-        part = _read_parquet_safe(
-            file_path,
-            profiler=p,
-            file_size=file_size,
-            columns=read_columns,
-            required=required,
-        )
+        if storage is not None:
+            part = _read_parquet_safe(
+                file_path,
+                profiler=profiler,
+                file_size=file_size,
+                columns=read_columns,
+                required=required,
+                storage=storage,
+            )
+        else:
+            part = _read_parquet_safe(
+                file_path,
+                profiler=p,
+                file_size=file_size,
+                columns=read_columns,
+                required=required,
+            )
         if part is None:
             continue
         # Validate the complete projected source before excluding already-dead
@@ -2449,30 +2692,37 @@ def _write_df_parquet(
     data: Optional[bytes] = None
     arrow_tbl: Optional[pa.Table] = None
     wrote_exact_bytes = False
-    fallback_reason: Optional[str] = "backend"
-    native_eligible = False
-    if callable(write_bytes):
-        with p.span("write.parquet_codec_check"):
-            native_eligible, fallback_reason = (
-                _native_polars_parquet_eligibility(write_df)
-            )
     with p.span("tombstone.encode"):
-        if native_eligible:
+        if callable(write_bytes):
             try:
-                data = _encode_parquet_polars(write_df, compression_level)
+                # System artifacts are read as complete objects and never use
+                # their own footer min/max statistics.  Bypass the data-file
+                # compatibility scan (long object keys otherwise force every
+                # stats/DV write through PyArrow) and attempt native Polars
+                # directly.  An encode failure is still safely recoverable
+                # because no bytes have been released to storage yet.
+                data = _encode_system_parquet_polars(
+                    write_df, compression_level,
+                )
                 _record_parquet_codec(p, "polars")
             except Exception as exc:
-                fallback_reason = "encode_error"
                 p.add("parquet_codec_polars_encode_error", 1)
                 logging.warning(
-                    "[write] native Polars parquet encode failed; using "
-                    "PyArrow: %s",
+                    "[write] native Polars system parquet encode failed; "
+                    "using PyArrow: %s",
                     exc,
                 )
-        if data is None:
+                arrow_tbl = write_df.to_arrow()
+                data = _encode_system_parquet_pyarrow(
+                    arrow_tbl, compression_level,
+                )
+                _record_parquet_codec(p, "pyarrow", "encode_error")
+        elif callable(write_parquet):
+            # The compatibility backend owns the final encoding.  Building a
+            # throwaway PyArrow byte buffer here would encode the same frame
+            # twice before one object is published.
             arrow_tbl = write_df.to_arrow()
-            data = _encode_parquet_pyarrow(arrow_tbl, compression_level)
-            _record_parquet_codec(p, "pyarrow", fallback_reason)
+            _record_parquet_codec(p, "pyarrow", "backend")
 
     if callable(write_bytes):
         # Upload failures are authoritative.  Never reinterpret a failed remote
@@ -2481,7 +2731,7 @@ def _write_df_parquet(
         write_bytes(path, data)
         wrote_exact_bytes = True
     elif callable(write_parquet):
-        if arrow_tbl is None:  # pragma: no cover - guarded by codec selection
+        if arrow_tbl is None:  # pragma: no cover - guarded above
             raise RuntimeError("Compatibility parquet backend requires Arrow")
         write_parquet(arrow_tbl, path)
     else:
@@ -2509,6 +2759,7 @@ def identify_deleted_rowids(
         read_columns: Optional[List[str]] = None,
         required: bool = False,
         dead_rowids_by_file: Optional[Dict[str, polars.Series]] = None,
+        storage: Optional[object] = None,
 ) -> List[Tuple[str, int]]:
     """Find the ``(file, __rowid__)`` pairs of existing rows matching a delete predicate.
 
@@ -2540,13 +2791,23 @@ def identify_deleted_rowids(
         if file_cache is not None and file in file_cache:
             existing_df = file_cache.get(file)
         else:
-            existing_df = _read_parquet_safe(
-                file,
-                profiler=p,
-                file_size=file_size,
-                columns=read_columns,
-                required=required,
-            )
+            if storage is not None:
+                existing_df = _read_parquet_safe(
+                    file,
+                    profiler=profiler,
+                    file_size=file_size,
+                    columns=read_columns,
+                    required=required,
+                    storage=storage,
+                )
+            else:
+                existing_df = _read_parquet_safe(
+                    file,
+                    profiler=p,
+                    file_size=file_size,
+                    columns=read_columns,
+                    required=required,
+                )
         if existing_df is None:
             continue
         if ROWID_COL not in existing_df.columns:
@@ -2669,16 +2930,45 @@ def _storage_duckdb_path(storage, key: str, force_presign: bool = False) -> str:
     a private object-store file unless the URL is **presigned**, so when
     ``SUPERTABLE_DUCKDB_PRESIGNED`` is set (or *force_presign* is True — used by
     the probe's reactive retry after an HTTP/auth error) the bare object key is
-    signed via ``storage.presign(key)``.  Otherwise object stores expose
-    ``to_duckdb_path`` (→ ``s3://``/``http(s)://``); local storage has none, so
-    the on-disk path is already DuckDB-readable and returned unchanged.  Anything
-    already a URL passes through untouched (presign takes a key, never a URL).
+    signed via ``storage.presign(key)``.  Local storage always resolves through
+    ``to_duckdb_path`` first and never presigns; object stores use either their
+    direct DuckDB URL or a signed URL. Anything already a URL passes through
+    untouched (presign takes a key, never a URL).
     """
     if not key:
         return key
+    if "://" in key:
+        return key
+
+    # A backend that identifies itself as local must always resolve through its
+    # filesystem path hook. Presigning is both unnecessary and unsafe for the
+    # local auto lane: the base StorageInterface method raises, while a hybrid
+    # adapter could return a remote URL and silently pull httpfs/network work
+    # into what is deliberately a local-only optimization.
+    is_local = getattr(storage, "is_local_storage", None)
+    try:
+        local = callable(is_local) and is_local() is True
+    except Exception:
+        local = False
+    if local:
+        fn = getattr(storage, "to_duckdb_path", None)
+        if callable(fn):
+            try:
+                path = fn(key)
+                if isinstance(path, str) and path:
+                    return path
+            except NotImplementedError:
+                pass
+            except Exception as e:
+                logging.debug(
+                    f"[write-probe] local to_duckdb_path failed for {key}: {e}"
+                )
+        raise ValueError(
+            f"local storage could not resolve a DuckDB filesystem path: {key!r}"
+        )
 
     # Proactive (or forced) presign — sign the bare object key, never a URL.
-    if (force_presign or settings.SUPERTABLE_DUCKDB_PRESIGNED) and "://" not in key:
+    if force_presign or settings.SUPERTABLE_DUCKDB_PRESIGNED:
         presign_fn = getattr(storage, "presign", None)
         if callable(presign_fn):
             try:
@@ -2688,8 +2978,6 @@ def _storage_duckdb_path(storage, key: str, force_presign: bool = False) -> str:
             except Exception as e:
                 logging.debug(f"[write-probe] presign failed for {key}: {e}")
 
-    if "://" in key:
-        return key
     fn = getattr(storage, "to_duckdb_path", None)
     if callable(fn):
         try:
@@ -2710,6 +2998,317 @@ _PRESIGN_RETRY_TOKENS = (
     "HTTP Error", "HTTP GET error", "301", "Moved Permanently",
     "AccessDenied", "SignatureDoesNotMatch", "403", "400",
 )
+_LOCAL_WRITE_PROBE_MIN_FILES = 8
+_LOCAL_WRITE_PROBE_MIN_BYTES = 128 * 1024
+_LOCAL_ROWID_INTEGRITY_CACHE_MAX_ENTRIES = 4096
+
+_LocalProbeFileIdentity = Tuple[str, int, int, int, int, int]
+
+
+@dataclass
+class _PinnedLocalProbeFile:
+    """An immutable LocalStorage candidate held open for one DuckDB probe."""
+
+    key: str
+    path: str
+    scan_path: str
+    fd: int
+    identity: _LocalProbeFileIdentity
+
+    def close(self) -> None:
+        fd, self.fd = self.fd, -1
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _is_exact_local_storage(storage: object) -> bool:
+    try:
+        from supertable.storage.local_storage import LocalStorage
+    except Exception:
+        return False
+    return type(storage) is LocalStorage
+
+
+def _local_probe_file_identity(
+        canonical_path: str,
+        state: os.stat_result,
+) -> _LocalProbeFileIdentity:
+    return (
+        canonical_path,
+        int(state.st_dev),
+        int(state.st_ino),
+        int(state.st_size),
+        int(state.st_mtime_ns),
+        int(state.st_ctime_ns),
+    )
+
+
+def _pin_local_probe_files(
+        storage: object,
+        file_keys: List[str],
+        resolved_paths: List[str],
+) -> Optional[List[_PinnedLocalProbeFile]]:
+    """Pin exact LocalStorage files and expose their open fds to DuckDB.
+
+    Cache eligibility is deliberately narrower than probe eligibility. Only the
+    built-in, exact ``LocalStorage`` type may use cached integrity results;
+    subclasses, duck-typed adapters, URLs, non-regular files, symlinks, and
+    platforms without a readable ``/proc/self/fd`` view keep doing the complete
+    rowid scan on every probe.
+    """
+    if not _is_exact_local_storage(storage) or len(file_keys) != len(resolved_paths):
+        return None
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    pins: List[_PinnedLocalProbeFile] = []
+    canonical_keys: Dict[str, str] = {}
+    try:
+        for key, raw_path in zip(file_keys, resolved_paths):
+            if not isinstance(raw_path, str) or not raw_path or "://" in raw_path:
+                raise ValueError("local probe path is not an unambiguous filesystem path")
+            path = os.path.abspath(raw_path)
+            fd = os.open(path, flags)
+            try:
+                opened = os.fstat(fd)
+                if not stat.S_ISREG(opened.st_mode):
+                    raise ValueError("local probe candidate is not a regular file")
+                current = os.stat(path, follow_symlinks=True)
+                canonical = os.path.realpath(path)
+                identity = _local_probe_file_identity(canonical, opened)
+                if _local_probe_file_identity(canonical, current) != identity:
+                    raise ValueError("local probe candidate changed while it was opened")
+                prior_key = canonical_keys.get(canonical)
+                if prior_key is not None and prior_key != key:
+                    raise ValueError("local probe paths alias the same canonical file")
+                canonical_keys[canonical] = key
+
+                scan_path = f"/proc/self/fd/{fd}"
+                proc_state = os.stat(scan_path, follow_symlinks=True)
+                if (
+                    not stat.S_ISREG(proc_state.st_mode)
+                    or int(proc_state.st_dev) != int(opened.st_dev)
+                    or int(proc_state.st_ino) != int(opened.st_ino)
+                ):
+                    raise ValueError("open local file cannot be pinned through /proc")
+                pins.append(_PinnedLocalProbeFile(
+                    key=key,
+                    path=path,
+                    scan_path=scan_path,
+                    fd=fd,
+                    identity=identity,
+                ))
+            except BaseException:
+                os.close(fd)
+                raise
+        return pins
+    except BaseException as exc:
+        for pin in pins:
+            pin.close()
+        logging.debug(f"[write-probe] local integrity cache unavailable: {exc}")
+        return None
+
+
+def _local_probe_pins_unchanged(pins: Iterable[_PinnedLocalProbeFile]) -> bool:
+    """Verify both each open inode and its pathname still have one identity."""
+    try:
+        for pin in pins:
+            opened = os.fstat(pin.fd)
+            current = os.stat(pin.path, follow_symlinks=True)
+            if (
+                _local_probe_file_identity(pin.identity[0], opened) != pin.identity
+                or _local_probe_file_identity(pin.identity[0], current) != pin.identity
+            ):
+                return False
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+class _LocalRowidIntegrityCache:
+    """Bounded positive-result cache with per-identity in-flight coalescing."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._entries: OrderedDict[_LocalProbeFileIdentity, None] = OrderedDict()
+        self._by_path: Dict[str, _LocalProbeFileIdentity] = {}
+        self._inflight: Dict[_LocalProbeFileIdentity, threading.Event] = {}
+
+    def reserve(
+            self,
+            identities: Iterable[_LocalProbeFileIdentity],
+    ) -> Tuple[List[_LocalProbeFileIdentity], List[_LocalProbeFileIdentity]]:
+        """Return identities this caller must scan and identities already valid.
+
+        Concurrent callers for the same cold identity wait for its owner. If
+        that owner's probe fails, exactly one waiter claims and rescans it;
+        failures are never cached.
+        """
+        pending = list(dict.fromkeys(identities))
+        owned: List[_LocalProbeFileIdentity] = []
+        hits: List[_LocalProbeFileIdentity] = []
+        while pending:
+            waiters: List[Tuple[_LocalProbeFileIdentity, threading.Event]] = []
+            with self._lock:
+                for identity in pending:
+                    path = identity[0]
+                    prior = self._by_path.get(path)
+                    if prior is not None and prior != identity:
+                        self._entries.pop(prior, None)
+                        if self._by_path.get(path) == prior:
+                            self._by_path.pop(path, None)
+                    if identity in self._entries:
+                        self._entries.move_to_end(identity)
+                        hits.append(identity)
+                        continue
+                    event = self._inflight.get(identity)
+                    if event is None:
+                        self._inflight[identity] = threading.Event()
+                        owned.append(identity)
+                    else:
+                        waiters.append((identity, event))
+            if not waiters:
+                break
+            for _identity, event in waiters:
+                event.wait()
+            pending = [identity for identity, _event in waiters]
+        return owned, hits
+
+    def finish(
+            self,
+            owned: Iterable[_LocalProbeFileIdentity],
+            successful: Iterable[_LocalProbeFileIdentity] = (),
+    ) -> None:
+        successful_set = set(successful)
+        signals: List[threading.Event] = []
+        with self._lock:
+            for identity in owned:
+                if identity in successful_set:
+                    path = identity[0]
+                    prior = self._by_path.get(path)
+                    if prior is not None and prior != identity:
+                        self._entries.pop(prior, None)
+                    self._entries[identity] = None
+                    self._entries.move_to_end(identity)
+                    self._by_path[path] = identity
+                event = self._inflight.pop(identity, None)
+                if event is not None:
+                    signals.append(event)
+            limit = max(0, int(_LOCAL_ROWID_INTEGRITY_CACHE_MAX_ENTRIES))
+            while len(self._entries) > limit:
+                evicted, _none = self._entries.popitem(last=False)
+                if self._by_path.get(evicted[0]) == evicted:
+                    self._by_path.pop(evicted[0], None)
+            for event in signals:
+                event.set()
+
+    def clear(self) -> None:
+        """Clear process-local state (also used for isolated contract tests)."""
+        with self._lock:
+            signals = list(self._inflight.values())
+            self._entries.clear()
+            self._by_path.clear()
+            self._inflight.clear()
+            for event in signals:
+                event.set()
+
+
+_LOCAL_ROWID_INTEGRITY_CACHE = _LocalRowidIntegrityCache()
+
+
+def _local_projected_parquet_bytes(
+        storage: object,
+        overlap_true_files: List[Tuple[str, int]],
+        projected_columns: Iterable[str],
+) -> Optional[int]:
+    """Return compressed local Parquet bytes for the probe's projection.
+
+    Candidate metadata reports whole-object sizes, which can be dominated by
+    payload columns neither overwrite-resolution path reads. Reading only the
+    local footers gives the exact compressed column-chunk cost signal without
+    materialising data. Any ambiguous path/footer fails closed to Polars.
+    """
+    wanted = set(projected_columns)
+    if not wanted:
+        return 0
+    total = 0
+    try:
+        for key, _whole_file_size in overlap_true_files:
+            path = _storage_duckdb_path(storage, key)
+            if not isinstance(path, str) or not path or "://" in path:
+                return None
+            metadata = pq.read_metadata(path)
+            for row_group_index in range(metadata.num_row_groups):
+                row_group = metadata.row_group(row_group_index)
+                for column_index in range(row_group.num_columns):
+                    column = row_group.column(column_index)
+                    if column.path_in_schema in wanted:
+                        compressed = int(column.total_compressed_size or 0)
+                        if compressed > 0:
+                            total += compressed
+    except Exception as e:
+        logging.debug(
+            f"[write-probe] projected local cost unavailable; using polars: {e}"
+        )
+        return None
+    return total
+
+
+def _write_probe_selected(
+        storage: Optional[object],
+        overlap_true_files: List[Tuple[str, int]],
+        projected_columns: Iterable[str],
+) -> Tuple[bool, bool]:
+    """Return ``(selected, auto_local)`` for overwrite resolution.
+
+    ``SUPERTABLE_DUCKDB_WRITE_PROBE`` remains the explicit cross-backend opt-in.
+    Larger many-file local candidate sets are safe to accelerate automatically
+    because DuckDB reads the same immutable files directly and cannot stall on
+    httpfs installation or remote authentication. The dedicated local-auto
+    switch keeps an explicit operational escape hatch; any probe/schema failure
+    still returns to the strict projected Polars oracle.
+    """
+    if settings.SUPERTABLE_DUCKDB_WRITE_PROBE:
+        return True, False
+    if not getattr(settings, "SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO", True):
+        return False, False
+    # Direct processing callers historically needed no storage construction to
+    # reach the strict fallback. Only the owning DataWriter may opt into local
+    # auto-selection by supplying its already-resolved backend instance.
+    if storage is None:
+        return False, False
+    is_local = getattr(storage, "is_local_storage", None)
+    if not callable(is_local):
+        return False, False
+    try:
+        local = is_local() is True
+    except Exception:
+        # Storage classification is optional acceleration metadata. An
+        # ambiguous/failed answer must retain the storage-SDK oracle path.
+        return False, False
+    if not local:
+        return False, False
+
+    # DuckDB pays a fixed schema/integrity-query cost and is slower than the
+    # projected Polars oracle for a handful of local files. Targeted crossover
+    # profiling puts the stable win at eight non-trivial candidates. Gate the
+    # byte side on the exact compressed key/rowid/version chunks, not unrelated
+    # payload columns that neither path reads.
+    if len(overlap_true_files) < _LOCAL_WRITE_PROBE_MIN_FILES:
+        return False, False
+    candidate_bytes = _local_projected_parquet_bytes(
+        storage, overlap_true_files, projected_columns,
+    )
+    selected = (
+        candidate_bytes is not None
+        and candidate_bytes >= _LOCAL_WRITE_PROBE_MIN_BYTES
+    )
+    return selected, selected
 
 
 def _duckdb_probe_overlap_matches(
@@ -2719,6 +3318,7 @@ def _duckdb_probe_overlap_matches(
         incoming_keys: polars.DataFrame,
         incoming_schema: Optional[Dict[str, polars.DataType]] = None,
         profiler: Optional[Profiler] = None,
+        storage: Optional[object] = None,
 ) -> Optional[polars.DataFrame]:
     """Column-projected pushdown probe over the overlapping data files.
 
@@ -2781,7 +3381,8 @@ def _duckdb_probe_overlap_matches(
         logging.info(f"[write-probe] duckdb unavailable, using polars path: {e}")
         return None
 
-    storage = _get_storage()
+    if storage is None:
+        storage = _get_storage()
     file_keys = [fk for fk, _sz in overlap_true_files]
 
     def _resolve(force_presign: bool):
@@ -2811,7 +3412,8 @@ def _duckdb_probe_overlap_matches(
             paths.append(dp)
         return paths, d2k
 
-    # Proactive: honours SUPERTABLE_DUCKDB_PRESIGNED exactly like the read path.
+    # Proactive: honours SUPERTABLE_DUCKDB_PRESIGNED for object stores exactly
+    # like the read path. Local storage always stays on its filesystem path.
     # Identity ambiguity disables only the optional accelerator; the strict
     # storage-SDK fallback below still reads each raw resource key separately.
     try:
@@ -2821,6 +3423,20 @@ def _duckdb_probe_overlap_matches(
             f"[write-probe] unsafe path identity, using polars path: {e}"
         )
         return None
+
+    local_pins = _pin_local_probe_files(storage, file_keys, duck_paths)
+    if local_pins is not None:
+        # DuckDB reads the already-open inode, while path + open-fd identities
+        # are checked again after both queries. This closes replacement races
+        # between a cache lookup, integrity validation, and the key probe.
+        duck_paths = [pin.scan_path for pin in local_pins]
+        duck_to_key = {pin.scan_path: pin.key for pin in local_pins}
+    elif _is_exact_local_storage(storage):
+        p.add("probe_rowid_integrity_cache_identity_fallback", 1)
+
+    cache_owned: List[_LocalProbeFileIdentity] = []
+    cache_scanned: Set[_LocalProbeFileIdentity] = set()
+    cache_finished = False
 
     select_cols = ["filename", quote_if_needed(ROWID_COL)]
     select_cols += [quote_if_needed(c) for c in overwrite_columns]
@@ -2904,18 +3520,38 @@ def _duckdb_probe_overlap_matches(
         # it completely for every candidate before the accelerator may emit a
         # pair.  Binary collation keeps case-distinct source paths separate
         # even though pooled SELECT connections default to nocase.
-        integrity_sql = (
-            "SELECT filename COLLATE \"binary\" AS __st_file__, "
-            "count(*) AS __rows__, "
-            f"count({quote_if_needed(ROWID_COL)}) AS __nonnull__, "
-            f"count(DISTINCT {quote_if_needed(ROWID_COL)}) AS __unique__, "
-            f"min({quote_if_needed(ROWID_COL)}) AS __min__ "
-            f"FROM parquet_scan([{files_sql}], union_by_name=TRUE, "
-            "filename=TRUE, hive_partitioning=FALSE) "
-            "GROUP BY filename COLLATE \"binary\""
-        )
-        with p.span("io.duckdb_probe_rowid_integrity"):
-            integrity_rows = con.execute(integrity_sql).fetchall()
+        integrity_paths = paths
+        owned_for_run: List[_LocalProbeFileIdentity] = []
+        if local_pins is not None:
+            owned_for_run, cache_hits = _LOCAL_ROWID_INTEGRITY_CACHE.reserve(
+                pin.identity for pin in local_pins
+            )
+            cache_owned.extend(owned_for_run)
+            p.add("probe_rowid_integrity_cache_hits", len(cache_hits))
+            p.add("probe_rowid_integrity_cache_misses", len(owned_for_run))
+            owned_set = set(owned_for_run)
+            integrity_paths = [
+                pin.scan_path for pin in local_pins if pin.identity in owned_set
+            ]
+
+        integrity_rows = []
+        if integrity_paths:
+            integrity_files_sql = ", ".join(
+                f"'{escape_parquet_path(path)}'" for path in integrity_paths
+            )
+            integrity_sql = (
+                "SELECT filename COLLATE \"binary\" AS __st_file__, "
+                "count(*) AS __rows__, "
+                f"count({quote_if_needed(ROWID_COL)}) AS __nonnull__, "
+                f"count(DISTINCT {quote_if_needed(ROWID_COL)}) AS __unique__, "
+                f"min({quote_if_needed(ROWID_COL)}) AS __min__ "
+                f"FROM parquet_scan([{integrity_files_sql}], union_by_name=TRUE, "
+                "filename=TRUE, hive_partitioning=FALSE) "
+                "GROUP BY filename COLLATE \"binary\""
+            )
+            with p.span("io.duckdb_probe_rowid_integrity"):
+                integrity_rows = con.execute(integrity_sql).fetchall()
+            p.add("probe_rowid_integrity_scanned_files", len(integrity_paths))
         checked_paths = set()
         for source_file, total, nonnull, unique, minimum in integrity_rows:
             source_file = str(source_file)
@@ -2931,11 +3567,15 @@ def _duckdb_probe_overlap_matches(
                 )
         # Non-empty inputs must appear exactly once in the binary-collated
         # aggregate. Empty parquet files cannot match a key and are harmless.
-        unexpected = checked_paths.difference(paths)
+        unexpected = checked_paths.difference(integrity_paths)
         if unexpected:
             raise ValueError(
                 f"mutation probe returned unrecognized source file(s): {unexpected!r}"
             )
+        # Empty Parquet inputs do not appear in the grouped result, but have no
+        # rowids and are therefore valid. Publish only after the main query and
+        # the post-query identity fence also succeed.
+        cache_scanned.update(owned_for_run)
         sql = (
             f"SELECT {', '.join(select_cols)} "
             f"FROM parquet_scan([{files_sql}], union_by_name=TRUE, "
@@ -2966,7 +3606,7 @@ def _duckdb_probe_overlap_matches(
             # rejects an unsigned/expired read (403 / AccessDenied /
             # SignatureDoesNotMatch / HTTP …); presign the keys and retry once.
             msg = str(e)
-            if getattr(storage, "presign", None) and any(
+            if local_pins is None and getattr(storage, "presign", None) and any(
                 tok in msg for tok in _PRESIGN_RETRY_TOKENS
             ):
                 logging.warning(f"[write-probe] presign fallback after: {msg}")
@@ -2975,10 +3615,17 @@ def _duckdb_probe_overlap_matches(
                 matched = _run(duck_paths)
             else:
                 raise
+        if local_pins is not None:
+            if not _local_probe_pins_unchanged(local_pins):
+                raise ValueError("local mutation candidate changed during probe")
+            _LOCAL_ROWID_INTEGRITY_CACHE.finish(cache_owned, cache_scanned)
+            cache_finished = True
     except Exception as e:
         logging.info(f"[write-probe] probe failed, using polars path: {e}")
         return None
     finally:
+        if not cache_finished and cache_owned:
+            _LOCAL_ROWID_INTEGRITY_CACHE.finish(cache_owned)
         if con is not None:
             # Return the connection to the thread-local pool (do NOT close it);
             # only drop the per-probe registered relation so the uuid-named
@@ -2987,6 +3634,8 @@ def _duckdb_probe_overlap_matches(
                 con.unregister(ik_name)
             except Exception:
                 pass
+        for pin in local_pins or ():
+            pin.close()
 
     if matched is None or "filename" not in matched.columns:
         return None
@@ -3098,20 +3747,27 @@ def resolve_overwrite_writes(
         profiler: Optional[Profiler] = None,
         required: bool = True,
         existing_tombstones: Optional[polars.DataFrame] = None,
+        storage: Optional[object] = None,
 ) -> Tuple[polars.DataFrame, List[Tuple[str, int]]]:
     """Single-pass overwrite resolution: stale filtering + delete-vector pairs.
 
-    Returns ``(filtered_incoming_df, delete_pairs)``.  When the DuckDB pushdown
-    probe is enabled (``SUPERTABLE_DUCKDB_WRITE_PROBE``) it is computed from ONE
-    probe over the overlapping files.  Falls back to the original polars
-    full-read path (``filter_stale_incoming_rows`` + ``identify_deleted_rowids``)
-    when the probe is disabled (the default), DuckDB is unavailable, the probe
-    fails, or the file schema can't be probed — semantics are identical on both
-    paths.
+    Returns ``(filtered_incoming_df, delete_pairs)``. When the DuckDB pushdown
+    probe is enabled explicitly, or selected automatically for a sufficiently
+    large LocalStorage candidate set, it is computed from ONE probe over the
+    overlapping files. It falls back to the
+    strict projected Polars path (``filter_stale_incoming_rows`` plus
+    ``identify_deleted_rowids``) when the probe is disabled, DuckDB is
+    unavailable, the probe fails, or the file schema cannot be probed; semantics
+    are identical on both paths.
 
     *newer_than_col* falsy ⇒ no stale filtering (delete/upsert without conflict
     resolution); the incoming df is returned unchanged and every overlapping row
     matched by an incoming key is tombstoned.
+
+    ``storage`` is the caller's already-pinned backend instance. ``None`` keeps
+    local auto-selection off (while the explicit cross-backend flag still works),
+    so direct processing callers never construct or contact a backend merely to
+    choose an optional accelerator.
     """
     p = profiler or get_null_profiler()
     overlap_true = [(f, sz) for f, has_overlap, sz in overlapping_files if has_overlap]
@@ -3130,12 +3786,22 @@ def resolve_overwrite_writes(
         f"{incoming_keys.height} unique incoming key(s) on {overwrite_columns}, "
         f"newer_than={newer_than_col}"
     )
-    # The DuckDB pushdown probe is opt-in (SUPERTABLE_DUCKDB_WRITE_PROBE).  When
-    # disabled (the default), skip it entirely and use the polars fallback below,
-    # which reads only the projected key columns via the storage SDK and needs no
-    # httpfs extension — the safe path for environments without one.
+    # Remote/object storage remains opt-in because probing it can require httpfs
+    # and credentials. LocalStorage is auto-selected: DuckDB reads the same
+    # immutable files directly, and every unsupported/error case still falls
+    # through to the required=True projected Polars oracle below.
     matched = None
-    if settings.SUPERTABLE_DUCKDB_WRITE_PROBE:
+    probe_columns = list(dict.fromkeys(
+        [ROWID_COL]
+        + list(overwrite_columns)
+        + ([newer_than_col] if newer_than_col else [])
+    ))
+    probe_selected, auto_local = _write_probe_selected(
+        storage, overlap_true, probe_columns,
+    )
+    if auto_local:
+        p.add("overwrite_resolve_probe_auto_local", 1)
+    if probe_selected:
         matched = _duckdb_probe_overlap_matches(
             overlap_true,
             overwrite_columns,
@@ -3143,6 +3809,7 @@ def resolve_overwrite_writes(
             incoming_keys,
             incoming_schema=dict(incoming_df.schema),
             profiler=p,
+            storage=storage,
         )
     if matched is not None:
         try:
@@ -3202,6 +3869,7 @@ def resolve_overwrite_writes(
             read_columns=read_columns,
             required=required,
             dead_rowids_by_file=dead_rowids_by_file,
+            storage=storage,
         )
     else:
         filtered = incoming_df
@@ -3210,6 +3878,7 @@ def resolve_overwrite_writes(
         file_cache=file_cache, profiler=p, read_columns=read_columns,
         required=required,
         dead_rowids_by_file=dead_rowids_by_file,
+        storage=storage,
     )
     return filtered, pairs
 
@@ -3243,6 +3912,8 @@ def build_tombstone_file(
         profiler: Optional[Profiler] = None,
         prev_df: Optional[polars.DataFrame] = None,
         persist: bool = True,
+        prev_df_validated: bool = False,
+        validation_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[str], Optional[polars.DataFrame]]:
     """Carry forward the previous deletion-vector and append newly deleted rows.
 
@@ -3276,7 +3947,7 @@ def build_tombstone_file(
         # required=True: refuse to build a truncated deletion-vector if the
         # previous one exists but cannot be read (would resurrect dead rows).
         prev_df = _read_parquet_safe(prev_tombstone_path, profiler=p, required=True)
-    if prev_df is not None:
+    if prev_df is not None and not prev_df_validated:
         prev_df = validate_tombstone_frame(
             prev_df, source=f"deletion-vector {prev_tombstone_path or '<memory>'}"
         )
@@ -3296,6 +3967,11 @@ def build_tombstone_file(
         polars.col(ROWID_COL).cast(polars.Int64, strict=True),
     )
     validate_tombstone_frame(combined, source="new deletion-vector")
+    if validation_out is not None:
+        validation_out["frame"] = combined
+        validation_out["digest"] = tombstone_digest(
+            combined, assume_valid=True,
+        )
 
     if not persist:
         # Threshold drains can consume this in-memory frame in the same locked
@@ -3331,6 +4007,7 @@ def reclaim_fully_dead_files(
         compression_level: int,
         profiler: Optional[Profiler] = None,
         persist: bool = True,
+        assume_valid: bool = False,
 ) -> Tuple[Set[str], Optional[str], Optional[polars.DataFrame]]:
     """Drop data files whose every physical row is in the deletion-vector.
 
@@ -3355,9 +4032,10 @@ def reclaim_fully_dead_files(
     if combined_dv is None or combined_dv.height == 0 or not resources:
         return set(), None, None
 
-    combined_dv = validate_tombstone_frame(
-        combined_dv, source="deletion-vector used for eager reclamation"
-    )
+    if not assume_valid:
+        combined_dv = validate_tombstone_frame(
+            combined_dv, source="deletion-vector used for eager reclamation"
+        )
     tombstone_groups = combined_dv.partition_by(
         TOMBSTONE_FILE_COL, as_dict=True, maintain_order=False
     )
@@ -3960,15 +4638,21 @@ def parquet_footer_sha256(md) -> str:
     return hashlib.sha256(payload.getvalue()).hexdigest()
 
 
-def _stats_rows_for_metadata(file_path: str, md) -> List[dict]:
+def _stats_rows_for_metadata(
+        file_path: str,
+        md,
+        *,
+        footer_sha256: Optional[str] = None,
+) -> List[dict]:
     """Build the per-(row_group × column) stats rows for one file's footer."""
     rows: List[dict] = []
-    try:
-        footer_sha256 = parquet_footer_sha256(md)
-    except Exception:
-        # Stats remain usable for conservative file pruning, but no executor may
-        # trust row-group IDs that are not bound to an exact live footer.
-        footer_sha256 = None
+    if footer_sha256 is None:
+        try:
+            footer_sha256 = parquet_footer_sha256(md)
+        except Exception:
+            # Stats remain usable for conservative file pruning, but no executor may
+            # trust row-group IDs that are not bound to an exact live footer.
+            footer_sha256 = None
     for rg in range(md.num_row_groups):
         g = md.row_group(rg)
         rg_rows = int(g.num_rows)
@@ -4051,25 +4735,54 @@ def stats_seal_for_metadata(
         md,
         *,
         rows: Optional[List[dict]] = None,
+        footer_sha256: Optional[str] = None,
 ) -> ResourceStatsSeal:
     """Build the exact footer + canonical stats-row seal for a new resource."""
-    footer_sha256 = parquet_footer_sha256(md)
-    exact_rows = _stats_rows_for_metadata(file_path, md) if rows is None else rows
+    exact_footer_sha256 = footer_sha256 or parquet_footer_sha256(md)
+    exact_rows = (
+        _stats_rows_for_metadata(
+            file_path,
+            md,
+            footer_sha256=exact_footer_sha256,
+        )
+        if rows is None else rows
+    )
     if not exact_rows:
         # A system-column-only file has no STATS_SCHEMA rows.  Seal that exact
         # empty stream anyway, although absence pruning will remain unavailable
         # because there are no user-column ranges to prove anything.
         return ResourceStatsSeal(
-            footer_sha256=footer_sha256,
+            footer_sha256=exact_footer_sha256,
             stats_rows=0,
             stats_digest=_new_stats_resource_hasher(file_path).hexdigest(),
         )
-    frame = polars.DataFrame(exact_rows, schema=STATS_SCHEMA)
-    seals = stats_resource_seals(frame)
-    seal = seals.get(file_path) if seals is not None else None
-    if seal is None or seal.footer_sha256 != footer_sha256:
-        raise ValueError(f"could not seal statistics for resource {file_path!r}")
-    return seal
+    # These rows were generated from one freshly parsed footer.  Hash their
+    # canonical stream directly instead of constructing a second DataFrame,
+    # sorting it, iterating it, and serialising the same footer again.  The
+    # ordering and row encoder are exactly those used by stats_resource_seals.
+    try:
+        ordered = sorted(
+            exact_rows,
+            key=lambda row: (row["row_group_id"], row["column_name"]),
+        )
+        digest = _new_stats_resource_hasher(file_path)
+        for row in ordered:
+            if (
+                row.get("file_path") != file_path
+                or row.get("footer_sha256") != exact_footer_sha256
+            ):
+                raise ValueError("stats rows do not match their footer resource")
+            values = tuple(row.get(name) for name in STATS_SCHEMA)
+            digest.update(_canonical_stats_row_bytes(values))
+        return ResourceStatsSeal(
+            footer_sha256=exact_footer_sha256,
+            stats_rows=len(ordered),
+            stats_digest=digest.hexdigest(),
+        )
+    except Exception as exc:
+        raise ValueError(
+            f"could not seal statistics for resource {file_path!r}"
+        ) from exc
 
 
 def _empty_stats_df() -> polars.DataFrame:
@@ -4198,6 +4911,7 @@ def build_stats_file(
         compression_level: int,
         profiler: Optional[Profiler] = None,
         prev_cache_identity: Optional[str] = None,
+        validation_out: Optional[Dict[str, _StatsFrameValidation]] = None,
 ) -> Tuple[Optional[str], Optional[polars.DataFrame]]:
     """Carry forward the previous stats parquet and apply this write's delta.
 
@@ -4255,11 +4969,74 @@ def build_stats_file(
         # Clearing all live resources/stats needs no empty immutable object.
         # A null pointer is exact, cheaper, and cannot suffer a remote upload
         # failure after the data rewrite has already completed.
+        if validation_out is not None:
+            validation_out["validation"] = _StatsFrameValidation({}, {})
         return None, combined
+
+    # The previous immutable stats frame was already validated before it was
+    # allowed to prune this write (and its validation is cached beside that
+    # exact frame).  Preserve those per-resource proofs, remove sunset paths,
+    # and validate only the newly extracted footer rows.  Without this handoff
+    # every successful write seeds the next cache entry without metadata, so
+    # the next mutation sorts and hashes the complete, ever-growing stats
+    # history again while holding the table lock.
+    #
+    # This is deliberately conservative: any malformed validation, duplicate
+    # path across the retained/new partitions, or unavailable proof falls back
+    # to the established full-frame validator.  The optimization can therefore
+    # only reduce work; it cannot make an untrusted stats row eligible for
+    # pruning.
+    combined_validation: Optional[_StatsFrameValidation] = None
+    try:
+        prev_validation = (
+            _stats_validation_for_frame(
+                prev_df,
+                stats_path=prev_cache_identity or prev_stats_path,
+            )
+            if prev_df is not None and prev_df.height > 0
+            else _StatsFrameValidation({}, {})
+        )
+        new_validation = (
+            _validate_stats_frame_once(new_df)
+            if has_new
+            else _StatsFrameValidation({}, {})
+        )
+        if (
+            prev_validation.resource_seals is not None
+            and new_validation.resource_seals is not None
+        ):
+            retained_seals = {
+                path: seal
+                for path, seal in prev_validation.resource_seals.items()
+                if path not in removed
+            }
+            retained_rows = {
+                path: rows
+                for path, rows in prev_validation.complete_resource_rows.items()
+                if path not in removed
+            }
+            new_paths = set(new_validation.resource_seals)
+            if not new_paths.intersection(retained_seals):
+                combined_validation = _StatsFrameValidation(
+                    {
+                        **retained_seals,
+                        **new_validation.resource_seals,
+                    },
+                    {
+                        **retained_rows,
+                        **new_validation.complete_resource_rows,
+                    },
+                )
+    except Exception:
+        combined_validation = None
+    if combined_validation is None:
+        combined_validation = _validate_stats_frame_once(combined)
 
     new_path = _partitioned_new_path(stats_dir, "stats")
     _write_df_parquet(combined, new_path, compression_level, profiler=p)
     p.add("stats_rows_total", int(combined.height))
+    if validation_out is not None:
+        validation_out["validation"] = combined_validation
     return new_path, combined
 
 
@@ -5748,6 +6525,7 @@ def cache_stats(
         df: Optional[polars.DataFrame],
         *,
         cache_identity: Optional[str] = None,
+        validation: Optional[_StatsFrameValidation] = None,
 ) -> None:
     """Seed the cache with a freshly built latest-version stats frame.
 
@@ -5756,7 +6534,12 @@ def cache_stats(
     """
     if stats_path and df is not None:
         identity = cache_identity or stats_cache_identity(stats_path)
-        _STATS_CACHE.put(identity, df)
+        metadata = (
+            _StatsCacheMetadata(validation)
+            if isinstance(validation, _StatsFrameValidation)
+            else None
+        )
+        _STATS_CACHE.put(identity, df, metadata)
 
 
 def load_tombstone(

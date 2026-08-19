@@ -240,3 +240,95 @@ class TestBuildStatsFileUsesCache:
                 compression_level=1,
             )
             assert mock_read.call_count == 1  # cold cache → exactly one GET
+
+    @patch(f"{_MOD}._get_storage")
+    def test_successor_carries_validation_and_hashes_only_new_delta(
+            self, mock_gs, monkeypatch,
+    ):
+        mock_gs.return_value = _FakeStorage()
+        prev_path = "t/stats/hour=00/prev.parquet"
+        prev = _full_stats_df("fileA.parquet", 1).with_columns(
+            pl.lit("a" * 64).alias("footer_sha256")
+        )
+        prev_validation = processing._validate_stats_frame_once(prev)
+        cache_stats(prev_path, prev, validation=prev_validation)
+
+        calls = []
+        original = processing._validate_stats_frame_once
+
+        def counted(frame):
+            calls.append(set(frame.get_column("file_path").to_list()))
+            return original(frame)
+
+        monkeypatch.setattr(processing, "_validate_stats_frame_once", counted)
+        validation_out = {}
+        path, combined = build_stats_file(
+            stats_dir="t/stats",
+            prev_stats_path=prev_path,
+            new_rows=_full_stats_df("fileB.parquet", 2).with_columns(
+                pl.lit("b" * 64).alias("footer_sha256")
+            ),
+            removed_files=set(),
+            compression_level=1,
+            validation_out=validation_out,
+        )
+
+        # Only the one-resource delta is validated.  The already-proven A
+        # partition is neither sorted nor cryptographically rehashed again.
+        assert calls == [{"fileB.parquet"}]
+        validation = validation_out["validation"]
+        assert set(validation.resource_seals) == {
+            "fileA.parquet", "fileB.parquet",
+        }
+        cache_stats(path, combined, validation=validation)
+
+        # The exact successor proof is attached to the cache entry, so the
+        # next pruning boundary performs no whole-history validation either.
+        safe = processing.stats_for_complete_files(
+            combined,
+            {"fileA.parquet": 1, "fileB.parquet": 1},
+            validation.resource_seals,
+            stats_path=path,
+        )
+        assert safe.height == combined.height
+        assert calls == [{"fileB.parquet"}]
+
+    @patch(f"{_MOD}._get_storage")
+    def test_validation_handoff_falls_back_on_path_collision(
+            self, mock_gs, monkeypatch,
+    ):
+        mock_gs.return_value = _FakeStorage()
+        prev_path = "t/stats/hour=00/prev.parquet"
+        prev = _full_stats_df("same.parquet", 1).with_columns(
+            pl.lit("a" * 64).alias("footer_sha256")
+        )
+        cache_stats(
+            prev_path,
+            prev,
+            validation=processing._validate_stats_frame_once(prev),
+        )
+        calls = []
+        original = processing._validate_stats_frame_once
+
+        def counted(frame):
+            calls.append(frame.height)
+            return original(frame)
+
+        monkeypatch.setattr(processing, "_validate_stats_frame_once", counted)
+        validation_out = {}
+        _path, combined = build_stats_file(
+            stats_dir="t/stats",
+            prev_stats_path=prev_path,
+            new_rows=_full_stats_df("same.parquet", 2).with_columns(
+                pl.lit("b" * 64).alias("footer_sha256")
+            ),
+            removed_files=set(),
+            compression_level=1,
+            validation_out=validation_out,
+        )
+
+        # A duplicate immutable resource key is not merge-safe.  Validate the
+        # new delta, then conservatively revalidate the exact combined frame.
+        assert calls == [1, 2]
+        assert validation_out["validation"].resource_seals == {}
+        assert combined.height == 2

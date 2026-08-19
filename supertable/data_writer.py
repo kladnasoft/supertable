@@ -863,6 +863,8 @@ class DataWriter:
                 self.super_table,
                 simple_name,
                 create_if_missing=not locked_target_exists,
+                catalog=self.catalog,
+                _live_leaf_verified=bool(locked_target_exists),
             )
             last_simple_table, last_simple_table_path = simple_table.get_simple_table_snapshot()
             # A current deletion-vector is immutable correctness metadata.  Do
@@ -1045,6 +1047,7 @@ class DataWriter:
                     newer_than_col=newer_than,
                     profiler=profiler,
                     existing_tombstones=prev_dv_df,
+                    storage=self.super_table.storage,
                 )
                 mark("resolve_overwrite")
                 _counts = profiler.counts
@@ -1193,6 +1196,7 @@ class DataWriter:
                         or enabled_mirrors
                     )
                 )
+                tombstone_validation_out: dict[str, Any] = {}
 
                 def _write_data_branch():
                     sub = Profiler()
@@ -1229,6 +1233,11 @@ class DataWriter:
                         profiler=sub,
                         prev_df=prev_dv_df,
                         persist=not defer_tombstone_upload,
+                        prev_df_validated=prev_dv_df is not None,
+                        validation_out=(
+                            tombstone_validation_out
+                            if not defer_tombstone_upload else None
+                        ),
                     )
                     return tp, cdf, sub, time.perf_counter() - t
 
@@ -1320,6 +1329,7 @@ class DataWriter:
                             compression_level=compression_level,
                             profiler=profiler,
                             persist=not defer_tombstone_upload,
+                            assume_valid=True,
                         )
                     )
                     if reclaimed_files:
@@ -1564,9 +1574,14 @@ class DataWriter:
                         # sorting and hashing the entire vector again.
                         last_simple_table["tombstone_digest"] = prior_tombstone_digest
                     elif digest_frame is not None:
-                        last_simple_table["tombstone_digest"] = tombstone_digest(
-                            digest_frame, assume_valid=True
-                        )
+                        if digest_frame is tombstone_validation_out.get("frame"):
+                            last_simple_table["tombstone_digest"] = (
+                                tombstone_validation_out["digest"]
+                            )
+                        else:
+                            last_simple_table["tombstone_digest"] = tombstone_digest(
+                                digest_frame, assume_valid=True
+                            )
                     elif tombstone_path == prev_tombstone_path:
                         # Pure append below threshold: preserve the already
                         # validated immutable seal without loading a large DV.
@@ -1719,6 +1734,7 @@ class DataWriter:
                     new_stats_rows = extract_stats_rows(
                         new_data_files, profiler=profiler, footer_md_cache=footer_md_cache
                     )
+                    stats_validation_out: dict[str, Any] = {}
                     stats_path, combined_stats_df = build_stats_file(
                         stats_dir=stats_dir,
                         prev_stats_path=last_simple_table.get("stats_file"),
@@ -1734,6 +1750,7 @@ class DataWriter:
                             )
                             if last_simple_table.get("stats_file") else None
                         ),
+                        validation_out=stats_validation_out,
                     )
                     stats_rows = (
                         combined_stats_df.height
@@ -1753,6 +1770,7 @@ class DataWriter:
                             organization=self.super_table.organization,
                             storage=self.super_table.storage,
                         ),
+                        validation=stats_validation_out.get("validation"),
                     )
                 mark("build_stats")
 
@@ -2506,6 +2524,7 @@ class DataWriter:
                 new_stats_rows = extract_stats_rows(
                     new_data_files, footer_md_cache=footer_md_cache,
                 )
+                stats_validation_out: dict[str, Any] = {}
                 stats_path, combined_stats_df = build_stats_file(
                     stats_dir=stats_dir,
                     prev_stats_path=last_simple_table.get("stats_file"),
@@ -2520,6 +2539,7 @@ class DataWriter:
                         )
                         if last_simple_table.get("stats_file") else None
                     ),
+                    validation_out=stats_validation_out,
                 )
                 last_simple_table["stats_file"] = stats_path
                 last_simple_table["stats_rows"] = (
@@ -2536,6 +2556,7 @@ class DataWriter:
                             organization=self.super_table.organization,
                             storage=self.super_table.storage,
                         ),
+                        validation=stats_validation_out.get("validation"),
                     )
                 mark("build_stats")
 

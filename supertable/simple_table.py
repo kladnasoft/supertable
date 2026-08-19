@@ -108,6 +108,12 @@ class SimpleTable:
             table surfaces as an error instead of being silently
             materialized as a side effect of constructing the Python
             object.
+        catalog: Existing catalog client to reuse. Writers pass the client that
+            owns their table lease; ordinary callers omit it.
+        _live_leaf_verified: Internal writer fast path. The caller must hold the
+            table lease and have just verified the exact live leaf plus both
+            deletion-intent fences. It is valid only with
+            ``create_if_missing=False``.
     """
 
     def __init__(
@@ -116,6 +122,8 @@ class SimpleTable:
         simple_name: str,
         *,
         create_if_missing: bool = True,
+        catalog: Optional[RedisCatalog] = None,
+        _live_leaf_verified: bool = False,
     ):
         # ``super == simple`` is the public aggregate relation that unions the
         # parent's children.  A physical child with that name is therefore
@@ -135,17 +143,27 @@ class SimpleTable:
 
         # Storage is the same as SuperTable's
         self.storage = self.super_table.storage
-        self.catalog = RedisCatalog()
+        # Writers already own a table lease and have just fenced the namespace,
+        # deletion intents, root and leaf through their catalog. Reuse that
+        # exact client and proof instead of constructing another catalog and
+        # repeating the same Redis lifecycle reads. Ordinary/read-side callers
+        # retain the independent fail-closed checks below.
+        self.catalog = catalog if catalog is not None else RedisCatalog()
 
-        deletion_guard = getattr(
-            type(self.catalog), "check_deletion_intent_absent", None,
-        )
-        if callable(deletion_guard):
-            self.catalog.check_deletion_intent_absent(
-                self.super_table.organization,
-                self.super_table.super_name,
-                simple=self.simple_name,
+        if _live_leaf_verified and create_if_missing:
+            raise ValueError(
+                "_live_leaf_verified requires create_if_missing=False"
             )
+        if not _live_leaf_verified:
+            deletion_guard = getattr(
+                type(self.catalog), "check_deletion_intent_absent", None,
+            )
+            if callable(deletion_guard):
+                self.catalog.check_deletion_intent_absent(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    simple=self.simple_name,
+                )
 
 
         # Data layout
@@ -154,6 +172,9 @@ class SimpleTable:
         )
         self.data_dir = os.path.join(self.simple_dir, "data")
         self.snapshot_dir = os.path.join(self.simple_dir, "snapshots")
+
+        if _live_leaf_verified:
+            return
 
         # Fast path: if meta:leaf exists, don't touch storage
         if self.catalog.leaf_exists(

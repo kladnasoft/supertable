@@ -77,6 +77,9 @@ def fresh_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
         "AZURE_BLOB_ENDPOINT",
         "GCS_BUCKET",
         "GCP_PROJECT",
+        # DuckDB write probe
+        "SUPERTABLE_DUCKDB_WRITE_PROBE",
+        "SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO",
         # Tokens
         "SUPERTABLE_SUPERUSER_TOKEN",
         "SUPERTABLE_SUPERTOKEN",
@@ -267,6 +270,8 @@ class TestSettingsDataclass:
         assert s.SUPERTABLE_API_PORT == 8051
         assert s.SUPERTABLE_DEFAULT_LIMIT == 200
         assert s.SUPERTABLE_DEFAULT_ENGINE == "AUTO"
+        assert s.SUPERTABLE_DUCKDB_WRITE_PROBE is False
+        assert s.SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO is True
         assert s.SUPERTABLE_QUERY_OBSERVATIONS_ENABLED is True
         assert s.SUPERTABLE_QUERY_OBSERVATION_MAX_SAMPLES == 64
         assert s.SUPERTABLE_QUERY_OBSERVATION_TTL_DAYS == 30
@@ -447,6 +452,28 @@ class TestBuildSettings:
         assert s.STORAGE_FORCE_PATH_STYLE is True
         assert s.STORAGE_USE_SSL is True
         assert s.SUPERTABLE_REDIS_PORT == 6380
+
+    def test_duckdb_write_probe_selection_overrides(
+        self, fresh_env: pytest.MonkeyPatch,
+    ) -> None:
+        fresh_env.setenv("SUPERTABLE_DUCKDB_WRITE_PROBE", "true")
+        fresh_env.setenv("SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO", "false")
+
+        s = _build_settings()
+
+        assert s.SUPERTABLE_DUCKDB_WRITE_PROBE is True
+        assert s.SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO is False
+
+    def test_duckdb_local_write_probe_escape_hatch(
+        self, fresh_env: pytest.MonkeyPatch,
+    ) -> None:
+        fresh_env.setenv("SUPERTABLE_DUCKDB_WRITE_PROBE", "false")
+        fresh_env.setenv("SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO", "false")
+
+        s = _build_settings()
+
+        assert s.SUPERTABLE_DUCKDB_WRITE_PROBE is False
+        assert s.SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO is False
 
     def test_garbage_redis_port_is_rejected(
         self, fresh_env: pytest.MonkeyPatch

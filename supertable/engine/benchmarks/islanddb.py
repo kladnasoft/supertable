@@ -10,6 +10,13 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+from .container_runner import (
+    DEFAULT_ENGINE_MEMORY_BYTES,
+    CONTAINER_CPUS,
+    CONTAINER_MEMORY_BYTES,
+    ContainerRunnerConfig,
+    DockerWorkerRunner,
+)
 from .corpus import (
     GIB,
     TIER_TARGET_BYTES,
@@ -50,10 +57,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="LIST",
-        help="comma-separated tiers: kb,mb,1gib,10gib,50gib (default: kb,mb)",
+        help=(
+            "comma-separated tiers: kb,mb,100mib,1gib,10gib,50gib "
+            "(default: kb,mb)"
+        ),
     )
     parser.add_argument("--kb", action="store_true", help="include the 512 KiB tier")
     parser.add_argument("--mb", action="store_true", help="include the 64 MiB tier")
+    parser.add_argument(
+        "--hundred-mib",
+        "--100mib",
+        "--100mb",
+        dest="hundred_mib",
+        action="store_true",
+        help="include the 100 MiB tier",
+    )
     parser.add_argument(
         "--one-gib",
         "--1gib",
@@ -90,7 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="LIST",
         help=(
             "comma-separated workloads: no_match,point,range_1pct,range_1pct_5cols,"
-            "range_10pct,projection,full_scan "
+            "range_10pct,projection,aggregate_stats,full_scan,spill_group "
             "(default: no_match,point,range_1pct,range_10pct,projection)"
         ),
     )
@@ -198,6 +216,31 @@ def build_parser() -> argparse.ArgumentParser:
             "fraction of unique projected bytes, e.g. 0.99"
         ),
     )
+    parser.add_argument(
+        "--container-image",
+        metavar="IMAGE",
+        help=(
+            "run every parity/timing series in a fresh 4-CPU/4-GiB/no-swap "
+            "container; prefer an immutable image@sha256 digest"
+        ),
+    )
+    parser.add_argument(
+        "--container-artifact-root",
+        type=Path,
+        help=(
+            "directory for per-container request/response/inspect/telemetry "
+            "artifacts (default: BENCHMARK_ROOT/container-attempts)"
+        ),
+    )
+    parser.add_argument(
+        "--cpuset-cpus",
+        default="0-3",
+        metavar="CPUSET",
+        help=(
+            "exact four-CPU set for container workers (default: 0-3); both "
+            "Docker inspect and cgroup effective affinity are verified"
+        ),
+    )
     return parser
 
 
@@ -207,6 +250,8 @@ def selected_tiers(args: argparse.Namespace) -> list[str]:
         raw.append("kb")
     if args.mb:
         raw.append("mb")
+    if args.hundred_mib:
+        raw.append("100mib")
     if args.one_gib:
         raw.append("1gib")
     if args.ten_gib:
@@ -280,6 +325,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("--source-repeat must be positive")
         if args.threads is not None and args.threads <= 0:
             raise ValueError("--threads must be positive")
+        if args.container_image and args.threads not in (None, CONTAINER_CPUS):
+            raise ValueError(
+                f"container mode requires --threads {CONTAINER_CPUS}"
+            )
+        if args.container_artifact_root is not None and not args.container_image:
+            raise ValueError(
+                "--container-artifact-root requires --container-image"
+            )
         if args.min_cold_read_fraction is not None:
             if not 0 < args.min_cold_read_fraction <= 1:
                 raise ValueError("--min-cold-read-fraction must be in (0, 1]")
@@ -299,6 +352,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     corpus_root = (args.corpus_root or root / "corpora").expanduser().resolve()
     cache_root = (args.cache_root or root / "shared-cache").expanduser().resolve()
     home_root = (args.home_root or root / "worker-home").expanduser().resolve()
+    effective_threads = CONTAINER_CPUS if args.container_image else args.threads
+    effective_memory_limit = (
+        memory_limit_bytes
+        if memory_limit_bytes is not None
+        else (DEFAULT_ENGINE_MEMORY_BYTES if args.container_image else None)
+    )
+    worker_runner = None
+    container_artifact_root = None
+    if args.container_image:
+        container_artifact_root = (
+            args.container_artifact_root or root / "container-attempts"
+        ).expanduser().resolve()
+        try:
+            worker_runner = DockerWorkerRunner(
+                ContainerRunnerConfig(
+                    repo_root=Path(__file__).resolve().parents[3],
+                    corpus_root=corpus_root,
+                    artifact_root=container_artifact_root,
+                    image=args.container_image,
+                    cpuset_cpus=args.cpuset_cpus,
+                    engine_memory_bytes=effective_memory_limit,
+                )
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
 
     manifests = []
     for tier in tiers:
@@ -331,20 +409,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         workloads=tuple(workloads),
         cold_mode=args.cold_mode,
         timeout_seconds=args.worker_timeout,
-        memory_limit_bytes=memory_limit_bytes,
+        memory_limit_bytes=effective_memory_limit,
         minimum_cold_read_fraction=args.min_cold_read_fraction,
         source_repeat=args.source_repeat,
-        threads=args.threads,
+        threads=effective_threads,
         disable_caches=args.disable_caches,
     )
     comparisons = []
     for manifest in manifests:
-        comparison = compare_manifest(
-            manifest,
-            cache_root=cache_root,
-            home_root=home_root,
-            config=comparison_config,
-        )
+        compare_arguments = {
+            "cache_root": cache_root,
+            "home_root": home_root,
+            "config": comparison_config,
+        }
+        if worker_runner is not None:
+            compare_arguments["worker_runner"] = worker_runner
+        comparison = compare_manifest(manifest, **compare_arguments)
         comparisons.append(comparison)
         _print_comparison(comparison)
 
@@ -364,13 +444,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             "payload_width": args.payload_width,
             "row_group_target_bytes": row_group_bytes,
             "shard_target_bytes": shard_bytes,
-            "memory_limit_bytes": memory_limit_bytes,
+            "memory_limit_bytes": effective_memory_limit,
             "minimum_cold_read_fraction": args.min_cold_read_fraction,
             "source_repeat": args.source_repeat,
-            "threads": args.threads,
+            "threads": effective_threads,
             "disable_caches": args.disable_caches,
             "corpus_root": str(corpus_root),
             "cache_root": str(cache_root),
+            "container": (
+                {
+                    "enabled": True,
+                    "image": args.container_image,
+                    "artifact_root": str(container_artifact_root),
+                    "cpus": CONTAINER_CPUS,
+                    "cpuset_cpus": args.cpuset_cpus,
+                    "memory_bytes": CONTAINER_MEMORY_BYTES,
+                    "swap_bytes": 0,
+                }
+                if args.container_image
+                else {"enabled": False}
+            ),
         },
     )
     destination = write_artifact(output, artifact)

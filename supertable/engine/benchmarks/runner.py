@@ -251,6 +251,68 @@ def assert_exact_parity(
     return digest
 
 
+def assert_independent_oracle(
+    engine_results: Mapping[str, Mapping[str, Any]],
+    plan: Mapping[str, Any],
+    *,
+    label: str,
+) -> dict[str, Any] | None:
+    """Validate every engine against a deterministic non-engine oracle.
+
+    Cross-engine agreement alone cannot identify a shared or oracle-engine
+    error.  Workloads backed by a generator proof carry their expected scalar
+    row in the plan; this gate names every engine that disagrees and still runs
+    before any timing series starts.
+    """
+    oracle = plan.get("independent_oracle")
+    if oracle is None:
+        return None
+    if not isinstance(oracle, Mapping):
+        raise BenchmarkParityError(f"invalid independent oracle for {label}")
+    kind = str(oracle.get("kind") or "")
+    if kind != "generated_metric_formula_v1":
+        raise BenchmarkParityError(
+            f"unsupported independent oracle {kind!r} for {label}"
+        )
+    columns = [str(value) for value in (oracle.get("columns") or [])]
+    dtypes = [str(value) for value in (oracle.get("dtypes") or [])]
+    row = list(oracle.get("row") or [])
+    if not columns or len(columns) != len(dtypes) or len(columns) != len(row):
+        raise BenchmarkParityError(f"malformed independent oracle for {label}")
+    expected = {
+        "columns": columns,
+        "dtypes": dtypes,
+        "rows": [[_json_value(value) for value in row]],
+    }
+    expected_digest = result_digest(expected)
+    mismatched = [
+        engine_name
+        for engine_name, result in engine_results.items()
+        if result.get("result") != expected
+        or result.get("result_digest") != expected_digest
+    ]
+    if mismatched:
+        observed = {
+            engine_name: result.get("result")
+            for engine_name, result in engine_results.items()
+            if engine_name in mismatched
+        }
+        raise BenchmarkParityError(
+            f"independent generator oracle mismatch for {label}; "
+            f"wrong_engines={','.join(sorted(mismatched))}; "
+            f"expected={json.dumps(expected, sort_keys=True)[:1000]}; "
+            f"observed={json.dumps(observed, sort_keys=True)[:1000]}"
+        )
+    return {
+        "checked": True,
+        "kind": kind,
+        "formula": str(oracle.get("formula") or ""),
+        "average_method": str(oracle.get("average_method") or ""),
+        "matched_engines": sorted(engine_results),
+        "expected_result_digest": expected_digest,
+    }
+
+
 def _resolve_engine(engine_name: str):
     from supertable.engine.engine_enum import Engine
 
@@ -660,6 +722,72 @@ def _drop_os_cache_best_effort(files: Sequence[str]) -> dict[str, Any]:
     }
 
 
+def _postprocess_generated_metric_stats(frame, plan: Mapping[str, Any]):
+    """Build COUNT/SUM-derived exact AVG/null-count benchmark output.
+
+    IslandDB intentionally does not admit native AVG because generic floating
+    reductions can depend on scan order. This corpus has a sealed non-null
+    integer metric and an oracle-proven sum below 2**53, so one exact integer
+    conversion followed by one binary64 division is deterministic in both
+    workers. Primitive engine reductions remain independently checked.
+    """
+    if plan.get("result_postprocess") != "generated_metric_formula_v1":
+        return frame
+    import pandas as pd
+
+    expected_columns = [
+        "row_count",
+        "metric_non_null_count",
+        "metric_sum",
+        "metric_min",
+        "metric_max",
+    ]
+    if list(frame.columns) != expected_columns or len(frame.index) != 1:
+        raise RuntimeError(
+            "aggregate_stats engine result has an unexpected scalar shape"
+        )
+
+    def exact_integer(column: str) -> int:
+        value = frame.iloc[0][column]
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError(
+                f"aggregate_stats {column} is not a finite integer"
+            ) from exc
+        try:
+            matches = bool(value == parsed)
+        except Exception:
+            matches = False
+        if not matches:
+            raise RuntimeError(f"aggregate_stats {column} lost integer precision")
+        return parsed
+
+    row_count = exact_integer("row_count")
+    non_null_count = exact_integer("metric_non_null_count")
+    metric_sum = exact_integer("metric_sum")
+    metric_min = exact_integer("metric_min")
+    metric_max = exact_integer("metric_max")
+    if row_count <= 0 or not 0 < non_null_count <= row_count:
+        raise RuntimeError("aggregate_stats returned invalid metric cardinalities")
+    if abs(metric_sum) > 2**53:
+        raise RuntimeError("aggregate_stats sum exceeds exact binary64 range")
+
+    return pd.DataFrame({
+        "row_count": pd.Series([row_count], dtype="int64"),
+        "metric_non_null_count": pd.Series([non_null_count], dtype="int64"),
+        "metric_null_count": pd.Series(
+            [row_count - non_null_count], dtype="int64"
+        ),
+        "metric_sum": pd.Series([metric_sum], dtype="int64"),
+        "metric_avg": pd.Series(
+            [metric_sum / non_null_count], dtype="float64"
+        ),
+        "metric_min": pd.Series([metric_min], dtype="int64"),
+        "metric_max": pd.Series([metric_max], dtype="int64"),
+    })
+
+
 def _execute_one(executor, engine, plan: Mapping[str, Any], sample_index: int) -> dict[str, Any]:
     import pyarrow as pa
 
@@ -721,6 +849,7 @@ def _execute_one(executor, engine, plan: Mapping[str, Any], sample_index: int) -
                 log_prefix="[islanddb.benchmark] ",
             )
             result_mode = "pandas"
+        frame = _postprocess_generated_metric_stats(frame, plan)
     wall_seconds = time.perf_counter() - wall_start
     cpu_seconds = time.process_time() - cpu_start
     process_io_after = _proc_io_counters()
@@ -1091,21 +1220,111 @@ def _percentile(values: Sequence[float], percentile: float) -> float | None:
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
 
 
+def _distribution(values: Sequence[float]) -> dict[str, float | int | None]:
+    numeric = [float(value) for value in values]
+    if not numeric:
+        return {
+            "samples": 0,
+            "min": None,
+            "mean": None,
+            "median": None,
+            "max": None,
+            "p95": None,
+            "stddev": None,
+            "cv": None,
+        }
+    mean = statistics.fmean(numeric)
+    stddev = statistics.pstdev(numeric)
+    return {
+        "samples": len(numeric),
+        "min": min(numeric),
+        "mean": mean,
+        "median": statistics.median(numeric),
+        "max": max(numeric),
+        "p95": _percentile(numeric, 0.95),
+        # Samples are the complete measured series, so report population
+        # standard deviation rather than estimating an unseen population.
+        "stddev": stddev,
+        "cv": stddev / mean if mean != 0 else None,
+    }
+
+
+def _add_flat_distribution(
+    result: dict[str, Any],
+    prefix: str,
+    values: Sequence[float],
+) -> None:
+    distribution = _distribution(values)
+    for name in ("min", "mean", "median", "max", "p95", "stddev", "cv"):
+        result[f"{prefix}_{name}"] = distribution[name]
+
+
 def summarize_series(series: Mapping[str, Any]) -> dict[str, Any]:
     samples = list(series.get("samples") or [])
     cold = next((sample for sample in samples if sample.get("temperature") == "cold"), None)
     warm = [sample for sample in samples if sample.get("temperature") == "warm"]
-    values = [float(sample["wall_seconds"]) for sample in warm]
-    return {
+    wall_values = [float(sample["wall_seconds"]) for sample in warm]
+    cpu_values = [
+        float(sample["cpu_seconds"])
+        for sample in warm
+        if sample.get("cpu_seconds") is not None
+    ]
+    mean_core_values = [
+        float(sample["cpu_seconds"]) / float(sample["wall_seconds"])
+        for sample in warm
+        if sample.get("cpu_seconds") is not None
+        and float(sample.get("wall_seconds") or 0.0) > 0.0
+    ]
+    rss_peak_values = [
+        float(sample["rss_peak_bytes"])
+        for sample in warm
+        if sample.get("rss_peak_bytes") is not None
+    ]
+    rss_delta_values = [
+        float(sample["rss_peak_delta_bytes"])
+        for sample in warm
+        if sample.get("rss_peak_delta_bytes") is not None
+    ]
+    process_io_keys = sorted({
+        str(key)
+        for sample in warm
+        if isinstance(sample.get("process_io_delta"), Mapping)
+        for key in sample["process_io_delta"]
+    })
+    process_io_summary = {
+        key: _distribution([
+            float(sample["process_io_delta"][key])
+            for sample in warm
+            if isinstance(sample.get("process_io_delta"), Mapping)
+            and sample["process_io_delta"].get(key) is not None
+        ])
+        for key in process_io_keys
+    }
+    result: dict[str, Any] = {
         "cold_wall_seconds": cold.get("wall_seconds") if cold else None,
-        "warm_samples": len(values),
-        "warm_wall_seconds_min": min(values) if values else None,
-        "warm_wall_seconds_median": statistics.median(values) if values else None,
-        "warm_wall_seconds_p25": _percentile(values, 0.25),
-        "warm_wall_seconds_p75": _percentile(values, 0.75),
-        "warm_wall_seconds_p95": _percentile(values, 0.95),
+        "cold_cpu_seconds": cold.get("cpu_seconds") if cold else None,
+        "cold_mean_cpu_cores": (
+            float(cold["cpu_seconds"]) / float(cold["wall_seconds"])
+            if cold
+            and cold.get("cpu_seconds") is not None
+            and float(cold.get("wall_seconds") or 0.0) > 0.0
+            else None
+        ),
+        "cold_rss_peak_bytes": cold.get("rss_peak_bytes") if cold else None,
+        "cold_rss_peak_delta_bytes": (
+            cold.get("rss_peak_delta_bytes") if cold else None
+        ),
+        "cold_process_io_delta": cold.get("process_io_delta") if cold else None,
+        "warm_samples": len(wall_values),
+        "warm_wall_seconds_p25": _percentile(wall_values, 0.25),
+        "warm_wall_seconds_p75": _percentile(wall_values, 0.75),
+        "warm_process_io_delta_summary": process_io_summary,
         "max_rss_peak_bytes": max(
-            (int(sample["rss_peak_bytes"]) for sample in samples if sample.get("rss_peak_bytes") is not None),
+            (
+                int(sample["rss_peak_bytes"])
+                for sample in samples
+                if sample.get("rss_peak_bytes") is not None
+            ),
             default=None,
         ),
         "max_rss_peak_delta_bytes": max(
@@ -1117,6 +1336,12 @@ def summarize_series(series: Mapping[str, Any]) -> dict[str, Any]:
             default=None,
         ),
     }
+    _add_flat_distribution(result, "warm_wall_seconds", wall_values)
+    _add_flat_distribution(result, "warm_cpu_seconds", cpu_values)
+    _add_flat_distribution(result, "warm_mean_cpu_cores", mean_core_values)
+    _add_flat_distribution(result, "warm_rss_peak_bytes", rss_peak_values)
+    _add_flat_distribution(result, "warm_rss_peak_delta_bytes", rss_delta_values)
+    return result
 
 
 WorkerRunner = Callable[..., dict[str, Any]]
@@ -1228,6 +1453,11 @@ def compare_manifest(
                 home_dir=home_base / run_id / "parity" / engine_name / name,
                 timeout_seconds=config.timeout_seconds,
             )
+        independent_oracle = assert_independent_oracle(
+            parity_results,
+            plan,
+            label=label,
+        )
         digest = assert_exact_parity(
             parity_results[ENGINE_DUCKDB],
             parity_results[ENGINE_ISLAND],
@@ -1301,6 +1531,7 @@ def compare_manifest(
                         "row_groups_pushdown_eligible",
                         "required_columns",
                         "island_streaming_result",
+                        "independent_oracle",
                     )
                 },
                 "parity": {
@@ -1308,6 +1539,7 @@ def compare_manifest(
                     "oracle": ENGINE_DUCKDB,
                     "result_digest": digest,
                     "checked_before_timing": True,
+                    "independent_oracle": independent_oracle,
                 },
                 "timing_order": order,
                 "engines": series,

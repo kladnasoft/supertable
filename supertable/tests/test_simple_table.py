@@ -316,6 +316,41 @@ class TestSimpleTableInit:
         assert obj.snapshot_dir == "my_org/my_sup/tables/my_tbl/snapshots"
         assert obj.identity == "tables"
 
+    @patch(_P_REDIS_CAT)
+    def test_writer_pinned_leaf_reuses_catalog_without_lifecycle_rereads(
+            self, MockCat,
+    ):
+        from supertable.simple_table import SimpleTable
+
+        pinned_catalog = MagicMock()
+        st = _mock_super("org", "sup")
+        obj = SimpleTable(
+            st,
+            "events",
+            create_if_missing=False,
+            catalog=pinned_catalog,
+            _live_leaf_verified=True,
+        )
+
+        MockCat.assert_not_called()
+        pinned_catalog.check_deletion_intent_absent.assert_not_called()
+        pinned_catalog.leaf_exists.assert_not_called()
+        assert obj.catalog is pinned_catalog
+        assert obj.data_dir == "org/sup/tables/events/data"
+        assert obj.snapshot_dir == "org/sup/tables/events/snapshots"
+
+    def test_writer_pinned_leaf_cannot_be_used_for_creation(self):
+        from supertable.simple_table import SimpleTable
+
+        with pytest.raises(ValueError, match="create_if_missing=False"):
+            SimpleTable(
+                _mock_super(),
+                "events",
+                create_if_missing=True,
+                catalog=MagicMock(),
+                _live_leaf_verified=True,
+            )
+
 
 # ===========================================================================
 # 4. SimpleTable.init_simple_table

@@ -342,11 +342,11 @@ def configure_table(
     self,
     role_name: str,
     simple_name: str,
-    primary_keys: list,
-    dedup_on_read: bool = False,
     max_memory_chunk_size: int | None = None,
+    max_decoded_compaction_bytes: int | None = None,
     max_overlapping_files: int | None = None,
-    tombstone_compact_total: int | None = None,
+    max_tombstone_rows: int | None = None,
+    tombstone_compaction_workers: int | None = None,
 ) -> None
 ```
 
@@ -354,14 +354,16 @@ Persists table-level configuration in Redis via `catalog.set_table_config()`. Th
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `primary_keys` | (required) | Column names forming the logical primary key |
-| `dedup_on_read` | `False` | Enables ROW_NUMBER dedup on read and `__timestamp__` injection on write |
 | `max_memory_chunk_size` | 16 MB | Legacy name for the compressed source-byte packing/output target. Decoded memory is governed separately by `max_decoded_compaction_bytes`; one unusually wide row is its indivisible lower bound. Metadata is bounded to 4,096 Arrow batches/65,536 rows per storage emission and 128 Polars frames/1,048,576 rows per concat. |
-| `max_decoded_compaction_bytes` | 16 MB | Total decoded-memory budget apportioned across the coordinator and bounded encoder slots |
+| `max_decoded_compaction_bytes` | derived | Optional hard decoded-frame budget apportioned across the coordinator and bounded encoder slots. If unset, the writer derives a bounded budget from the encoded target (12× per retained lane), capped at 1 GiB and one quarter of the detected cgroup-v2/host-memory boundary; an unknown boundary uses a conservative 128 MiB cap. An explicit positive value remains authoritative. |
 | `max_overlapping_files` | 100 | File-count threshold that triggers compaction of small files |
-| `tombstone_compact_total` | 1000 | Maximum tombstone entries before physical compaction is triggered |
+| `max_tombstone_rows` | 1,000,000 | Maximum deletion-vector rows before physical compaction is triggered |
+| `tombstone_compaction_workers` | 2 | Bounded worker count for independent tombstone rewrites; valid range 1–8 |
 
-Configuration is cached locally in `_table_config_cache` so that subsequent `write()` calls avoid extra Redis round-trips.
+Configuration is persisted in Redis. A process-local copy is retained for
+observability, but every write refreshes the authoritative configuration after
+acquiring the table lease so cross-process changes cannot be hidden by stale
+cache state.
 
 ---
 

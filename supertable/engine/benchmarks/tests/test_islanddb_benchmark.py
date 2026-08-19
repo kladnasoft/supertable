@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ import pytest
 from supertable.engine.benchmarks.corpus import (
     CorpusSpec,
     build_workloads,
+    generated_metric_statistics,
     normalize_tiers,
     normalize_workloads,
     plan_workload,
@@ -29,11 +32,13 @@ from supertable.engine.benchmarks.runner import (
     _proc_io_counters,
     _validate_cold_physical_read,
     assert_exact_parity,
+    assert_independent_oracle,
     canonical_frame,
     compare_manifest,
     islanddb_available,
     result_digest,
     run_isolated_worker,
+    summarize_series,
 )
 
 
@@ -97,21 +102,81 @@ def _file_digest(path: Path) -> str:
 
 
 def test_tier_aliases_and_large_opt_in():
-    assert normalize_tiers(["KB,64MiB", "1GB", "10gib", "50GB"]) == [
+    assert normalize_tiers(
+        ["KB,64MiB", "100MB", "1GB", "10gib", "50GB"]
+    ) == [
         "kb",
         "mb",
+        "100mib",
         "1gib",
         "10gib",
         "50gib",
     ]
 
     parser = build_parser()
+    args = parser.parse_args(["--100mb"])
+    assert selected_tiers(args) == ["100mib"]
+    assert CorpusSpec.for_tier("100MB").target_bytes == 100 * 1024**2
+
     args = parser.parse_args(["--1gb"])
     with pytest.raises(ValueError, match="opt-in"):
         selected_tiers(args)
 
     args = parser.parse_args(["--1gb", "--10gb", "--50gb", "--allow-large"])
     assert selected_tiers(args) == ["1gib", "10gib", "50gib"]
+
+
+def test_generated_metric_statistics_matches_formula_and_repetition():
+    rows = 4_097
+    values = [
+        (row_id * 48_271 + 17) % 1_000_003
+        for row_id in range(rows)
+    ]
+    oracle = generated_metric_statistics(rows, source_repeat=3)
+
+    assert oracle["columns"] == [
+        "row_count",
+        "metric_non_null_count",
+        "metric_null_count",
+        "metric_sum",
+        "metric_avg",
+        "metric_min",
+        "metric_max",
+    ]
+    assert oracle["row"] == [
+        rows * 3,
+        rows * 3,
+        0,
+        sum(values) * 3,
+        sum(values) / rows,
+        min(values),
+        max(values),
+    ]
+
+    full_period = generated_metric_statistics(1_000_003)
+    assert full_period["row"][3] == 1_000_003 * 1_000_002 // 2
+    assert full_period["row"][-2:] == [0, 1_000_002]
+
+    with pytest.raises(ValueError, match="total_rows"):
+        generated_metric_statistics(0)
+    with pytest.raises(ValueError, match="source_repeat"):
+        generated_metric_statistics(1, source_repeat=0)
+
+
+def test_aggregate_stats_plan_has_independent_generator_oracle(tiny_manifest):
+    workload = build_workloads(tiny_manifest["total_rows"])["aggregate_stats"]
+    plan = plan_workload(tiny_manifest, workload)
+
+    assert normalize_workloads(["aggregate_stats"]) == ["aggregate_stats"]
+    assert plan["required_columns"] == ["metric"]
+    assert "COUNT(*) AS row_count" in plan["sql"]
+    assert "SUM(metric) AS metric_sum" in plan["sql"]
+    assert "MIN(metric) AS metric_min" in plan["sql"]
+    assert "MAX(metric) AS metric_max" in plan["sql"]
+    assert plan["result_postprocess"] == "generated_metric_formula_v1"
+    assert plan["independent_oracle"] == generated_metric_statistics(
+        tiny_manifest["total_rows"]
+    )
 
 
 def test_full_scan_projects_every_public_column(tiny_manifest):
@@ -427,6 +492,110 @@ def test_exact_parity_includes_dtype_and_value():
         assert_exact_parity(duck_result, wrong_result, label="smoke")
 
 
+def test_independent_oracle_rejects_two_engines_agreeing_on_wrong_result():
+    pd = pytest.importorskip("pandas")
+    oracle = generated_metric_statistics(37)
+    frame = pd.DataFrame({
+        column: pd.Series([value], dtype=dtype)
+        for column, dtype, value in zip(
+            oracle["columns"], oracle["dtypes"], oracle["row"], strict=True,
+        )
+    })
+    correct = canonical_frame(frame)
+    wrong = copy.deepcopy(correct)
+    wrong["rows"][0][3] += 1
+    agreed_wrong = {
+        "result": wrong,
+        "result_digest": result_digest(wrong),
+    }
+
+    with pytest.raises(
+        BenchmarkParityError,
+        match=r"wrong_engines=duckdb,islanddb",
+    ):
+        assert_independent_oracle(
+            {"duckdb": agreed_wrong, "islanddb": agreed_wrong},
+            {"independent_oracle": oracle},
+            label="smoke/aggregate_stats",
+        )
+
+    correct_result = {
+        "result": correct,
+        "result_digest": result_digest(correct),
+    }
+    evidence = assert_independent_oracle(
+        {"duckdb": correct_result, "islanddb": correct_result},
+        {"independent_oracle": oracle},
+        label="smoke/aggregate_stats",
+    )
+    assert evidence is not None
+    assert evidence["matched_engines"] == ["duckdb", "islanddb"]
+    assert evidence["expected_result_digest"] == result_digest(correct)
+
+
+def test_summarize_series_reports_warm_resource_distributions():
+    series = {
+        "samples": [
+            {
+                "temperature": "cold",
+                "wall_seconds": 4.0,
+                "cpu_seconds": 2.0,
+                "rss_peak_bytes": 90,
+                "rss_peak_delta_bytes": 9,
+                "process_io_delta": {"read_bytes": 50},
+            },
+            {
+                "temperature": "warm",
+                "wall_seconds": 1.0,
+                "cpu_seconds": 0.5,
+                "rss_peak_bytes": 100,
+                "rss_peak_delta_bytes": 10,
+                "process_io_delta": {"read_bytes": 100, "write_bytes": 5},
+            },
+            {
+                "temperature": "warm",
+                "wall_seconds": 2.0,
+                "cpu_seconds": 2.0,
+                "rss_peak_bytes": 120,
+                "rss_peak_delta_bytes": 20,
+                "process_io_delta": {"read_bytes": 200},
+            },
+            {
+                "temperature": "warm",
+                "wall_seconds": 3.0,
+                "cpu_seconds": 4.5,
+                "rss_peak_bytes": 140,
+                "rss_peak_delta_bytes": 30,
+                "process_io_delta": {"read_bytes": 400, "write_bytes": 15},
+            },
+        ]
+    }
+
+    summary = summarize_series(series)
+
+    assert summary["cold_cpu_seconds"] == 2.0
+    assert summary["cold_mean_cpu_cores"] == 0.5
+    assert summary["warm_samples"] == 3
+    assert summary["warm_wall_seconds_min"] == 1.0
+    assert summary["warm_wall_seconds_mean"] == 2.0
+    assert summary["warm_wall_seconds_median"] == 2.0
+    assert summary["warm_wall_seconds_max"] == 3.0
+    assert summary["warm_wall_seconds_p95"] == pytest.approx(2.9)
+    assert summary["warm_wall_seconds_stddev"] == pytest.approx(math.sqrt(2 / 3))
+    assert summary["warm_wall_seconds_cv"] == pytest.approx(math.sqrt(2 / 3) / 2)
+    assert summary["warm_cpu_seconds_mean"] == pytest.approx(7 / 3)
+    assert summary["warm_mean_cpu_cores_mean"] == 1.0
+    assert summary["warm_rss_peak_bytes_mean"] == 120.0
+    assert summary["warm_rss_peak_delta_bytes_max"] == 30.0
+    read_io = summary["warm_process_io_delta_summary"]["read_bytes"]
+    assert read_io["samples"] == 3
+    assert read_io["mean"] == pytest.approx(700 / 3)
+    write_io = summary["warm_process_io_delta_summary"]["write_bytes"]
+    assert write_io["samples"] == 2
+    assert write_io["min"] == 5.0
+    assert write_io["max"] == 15.0
+
+
 def test_compare_stops_before_timing_on_parity_failure(tiny_manifest, tmp_path):
     calls = []
 
@@ -446,6 +615,47 @@ def test_compare_stops_before_timing_on_parity_failure(tiny_manifest, tmp_path):
             cache_root=tmp_path / "cache",
             home_root=tmp_path / "home",
             config=ComparisonConfig(warm_repeats=1, workloads=("point",)),
+            worker_runner=fake_worker,
+        )
+    assert calls == [("parity", "duckdb"), ("parity", "islanddb")]
+
+
+def test_compare_stops_when_both_engines_agree_against_independent_oracle(
+    tiny_manifest,
+    tmp_path,
+):
+    pd = pytest.importorskip("pandas")
+    calls = []
+
+    def fake_worker(request, **kwargs):
+        calls.append((request["purpose"], request["engine"]))
+        oracle = request["plan"]["independent_oracle"]
+        frame = pd.DataFrame({
+            column: pd.Series([value], dtype=dtype)
+            for column, dtype, value in zip(
+                oracle["columns"], oracle["dtypes"], oracle["row"], strict=True,
+            )
+        })
+        canonical = canonical_frame(frame)
+        canonical["rows"][0][3] += 1
+        return {
+            "result": canonical,
+            "result_digest": result_digest(canonical),
+            "samples": [],
+        }
+
+    with pytest.raises(
+        BenchmarkParityError,
+        match=r"wrong_engines=duckdb,islanddb",
+    ):
+        compare_manifest(
+            tiny_manifest,
+            cache_root=tmp_path / "cache",
+            home_root=tmp_path / "home",
+            config=ComparisonConfig(
+                warm_repeats=1,
+                workloads=("aggregate_stats",),
+            ),
             worker_runner=fake_worker,
         )
     assert calls == [("parity", "duckdb"), ("parity", "islanddb")]
@@ -496,7 +706,11 @@ def test_explicit_duckdb_production_worker_reports_cold_and_warm(tiny_manifest, 
     assert [sample["temperature"] for sample in result["samples"]] == ["cold", "warm"]
     assert all(sample["result_digest"] == result["result_digest"] for sample in result["samples"])
     assert result["samples"][0]["wall_seconds"] > 0
-    assert "total_bytes_read" in result["samples"][0]["engine_profile"]
+    profile = result["samples"][0]["engine_profile"]
+    # Production hardening may suppress raw DuckDB profiles because physical
+    # filenames can contain bearer URLs. Retain metrics when safely emitted,
+    # while process/cgroup telemetry remains mandatory either way.
+    assert not profile or "total_bytes_read" in profile
 
 
 @pytest.mark.skipif(not islanddb_available(), reason="Engine.ISLANDDB is not implemented")
@@ -523,6 +737,50 @@ def test_explicit_islanddb_matches_duckdb_in_production_workers(tiny_manifest, t
     island = run("islanddb")
     assert assert_exact_parity(duck, island, label="production-smoke") == duck["result_digest"]
     assert island["samples"][0]["engine"] == "islanddb"
+
+
+@pytest.mark.skipif(not islanddb_available(), reason="Engine.ISLANDDB is not implemented")
+def test_aggregate_stats_matches_both_engines_and_independent_oracle(
+    tiny_manifest,
+    tmp_path,
+):
+    plan = plan_workload(
+        tiny_manifest,
+        build_workloads(
+            tiny_manifest["total_rows"], payload_columns=2,
+        )["aggregate_stats"],
+    )
+
+    def run(engine: str):
+        return run_isolated_worker(
+            {
+                "purpose": "aggregate-stats-smoke-parity",
+                "engine": engine,
+                "plan": plan,
+                "warm_repeats": 0,
+                "cold_mode": "process",
+                "memory_limit_bytes": 256 * 1024**2,
+                "threads": 2,
+                "disable_caches": True,
+            },
+            cache_dir=tmp_path / "shared-cache" / engine,
+            home_dir=tmp_path / "home" / engine,
+            timeout_seconds=120,
+        )
+
+    results = {engine: run(engine) for engine in ("duckdb", "islanddb")}
+    evidence = assert_independent_oracle(
+        results,
+        plan,
+        label="smoke/aggregate_stats",
+    )
+    assert evidence is not None
+    digest = assert_exact_parity(
+        results["duckdb"],
+        results["islanddb"],
+        label="smoke/aggregate_stats",
+    )
+    assert digest == evidence["expected_result_digest"]
 
 
 @pytest.mark.skipif(not islanddb_available(), reason="Engine.ISLANDDB is not implemented")

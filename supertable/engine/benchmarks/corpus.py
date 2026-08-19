@@ -38,6 +38,7 @@ SUPER_NAME = "island_benchmark"
 TIER_TARGET_BYTES: dict[str, int] = {
     "kb": 512 * KIB,
     "mb": 64 * MIB,
+    "100mib": 100 * MIB,
     "1gib": GIB,
     "10gib": 10 * GIB,
     "50gib": 50 * GIB,
@@ -52,6 +53,9 @@ _TIER_ALIASES = {
     "mib": "mb",
     "64mb": "mb",
     "64mib": "mb",
+    "100m": "100mib",
+    "100mb": "100mib",
+    "100mib": "100mib",
     "1gb": "1gib",
     "1g": "1gib",
     "1gib": "1gib",
@@ -74,6 +78,98 @@ SYSTEM_COLUMN_TYPES: dict[str, str] = {
     "__rowid__": "Int64",
     "__timestamp__": "Datetime(time_unit='us', time_zone=None)",
 }
+
+_METRIC_MULTIPLIER = 48_271
+_METRIC_OFFSET = 17
+_METRIC_MODULUS = 1_000_003
+
+
+def generated_metric_statistics(
+    total_rows: int,
+    *,
+    source_repeat: int = 1,
+) -> dict[str, Any]:
+    """Return an engine-independent oracle for the generated metric column.
+
+    The generator emits a permutation of every integer in
+    ``[0, _METRIC_MODULUS)`` once per modulus-sized cycle.  Computing complete
+    cycles algebraically bounds the residual loop to fewer than 1,000,003
+    iterations even for the 50-GiB tier.  Repeated benchmark paths contain the
+    same immutable rows, so count and sum scale while min/max do not change.
+    """
+    if total_rows <= 0:
+        raise ValueError("total_rows must be positive")
+    if source_repeat <= 0:
+        raise ValueError("source_repeat must be positive")
+    if math.gcd(_METRIC_MULTIPLIER, _METRIC_MODULUS) != 1:
+        raise RuntimeError("generated metric sequence no longer has a full period")
+
+    complete_cycles, remainder = divmod(total_rows, _METRIC_MODULUS)
+    unique_sum = (
+        complete_cycles
+        * _METRIC_MODULUS
+        * (_METRIC_MODULUS - 1)
+        // 2
+    )
+    value = _METRIC_OFFSET % _METRIC_MODULUS
+    remainder_min: int | None = None
+    remainder_max: int | None = None
+    for _ in range(remainder):
+        unique_sum += value
+        remainder_min = value if remainder_min is None else min(remainder_min, value)
+        remainder_max = value if remainder_max is None else max(remainder_max, value)
+        value = (value + _METRIC_MULTIPLIER) % _METRIC_MODULUS
+
+    if complete_cycles:
+        metric_min = 0
+        metric_max = _METRIC_MODULUS - 1
+    else:
+        # total_rows is positive, so a zero-cycle input has a non-empty tail.
+        assert remainder_min is not None and remainder_max is not None
+        metric_min = remainder_min
+        metric_max = remainder_max
+
+    logical_rows = total_rows * source_repeat
+    logical_sum = unique_sum * source_repeat
+    if logical_sum > 2**53:
+        raise ValueError(
+            "generated metric sum exceeds the exact binary64 integer range; "
+            "reduce source_repeat before benchmarking metric_avg"
+        )
+    return {
+        "kind": "generated_metric_formula_v1",
+        "formula": "(id * 48271 + 17) % 1000003",
+        "average_method": "exact_integer_sum_then_binary64_division",
+        "source_rows": int(total_rows),
+        "source_repeat": int(source_repeat),
+        "columns": [
+            "row_count",
+            "metric_non_null_count",
+            "metric_null_count",
+            "metric_sum",
+            "metric_avg",
+            "metric_min",
+            "metric_max",
+        ],
+        "dtypes": [
+            "int64",
+            "int64",
+            "int64",
+            "int64",
+            "float64",
+            "int64",
+            "int64",
+        ],
+        "row": [
+            int(logical_rows),
+            int(logical_rows),
+            0,
+            int(logical_sum),
+            logical_sum / logical_rows,
+            int(metric_min),
+            int(metric_max),
+        ],
+    }
 
 
 def normalize_tier(value: str) -> str:
@@ -565,6 +661,7 @@ class Workload:
     # API even though the generated dimension's sealed domain is small enough
     # to collect. This keeps benchmark result handling independent of pandas.
     island_streaming_result: bool = False
+    independent_oracle_kind: str | None = None
 
 
 WORKLOAD_NAMES = (
@@ -574,6 +671,7 @@ WORKLOAD_NAMES = (
     "range_1pct_5cols",
     "range_10pct",
     "projection",
+    "aggregate_stats",
     "full_scan",
     "spill_group",
 )
@@ -662,6 +760,26 @@ def build_workloads(
             lower_id=None,
             upper_id=None,
             required_columns=("metric",),
+        ),
+        # This scalar result is checked against the corpus generator's closed
+        # arithmetic formula as well as against the other engine. IslandDB
+        # deliberately rejects order-sensitive native AVG and computed
+        # aggregate expressions. The benchmark therefore asks both engines for
+        # exact primitive reductions, then derives NULL count and average from
+        # their returned integer count/sum under a proven binary64-safe bound.
+        "aggregate_stats": Workload(
+            name="aggregate_stats",
+            sql=(
+                "SELECT COUNT(*) AS row_count, "
+                "COUNT(metric) AS metric_non_null_count, "
+                "SUM(metric) AS metric_sum, "
+                "MIN(metric) AS metric_min, MAX(metric) AS metric_max "
+                f"FROM {TABLE_NAME}"
+            ),
+            lower_id=None,
+            upper_id=None,
+            required_columns=("metric",),
+            independent_oracle_kind="generated_metric_formula_v1",
         ),
         # A direct MAX reduction consumes values from every public column in
         # both engines. COUNT is intentionally not used: DuckDB can answer it
@@ -884,11 +1002,18 @@ def plan_workload(
         manifest, workload.required_columns,
     )
     estimated_decoded_bytes = candidate_rows * decoded_row_width
+    independent_oracle = None
+    if workload.independent_oracle_kind == "generated_metric_formula_v1":
+        independent_oracle = generated_metric_statistics(
+            int(manifest["total_rows"]),
+            source_repeat=source_repeat,
+        )
     return {
         "name": workload.name,
         "sql": workload.sql,
         "required_columns": list(workload.required_columns),
         "island_streaming_result": bool(workload.island_streaming_result),
+        "result_postprocess": workload.independent_oracle_kind,
         "payload_width": int(manifest["spec"]["payload_width"]),
         "lower_id": workload.lower_id,
         "upper_id": workload.upper_id,
@@ -939,6 +1064,7 @@ def plan_workload(
                 "has_null": False,
             },
         },
+        "independent_oracle": independent_oracle,
         "schema": dict(manifest["schema"]),
         "super_name": str(manifest.get("super_name") or SUPER_NAME),
         "table": str(manifest.get("table") or TABLE_NAME),

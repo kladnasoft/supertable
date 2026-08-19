@@ -21,6 +21,8 @@ local files regardless of the ambient STORAGE_TYPE.
 from __future__ import annotations
 
 import dataclasses
+import os
+import threading
 from unittest.mock import patch
 
 import polars as pl
@@ -49,6 +51,13 @@ def _enable_write_probe(monkeypatch):
         st_processing, "settings",
         dataclasses.replace(settings, SUPERTABLE_DUCKDB_WRITE_PROBE=True),
     )
+
+
+@pytest.fixture(autouse=True)
+def _clear_local_integrity_cache():
+    st_processing._LOCAL_ROWID_INTEGRITY_CACHE.clear()
+    yield
+    st_processing._LOCAL_ROWID_INTEGRITY_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +339,11 @@ class TestProbeStrictEquivalence:
         monkeypatch.setattr(
             st_processing,
             "settings",
-            dataclasses.replace(settings, SUPERTABLE_DUCKDB_WRITE_PROBE=False),
+            dataclasses.replace(
+                settings,
+                SUPERTABLE_DUCKDB_WRITE_PROBE=False,
+                SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO=False,
+            ),
         )
         original_to_list = pl.Series.to_list
 
@@ -391,3 +404,160 @@ class TestProbeStrictEquivalence:
         filtered, pairs = resolve_overwrite_writes(incoming, {f}, ["key"], None)
         assert filtered.height == 1
         assert pairs == [(f[0], 1)]
+
+
+class TestLocalRowidIntegrityCache:
+    @staticmethod
+    def _probe(candidate, incoming, profiler, storage=None):
+        storage = storage or LocalStorage()
+        return st_processing._duckdb_probe_overlap_matches(
+            [(candidate[0], candidate[2])],
+            ["key"],
+            None,
+            incoming.select("key").unique(),
+            incoming_schema=dict(incoming.schema),
+            profiler=profiler,
+            storage=storage,
+        )
+
+    def test_unchanged_identity_skips_only_the_warm_integrity_scan(self, tmp_path):
+        candidate = _write(tmp_path, "warm.parquet", pl.DataFrame({
+            "__rowid__": [11, 12], "key": [7, 8],
+        }))
+        incoming = pl.DataFrame({"key": [7]})
+
+        cold = Profiler()
+        warm = Profiler()
+        assert self._probe(candidate, incoming, cold).height == 1
+        assert self._probe(candidate, incoming, warm).height == 1
+
+        cold_counts = cold.emit_counts()
+        warm_counts = warm.emit_counts()
+        assert cold_counts["probe_rowid_integrity_cache_misses"] == 1
+        assert cold_counts["probe_rowid_integrity_scanned_files"] == 1
+        assert cold_counts["io.duckdb_probe_rowid_integrity.n"] == 1
+        assert warm_counts["probe_rowid_integrity_cache_hits"] == 1
+        assert "probe_rowid_integrity_scanned_files" not in warm_counts
+        assert "io.duckdb_probe_rowid_integrity.n" not in warm_counts
+        # Schema and key projection are deliberately never cached.
+        assert warm_counts["io.duckdb_probe_schema.n"] == 1
+        assert warm_counts["io.duckdb_probe.n"] == 1
+
+    @pytest.mark.parametrize("replace_inode", [False, True])
+    def test_change_or_replacement_invalidates_identity(
+        self, tmp_path, replace_inode,
+    ):
+        candidate = _write(tmp_path, "changed.parquet", pl.DataFrame({
+            "__rowid__": [1], "key": [7],
+        }))
+        incoming = pl.DataFrame({"key": [7]})
+        assert self._probe(candidate, incoming, Profiler()).height == 1
+
+        replacement = tmp_path / ("replacement.parquet" if replace_inode else "changed.parquet")
+        pq.write_table(pl.DataFrame({
+            "__rowid__": [99, 100], "key": [7, 9],
+        }).to_arrow(), replacement)
+        if replace_inode:
+            os.replace(replacement, candidate[0])
+        changed = (candidate[0], True, os.stat(candidate[0]).st_size)
+        profiler = Profiler()
+        matched = self._probe(changed, incoming, profiler)
+
+        assert matched is not None
+        assert matched.get_column("__rowid__").to_list() == [99]
+        assert profiler.emit_counts()["probe_rowid_integrity_cache_misses"] == 1
+
+    def test_corrupt_replacement_is_rescanned_never_cached_and_falls_back(
+        self, tmp_path,
+    ):
+        candidate = _write(tmp_path, "corrupt.parquet", pl.DataFrame({
+            "__rowid__": [1, 2], "key": [7, 8],
+        }))
+        incoming = pl.DataFrame({"key": [7]})
+        assert self._probe(candidate, incoming, Profiler()).height == 1
+
+        replacement = tmp_path / "corrupt-replacement.parquet"
+        pq.write_table(pl.DataFrame({
+            "__rowid__": [5, 5], "key": [7, 8],
+        }).to_arrow(), replacement)
+        os.replace(replacement, candidate[0])
+        corrupt = (candidate[0], True, os.stat(candidate[0]).st_size)
+
+        for _attempt in range(2):
+            profiler = Profiler()
+            assert self._probe(corrupt, incoming, profiler) is None
+            assert profiler.emit_counts()["probe_rowid_integrity_cache_misses"] == 1
+        with pytest.raises(ValueError, match="duplicate rowids"):
+            resolve_overwrite_writes(
+                incoming, {corrupt}, ["key"], None, storage=LocalStorage(),
+            )
+
+    def test_lru_eviction_forces_a_rescan(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            st_processing, "_LOCAL_ROWID_INTEGRITY_CACHE_MAX_ENTRIES", 2,
+        )
+        incoming = pl.DataFrame({"key": [7]})
+        candidates = [
+            _write(tmp_path, f"evict-{index}.parquet", pl.DataFrame({
+                "__rowid__": [index + 1], "key": [7],
+            }))
+            for index in range(3)
+        ]
+        for candidate in candidates:
+            assert self._probe(candidate, incoming, Profiler()).height == 1
+
+        profiler = Profiler()
+        assert self._probe(candidates[0], incoming, profiler).height == 1
+        assert profiler.emit_counts()["probe_rowid_integrity_cache_misses"] == 1
+
+    def test_concurrent_cold_reservations_are_coalesced(self):
+        cache = st_processing._LocalRowidIntegrityCache()
+        identity = ("/immutable.parquet", 1, 2, 3, 4, 5)
+        owner_ready = threading.Event()
+        release_owner = threading.Event()
+        results = []
+
+        def owner():
+            owned, hits = cache.reserve([identity])
+            results.append((owned, hits))
+            owner_ready.set()
+            assert release_owner.wait(timeout=5)
+            cache.finish(owned, owned)
+
+        def waiter():
+            assert owner_ready.wait(timeout=5)
+            owned, hits = cache.reserve([identity])
+            results.append((owned, hits))
+
+        first = threading.Thread(target=owner)
+        second = threading.Thread(target=waiter)
+        first.start()
+        second.start()
+        assert owner_ready.wait(timeout=5)
+        release_owner.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive() and not second.is_alive()
+        assert sum(len(owned) for owned, _hits in results) == 1
+        assert sum(len(hits) for _owned, hits in results) == 1
+
+    def test_ambiguous_local_subclass_rescans_and_matches_exact_local(self, tmp_path):
+        class AmbiguousLocalStorage(LocalStorage):
+            pass
+
+        candidate = _write(tmp_path, "ambiguous.parquet", pl.DataFrame({
+            "__rowid__": [1, 2], "key": [7, 8],
+        }))
+        incoming = pl.DataFrame({"key": [7]})
+        expected = self._probe(candidate, incoming, Profiler(), LocalStorage())
+
+        for _attempt in range(2):
+            profiler = Profiler()
+            actual = self._probe(
+                candidate, incoming, profiler, AmbiguousLocalStorage(),
+            )
+            assert actual.rows() == expected.rows()
+            counts = profiler.emit_counts()
+            assert counts["io.duckdb_probe_rowid_integrity.n"] == 1
+            assert "probe_rowid_integrity_cache_hits" not in counts

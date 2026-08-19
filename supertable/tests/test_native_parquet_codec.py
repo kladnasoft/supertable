@@ -194,6 +194,124 @@ def test_exactly_64_utf8_bytes_remains_native_eligible():
     assert profiler.emit_counts().get("parquet_codec_polars") == 1
 
 
+def test_system_codec_uses_native_polars_for_long_object_keys_without_stats_scan():
+    """Stats/DV paths are payload, not footer-pruning metadata."""
+    profiler = Profiler()
+    frame = pl.DataFrame({
+        "__file__": ["org/super/tables/table/data/" + ("x" * 256)],
+        "__rowid__": pl.Series([1], dtype=pl.Int64),
+    })
+    uploaded = {}
+    storage = MagicMock()
+    storage.write_bytes.side_effect = (
+        lambda path, data: uploaded.update({path: data})
+    )
+
+    with (
+        patch.object(processing, "_get_storage", return_value=storage),
+        patch.object(
+            processing,
+            "_native_polars_parquet_eligibility",
+            side_effect=AssertionError("system file used data footer gate"),
+        ),
+    ):
+        size = processing._write_df_parquet(
+            frame,
+            "/table/tombstone/deleted.parquet",
+            compression_level=1,
+            profiler=profiler,
+        )
+
+    payload = uploaded["/table/tombstone/deleted.parquet"]
+    assert size == len(payload)
+    assert_frame_equal(pl.read_parquet(io.BytesIO(payload)), frame)
+    metadata = pq.read_metadata(io.BytesIO(payload))
+    assert all(
+        not metadata.row_group(group_index).column(column_index).is_stats_set
+        for group_index in range(metadata.num_row_groups)
+        for column_index in range(metadata.row_group(group_index).num_columns)
+    )
+    counts = profiler.emit_counts()
+    assert counts.get("parquet_codec_polars") == 1
+    assert counts.get("parquet_codec_pyarrow", 0) == 0
+    assert counts.get("write.parquet_codec_check.n", 0) == 0
+
+
+def test_system_native_encode_error_falls_back_before_upload():
+    profiler = Profiler()
+    frame = pl.DataFrame({
+        "file_path": ["x" * 128],
+        "row_group_id": pl.Series([0], dtype=pl.Int64),
+    })
+    uploaded = {}
+    storage = MagicMock()
+    storage.write_bytes.side_effect = (
+        lambda path, data: uploaded.update({path: data})
+    )
+
+    with (
+        patch.object(processing, "_get_storage", return_value=storage),
+        patch.object(
+            processing,
+            "_encode_system_parquet_polars",
+            side_effect=RuntimeError("unsupported native system dtype"),
+        ),
+    ):
+        processing._write_df_parquet(
+            frame,
+            "/table/stats/stats.parquet",
+            compression_level=1,
+            profiler=profiler,
+        )
+
+    assert_frame_equal(
+        pl.read_parquet(io.BytesIO(uploaded["/table/stats/stats.parquet"])),
+        frame,
+    )
+    counts = profiler.emit_counts()
+    assert counts.get("parquet_codec_polars_encode_error") == 1
+    assert counts.get("parquet_codec_pyarrow") == 1
+    assert counts.get("parquet_codec_pyarrow_encode_error") == 1
+    assert counts.get("parquet_codec_polars", 0) == 0
+
+
+def test_system_parquet_only_backend_does_not_build_throwaway_encoded_bytes():
+    class ParquetOnlyStorage:
+        def __init__(self):
+            self.table = None
+
+        def write_parquet(self, table, _path):
+            self.table = table
+
+        def size(self, _path):
+            return 123
+
+    storage = ParquetOnlyStorage()
+    profiler = Profiler()
+    frame = pl.DataFrame({"__file__": ["x" * 128], "__rowid__": [1]})
+    with (
+        patch.object(processing, "_get_storage", return_value=storage),
+        patch.object(
+            processing,
+            "_encode_system_parquet_pyarrow",
+            side_effect=AssertionError("system frame was encoded twice"),
+        ),
+    ):
+        size = processing._write_df_parquet(
+            frame,
+            "/table/tombstone/deleted.parquet",
+            compression_level=1,
+            profiler=profiler,
+        )
+
+    assert size == 123
+    assert storage.table is not None
+    assert_frame_equal(pl.from_arrow(storage.table), frame)
+    counts = profiler.emit_counts()
+    assert counts.get("parquet_codec_pyarrow") == 1
+    assert counts.get("parquet_codec_pyarrow_backend") == 1
+
+
 def test_native_encode_error_falls_back_before_upload():
     profiler = Profiler()
     frame = pl.DataFrame({"id": [1, 2], "value": ["a", "b"]})

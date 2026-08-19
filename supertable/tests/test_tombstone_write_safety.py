@@ -819,6 +819,58 @@ def test_deferred_tombstone_build_does_not_upload(monkeypatch):
     assert frame.rows() == [("f.parquet", 1)]
 
 
+def test_tombstone_successor_validates_once_and_hands_off_digest(monkeypatch):
+    previous = _dv([("old.parquet", 1)])
+    validations = 0
+    digests = 0
+    real_validate = processing.validate_tombstone_frame
+    real_digest = processing.tombstone_digest
+
+    def counted_validate(*args, **kwargs):
+        nonlocal validations
+        validations += 1
+        return real_validate(*args, **kwargs)
+
+    def counted_digest(*args, **kwargs):
+        nonlocal digests
+        digests += 1
+        return real_digest(*args, **kwargs)
+
+    monkeypatch.setattr(processing, "validate_tombstone_frame", counted_validate)
+    monkeypatch.setattr(processing, "tombstone_digest", counted_digest)
+    validation_out = {}
+    path, frame = processing.build_tombstone_file(
+        tombstone_dir="dv",
+        prev_tombstone_path="dv/previous.parquet",
+        new_pairs=[("new.parquet", 2)],
+        compression_level=1,
+        prev_df=previous,
+        persist=False,
+        prev_df_validated=True,
+        validation_out=validation_out,
+    )
+
+    assert path is None
+    assert validations == 1  # exact combined successor only; not previous again
+    assert digests == 1
+    assert validation_out["frame"] is frame
+    assert validation_out["digest"] == real_digest(frame, assume_valid=True)
+
+
+def test_validated_previous_flag_does_not_skip_successor_integrity(monkeypatch):
+    previous = _dv([("old.parquet", 1)])
+    with pytest.raises(ValueError, match="reuses a rowid"):
+        processing.build_tombstone_file(
+            tombstone_dir="dv",
+            prev_tombstone_path="dv/previous.parquet",
+            new_pairs=[("new.parquet", 1)],
+            compression_level=1,
+            prev_df=previous,
+            persist=False,
+            prev_df_validated=True,
+        )
+
+
 def test_incomplete_same_height_stats_cannot_hide_overwrite_candidate(
     tmp_path, monkeypatch,
 ):

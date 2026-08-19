@@ -5,12 +5,15 @@ import fnmatch
 import pyarrow as pa
 import pyarrow.parquet as pq
 import shutil
+import stat
 import tempfile
+import threading
 import time
 import hashlib
+from collections import OrderedDict
 from pathlib import Path
 
-from typing import Any, BinaryIO, Dict, List, Optional
+from typing import Any, BinaryIO, Dict, List, Optional, Sequence
 
 from supertable.storage.storage_interface import (
     ObjectIdentityMismatch,
@@ -19,6 +22,56 @@ from supertable.storage.storage_interface import (
     validate_range_request,
     write_all,
 )
+
+
+class _DirectoryHandle:
+    """An open directory identity that prevents inode reuse while cached."""
+
+    __slots__ = ("path", "fd", "device", "inode", "_closed")
+
+    def __init__(self, path: str, fd: int, stat_result: os.stat_result) -> None:
+        self.path = os.path.abspath(path)
+        self.fd = fd
+        self.device = int(stat_result.st_dev)
+        self.inode = int(stat_result.st_ino)
+        self._closed = False
+
+    @property
+    def identity(self) -> tuple[int, int]:
+        return self.device, self.inode
+
+    def matches_path(self) -> bool:
+        try:
+            current = os.stat(self.path)
+        except (FileNotFoundError, NotADirectoryError, OSError):
+            return False
+        return (
+            stat.S_ISDIR(current.st_mode)
+            and (int(current.st_dev), int(current.st_ino)) == self.identity
+        )
+
+    def close(self, _close_fd=os.close) -> None:
+        # Bind os.close at definition time: module globals may already be set
+        # to None when Python finalizes a process-global LocalStorage instance.
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        fd = getattr(self, "fd", None)
+        if fd is None:
+            return
+        try:
+            _close_fd(fd)
+        except (OSError, TypeError):
+            pass
+
+    def __del__(self) -> None:  # pragma: no cover - explicit paths close eagerly
+        try:
+            self.close()
+        except BaseException:
+            # Destructors must remain silent during partial interpreter
+            # teardown, including if the object was only partly initialized.
+            pass
+
 
 class LocalStorage(StorageInterface):
     """
@@ -40,6 +93,18 @@ class LocalStorage(StorageInterface):
         # created ancestor that links it to this durable anchor.
         self._logical_durability_anchor = self._nearest_existing_directory(
             self.root,
+        )
+        # Logical writes commonly publish many objects below the same stable
+        # table hierarchy.  Once a complete directory chain has been fsynced,
+        # only the destination directory needs another fsync for the next
+        # atomic replace.  Open handles make the cached identities resistant
+        # to inode-number reuse after delete/recreate, while the lock makes a
+        # first publication and cache installation one per-instance action.
+        self._durability_lock = threading.RLock()
+        self._durable_directories: OrderedDict[str, _DirectoryHandle] = OrderedDict()
+        self._durable_directory_limit = 256
+        self._trusted_durability_anchors = self._open_existing_ancestor_chain(
+            self._logical_durability_anchor,
         )
 
     def _resolve_path(self, path: str | os.PathLike[str]) -> str:
@@ -161,8 +226,10 @@ class LocalStorage(StorageInterface):
             # Persist the rename before acknowledging success. This helper uses
             # O_DIRECTORY when available and propagates I/O failures; swallowing
             # them can publish a Redis pointer to a rename lost on host crash.
-            self._fsync_directory_chain(
-                directory, stop_directory=durability_anchor,
+            self._fsync_published_directory(
+                directory,
+                logical_input=logical_input,
+                stop_directory=durability_anchor,
             )
         finally:
             # if something failed before replace(), make sure temp is gone
@@ -288,8 +355,13 @@ class LocalStorage(StorageInterface):
             raise FileNotFoundError(f"File not found: {path}") from exc
         with source:
             before = self._metadata_from_open_file(source)
-            if expected is not None and before.identity_token() != expected.identity_token():
-                raise ObjectIdentityMismatch(f"Object changed before range read: {path}")
+            if (
+                expected is not None
+                and before.identity_token() != expected.identity_token()
+            ):
+                raise ObjectIdentityMismatch(
+                    f"Object changed before range read: {path}"
+                )
             if offset > before.size or length > before.size - offset:
                 raise ObjectIdentityMismatch(f"Object shrank before range read: {path}")
             if length == 0:
@@ -310,7 +382,9 @@ class LocalStorage(StorageInterface):
                 remaining -= len(chunk)
             after = self._metadata_from_open_file(source)
             if after.identity_token() != before.identity_token():
-                raise ObjectIdentityMismatch(f"Object changed during range read: {path}")
+                raise ObjectIdentityMismatch(
+                    f"Object changed during range read: {path}"
+                )
             return b"".join(chunks)
 
     def cache_namespace(self) -> Dict[str, str]:
@@ -379,6 +453,10 @@ class LocalStorage(StorageInterface):
             raise ValueError("Refusing to delete a filesystem root")
         if absolute_path == self.root:
             raise ValueError("Refusing to delete the configured storage root")
+        # Close and discard cached descendants before recursive removal. This
+        # is required on platforms where an open directory blocks deletion and
+        # also prevents a later recreation from inheriting stale cache state.
+        self._invalidate_durable_prefix(absolute_path)
         if os.path.isfile(path) or os.path.islink(path):
             os.remove(path)
         elif os.path.isdir(path):
@@ -408,9 +486,7 @@ class LocalStorage(StorageInterface):
         portable = path.replace("\\", "/")
         components = portable.split("/")
         significant = [component for component in components if component]
-        if ".." in significant or (
-            significant and significant[-1] == "."
-        ):
+        if ".." in significant or (significant and significant[-1] == "."):
             raise ValueError(
                 "Refusing to delete a path containing traversal or a final dot segment"
             )
@@ -429,10 +505,7 @@ class LocalStorage(StorageInterface):
         # the deletion can still be durably anchored instead of failing while
         # trying to open an already-removed immediate parent.
         surviving_parent = self._nearest_existing_directory(parent)
-        stop = (
-            self._logical_durability_anchor
-            if logical_input else surviving_parent
-        )
+        stop = self._logical_durability_anchor if logical_input else surviving_parent
         self._fsync_directory_chain(surviving_parent, stop_directory=stop)
 
     def delete_prefix(self, path: str) -> None:
@@ -521,8 +594,10 @@ class LocalStorage(StorageInterface):
             with open(tmp_path, "rb") as completed:
                 os.fsync(completed.fileno())
             os.replace(tmp_path, path)
-            self._fsync_directory_chain(
-                directory, stop_directory=durability_anchor,
+            self._fsync_published_directory(
+                directory,
+                logical_input=logical_input,
+                stop_directory=durability_anchor,
             )
         finally:
             try:
@@ -539,7 +614,8 @@ class LocalStorage(StorageInterface):
         try:
             proj = (
                 self._project_columns(pq.read_schema(path).names, columns)
-                if columns is not None else None
+                if columns is not None
+                else None
             )
             # partitioning=None: read only the file's own footer columns; never let
             # pyarrow infer Hive year/month/day from a ``year=YYYY/...`` path.  The
@@ -584,8 +660,10 @@ class LocalStorage(StorageInterface):
                 tmpf.flush()
                 os.fsync(tmpf.fileno())
             os.replace(tmp_path, path)
-            self._fsync_directory_chain(
-                directory, stop_directory=durability_anchor,
+            self._fsync_published_directory(
+                directory,
+                logical_input=logical_input,
+                stop_directory=durability_anchor,
             )
         finally:
             try:
@@ -595,7 +673,44 @@ class LocalStorage(StorageInterface):
                 pass
 
     @staticmethod
-    def _fsync_directory(directory: str) -> None:
+    def _open_directory(directory: str) -> _DirectoryHandle:
+        """Open one directory and retain its device/inode identity."""
+
+        absolute = os.path.abspath(directory)
+        directory_flag = getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(absolute, os.O_RDONLY | directory_flag)
+        try:
+            stat_result = os.fstat(fd)
+            if not stat.S_ISDIR(stat_result.st_mode):
+                raise NotADirectoryError(absolute)
+            return _DirectoryHandle(absolute, fd, stat_result)
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @classmethod
+    def _open_existing_ancestor_chain(
+        cls,
+        directory: str,
+    ) -> Dict[str, _DirectoryHandle]:
+        """Pin the pre-existing anchor and its ancestors for replacement checks."""
+
+        handles: Dict[str, _DirectoryHandle] = {}
+        current = os.path.abspath(directory)
+        try:
+            while True:
+                handles[current] = cls._open_directory(current)
+                parent = os.path.dirname(current)
+                if parent == current:
+                    return handles
+                current = parent
+        except BaseException:
+            for handle in handles.values():
+                handle.close()
+            raise
+
+    @classmethod
+    def _fsync_directory(cls, directory: str) -> _DirectoryHandle:
         """Persist a directory-entry update or raise.
 
         Storage publication must not acknowledge an object merely because
@@ -604,12 +719,13 @@ class LocalStorage(StorageInterface):
         catalog pointer reference an object whose rename was never durable.
         """
 
-        directory_flag = getattr(os, "O_DIRECTORY", 0)
-        dir_fd = os.open(directory, os.O_RDONLY | directory_flag)
+        handle = cls._open_directory(directory)
         try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+            os.fsync(handle.fd)
+            return handle
+        except BaseException:
+            handle.close()
+            raise
 
     @classmethod
     def _nearest_existing_directory(cls, directory: str) -> str:
@@ -625,14 +741,13 @@ class LocalStorage(StorageInterface):
             current = parent
         return current
 
-    @classmethod
-    def _fsync_directory_chain(
-        cls,
+    @staticmethod
+    def _directory_chain(
         directory: str,
         *,
         stop_directory: str,
-    ) -> None:
-        """Durably anchor a hierarchy, bounded by a known storage ancestor."""
+    ) -> tuple[str, ...]:
+        """Return ``directory`` through ``stop_directory``, both inclusive."""
 
         current = os.path.abspath(directory)
         stop = os.path.abspath(stop_directory)
@@ -642,14 +757,206 @@ class LocalStorage(StorageInterface):
             raise ValueError("directory durability anchor is on another drive") from exc
         if common != stop:
             raise ValueError("directory durability anchor is not an ancestor")
+        paths = []
         while True:
-            cls._fsync_directory(current)
+            paths.append(current)
             if current == stop:
-                break
+                return tuple(paths)
             parent = os.path.dirname(current)
             if parent == current:
                 raise ValueError("directory durability anchor was not reached")
             current = parent
+
+    @classmethod
+    def _fsync_directory_chain(
+        cls,
+        directory: str,
+        *,
+        stop_directory: str,
+        retain_handles: bool = False,
+    ) -> tuple[_DirectoryHandle, ...]:
+        """Durably anchor a hierarchy, bounded by a known storage ancestor."""
+
+        handles: list[_DirectoryHandle] = []
+        complete_identity_set = True
+        try:
+            for current in cls._directory_chain(
+                directory,
+                stop_directory=stop_directory,
+            ):
+                handle = cls._fsync_directory(current)
+                # A few legacy tests replace this helper with a recording stub
+                # that returns None. The sync contract is still exercised, but
+                # no identity may be cached from incomplete test doubles.
+                if isinstance(handle, _DirectoryHandle):
+                    handles.append(handle)
+                else:
+                    complete_identity_set = False
+        except BaseException:
+            for handle in handles:
+                handle.close()
+            raise
+        if retain_handles and complete_identity_set:
+            return tuple(handles)
+        for handle in handles:
+            handle.close()
+        return ()
+
+    @staticmethod
+    def _path_is_within(path: str, directory: str) -> bool:
+        try:
+            return os.path.commonpath((path, directory)) == directory
+        except ValueError:
+            return False
+
+    def _invalidate_durable_prefix_locked(self, directory: str) -> None:
+        prefix = os.path.abspath(directory)
+        stale = [
+            path
+            for path in self._durable_directories
+            if self._path_is_within(path, prefix)
+        ]
+        for path in stale:
+            self._durable_directories.pop(path).close()
+
+    def _invalidate_durable_prefix(self, directory: str) -> None:
+        with self._durability_lock:
+            self._invalidate_durable_prefix_locked(directory)
+
+    def _valid_durable_handle_locked(
+        self,
+        directory: str,
+    ) -> _DirectoryHandle | None:
+        path = os.path.abspath(directory)
+        cached = self._durable_directories.get(path)
+        if cached is not None:
+            if cached.matches_path():
+                self._durable_directories.move_to_end(path)
+                return cached
+            # If a cached ancestor changed identity, no descendant below that
+            # path may continue to claim a durable link to the old hierarchy.
+            self._invalidate_durable_prefix_locked(path)
+
+        trusted = self._trusted_durability_anchors.get(path)
+        if trusted is not None and trusted.matches_path():
+            return trusted
+        return None
+
+    def _deepest_durable_anchor_locked(self, directory: str) -> str | None:
+        """Find the closest directory whose complete ancestry is still pinned."""
+
+        paths = []
+        current = os.path.abspath(directory)
+        while True:
+            paths.append(current)
+            parent = os.path.dirname(current)
+            if parent == current:
+                break
+            current = parent
+
+        deepest = None
+        complete_suffix = True
+        for path in reversed(paths):
+            if complete_suffix and self._valid_durable_handle_locked(path) is not None:
+                deepest = path
+            else:
+                complete_suffix = False
+        return deepest
+
+    def _cache_durable_handles_locked(
+        self,
+        handles: Sequence[_DirectoryHandle],
+    ) -> None:
+        for handle in handles:
+            trusted = self._trusted_durability_anchors.get(handle.path)
+            if trusted is not None and trusted.identity == handle.identity:
+                handle.close()
+                continue
+            previous = self._durable_directories.pop(handle.path, None)
+            if previous is not None:
+                previous.close()
+            self._durable_directories[handle.path] = handle
+
+        while len(self._durable_directories) > self._durable_directory_limit:
+            _path, evicted = self._durable_directories.popitem(last=False)
+            evicted.close()
+
+    def _fsync_logical_publication(self, directory: str) -> None:
+        """Fsync one rename and anchor only ancestry not already durable."""
+
+        current = os.path.abspath(directory)
+        with self._durability_lock:
+            anchor = self._deepest_durable_anchor_locked(current)
+            if anchor is None:
+                raise OSError(
+                    f"no inode-validated durability anchor remains for {current!r}"
+                )
+
+            if anchor == current:
+                expected = self._valid_durable_handle_locked(current)
+                synced = self._fsync_directory(current)
+                if not isinstance(synced, _DirectoryHandle):
+                    return
+                try:
+                    if (
+                        expected is None
+                        or synced.identity != expected.identity
+                        or not synced.matches_path()
+                        or self._deepest_durable_anchor_locked(current) != current
+                    ):
+                        raise OSError(
+                            f"directory hierarchy changed during publication: {current}"
+                        )
+                finally:
+                    synced.close()
+                return
+
+            expected_anchor = self._valid_durable_handle_locked(anchor)
+            if expected_anchor is None:
+                raise OSError(f"durability anchor changed before publication: {anchor}")
+            handles = self._fsync_directory_chain(
+                current,
+                stop_directory=anchor,
+                retain_handles=True,
+            )
+            if not handles:
+                return
+            try:
+                if handles[-1].identity != expected_anchor.identity or any(
+                    not handle.matches_path() for handle in handles
+                ):
+                    raise OSError(
+                        f"directory hierarchy changed during publication: {current}"
+                    )
+                anchor_parent = os.path.dirname(anchor)
+                if (
+                    anchor_parent != anchor
+                    and self._deepest_durable_anchor_locked(anchor_parent)
+                    != anchor_parent
+                ):
+                    raise OSError(
+                        f"durability anchor changed during publication: {anchor}"
+                    )
+                self._cache_durable_handles_locked(handles)
+            except BaseException:
+                for handle in handles:
+                    handle.close()
+                raise
+
+    def _fsync_published_directory(
+        self,
+        directory: str,
+        *,
+        logical_input: bool,
+        stop_directory: str,
+    ) -> None:
+        if logical_input:
+            self._fsync_logical_publication(directory)
+            return
+        self._fsync_directory_chain(
+            directory,
+            stop_directory=stop_directory,
+        )
 
     def ensure_bytes_durable(self, path: str) -> None:
         """Re-establish durability for an already-visible byte object.
@@ -671,7 +978,11 @@ class LocalStorage(StorageInterface):
         # publication. Absolute paths are treated as pre-provisioned and only
         # their immediate parent is synced.
         stop = self._logical_durability_anchor if logical_input else directory
-        self._fsync_directory_chain(directory, stop_directory=stop)
+        self._fsync_published_directory(
+            directory,
+            logical_input=logical_input,
+            stop_directory=stop,
+        )
 
     def read_bytes(self, path: str) -> bytes:
         path = self._resolve_path(path)
@@ -715,8 +1026,10 @@ class LocalStorage(StorageInterface):
             with open(tmp_path, "rb") as completed:
                 os.fsync(completed.fileno())
             os.replace(tmp_path, dst_path)
-            self._fsync_directory_chain(
-                directory, stop_directory=durability_anchor,
+            self._fsync_published_directory(
+                directory,
+                logical_input=logical_destination,
+                stop_directory=durability_anchor,
             )
         finally:
             try:

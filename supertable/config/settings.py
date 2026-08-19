@@ -200,12 +200,13 @@ class Settings:
     # self-install.
     SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD: bool = False  # SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD
     # Write-path overwrite/delete resolution via the DuckDB pushdown probe.
-    # Disabled by default: the polars fallback reads only the projected key
-    # columns through the storage SDK and needs no httpfs extension, so it works
-    # in environments without one (or without internet to install it).  Enable
-    # only where httpfs is available and the probe's row-group skipping is worth
-    # it (e.g. very wide tables / many overlapping files).
+    # This flag force-enables the probe for every storage backend. LocalStorage
+    # is selected automatically for sufficiently large many-file candidate sets
+    # by the separate switch below: it needs neither httpfs nor credentials and
+    # can safely fall back to the projected Polars reader if DuckDB rejects a
+    # file/schema.
     SUPERTABLE_DUCKDB_WRITE_PROBE: bool = False    # SUPERTABLE_DUCKDB_WRITE_PROBE
+    SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO: bool = True  # SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO
     # Deletion-vector (tombstone) table cache.  Each entry is a small
     # `DISTINCT __rowid__` table keyed by the stable tombstone path; the
     # tombstone view ANTI JOINs it instead of re-reading the parquet every
@@ -581,6 +582,9 @@ def _build_settings() -> Settings:
         SUPERTABLE_DUCKDB_USE_HTTPFS=_env_bool("SUPERTABLE_DUCKDB_USE_HTTPFS", False),
         SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=_env_bool("SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD", False),
         SUPERTABLE_DUCKDB_WRITE_PROBE=_env_bool("SUPERTABLE_DUCKDB_WRITE_PROBE", False),
+        SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO=_env_bool(
+            "SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO", True,
+        ),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE", 8),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_ENTRIES=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_ENTRIES", 128),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC", 300),

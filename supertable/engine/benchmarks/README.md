@@ -11,6 +11,27 @@ The default run prepares the 512 KiB and 64 MiB tiers:
 python -m supertable.engine.benchmarks --sizes kb,mb --repeats 5
 ```
 
+The read-scaling matrix has a deterministic 100-MiB tier in addition to the
+large tiers. `100mb`, `100mib`, and `100m` are aliases for exactly
+104,857,600 source-target bytes; the `1gb` and `10gb` aliases likewise retain
+the harness' IEC 1-GiB and 10-GiB definitions:
+
+```bash
+python -m supertable.engine.benchmarks \
+  --sizes 100mib,1gib,10gib --allow-large --repeats 5
+```
+
+`aggregate_stats` reads the generated `metric` values and returns row count,
+non-null/null counts, sum, average, minimum, and maximum. Both engines execute
+the same primitive `COUNT`/`SUM`/`MIN`/`MAX` reductions; the harness derives
+null count and average from those returned scalars because IslandDB correctly
+rejects generic order-sensitive native `AVG`. Before timing, the completed
+result from each engine must match an independent arithmetic oracle derived
+from the sealed generator formula `(id * 48271 + 17) % 1000003`. The average
+uses the exact integer sum followed by one binary64 division, avoiding
+order-dependent floating-point accumulation. This gate can identify DuckDB,
+IslandDB, or both as wrong even when the two engines agree with each other.
+
 `spill_group` projects every public column, groups by the generated
 low-cardinality `dimension`, and orders the 1,024-row result. IslandDB executes
 this workload through its bounded Arrow streaming API so its conservative
@@ -105,7 +126,7 @@ Generation can be separated from execution:
 
 ```bash
 python -m supertable.engine.benchmarks \
-  --sizes kb,mb,1gib,10gib --allow-large --prepare-only
+  --sizes kb,mb,100mib,1gib,10gib --allow-large --prepare-only
 ```
 
 Each engine/workload timing series runs in a fresh process. The first query is
@@ -120,9 +141,15 @@ Result JSON records:
 - whole-file bytes retained after file min/max pruning;
 - compressed selected-column bytes across retained files (routing estimate);
 - selected-column bytes in predicate-eligible row groups (pushdown estimate);
-- cold and warm wall/CPU timings, RSS, Arrow, and DuckDB profile metrics;
+- cold and warm wall/CPU timings, RSS, Arrow, and any DuckDB profile metrics
+  permitted by the production security policy (raw profiles may be suppressed
+  because physical filenames can carry bearer URLs);
+- warm min/mean/median/max/p95/population-standard-deviation/CV summaries for
+  wall time, CPU time, utilised cores, RSS peaks/deltas, and every available
+  Linux process-I/O delta counter;
 - cache footprint and any cache metrics emitted through `PlanStats`;
-- exact result digest and parity status;
+- exact result digest, cross-engine parity, and independent generator-oracle
+  evidence for `aggregate_stats`;
 - paired warm-median IslandDB speedup over DuckDB.
 
 IslandDB additionally records its validated row-group count, decoded working

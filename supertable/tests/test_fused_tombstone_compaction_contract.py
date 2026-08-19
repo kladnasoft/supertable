@@ -373,6 +373,231 @@ def test_fused_twenty_file_drain_writes_only_final_exact_packed_outputs(
     assert 0 < output_estimates[-1] <= TARGET_BYTES + row_tolerance
 
 
+def test_default_decoded_budget_does_not_shred_target_sized_compressed_inputs(
+    monkeypatch,
+):
+    """The encoded target is not itself the shared decoded-memory budget.
+
+    This is a scaled version of the 15 x ~16 MiB campaign: every source has a
+    roughly 4:1 decoded/encoded ratio and one tombstoned row.  The old default
+    divided the 4 KiB encoded target among five retained-frame slots, yielding
+    an 819-byte decoded lane and roughly 285 tiny outputs.  The derived bounded
+    default gives each slot 16 KiB, so encoded packing remains authoritative.
+    """
+    from supertable import processing
+    from supertable.utils.profiler import Profiler
+
+    monkeypatch.setattr(
+        processing, "_detect_compaction_hard_memory_bytes", lambda: 4 * 1024**3,
+    )
+
+    target_bytes = 4 * 1024
+    source_file_bytes = 4_000
+    source_count = 15
+    rows_per_source = 65
+    sources: Dict[str, pl.DataFrame] = {}
+    resources = []
+    dead_pairs = []
+    for file_index in range(source_count):
+        path = f"compressed-{file_index:02d}.parquet"
+        first_rowid = file_index * rows_per_source + 1
+        frame = pl.DataFrame({
+            "__rowid__": pl.Series(
+                range(first_rowid, first_rowid + rows_per_source),
+                dtype=pl.Int64,
+            ),
+            "id": range(first_rowid, first_rowid + rows_per_source),
+            # 64 surviving rows occupy ~15 KiB decoded while their declared
+            # compressed contribution remains just under the 4 KiB target.
+            "payload": ["x" * 220] * rows_per_source,
+        })
+        sources[path] = frame
+        resources.append({
+            "file": path,
+            "file_size": source_file_bytes,
+            "rows": rows_per_source,
+        })
+        dead_pairs.append((path, first_rowid))
+
+    monkeypatch.setattr(
+        processing,
+        "_read_parquet_safe",
+        lambda path, **_kwargs: sources[path].clone(),
+    )
+    outputs: Dict[str, pl.DataFrame] = {}
+    output_lock = threading.Lock()
+
+    def write_final(**kwargs):
+        frame = kwargs["write_df"].clone()
+        path = f"final-{int(frame.get_column('__rowid__').min())}.parquet"
+        with output_lock:
+            outputs[path] = frame
+        kwargs["new_resources"].append({
+            "file": path,
+            "file_size": 3_900,
+            "rows": frame.height,
+        })
+
+    monkeypatch.setattr(
+        processing, "write_parquet_and_collect_resources", write_final,
+    )
+    profiler = Profiler()
+
+    considered, rows, new_resources, sunset, residual = (
+        processing.compact_resources(
+            snapshot={"resources": resources},
+            data_dir="data",
+            compression_level=1,
+            table_config={
+                "max_memory_chunk_size": target_bytes,
+                "tombstone_compaction_workers": 4,
+            },
+            small_only=True,
+            required_reads=True,
+            tombstone_df=_dv(dead_pairs),
+            return_residual=True,
+            profiler=profiler,
+        )
+    )
+
+    assert considered == source_count
+    assert rows == source_count * (rows_per_source - 1)
+    assert sunset == set(sources)
+    assert residual.height == 0
+    assert len(new_resources) == len(outputs) == source_count
+
+    counts = profiler.emit_counts()
+    retained_slots = 3 + 2  # configured workers are clamped to three
+    expected_budget = (
+        target_bytes
+        * processing._DEFAULT_COMPACTION_DECODED_EXPANSION
+        * retained_slots
+    )
+    assert counts["compact_decoded_budget_defaulted"] == 1
+    assert counts["compact_decoded_budget_bytes"] == expected_budget
+    assert counts["compact_decoded_chunk_limit_bytes"] == (
+        target_bytes * processing._DEFAULT_COMPACTION_DECODED_EXPANSION
+    )
+    assert counts["compact_decoded_peak_buffer_bytes"] <= counts[
+        "compact_decoded_chunk_limit_bytes"
+    ]
+
+
+def test_decoded_budget_override_is_exact_and_implicit_budget_is_capped(monkeypatch):
+    from supertable import processing
+
+    monkeypatch.setattr(
+        processing,
+        "_detect_compaction_hard_memory_bytes",
+        lambda: (_ for _ in ()).throw(AssertionError("explicit budget probed memory")),
+    )
+    explicit = processing._resolve_compaction_decoded_budget(
+        {"max_decoded_compaction_bytes": 12_345},
+        encoded_target_bytes=16 * MIB,
+        retained_frame_slots=5,
+    )
+    assert explicit == (12_345, False, False)
+    assert processing._resolve_compaction_decoded_budget(
+        {"max_decoded_compaction_bytes": 0},
+        encoded_target_bytes=16 * MIB,
+        retained_frame_slots=5,
+    ) == (1, False, False)
+
+    monkeypatch.setattr(
+        processing, "_detect_compaction_hard_memory_bytes", lambda: 4 * 1024**3,
+    )
+    assert processing._resolve_compaction_decoded_budget(
+        {}, encoded_target_bytes=16 * MIB, retained_frame_slots=5,
+    ) == (960 * MIB, True, False)
+    implicit = processing._resolve_compaction_decoded_budget(
+        {},
+        encoded_target_bytes=256 * MIB,
+        retained_frame_slots=5,
+    )
+    assert implicit == (
+        processing._DEFAULT_COMPACTION_DECODED_BUDGET_CAP,
+        True,
+        True,
+    )
+
+    monkeypatch.setattr(
+        processing, "_detect_compaction_hard_memory_bytes", lambda: 256 * MIB,
+    )
+    assert processing._resolve_compaction_decoded_budget(
+        {}, encoded_target_bytes=16 * MIB, retained_frame_slots=5,
+    ) == (64 * MIB, True, True)
+
+    monkeypatch.setattr(
+        processing, "_detect_compaction_hard_memory_bytes", lambda: None,
+    )
+    assert processing._resolve_compaction_decoded_budget(
+        {}, encoded_target_bytes=16 * MIB, retained_frame_slots=5,
+    ) == (128 * MIB, True, True)
+
+
+def test_detect_compaction_memory_uses_nested_cgroup_v2_limit(
+    tmp_path, monkeypatch,
+):
+    from supertable import processing
+
+    proc = tmp_path / "proc-cgroup"
+    root = tmp_path / "cgroup"
+    nested = root / "workload.slice"
+    nested.mkdir(parents=True)
+    proc.write_text("0::/workload.slice\n", encoding="utf-8")
+    (root / "memory.max").write_text("max\n", encoding="ascii")
+    (nested / "memory.max").write_text(str(256 * MIB), encoding="ascii")
+    monkeypatch.setattr(
+        processing, "_host_physical_memory_bytes", lambda: 8 * 1024**3,
+    )
+
+    assert processing._detect_compaction_hard_memory_bytes(
+        proc_cgroup_path=str(proc), cgroup_root=str(root),
+    ) == 256 * MIB
+
+
+def test_detect_compaction_memory_honours_a_finite_cgroup_ancestor(
+    tmp_path, monkeypatch,
+):
+    from supertable import processing
+
+    proc = tmp_path / "proc-cgroup"
+    root = tmp_path / "cgroup"
+    parent = root / "parent.slice"
+    nested = parent / "workload.slice"
+    nested.mkdir(parents=True)
+    proc.write_text("0::/parent.slice/workload.slice\n", encoding="utf-8")
+    (root / "memory.max").write_text("max\n", encoding="ascii")
+    (parent / "memory.max").write_text(str(384 * MIB), encoding="ascii")
+    (nested / "memory.max").write_text("max\n", encoding="ascii")
+    monkeypatch.setattr(
+        processing, "_host_physical_memory_bytes", lambda: 8 * 1024**3,
+    )
+
+    assert processing._detect_compaction_hard_memory_bytes(
+        proc_cgroup_path=str(proc), cgroup_root=str(root),
+    ) == 384 * MIB
+
+
+def test_detect_compaction_memory_falls_back_to_host_for_unlimited_cgroup(
+    tmp_path, monkeypatch,
+):
+    from supertable import processing
+
+    proc = tmp_path / "proc-cgroup"
+    root = tmp_path / "cgroup"
+    root.mkdir()
+    proc.write_text("0::/\n", encoding="utf-8")
+    (root / "memory.max").write_text("max\n", encoding="ascii")
+    monkeypatch.setattr(
+        processing, "_host_physical_memory_bytes", lambda: 2 * 1024**3,
+    )
+
+    assert processing._detect_compaction_hard_memory_bytes(
+        proc_cgroup_path=str(proc), cgroup_root=str(root),
+    ) == 2 * 1024**3
+
+
 def test_fused_drain_retains_entire_unprovable_group_under_original_identity(
     monkeypatch,
 ):
