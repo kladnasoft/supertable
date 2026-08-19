@@ -1,7 +1,7 @@
 # supertable/tests/test_resolve_overwrite_writes.py
 """
-Characterization tests for resolve_overwrite_writes (the DuckDB-pushdown
-write-path probe) against the polars oracle it replaces.
+Characterization tests for resolve_overwrite_writes (the native pushdown
+write-path probe) against the Polars oracle it replaces.
 
 resolve_overwrite_writes runs ONE column-projected, row-group-skipping,
 null-safe SEMI JOIN over the overlapping data files and derives BOTH the
@@ -11,7 +11,7 @@ that single read.  The pre-existing polars implementation
 files) remains as the fallback and is the behavioral oracle here.
 
 Each test writes REAL local parquet files and asserts:
-  1. the DuckDB path was actually exercised (profiler 'probe_files' present,
+  1. the accelerated path was actually exercised (profiler 'probe_files' present,
      no 'overwrite_resolve_fallback'), and
   2. its (filtered rows, delete pairs) match the polars oracle exactly.
 
@@ -42,11 +42,7 @@ from supertable.utils.profiler import Profiler
 
 @pytest.fixture(autouse=True)
 def _enable_write_probe(monkeypatch):
-    """These tests validate the DuckDB pushdown probe path, which is opt-in
-    (``SUPERTABLE_DUCKDB_WRITE_PROBE``, default off).  Force it on so the probe
-    is actually exercised; without this the gate in ``resolve_overwrite_writes``
-    would route every call to the polars fallback and the probe assertions
-    (``probe_files`` present, no ``overwrite_resolve_fallback``) would be vacuous."""
+    """Force the local-native path through the legacy explicit probe switch."""
     monkeypatch.setattr(
         st_processing, "settings",
         dataclasses.replace(settings, SUPERTABLE_DUCKDB_WRITE_PROBE=True),
@@ -56,8 +52,10 @@ def _enable_write_probe(monkeypatch):
 @pytest.fixture(autouse=True)
 def _clear_local_integrity_cache():
     st_processing._LOCAL_ROWID_INTEGRITY_CACHE.clear()
+    st_processing._LOCAL_PROBE_SCHEMA_CACHE.clear()
     yield
     st_processing._LOCAL_ROWID_INTEGRITY_CACHE.clear()
+    st_processing._LOCAL_PROBE_SCHEMA_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -86,12 +84,12 @@ def _rows(df):
     return sorted(df.sort(df.columns).to_dicts(), key=repr)
 
 
-def _used_duck(counts):
+def _used_probe(counts):
     return "probe_files" in counts and "overwrite_resolve_fallback" not in counts
 
 
 def _compare(incoming, files, keys, ntc):
-    """Run both paths; assert DuckDB ran and equals the polars oracle."""
+    """Run both paths; assert the native probe ran and equals the oracle."""
     exp_filt, exp_pairs = _oracle(incoming, files, keys, ntc)
     prof = Profiler()
     got_filt, got_pairs = resolve_overwrite_writes(
@@ -102,7 +100,7 @@ def _compare(incoming, files, keys, ntc):
         profiler=prof,
     )
     counts = prof.emit_counts()
-    assert _used_duck(counts), f"DuckDB probe not exercised; counts={counts}"
+    assert _used_probe(counts), f"native probe not exercised; counts={counts}"
     assert _rows(got_filt) == _rows(exp_filt), "filtered rows diverge from oracle"
     assert sorted(got_pairs) == sorted(exp_pairs), "delete pairs diverge from oracle"
     return got_filt, got_pairs, counts
@@ -404,6 +402,346 @@ class TestProbeStrictEquivalence:
         filtered, pairs = resolve_overwrite_writes(incoming, {f}, ["key"], None)
         assert filtered.height == 1
         assert pairs == [(f[0], 1)]
+
+
+class TestIslandNativeProbeSafety:
+    @staticmethod
+    def _probe(candidate, incoming, profiler):
+        return st_processing._island_probe_overlap_matches(
+            [(candidate[0], candidate[2])],
+            ["key"],
+            None,
+            incoming.select("key").unique(),
+            incoming_schema=dict(incoming.schema),
+            profiler=profiler,
+            storage=LocalStorage(),
+        )
+
+    @staticmethod
+    def _publish(tmp_path, frame, profiler=None):
+        storage = LocalStorage(tmp_path)
+        resources = []
+        with patch("supertable.processing._get_storage", return_value=storage):
+            st_processing.write_parquet_and_collect_resources(
+                write_df=frame,
+                overwrite_columns=[],
+                data_dir=str(tmp_path),
+                new_resources=resources,
+                compression_level=1,
+                profiler=profiler,
+            )
+        resource = resources[0]
+        return (
+            resource["file"], True, resource["file_size"],
+        )
+
+    def test_trusted_writer_seeds_metadata_but_keeps_rowid_proof_lazy(
+            self, tmp_path, monkeypatch,
+    ):
+        write_profiler = Profiler()
+        with monkeypatch.context() as publication:
+            publication.setattr(
+                st_processing.pq,
+                "ParquetFile",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("publication decoded a data column")
+                ),
+            )
+            publication.setattr(
+                st_processing,
+                "_pin_local_probe_files",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("publication reopened its output")
+                ),
+            )
+            candidate = self._publish(tmp_path, pl.DataFrame({
+                "__rowid__": pl.Series([1, 2], dtype=pl.Int64),
+                "key": [7, 8],
+            }), write_profiler)
+        write_counts = write_profiler.emit_counts()
+        assert write_counts["write_probe_published_schema_metadata"] == 1
+        assert "write_probe_published_rowid_proofs" not in write_counts
+
+        # The first probe reuses only metadata. It must not reopen the footer or
+        # schema, but it must decode and validate the actual published rowids.
+        monkeypatch.setattr(
+            st_processing.pq,
+            "read_metadata",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("seeded footer was reopened")
+            ),
+        )
+        assert st_processing._local_projected_parquet_bytes(
+            LocalStorage(),
+            [(candidate[0], candidate[2])],
+            ["__rowid__", "key"],
+        ) is not None
+        monkeypatch.setattr(
+            st_processing.pq,
+            "read_schema",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("seeded schema was reopened")
+            ),
+        )
+        probe_profiler = Profiler()
+        matched = self._probe(
+            candidate, pl.DataFrame({"key": [7]}), probe_profiler,
+        )
+        assert matched.get_column("__rowid__").to_list() == [1]
+        probe_counts = probe_profiler.emit_counts()
+        assert probe_counts["probe_schema_cache_hits"] == 1
+        assert probe_counts["probe_rowid_integrity_cache_misses"] == 1
+        assert "probe_schema_cache_misses" not in probe_counts
+        assert probe_counts["io.island_probe_rowid_integrity.n"] == 1
+
+        warm_profiler = Profiler()
+        assert self._probe(
+            candidate, pl.DataFrame({"key": [7]}), warm_profiler,
+        ).get_column("__rowid__").to_list() == [1]
+        assert warm_profiler.emit_counts()[
+            "probe_rowid_integrity_cache_hits"
+        ] == 1
+
+    @pytest.mark.parametrize("replace_inode", [False, True])
+    def test_published_metadata_is_invalidated_by_mutation_or_replacement(
+            self, tmp_path, replace_inode, monkeypatch,
+    ):
+        candidate = self._publish(tmp_path, pl.DataFrame({
+            "__rowid__": pl.Series([1, 2], dtype=pl.Int64),
+            "key": [7, 8],
+        }))
+        replacement = tmp_path / "published-proof-corrupt.parquet"
+        pq.write_table(pl.DataFrame({
+            "__rowid__": pl.Series([5, 5], dtype=pl.Int64),
+            "key": [7, 8],
+        }).to_arrow(), replacement)
+        if replace_inode:
+            os.replace(replacement, candidate[0])
+        else:
+            pq.write_table(pl.DataFrame({
+                "__rowid__": pl.Series([5, 5], dtype=pl.Int64),
+                "key": [7, 8],
+            }).to_arrow(), candidate[0])
+        changed = (candidate[0], True, os.stat(candidate[0]).st_size)
+
+        metadata_reads = 0
+        real_read_metadata = st_processing.pq.read_metadata
+
+        def count_metadata_reads(*args, **kwargs):
+            nonlocal metadata_reads
+            metadata_reads += 1
+            return real_read_metadata(*args, **kwargs)
+
+        monkeypatch.setattr(
+            st_processing.pq, "read_metadata", count_metadata_reads,
+        )
+        assert st_processing._local_projected_parquet_bytes(
+            LocalStorage(),
+            [(changed[0], changed[2])],
+            ["__rowid__", "key"],
+        ) is not None
+        assert metadata_reads == 1
+
+        profiler = Profiler()
+        assert self._probe(
+            changed, pl.DataFrame({"key": [7]}), profiler,
+        ) is None
+        counts = profiler.emit_counts()
+        assert counts["probe_schema_cache_misses"] == 1
+        assert counts["probe_rowid_integrity_cache_misses"] == 1
+        assert counts["io.island_probe_rowid_integrity.n"] == 1
+
+    def test_faulted_encoder_rowids_are_validated_lazily_from_actual_file(
+            self, tmp_path, monkeypatch,
+    ):
+        corrupt_encoded = st_processing._encode_parquet_polars(
+            pl.DataFrame({
+                "__rowid__": pl.Series([5, 5], dtype=pl.Int64),
+                "key": [7, 8],
+            }),
+            1,
+        )
+        monkeypatch.setattr(
+            st_processing,
+            "_encode_parquet_polars",
+            lambda *_args, **_kwargs: corrupt_encoded,
+        )
+        write_profiler = Profiler()
+        candidate = self._publish(tmp_path, pl.DataFrame({
+            "__rowid__": pl.Series([1, 2], dtype=pl.Int64),
+            "key": [7, 8],
+        }), write_profiler)
+        write_counts = write_profiler.emit_counts()
+        assert write_counts["write_probe_published_schema_metadata"] == 1
+        assert "write_probe_published_rowid_proofs" not in write_counts
+
+        probe_profiler = Profiler()
+        assert self._probe(
+            candidate, pl.DataFrame({"key": [7]}), probe_profiler,
+        ) is None
+        counts = probe_profiler.emit_counts()
+        assert counts["probe_schema_cache_hits"] == 1
+        assert counts["probe_rowid_integrity_cache_misses"] == 1
+        assert counts["io.island_probe_rowid_integrity.n"] == 1
+
+    def test_invalid_publication_identity_leaves_metadata_cache_cold(
+            self, tmp_path, monkeypatch,
+    ):
+        real_write = LocalStorage.write_bytes_with_identity
+
+        def write_with_wrong_size(storage, path, data):
+            identity = real_write(storage, path, data)
+            return dataclasses.replace(identity, size=identity.size + 1)
+
+        write_profiler = Profiler()
+        monkeypatch.setattr(
+            LocalStorage, "write_bytes_with_identity", write_with_wrong_size,
+        )
+        candidate = self._publish(tmp_path, pl.DataFrame({
+            "__rowid__": pl.Series([1, 2], dtype=pl.Int64),
+            "key": [7, 8],
+        }), write_profiler)
+        assert write_profiler.emit_counts()[
+            "write_probe_publication_metadata_failures"
+        ] == 1
+
+        probe_profiler = Profiler()
+        matched = self._probe(
+            candidate, pl.DataFrame({"key": [7]}), probe_profiler,
+        )
+        assert matched.get_column("__rowid__").to_list() == [1]
+        counts = probe_profiler.emit_counts()
+        assert counts["probe_schema_cache_misses"] == 1
+        assert counts["probe_rowid_integrity_cache_misses"] == 1
+        assert counts["io.island_probe_rowid_integrity.n"] == 1
+
+    def test_warm_identity_skips_only_integrity_proof(self, tmp_path):
+        candidate = _write(tmp_path, "native-warm.parquet", pl.DataFrame({
+            "__rowid__": [11, 12], "key": [7, 8],
+        }))
+        incoming = pl.DataFrame({"key": [7]})
+
+        cold = Profiler()
+        warm = Profiler()
+        assert self._probe(candidate, incoming, cold).rows() == [
+            (11, 7, candidate[0]),
+        ]
+        assert self._probe(candidate, incoming, warm).rows() == [
+            (11, 7, candidate[0]),
+        ]
+
+        cold_counts = cold.emit_counts()
+        warm_counts = warm.emit_counts()
+        assert cold_counts["probe_rowid_integrity_cache_misses"] == 1
+        assert cold_counts["probe_schema_cache_misses"] == 1
+        assert cold_counts["probe_rowid_integrity_scanned_files"] == 1
+        assert cold_counts["io.island_probe_rowid_integrity.n"] == 1
+        assert warm_counts["probe_rowid_integrity_cache_hits"] == 1
+        assert warm_counts["probe_schema_cache_hits"] == 1
+        assert "io.island_probe_rowid_integrity.n" not in warm_counts
+        # Physical schema and the key match remain per-call safety checks.
+        assert warm_counts["io.island_probe_schema.n"] == 1
+        assert warm_counts["io.island_probe.n"] == 1
+
+    def test_failed_final_identity_fence_does_not_publish_proof(
+            self, tmp_path, monkeypatch,
+    ):
+        candidate = _write(tmp_path, "native-fence.parquet", pl.DataFrame({
+            "__rowid__": [1], "key": [7],
+        }))
+        incoming = pl.DataFrame({"key": [7]})
+        replacement = tmp_path / "native-fence-replacement.parquet"
+        pq.write_table(pl.DataFrame({
+            "__rowid__": [99], "key": [7],
+        }).to_arrow(), replacement)
+        real_fence = st_processing._local_probe_pins_unchanged
+        replaced = False
+
+        def replace_before_fence(pins):
+            nonlocal replaced
+            if not replaced:
+                os.replace(replacement, candidate[0])
+                replaced = True
+            return real_fence(pins)
+
+        with monkeypatch.context() as context:
+            context.setattr(
+                st_processing,
+                "_local_probe_pins_unchanged",
+                replace_before_fence,
+            )
+            failed = Profiler()
+            assert self._probe(candidate, incoming, failed) is None
+            assert failed.emit_counts()[
+                "probe_rowid_integrity_cache_misses"
+            ] == 1
+
+        retry = Profiler()
+        matched = self._probe(candidate, incoming, retry)
+        assert matched.get_column("__rowid__").to_list() == [99]
+        assert retry.emit_counts()["probe_rowid_integrity_cache_misses"] == 1
+
+    def test_corrupt_replacement_is_never_cached(self, tmp_path):
+        candidate = _write(tmp_path, "native-corrupt.parquet", pl.DataFrame({
+            "__rowid__": [1, 2], "key": [7, 8],
+        }))
+        incoming = pl.DataFrame({"key": [7]})
+        assert self._probe(candidate, incoming, Profiler()).height == 1
+
+        replacement = tmp_path / "native-corrupt-replacement.parquet"
+        pq.write_table(pl.DataFrame({
+            "__rowid__": [5, 5], "key": [7, 8],
+        }).to_arrow(), replacement)
+        os.replace(replacement, candidate[0])
+        corrupt = (candidate[0], True, os.stat(candidate[0]).st_size)
+
+        for _attempt in range(2):
+            profiler = Profiler()
+            assert self._probe(corrupt, incoming, profiler) is None
+            assert profiler.emit_counts()[
+                "probe_rowid_integrity_cache_misses"
+            ] == 1
+
+    def test_concurrent_cold_probes_coalesce_integrity_scan(self, tmp_path):
+        candidate = _write(tmp_path, "native-concurrent.parquet", pl.DataFrame({
+            "__rowid__": list(range(1, 10_001)),
+            "key": list(range(1, 10_001)),
+        }))
+        incoming = pl.DataFrame({"key": [7]})
+        start = threading.Barrier(2)
+        results = []
+        errors = []
+
+        def run_probe():
+            profiler = Profiler()
+            try:
+                start.wait(timeout=5)
+                result = self._probe(candidate, incoming, profiler)
+                results.append((result, profiler.emit_counts()))
+            except BaseException as exc:  # surfaced with useful context below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run_probe) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert not errors
+        assert all(not thread.is_alive() for thread in threads)
+        assert [result.height for result, _counts in results] == [1, 1]
+        assert sum(
+            counts.get("io.island_probe_rowid_integrity.n", 0)
+            for _result, counts in results
+        ) == 1
+        assert sum(
+            counts.get("probe_rowid_integrity_cache_misses", 0)
+            for _result, counts in results
+        ) == 1
+        assert sum(
+            counts.get("probe_rowid_integrity_cache_hits", 0)
+            for _result, counts in results
+        ) == 1
 
 
 class TestLocalRowidIntegrityCache:

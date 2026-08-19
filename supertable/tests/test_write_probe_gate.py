@@ -1,9 +1,10 @@
 # supertable/tests/test_write_probe_gate.py
-"""Selection tests for the overwrite-resolution DuckDB probe.
+"""Selection tests for overwrite-resolution probe routing.
 
-LocalStorage is accelerated automatically because it needs no httpfs or remote
-credentials. Remote storage remains opt-in and therefore uses the Polars
-fallback by default. These tests pin the selection and safety contract:
+LocalStorage uses the Island-native scanner automatically because it needs no
+httpfs or remote credentials. Remote DuckDB compatibility remains opt-in and
+therefore uses the Polars fallback by default. These tests pin the selection
+and safety contract:
 
   * local auto ON -> the probe is called even when the cross-backend flag is OFF;
   * local auto OFF and cross-backend flag OFF -> the Polars fallback is used;
@@ -85,7 +86,19 @@ def _set_probe(monkeypatch, enabled: bool, *, local_auto: bool = False):
 
 
 def _spy_probe(monkeypatch):
-    """Wrap the real probe to count calls without altering its behavior."""
+    """Wrap the real local-native probe without altering its behavior."""
+    calls = {"n": 0}
+    real = st_processing._island_probe_overlap_matches
+
+    def _counting(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(st_processing, "_island_probe_overlap_matches", _counting)
+    return calls
+
+
+def _spy_remote_duckdb(monkeypatch):
     calls = {"n": 0}
     real = st_processing._duckdb_probe_overlap_matches
 
@@ -231,6 +244,30 @@ def test_explicit_flag_calls_probe_when_local_auto_is_off(tmp_path, monkeypatch)
     assert pairs == [(f[0], 1)]
 
 
+def test_explicit_nonlocal_compatibility_uses_duckdb(tmp_path, monkeypatch):
+    class _NonlocalReadableStorage(LocalStorage):
+        def is_local_storage(self):
+            return False
+
+    storage = _NonlocalReadableStorage(tmp_path)
+    candidate = _write(tmp_path, "remote-shaped.parquet", pl.DataFrame({
+        "__rowid__": [1], "user_id": [5], "updated_at": [7],
+    }))
+    incoming = pl.DataFrame({"user_id": [5], "updated_at": [9]})
+    _set_probe(monkeypatch, True, local_auto=False)
+    native_calls = _spy_probe(monkeypatch)
+    duckdb_calls = _spy_remote_duckdb(monkeypatch)
+
+    filtered, pairs = resolve_overwrite_writes(
+        incoming, {candidate}, ["user_id"], "updated_at", storage=storage,
+    )
+
+    assert native_calls["n"] == 0
+    assert duckdb_calls["n"] == 1
+    assert filtered.rows() == [(5, 9)]
+    assert pairs == [(candidate[0], 1)]
+
+
 def test_nonlocal_storage_is_not_auto_selected(tmp_path, monkeypatch):
     class _NonlocalReadableStorage(LocalStorage):
         def is_local_storage(self):
@@ -267,7 +304,7 @@ def test_auto_probe_failure_runs_strict_fallback(tmp_path, monkeypatch):
         return None
 
     monkeypatch.setattr(
-        st_processing, "_duckdb_probe_overlap_matches", _unavailable,
+        st_processing, "_island_probe_overlap_matches", _unavailable,
     )
     prof = Profiler()
     filt, pairs = _resolve(incoming, files, ["user_id"], "updated_at", prof)
@@ -309,7 +346,7 @@ def test_probe_failure_fallback_keeps_caller_pinned_storage(
     monkeypatch.setattr(st_processing, "_get_storage", lambda: ambient)
     _set_probe(monkeypatch, True, local_auto=False)
     monkeypatch.setattr(
-        st_processing, "_duckdb_probe_overlap_matches", lambda *a, **k: None,
+        st_processing, "_island_probe_overlap_matches", lambda *a, **k: None,
     )
     failed_probe = resolve_overwrite_writes(
         incoming, candidate, ["user_id"], "updated_at", storage=pinned,
@@ -356,8 +393,9 @@ def test_auto_probe_fallback_preserves_rowid_integrity_error(
     with pytest.raises(ValueError, match="duplicate rowids"):
         _resolve(incoming, files, ["user_id"], None, prof)
 
-    # DuckDB rejects the corrupt candidate, then the strict oracle independently
-    # proves the same corruption instead of treating probe failure as no match.
+    # The native probe rejects the corrupt candidate, then the strict oracle
+    # independently proves the same corruption instead of treating probe
+    # failure as no match.
     assert calls["n"] == 1
     assert prof.emit_counts().get("overwrite_resolve_fallback") == 1
 

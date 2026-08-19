@@ -11,6 +11,7 @@ import threading
 import time
 import hashlib
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 
 from typing import Any, BinaryIO, Dict, List, Optional, Sequence
@@ -22,6 +23,18 @@ from supertable.storage.storage_interface import (
     validate_range_request,
     write_all,
 )
+
+
+@dataclass(frozen=True)
+class LocalWriteIdentity:
+    """Complete identity of bytes durably published by ``LocalStorage``."""
+
+    canonical_path: str
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
 
 
 class _DirectoryHandle:
@@ -634,7 +647,7 @@ class LocalStorage(StorageInterface):
         # resources and publishes their snapshot pointer immediately after the
         # call. Give it the same crash-durable boundary as the explicit audit
         # helper instead of acknowledging a buffered, partially visible file.
-        self.write_bytes_atomic(path, data)
+        self._write_bytes_atomic_with_identity(path, data)
 
     def write_bytes_atomic(self, path: str, data: bytes) -> None:
         """Durably replace a byte object without exposing a partial target.
@@ -644,9 +657,27 @@ class LocalStorage(StorageInterface):
         ``os.replace`` gives readers either the previous complete object or the
         new complete object, never a prefix written by a crashed process.
         """
+        self._write_bytes_atomic_with_identity(path, data)
+
+    def write_bytes_with_identity(
+            self, path: str, data: bytes,
+    ) -> LocalWriteIdentity:
+        """Durably publish bytes and return the identity of that exact inode.
+
+        This is a local-only optimization boundary for immutable resources.
+        Ordinary storage-interface callers continue to use ``write_bytes``.
+        """
+        return self._write_bytes_atomic_with_identity(path, data)
+
+    def _write_bytes_atomic_with_identity(
+            self, path: str, data: bytes,
+    ) -> LocalWriteIdentity:
         logical_input = not os.path.isabs(os.fspath(path))
         path = self._resolve_path(path)
         directory = os.path.dirname(path) or "."
+        canonical_path = os.path.join(
+            os.path.realpath(directory), os.path.basename(path),
+        )
         durability_anchor = (
             self._logical_durability_anchor
             if logical_input
@@ -654,23 +685,38 @@ class LocalStorage(StorageInterface):
         )
         os.makedirs(directory, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(prefix=".tmp-bytes-", dir=directory)
+        published_state = None
         try:
             with os.fdopen(fd, "wb") as tmpf:
                 write_all(tmpf, data)
                 tmpf.flush()
                 os.fsync(tmpf.fileno())
-            os.replace(tmp_path, path)
-            self._fsync_published_directory(
-                directory,
-                logical_input=logical_input,
-                stop_directory=durability_anchor,
-            )
+                os.replace(tmp_path, path)
+                self._fsync_published_directory(
+                    directory,
+                    logical_input=logical_input,
+                    stop_directory=durability_anchor,
+                )
+                # Capture after rename + directory fsync while the exact
+                # published inode is still held open. A later path replacement
+                # cannot acquire this cache identity.
+                published_state = os.fstat(tmpf.fileno())
         finally:
             try:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
             except Exception:
                 pass
+        if published_state is None:  # pragma: no cover - success sets it
+            raise RuntimeError("Local byte publication produced no identity")
+        return LocalWriteIdentity(
+            canonical_path=canonical_path,
+            device=int(published_state.st_dev),
+            inode=int(published_state.st_ino),
+            size=int(published_state.st_size),
+            mtime_ns=int(published_state.st_mtime_ns),
+            ctime_ns=int(published_state.st_ctime_ns),
+        )
 
     @staticmethod
     def _open_directory(directory: str) -> _DirectoryHandle:

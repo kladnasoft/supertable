@@ -1160,9 +1160,11 @@ class DataWriter:
             file_cache = {}
 
             # --- Overwrite resolution: stale-row filtering + delete-pair -------
-            # identification in one DuckDB-pushdown probe over the overlapping
-            # files (column projection, row-group skipping, ranged GETs, native
-            # null-safe SEMI JOIN) instead of full-file polars reads.  Returns
+            # identification in one native pushdown probe over the overlapping
+            # files (column projection, row-group skipping, null-safe SEMI JOIN)
+            # instead of per-file eager Polars reads. Local files use the
+            # Island-native scanner; explicit remote compatibility may use
+            # DuckDB. Returns
             # the stale-filtered incoming df plus the (file, __rowid__) delete
             # pairs derived from the surviving keys; falls back to the polars
             # oracle on any probe/derive failure.  delete_only (no
@@ -1182,8 +1184,18 @@ class DataWriter:
                 mark("resolve_overwrite")
                 _counts = profiler.counts
                 _fallback = bool(_counts.get("overwrite_resolve_fallback"))
+                _probe_backend = (
+                    "polars-fallback" if _fallback else
+                    "island-native" if _counts.get(
+                        "overwrite_resolve_probe_island_native"
+                    ) else
+                    "duckdb-remote" if _counts.get(
+                        "overwrite_resolve_probe_duckdb_remote"
+                    ) else
+                    "no-overlap"
+                )
                 logger.debug(lp(
-                    f"step[probe-resolve] via {'polars-fallback' if _fallback else 'duckdb-pushdown'}: "
+                    f"step[probe-resolve] via {_probe_backend}: "
                     f"matched {_counts.get('probe_rows_matched', _counts.get('delete_rows_matched', 0))} "
                     f"existing row(s) on {overwrite_columns} → "
                     f"{len(resolved_delete_pairs or [])} (file,__rowid__) delete pair(s); "

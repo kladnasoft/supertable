@@ -199,12 +199,11 @@ class Settings:
     # an actionable message; set ON only on a networked box that must
     # self-install.
     SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD: bool = False  # SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD
-    # Write-path overwrite/delete resolution via the DuckDB pushdown probe.
-    # This flag force-enables the probe for every storage backend. LocalStorage
-    # is selected automatically for sufficiently large many-file candidate sets
-    # by the separate switch below: it needs neither httpfs nor credentials and
-    # can safely fall back to the projected Polars reader if DuckDB rejects a
-    # file/schema.
+    # Legacy write-probe compatibility switch. It explicitly enables remote
+    # DuckDB probing; on LocalStorage the same switch selects the faster
+    # Island-native scanner. LocalStorage is also selected automatically for
+    # sufficiently large many-file candidate sets by the separate switch below.
+    # Every accelerator fails closed to the projected strict Polars reader.
     SUPERTABLE_DUCKDB_WRITE_PROBE: bool = False    # SUPERTABLE_DUCKDB_WRITE_PROBE
     SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO: bool = True  # SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO
     # Deletion-vector (tombstone) table cache.  Each entry is a small

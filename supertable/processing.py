@@ -2123,10 +2123,20 @@ def _write_single_parquet_file_attempt(
 
     footer_md = None
     object_seal = None
+    local_write_identity = None
     if callable(write_bytes):
         with p.span("write.upload_bytes"):
             state["released"] = True
-            write_bytes(new_parquet_path, data)
+            write_with_identity = (
+                getattr(storage, "write_bytes_with_identity", None)
+                if _is_exact_local_storage(storage) else None
+            )
+            if callable(write_with_identity):
+                local_write_identity = write_with_identity(
+                    new_parquet_path, data,
+                )
+            else:
+                write_bytes(new_parquet_path, data)
         # These are the exact bytes submitted to the backend, so size does not
         # require another lookup. A remote metadata observation below exists
         # solely to obtain the provider's conditional-read identity.
@@ -2261,6 +2271,28 @@ def _write_single_parquet_file_attempt(
             footer_md_out[new_parquet_path] = _FooterStatsCacheEntry(
                 metadata=footer_md,
                 rows=exact_stats_rows,
+            )
+    # Exact LocalStorage publication is a trusted, durable exact-byte boundary.
+    # Retain only the physical schema and projected-byte routing map already
+    # available in the encoded footer. Complete rowid integrity deliberately
+    # remains lazy: decoding that column here taxes every append, including
+    # files that are never mutation candidates. Compatibility backends may
+    # re-encode ``data`` and therefore cannot seed from the submitted bytes.
+    if (
+        callable(write_bytes)
+        and footer_md is not None
+        and data is not None
+        and local_write_identity is not None
+        and _is_exact_local_storage(storage)
+    ):
+        with p.span("write.probe_metadata_seed"):
+            _seed_local_write_probe_metadata(
+                file_key=new_parquet_path,
+                published_identity=local_write_identity,
+                published_size=len(data),
+                encoded_metadata=footer_md,
+                encoded_footer_sha256=footer_sha256,
+                profiler=p,
             )
     new_resources.append(resource)
     state["published"] = True
@@ -2908,19 +2940,20 @@ def identify_all_rowids(
 
 
 # =========================
-# Pushdown overwrite resolution (DuckDB probe, polars fallback)
+# Pushdown overwrite resolution (Island-native local / DuckDB remote probe,
+# strict Polars fallback)
 # =========================
 #
 # The legacy path (``filter_stale_incoming_rows`` + ``identify_deleted_rowids``)
 # reads EVERY overlapping data file FULLY (all columns, all rows) into polars,
 # then group/join over the whole table — cost O(table size), independent of how
 # few rows are actually written.  ``resolve_overwrite_writes`` replaces both with
-# ONE column-projected DuckDB ``parquet_scan`` that reads only the key /
-# ``__rowid__`` / newer-than columns and only the rows whose key matches an
+# ONE column-projected native ``scan_parquet`` that reads only the key /
+# ``__rowid__`` / newer-than columns and returns only rows whose key matches an
 # incoming key (null-safe SEMI JOIN), then derives both results in-memory from
-# that small matched set.  The two legacy functions are retained as the exact
-# semantic oracle and the fallback for any environment/schema the probe can't
-# handle.
+# that small matched set. DuckDB is retained only for the explicit remote
+# compatibility lane. The two legacy functions are the exact semantic oracle
+# and fallback for any environment/schema the accelerators cannot handle.
 
 
 def _storage_duckdb_path(storage, key: str, force_presign: bool = False) -> str:
@@ -3007,7 +3040,7 @@ _LocalProbeFileIdentity = Tuple[str, int, int, int, int, int]
 
 @dataclass
 class _PinnedLocalProbeFile:
-    """An immutable LocalStorage candidate held open for one DuckDB probe."""
+    """An immutable LocalStorage candidate held open for one write probe."""
 
     key: str
     path: str
@@ -3051,7 +3084,7 @@ def _pin_local_probe_files(
         file_keys: List[str],
         resolved_paths: List[str],
 ) -> Optional[List[_PinnedLocalProbeFile]]:
-    """Pin exact LocalStorage files and expose their open fds to DuckDB.
+    """Pin exact LocalStorage files and expose their open fds to a scanner.
 
     Cache eligibility is deliberately narrower than probe eligibility. Only the
     built-in, exact ``LocalStorage`` type may use cached integrity results;
@@ -3221,6 +3254,184 @@ class _LocalRowidIntegrityCache:
 _LOCAL_ROWID_INTEGRITY_CACHE = _LocalRowidIntegrityCache()
 
 
+class _LocalProbeSchemaProof:
+    """Physical footer facts for one exact immutable local identity.
+
+    Writer publication retains the already-parsed footer object without doing
+    more work. Schema conversion and compressed-byte aggregation are computed
+    only if a later mutation probe actually consumes them. Cold/legacy probes
+    may instead supply an already-read Arrow schema and no footer metadata.
+    """
+
+    def __init__(
+            self,
+            *,
+            arrow_schema: Optional[pa.Schema],
+            rows: int,
+            footer_sha256: str,
+            compressed_column_bytes: Optional[Tuple[Tuple[str, int], ...]] = None,
+            encoded_metadata: Optional[pq.FileMetaData] = None,
+    ) -> None:
+        self._arrow_schema = arrow_schema
+        self.rows = rows
+        self.footer_sha256 = footer_sha256
+        self._compressed_column_bytes = compressed_column_bytes
+        self._encoded_metadata = encoded_metadata
+        self._materialize_lock = threading.Lock()
+
+    @property
+    def arrow_schema(self) -> pa.Schema:
+        with self._materialize_lock:
+            if self._arrow_schema is None:
+                if self._encoded_metadata is None:
+                    raise ValueError("cached local probe schema is unavailable")
+                self._arrow_schema = (
+                    self._encoded_metadata.schema.to_arrow_schema()
+                )
+            return self._arrow_schema
+
+    @property
+    def compressed_column_bytes(
+            self,
+    ) -> Optional[Tuple[Tuple[str, int], ...]]:
+        with self._materialize_lock:
+            if (
+                self._compressed_column_bytes is None
+                and self._encoded_metadata is not None
+            ):
+                self._compressed_column_bytes = (
+                    _parquet_compressed_column_bytes(self._encoded_metadata)
+                )
+            return self._compressed_column_bytes
+
+
+class _LocalProbeSchemaCache:
+    """Bounded physical-schema cache keyed by the complete local identity."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._entries: OrderedDict[
+            _LocalProbeFileIdentity, _LocalProbeSchemaProof,
+        ] = OrderedDict()
+        self._by_path: Dict[str, _LocalProbeFileIdentity] = {}
+
+    def get(
+            self, identity: _LocalProbeFileIdentity,
+    ) -> Optional[_LocalProbeSchemaProof]:
+        with self._lock:
+            path = identity[0]
+            prior = self._by_path.get(path)
+            if prior is not None and prior != identity:
+                self._entries.pop(prior, None)
+                if self._by_path.get(path) == prior:
+                    self._by_path.pop(path, None)
+            proof = self._entries.get(identity)
+            if proof is not None:
+                self._entries.move_to_end(identity)
+            return proof
+
+    def publish(
+            self,
+            identity: _LocalProbeFileIdentity,
+            proof: _LocalProbeSchemaProof,
+    ) -> None:
+        with self._lock:
+            path = identity[0]
+            prior = self._by_path.get(path)
+            if prior is not None and prior != identity:
+                self._entries.pop(prior, None)
+            self._entries[identity] = proof
+            self._entries.move_to_end(identity)
+            self._by_path[path] = identity
+            limit = max(0, int(_LOCAL_ROWID_INTEGRITY_CACHE_MAX_ENTRIES))
+            while len(self._entries) > limit:
+                evicted, _proof = self._entries.popitem(last=False)
+                if self._by_path.get(evicted[0]) == evicted:
+                    self._by_path.pop(evicted[0], None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._by_path.clear()
+
+
+_LOCAL_PROBE_SCHEMA_CACHE = _LocalProbeSchemaCache()
+
+
+def _parquet_compressed_column_bytes(
+        metadata: pq.FileMetaData,
+) -> Tuple[Tuple[str, int], ...]:
+    """Return exact compressed bytes per physical Parquet column path."""
+    totals: Dict[str, int] = defaultdict(int)
+    for row_group_index in range(metadata.num_row_groups):
+        row_group = metadata.row_group(row_group_index)
+        for column_index in range(row_group.num_columns):
+            column = row_group.column(column_index)
+            totals[str(column.path_in_schema)] += max(
+                0, int(column.total_compressed_size or 0),
+            )
+    return tuple(sorted(totals.items()))
+
+
+def _seed_local_write_probe_metadata(
+        *,
+        file_key: str,
+        published_identity: object,
+        published_size: int,
+        encoded_metadata: pq.FileMetaData,
+        encoded_footer_sha256: str,
+        profiler: Optional[Profiler] = None,
+) -> None:
+    """Seed identity-bound local probe metadata without reading published data.
+
+    The exact built-in ``LocalStorage`` writer has just durably published the
+    same byte string whose footer produced ``encoded_metadata``. Bind its
+    physical schema and compressed-column map to the live path/inode identity,
+    but never infer or publish rowid integrity from the input frame. The first
+    mutation probe still scans and validates every encoded rowid from the pinned
+    file. Any identity ambiguity merely leaves the metadata cache cold.
+    """
+    p = profiler or get_null_profiler()
+    try:
+        from supertable.storage.local_storage import LocalWriteIdentity
+
+        if not isinstance(published_identity, LocalWriteIdentity):
+            raise ValueError("local publication returned no trusted identity")
+        identity: _LocalProbeFileIdentity = (
+            published_identity.canonical_path,
+            int(published_identity.device),
+            int(published_identity.inode),
+            int(published_identity.size),
+            int(published_identity.mtime_ns),
+            int(published_identity.ctime_ns),
+        )
+        if not os.path.isabs(identity[0]) or "://" in identity[0]:
+            raise ValueError("local publication identity has an invalid path")
+        if identity[3] != int(published_size):
+            raise ValueError("published local file size differs from encoded bytes")
+
+        if (
+            not isinstance(encoded_footer_sha256, str)
+            or not encoded_footer_sha256
+        ):
+            raise ValueError("encoded Parquet footer seal is missing")
+        schema_proof = _LocalProbeSchemaProof(
+            arrow_schema=None,
+            rows=int(encoded_metadata.num_rows),
+            footer_sha256=encoded_footer_sha256,
+            encoded_metadata=encoded_metadata,
+        )
+        _LOCAL_PROBE_SCHEMA_CACHE.publish(identity, schema_proof)
+        p.add("write_probe_published_schema_metadata", 1)
+    except Exception as exc:
+        p.add("write_probe_publication_metadata_failures", 1)
+        logging.debug(
+            "[write-probe] local publication metadata not cached for %r: %s",
+            file_key,
+            exc,
+        )
+
+
 def _local_projected_parquet_bytes(
         storage: object,
         overlap_true_files: List[Tuple[str, int]],
@@ -3229,9 +3440,10 @@ def _local_projected_parquet_bytes(
     """Return compressed local Parquet bytes for the probe's projection.
 
     Candidate metadata reports whole-object sizes, which can be dominated by
-    payload columns neither overwrite-resolution path reads. Reading only the
-    local footers gives the exact compressed column-chunk cost signal without
-    materialising data. Any ambiguous path/footer fails closed to Polars.
+    payload columns neither overwrite-resolution path reads. Trusted writer
+    publications retain this footer-derived map under the immutable identity;
+    legacy/cold files read only their local footer. Any ambiguous path/footer
+    fails closed to Polars.
     """
     wanted = set(projected_columns)
     if not wanted:
@@ -3242,6 +3454,28 @@ def _local_projected_parquet_bytes(
             path = _storage_duckdb_path(storage, key)
             if not isinstance(path, str) or not path or "://" in path:
                 return None
+            # Exact writer publications retain their footer-bound projected
+            # byte map under the same complete identity used by the probe.
+            # A stale observation can only influence optional route selection:
+            # the selected probe still opens/pins/revalidates the live file
+            # before returning a mutation decision.
+            if _is_exact_local_storage(storage):
+                state = os.stat(path, follow_symlinks=True)
+                if not stat.S_ISREG(state.st_mode):
+                    return None
+                identity = _local_probe_file_identity(
+                    os.path.realpath(os.path.abspath(path)), state,
+                )
+                proof = _LOCAL_PROBE_SCHEMA_CACHE.get(identity)
+                if (
+                    proof is not None
+                    and proof.compressed_column_bytes is not None
+                ):
+                    compressed = dict(proof.compressed_column_bytes)
+                    total += sum(
+                        compressed.get(column, 0) for column in wanted
+                    )
+                    continue
             metadata = pq.read_metadata(path)
             for row_group_index in range(metadata.num_row_groups):
                 row_group = metadata.row_group(row_group_index)
@@ -3259,6 +3493,18 @@ def _local_projected_parquet_bytes(
     return total
 
 
+def _storage_reports_local(storage: Optional[object]) -> bool:
+    if storage is None:
+        return False
+    is_local = getattr(storage, "is_local_storage", None)
+    if not callable(is_local):
+        return False
+    try:
+        return is_local() is True
+    except Exception:
+        return False
+
+
 def _write_probe_selected(
         storage: Optional[object],
         overlap_true_files: List[Tuple[str, int]],
@@ -3266,12 +3512,15 @@ def _write_probe_selected(
 ) -> Tuple[bool, bool]:
     """Return ``(selected, auto_local)`` for overwrite resolution.
 
-    ``SUPERTABLE_DUCKDB_WRITE_PROBE`` remains the explicit cross-backend opt-in.
+    ``SUPERTABLE_DUCKDB_WRITE_PROBE`` remains the explicit cross-backend opt-in
+    for compatibility. Local selections run through the Island-native scanner;
+    DuckDB is used only when an explicitly selected backend is non-local.
     Larger many-file local candidate sets are safe to accelerate automatically
-    because DuckDB reads the same immutable files directly and cannot stall on
-    httpfs installation or remote authentication. The dedicated local-auto
-    switch keeps an explicit operational escape hatch; any probe/schema failure
-    still returns to the strict projected Polars oracle.
+    because the native scanner reads the same pinned immutable files directly
+    and cannot stall on httpfs installation or remote authentication. The
+    dedicated local-auto switch keeps an explicit operational escape hatch;
+    any probe/schema failure still returns to the strict projected Polars
+    oracle.
     """
     if settings.SUPERTABLE_DUCKDB_WRITE_PROBE:
         return True, False
@@ -3282,23 +3531,16 @@ def _write_probe_selected(
     # auto-selection by supplying its already-resolved backend instance.
     if storage is None:
         return False, False
-    is_local = getattr(storage, "is_local_storage", None)
-    if not callable(is_local):
-        return False, False
-    try:
-        local = is_local() is True
-    except Exception:
+    if not _storage_reports_local(storage):
         # Storage classification is optional acceleration metadata. An
         # ambiguous/failed answer must retain the storage-SDK oracle path.
         return False, False
-    if not local:
-        return False, False
 
-    # DuckDB pays a fixed schema/integrity-query cost and is slower than the
-    # projected Polars oracle for a handful of local files. Targeted crossover
-    # profiling puts the stable win at eight non-trivial candidates. Gate the
-    # byte side on the exact compressed key/rowid/version chunks, not unrelated
-    # payload columns that neither path reads.
+    # A multi-file probe pays fixed schema/integrity costs and is slower than
+    # the projected strict oracle for a handful of tiny local files. Targeted
+    # crossover profiling puts the stable win at eight non-trivial candidates.
+    # Gate the byte side on the exact compressed key/rowid/version chunks, not
+    # unrelated payload columns that neither path reads.
     if len(overlap_true_files) < _LOCAL_WRITE_PROBE_MIN_FILES:
         return False, False
     candidate_bytes = _local_projected_parquet_bytes(
@@ -3309,6 +3551,298 @@ def _write_probe_selected(
         and candidate_bytes >= _LOCAL_WRITE_PROBE_MIN_BYTES
     )
     return selected, selected
+
+
+_ISLAND_PROBE_SOURCE_COL = "__supertable_write_probe_source__"
+_ISLAND_PROBE_EXACT_TYPES = frozenset({
+    polars.Boolean,
+    polars.Int8,
+    polars.Int16,
+    polars.Int32,
+    polars.Int64,
+    polars.UInt8,
+    polars.UInt16,
+    polars.UInt32,
+    polars.UInt64,
+    polars.Utf8,
+})
+
+
+def _island_probe_scan(
+        paths: List[str],
+        projected_schema: Dict[str, polars.DataType],
+) -> polars.LazyFrame:
+    """Return IslandDB's native local Parquet scan for a write probe.
+
+    This intentionally uses the same Polars lazy scanner as IslandDB without
+    constructing the public SQL/parser/planner facade.  The caller has already
+    pinned every path to an open immutable inode and proven each physical
+    schema.  ``missing_columns='insert'`` is therefore used only for the
+    optional newer-than column; rowid and overwrite keys were required in every
+    file before this scan was built.
+    """
+    return polars.scan_parquet(
+        paths,
+        schema=polars.Schema(projected_schema),
+        include_file_paths=_ISLAND_PROBE_SOURCE_COL,
+        hive_partitioning=False,
+        use_statistics=True,
+        parallel="auto",
+        missing_columns="insert",
+        extra_columns="ignore",
+    )
+
+
+def _island_probe_overlap_matches(
+        overlap_true_files: List[Tuple[str, int]],
+        overwrite_columns: List[str],
+        newer_than_col: Optional[str],
+        incoming_keys: polars.DataFrame,
+        incoming_schema: Optional[Dict[str, polars.DataType]] = None,
+        profiler: Optional[Profiler] = None,
+        storage: Optional[object] = None,
+) -> Optional[polars.DataFrame]:
+    """Resolve local overwrite matches with IslandDB's native Polars scan.
+
+    The public IslandDB SQL facade deliberately hides source identity and rowid,
+    so the write path uses its lower-level execution primitive instead.  Every
+    candidate is opened with ``O_NOFOLLOW`` and scanned through ``/proc/self/fd``;
+    path and inode identity are fenced again after collection.  Physical schema
+    and complete rowid integrity are proven before a ``(file, rowid)`` pair can
+    be returned.  Any unsupported or ambiguous state returns ``None`` so the
+    required strict Polars/storage oracle remains authoritative.
+    """
+    p = profiler or get_null_profiler()
+    if not overlap_true_files or not overwrite_columns:
+        return None
+
+    source_schema = incoming_schema or dict(incoming_keys.schema)
+    projected_schema: Dict[str, polars.DataType] = {ROWID_COL: polars.Int64}
+    for column in overwrite_columns:
+        dtype = source_schema.get(column)
+        if dtype not in _ISLAND_PROBE_EXACT_TYPES:
+            logging.info(
+                f"[write-probe] unsupported exact native key type "
+                f"{column}={dtype}; using strict polars path"
+            )
+            return None
+        projected_schema[column] = dtype
+    if newer_than_col:
+        dtype = source_schema.get(newer_than_col)
+        if dtype not in _ISLAND_PROBE_EXACT_TYPES:
+            logging.info(
+                f"[write-probe] unsupported exact native version type "
+                f"{newer_than_col}={dtype}; using strict polars path"
+            )
+            return None
+        projected_schema[newer_than_col] = dtype
+
+    if storage is None:
+        try:
+            storage = _get_storage()
+        except Exception as exc:
+            logging.info(
+                f"[write-probe] local storage unavailable, using polars path: {exc}"
+            )
+            return None
+    # Open-fd pinning and its proof cache are intentionally restricted to the
+    # exact built-in LocalStorage implementation.  A subclass can change path
+    # resolution/immutability semantics, so it keeps the storage-SDK oracle.
+    if not _is_exact_local_storage(storage):
+        return None
+
+    file_keys = [key for key, _size in overlap_true_files]
+    if len(set(file_keys)) != len(file_keys):
+        logging.info(
+            "[write-probe] duplicate mutation resource key; using polars path"
+        )
+        return None
+    try:
+        resolved_paths = [
+            _storage_duckdb_path(storage, key) for key in file_keys
+        ]
+    except Exception as exc:
+        logging.info(
+            f"[write-probe] local path resolution failed, using polars path: {exc}"
+        )
+        return None
+
+    pins = _pin_local_probe_files(storage, file_keys, resolved_paths)
+    if pins is None:
+        return None
+
+    cache_owned: List[_LocalProbeFileIdentity] = []
+    cache_scanned: Set[_LocalProbeFileIdentity] = set()
+    cache_finished = False
+    schema_cache_pending: Dict[
+        _LocalProbeFileIdentity, _LocalProbeSchemaProof,
+    ] = {}
+    try:
+        # Required mutation columns must physically exist with their exact
+        # canonical spelling/type in EVERY file.  Allowing schema-union to
+        # synthesize a NULL key could make an incoming NULL tombstone an
+        # unrelated legacy row.  A missing newer-than column remains valid
+        # legacy state and is materialized as typed NULL by the native scan.
+        schema_cache_hits = 0
+        schema_cache_misses = 0
+        with p.span("io.island_probe_schema"):
+            for pin in pins:
+                schema_proof = _LOCAL_PROBE_SCHEMA_CACHE.get(pin.identity)
+                if schema_proof is None:
+                    schema_cache_misses += 1
+                    arrow_schema = pq.read_schema(pin.scan_path)
+                    schema_proof = _LocalProbeSchemaProof(
+                        arrow_schema=arrow_schema,
+                        rows=-1,
+                        footer_sha256="",
+                    )
+                    schema_cache_pending[pin.identity] = schema_proof
+                else:
+                    schema_cache_hits += 1
+                    arrow_schema = schema_proof.arrow_schema
+                names = [str(field.name) for field in arrow_schema]
+                folded: Dict[str, int] = {}
+                for name in names:
+                    key = name.casefold()
+                    folded[key] = folded.get(key, 0) + 1
+                if folded.get(_ISLAND_PROBE_SOURCE_COL.casefold(), 0):
+                    raise ValueError(
+                        "mutation candidate contains the reserved probe source column"
+                    )
+                physical = polars.Schema(arrow_schema)
+                required = [ROWID_COL, *overwrite_columns]
+                for column in required:
+                    expected = projected_schema[column]
+                    if (
+                        column not in physical
+                        or physical[column] != expected
+                        or folded.get(column.casefold(), 0) != 1
+                    ):
+                        raise ValueError(
+                            f"mutation candidate {pin.key!r} has missing, ambiguous, "
+                            f"or non-{expected} column {column!r}"
+                        )
+                if newer_than_col and newer_than_col in physical:
+                    if (
+                        physical[newer_than_col]
+                        != projected_schema[newer_than_col]
+                    ):
+                        raise ValueError(
+                            f"mutation candidate {pin.key!r} has incompatible "
+                            f"newer-than column {newer_than_col!r}"
+                        )
+        p.add("probe_schema_cache_hits", schema_cache_hits)
+        p.add("probe_schema_cache_misses", schema_cache_misses)
+
+        cache_owned, cache_hits = _LOCAL_ROWID_INTEGRITY_CACHE.reserve(
+            pin.identity for pin in pins
+        )
+        p.add("probe_rowid_integrity_cache_hits", len(cache_hits))
+        p.add("probe_rowid_integrity_cache_misses", len(cache_owned))
+        owned = set(cache_owned)
+        integrity_pins = [pin for pin in pins if pin.identity in owned]
+        if integrity_pins:
+            integrity_scan = _island_probe_scan(
+                [pin.scan_path for pin in integrity_pins],
+                {ROWID_COL: polars.Int64},
+            )
+            with p.span("io.island_probe_rowid_integrity"):
+                integrity = (
+                    integrity_scan
+                    .group_by(_ISLAND_PROBE_SOURCE_COL)
+                    .agg([
+                        polars.len().alias("__rows__"),
+                        polars.col(ROWID_COL).count().alias("__nonnull__"),
+                        polars.col(ROWID_COL).n_unique().alias("__unique__"),
+                        polars.col(ROWID_COL).min().alias("__minimum__"),
+                    ])
+                    .collect(engine="streaming")
+                )
+            expected_paths = {pin.scan_path for pin in integrity_pins}
+            observed_paths = set(
+                integrity.get_column(_ISLAND_PROBE_SOURCE_COL).to_list()
+            ) if integrity.height else set()
+            if not observed_paths.issubset(expected_paths):
+                raise ValueError(
+                    "native mutation probe returned an unknown source file"
+                )
+            invalid = integrity.filter(
+                (polars.col("__rows__") != polars.col("__nonnull__"))
+                | (polars.col("__rows__") != polars.col("__unique__"))
+                | (polars.col("__minimum__") <= 0)
+            )
+            if invalid.height:
+                raise ValueError(
+                    "mutation candidate contains NULL, non-positive, or "
+                    "duplicate rowids"
+                )
+            # Empty Parquet files do not appear in the grouped result and are
+            # valid.  Publish their proof only after the main query and final
+            # path/inode fence also succeed.
+            cache_scanned.update(cache_owned)
+            p.add("probe_rowid_integrity_scanned_files", len(integrity_pins))
+
+        relation = _island_probe_scan(
+            [pin.scan_path for pin in pins], projected_schema,
+        )
+        with p.span("io.island_probe"):
+            matched = (
+                relation
+                .select([
+                    _ISLAND_PROBE_SOURCE_COL,
+                    ROWID_COL,
+                    *overwrite_columns,
+                    *([newer_than_col] if newer_than_col else []),
+                ])
+                .join(
+                    incoming_keys.lazy(),
+                    on=overwrite_columns,
+                    how="semi",
+                    nulls_equal=True,
+                )
+                .collect(engine="streaming")
+            )
+        if not _local_probe_pins_unchanged(pins):
+            raise ValueError("local mutation candidate changed during probe")
+
+        for pin in pins:
+            proof = schema_cache_pending.get(pin.identity)
+            if proof is not None:
+                _LOCAL_PROBE_SCHEMA_CACHE.publish(pin.identity, proof)
+        _LOCAL_ROWID_INTEGRITY_CACHE.finish(cache_owned, cache_scanned)
+        cache_finished = True
+
+        source_map = polars.DataFrame({
+            _ISLAND_PROBE_SOURCE_COL: [pin.scan_path for pin in pins],
+            TOMBSTONE_FILE_COL: [pin.key for pin in pins],
+        })
+        matched = matched.join(
+            source_map, on=_ISLAND_PROBE_SOURCE_COL, how="left",
+        ).drop(_ISLAND_PROBE_SOURCE_COL)
+        if (
+            TOMBSTONE_FILE_COL not in matched.columns
+            or matched.get_column(TOMBSTONE_FILE_COL).null_count() > 0
+            or ROWID_COL not in matched.columns
+            or matched.get_column(ROWID_COL).null_count() > 0
+        ):
+            raise ValueError("native mutation probe returned ambiguous identity")
+        p.add("probe_files", len(pins))
+        p.add("probe_rows_matched", int(matched.height))
+        logging.debug(
+            f"[write-probe] island-native scan matched {matched.height} "
+            f"existing row(s) across {len(pins)} file(s)"
+        )
+        return matched
+    except Exception as exc:
+        logging.info(
+            f"[write-probe] island-native probe failed, using polars path: {exc}"
+        )
+        return None
+    finally:
+        if not cache_finished and cache_owned:
+            _LOCAL_ROWID_INTEGRITY_CACHE.finish(cache_owned)
+        for pin in pins:
+            pin.close()
 
 
 def _duckdb_probe_overlap_matches(
@@ -3751,14 +4285,14 @@ def resolve_overwrite_writes(
 ) -> Tuple[polars.DataFrame, List[Tuple[str, int]]]:
     """Single-pass overwrite resolution: stale filtering + delete-vector pairs.
 
-    Returns ``(filtered_incoming_df, delete_pairs)``. When the DuckDB pushdown
-    probe is enabled explicitly, or selected automatically for a sufficiently
-    large LocalStorage candidate set, it is computed from ONE probe over the
-    overlapping files. It falls back to the
+    Returns ``(filtered_incoming_df, delete_pairs)``. A sufficiently large local
+    candidate set uses the Island-native Polars scanner; an explicitly enabled
+    non-local compatibility lane uses DuckDB. Both compute the result from one
+    projected match probe over the overlapping files. It falls back to the
     strict projected Polars path (``filter_stale_incoming_rows`` plus
-    ``identify_deleted_rowids``) when the probe is disabled, DuckDB is
-    unavailable, the probe fails, or the file schema cannot be probed; semantics
-    are identical on both paths.
+    ``identify_deleted_rowids``) when acceleration is disabled/unavailable, a
+    probe fails, or a file schema cannot be proven; semantics are identical on
+    every path.
 
     *newer_than_col* falsy ⇒ no stale filtering (delete/upsert without conflict
     resolution); the incoming df is returned unchanged and every overlapping row
@@ -3787,9 +4321,9 @@ def resolve_overwrite_writes(
         f"newer_than={newer_than_col}"
     )
     # Remote/object storage remains opt-in because probing it can require httpfs
-    # and credentials. LocalStorage is auto-selected: DuckDB reads the same
-    # immutable files directly, and every unsupported/error case still falls
-    # through to the required=True projected Polars oracle below.
+    # and credentials. LocalStorage is auto-selected into the Island-native
+    # open-fd scanner; every unsupported/error case still falls through to the
+    # required=True projected Polars oracle below.
     matched = None
     probe_columns = list(dict.fromkeys(
         [ROWID_COL]
@@ -3802,15 +4336,36 @@ def resolve_overwrite_writes(
     if auto_local:
         p.add("overwrite_resolve_probe_auto_local", 1)
     if probe_selected:
-        matched = _duckdb_probe_overlap_matches(
-            overlap_true,
-            overwrite_columns,
-            newer_than_col,
-            incoming_keys,
-            incoming_schema=dict(incoming_df.schema),
-            profiler=p,
-            storage=storage,
-        )
+        probe_storage = storage
+        if probe_storage is None:
+            try:
+                probe_storage = _get_storage()
+            except Exception:
+                probe_storage = None
+        if _storage_reports_local(probe_storage):
+            p.add("overwrite_resolve_probe_island_native", 1)
+            matched = _island_probe_overlap_matches(
+                overlap_true,
+                overwrite_columns,
+                newer_than_col,
+                incoming_keys,
+                incoming_schema=dict(incoming_df.schema),
+                profiler=p,
+                storage=probe_storage,
+            )
+        else:
+            # Compatibility only: remote probing is never automatic and still
+            # requires the explicit SUPERTABLE_DUCKDB_WRITE_PROBE opt-in.
+            p.add("overwrite_resolve_probe_duckdb_remote", 1)
+            matched = _duckdb_probe_overlap_matches(
+                overlap_true,
+                overwrite_columns,
+                newer_than_col,
+                incoming_keys,
+                incoming_schema=dict(incoming_df.schema),
+                profiler=p,
+                storage=probe_storage,
+            )
     if matched is not None:
         try:
             if existing_tombstones is not None and existing_tombstones.height:
