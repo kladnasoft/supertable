@@ -38,6 +38,7 @@ def _now_ms() -> int:
 
 _ROOT_CLONE_TYPES = frozenset({"readonly", "replica"})
 _REDIS_LUA_MAX_SAFE_INTEGER = (1 << 53) - 1
+_UNPINNED_MIRROR_CONFIG = object()
 
 
 def _lua_safe_integer(
@@ -945,6 +946,9 @@ class RedisCatalog:
     # when a catalog advertises this capability.  Third-party/test adapters
     # without it retain the post-commit compatibility path.
     supports_atomic_quality_generation = True
+    # DataWriter may pass the exact raw mirror configuration returned by
+    # begin_table_mutation to select the no-mirror commit hot path.
+    supports_pinned_no_mirror_commit = True
     _STAGE_LOCK_SCAN_COUNT = 256
     _STAGE_LOCK_DRAIN_LIMIT = 10_000
     _STAGE_LOCK_SCAN_CALL_LIMIT = 100_000
@@ -2751,6 +2755,165 @@ end
 if quality_generation ~= '' then
   -- The scheduler resolves this persistent generation into configured modes.
   -- Publication here is atomic with root/leaf commit and all lifecycle fences.
+  redis.call('SET', quality_unresolved_key, quality_generation)
+end
+return {1, new_leaf_version, new_root_version}
+"""
+
+    # No-mirror snapshot publication hot path.  The begin-mutation boundary
+    # already validated the raw mirror document and proved that its format set
+    # was empty.  Comparing that exact raw value (including absent-vs-present)
+    # here preserves the acknowledged-enable race fence without decoding or
+    # normalizing mirror configuration, and no publication intent can exist
+    # for a commit with an empty mirror set.  Every core publication invariant
+    # remains identical to _LUA_SNAPSHOT_COMMIT.
+    _LUA_SNAPSHOT_COMMIT_NO_MIRRORS = _LUA_ROOT_DOCUMENT_GUARD + """
+local leaf_key = KEYS[1]
+local root_key = KEYS[2]
+local lock_key = KEYS[3]
+local namespace_lock = KEYS[4]
+local table_names = KEYS[5]
+local namespace_delete = KEYS[6]
+local simple_delete = KEYS[7]
+local schema_key = KEYS[8]
+local quality_unresolved_key = KEYS[9]
+local mirrors_config_key = KEYS[10]
+
+local payload_json = ARGV[1]
+local new_path = ARGV[2]
+local now_ms = tonumber(ARGV[3])
+local expected_version = tonumber(ARGV[4])
+local expected_path = ARGV[5]
+local lock_token = ARGV[6]
+local commit_id = ARGV[7]
+local simple_name = ARGV[8]
+local schema_json = ARGV[9]
+local quality_generation = ARGV[10]
+local mirror_pin_present = ARGV[11]
+local expected_mirror_raw = ARGV[12]
+
+if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
+    or now_ms ~= math.floor(now_ms)
+    or not expected_version or expected_version < -1
+    or expected_version > ROOT_MAX_SAFE_INTEGER
+    or expected_version ~= math.floor(expected_version) then
+  return {-13, 0, 0}
+end
+
+local early_held_token = redis.call('GET', lock_key)
+if not early_held_token or early_held_token ~= lock_token then
+  return {-2, 0, 0}
+end
+
+-- The raw pin was validated by begin_table_mutation.  Exact comparison is
+-- stronger than comparing only normalized formats: any distinct generation
+-- conflicts rather than letting this writer omit a newly enabled mirror.
+local mirrors_config_type = redis.call('TYPE', mirrors_config_key)
+if type(mirrors_config_type) == 'table' then
+  mirrors_config_type = mirrors_config_type['ok']
+end
+if mirrors_config_type ~= 'none' and mirrors_config_type ~= 'string' then
+  return {-15, 0, 0}
+end
+if mirror_pin_present == '0' then
+  if mirrors_config_type ~= 'none' then return {-14, 0, 0} end
+elseif mirror_pin_present == '1' then
+  if mirrors_config_type ~= 'string'
+      or redis.call('GET', mirrors_config_key) ~= expected_mirror_raw then
+    return {-14, 0, 0}
+  end
+else
+  return {-15, 0, 0}
+end
+
+local held_token = redis.call('GET', lock_key)
+if not held_token or held_token ~= lock_token then
+  return {-2, 0, 0}
+end
+if redis.call('EXISTS', namespace_lock) == 1 then
+  return {-7, 0, 0}
+end
+if redis.call('EXISTS', namespace_delete) == 1 then
+  return {-8, 0, 0}
+end
+if redis.call('EXISTS', simple_delete) == 1 then
+  return {-9, 0, 0}
+end
+local names_type = redis.call('TYPE', table_names)
+if type(names_type) == 'table' then names_type = names_type['ok'] end
+if names_type ~= 'none' and names_type ~= 'set' then
+  return {-3, 0, 0}
+end
+
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return {-11, 0, 0} end
+if root_type ~= 'string' then return {-3, 0, 0} end
+local raw_root = redis.call('GET', root_key)
+local okr, root = pcall(cjson.decode, raw_root)
+if not okr or type(root) ~= 'table' then return {-3, 0, 0} end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return {-3, 0, 0} end
+if root_state == 0 then return {-12, 0, 0} end
+local root_version = root['version']
+
+local old_version = -1
+local old_path = ''
+local cur = redis.call('GET', leaf_key)
+if cur then
+  local ok, obj = pcall(cjson.decode, cur)
+  if not ok or type(obj) ~= 'table'
+      or type(obj['version']) ~= 'number'
+      or obj['version'] < 0
+      or obj['version'] > ROOT_MAX_SAFE_INTEGER
+      or obj['version'] ~= math.floor(obj['version'])
+      or type(obj['ts']) ~= 'number'
+      or obj['ts'] < 0
+      or obj['ts'] > ROOT_MAX_SAFE_INTEGER
+      or obj['ts'] ~= math.floor(obj['ts'])
+      or type(obj['path']) ~= 'string'
+      or obj['path'] == '' then
+    return {-3, 0, 0}
+  end
+  old_version = obj['version']
+  old_path = obj['path']
+end
+
+if old_version ~= expected_version or old_path ~= expected_path then
+  return {-1, old_version, 0}
+end
+
+local okp, payload = pcall(cjson.decode, payload_json)
+if not okp or type(payload) ~= 'table' then
+  return {-4, 0, 0}
+end
+local oks, schema = pcall(cjson.decode, schema_json)
+if not oks or type(schema) ~= 'table' then
+  return {-4, 0, 0}
+end
+if old_version >= ROOT_MAX_SAFE_INTEGER
+    or root_version >= ROOT_MAX_SAFE_INTEGER then
+  return {-13, 0, 0}
+end
+
+local new_leaf_version = old_version + 1
+local new_root_version = root_version + 1
+local leaf = {
+  version = new_leaf_version,
+  ts = now_ms,
+  path = new_path,
+  payload = payload,
+  commit_id = commit_id
+}
+root['version'] = new_root_version
+root['ts'] = now_ms
+root['commit_id'] = commit_id
+
+redis.call('SET', leaf_key, cjson.encode(leaf))
+redis.call('SET', root_key, cjson.encode(root))
+redis.call('SET', schema_key, schema_json)
+redis.call('SADD', table_names, simple_name)
+if quality_generation ~= '' then
   redis.call('SET', quality_unresolved_key, quality_generation)
 end
 return {1, new_leaf_version, new_root_version}
@@ -4586,6 +4749,9 @@ return 1
             self._LUA_FINALIZE_NAMESPACE_DELETION
         )
         self._snapshot_commit = self.r.register_script(self._LUA_SNAPSHOT_COMMIT)
+        self._snapshot_commit_no_mirrors = self.r.register_script(
+            self._LUA_SNAPSHOT_COMMIT_NO_MIRRORS
+        )
         self._mirror_publication_prepare = self.r.register_script(
             self._LUA_MIRROR_PUBLICATION_PREPARE
         )
@@ -4880,7 +5046,22 @@ return 1
                 f"Corrupt table configuration for {org}/{sup}/{simple}"
             )
 
-        mirrors_document = decode_json(raw[3], field="mirror configuration")
+        mirror_pin_raw = raw[3]
+        if isinstance(mirror_pin_raw, bytes):
+            try:
+                mirror_pin_raw = mirror_pin_raw.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise RuntimeError(
+                    f"Corrupt mirror configuration for {org}/{sup}/{simple}"
+                ) from exc
+        mirror_pin = None if mirror_pin_raw in (None, "") else mirror_pin_raw
+        if mirror_pin is not None and not isinstance(mirror_pin, str):
+            raise RuntimeError(
+                f"Corrupt mirror configuration for {org}/{sup}/{simple}"
+            )
+        mirrors_document = decode_json(
+            mirror_pin_raw, field="mirror configuration",
+        )
         mirrors: List[str] = []
         if mirrors_document is not None:
             if not isinstance(mirrors_document, dict):
@@ -4964,6 +5145,7 @@ return 1
             "leaf": leaf,
             "table_config": dict(config or {}),
             "mirrors": mirrors,
+            "mirror_pin": mirror_pin,
             "rowid_floor": rowid_floor,
             "rowid_reservation": rowid_reservation,
         }
@@ -5913,6 +6095,7 @@ return 1
             commit_id: Optional[str] = None,
             mirror_publication: bool = False,
             expected_mirrors: Optional[Sequence[str]] = None,
+            expected_mirror_pin: Any = _UNPINNED_MIRROR_CONFIG,
             quality_generation: Optional[str] = None,
             now_ms: Optional[int] = None,
     ) -> tuple[int, int]:
@@ -5934,6 +6117,12 @@ return 1
         The same transaction persists it as unresolved post-ingest work.  The
         scheduler later expands it into configured modes under exact root/leaf
         lifecycle pins, so schedule reads never delay the writer.
+
+        ``expected_mirror_pin`` is the exact raw empty-mirror configuration
+        observed by :meth:`begin_table_mutation`; explicit ``None`` pins key
+        absence.  It selects a smaller commit script that compares this raw
+        generation without decoding mirror state.  Omission retains the
+        general mirror-capable path for adapters and direct callers.
         """
         if not lock_token:
             raise LockLostError("snapshot publication requires a fencing lock token")
@@ -5973,38 +6162,105 @@ return 1
                 raise ValueError("expected_mirrors contains an invalid format")
             if normalized not in normalized_mirrors:
                 normalized_mirrors.append(normalized)
+
+        use_no_mirror_path = (
+            expected_mirror_pin is not _UNPINNED_MIRROR_CONFIG
+        )
+        mirror_pin_present = False
+        mirror_pin_raw = ""
+        if use_no_mirror_path:
+            if mirror_publication or normalized_mirrors:
+                raise ValueError(
+                    "no-mirror snapshot commit received configured mirrors"
+                )
+            if expected_mirror_pin is not None:
+                if not isinstance(expected_mirror_pin, str) or not expected_mirror_pin:
+                    raise TypeError(
+                        "expected_mirror_pin must be raw JSON or explicit None"
+                    )
+                try:
+                    pinned_document = json.loads(expected_mirror_pin)
+                except (json.JSONDecodeError, TypeError) as exc:
+                    raise ValueError(
+                        "expected_mirror_pin is not valid JSON"
+                    ) from exc
+                if (
+                    not isinstance(pinned_document, dict)
+                    or pinned_document.get("formats") != []
+                    or type(pinned_document.get("ts")) is not int
+                    or pinned_document["ts"] < 0
+                    or pinned_document["ts"] > _REDIS_LUA_MAX_SAFE_INTEGER
+                ):
+                    raise ValueError(
+                        "expected_mirror_pin is not an empty mirror configuration"
+                    )
+                mirror_pin_present = True
+                mirror_pin_raw = expected_mirror_pin
         try:
-            raw = self._snapshot_commit(
-                keys=[
-                    RK.meta_leaf(org, sup, simple),
-                    RK.meta_root(org, sup),
-                    RK.lock_leaf(org, sup, simple),
-                    RK.meta_mirror_publication(org, sup, simple),
-                    RK.lock_namespace(org, sup),
-                    RK.meta_table_names(org, sup),
-                    RK.meta_namespace_deletion_intent(org, sup),
-                    RK.meta_simple_deletion_intent(org, sup, simple),
-                    RK.schema(org, sup, simple),
-                    RK.meta_mirrors(org, sup),
-                    self._quality_key(
-                        org, sup, "pending_unresolved", simple,
-                    ),
-                ],
-                args=[
-                    payload_json,
-                    path,
-                    timestamp,
-                    base_version,
-                    expected_path or "",
-                    lock_token,
-                    cid,
-                    "1" if mirror_publication else "0",
-                    simple,
-                    json.dumps(self._snapshot_schema_document(payload)),
-                    json.dumps(normalized_mirrors),
-                    quality_generation,
-                ],
-            )
+            schema_json = json.dumps(self._snapshot_schema_document(payload))
+            if use_no_mirror_path:
+                raw = self._snapshot_commit_no_mirrors(
+                    keys=[
+                        RK.meta_leaf(org, sup, simple),
+                        RK.meta_root(org, sup),
+                        RK.lock_leaf(org, sup, simple),
+                        RK.lock_namespace(org, sup),
+                        RK.meta_table_names(org, sup),
+                        RK.meta_namespace_deletion_intent(org, sup),
+                        RK.meta_simple_deletion_intent(org, sup, simple),
+                        RK.schema(org, sup, simple),
+                        self._quality_key(
+                            org, sup, "pending_unresolved", simple,
+                        ),
+                        RK.meta_mirrors(org, sup),
+                    ],
+                    args=[
+                        payload_json,
+                        path,
+                        timestamp,
+                        base_version,
+                        expected_path or "",
+                        lock_token,
+                        cid,
+                        simple,
+                        schema_json,
+                        quality_generation,
+                        "1" if mirror_pin_present else "0",
+                        mirror_pin_raw,
+                    ],
+                )
+            else:
+                raw = self._snapshot_commit(
+                    keys=[
+                        RK.meta_leaf(org, sup, simple),
+                        RK.meta_root(org, sup),
+                        RK.lock_leaf(org, sup, simple),
+                        RK.meta_mirror_publication(org, sup, simple),
+                        RK.lock_namespace(org, sup),
+                        RK.meta_table_names(org, sup),
+                        RK.meta_namespace_deletion_intent(org, sup),
+                        RK.meta_simple_deletion_intent(org, sup, simple),
+                        RK.schema(org, sup, simple),
+                        RK.meta_mirrors(org, sup),
+                        self._quality_key(
+                            org, sup, "pending_unresolved", simple,
+                        ),
+                    ],
+                    args=[
+                        payload_json,
+                        path,
+                        timestamp,
+                        base_version,
+                        expected_path or "",
+                        lock_token,
+                        cid,
+                        "1" if mirror_publication else "0",
+                        simple,
+                        schema_json,
+                        json.dumps(normalized_mirrors),
+                        quality_generation,
+                    ],
+                )
         except redis.RedisError as exc:
             logger.error(f"[redis-catalog] snapshot commit error: {exc}")
             raise

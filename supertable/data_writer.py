@@ -315,9 +315,11 @@ class DataWriter:
             base_path: str,
             lock_token: str,
             commit_id: str,
-            now_ms: int,
-            mirrors: list[str] | None = None,
-            notify_quality: bool = False,
+        now_ms: int,
+        mirrors: list[str] | None = None,
+        mirror_pin_available: bool = False,
+        mirror_pin: str | None = None,
+        notify_quality: bool = False,
     ) -> None:
         """Publish a snapshot through the fenced atomic catalog primitive.
 
@@ -370,6 +372,15 @@ class DataWriter:
             }
             if mirror_formats:
                 commit_kwargs["mirror_publication"] = True
+            elif (
+                mirror_pin_available
+                and getattr(
+                    self.catalog,
+                    "supports_pinned_no_mirror_commit",
+                    False,
+                ) is True
+            ):
+                commit_kwargs["expected_mirror_pin"] = mirror_pin
             atomic_quality = bool(
                 notify_quality
                 and getattr(
@@ -1951,6 +1962,11 @@ class DataWriter:
                         commit_id=qid,
                         now_ms=now_ms,
                         mirrors=enabled_mirrors,
+                        mirror_pin_available=mutation_context is not None,
+                        mirror_pin=(
+                            mutation_context.get("mirror_pin")
+                            if mutation_context is not None else None
+                        ),
                         notify_quality=not (
                             simple_name.startswith("__")
                             and simple_name.endswith("__")

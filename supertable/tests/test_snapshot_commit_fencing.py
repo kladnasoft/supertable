@@ -103,6 +103,232 @@ def test_snapshot_commit_atomically_persists_unresolved_quality_generation():
     assert fake.ttl(unresolved_key) == -1
 
 
+def test_pinned_absent_mirrors_use_small_atomic_commit_path(monkeypatch):
+    catalog, fake = _catalog()
+    _seed(fake)
+    general_commit = MagicMock(
+        side_effect=AssertionError("general mirror commit path used"),
+    )
+    monkeypatch.setattr(catalog, "_snapshot_commit", general_commit)
+
+    assert catalog.commit_snapshot(
+        "org",
+        "lake",
+        "table",
+        {"schema": [{"id": "long"}], "resources": []},
+        "snap/5.json",
+        expected_version=4,
+        expected_path="snap/4.json",
+        lock_token="token",
+        commit_id="commit-5",
+        expected_mirrors=[],
+        expected_mirror_pin=None,
+        quality_generation="commit-5",
+        now_ms=123,
+    ) == (5, 10)
+
+    general_commit.assert_not_called()
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    root = json.loads(fake.get(RK.meta_root("org", "lake")))
+    assert leaf["version"] == 5
+    assert leaf["path"] == "snap/5.json"
+    assert leaf["commit_id"] == "commit-5"
+    assert root["version"] == 10
+    assert root["commit_id"] == "commit-5"
+    assert json.loads(fake.get(RK.schema("org", "lake", "table"))) == {
+        "id": "long",
+    }
+    assert fake.sismember(RK.meta_table_names("org", "lake"), "table")
+    assert fake.get(catalog._quality_key(
+        "org", "lake", "pending_unresolved", "table",
+    )) == "commit-5"
+
+
+def test_pinned_empty_mirror_document_uses_small_commit_path(monkeypatch):
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    fake.set(
+        RK.meta_mirrors("org", "lake"),
+        json.dumps({"formats": [], "ts": 7}, separators=(",", ":")),
+    )
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token",
+    )
+    general_commit = MagicMock(
+        side_effect=AssertionError("general mirror commit path used"),
+    )
+    monkeypatch.setattr(catalog, "_snapshot_commit", general_commit)
+
+    assert catalog.commit_snapshot(
+        "org", "lake", "table", {"resources": []}, "snap/5.json",
+        expected_version=4,
+        expected_path="snap/4.json",
+        lock_token="token",
+        expected_mirrors=context["mirrors"],
+        expected_mirror_pin=context["mirror_pin"],
+        now_ms=123,
+    ) == (5, 10)
+    general_commit.assert_not_called()
+
+
+def test_pinned_no_mirror_commit_rejects_concurrent_enable():
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token",
+    )
+    assert context["mirrors"] == []
+    assert context["mirror_pin"] is None
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+
+    catalog.enable_mirror("org", "lake", "DELTA")
+    with pytest.raises(
+        SnapshotCommitConflictError, match="Mirror configuration changed",
+    ):
+        catalog.commit_snapshot(
+            "org", "lake", "table", {"resources": []}, "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            expected_mirrors=[],
+            expected_mirror_pin=context["mirror_pin"],
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+
+
+def test_pinned_no_mirror_commit_rejects_disable_enable_aba():
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token",
+    )
+    catalog.enable_mirror("org", "lake", "DELTA")
+    catalog.disable_mirror("org", "lake", "DELTA")
+    assert catalog.get_mirrors("org", "lake") == []
+
+    with pytest.raises(
+        SnapshotCommitConflictError, match="Mirror configuration changed",
+    ):
+        catalog.commit_snapshot(
+            "org", "lake", "table", {"resources": []}, "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            expected_mirrors=[],
+            expected_mirror_pin=context["mirror_pin"],
+        )
+
+
+def test_pinned_no_mirror_commit_rejects_corrupt_current_key_type():
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token",
+    )
+    fake.hset(RK.meta_mirrors("org", "lake"), "corrupt", "state")
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+
+    with pytest.raises(RuntimeError, match="Corrupt mirror configuration"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", {"resources": []}, "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            expected_mirrors=[],
+            expected_mirror_pin=context["mirror_pin"],
+        )
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+
+
+def test_no_mirror_fast_path_rejects_nonempty_raw_pin():
+    catalog, fake = _catalog()
+    _seed(fake)
+    pin = json.dumps({"formats": ["DELTA"], "ts": 1})
+
+    with pytest.raises(ValueError, match="empty mirror configuration"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", {}, "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            expected_mirrors=[],
+            expected_mirror_pin=pin,
+        )
+
+
+@pytest.mark.parametrize(
+    "race,error_type",
+    [
+        ("stale-base", SnapshotCommitConflictError),
+        ("lost-lock", LockLostError),
+        ("namespace-lock", RuntimeError),
+        ("namespace-delete", DeletionIntentConflictError),
+        ("simple-delete", DeletionIntentConflictError),
+        ("missing-root", FileNotFoundError),
+        ("read-only", PermissionError),
+        ("corrupt-leaf", RuntimeError),
+    ],
+)
+def test_no_mirror_fast_path_retains_publication_fences(race, error_type):
+    catalog, fake = _catalog()
+    _seed(fake)
+    expected_version = 4
+    lock_token = "token"
+    if race == "stale-base":
+        expected_version = 3
+    elif race == "lost-lock":
+        lock_token = "stale-owner"
+    elif race == "namespace-lock":
+        fake.set(RK.lock_namespace("org", "lake"), "deleter")
+    elif race == "namespace-delete":
+        fake.set(RK.meta_namespace_deletion_intent("org", "lake"), "pending")
+    elif race == "simple-delete":
+        fake.set(
+            RK.meta_simple_deletion_intent("org", "lake", "table"),
+            "pending",
+        )
+    elif race == "missing-root":
+        fake.delete(RK.meta_root("org", "lake"))
+    elif race == "read-only":
+        fake.set(
+            RK.meta_root("org", "lake"),
+            json.dumps({
+                "version": 9,
+                "ts": 1,
+                "read_only": True,
+                "clone_type": "readonly",
+                "cloned_from": "source",
+            }),
+        )
+    else:
+        fake.set(RK.meta_leaf("org", "lake", "table"), "[]")
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+
+    with pytest.raises(error_type):
+        catalog.commit_snapshot(
+            "org", "lake", "table", {"schema": [], "resources": []},
+            "snap/5.json",
+            expected_version=expected_version,
+            expected_path="snap/4.json",
+            lock_token=lock_token,
+            commit_id="commit-5",
+            expected_mirrors=[],
+            expected_mirror_pin=None,
+            quality_generation="commit-5",
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+    assert not fake.exists(RK.schema("org", "lake", "table"))
+    assert not fake.exists(catalog._quality_key(
+        "org", "lake", "pending_unresolved", "table",
+    ))
+
+
 @pytest.mark.parametrize("failure", ["stale", "lost_lock", "deleting"])
 def test_failed_snapshot_commit_never_publishes_quality_generation(failure):
     catalog, fake = _catalog()
@@ -1001,6 +1227,43 @@ def test_ambiguous_atomic_commit_error_is_never_retried_as_path_only():
     writer.catalog.bump_root.assert_not_called()
 
 
+def test_writer_passes_pinned_empty_mirror_generation_to_capable_catalog():
+    class Catalog:
+        supports_pinned_no_mirror_commit = True
+
+        def __init__(self):
+            self.kwargs = None
+
+        def commit_snapshot(self, *args, **kwargs):
+            self.kwargs = kwargs
+            return 5, 10
+
+    writer = DataWriter.__new__(DataWriter)
+    writer.super_table = SimpleNamespace(organization="org", super_name="lake")
+    writer.catalog = Catalog()
+    table = SimpleNamespace(
+        _last_snapshot_leaf={"version": 4, "path": "snap/4.json"},
+    )
+    raw_pin = json.dumps({"formats": [], "ts": 7}, separators=(",", ":"))
+
+    writer._publish_snapshot(
+        simple_table=table,
+        simple_name="table",
+        payload={"resources": []},
+        path="snap/5.json",
+        base_path="snap/4.json",
+        lock_token="token",
+        commit_id="commit-5",
+        now_ms=123,
+        mirrors=[],
+        mirror_pin_available=True,
+        mirror_pin=raw_pin,
+    )
+
+    assert writer.catalog.kwargs["expected_mirror_pin"] == raw_pin
+    assert writer.catalog.kwargs["expected_mirrors"] == []
+
+
 def test_legacy_catalog_adapter_uses_lightweight_quality_fallback():
     fake = fakeredis.FakeStrictRedis(decode_responses=True)
     _seed(fake)
@@ -1138,6 +1401,9 @@ def test_begin_table_mutation_pins_context_and_reserves_in_one_boundary():
         "primary_keys": ["id"], "modified_ms": 7,
     }
     assert context["mirrors"] == ["DELTA", "PARQUET"]
+    assert json.loads(context["mirror_pin"]) == {
+        "formats": ["DELTA", "PARQUET"], "ts": 8,
+    }
     assert context["rowid_floor"] == 100
     assert context["rowid_reservation"] == (101, 104)
     assert fake.get(RK.meta_rowid_seq("org", "lake", "table")) == "104"
@@ -1156,6 +1422,7 @@ def test_begin_table_mutation_returns_absent_leaf_without_creating_state():
         "leaf": None,
         "table_config": {},
         "mirrors": [],
+        "mirror_pin": None,
         "rowid_floor": None,
         "rowid_reservation": None,
     }
