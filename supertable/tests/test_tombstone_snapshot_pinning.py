@@ -29,13 +29,27 @@ from supertable.utils.snapshot import (
 _PINNED_DIGEST = "0" * 64
 
 
-def _seal_mock_manifest(storage, manifest_key: str, body: bytes) -> None:
+def _seal_mock_manifest(
+    storage,
+    manifest_key: str,
+    body: bytes,
+    *,
+    segment_sizes=None,
+) -> None:
     metadata = ObjectMetadata(size=len(body), version="manifest-v1")
-    storage.stat_object.side_effect = lambda key: (
-        metadata
-        if key == manifest_key
-        else (_ for _ in ()).throw(KeyError(key))
-    )
+    segment_metadata = {
+        key: ObjectMetadata(size=size, version=f"segment-v1:{key}")
+        for key, size in dict(segment_sizes or {}).items()
+    }
+
+    def _stat_object(key):
+        if key == manifest_key:
+            return metadata
+        if key in segment_metadata:
+            return segment_metadata[key]
+        raise KeyError(key)
+
+    storage.stat_object.side_effect = _stat_object
 
     def _read_range(key, offset, length, *, expected=None):
         assert key == manifest_key
@@ -751,11 +765,12 @@ def test_reader_loads_v2_manifest_once_for_self_join_and_resolves_segments(
         "org",
         "SELECT a.id FROM t AS a JOIN t AS b ON a.id = b.id",
     )
-    reader.storage.size.side_effect = {
-        manifest_key: len(body),
-        segment_key: 123,
-    }.__getitem__
-    _seal_mock_manifest(reader.storage, manifest_key, body)
+    _seal_mock_manifest(
+        reader.storage,
+        manifest_key,
+        body,
+        segment_sizes={segment_key: 123},
+    )
 
     result, status, message = reader.execute("admin", engine=Engine.DUCKDB)
 
@@ -764,8 +779,8 @@ def test_reader_loads_v2_manifest_once_for_self_join_and_resolves_segments(
     assert result["id"].tolist() == [1]
     reader.storage.read_bytes.assert_not_called()
     reader.storage.read_range.assert_called_once()
-    assert reader.storage.stat_object.call_count == 2
-    reader.storage.size.assert_called_once_with(segment_key)
+    assert reader.storage.stat_object.call_count == 3
+    reader.storage.size.assert_not_called()
     assert [item.args for item in estimator._to_duckdb_path.call_args_list] == [
         (manifest_key,),
         (segment_key,),
@@ -779,6 +794,9 @@ def test_reader_loads_v2_manifest_once_for_self_join_and_resolves_segments(
         assert len(definition.segments) == 1
         assert definition.segments[0].cache_key == segment_key
         assert definition.segments[0].tombstone_path == "/resolved/segment-a.parquet"
+        assert definition.segments[0].provider_identity == (
+            f"size=123|version=segment-v1:{segment_key}"
+        )
     catalog.get_leaf.assert_not_called()
 
 
@@ -827,11 +845,14 @@ def test_reader_aborts_when_any_v2_segment_cannot_be_proved(
         monkeypatch, reflection, resolver=_resolve,
     )
     reader = reader_module.DataReader("s", "org", "SELECT * FROM t")
-    reader.storage.size.side_effect = {
-        manifest_key: len(body),
-        segment_key: (122 if failure == "size" else 123),
-    }.__getitem__
-    _seal_mock_manifest(reader.storage, manifest_key, body)
+    _seal_mock_manifest(
+        reader.storage,
+        manifest_key,
+        body,
+        segment_sizes={
+            segment_key: (122 if failure == "size" else 123),
+        },
+    )
 
     result, status, message = reader.execute("admin", engine=Engine.DUCKDB)
 
