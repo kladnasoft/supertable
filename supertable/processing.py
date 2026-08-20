@@ -8168,6 +8168,8 @@ def load_tombstone_segments(
     if frame is None:  # required loader and active segments make this defensive.
         raise ValueError("Required v2 deletion vector was unavailable")
     return frame
+
+
 def load_tombstone_state(
         tombstone_path: Optional[str], **kwargs: Any,
 ) -> Optional[LoadedTombstoneState]:
