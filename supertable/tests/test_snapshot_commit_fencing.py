@@ -9,7 +9,11 @@ import redis
 from supertable import redis_keys as RK
 from supertable.data_writer import DataWriter
 from supertable.errors import LockLostError, SnapshotCommitConflictError
-from supertable.redis_catalog import DeletionIntentConflictError, RedisCatalog
+from supertable.redis_catalog import (
+    DeletionIntentConflictError,
+    ReadOnlyCatalogError,
+    RedisCatalog,
+)
 from supertable.tombstone_manifest_v2 import MAX_JSON_EXACT_INTEGER
 
 
@@ -1629,7 +1633,18 @@ def test_ambiguous_atomic_commit_error_is_never_retried_as_path_only():
     writer.catalog.bump_root.assert_not_called()
 
 
-def test_typed_catalog_rejection_returns_batch_to_safe_orphan_cleanup():
+@pytest.mark.parametrize(
+    "rejection",
+    [
+        SnapshotCommitConflictError("stale base"),
+        LockLostError("lost lock"),
+        DeletionIntentConflictError("deletion intent"),
+        ReadOnlyCatalogError("read only"),
+    ],
+)
+def test_typed_catalog_rejection_returns_batch_to_safe_orphan_cleanup(
+    rejection,
+):
     events = []
 
     class Batch:
@@ -1645,14 +1660,14 @@ def test_typed_catalog_rejection_returns_batch_to_safe_orphan_cleanup():
     class Catalog:
         def commit_snapshot(self, *args, **kwargs):
             events.append("redis")
-            raise SnapshotCommitConflictError("stale base")
+            raise rejection
 
     writer = DataWriter.__new__(DataWriter)
     writer.super_table = SimpleNamespace(organization="org", super_name="lake")
     writer.catalog = Catalog()
     table = SimpleNamespace(_last_snapshot_leaf={"version": 4, "path": "snap/4.json"})
 
-    with pytest.raises(SnapshotCommitConflictError, match="stale base"):
+    with pytest.raises(type(rejection), match=str(rejection)):
         writer._publish_snapshot(
             simple_table=table,
             simple_name="table",

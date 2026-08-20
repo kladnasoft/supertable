@@ -73,6 +73,8 @@ from supertable.rbac.access_control import (  # noqa: F401
     check_write_access,
 )
 from supertable.redis_catalog import (
+    DeletionIntentConflictError,
+    ReadOnlyCatalogError,
     RedisCatalog,
     persist_unresolved_quality_generation,
 )
@@ -568,7 +570,13 @@ class DataWriter:
                     durability_batch.catalog_commit_succeeded()
             except Exception as exc:
                 if durability_batch is not None and isinstance(
-                    exc, (SnapshotCommitConflictError, LockLostError),
+                    exc,
+                    (
+                        SnapshotCommitConflictError,
+                        LockLostError,
+                        DeletionIntentConflictError,
+                        ReadOnlyCatalogError,
+                    ),
                 ):
                     # These typed responses prove the fenced Lua transaction
                     # rejected the commit. Unlike a transport timeout, cleanup

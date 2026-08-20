@@ -440,6 +440,37 @@ def test_reclaim_does_not_sunset_when_dv_has_extra_ghost_rowid(monkeypatch):
     assert result == (set(), None, None)
 
 
+def test_reclaim_counts_v2_nonpersisted_dead_files(monkeypatch):
+    profiler = processing.Profiler()
+    monkeypatch.setattr(
+        processing,
+        "_read_parquet_safe",
+        lambda *a, **k: pl.DataFrame({
+            "__rowid__": pl.Series([10], dtype=pl.Int64),
+        }),
+    )
+
+    result = processing.reclaim_fully_dead_files(
+        resources=[{"file": "f.parquet", "rows": 1, "file_size": 10}],
+        combined_dv=_dv([
+            ("f.parquet", 10),
+            ("survivor.parquet", 20),
+        ]),
+        tombstone_dir="dv",
+        compression_level=1,
+        profiler=profiler,
+        persist=False,
+    )
+
+    assert result[0] == {"f.parquet"}
+    assert result[1] is None
+    assert result[2].to_dict(as_series=False) == {
+        "__file__": ["survivor.parquet"],
+        "__rowid__": [20],
+    }
+    assert profiler.counts["reclaimed_dead_files"] == 1
+
+
 def test_compaction_rejects_duplicate_physical_rowids(monkeypatch):
     monkeypatch.setattr(
         processing,

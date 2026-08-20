@@ -4989,6 +4989,8 @@ def reclaim_fully_dead_files(
     if not fully_dead:
         return set(), None, None
 
+    p.add("reclaimed_dead_files", len(fully_dead))
+
     survivors = combined_dv.filter(
         ~polars.col(TOMBSTONE_FILE_COL).is_in(list(fully_dead))
     )
@@ -5000,7 +5002,6 @@ def reclaim_fully_dead_files(
 
     new_path = _partitioned_new_path(tombstone_dir, "deleted")
     _write_df_parquet(survivors, new_path, compression_level, profiler=p)
-    p.add("reclaimed_dead_files", len(fully_dead))
     return fully_dead, new_path, survivors
 
 
