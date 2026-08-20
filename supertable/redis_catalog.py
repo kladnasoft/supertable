@@ -1974,17 +1974,57 @@ else
     local pointer = candidate['tombstone']
     local tombstone_rows = candidate['tombstone_rows']
     local digest = candidate['tombstone_digest']
+    local format_marker = candidate['tombstone_format']
+    local tombstone_format = 1
+    local format_ok = false
+    if format_marker == nil then
+      format_ok = true
+    elseif type(format_marker) == 'number'
+        and format_marker == math.floor(format_marker)
+        and (format_marker == 1 or format_marker == 2) then
+      tombstone_format = format_marker
+      format_ok = true
+    end
+    local function v2_manifest_path_ok(path)
+      if type(path) ~= 'string' or path == ''
+          or string.len(path) > 4096
+          or string.sub(path, 1, 1) == '/'
+          or string.sub(path, -1) == '/'
+          or string.sub(path, -5) ~= '.json'
+          or string.find(path, string.char(92), 1, true)
+          or string.find(path, '//', 1, true)
+          or string.find(path, '?', 1, true)
+          or string.find(path, '#', 1, true)
+          or string.find(path, '://', 1, true)
+          or string.match(path, '^[%a][%w+%.%-]*:')
+          or string.match(path, '[%c]')
+          or string.match(path, '^%s')
+          or string.match(path, '%s$') then return false end
+      local components = 0
+      for component in string.gmatch(path, '[^/]+') do
+        if component == '.' or component == '..' then return false end
+        components = components + 1
+      end
+      return components > 0
+    end
     local tombstone_ok = false
-    if pointer == cjson.null and type(tombstone_rows) == 'number'
+    if format_ok and pointer == cjson.null and type(tombstone_rows) == 'number'
         and tombstone_rows == 0 and digest == cjson.null then
       tombstone_ok = true
-    elseif type(pointer) == 'string' and pointer ~= ''
+    elseif format_ok and type(pointer) == 'string' and pointer ~= ''
         and type(tombstone_rows) == 'number'
         and tombstone_rows > 0
         and tombstone_rows == math.floor(tombstone_rows)
         and type(digest) == 'string' and string.len(digest) == 64
         and string.match(digest, '^[0-9a-f]+$') then
-      tombstone_ok = true
+      if tombstone_format == 2 then
+        tombstone_ok = tombstone_rows <= ROOT_MAX_SAFE_INTEGER
+            and v2_manifest_path_ok(pointer)
+      else
+        -- A JSON root without the explicit v2 discriminator is a malformed
+        -- hybrid that an old reader would try to open as Parquet.
+        tombstone_ok = string.sub(pointer, -5) ~= '.json'
+      end
     end
     local raw_floor = candidate['rowid_high_watermark']
     if type(candidate['snapshot_version']) == 'number'

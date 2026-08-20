@@ -330,6 +330,12 @@ class SuperSnapshot:
     # zero.  Trailing fields preserve the positional constructor contract.
     candidate_row_groups: int = 0
     candidate_row_groups_complete: bool = False
+    # Deletion-vector representation pinned by this snapshot.  ``None`` and
+    # ``1`` are the legacy single-Parquet artifact; explicit ``2`` means an
+    # active pointer names a standalone, content-sealed segment manifest.  A
+    # drained v2 table may retain format 2 with the exact empty state.
+    # Kept last to preserve every existing positional constructor.
+    tombstone_format: Optional[int] = None
 
 
 @dataclass
@@ -387,6 +393,8 @@ class TombstoneDef:
     # row with a coincidentally equal row id.
     resource_keys: Tuple[str, ...] = field(default_factory=tuple)
     snapshot_resource_keys: Optional[Tuple[str, ...]] = None
+    # Trailing for positional compatibility; see SuperSnapshot above.
+    tombstone_format: Optional[int] = None
 
 
 @dataclass

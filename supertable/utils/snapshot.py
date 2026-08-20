@@ -8,11 +8,14 @@ explicit empty state can resurrect physically retained deleted rows.
 
 from __future__ import annotations
 
-import re
 from typing import Any, Dict, Optional, Tuple
 
+from supertable.tombstone_manifest_v2 import (
+    TombstoneManifestV2Error,
+    validate_snapshot_tombstone_state,
+)
 
-_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
 _MAX_LUA_EXACT_INTEGER = 2**53 - 1
 
 
@@ -94,12 +97,15 @@ def complete_snapshot_payload(
     """Return a complete cached snapshot, otherwise ``None``.
 
     Completeness includes an explicit deletion-vector state.  The only valid
-    pointerless state is exactly ``(None, 0, None)``; an active pointer needs a
-    positive exact integer count and the canonical lowercase SHA-256 seal.
-    Invalid or legacy payloads deliberately fall back to the heavy immutable
-    JSON rather than guessing that no tombstone exists.  Redis callers must
-    set ``require_policy_marker=True``: only an explicit ``_row_filter`` key
-    proves that the cache publisher represented the linked-share policy state.
+    pointerless state is exactly ``(None, 0, None)`` (for legacy v1 or a
+    physically drained explicit v2 table); an active pointer needs a positive
+    exact integer count and the canonical lowercase SHA-256 seal.  Missing or
+    explicit format 1 is the legacy single-Parquet representation.  Explicit
+    format 2 requires a canonical standalone JSON-manifest pointer.  Invalid
+    or partial payloads deliberately fall back to the heavy immutable JSON
+    rather than guessing that no tombstone exists.  Redis callers must set
+    ``require_policy_marker=True``: only an explicit ``_row_filter`` key proves
+    that the cache publisher represented the linked-share policy state.
     Immutable snapshot objects may omit that key; absence there is the
     established unrestricted representation.
     """
@@ -143,22 +149,15 @@ def complete_snapshot_payload(
         ):
             return None
 
-    pointer = candidate.get("tombstone")
-    count = candidate.get("tombstone_rows")
-    digest = candidate.get("tombstone_digest")
-    exact_count = isinstance(count, int) and not isinstance(count, bool)
-    if pointer is None:
-        if not (exact_count and count == 0 and digest is None):
-            return None
-    elif isinstance(pointer, str) and bool(pointer):
-        if not (
-            exact_count
-            and count > 0
-            and isinstance(digest, str)
-            and _SHA256_RE.fullmatch(digest)
-        ):
-            return None
-    else:
+    try:
+        validate_snapshot_tombstone_state(
+            candidate.get("tombstone"),
+            candidate.get("tombstone_rows"),
+            candidate.get("tombstone_digest"),
+            format_present="tombstone_format" in candidate,
+            tombstone_format=candidate.get("tombstone_format"),
+        )
+    except (TypeError, TombstoneManifestV2Error):
         return None
 
     return candidate

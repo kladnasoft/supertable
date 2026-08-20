@@ -1463,6 +1463,97 @@ def test_begin_table_mutation_pins_context_and_reserves_in_one_boundary():
     assert fake.get(RK.meta_rowid_seq("org", "lake", "table")) == "104"
 
 
+@pytest.mark.parametrize("active", [False, True])
+def test_begin_table_mutation_lua_accepts_explicit_v2_snapshot_state(active):
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    leaf["payload"]["tombstone_format"] = 2
+    if active:
+        leaf["payload"].update({
+            "tombstone": "org/lake/tables/table/tombstone/manifest.json",
+            "tombstone_rows": 3,
+            "tombstone_digest": "0" * 64,
+        })
+    fake.set(RK.meta_leaf("org", "lake", "table"), json.dumps(leaf))
+
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token", reserve_count=2,
+    )
+
+    assert context["validated_snapshot"]["tombstone_format"] == 2
+    assert context["rowid_floor"] == 100
+    assert context["rowid_reservation"] == (101, 102)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"tombstone_format": None},
+        {"tombstone_format": True},
+        {"tombstone_format": 3},
+        {
+            "tombstone_format": 2,
+            "tombstone": "org/lake/tables/table/tombstone/deleted.parquet",
+            "tombstone_rows": 1,
+            "tombstone_digest": "0" * 64,
+        },
+        {
+            "tombstone": "org/lake/tables/table/tombstone/manifest.json",
+            "tombstone_rows": 1,
+            "tombstone_digest": "0" * 64,
+        },
+        {
+            "tombstone_format": 2,
+            "tombstone": "../tombstone/manifest.json",
+            "tombstone_rows": 1,
+            "tombstone_digest": "0" * 64,
+        },
+        {
+            "tombstone_format": 2,
+            "tombstone": "org/lake/tables/table/tombstone/manifest.json",
+            "tombstone_rows": 1,
+            "tombstone_digest": "A" * 64,
+        },
+        {
+            "tombstone_format": 2,
+            "tombstone": "org/lake/tables/table/tombstone/manifest.json",
+            "tombstone_rows": (1 << 53),
+            "tombstone_digest": "0" * 64,
+        },
+        {
+            "tombstone_format": 2,
+            "tombstone": None,
+            "tombstone_rows": 1,
+            "tombstone_digest": None,
+        },
+    ],
+)
+def test_begin_table_mutation_lua_rejects_malformed_v2_hybrids(
+        monkeypatch, changes,
+):
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    leaf["payload"].update(changes)
+    fake.set(RK.meta_leaf("org", "lake", "table"), json.dumps(leaf))
+
+    # Isolate the Lua decision.  Even if the post-command Python validator
+    # were accidentally permissive, malformed v2 state must not authorize the
+    # cached floor or mutate the row-ID allocator.
+    monkeypatch.setattr(
+        "supertable.redis_catalog.complete_snapshot_payload",
+        lambda *_args, **_kwargs: leaf["payload"],
+    )
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token", reserve_count=2,
+    )
+
+    assert context["rowid_floor"] is None
+    assert context["rowid_reservation"] is None
+    assert not fake.exists(RK.meta_rowid_seq("org", "lake", "table"))
+
+
 def test_prepared_mutation_leaf_reuses_exact_validated_payload(monkeypatch):
     catalog, fake = _catalog()
     _seed_current_snapshot(fake)
