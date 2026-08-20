@@ -36,6 +36,7 @@ from supertable.tombstone_manifest_v2 import (
 )
 from supertable.simple_table import SimpleTable
 from supertable.storage.local_storage import LocalStorage
+from supertable.storage.storage_interface import ObjectMetadata
 
 
 class _MemoryStorage:
@@ -48,6 +49,16 @@ class _MemoryStorage:
 
     def size(self, key):
         return self.sizes[key]
+
+    def stat_object(self, key):
+        size = self.sizes[key]
+        return ObjectMetadata(size=size, version=f"memory:{key}:{size}")
+
+    def read_range(self, key, offset, length, *, expected=None):
+        observed = self.stat_object(key)
+        if expected is not None and observed != expected:
+            raise OSError("object identity changed")
+        return self.read_bytes(key)[offset:offset + length]
 
     def read_bytes(self, key):
         self.read_bytes_calls.append(key)

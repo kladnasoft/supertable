@@ -36,6 +36,8 @@ _P_REDIS_CAT     = f"{_MOD}.RedisCatalog"
 _P_COMPACT_RES   = f"{_MOD}.compact_resources"
 _P_COMPACT_TOMB  = f"{_MOD}.compact_tombstones"
 _P_READ_PARQUET  = f"{_MOD}._read_parquet_safe"
+_P_LOAD_TOMB     = f"{_MOD}.load_tombstone"
+_P_PERSIST_V2    = f"{_MOD}.persist_tombstone_v2_frame"
 _P_BUILD_STATS   = f"{_MOD}.build_stats_file"
 _P_MIRROR        = f"{_MOD}.MirrorFormats"
 _P_MON_WRITER    = f"{_MOD}.MonitoringWriter"
@@ -65,6 +67,9 @@ def _snapshot(
         "simple_name": "orders",
         "snapshot_version": 1,
         "resources": resources,
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
     }
     if tombstone is not None:
         # In the merge-on-read model the snapshot stores a POINTER (path)
@@ -93,15 +98,31 @@ def _mk_simple_mock(snap: dict, *, snap_path: str = "/snap/v1.json",
                     data_dir: str = "/d"):
     """Build a SimpleTable mock returning the given snapshot."""
     mock = MagicMock()
+    mock.simple_dir = "acme/warehouse/tables/tbl"
     mock.data_dir = data_dir
     mock._last_snapshot_leaf = {"version": 1, "path": snap_path}
     mock.get_simple_table_snapshot.return_value = (snap, snap_path)
     # ``update`` returns (new_snapshot_dict, new_snapshot_path).
     # Callers patch this further if they care.
-    mock.update.return_value = (
-        {"resources": [{"file": "compacted.parquet"}], "snapshot_version": 2},
-        "/snap/v2.json",
-    )
+    default_snapshot = {
+        **snap,
+        "resources": [{"file": "compacted.parquet"}],
+        "snapshot_version": 2,
+    }
+    mock.update.return_value = (default_snapshot, "/snap/v2.json")
+
+    def update(
+            new_resources, sunset_files, model_df,
+            *, last_snapshot, **_kwargs,
+    ):
+        updated = dict(last_snapshot)
+        updated["resources"] = [{"file": "compacted.parquet"}]
+        updated["snapshot_version"] = (
+            int(last_snapshot.get("snapshot_version", 1)) + 1
+        )
+        return updated, "/snap/v2.json"
+
+    mock.update.side_effect = update
     return mock
 
 
@@ -516,6 +537,77 @@ class TestTombstoneGating:
         mock_compact_tomb.assert_not_called()
         mock_read_pq.assert_not_called()
 
+    @patch(_P_AUDIT)
+    @patch(_P_MON_WRITER)
+    @patch(_P_MIRROR)
+    @patch(_P_COMPACT_RES)
+    @patch(_P_COMPACT_TOMB)
+    @patch(_P_READ_PARQUET)
+    @patch(_P_SETTINGS, new_callable=_stub_settings)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
+    def test_v2_full_drain_preserves_marker_without_zero_manifest(
+        self, mock_check_write, MockSimple, mock_settings, mock_read_pq,
+        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+    ):
+        from supertable.processing import LoadedTombstoneState, tombstone_digest
+        from supertable.tombstone_manifest_v2 import TombstoneSegment
+
+        dw = _build_writer()
+        manifest_path = (
+            "acme/warehouse/tables/tbl/tombstone/manifest.json"
+        )
+        segment_path = (
+            "acme/warehouse/tables/tbl/tombstone/segment.parquet"
+        )
+        frame = _dv_frame(1, file="a")
+        segment = TombstoneSegment(
+            file=segment_path,
+            rows=1,
+            file_size=123,
+            digest=tombstone_digest(frame),
+        )
+        state = LoadedTombstoneState(
+            frame=frame,
+            tombstone_format=2,
+            tombstone_path=manifest_path,
+            root_digest="b" * 64,
+            segments=(segment,),
+        )
+        snap = _snapshot([_resource("a")])
+        snap.update({
+            "tombstone": manifest_path,
+            "tombstone_rows": 1,
+            "tombstone_digest": state.root_digest,
+            "tombstone_format": 2,
+        })
+        mock_simple = _mk_simple_mock(snap)
+        mock_simple.simple_dir = "acme/warehouse/tables/tbl"
+        MockSimple.return_value = mock_simple
+        empty = _dv_frame(0)
+        mock_compact_res.return_value = (1, 0, [], {"a"}, empty)
+        dw._get_table_config = MagicMock(return_value={})
+
+        def load_v2(_path, **kwargs):
+            kwargs["state_out"]["state"] = state
+            return frame
+
+        with (
+            patch(_P_LOAD_TOMB, side_effect=load_v2) as load_tomb,
+            patch(_P_PERSIST_V2) as persist_v2,
+        ):
+            dw.compact("admin", "tbl", force_tombstones=True)
+
+        load_tomb.assert_called_once()
+        assert load_tomb.call_args.kwargs["tombstone_format"] == 2
+        mock_read_pq.assert_not_called()
+        persist_v2.assert_not_called()
+        pinned = mock_simple.update.call_args.kwargs["last_snapshot"]
+        assert pinned["tombstone_format"] == 2
+        assert pinned["tombstone"] is None
+        assert pinned["tombstone_rows"] == 0
+        assert pinned["tombstone_digest"] is None
+
 
 # ===========================================================================
 # 4. Small-file compaction is delegated to processing.compact_resources
@@ -747,6 +839,122 @@ class TestSnapshotCommit:
         dw.compact("admin", "tbl")
 
         dw.catalog.commit_snapshot_mock.assert_called_once()
+
+    @patch(_P_AUDIT)
+    @patch(_P_MON_WRITER)
+    @patch(_P_MIRROR)
+    @patch(_P_COMPACT_RES)
+    @patch(_P_COMPACT_TOMB, return_value=(0, [], set()))
+    @patch(_P_SETTINGS, new_callable=_stub_settings)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
+    def test_durability_barrier_precedes_catalog_and_batch_exits(
+        self, mock_check_write, MockSimple, mock_settings,
+        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+    ):
+        events = []
+
+        class Batch:
+            def __enter__(self):
+                events.append("enter")
+                return self
+
+            def barrier(self):
+                events.append("barrier")
+
+            def catalog_commit_started(self):
+                events.append("commit_started")
+
+            def catalog_commit_succeeded(self):
+                events.append("commit_succeeded")
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                events.append(("exit", exc_type))
+                return False
+
+        dw = _build_writer()
+        dw.super_table.storage.durability_batch.return_value = Batch()
+        snap = _snapshot([_resource("a")])
+        mock_simple = _mk_simple_mock(snap)
+        update_result = mock_simple.update.return_value
+
+        def update(*args, **kwargs):
+            events.append("snapshot_written")
+            return update_result
+
+        mock_simple.update.side_effect = update
+        MockSimple.return_value = mock_simple
+        mock_compact_res.return_value = (
+            1,
+            100,
+            [{"file": "c.parquet", "file_size": 1, "columns": []}],
+            {"a"},
+        )
+
+        def commit(*args, **kwargs):
+            events.append("redis")
+            return (2, 2)
+
+        dw.catalog.commit_snapshot_mock.side_effect = commit
+        dw._get_table_config = MagicMock(return_value={})
+
+        dw.compact("admin", "tbl")
+
+        assert events == [
+            "enter",
+            "snapshot_written",
+            "barrier",
+            "commit_started",
+            "redis",
+            "commit_succeeded",
+            ("exit", None),
+        ]
+
+    @patch(_P_AUDIT)
+    @patch(_P_MON_WRITER)
+    @patch(_P_MIRROR)
+    @patch(_P_COMPACT_RES)
+    @patch(_P_COMPACT_TOMB, return_value=(0, [], set()))
+    @patch(_P_SETTINGS, new_callable=_stub_settings)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
+    def test_durability_barrier_failure_exits_before_catalog(
+        self, mock_check_write, MockSimple, mock_settings,
+        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+    ):
+        events = []
+
+        class Batch:
+            def __enter__(self):
+                events.append("enter")
+                return self
+
+            def barrier(self):
+                events.append("barrier")
+                raise OSError("directory fsync failed")
+
+            def __exit__(self, exc_type, exc_value, traceback):
+                events.append(("exit", exc_type))
+                return False
+
+        dw = _build_writer()
+        dw.super_table.storage.durability_batch.return_value = Batch()
+        MockSimple.return_value = _mk_simple_mock(_snapshot([_resource("a")]))
+        mock_compact_res.return_value = (
+            1,
+            100,
+            [{"file": "c.parquet", "file_size": 1, "columns": []}],
+            {"a"},
+        )
+        dw._get_table_config = MagicMock(return_value={})
+
+        with pytest.raises(OSError, match="directory fsync failed"):
+            dw.compact("admin", "tbl")
+
+        assert events[0:2] == ["enter", "barrier"]
+        assert events[-1] == ("exit", OSError)
+        dw.catalog.commit_snapshot_mock.assert_not_called()
+        dw.catalog.release_simple_lock.assert_called_once()
 
 
 # ===========================================================================

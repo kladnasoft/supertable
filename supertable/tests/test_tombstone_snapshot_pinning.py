@@ -15,6 +15,7 @@ from supertable import redis_keys as RK
 from supertable.data_classes import Reflection, SuperSnapshot, TableDefinition
 from supertable.engine.engine_enum import Engine
 from supertable.redis_catalog import RedisCatalog
+from supertable.storage.storage_interface import ObjectMetadata
 from supertable.tombstone_manifest_v2 import (
     TombstoneManifestV2,
     TombstoneSegment,
@@ -587,6 +588,24 @@ def _install_reader_fakes(monkeypatch, reflection, *, resolver):
     return reader_module, catalog, estimator, executor
 
 
+def _configure_bounded_storage(storage, *, blobs, sizes):
+    storage.size.side_effect = sizes.__getitem__
+    storage.read_bytes.side_effect = blobs.__getitem__
+    storage.stat_object.side_effect = lambda key: ObjectMetadata(
+        size=sizes[key], version=f"test:{key}:{sizes[key]}",
+    )
+
+    def read_range(key, offset, length, *, expected=None):
+        observed = ObjectMetadata(
+            size=sizes[key], version=f"test:{key}:{sizes[key]}",
+        )
+        if expected is not None and expected != observed:
+            raise OSError("object identity changed")
+        return storage.read_bytes(key)[offset:offset + length]
+
+    storage.read_range.side_effect = read_range
+
+
 def test_reader_uses_coherent_pinned_pointer_without_second_leaf_lookup(monkeypatch):
     """A concurrent S1 commit cannot attach S1's DV to S0's files."""
     pinned_key = "tombstone/v1.parquet"
@@ -696,11 +715,11 @@ def test_reader_loads_v2_manifest_once_for_self_join_and_resolves_segments(
         "org",
         "SELECT a.id FROM t AS a JOIN t AS b ON a.id = b.id",
     )
-    reader.storage.size.side_effect = {
-        manifest_key: len(body),
-        segment_key: 123,
-    }.__getitem__
-    reader.storage.read_bytes.return_value = body
+    _configure_bounded_storage(
+        reader.storage,
+        blobs={manifest_key: body},
+        sizes={manifest_key: len(body), segment_key: 123},
+    )
 
     result, status, message = reader.execute("admin", engine=Engine.DUCKDB)
 
@@ -708,7 +727,9 @@ def test_reader_loads_v2_manifest_once_for_self_join_and_resolves_segments(
     assert message is None
     assert result["id"].tolist() == [1]
     reader.storage.read_bytes.assert_called_once_with(manifest_key)
-    assert reader.storage.size.call_count == 2
+    reader.storage.read_range.assert_called_once()
+    assert reader.storage.stat_object.call_count == 2
+    assert reader.storage.size.call_count == 1
     assert [item.args for item in estimator._to_duckdb_path.call_args_list] == [
         (manifest_key,),
         (segment_key,),
@@ -770,11 +791,14 @@ def test_reader_aborts_when_any_v2_segment_cannot_be_proved(
         monkeypatch, reflection, resolver=_resolve,
     )
     reader = reader_module.DataReader("s", "org", "SELECT * FROM t")
-    reader.storage.size.side_effect = {
-        manifest_key: len(body),
-        segment_key: (122 if failure == "size" else 123),
-    }.__getitem__
-    reader.storage.read_bytes.return_value = body
+    _configure_bounded_storage(
+        reader.storage,
+        blobs={manifest_key: body},
+        sizes={
+            manifest_key: len(body),
+            segment_key: (122 if failure == "size" else 123),
+        },
+    )
 
     result, status, message = reader.execute("admin", engine=Engine.DUCKDB)
 

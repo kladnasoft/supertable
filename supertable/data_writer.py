@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -37,7 +38,9 @@ from supertable.processing import (
     resolve_overwrite_writes,
     identify_all_rowids,
     build_tombstone_file,
+    build_tombstone_v2,
     persist_tombstone_frame,
+    persist_tombstone_v2_frame,
     reclaim_fully_dead_files,
     build_stats_file,
     extract_stats_rows,
@@ -61,6 +64,7 @@ from supertable.processing import (
     resource_stats_seal,
     stats_cache_identity,
     tombstone_cache_identity,
+    LoadedTombstoneState,
     ROWID_COL,
     TOMBSTONE_FILE_COL,
 )
@@ -75,6 +79,11 @@ from supertable.redis_catalog import (
 from supertable.mirroring.mirror_formats import (
     MirrorFormats,
     MirrorPublicationError,
+)
+from supertable.tombstone_manifest_v2 import (
+    TOMBSTONE_FORMAT_V2,
+    validate_logical_storage_path,
+    validate_snapshot_tombstone_state,
 )
 from supertable.audit import emit as _audit_emit, EventCategory, Actions, Severity, make_detail
 
@@ -97,6 +106,53 @@ class DataWriter:
         self._table_config_cache: dict = {}
 
     timer = Timer()
+
+    @staticmethod
+    def _snapshot_uses_tombstone_v2(snapshot: dict) -> bool:
+        """Return whether the pinned snapshot is explicitly format 2."""
+        return (
+            type(snapshot.get("tombstone_format")) is int
+            and snapshot.get("tombstone_format") == TOMBSTONE_FORMAT_V2
+        )
+
+    @classmethod
+    def _tombstone_v2_transition_enabled(
+            cls, snapshot: dict, table_config: dict,
+    ) -> bool:
+        """Keep active v2 sticky; gate only the first v1 -> v2 publish."""
+        if cls._snapshot_uses_tombstone_v2(snapshot):
+            return True
+        return bool(
+            settings.SUPERTABLE_DV_V2_WRITES_ENABLED is True
+            and type(table_config.get("deletion_vector_format")) is int
+            and table_config.get("deletion_vector_format")
+            == TOMBSTONE_FORMAT_V2
+            and table_config.get("dv_v2_reader_fleet_confirmed") is True
+        )
+
+    @staticmethod
+    def _validate_pinned_tombstone_state(snapshot: dict) -> None:
+        """Validate the base snapshot, upgrading only pre-DV empty metadata.
+
+        Snapshots created before deletion-vector metadata existed omitted the
+        entire three-field state.  That historical all-missing shape is
+        unambiguously empty and is made explicit in the successor.  Any
+        partial state or explicit format marker remains strict corruption.
+        """
+        fields = {"tombstone", "tombstone_rows", "tombstone_digest"}
+        if fields.isdisjoint(snapshot) and "tombstone_format" not in snapshot:
+            snapshot.update({
+                "tombstone": None,
+                "tombstone_rows": 0,
+                "tombstone_digest": None,
+            })
+        validate_snapshot_tombstone_state(
+            snapshot.get("tombstone"),
+            snapshot.get("tombstone_rows"),
+            snapshot.get("tombstone_digest"),
+            format_present="tombstone_format" in snapshot,
+            tombstone_format=snapshot.get("tombstone_format"),
+        )
 
     @staticmethod
     def _declared_tombstone_rows(snapshot: dict):
@@ -178,6 +234,7 @@ class DataWriter:
             self,
             snapshot: dict,
             *,
+            simple_name: str,
             profiler: Profiler,
     ) -> int:
         """Prove the row-id floor for a snapshot predating durable allocation.
@@ -238,6 +295,19 @@ class DataWriter:
                 expected_digest=self._declared_tombstone_digest(snapshot),
                 allowed_files=self._snapshot_resource_files(snapshot),
                 profiler=profiler,
+                tombstone_format=snapshot.get("tombstone_format"),
+                storage=self.super_table.storage,
+                expected_organization=self.super_table.organization,
+                expected_super_name=self.super_table.super_name,
+                expected_simple_name=simple_name,
+                pinned_snapshot_version=snapshot.get("snapshot_version"),
+                expected_segment_prefix=os.path.join(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    "tables",
+                    simple_name,
+                    "tombstone",
+                ),
             )
             if tombstone_df is not None and tombstone_df.height:
                 high = max(high, int(tombstone_df.get_column(ROWID_COL).max()))
@@ -273,7 +343,7 @@ class DataWriter:
             )
         if raw_floor is None:
             floor = self._derive_legacy_rowid_high_watermark(
-                snapshot, profiler=profiler
+                snapshot, simple_name=simple_name, profiler=profiler
             )
         else:
             if type(raw_floor) is not int:
@@ -310,6 +380,68 @@ class DataWriter:
             )
             return removed, resources, sunset, residual
         raise RuntimeError("Invalid tombstone compaction result")
+
+    @staticmethod
+    def _validate_snapshot_for_publish(
+            payload: dict,
+            *,
+            simple_table: SimpleTable,
+            expected_version: int,
+    ) -> None:
+        """Fail closed before Redis can expose an invalid snapshot cache.
+
+        The immutable snapshot and its Redis payload are the same document.
+        Validate the exact object returned by ``SimpleTable.update`` rather
+        than trusting catalog-side validation or reconstructing its intended
+        deletion-vector state from local variables.
+        """
+        if not isinstance(payload, dict):
+            raise TypeError("Snapshot publication payload must be a dictionary")
+        required = {
+            "tombstone", "tombstone_rows", "tombstone_digest",
+            "snapshot_version",
+        }
+        missing = required.difference(payload)
+        if missing:
+            raise ValueError(
+                "Snapshot publication payload is incomplete: missing "
+                + ", ".join(sorted(missing))
+            )
+
+        snapshot_version = payload.get("snapshot_version")
+        if (
+            type(snapshot_version) is not int
+            or snapshot_version != expected_version + 1
+        ):
+            raise ValueError(
+                "Snapshot publication version must advance the pinned base "
+                "version by exactly one"
+            )
+
+        normalized_format = validate_snapshot_tombstone_state(
+            payload.get("tombstone"),
+            payload.get("tombstone_rows"),
+            payload.get("tombstone_digest"),
+            format_present="tombstone_format" in payload,
+            tombstone_format=payload.get("tombstone_format"),
+        )
+        pointer = payload.get("tombstone")
+        if normalized_format != TOMBSTONE_FORMAT_V2 or pointer is None:
+            return
+
+        simple_dir = getattr(simple_table, "simple_dir", None)
+        if not isinstance(simple_dir, str) or not simple_dir:
+            raise ValueError(
+                "Cannot prove the table prefix for a v2 tombstone manifest"
+            )
+        tombstone_prefix = validate_logical_storage_path(
+            os.path.join(simple_dir, "tombstone").rstrip("/"),
+            field_name="table tombstone prefix",
+        )
+        if not pointer.startswith(tombstone_prefix + "/"):
+            raise ValueError(
+                "V2 tombstone manifest escapes the expected table prefix"
+            )
 
     def _publish_snapshot(
             self,
@@ -349,6 +481,16 @@ class DataWriter:
                 expected_version = int(leaf.get("version", -1))
             except (TypeError, ValueError) as exc:
                 raise RuntimeError("Current leaf has an invalid version") from exc
+            if (
+                type(leaf.get("version")) is not int
+                or expected_version < 0
+            ):
+                raise RuntimeError("Current leaf has an invalid version")
+            self._validate_snapshot_for_publish(
+                payload,
+                simple_table=simple_table,
+                expected_version=expected_version,
+            )
             mirror_formats = list(mirrors or [])
             if mirror_formats:
                 prepare = getattr(
@@ -527,6 +669,9 @@ class DataWriter:
             max_overlapping_files: int | None = None,
             max_tombstone_rows: int | None = None,
             tombstone_compaction_workers: int | None = None,
+            deletion_vector_format: int | None = None,
+            *,
+            confirm_dv_v2_reader_fleet: bool = False,
     ) -> None:
         """Set per-table limit overrides.
 
@@ -554,6 +699,13 @@ class DataWriter:
             tombstone_compaction_workers: Bounded worker count for independent
                 tombstone file rewrites. Must be an integer from 1 through 8.
                 The global default remains 2 for bounded memory use.
+            deletion_vector_format: Set to 2 to prime this table for segmented
+                deletion-vector manifests.  The writer-wide transition switch
+                remains independently default-off.
+            confirm_dv_v2_reader_fleet: Required exact ``True`` in the same
+                call as ``deletion_vector_format=2``.  This acknowledgement and
+                the format request are persisted atomically; it cannot be set
+                on its own.
         """
         check_write_access(
             super_name=self.super_table.super_name,
@@ -562,7 +714,7 @@ class DataWriter:
             table_name=simple_name,
         )
 
-        updates: dict[str, int] = {}
+        updates: dict[str, Any] = {}
         if max_memory_chunk_size is not None:
             if (
                 type(max_memory_chunk_size) is not int
@@ -604,6 +756,24 @@ class DataWriter:
                     "tombstone_compaction_workers must be an integer from 1 to 8"
                 )
             updates["tombstone_compaction_workers"] = tombstone_compaction_workers
+        if deletion_vector_format is None:
+            if confirm_dv_v2_reader_fleet is not False:
+                raise ValueError(
+                    "confirm_dv_v2_reader_fleet cannot be set independently"
+                )
+        else:
+            if (
+                type(deletion_vector_format) is not int
+                or deletion_vector_format != TOMBSTONE_FORMAT_V2
+            ):
+                raise ValueError("deletion_vector_format must be integer 2")
+            if confirm_dv_v2_reader_fleet is not True:
+                raise ValueError(
+                    "deletion_vector_format=2 requires "
+                    "confirm_dv_v2_reader_fleet=True"
+                )
+            updates["deletion_vector_format"] = TOMBSTONE_FORMAT_V2
+            updates["dv_v2_reader_fleet_confirmed"] = True
 
         token = self.catalog.acquire_simple_lock(
             self.super_table.organization,
@@ -1017,11 +1187,20 @@ class DataWriter:
                 table_config = self._get_table_config(simple_name)
 
             last_simple_table, last_simple_table_path = simple_table.get_simple_table_snapshot()
+            self._validate_pinned_tombstone_state(last_simple_table)
             # A current deletion-vector is immutable correctness metadata.  Do
             # not let a mutation bless a legacy/unsealed pointer into a new
             # snapshot: recovery must first supply both independent seals.
             prior_tombstone_rows = self._declared_tombstone_rows(last_simple_table)
             prior_tombstone_digest = self._declared_tombstone_digest(last_simple_table)
+            snapshot_was_tombstone_v2 = self._snapshot_uses_tombstone_v2(
+                last_simple_table
+            )
+            tombstone_v2_transition_enabled = (
+                self._tombstone_v2_transition_enabled(
+                    last_simple_table, table_config,
+                )
+            )
             mark("snapshot")
 
             batch_factory = getattr(
@@ -1183,6 +1362,7 @@ class DataWriter:
 
             prev_tombstone_path = last_simple_table.get("tombstone")
             current_resources = last_simple_table.get("resources") or []
+            prior_tombstone_state_out: dict[str, LoadedTombstoneState] = {}
             # Conflict resolution must see the logical live relation.  A dead
             # physical row with a larger newer_than value cannot make a valid
             # reinsertion stale, and must not be tombstoned again.
@@ -1200,6 +1380,21 @@ class DataWriter:
                     expected_digest=prior_tombstone_digest,
                     allowed_files=self._snapshot_resource_files(last_simple_table),
                     profiler=profiler,
+                    tombstone_format=last_simple_table.get("tombstone_format"),
+                    state_out=(
+                        prior_tombstone_state_out
+                        if tombstone_v2_transition_enabled else None
+                    ),
+                    storage=self.super_table.storage,
+                    expected_organization=self.super_table.organization,
+                    expected_super_name=self.super_table.super_name,
+                    expected_simple_name=simple_name,
+                    pinned_snapshot_version=last_simple_table.get(
+                        "snapshot_version"
+                    ),
+                    expected_segment_prefix=os.path.join(
+                        simple_table.simple_dir, "tombstone"
+                    ),
                 )
                 if (
                     prev_tombstone_path
@@ -1207,6 +1402,7 @@ class DataWriter:
                     and (overwrite_columns or delete_only or enabled_mirrors)
                 ) else None
             )
+            previous_tombstone_state = prior_tombstone_state_out.get("state")
 
             # File cache: used only by delete_only's identify_all_rowids below.
             file_cache = {}
@@ -1378,6 +1574,13 @@ class DataWriter:
                 footer_md_cache = {}
                 tombstone_dir = os.path.join(simple_table.simple_dir, "tombstone")
                 do_insert = (not delete_only and dataframe.height > 0)
+                publish_tombstone_v2 = bool(
+                    snapshot_was_tombstone_v2
+                    or (
+                        tombstone_v2_transition_enabled
+                        and (new_delete_pairs or delete_all)
+                    )
+                )
                 projected_tombstone_rows = (
                     (prev_dv_df.height if prev_dv_df is not None else 0)
                     + len(new_delete_pairs)
@@ -1410,15 +1613,39 @@ class DataWriter:
                     sub = Profiler()
                     t = time.perf_counter()
                     if delete_all:
-                        return None, None, sub, time.perf_counter() - t
+                        return None, None, None, sub, time.perf_counter() - t
                     if not new_delete_pairs:
                         # Most writes are pure appends to a table without a DV.
                         # Carry an existing immutable pointer directly as well;
                         # no builder call, object-store read, or executor task.
                         return (
-                            prev_tombstone_path, None, sub,
+                            prev_tombstone_path, None, previous_tombstone_state, sub,
                             time.perf_counter() - t,
                         )
+                    if publish_tombstone_v2:
+                        tp, cdf, state = build_tombstone_v2(
+                            tombstone_dir=tombstone_dir,
+                            previous_state=previous_tombstone_state,
+                            new_pairs=new_delete_pairs,
+                            compression_level=compression_level,
+                            organization=self.super_table.organization,
+                            super_name=self.super_table.super_name,
+                            simple_name=simple_name,
+                            base_snapshot_version=last_simple_table[
+                                "snapshot_version"
+                            ],
+                            snapshot_version=(
+                                last_simple_table["snapshot_version"] + 1
+                            ),
+                            profiler=sub,
+                            persist=not defer_tombstone_upload,
+                            validation_out=(
+                                tombstone_validation_out
+                                if not defer_tombstone_upload else None
+                            ),
+                            storage=self.super_table.storage,
+                        )
+                        return tp, cdf, state, sub, time.perf_counter() - t
                     tp, cdf = build_tombstone_file(
                         tombstone_dir=tombstone_dir,
                         prev_tombstone_path=prev_tombstone_path,
@@ -1433,7 +1660,7 @@ class DataWriter:
                             if not defer_tombstone_upload else None
                         ),
                     )
-                    return tp, cdf, sub, time.perf_counter() - t
+                    return tp, cdf, None, sub, time.perf_counter() - t
 
                 tombstone_work = bool(not delete_all and new_delete_pairs)
                 if do_insert and tombstone_work:
@@ -1449,9 +1676,13 @@ class DataWriter:
                         # as the former sequential path did (an orphaned immutable
                         # file no snapshot references is harmless garbage).
                         data_sub, data_secs = _f_data.result()
-                        tombstone_path, combined_tombstone_df, tomb_sub, tomb_secs = (
-                            _f_tomb.result()
-                        )
+                        (
+                            tombstone_path,
+                            combined_tombstone_df,
+                            current_tombstone_state,
+                            tomb_sub,
+                            tomb_secs,
+                        ) = _f_tomb.result()
                     profiler.merge(data_sub)
                     profiler.merge(tomb_sub)
                     inserted = dataframe.height
@@ -1460,12 +1691,17 @@ class DataWriter:
                     profiler.merge(data_sub)
                     tombstone_path = prev_tombstone_path
                     combined_tombstone_df = None
+                    current_tombstone_state = previous_tombstone_state
                     tomb_secs = 0.0
                     inserted = dataframe.height
                 else:
-                    tombstone_path, combined_tombstone_df, tomb_sub, tomb_secs = (
-                        _write_tombstone_branch()
-                    )
+                    (
+                        tombstone_path,
+                        combined_tombstone_df,
+                        current_tombstone_state,
+                        tomb_sub,
+                        tomb_secs,
+                    ) = _write_tombstone_branch()
                     profiler.merge(tomb_sub)
                     data_secs = 0.0
                     inserted = 0
@@ -1526,17 +1762,55 @@ class DataWriter:
                             tombstone_dir=tombstone_dir,
                             compression_level=compression_level,
                             profiler=profiler,
-                            persist=not defer_tombstone_upload,
+                            persist=(
+                                not defer_tombstone_upload
+                                and not publish_tombstone_v2
+                            ),
                             assume_valid=True,
                         )
                     )
                     if reclaimed_files:
                         sunset_files |= reclaimed_files
-                        tombstone_path = reclaimed_tomb_path
                         combined_tombstone_df = reclaimed_dv
                         tombstone_rows = (
                             reclaimed_dv.height if reclaimed_dv is not None else 0
                         )
+                        if publish_tombstone_v2:
+                            residual_frame = (
+                                reclaimed_dv
+                                if reclaimed_dv is not None else polars.DataFrame(
+                                    schema={
+                                        TOMBSTONE_FILE_COL: polars.Utf8,
+                                        ROWID_COL: polars.Int64,
+                                    }
+                                )
+                            )
+                            if not defer_tombstone_upload or residual_frame.height == 0:
+                                (
+                                    tombstone_path,
+                                    combined_tombstone_df,
+                                    current_tombstone_state,
+                                ) = persist_tombstone_v2_frame(
+                                    tombstone_dir=tombstone_dir,
+                                    frame=residual_frame,
+                                    compression_level=compression_level,
+                                    organization=self.super_table.organization,
+                                    super_name=self.super_table.super_name,
+                                    simple_name=simple_name,
+                                    base_snapshot_version=last_simple_table[
+                                        "snapshot_version"
+                                    ],
+                                    snapshot_version=(
+                                        last_simple_table["snapshot_version"] + 1
+                                    ),
+                                    profiler=profiler,
+                                    storage=self.super_table.storage,
+                                )
+                            else:
+                                tombstone_path = None
+                                current_tombstone_state = None
+                        else:
+                            tombstone_path = reclaimed_tomb_path
                         logger.info(lp(
                             f"reclaimed {len(reclaimed_files)} fully-deleted "
                             f"file(s); deletion-vector now {tombstone_rows} rows"
@@ -1600,10 +1874,13 @@ class DataWriter:
                         # storage read (fall back to a read only if it wasn't
                         # loaded, which shouldn't happen when tombstone_path is
                         # set, but stays correct if it ever does).
-                        dv_to_drain = (
-                            prev_dv_df
-                            if prev_dv_df is not None
-                            else load_tombstone(
+                        if prev_dv_df is not None:
+                            dv_to_drain = prev_dv_df
+                        else:
+                            drain_state_out: dict[
+                                str, LoadedTombstoneState
+                            ] = {}
+                            dv_to_drain = load_tombstone(
                                 tombstone_path,
                                 cache_identity=tombstone_cache_identity(
                                     tombstone_path,
@@ -1622,8 +1899,30 @@ class DataWriter:
                                     last_simple_table
                                 ),
                                 profiler=profiler,
+                                tombstone_format=(
+                                    TOMBSTONE_FORMAT_V2
+                                    if publish_tombstone_v2 else
+                                    last_simple_table.get("tombstone_format")
+                                ),
+                                state_out=(
+                                    drain_state_out
+                                    if publish_tombstone_v2 else None
+                                ),
+                                storage=self.super_table.storage,
+                                expected_organization=(
+                                    self.super_table.organization
+                                ),
+                                expected_super_name=self.super_table.super_name,
+                                expected_simple_name=simple_name,
+                                pinned_snapshot_version=last_simple_table.get(
+                                    "snapshot_version"
+                                ),
+                                expected_segment_prefix=tombstone_dir,
                             )
-                        )
+                            if publish_tombstone_v2:
+                                current_tombstone_state = drain_state_out.get(
+                                    "state"
+                                )
                     if dv_to_drain is not None and dv_to_drain.height > 0:
                         # When both physical phases are due, consume them in one
                         # source pass.  Partial-DV survivors flow directly into
@@ -1716,14 +2015,40 @@ class DataWriter:
                                 # Some groups were physically consumed. Publish a
                                 # successor vector containing only the untouched
                                 # groups; the old pointer must never be cleared.
-                                tombstone_path, combined_tombstone_df = (
-                                    persist_tombstone_frame(
+                                if publish_tombstone_v2:
+                                    (
+                                        tombstone_path,
+                                        combined_tombstone_df,
+                                        current_tombstone_state,
+                                    ) = persist_tombstone_v2_frame(
                                         tombstone_dir=tombstone_dir,
                                         frame=residual_dv,
                                         compression_level=compression_level,
+                                        organization=(
+                                            self.super_table.organization
+                                        ),
+                                        super_name=self.super_table.super_name,
+                                        simple_name=simple_name,
+                                        base_snapshot_version=last_simple_table[
+                                            "snapshot_version"
+                                        ],
+                                        snapshot_version=(
+                                            last_simple_table[
+                                                "snapshot_version"
+                                            ] + 1
+                                        ),
                                         profiler=profiler,
+                                        storage=self.super_table.storage,
                                     )
-                                )
+                                else:
+                                    tombstone_path, combined_tombstone_df = (
+                                        persist_tombstone_frame(
+                                            tombstone_dir=tombstone_dir,
+                                            frame=residual_dv,
+                                            compression_level=compression_level,
+                                            profiler=profiler,
+                                        )
+                                    )
                             else:
                                 # Nothing was consumed. Keep the existing/newly
                                 # built immutable vector as-is.
@@ -1733,6 +2058,19 @@ class DataWriter:
                             tombstone_path = None
                             combined_tombstone_df = None
                             tombstone_rows = 0
+                            if publish_tombstone_v2:
+                                current_tombstone_state = LoadedTombstoneState(
+                                    frame=polars.DataFrame(
+                                        schema={
+                                            TOMBSTONE_FILE_COL: polars.Utf8,
+                                            ROWID_COL: polars.Int64,
+                                        }
+                                    ),
+                                    tombstone_format=TOMBSTONE_FORMAT_V2,
+                                    tombstone_path=None,
+                                    root_digest=None,
+                                    segments=(),
+                                )
                         if mirror_requires_drain and residual_dv.height > 0:
                             raise RuntimeError(
                                 "Cannot publish a mirror while deletion-vector "
@@ -1757,7 +2095,36 @@ class DataWriter:
                 #    and its row count.
                 last_simple_table["tombstone"] = tombstone_path
                 last_simple_table["tombstone_rows"] = tombstone_rows
-                if tombstone_path:
+                if publish_tombstone_v2:
+                    last_simple_table["tombstone_format"] = TOMBSTONE_FORMAT_V2
+                    if tombstone_path:
+                        if current_tombstone_state is not None:
+                            if (
+                                current_tombstone_state.tombstone_path
+                                != tombstone_path
+                                or current_tombstone_state.root_digest is None
+                            ):
+                                raise RuntimeError(
+                                    "Format-2 deletion-vector state does not "
+                                    "match its successor manifest pointer"
+                                )
+                            last_simple_table["tombstone_digest"] = (
+                                current_tombstone_state.root_digest
+                            )
+                        elif tombstone_path == prev_tombstone_path:
+                            # Pure append can carry a validated immutable root
+                            # without loading its segment union.
+                            last_simple_table["tombstone_digest"] = (
+                                prior_tombstone_digest
+                            )
+                        else:
+                            raise RuntimeError(
+                                "Cannot seal format-2 deletion-vector without "
+                                "its manifest state"
+                            )
+                    else:
+                        last_simple_table["tombstone_digest"] = None
+                elif tombstone_path:
                     digest_frame = (
                         combined_tombstone_df
                         if combined_tombstone_df is not None else prev_dv_df
@@ -1797,7 +2164,13 @@ class DataWriter:
                 # the vector was fully consumed this write (tombstone_path is None).
                 cache_tombstone(
                     tombstone_path,
-                    combined_tombstone_df if combined_tombstone_df is not None else prev_dv_df,
+                    (
+                        current_tombstone_state.frame
+                        if current_tombstone_state is not None
+                        and tombstone_path else
+                        combined_tombstone_df
+                        if combined_tombstone_df is not None else prev_dv_df
+                    ),
                     cache_identity=(
                         tombstone_cache_identity(
                             tombstone_path,
@@ -1812,6 +2185,13 @@ class DataWriter:
                         if tombstone_path else None
                     ),
                     assume_valid=bool(tombstone_path),
+                    loaded_state=(
+                        current_tombstone_state
+                        if publish_tombstone_v2 else None
+                    ),
+                    tombstone_format=(
+                        TOMBSTONE_FORMAT_V2 if publish_tombstone_v2 else None
+                    ),
                 )
                 mark("compact_tombstones")
 
@@ -2365,6 +2745,8 @@ class DataWriter:
         mirror_error: Exception | None = None
         mirror_snapshot_path: str | None = None
         monitoring_error: MonitoringDurabilityError | None = None
+        durability_batch = None
+        durability_batch_committed = False
         result: dict = {
             "query_id": qid,
             "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -2454,14 +2836,24 @@ class DataWriter:
             last_simple_table, last_simple_table_path = (
                 simple_table.get_simple_table_snapshot()
             )
+            self._validate_pinned_tombstone_state(last_simple_table)
             prior_tombstone_rows = self._declared_tombstone_rows(last_simple_table)
             prior_tombstone_digest = self._declared_tombstone_digest(last_simple_table)
             table_config = self._get_table_config(simple_name)
+            compact_tombstone_v2 = self._snapshot_uses_tombstone_v2(
+                last_simple_table
+            )
             footer_md_cache = {}
             files_before = len(last_simple_table.get("resources") or [])
             result["files_before"] = files_before
             mark("snapshot")
             enabled_mirrors = self._get_enabled_mirrors("compaction")
+            batch_factory = getattr(
+                self.super_table.storage, "durability_batch", None,
+            )
+            if callable(batch_factory):
+                durability_batch = batch_factory()
+                durability_batch.__enter__()
 
             # --- Phase A: tombstone compaction -------------------------------
             # Physically remove tombstoned rows from the data files named in
@@ -2487,16 +2879,51 @@ class DataWriter:
             # prior snapshot + vector intact for a retry, and matches the
             # write-path carry-forward read (required=True) above. Validation also
             # seals schema, non-null/uniqueness, and the snapshot-declared count.
-            tombstone_df = (
-                validate_tombstone_frame(
-                    _read_parquet_safe(tombstone_path, required=True),
+            compact_tombstone_state: LoadedTombstoneState | None = None
+            if tombstone_path and compact_tombstone_v2:
+                compact_state_out: dict[str, LoadedTombstoneState] = {}
+                tombstone_df = load_tombstone(
+                    tombstone_path,
+                    cache_identity=tombstone_cache_identity(
+                        tombstone_path,
+                        organization=self.super_table.organization,
+                        storage=self.super_table.storage,
+                    ),
+                    allow_cache=True,
+                    required=True,
                     expected_rows=prior_tombstone_rows,
                     expected_digest=prior_tombstone_digest,
-                    allowed_files=self._snapshot_resource_files(last_simple_table),
-                    source=f"deletion-vector {tombstone_path}",
+                    allowed_files=self._snapshot_resource_files(
+                        last_simple_table
+                    ),
+                    profiler=compaction_profiler,
+                    tombstone_format=TOMBSTONE_FORMAT_V2,
+                    state_out=compact_state_out,
+                    storage=self.super_table.storage,
+                    expected_organization=self.super_table.organization,
+                    expected_super_name=self.super_table.super_name,
+                    expected_simple_name=simple_name,
+                    pinned_snapshot_version=last_simple_table.get(
+                        "snapshot_version"
+                    ),
+                    expected_segment_prefix=os.path.join(
+                        simple_table.simple_dir, "tombstone"
+                    ),
                 )
-                if tombstone_path else None
-            )
+                compact_tombstone_state = compact_state_out.get("state")
+            else:
+                tombstone_df = (
+                    validate_tombstone_frame(
+                        _read_parquet_safe(tombstone_path, required=True),
+                        expected_rows=prior_tombstone_rows,
+                        expected_digest=prior_tombstone_digest,
+                        allowed_files=self._snapshot_resource_files(
+                            last_simple_table
+                        ),
+                        source=f"deletion-vector {tombstone_path}",
+                    )
+                    if tombstone_path else None
+                )
             tombstone_rows = (
                 tombstone_df.height if tombstone_df is not None else 0
             )
@@ -2570,15 +2997,47 @@ class DataWriter:
                         self._tombstone_referenced_files(residual_dv)
                     )
                     if tomb_new_resources or tomb_sunset:
-                        tombstone_path, residual_dv = persist_tombstone_frame(
-                            tombstone_dir=os.path.join(
-                                simple_table.simple_dir, "tombstone"
-                            ),
-                            frame=residual_dv,
-                            compression_level=compression_level,
-                        )
+                        if compact_tombstone_v2:
+                            (
+                                tombstone_path,
+                                residual_dv,
+                                compact_tombstone_state,
+                            ) = persist_tombstone_v2_frame(
+                                tombstone_dir=os.path.join(
+                                    simple_table.simple_dir, "tombstone"
+                                ),
+                                frame=residual_dv,
+                                compression_level=compression_level,
+                                organization=self.super_table.organization,
+                                super_name=self.super_table.super_name,
+                                simple_name=simple_name,
+                                base_snapshot_version=last_simple_table[
+                                    "snapshot_version"
+                                ],
+                                snapshot_version=(
+                                    last_simple_table["snapshot_version"] + 1
+                                ),
+                                profiler=compaction_profiler,
+                                storage=self.super_table.storage,
+                            )
+                        else:
+                            tombstone_path, residual_dv = persist_tombstone_frame(
+                                tombstone_dir=os.path.join(
+                                    simple_table.simple_dir, "tombstone"
+                                ),
+                                frame=residual_dv,
+                                compression_level=compression_level,
+                            )
                 else:
                     tombstone_path = None
+                    if compact_tombstone_v2:
+                        compact_tombstone_state = LoadedTombstoneState(
+                            frame=residual_dv,
+                            tombstone_format=TOMBSTONE_FORMAT_V2,
+                            tombstone_path=None,
+                            root_digest=None,
+                            segments=(),
+                        )
                 if enabled_mirrors and residual_dv.height > 0:
                     raise RuntimeError(
                         "Cannot publish a mirror while deletion-vector entries "
@@ -2711,11 +3170,62 @@ class DataWriter:
                     last_simple_table["tombstone"] = tombstone_path
                     last_simple_table["tombstone_rows"] = residual_dv.height
                     if tombstone_path:
-                        last_simple_table["tombstone_digest"] = tombstone_digest(
-                            residual_dv, assume_valid=True
-                        )
+                        if compact_tombstone_v2:
+                            if (
+                                compact_tombstone_state is None
+                                or compact_tombstone_state.tombstone_path
+                                != tombstone_path
+                                or compact_tombstone_state.root_digest is None
+                            ):
+                                raise RuntimeError(
+                                    "Cannot seal compacted format-2 deletion-vector "
+                                    "without its manifest state"
+                                )
+                            last_simple_table["tombstone_digest"] = (
+                                compact_tombstone_state.root_digest
+                            )
+                        else:
+                            last_simple_table["tombstone_digest"] = tombstone_digest(
+                                residual_dv, assume_valid=True
+                            )
                     else:
                         last_simple_table["tombstone_digest"] = None
+                    if compact_tombstone_v2:
+                        last_simple_table["tombstone_format"] = (
+                            TOMBSTONE_FORMAT_V2
+                        )
+                    cache_tombstone(
+                        tombstone_path,
+                        (
+                            compact_tombstone_state.frame
+                            if compact_tombstone_state is not None
+                            and tombstone_path else residual_dv
+                        ),
+                        cache_identity=(
+                            tombstone_cache_identity(
+                                tombstone_path,
+                                organization=self.super_table.organization,
+                                storage=self.super_table.storage,
+                            )
+                            if tombstone_path else None
+                        ),
+                        expected_rows=(
+                            residual_dv.height if tombstone_path else None
+                        ),
+                        expected_digest=(
+                            last_simple_table.get("tombstone_digest")
+                            if tombstone_path else None
+                        ),
+                        assume_valid=bool(tombstone_path),
+                        loaded_state=(
+                            compact_tombstone_state
+                            if compact_tombstone_v2 else None
+                        ),
+                        tombstone_format=(
+                            TOMBSTONE_FORMAT_V2
+                            if compact_tombstone_v2 else None
+                        ),
+                    )
 
                 # Carry forward + extend the external column-statistics parquet
                 # for the compacted file set: drop rows of every sunset file and
@@ -2784,6 +3294,8 @@ class DataWriter:
                 # --- Fenced atomic snapshot publication -------------------------
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
                 payload = new_snapshot_dict
+                if durability_batch is not None:
+                    durability_batch.barrier()
                 self._publish_snapshot(
                     simple_table=simple_table,
                     simple_name=simple_name,
@@ -2794,7 +3306,9 @@ class DataWriter:
                     commit_id=qid,
                     now_ms=now_ms,
                     mirrors=enabled_mirrors,
+                    durability_batch=durability_batch,
                 )
+                durability_batch_committed = True
                 if (
                     previous_tombstone_path
                     and previous_tombstone_path != tombstone_path
@@ -2887,19 +3401,41 @@ class DataWriter:
             logger.error(lp(f"compact() failed: {e!s}"))
             raise
         finally:
-            # Release per-simple lock first
-            if token:
-                try:
-                    ok = self.catalog.release_simple_lock(
-                        self.super_table.organization,
-                        self.super_table.super_name,
-                        simple_name,
-                        token,
-                    )
-                    if not ok:
-                        logger.debug(lp("Lock release skipped (token mismatch or already expired)."))
-                except Exception:
-                    pass
+            try:
+                if durability_batch is not None:
+                    exc_info = sys.exc_info()
+                    if durability_batch_committed:
+                        durability_batch.__exit__(None, None, None)
+                    elif exc_info[0] is not None:
+                        durability_batch.__exit__(*exc_info)
+                    else:
+                        # A no-op compaction has no catalog transaction. Exit
+                        # through the failure/cancellation arm so any temporary
+                        # immutable publications are rolled back and the
+                        # context-local batch is always detached.
+                        cancelled = RuntimeError(
+                            "compaction completed without catalog publication"
+                        )
+                        durability_batch.__exit__(
+                            RuntimeError, cancelled, None,
+                        )
+            finally:
+                # Rollback/durability cleanup remains inside the table lock.
+                if token:
+                    try:
+                        ok = self.catalog.release_simple_lock(
+                            self.super_table.organization,
+                            self.super_table.super_name,
+                            simple_name,
+                            token,
+                        )
+                        if not ok:
+                            logger.debug(lp(
+                                "Lock release skipped (token mismatch or "
+                                "already expired)."
+                            ))
+                    except Exception:
+                        pass
 
         # ---------- LOCK IS RELEASED HERE ----------
         # Monitoring + audit run after the lock is released so a slow

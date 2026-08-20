@@ -337,17 +337,37 @@ def writer(fake_storage, fake_catalog, fake_monitor):
             "snapshot_version": 0,
             "schema": [],
             "resources": [],
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
         }
         initial_path = "testorg/testsuper/tables/t1/snapshots/init.json"
         simple_inst = MockSimpleTable.return_value
         simple_inst.get_simple_table_snapshot.return_value = (initial_snapshot, initial_path)
         simple_inst._last_snapshot_leaf = {"version": 0, "path": initial_path}
+        simple_inst.simple_dir = "testorg/testsuper/tables/t1"
         simple_inst.data_dir = "testorg/testsuper/tables/t1/data"
         simple_inst.snapshot_dir = "testorg/testsuper/tables/t1/snapshots"
-        simple_inst.update.return_value = (
-            {**initial_snapshot, "snapshot_version": 1, "resources": []},
-            "testorg/testsuper/tables/t1/snapshots/new.json",
-        )
+
+        def _update_snapshot(
+                new_resources, sunset_files, model_df,
+                *, last_snapshot, **_kwargs,
+        ):
+            snapshot = dict(last_snapshot)
+            sunset = set(sunset_files)
+            snapshot["resources"] = [
+                resource for resource in snapshot.get("resources", [])
+                if resource.get("file") not in sunset
+            ] + list(new_resources)
+            snapshot["snapshot_version"] = (
+                int(last_snapshot.get("snapshot_version", 0)) + 1
+            )
+            return (
+                snapshot,
+                "testorg/testsuper/tables/t1/snapshots/new.json",
+            )
+
+        simple_inst.update.side_effect = _update_snapshot
 
         # Default write-path mock behaviour.
         # write_parquet_and_collect_resources appends a resource dict to the
@@ -661,6 +681,85 @@ class TestConfigureTable:
         cfg = fake_catalog.get_table_config("testorg", "testsuper", "t1")
         assert cfg["tombstone_compaction_workers"] == value
 
+    def test_dv_v2_activation_stores_both_fleet_keys_atomically(
+        self, fake_catalog,
+    ):
+        dw = self._make_writer(fake_catalog)
+        with patch("supertable.data_writer.check_write_access"):
+            dw.configure_table(
+                "admin",
+                "t1",
+                deletion_vector_format=2,
+                confirm_dv_v2_reader_fleet=True,
+            )
+
+        cfg = fake_catalog.get_table_config("testorg", "testsuper", "t1")
+        assert cfg["deletion_vector_format"] == 2
+        assert cfg["dv_v2_reader_fleet_confirmed"] is True
+
+    @pytest.mark.parametrize("value", [None, False, 0, 1, "yes"])
+    def test_dv_v2_activation_requires_exact_confirmation(
+        self, fake_catalog, value,
+    ):
+        dw = self._make_writer(fake_catalog)
+        with patch("supertable.data_writer.check_write_access"):
+            with pytest.raises(ValueError, match="requires.*confirmation|requires.*confirm"):
+                dw.configure_table(
+                    "admin",
+                    "t1",
+                    deletion_vector_format=2,
+                    confirm_dv_v2_reader_fleet=value,
+                )
+
+    @pytest.mark.parametrize("value", [1, 3, True, 2.0, "2"])
+    def test_dv_v2_activation_rejects_other_formats(
+        self, fake_catalog, value,
+    ):
+        dw = self._make_writer(fake_catalog)
+        with patch("supertable.data_writer.check_write_access"):
+            with pytest.raises(ValueError, match="must be integer 2"):
+                dw.configure_table(
+                    "admin",
+                    "t1",
+                    deletion_vector_format=value,
+                    confirm_dv_v2_reader_fleet=True,
+                )
+
+    def test_dv_v2_confirmation_cannot_be_set_independently(
+        self, fake_catalog,
+    ):
+        dw = self._make_writer(fake_catalog)
+        with patch("supertable.data_writer.check_write_access"):
+            with pytest.raises(ValueError, match="cannot be set independently"):
+                dw.configure_table(
+                    "admin", "t1", confirm_dv_v2_reader_fleet=True,
+                )
+
+    @pytest.mark.parametrize(
+        "snapshot,config,local_enabled,expected",
+        [
+            ({}, {"deletion_vector_format": 2,
+                  "dv_v2_reader_fleet_confirmed": True}, False, False),
+            ({}, {"deletion_vector_format": 2,
+                  "dv_v2_reader_fleet_confirmed": True}, True, True),
+            ({}, {"deletion_vector_format": 2}, True, False),
+            ({"tombstone_format": 2}, {}, False, True),
+            ({"tombstone_format": 2.0}, {}, False, False),
+        ],
+    )
+    def test_dv_v2_transition_gate_and_sticky_active_state(
+        self, snapshot, config, local_enabled, expected,
+    ):
+        from supertable.data_writer import DataWriter
+
+        with patch(
+            "supertable.data_writer.settings",
+            MagicMock(SUPERTABLE_DV_V2_WRITES_ENABLED=local_enabled),
+        ):
+            assert DataWriter._tombstone_v2_transition_enabled(
+                snapshot, config,
+            ) is expected
+
 
 # ===========================================================================
 # Tests: _get_table_config()
@@ -784,6 +883,189 @@ class TestWriteOverwrite:
         assert result is not None
         assert len(result) == 4
 
+    def test_confirmed_enabled_table_publishes_v2_manifest_root(
+        self, writer, fake_catalog,
+    ):
+        from supertable.processing import LoadedTombstoneState, tombstone_digest
+        from supertable.tombstone_manifest_v2 import TombstoneSegment
+
+        fake_catalog.set_table_config("testorg", "testsuper", "t1", {
+            "deletion_vector_format": 2,
+            "dv_v2_reader_fleet_confirmed": True,
+        })
+        writer._mocks["resolve"].side_effect = lambda **kw: (
+            kw["incoming_df"], [("old.parquet", 99)],
+        )
+        frame = pl.DataFrame(
+            {"__file__": ["old.parquet"], "__rowid__": [99]},
+            schema={"__file__": pl.Utf8, "__rowid__": pl.Int64},
+        )
+        segment = TombstoneSegment(
+            file="testorg/testsuper/tables/t1/tombstone/segment.parquet",
+            rows=1,
+            file_size=123,
+            digest=tombstone_digest(frame),
+        )
+        state = LoadedTombstoneState(
+            frame=frame,
+            tombstone_format=2,
+            tombstone_path=(
+                "testorg/testsuper/tables/t1/tombstone/manifest.json"
+            ),
+            root_digest="a" * 64,
+            segments=(segment,),
+        )
+
+        with (
+            patch(
+                "supertable.data_writer.settings",
+                MagicMock(SUPERTABLE_DV_V2_WRITES_ENABLED=True),
+            ),
+            patch(
+                "supertable.data_writer.build_tombstone_v2",
+                return_value=(state.tombstone_path, frame, state),
+            ) as build_v2,
+        ):
+            writer.write("admin", "t1", _simple_arrow(1), ["id"])
+
+        build_v2.assert_called_once()
+        writer._mocks["build_tombstone"].assert_not_called()
+        pinned = writer._mocks["simple_inst"].update.call_args.kwargs[
+            "last_snapshot"
+        ]
+        assert pinned["tombstone_format"] == 2
+        assert pinned["tombstone"] == state.tombstone_path
+        assert pinned["tombstone_rows"] == 1
+        assert pinned["tombstone_digest"] == state.root_digest
+
+    def test_existing_empty_v2_snapshot_stays_v2_with_local_switch_off(
+        self, writer,
+    ):
+        simple = writer._mocks["simple_inst"]
+        snapshot = {
+            "simple_name": "t1",
+            "location": "testorg/testsuper/tables/t1",
+            "snapshot_version": 4,
+            "schema": [],
+            "resources": [],
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+            "tombstone_format": 2,
+            "rowid_high_watermark": 0,
+        }
+        simple.get_simple_table_snapshot.return_value = (
+            snapshot, "testorg/testsuper/tables/t1/snapshots/v4.json",
+        )
+        simple._last_snapshot_leaf = {
+            "version": 4,
+            "path": "testorg/testsuper/tables/t1/snapshots/v4.json",
+        }
+
+        with patch(
+            "supertable.data_writer.settings",
+            MagicMock(SUPERTABLE_DV_V2_WRITES_ENABLED=False),
+        ), patch(
+            "supertable.data_writer.build_tombstone_v2",
+        ) as build_v2, patch(
+            "supertable.data_writer.persist_tombstone_v2_frame",
+        ) as persist_v2:
+            writer.write("admin", "t1", _simple_arrow(1), [])
+
+        build_v2.assert_not_called()
+        persist_v2.assert_not_called()
+        pinned = simple.update.call_args.kwargs["last_snapshot"]
+        assert pinned["tombstone_format"] == 2
+        assert pinned["tombstone"] is None
+        assert pinned["tombstone_rows"] == 0
+        assert pinned["tombstone_digest"] is None
+        writer._mocks["build_tombstone"].assert_not_called()
+
+    def test_pure_append_carries_active_v2_root_without_manifest_write(
+        self, writer,
+    ):
+        simple = writer._mocks["simple_inst"]
+        manifest = (
+            "testorg/testsuper/tables/t1/tombstone/manifest.json"
+        )
+        snapshot = {
+            "simple_name": "t1",
+            "location": "testorg/testsuper/tables/t1",
+            "snapshot_version": 4,
+            "schema": [],
+            "resources": [{"file": "old.parquet", "rows": 1}],
+            "tombstone": manifest,
+            "tombstone_rows": 1,
+            "tombstone_digest": "a" * 64,
+            "tombstone_format": 2,
+            "rowid_high_watermark": 1,
+        }
+        old_path = "testorg/testsuper/tables/t1/snapshots/v4.json"
+        simple.get_simple_table_snapshot.return_value = (snapshot, old_path)
+        simple._last_snapshot_leaf = {"version": 4, "path": old_path}
+
+        with patch(
+            "supertable.data_writer.settings",
+            MagicMock(SUPERTABLE_DV_V2_WRITES_ENABLED=False),
+        ), patch(
+            "supertable.data_writer.build_tombstone_v2",
+        ) as build_v2, patch(
+            "supertable.data_writer.persist_tombstone_v2_frame",
+        ) as persist_v2:
+            writer.write("admin", "t1", _simple_arrow(1), [])
+
+        build_v2.assert_not_called()
+        persist_v2.assert_not_called()
+        pinned = simple.update.call_args.kwargs["last_snapshot"]
+        assert pinned["tombstone"] == manifest
+        assert pinned["tombstone_rows"] == 1
+        assert pinned["tombstone_digest"] == "a" * 64
+        assert pinned["tombstone_format"] == 2
+
+    def test_confirmed_v2_table_pure_append_does_not_transition_v1(
+        self, writer, fake_catalog,
+    ):
+        simple = writer._mocks["simple_inst"]
+        legacy = (
+            "testorg/testsuper/tables/t1/tombstone/legacy.parquet"
+        )
+        snapshot = {
+            "simple_name": "t1",
+            "location": "testorg/testsuper/tables/t1",
+            "snapshot_version": 4,
+            "schema": [],
+            "resources": [{"file": "old.parquet", "rows": 1}],
+            "tombstone": legacy,
+            "tombstone_rows": 1,
+            "tombstone_digest": "b" * 64,
+            "rowid_high_watermark": 1,
+        }
+        old_path = "testorg/testsuper/tables/t1/snapshots/v4.json"
+        simple.get_simple_table_snapshot.return_value = (snapshot, old_path)
+        simple._last_snapshot_leaf = {"version": 4, "path": old_path}
+        fake_catalog.set_table_config("testorg", "testsuper", "t1", {
+            "deletion_vector_format": 2,
+            "dv_v2_reader_fleet_confirmed": True,
+        })
+
+        with patch(
+            "supertable.data_writer.settings",
+            MagicMock(SUPERTABLE_DV_V2_WRITES_ENABLED=True),
+        ), patch(
+            "supertable.data_writer.build_tombstone_v2",
+        ) as build_v2, patch(
+            "supertable.data_writer.persist_tombstone_v2_frame",
+        ) as persist_v2:
+            writer.write("admin", "t1", _simple_arrow(1), [])
+
+        build_v2.assert_not_called()
+        persist_v2.assert_not_called()
+        writer._mocks["build_tombstone"].assert_not_called()
+        pinned = simple.update.call_args.kwargs["last_snapshot"]
+        assert pinned["tombstone"] == legacy
+        assert pinned["tombstone_digest"] == "b" * 64
+        assert "tombstone_format" not in pinned
+
 
 class TestWriteDeleteOnly:
     """write() with delete_only=True."""
@@ -830,6 +1112,45 @@ class TestWriteDeleteOnly:
         total_cols, total_rows, inserted, deleted = result
         assert inserted == 0
         assert deleted == 2
+        assert simple.update.call_args.args[1] == {"old.parquet"}
+
+    def test_delete_all_keeps_explicit_v2_empty_marker_with_switch_off(
+        self, writer,
+    ):
+        simple = writer._mocks["simple_inst"]
+        snapshot = {
+            "simple_name": "t1",
+            "location": "testorg/testsuper/tables/t1",
+            "snapshot_version": 4,
+            "schema": [],
+            "resources": [{"file": "old.parquet", "rows": 2}],
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+            "tombstone_format": 2,
+            "rowid_high_watermark": 2,
+        }
+        old_path = "testorg/testsuper/tables/t1/snapshots/v4.json"
+        simple.get_simple_table_snapshot.return_value = (snapshot, old_path)
+        simple._last_snapshot_leaf = {"version": 4, "path": old_path}
+
+        with patch(
+            "supertable.data_writer.settings",
+            MagicMock(SUPERTABLE_DV_V2_WRITES_ENABLED=False),
+        ):
+            writer.write(
+                "admin",
+                "t1",
+                _simple_arrow(1),
+                overwrite_columns=[],
+                delete_only=True,
+            )
+
+        pinned = simple.update.call_args.kwargs["last_snapshot"]
+        assert pinned["tombstone_format"] == 2
+        assert pinned["tombstone"] is None
+        assert pinned["tombstone_rows"] == 0
+        assert pinned["tombstone_digest"] is None
         assert simple.update.call_args.args[1] == {"old.parquet"}
 
 

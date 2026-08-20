@@ -786,6 +786,7 @@ def test_legacy_highwater_rejects_nonpositive_physical_rowid(monkeypatch):
     with pytest.raises(ValueError, match="positive"):
         writer._derive_legacy_rowid_high_watermark(
             {"resources": [{"file": "f.parquet", "file_size": 1}]},
+            simple_name="t",
             profiler=Profiler(),
         )
 
