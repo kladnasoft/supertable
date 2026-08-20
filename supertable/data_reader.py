@@ -43,6 +43,7 @@ from supertable.engine.data_estimator import DataEstimator
 from supertable.engine.executor import Executor
 from supertable.engine.engine_enum import Engine as engine
 from supertable.data_classes import (
+    MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES,
     RbacViewDef,
     TombstoneDef,
     TombstoneSegmentDef,
@@ -1076,8 +1077,18 @@ class DataReader:
                             segment_defs = []
                             for segment in manifest.segments:
                                 try:
-                                    observed_size = self.storage.size(
+                                    metadata = self.storage.stat_object(
                                         segment.file
+                                    )
+                                    observed_size = getattr(
+                                        metadata, "size", None,
+                                    )
+                                    identity_fn = getattr(
+                                        metadata, "identity_token", None,
+                                    )
+                                    provider_identity = (
+                                        identity_fn()
+                                        if callable(identity_fn) else None
                                     )
                                 except Exception as size_err:
                                     raise RuntimeError(
@@ -1093,6 +1104,17 @@ class DataReader:
                                         "Deletion-vector segment size does not "
                                         "match the manifest"
                                     )
+                                if (
+                                    not isinstance(provider_identity, str)
+                                    or not provider_identity
+                                    or "\x00" in provider_identity
+                                    or len(provider_identity.encode("utf-8"))
+                                    > MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES
+                                ):
+                                    raise RuntimeError(
+                                        "Deletion-vector segment has no stable "
+                                        "provider identity"
+                                    )
                                 segment_defs.append(TombstoneSegmentDef(
                                     cache_key=segment.file,
                                     tombstone_path=(
@@ -1105,6 +1127,7 @@ class DataReader:
                                     expected_rows=segment.rows,
                                     file_size=segment.file_size,
                                     tombstone_digest=segment.digest,
+                                    provider_identity=provider_identity,
                                 ))
                             resolved_segments = tuple(segment_defs)
                         resolved_entry = (

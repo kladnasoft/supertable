@@ -2,6 +2,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 
+MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES = 4096
+
+
 class PredInterval(NamedTuple):
     """A closed/open range of values a column is *allowed* to take, derived from
     a SQL WHERE predicate, used for read-path file pruning.
@@ -377,6 +380,25 @@ class TombstoneSegmentDef:
     expected_rows: int
     file_size: int
     tombstone_digest: str
+    # Stable identity observed through ``storage.stat_object(cache_key)`` by
+    # DataReader. Local/cache paths are fenced directly with ``stat`` and do
+    # not require this provider proof.
+    provider_identity: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        identity = self.provider_identity
+        if identity is None:
+            return
+        if (
+            not isinstance(identity, str)
+            or not identity
+            or "\x00" in identity
+            or len(identity.encode("utf-8"))
+            > MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES
+        ):
+            raise ValueError(
+                "provider_identity must be a bounded non-empty string"
+            )
 
 
 @dataclass

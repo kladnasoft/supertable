@@ -375,6 +375,7 @@ class DuckDB:
             settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE,
             settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC,
             settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_ENTRIES,
+            storage=self.storage,
         )
 
     # ------------------------------------------------------------------

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import importlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +12,7 @@ import polars as pl
 import pytest
 
 from supertable.data_classes import (
+    MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES,
     Reflection,
     SuperSnapshot,
     TombstoneDef,
@@ -38,6 +40,9 @@ from supertable.simple_table import SimpleTable
 from supertable.storage.local_storage import LocalStorage
 from supertable.storage.storage_interface import ObjectMetadata
 from supertable.utils.snapshot import read_bounded_tombstone_manifest_bytes
+
+
+engine_common = importlib.import_module("supertable.engine.engine_common")
 
 
 class _MemoryStorage:
@@ -476,6 +481,16 @@ def _duckdb_v2(tmp_path):
     return definition
 
 
+@pytest.mark.parametrize(
+    "identity",
+    ["", 7, "x" * (MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES + 1)],
+)
+def test_duckdb_v2_provider_identity_is_bounded(identity, tmp_path) -> None:
+    definition = _duckdb_v2(tmp_path)
+    with pytest.raises(ValueError, match="bounded non-empty string"):
+        replace(definition.segments[0], provider_identity=identity)
+
+
 def _source(con) -> None:
     con.execute(
         "CREATE TABLE src(id BIGINT, __rowid__ BIGINT, "
@@ -503,6 +518,138 @@ class _TrackedDuckDBConnection:
         return self.connection.execute(sql, *args, **kwargs)
 
 
+class _SequencedProviderStorage:
+    def __init__(self, observations):
+        self.observations = {
+            key: list(values) for key, values in observations.items()
+        }
+        self.calls = []
+
+    def stat_object(self, key):
+        self.calls.append(key)
+        values = self.observations[key]
+        if len(values) > 1:
+            return values.pop(0)
+        return values[0]
+
+
+def _with_provider_identity(definition, version="v1"):
+    return replace(
+        definition,
+        segments=tuple(
+            replace(
+                segment,
+                provider_identity=ObjectMetadata(
+                    size=segment.file_size,
+                    version=version,
+                ).identity_token(),
+            )
+            for segment in definition.segments
+        ),
+    )
+
+
+def test_duckdb_v2_provider_proof_fences_one_segment_read(tmp_path) -> None:
+    definition = _with_provider_identity(_duckdb_v2(tmp_path))
+    observations = {
+        segment.cache_key: [
+            ObjectMetadata(size=segment.file_size, version="v1"),
+            ObjectMetadata(size=segment.file_size, version="v1"),
+        ]
+        for segment in definition.segments
+    }
+    storage = _SequencedProviderStorage(observations)
+    paths = [segment.tombstone_path for segment in definition.segments]
+    raw_connection = duckdb.connect()
+    con = _TrackedDuckDBConnection(raw_connection, paths)
+
+    with patch.object(
+        engine_common, "_local_parquet_file_identity", return_value=None,
+    ):
+        table = TombstoneCache(
+            capacity=2, ttl_seconds=60, storage=storage,
+        ).acquire(
+            con,
+            definition.cache_key,
+            definition.tombstone_path,
+            expected_rows=definition.expected_rows,
+            expected_digest=definition.tombstone_digest,
+            tombstone_def=definition,
+        )
+
+    assert table is not None
+    assert con.path_reads == {path: 1 for path in paths}
+    assert storage.calls == [
+        definition.segments[0].cache_key,
+        definition.segments[0].cache_key,
+        definition.segments[1].cache_key,
+        definition.segments[1].cache_key,
+    ]
+
+
+def test_duckdb_v2_provider_identity_change_after_read_fails_closed(
+    tmp_path,
+) -> None:
+    definition = _with_provider_identity(_duckdb_v2(tmp_path))
+    first = definition.segments[0]
+    storage = _SequencedProviderStorage({
+        first.cache_key: [
+            ObjectMetadata(size=first.file_size, version="v1"),
+            ObjectMetadata(size=first.file_size, version="v2"),
+        ],
+    })
+    paths = [segment.tombstone_path for segment in definition.segments]
+    raw_connection = duckdb.connect()
+    con = _TrackedDuckDBConnection(raw_connection, paths)
+    cache = TombstoneCache(
+        capacity=2, ttl_seconds=60, storage=storage,
+    )
+
+    with patch.object(
+        engine_common, "_local_parquet_file_identity", return_value=None,
+    ), pytest.raises(RuntimeError, match="changed while being read"):
+        cache.acquire(
+            con,
+            definition.cache_key,
+            definition.tombstone_path,
+            expected_rows=definition.expected_rows,
+            expected_digest=definition.tombstone_digest,
+            tombstone_def=definition,
+        )
+
+    assert con.path_reads == {paths[0]: 1, paths[1]: 0}
+    assert cache.snapshot() == []
+
+
+def test_duckdb_v2_provider_proof_mismatch_rejects_before_read(
+    tmp_path,
+) -> None:
+    definition = _with_provider_identity(_duckdb_v2(tmp_path))
+    first = definition.segments[0]
+    storage = _SequencedProviderStorage({
+        first.cache_key: [
+            ObjectMetadata(size=first.file_size, version="other"),
+        ],
+    })
+    con = MagicMock()
+
+    with patch.object(
+        engine_common, "_local_parquet_file_identity", return_value=None,
+    ), pytest.raises(RuntimeError, match="provider identity does not match"):
+        TombstoneCache(
+            capacity=2, ttl_seconds=60, storage=storage,
+        ).acquire(
+            con,
+            definition.cache_key,
+            definition.tombstone_path,
+            expected_rows=definition.expected_rows,
+            expected_digest=definition.tombstone_digest,
+            tombstone_def=definition,
+        )
+
+    con.execute.assert_not_called()
+
+
 def test_duckdb_v2_inline_and_cached_paths_are_equal(tmp_path) -> None:
     definition = _duckdb_v2(tmp_path)
     con = duckdb.connect()
@@ -528,6 +675,135 @@ def test_duckdb_v2_inline_and_cached_paths_are_equal(tmp_path) -> None:
     cached = con.execute("SELECT id FROM cached_live ORDER BY id").fetchall()
     assert inline == cached == [(20,), (40,)]
     cache.release(con, cached_table.cache_key)
+
+
+@pytest.mark.parametrize("capacity", [2, 0])
+def test_duckdb_v2_cache_enforces_actual_parquet_file_size(
+    tmp_path, capacity,
+) -> None:
+    definition = _duckdb_v2(tmp_path)
+    raw_connection = duckdb.connect()
+    con = MagicMock(wraps=raw_connection)
+    cache = TombstoneCache(capacity=capacity, ttl_seconds=60)
+
+    accepted = cache.acquire(
+        con,
+        definition.cache_key,
+        definition.tombstone_path,
+        expected_rows=definition.expected_rows,
+        expected_digest=definition.tombstone_digest,
+        tombstone_def=definition,
+        allowed_files=list(definition.snapshot_resource_keys or ()),
+    )
+    assert accepted is not None
+    cache.release(con, accepted.cache_key)
+    con.execute.reset_mock()
+
+    altered = replace(
+        definition,
+        segments=(
+            replace(
+                definition.segments[0],
+                file_size=definition.segments[0].file_size + 1,
+            ),
+            definition.segments[1],
+        ),
+    )
+    rejecting_cache = TombstoneCache(capacity=capacity, ttl_seconds=60)
+    with pytest.raises(RuntimeError, match="file_size does not match"):
+        rejecting_cache.acquire(
+            con,
+            altered.cache_key,
+            altered.tombstone_path,
+            expected_rows=altered.expected_rows,
+            expected_digest=altered.tombstone_digest,
+            tombstone_def=altered,
+            allowed_files=list(altered.snapshot_resource_keys or ()),
+        )
+    assert rejecting_cache.snapshot() == []
+    con.execute.assert_not_called()
+
+
+def test_direct_duckdb_v2_rejects_actual_parquet_file_size_mismatch(
+    tmp_path,
+) -> None:
+    definition = _duckdb_v2(tmp_path)
+    altered = replace(
+        definition,
+        segments=(
+            replace(
+                definition.segments[0],
+                file_size=definition.segments[0].file_size + 1,
+            ),
+            definition.segments[1],
+        ),
+    )
+    con = duckdb.connect()
+    _source(con)
+
+    with pytest.raises(RuntimeError, match="file_size does not match"):
+        create_tombstone_view(con, "src", "live", altered)
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["segment-*.parquet", "segment-?.parquet", "segment-[ab].parquet"],
+)
+def test_direct_duckdb_v2_rejects_segment_globs_before_io(
+    tmp_path, pattern,
+) -> None:
+    definition = _duckdb_v2(tmp_path)
+    altered = replace(
+        definition,
+        segments=(
+            replace(
+                definition.segments[0],
+                tombstone_path=str(tmp_path / pattern),
+            ),
+            definition.segments[1],
+        ),
+    )
+    con = MagicMock()
+    with pytest.raises(RuntimeError, match="one exact object path"):
+        TombstoneCache(capacity=2, ttl_seconds=60).acquire(
+            con,
+            altered.cache_key,
+            altered.tombstone_path,
+            expected_rows=altered.expected_rows,
+            expected_digest=altered.tombstone_digest,
+            tombstone_def=altered,
+        )
+    con.execute.assert_not_called()
+
+
+def test_direct_duckdb_v2_rejects_remote_segment_without_provider_proof(
+    tmp_path,
+) -> None:
+    definition = _duckdb_v2(tmp_path)
+    altered = replace(
+        definition,
+        segments=(
+            replace(
+                definition.segments[0],
+                tombstone_path=(
+                    "https://objects.example/segment-a.parquet?token=secret"
+                ),
+            ),
+            definition.segments[1],
+        ),
+    )
+    con = MagicMock()
+
+    with pytest.raises(RuntimeError, match="pinned provider identity"):
+        TombstoneCache(capacity=2, ttl_seconds=60).acquire(
+            con,
+            altered.cache_key,
+            altered.tombstone_path,
+            expected_rows=altered.expected_rows,
+            expected_digest=altered.tombstone_digest,
+            tombstone_def=altered,
+        )
+    con.execute.assert_not_called()
 
 
 def test_duckdb_v2_capacity_zero_reads_once_and_survives_replacement(
@@ -780,7 +1056,7 @@ def test_direct_duckdb_rejects_resolved_json_hybrid_and_accepts_empty_v2() -> No
 def test_duckdb_path_collection_uses_every_segment_not_manifest(tmp_path) -> None:
     definition = _duckdb_v2(tmp_path)
     paths = (
-        "https://objects.example/segment-a.parquet?token=one",
+        "https://objects.example/segment-a.parquet?token=[one]*?",
         "https://objects.example/segment-b.parquet?token=two",
     )
     definition = replace(

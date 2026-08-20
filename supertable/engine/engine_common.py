@@ -6,12 +6,13 @@ import hashlib
 import ast
 import os
 import re
+import stat
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 import duckdb
 import sqlglot
@@ -23,6 +24,7 @@ from sqlglot.optimizer.scope import traverse_scope
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.config.homedir import get_app_home
+from supertable.data_classes import MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES
 from supertable.engine.engine_config import normalize_memory_size
 from supertable.tombstone_manifest_v2 import (
     MAX_JSON_EXACT_INTEGER,
@@ -2505,6 +2507,27 @@ class ValidatedTombstoneTable(str):
         return obj
 
 
+def _duckdb_parquet_path_is_glob(path: str) -> bool:
+    """Return whether one resolved path can expand to multiple objects.
+
+    Signed HTTP URLs legitimately use ``?`` (and may use brackets or stars)
+    in their credential query, which DuckDB does not treat as the object path.
+    Native provider URIs and local paths have no such query convention here,
+    so inspect their full spelling instead of accidentally hiding a wildcard
+    parsed as a URL query delimiter.
+    """
+    try:
+        parsed = urlsplit(path)
+    except ValueError as exc:
+        raise RuntimeError("Invalid resolved deletion-vector path") from exc
+    candidate = (
+        parsed.path
+        if parsed.scheme.casefold() in {"http", "https"}
+        else path
+    )
+    return any(character in candidate for character in ("*", "?", "[", "]"))
+
+
 def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
     """Return a structurally closed v2 segment tuple or raise.
 
@@ -2583,8 +2606,13 @@ def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
         rows = getattr(segment, "expected_rows", None)
         file_size = getattr(segment, "file_size", None)
         digest = getattr(segment, "tombstone_digest", None)
+        provider_identity = getattr(segment, "provider_identity", None)
         if not isinstance(key, str) or not key or not isinstance(path, str) or not path:
             raise RuntimeError("Invalid deletion-vector segment path")
+        if _duckdb_parquet_path_is_glob(path):
+            raise RuntimeError(
+                "Deletion-vector segment must resolve to one exact object path"
+            )
         try:
             validate_logical_storage_path(
                 key,
@@ -2603,6 +2631,16 @@ def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
             or re.fullmatch(r"[0-9a-f]{64}", digest) is None
         ):
             raise RuntimeError("Invalid deletion-vector segment seal")
+        if provider_identity is not None and (
+            not isinstance(provider_identity, str)
+            or not provider_identity
+            or "\x00" in provider_identity
+            or len(provider_identity.encode("utf-8"))
+            > MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES
+        ):
+            raise RuntimeError(
+                "Invalid deletion-vector segment provider identity"
+            )
         keys.append(key)
         row_total += rows
     if keys != sorted(keys) or len(keys) != len(set(keys)):
@@ -2642,6 +2680,7 @@ def _v2_segment_fingerprint(segments: Tuple[object, ...]) -> str:
             str(int(segment.expected_rows)),
             str(int(segment.file_size)),
             str(segment.tombstone_digest),
+            str(getattr(segment, "provider_identity", None) or ""),
         )
         for value in fields:
             encoded = value.encode("utf-8")
@@ -2668,6 +2707,76 @@ def _v2_union_relation(relations: List[str]) -> str:
     ) + ")"
 
 
+def _local_parquet_file_identity(path: str) -> Optional[tuple[int, ...]]:
+    """Return a stable local-file identity, or ``None`` for provider paths.
+
+    DuckDB opens provider-resolved S3/GCS/Azure/HTTP paths through its own
+    filesystem implementations, so attempting to reinterpret those URLs as
+    local paths would either inspect the wrong object or reject valid reads.
+    Plain paths (the normal LocalStorage/cache representation) and local file
+    URLs can be fenced with the host filesystem around the DuckDB statement.
+    """
+    parsed = urlsplit(path)
+    if parsed.scheme:
+        if parsed.scheme.casefold() != "file":
+            return None
+        if parsed.query or parsed.fragment or parsed.netloc not in ("", "localhost"):
+            raise RuntimeError("Invalid local deletion-vector segment path")
+        local_path = unquote(parsed.path)
+    else:
+        local_path = path
+
+    try:
+        observed = os.stat(local_path, follow_symlinks=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "Unable to inspect local deletion-vector segment"
+        ) from exc
+    if not stat.S_ISREG(observed.st_mode):
+        raise RuntimeError("Local deletion-vector segment is not a regular file")
+    return (
+        int(observed.st_dev),
+        int(observed.st_ino),
+        int(observed.st_size),
+        int(observed.st_mtime_ns),
+        int(observed.st_ctime_ns),
+    )
+
+
+def _provider_parquet_file_identity(
+        storage: object, cache_key: str,
+) -> tuple[int, str]:
+    """Observe one logical provider object without reading its row bytes."""
+    stat_object = getattr(storage, "stat_object", None)
+    if not callable(stat_object):
+        raise RuntimeError(
+            "Remote deletion-vector segments require provider identity support"
+        )
+    try:
+        metadata = stat_object(cache_key)
+        size = getattr(metadata, "size", None)
+        identity_fn = getattr(metadata, "identity_token", None)
+        identity = identity_fn() if callable(identity_fn) else None
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to observe remote deletion-vector segment"
+        ) from exc
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or not isinstance(identity, str)
+        or not identity
+        or "\x00" in identity
+        or len(identity.encode("utf-8"))
+        > MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES
+    ):
+        raise RuntimeError(
+            "Remote deletion-vector segment has no stable provider identity"
+        )
+    return int(size), identity
+
+
 def _materialize_v2_tombstone_table(
         con: duckdb.DuckDBPyConnection,
         tombstone_def,
@@ -2676,6 +2785,7 @@ def _materialize_v2_tombstone_table(
         occupied_table_names: set[str],
         allowed_files: Optional[List[str]] = None,
         temporary: bool = False,
+        storage: Optional[object] = None,
 ) -> tuple[str, int, str, frozenset[str]]:
     """Read each v2 segment exactly once into a private validated table.
 
@@ -2695,13 +2805,56 @@ def _materialize_v2_tombstone_table(
             staging = (
                 f"{base_table_name}_segment_{index}_{uuid.uuid4().hex}"
             )
-            escaped = escape_parquet_path(str(segment.tombstone_path))
+            segment_path = str(segment.tombstone_path)
+            escaped = escape_parquet_path(segment_path)
             relation = f"read_parquet('{escaped}', hive_partitioning=false)"
+            expected_size = int(segment.file_size)
+            local_identity = _local_parquet_file_identity(segment_path)
+            provider_identity: Optional[tuple[int, str]] = None
+            if local_identity is not None:
+                if local_identity[2] != expected_size:
+                    raise RuntimeError(
+                        "Deletion-vector segment file_size does not match "
+                        "the manifest"
+                    )
+            else:
+                expected_provider_identity = getattr(
+                    segment, "provider_identity", None,
+                )
+                if storage is None or expected_provider_identity is None:
+                    raise RuntimeError(
+                        "Remote deletion-vector segment lacks a pinned "
+                        "provider identity"
+                    )
+                provider_identity = _provider_parquet_file_identity(
+                    storage, str(segment.cache_key),
+                )
+                if provider_identity[0] != expected_size:
+                    raise RuntimeError(
+                        "Deletion-vector segment file_size does not match "
+                        "the manifest"
+                    )
+                if provider_identity[1] != expected_provider_identity:
+                    raise RuntimeError(
+                        "Deletion-vector segment provider identity does not "
+                        "match the pinned observation"
+                    )
             con.execute(
                 f"CREATE TEMPORARY TABLE {quote_if_needed(staging)} AS "
                 f"SELECT * FROM {relation};"
             )
             staging_tables.append(staging)
+            if local_identity is not None:
+                if _local_parquet_file_identity(segment_path) != local_identity:
+                    raise RuntimeError(
+                        "Deletion-vector segment changed while being read"
+                    )
+            elif _provider_parquet_file_identity(
+                storage, str(segment.cache_key),
+            ) != provider_identity:
+                raise RuntimeError(
+                    "Deletion-vector segment changed while being read"
+                )
             _validate_tombstone_relation_details(
                 con,
                 quote_if_needed(staging),
@@ -3352,11 +3505,13 @@ class TombstoneCache:
             global_capacity: int = 128,
             *,
             time_fn: Callable[[], float] = time.monotonic,
+            storage: Optional[object] = None,
     ):
         self.capacity = capacity
         self.ttl_seconds = ttl_seconds
         self.global_capacity = global_capacity
         self._time = time_fn
+        self.storage = storage
         self._lock = threading.Lock()
         self._registry: Dict[str, _DVCacheEntry] = {}   # cache_key -> entry
         self._tick = 0
@@ -3472,6 +3627,7 @@ class TombstoneCache:
                         occupied_table_names=occupied_names,
                         allowed_files=allowed_files,
                         temporary=not self.enabled,
+                        storage=self.storage,
                     )
                 else:
                     rid = quote_if_needed(ROWID_COL)
