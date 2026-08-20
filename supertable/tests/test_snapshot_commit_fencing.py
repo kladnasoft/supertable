@@ -68,6 +68,22 @@ def _snapshot_payload(**updates):
     return payload
 
 
+def _explicit_v2_payload(snapshot_version, *, active):
+    updates = {
+        "snapshot_version": snapshot_version,
+        "tombstone_format": 2,
+    }
+    if active:
+        updates.update({
+            "tombstone": (
+                "org/lake/tables/table/tombstone/generation/root.json"
+            ),
+            "tombstone_rows": 1,
+            "tombstone_digest": "0" * 64,
+        })
+    return _snapshot_payload(**updates)
+
+
 def test_snapshot_commit_atomically_updates_leaf_and_root():
     catalog, fake = _catalog()
     _seed(fake)
@@ -297,6 +313,131 @@ def test_v2_row_count_round_trips_at_redis_cjson_precision_ceiling():
     stored = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
     assert stored["payload"]["tombstone_rows"] == MAX_JSON_EXACT_INTEGER
     assert type(stored["payload"]["tombstone_rows"]) is int
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_writer_prepublish_enforces_sticky_v2_snapshot_version_ceiling(active):
+    table = SimpleNamespace(simple_dir="org/lake/tables/table")
+    DataWriter._validate_snapshot_for_publish(
+        _explicit_v2_payload(MAX_JSON_EXACT_INTEGER, active=active),
+        simple_table=table,
+        expected_version=MAX_JSON_EXACT_INTEGER - 1,
+    )
+    with pytest.raises(ValueError, match="v2 exact-integer boundary"):
+        DataWriter._validate_snapshot_for_publish(
+            _explicit_v2_payload(MAX_JSON_EXACT_INTEGER + 1, active=active),
+            simple_table=table,
+            expected_version=MAX_JSON_EXACT_INTEGER,
+        )
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_catalog_accepts_sticky_v2_successor_at_version_ceiling(active):
+    catalog, fake = _catalog()
+    base_path = "snap/max-minus-one.json"
+    _seed(
+        fake,
+        version=MAX_JSON_EXACT_INTEGER - 1,
+        path=base_path,
+    )
+
+    assert catalog.commit_snapshot(
+        "org", "lake", "table",
+        _explicit_v2_payload(MAX_JSON_EXACT_INTEGER, active=active),
+        "snap/max.json",
+        expected_version=MAX_JSON_EXACT_INTEGER - 1,
+        expected_path=base_path,
+        lock_token="token",
+        expected_mirrors=[],
+    ) == (MAX_JSON_EXACT_INTEGER, 10)
+
+    stored = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    assert stored["version"] == MAX_JSON_EXACT_INTEGER
+    assert stored["payload"]["snapshot_version"] == MAX_JSON_EXACT_INTEGER
+    assert stored["payload"]["tombstone_format"] == 2
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_catalog_rejects_sticky_v2_successor_above_version_ceiling(active):
+    catalog, fake = _catalog()
+    base_path = "snap/max.json"
+    _seed(fake, version=MAX_JSON_EXACT_INTEGER, path=base_path)
+    leaf_key = RK.meta_leaf("org", "lake", "table")
+    root_key = RK.meta_root("org", "lake")
+    before = (fake.get(leaf_key), fake.get(root_key))
+
+    with pytest.raises(ValueError, match="exact integer range"):
+        catalog.commit_snapshot(
+            "org", "lake", "table",
+            _explicit_v2_payload(MAX_JSON_EXACT_INTEGER + 1, active=active),
+            "snap/above-max.json",
+            expected_version=MAX_JSON_EXACT_INTEGER,
+            expected_path=base_path,
+            lock_token="token",
+            expected_mirrors=[],
+        )
+
+    assert (fake.get(leaf_key), fake.get(root_key)) == before
+    assert not fake.exists(RK.schema("org", "lake", "table"))
+    assert not fake.exists(RK.meta_table_names("org", "lake"))
+
+
+def test_catalog_keeps_v1_successor_behavior_above_v2_ceiling():
+    catalog, fake = _catalog()
+    base_path = "snap/max.json"
+    _seed(fake, version=MAX_JSON_EXACT_INTEGER, path=base_path)
+
+    leaf_version, root_version = catalog.commit_snapshot(
+        "org", "lake", "table",
+        _snapshot_payload(
+            snapshot_version=MAX_JSON_EXACT_INTEGER + 1,
+            tombstone_format=1,
+        ),
+        "snap/v1-above-v2-max.json",
+        expected_version=MAX_JSON_EXACT_INTEGER,
+        expected_path=base_path,
+        lock_token="token",
+        expected_mirrors=[],
+    )
+
+    assert leaf_version == MAX_JSON_EXACT_INTEGER + 1
+    assert root_version == 10
+
+
+@pytest.mark.parametrize("fast_path", [False, True])
+@pytest.mark.parametrize("active", [False, True])
+def test_both_lua_commit_paths_reject_v2_version_above_ceiling(
+        monkeypatch, fast_path, active,
+):
+    catalog, fake = _catalog()
+    base_path = "snap/max.json"
+    _seed(fake, version=MAX_JSON_EXACT_INTEGER, path=base_path)
+    leaf_key = RK.meta_leaf("org", "lake", "table")
+    root_key = RK.meta_root("org", "lake")
+    before = (fake.get(leaf_key), fake.get(root_key))
+    # Bypass only the Python ceiling to exercise the duplicated Lua boundary.
+    monkeypatch.setattr(
+        "supertable.redis_catalog.MAX_TOMBSTONE_JSON_EXACT_INTEGER",
+        MAX_JSON_EXACT_INTEGER + 1,
+    )
+    kwargs = {"expected_mirrors": []}
+    if fast_path:
+        kwargs["expected_mirror_pin"] = None
+
+    with pytest.raises(ValueError, match="invalid snapshot payload"):
+        catalog.commit_snapshot(
+            "org", "lake", "table",
+            _explicit_v2_payload(MAX_JSON_EXACT_INTEGER + 1, active=active),
+            "snap/above-max.json",
+            expected_version=MAX_JSON_EXACT_INTEGER,
+            expected_path=base_path,
+            lock_token="token",
+            **kwargs,
+        )
+
+    assert (fake.get(leaf_key), fake.get(root_key)) == before
+    assert not fake.exists(RK.schema("org", "lake", "table"))
+    assert not fake.exists(RK.meta_table_names("org", "lake"))
 
 
 def test_snapshot_zero_cannot_publish_active_v2_manifest_lineage():

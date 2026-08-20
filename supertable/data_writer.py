@@ -81,6 +81,7 @@ from supertable.mirroring.mirror_formats import (
     MirrorPublicationError,
 )
 from supertable.tombstone_manifest_v2 import (
+    MAX_JSON_EXACT_INTEGER,
     TOMBSTONE_FORMAT_V2,
     validate_logical_storage_path,
     validate_snapshot_tombstone_state,
@@ -425,6 +426,14 @@ class DataWriter:
             format_present="tombstone_format" in payload,
             tombstone_format=payload.get("tombstone_format"),
         )
+        if (
+            normalized_format == TOMBSTONE_FORMAT_V2
+            and snapshot_version > MAX_JSON_EXACT_INTEGER
+        ):
+            raise ValueError(
+                "Snapshot publication version exceeds the v2 exact-integer "
+                "boundary"
+            )
         pointer = payload.get("tombstone")
         if normalized_format != TOMBSTONE_FORMAT_V2 or pointer is None:
             return

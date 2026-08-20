@@ -106,6 +106,10 @@ def test_manifest_creation_lineage_allows_pure_append_carry_forward() -> None:
     assert load_tombstone_manifest_v2(
         manifest.canonical_bytes(), pinned_snapshot_version=9,
     ) == manifest
+    assert load_tombstone_manifest_v2(
+        manifest.canonical_bytes(),
+        pinned_snapshot_version=MAX_JSON_EXACT_INTEGER,
+    ) == manifest
     with pytest.raises(TombstoneManifestV2Error, match="created after"):
         load_tombstone_manifest_v2(
             manifest.canonical_bytes(), pinned_snapshot_version=4,

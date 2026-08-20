@@ -352,6 +352,17 @@ local function snapshot_tombstone_state_ok(candidate, expected_v2_prefix)
     return false
   end
 
+  if tombstone_format == 2
+      and (type(candidate['snapshot_version']) ~= 'number'
+          or candidate['snapshot_version'] < 0
+          or candidate['snapshot_version'] ~= math.floor(
+            candidate['snapshot_version']
+          )
+          or candidate['snapshot_version']
+            > TOMBSTONE_JSON_MAX_EXACT_INTEGER) then
+    return false
+  end
+
   if pointer == cjson.null then
     return type(tombstone_rows) == 'number'
         and tombstone_rows == 0
@@ -6604,6 +6615,14 @@ return 1
             raise ValueError(
                 "snapshot payload has an invalid deletion-vector state"
             ) from exc
+        if (
+            tombstone_format == TOMBSTONE_FORMAT_V2
+            and successor_version > MAX_TOMBSTONE_JSON_EXACT_INTEGER
+        ):
+            raise ValueError(
+                "explicit snapshot v2 version exceeds Redis JSON's exact "
+                "integer range"
+            )
         if (
             tombstone_format == TOMBSTONE_FORMAT_V2
             and payload.get("tombstone") is not None
