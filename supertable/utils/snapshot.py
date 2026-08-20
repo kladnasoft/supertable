@@ -8,15 +8,264 @@ explicit empty state can resurrect physically retained deleted rows.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 
 from supertable.tombstone_manifest_v2 import (
+    MAX_TOMBSTONE_MANIFEST_V2_BYTES,
     TombstoneManifestV2Error,
+    load_tombstone_manifest_v2,
+    validate_logical_storage_path,
     validate_snapshot_tombstone_state,
 )
 
 
 _MAX_LUA_EXACT_INTEGER = 2**53 - 1
+
+
+@dataclass(frozen=True)
+class SnapshotArtifactReference:
+    """One immutable object retained by a snapshot.
+
+    ``declared_digest`` is representation-specific provenance, not always a
+    byte hash: data/statistics objects have no snapshot-level digest, v1 and
+    v2 segments use the logical deletion-vector digest, and a v2 manifest uses
+    the SHA-256 of its canonical JSON.  Consumers that need a raw content seal
+    (notably disaster recovery) must hash the referenced object independently.
+    """
+
+    path: str
+    kind: str
+    declared_size: Optional[int] = None
+    declared_digest: Optional[str] = None
+
+
+_ManifestLoader = Callable[[str], Union[str, bytes, bytearray, memoryview]]
+
+
+def _positive_artifact_size(value: object, *, field: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 1
+    ):
+        raise TombstoneManifestV2Error(
+            f"{field} must be a positive exact integer"
+        )
+    return value
+
+
+def referenced_snapshot_artifacts(
+    snapshot: Mapping[str, Any],
+    storage: Optional[object] = None,
+    *,
+    organization: Optional[str] = None,
+    super_name: Optional[str] = None,
+    simple_name: Optional[str] = None,
+    manifest_loader: Optional[_ManifestLoader] = None,
+    require_canonical_manifest: bool = True,
+) -> Tuple[SnapshotArtifactReference, ...]:
+    """Return every immutable object reachable from one snapshot.
+
+    The traversal is the retention boundary for recovery and external garbage
+    collectors.  Legacy v1 snapshots contribute their single Parquet deletion
+    vector.  An active v2 snapshot contributes both the JSON root and every
+    segment named by that root.  V2 expansion is mandatory: omitting a loader
+    is an error rather than permission to return an incomplete live set.
+
+    ``storage`` is an ergonomic adapter for objects exposing ``size`` and
+    ``read_bytes``; callers with a bounded or conditional reader can supply
+    ``manifest_loader`` instead.  Active v2 traversal also requires the pinned
+    table identity so the root and all reachable paths can be confined and the
+    manifest's identity and lineage can be validated.
+    """
+    if not isinstance(snapshot, Mapping):
+        raise TombstoneManifestV2Error("snapshot must be an object")
+    if manifest_loader is not None and storage is not None:
+        raise TypeError("provide storage or manifest_loader, not both")
+    if manifest_loader is None and storage is not None:
+        read_bytes = getattr(storage, "read_bytes", None)
+        size = getattr(storage, "size", None)
+        if not callable(read_bytes) or not callable(size):
+            raise TypeError(
+                "storage must provide size(path) and read_bytes(path) for "
+                "bounded manifest reads"
+            )
+
+        def bounded_storage_manifest_loader(path: str) -> bytes:
+            observed_size = size(path)
+            if (
+                isinstance(observed_size, bool)
+                or not isinstance(observed_size, int)
+                or not 1 <= observed_size <= MAX_TOMBSTONE_MANIFEST_V2_BYTES
+            ):
+                raise TombstoneManifestV2Error(
+                    "tombstone manifest size is outside the supported bound"
+                )
+            payload = read_bytes(path)
+            if (
+                not isinstance(payload, bytes)
+                or len(payload) != observed_size
+            ):
+                raise TombstoneManifestV2Error(
+                    "tombstone manifest bytes differ from the bounded size"
+                )
+            return payload
+
+        manifest_loader = bounded_storage_manifest_loader
+
+    identity_values = (organization, super_name, simple_name)
+    if any(value is not None for value in identity_values) and not all(
+        isinstance(value, str) and value for value in identity_values
+    ):
+        raise TombstoneManifestV2Error(
+            "organization, super_name, and simple_name must be supplied together"
+        )
+    table_prefix: Optional[str] = None
+    tombstone_prefix: Optional[str] = None
+    if all(isinstance(value, str) and value for value in identity_values):
+        table_prefix = (
+            f"{organization}/{super_name}/tables/{simple_name}/"
+        )
+        tombstone_prefix = table_prefix + "tombstone/"
+
+    references: dict[str, SnapshotArtifactReference] = {}
+
+    def retain(reference: SnapshotArtifactReference) -> None:
+        path = validate_logical_storage_path(
+            reference.path,
+            field_name=f"{reference.kind} artifact path",
+        )
+        if table_prefix is not None and not path.startswith(table_prefix):
+            raise TombstoneManifestV2Error(
+                f"{reference.kind} artifact escapes the pinned table"
+            )
+        normalized = SnapshotArtifactReference(
+            path=path,
+            kind=reference.kind,
+            declared_size=reference.declared_size,
+            declared_digest=reference.declared_digest,
+        )
+        previous = references.setdefault(path, normalized)
+        if previous != normalized:
+            raise TombstoneManifestV2Error(
+                f"snapshot artifact {path!r} has conflicting declarations"
+            )
+
+    resources = snapshot.get("resources")
+    if not isinstance(resources, list):
+        raise TombstoneManifestV2Error("snapshot resources must be a list")
+    for index, resource in enumerate(resources):
+        if not isinstance(resource, Mapping):
+            raise TombstoneManifestV2Error(
+                f"snapshot resources[{index}] must be an object"
+            )
+        path = resource.get("file")
+        if not isinstance(path, str):
+            raise TombstoneManifestV2Error(
+                f"snapshot resources[{index}].file must be a string"
+            )
+        retain(SnapshotArtifactReference(
+            path=path,
+            kind="data",
+            declared_size=_positive_artifact_size(
+                resource.get("file_size"),
+                field=f"snapshot resources[{index}].file_size",
+            ),
+        ))
+
+    pointer = snapshot.get("tombstone")
+    rows = snapshot.get("tombstone_rows")
+    digest = snapshot.get("tombstone_digest")
+    tombstone_format = validate_snapshot_tombstone_state(
+        pointer,
+        rows,
+        digest,
+        format_present="tombstone_format" in snapshot,
+        tombstone_format=snapshot.get("tombstone_format"),
+    )
+    if pointer is not None and tombstone_format == 1:
+        retain(SnapshotArtifactReference(
+            path=pointer,
+            kind="tombstone",
+            declared_digest=digest,
+        ))
+    elif pointer is not None:
+        if table_prefix is None or tombstone_prefix is None:
+            raise TombstoneManifestV2Error(
+                "active tombstone_format=2 requires the pinned table identity"
+            )
+        snapshot_version = snapshot.get("snapshot_version")
+        if (
+            isinstance(snapshot_version, bool)
+            or not isinstance(snapshot_version, int)
+            or not 1 <= snapshot_version <= _MAX_LUA_EXACT_INTEGER
+        ):
+            raise TombstoneManifestV2Error(
+                "active tombstone_format=2 requires a valid snapshot_version"
+            )
+        manifest_path = validate_logical_storage_path(
+            pointer,
+            field_name="tombstone manifest path",
+            required_suffix=".json",
+        )
+        if tombstone_prefix is not None and not manifest_path.startswith(
+            tombstone_prefix
+        ):
+            raise TombstoneManifestV2Error(
+                "tombstone manifest escapes the pinned tombstone namespace"
+            )
+        if manifest_loader is None:
+            raise TombstoneManifestV2Error(
+                "active tombstone_format=2 requires a manifest loader"
+            )
+        try:
+            raw_manifest = manifest_loader(manifest_path)
+        except TombstoneManifestV2Error:
+            raise
+        except Exception as exc:
+            raise TombstoneManifestV2Error(
+                f"cannot read tombstone manifest {manifest_path!r}: {exc}"
+            ) from exc
+        manifest = load_tombstone_manifest_v2(
+            raw_manifest,
+            expected_organization=organization,
+            expected_super_name=super_name,
+            expected_simple_name=simple_name,
+            pinned_snapshot_version=snapshot_version,
+            expected_total_rows=rows,
+            expected_digest=digest,
+            expected_segment_prefix=(
+                tombstone_prefix.rstrip("/")
+                if tombstone_prefix is not None else None
+            ),
+            require_canonical_json=require_canonical_manifest,
+        )
+        retain(SnapshotArtifactReference(
+            path=manifest_path,
+            kind="tombstone_manifest",
+            declared_digest=digest,
+        ))
+        for segment in manifest.segments:
+            retain(SnapshotArtifactReference(
+                path=segment.file,
+                kind="tombstone_segment",
+                declared_size=segment.file_size,
+                declared_digest=segment.digest,
+            ))
+
+    stats_file = snapshot.get("stats_file")
+    if stats_file is not None:
+        if not isinstance(stats_file, str):
+            raise TombstoneManifestV2Error(
+                "snapshot stats_file must be a string or null"
+            )
+        retain(SnapshotArtifactReference(
+            path=stats_file,
+            kind="stats_file",
+        ))
+
+    return tuple(references[path] for path in sorted(references))
 
 
 def collect_share_row_filters(*documents: object) -> Tuple[str, ...]:

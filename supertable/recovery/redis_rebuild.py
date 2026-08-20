@@ -21,17 +21,23 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from supertable import redis_keys as RK
 from supertable.redis_catalog import (
     _REDIS_LUA_MAX_SAFE_INTEGER,
     _canonicalize_role_document,
     _validate_root_document,
+    _validate_table_config_document,
     validate_username,
+)
+from supertable.tombstone_manifest_v2 import (
+    MAX_TOMBSTONE_MANIFEST_V2_BYTES,
+    TombstoneManifestV2Error,
 )
 from supertable.utils.snapshot import (
     complete_snapshot_payload,
+    referenced_snapshot_artifacts,
     snapshot_cache_payload,
 )
 
@@ -409,31 +415,6 @@ def _validate_state_items(
     return result
 
 
-def _snapshot_artifacts(
-    snapshot: Mapping[str, Any],
-) -> Iterable[tuple[Any, Optional[int], str]]:
-    resources = snapshot.get("resources")
-    if not isinstance(resources, list):
-        raise RecoveryError("snapshot resources must be a list")
-    for resource in resources:
-        if not isinstance(resource, Mapping):
-            raise RecoveryError("snapshot contains an invalid resource")
-        declared_size = resource.get("file_size")
-        if (
-            isinstance(declared_size, bool)
-            or not isinstance(declared_size, int)
-            or declared_size < 1
-        ):
-            raise RecoveryError(
-                "snapshot resource is missing a positive declared file_size"
-            )
-        yield resource.get("file"), declared_size, "data"
-    for field in ("tombstone", "stats_file"):
-        value = snapshot.get(field)
-        if value is not None:
-            yield value, None, field
-
-
 def _content_seal(
     storage: Any,
     path: str,
@@ -569,18 +550,41 @@ def _validate_snapshot(
         )
     if leaf_version != complete["snapshot_version"]:
         raise RecoveryError(f"leaf {super_name}/{simple_name} version differs from snapshot")
-    table_prefix = f"{organization}/{super_name}/tables/{simple_name}/"
-    artifact_seals: dict[str, dict[str, Any]] = {}
-    for raw_artifact, declared_size, artifact_kind in _snapshot_artifacts(complete):
-        artifact = _logical_path(raw_artifact, field="snapshot artifact path")
-        if not artifact.startswith(table_prefix):
-            raise RecoveryError(f"snapshot artifact {artifact!r} escapes table namespace")
-        size, content_sha256 = _content_seal(
-            storage, artifact, declared_size=declared_size,
+    try:
+        artifact_references = referenced_snapshot_artifacts(
+            complete,
+            organization=organization,
+            super_name=super_name,
+            simple_name=simple_name,
+            manifest_loader=lambda manifest_path: _read_bytes(
+                storage,
+                manifest_path,
+                maximum=MAX_TOMBSTONE_MANIFEST_V2_BYTES,
+                label="tombstone manifest",
+            ),
+            require_canonical_manifest=True,
         )
+    except (TypeError, TombstoneManifestV2Error) as exc:
+        raise RecoveryError(
+            f"snapshot {path!r} has an invalid artifact graph: {exc}"
+        ) from exc
+
+    artifact_seals: dict[str, dict[str, Any]] = {}
+    for reference in artifact_references:
+        artifact = reference.path
+        size, content_sha256 = _content_seal(
+            storage, artifact, declared_size=reference.declared_size,
+        )
+        if (
+            reference.kind == "tombstone_manifest"
+            and content_sha256 != reference.declared_digest
+        ):
+            raise RecoveryError(
+                f"tombstone manifest {artifact!r} changed after root validation"
+            )
         seal = {
             "path": artifact,
-            "kind": artifact_kind,
+            "kind": reference.kind,
             "bytes": size,
             "sha256": content_sha256,
         }
@@ -1157,6 +1161,13 @@ def _validate_catalog_state(
                     item, label=f"{family} for {sup}/{simple}",
                 )
                 if family == "table config":
+                    try:
+                        document = _validate_table_config_document(document)
+                    except ValueError as exc:
+                        raise RecoveryError(
+                            f"table config for {sup}/{simple} has an invalid "
+                            f"DV-v2 activation: {exc}"
+                        ) from exc
                     # Preserve unknown legacy/user metadata, but every field
                     # interpreted by the current writer must have the exact
                     # runtime shape.  Otherwise a checkpoint can be sealed and

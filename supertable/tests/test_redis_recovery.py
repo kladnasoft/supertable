@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -26,6 +27,11 @@ from supertable.recovery.redis_rebuild import (
 )
 from supertable.redis_catalog import RedisCatalog
 from supertable.redis_catalog import _canonicalize_role_document
+from supertable.tombstone_manifest_v2 import (
+    TombstoneManifestV2,
+    TombstoneSegment,
+    canonical_tombstone_manifest_v2_bytes,
+)
 
 
 ORG = "acme"
@@ -33,6 +39,10 @@ SUP = "sales"
 TABLE = "orders"
 SNAPSHOT_PATH = f"{ORG}/{SUP}/tables/{TABLE}/snapshots/v3.json"
 DATA_PATH = f"{ORG}/{SUP}/tables/{TABLE}/data/part.parquet"
+DV_ROOT = f"{ORG}/{SUP}/tables/{TABLE}/tombstone/generation-3/manifest.json"
+DV_SEGMENT = (
+    f"{ORG}/{SUP}/tables/{TABLE}/tombstone/generation-3/segment.parquet"
+)
 
 
 class MemoryStorage:
@@ -129,6 +139,40 @@ def _seed_catalog(redis_client, storage):
     )
     # Ephemeral ownership must never be resurrected by a DR checkpoint.
     redis_client.set(RK.lock_leaf(ORG, SUP, TABLE), "dead-owner", ex=30)
+
+
+def _seed_v2_catalog(redis_client, storage) -> TombstoneManifestV2:
+    _seed_catalog(redis_client, storage)
+    segment_bytes = b"sealed-v2-segment"
+    storage.files[DV_SEGMENT] = segment_bytes
+    manifest = TombstoneManifestV2(
+        organization=ORG,
+        super_name=SUP,
+        simple_name=TABLE,
+        base_snapshot_version=2,
+        snapshot_version=3,
+        total_rows=1,
+        segments=(TombstoneSegment(
+            file=DV_SEGMENT,
+            rows=1,
+            file_size=len(segment_bytes),
+            digest="d" * 64,
+        ),),
+    )
+    storage.files[DV_ROOT] = manifest.canonical_bytes()
+
+    snapshot = json.loads(storage.files[SNAPSHOT_PATH])
+    snapshot.update({
+        "tombstone": DV_ROOT,
+        "tombstone_rows": 1,
+        "tombstone_digest": manifest.digest(),
+        "tombstone_format": 2,
+    })
+    storage.files[SNAPSHOT_PATH] = json.dumps(snapshot).encode()
+    leaf = json.loads(redis_client.get(RK.meta_leaf(ORG, SUP, TABLE)))
+    leaf["payload"] = snapshot
+    redis_client.set(RK.meta_leaf(ORG, SUP, TABLE), json.dumps(leaf))
+    return manifest
 
 
 def _append_event(source, storage, *, sequence=1, archive=True):
@@ -691,6 +735,147 @@ def test_rebuild_rejects_same_path_data_replacement_and_declared_size_drift():
     snapshot["resources"][0]["file_size"] += 1
     storage.files[SNAPSHOT_PATH] = json.dumps(snapshot).encode()
     with pytest.raises(RecoveryError, match="size differs from file_size"):
+        _checkpoint(source, storage)
+
+
+def test_recovery_seals_v2_root_and_every_segment_and_detects_replacement():
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_v2_catalog(source, storage)
+
+    checkpoint = _checkpoint(source, storage)
+    checkpoint_document = json.loads(storage.files[checkpoint.path])
+    artifacts = {
+        item["path"]: item
+        for item in checkpoint_document["snapshots"][0]["artifacts"]
+    }
+    assert artifacts[DV_ROOT]["kind"] == "tombstone_manifest"
+    assert artifacts[DV_SEGMENT]["kind"] == "tombstone_segment"
+    assert artifacts[DV_ROOT]["sha256"] == hashlib.sha256(
+        storage.files[DV_ROOT]
+    ).hexdigest()
+    assert artifacts[DV_SEGMENT]["sha256"] == hashlib.sha256(
+        storage.files[DV_SEGMENT]
+    ).hexdigest()
+
+    storage.files[DV_SEGMENT] = b"xxxxxx-v2-segment"
+    assert len(storage.files[DV_SEGMENT]) == len(b"sealed-v2-segment")
+    with pytest.raises(RecoveryError, match="snapshot seals differ"):
+        plan_redis_rebuild(storage, ORG)
+
+
+def test_checkpoint_rejects_v2_manifest_swap_between_validation_and_seal():
+    class SwappingStorage(MemoryStorage):
+        manifest_reads = 0
+
+        def read_bytes(self, path):
+            payload = super().read_bytes(path)
+            if path == DV_ROOT:
+                self.manifest_reads += 1
+                if self.manifest_reads == 1:
+                    self.files[path] = payload.replace(
+                        b'"digest":"dddddddd',
+                        b'"digest":"eeeeeeee',
+                        1,
+                    )
+            return payload
+
+    source = _redis()
+    storage = SwappingStorage()
+    _seed_v2_catalog(source, storage)
+
+    with pytest.raises(RecoveryError, match="changed after root validation"):
+        _checkpoint(source, storage)
+    assert storage.manifest_reads == 2
+
+
+@pytest.mark.parametrize(
+    "mutation, error",
+    [
+        ("noncanonical", "canonical"),
+        ("root_digest", "SHA-256"),
+        ("table", "pinned table"),
+        ("lineage", "immediate successor"),
+        ("count", "total_rows"),
+    ],
+)
+def test_checkpoint_rejects_invalid_v2_manifest_contract(mutation, error):
+    source = _redis()
+    storage = MemoryStorage()
+    manifest = _seed_v2_catalog(source, storage)
+    snapshot = json.loads(storage.files[SNAPSHOT_PATH])
+    leaf = json.loads(source.get(RK.meta_leaf(ORG, SUP, TABLE)))
+    document = manifest.to_dict()
+
+    if mutation == "noncanonical":
+        storage.files[DV_ROOT] = json.dumps(document, indent=2).encode()
+    elif mutation == "root_digest":
+        snapshot["tombstone_digest"] = "0" * 64
+    elif mutation == "table":
+        document["simple_name"] = "other"
+        storage.files[DV_ROOT] = canonical_tombstone_manifest_v2_bytes(document)
+        snapshot["tombstone_digest"] = hashlib.sha256(
+            storage.files[DV_ROOT]
+        ).hexdigest()
+    elif mutation == "lineage":
+        document["base_snapshot_version"] = 1
+        storage.files[DV_ROOT] = canonical_tombstone_manifest_v2_bytes(document)
+        snapshot["tombstone_digest"] = hashlib.sha256(
+            storage.files[DV_ROOT]
+        ).hexdigest()
+    else:
+        snapshot["tombstone_rows"] = 2
+
+    storage.files[SNAPSHOT_PATH] = json.dumps(snapshot).encode()
+    leaf["payload"] = snapshot
+    source.set(RK.meta_leaf(ORG, SUP, TABLE), json.dumps(leaf))
+
+    with pytest.raises(RecoveryError, match=error):
+        _checkpoint(source, storage)
+
+
+def test_recovery_round_trips_durable_v2_activation_config():
+    source = _redis()
+    destination = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    config = {
+        "deletion_vector_format": 2,
+        "dv_v2_reader_fleet_confirmed": True,
+        "modified_ms": 1_700_000_000_000,
+    }
+    source.set(
+        RK.meta_table_config(ORG, SUP, TABLE),
+        json.dumps(config, sort_keys=True, separators=(",", ":")),
+    )
+
+    _checkpoint(source, storage)
+    rebuild_redis(destination, storage, ORG, dry_run=False)
+
+    restored = RedisCatalog(redis_client=destination).get_table_config(
+        ORG, SUP, TABLE,
+    )
+    assert restored == config
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"deletion_vector_format": 2},
+        {"dv_v2_reader_fleet_confirmed": True},
+        {
+            "deletion_vector_format": 2,
+            "dv_v2_reader_fleet_confirmed": "true",
+        },
+    ],
+)
+def test_checkpoint_rejects_ambiguous_v2_activation_config(config):
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    source.set(RK.meta_table_config(ORG, SUP, TABLE), json.dumps(config))
+
+    with pytest.raises(RecoveryError, match="invalid DV-v2 activation"):
         _checkpoint(source, storage)
 
 

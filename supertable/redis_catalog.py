@@ -39,6 +39,41 @@ def _now_ms() -> int:
 _ROOT_CLONE_TYPES = frozenset({"readonly", "replica"})
 _REDIS_LUA_MAX_SAFE_INTEGER = (1 << 53) - 1
 _UNPINNED_MIRROR_CONFIG = object()
+_DV_V2_FORMAT_CONFIG_KEY = "deletion_vector_format"
+_DV_V2_FLEET_CONFIG_KEY = "dv_v2_reader_fleet_confirmed"
+
+
+def _validate_table_config_document(
+    config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Return a table config whose durable DV-v2 activation is unambiguous.
+
+    Legacy documents contain neither activation field and remain valid.  Once
+    either marker appears, both must carry the exact rollout proof emitted by
+    ``DataWriter.configure_table``.  In particular, Python/JSON booleans do
+    not pass as integer format values and integer/string truthy values do not
+    pass as the fleet confirmation.
+    """
+    if not isinstance(config, Mapping):
+        raise ValueError("table configuration must be an object")
+    document = dict(config)
+    format_present = _DV_V2_FORMAT_CONFIG_KEY in document
+    fleet_present = _DV_V2_FLEET_CONFIG_KEY in document
+    if format_present != fleet_present:
+        raise ValueError(
+            "DV-v2 activation requires deletion_vector_format=2 and "
+            "dv_v2_reader_fleet_confirmed=true together"
+        )
+    if format_present and (
+        type(document[_DV_V2_FORMAT_CONFIG_KEY]) is not int
+        or document[_DV_V2_FORMAT_CONFIG_KEY] != 2
+        or document[_DV_V2_FLEET_CONFIG_KEY] is not True
+    ):
+        raise ValueError(
+            "DV-v2 activation requires deletion_vector_format=2 and "
+            "dv_v2_reader_fleet_confirmed=true together"
+        )
+    return document
 
 
 class _PreparedTableMutationLeaf:
@@ -11987,7 +12022,7 @@ return 1
         if not (org and sup and simple):
             return False
         try:
-            doc = dict(config)
+            doc = _validate_table_config_document(config)
             doc["modified_ms"] = _now_ms()
             result = int(self._set_table_config_fenced(
                 keys=[
@@ -12056,7 +12091,12 @@ return 1
             raise RuntimeError(
                 f"Corrupt table configuration for {org}/{sup}/{simple}"
             )
-        return document
+        try:
+            return _validate_table_config_document(document)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Corrupt table configuration for {org}/{sup}/{simple}: {exc}"
+            ) from exc
 
     # ========================================================================= #
     # Engine runtime configuration (DuckDB memory, threads, caches, thresholds)

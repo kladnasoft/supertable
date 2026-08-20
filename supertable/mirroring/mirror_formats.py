@@ -6,6 +6,10 @@ from typing import Iterable, List, Dict, Any, Optional
 
 from supertable.config.defaults import logger
 from supertable.redis_catalog import RedisCatalog
+from supertable.tombstone_manifest_v2 import (
+    TombstoneManifestV2Error,
+    validate_snapshot_tombstone_state,
+)
 from supertable.utils.snapshot import (
     complete_snapshot_payload,
     snapshot_cache_payload,
@@ -235,9 +239,21 @@ class MirrorFormats:
         # do not apply its deletion vector.  Publishing such a mirror would
         # resurrect logically deleted rows.  DataWriter drains an active vector
         # before mirroring, and this guard keeps every other caller fail-closed.
-        tombstone = simple_snapshot.get("tombstone")
-        tombstone_rows = int(simple_snapshot.get("tombstone_rows") or 0)
-        if tombstone or tombstone_rows:
+        try:
+            validate_snapshot_tombstone_state(
+                simple_snapshot.get("tombstone"),
+                simple_snapshot.get("tombstone_rows"),
+                simple_snapshot.get("tombstone_digest"),
+                format_present="tombstone_format" in simple_snapshot,
+                tombstone_format=simple_snapshot.get("tombstone_format"),
+            )
+        except (TypeError, TombstoneManifestV2Error) as exc:
+            raise RuntimeError(
+                "Cannot mirror a snapshot with an active deletion vector or "
+                "invalid deletion-vector state; compact/drain and repair the "
+                "snapshot first"
+            ) from exc
+        if simple_snapshot.get("tombstone") is not None:
             raise RuntimeError(
                 "Cannot mirror a snapshot with an active deletion vector; "
                 "compact/drain the tombstone first"

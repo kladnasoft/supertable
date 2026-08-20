@@ -365,6 +365,24 @@ observability, but every write refreshes the authoritative configuration after
 acquiring the table lease so cross-process changes cannot be hidden by stale
 cache state.
 
+### Deletion-vector v2 activation gate
+
+DV-v2 publication is a coordinated deployment gate, not an ordinary tuning
+switch. Before activating a table, deploy a v2-capable reader fleet and every
+non-query consumer (recovery, mirroring, metadata, and quality), and update the
+external retention/garbage collector to expand
+`supertable.utils.snapshot.referenced_snapshot_artifacts()` so it retains the
+JSON manifest **and every segment**. A collector that retains only the manifest
+can permanently delete live deletion-vector segments.
+
+After those checks, enable the local writer gate
+`SUPERTABLE_DV_V2_WRITES_ENABLED=true` and persist the two durable table-config
+fields together: `deletion_vector_format=2` and
+`dv_v2_reader_fleet_confirmed=true`. Partial, coerced, or contradictory pairs
+are rejected. Do not roll old readers or the old GC back into service while
+any retained snapshot can reference format 2; removing the config does not
+rewrite already-published snapshots.
+
 ---
 
 ## Overlap Detection Details

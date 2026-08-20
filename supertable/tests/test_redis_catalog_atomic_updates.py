@@ -743,6 +743,88 @@ def test_table_config_read_rejects_corrupt_or_nonobject_state(raw):
         catalog.get_table_config("acme", "lake", "orders")
 
 
+def test_dv_v2_activation_config_round_trips_with_exact_json_types():
+    catalog, client = _catalog()
+    _seed_root(client)
+    client.set(
+        RK.meta_leaf("acme", "lake", "orders"),
+        json.dumps({"version": 0, "ts": 1, "path": "snapshots/v0.json"}),
+    )
+    client.set(RK.lock_leaf("acme", "lake", "orders"), "owner")
+
+    assert catalog.set_table_config(
+        "acme",
+        "lake",
+        "orders",
+        {
+            "max_overlapping_files": 4,
+            "deletion_vector_format": 2,
+            "dv_v2_reader_fleet_confirmed": True,
+        },
+        lock_token="owner",
+    )
+
+    restored = catalog.get_table_config("acme", "lake", "orders")
+    assert restored is not None
+    assert restored["deletion_vector_format"] == 2
+    assert type(restored["deletion_vector_format"]) is int
+    assert restored["dv_v2_reader_fleet_confirmed"] is True
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"deletion_vector_format": 2},
+        {"dv_v2_reader_fleet_confirmed": True},
+        {
+            "deletion_vector_format": True,
+            "dv_v2_reader_fleet_confirmed": True,
+        },
+        {
+            "deletion_vector_format": "2",
+            "dv_v2_reader_fleet_confirmed": True,
+        },
+        {
+            "deletion_vector_format": 2,
+            "dv_v2_reader_fleet_confirmed": 1,
+        },
+        {
+            "deletion_vector_format": 2,
+            "dv_v2_reader_fleet_confirmed": False,
+        },
+    ],
+)
+def test_table_config_write_rejects_partial_or_coerced_v2_activation(config):
+    catalog, client = _catalog()
+
+    with pytest.raises(ValueError, match="DV-v2 activation"):
+        catalog.set_table_config(
+            "acme", "lake", "orders", config, lock_token="owner",
+        )
+    assert not client.exists(RK.meta_table_config("acme", "lake", "orders"))
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"deletion_vector_format": 2},
+        {
+            "deletion_vector_format": 2,
+            "dv_v2_reader_fleet_confirmed": "true",
+        },
+    ],
+)
+def test_table_config_read_rejects_ambiguous_v2_activation(config):
+    catalog, client = _catalog()
+    client.set(
+        RK.meta_table_config("acme", "lake", "orders"),
+        json.dumps(config),
+    )
+
+    with pytest.raises(RuntimeError, match="Corrupt table configuration"):
+        catalog.get_table_config("acme", "lake", "orders")
+
+
 def test_table_config_transport_failure_aborts_writer_and_configure():
     backend = MagicMock()
     backend.get_table_config.side_effect = redis.TimeoutError("redis unavailable")
