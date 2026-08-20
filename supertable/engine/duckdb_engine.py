@@ -32,6 +32,7 @@ from supertable.engine.engine_common import (
     create_typed_empty_view,
     redact_url_credentials,
     _validated_rbac_predicate_sql,
+    tombstone_data_paths,
     validate_rbac_binding_stability,
 )
 from supertable.engine.island_resources import (
@@ -118,6 +119,17 @@ def _path_contains_bearer_credentials(path: object) -> bool:
         parsed.scheme.casefold() in {"http", "https"}
         and bool(parsed.query or parsed.fragment or parsed.username or parsed.password)
     )
+
+
+def _tombstone_source_paths(reflection: Reflection) -> List[str]:
+    """Collect every Parquet DV source and exclude v2 JSON tripwires."""
+    return [
+        path
+        for view_def in (
+            getattr(reflection, "tombstone_views", None) or {}
+        ).values()
+        for path in tombstone_data_paths(view_def)
+    ]
 
 
 _SENSITIVE_ERROR_ASSIGNMENT_RE = re.compile(
@@ -497,16 +509,12 @@ class DuckDB:
             raise ValueError(
                 "EXPLAIN is unavailable for access-controlled queries"
             )
+        tombstone_paths = _tombstone_source_paths(reflection)
         initial_source_paths = [
             path
             for snapshot in reflection.supers
             for path in (getattr(snapshot, "files", None) or [])
-        ] + [
-            getattr(view_def, "tombstone_path", None)
-            for view_def in (
-                getattr(reflection, "tombstone_views", None) or {}
-            ).values()
-        ]
+        ] + tombstone_paths
         if explain and any(
             _path_contains_bearer_credentials(path)
             for path in initial_source_paths
@@ -618,12 +626,6 @@ class DuckDB:
 
         # Ensure httpfs is configured on the persistent connection (once only).
         all_files = [f for files in alias_to_files.values() for f in files]
-        tombstone_paths = [
-            getattr(view_def, "tombstone_path", None)
-            for view_def in (
-                getattr(reflection, "tombstone_views", None) or {}
-            ).values()
-        ]
         sensitive_source_paths = any(
             _path_contains_bearer_credentials(path)
             for path in [*all_files, *tombstone_paths]
@@ -787,13 +789,30 @@ class DuckDB:
                 tomb_path = getattr(tomb_def, "tombstone_path", None) if tomb_def else None
                 expected_rows = getattr(tomb_def, "expected_rows", None) if tomb_def else None
                 expected_digest = getattr(tomb_def, "tombstone_digest", None) if tomb_def else None
+                raw_snapshot_keys = (
+                    getattr(tomb_def, "snapshot_resource_keys", None)
+                    if tomb_def else None
+                )
+                selected_keys = (
+                    list(getattr(tomb_def, "resource_keys", ()) or ())
+                    if tomb_def else []
+                )
+                allowed_dv_files = (
+                    list(raw_snapshot_keys)
+                    if raw_snapshot_keys is not None
+                    else (selected_keys or None)
+                )
                 with self._lock:
                     dv_table = self._tombstone_cache.acquire(
                         con, cache_key, tomb_path, expected_rows=expected_rows,
                         expected_digest=expected_digest,
+                        tombstone_def=tomb_def,
+                        allowed_files=allowed_dv_files,
                     )
                 if dv_table:
-                    acquired_dv_keys.append(cache_key)
+                    acquired_dv_keys.append(
+                        getattr(dv_table, "cache_key", cache_key)
+                    )
                 create_tombstone_view(con, source, view, tomb_def, dv_table=dv_table)
                 created_views.append(view)
                 query_alias_to_name[alias] = view

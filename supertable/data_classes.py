@@ -361,6 +361,24 @@ class RbacViewDef:
     filter_spec: object = None
 
 
+@dataclass(frozen=True)
+class TombstoneSegmentDef:
+    """One resolved immutable segment of a v2 deletion vector.
+
+    ``cache_key`` remains the stable logical object key sealed by the
+    standalone manifest while ``tombstone_path`` is the executor-facing path
+    (and may therefore be a short-lived presigned URL or a local cache path).
+    The digest is the established ``st-dv-v1`` logical row-stream digest for
+    this segment, never a hash of the encoded Parquet bytes.
+    """
+
+    cache_key: str
+    tombstone_path: str
+    expected_rows: int
+    file_size: int
+    tombstone_digest: str
+
+
 @dataclass
 class TombstoneDef:
     """Tombstone (deletion-vector) definition for a single table alias.
@@ -395,6 +413,9 @@ class TombstoneDef:
     snapshot_resource_keys: Optional[Tuple[str, ...]] = None
     # Trailing for positional compatibility; see SuperSnapshot above.
     tombstone_format: Optional[int] = None
+    # Resolved immutable Parquet segments for explicit format 2.  The legacy
+    # format keeps this empty and continues to consume ``tombstone_path``.
+    segments: Tuple[TombstoneSegmentDef, ...] = field(default_factory=tuple)
 
 
 @dataclass

@@ -55,10 +55,12 @@ from supertable.engine.engine_common import (
     SOURCE_FILE_COL,
     TIMESTAMP_COL,
     rewrite_query_with_hashed_tables,
+    tombstone_data_paths,
 )
 from supertable.processing import (
     TOMBSTONE_FILE_COL,
     load_tombstone,
+    load_tombstone_segments,
     parquet_footer_sha256,
 )
 from supertable.engine.island_resources import (
@@ -3288,6 +3290,15 @@ class IslandDB:
         )
 
     def _load_tombstone(self, tomb_def) -> pl.DataFrame:
+        # Validate the discriminator/segment hybrid before selecting a loader;
+        # in particular, never let a direct caller route a JSON pointer through
+        # the legacy Parquet path.
+        try:
+            tombstone_data_paths(tomb_def)
+        except Exception as exc:
+            raise IslandIntegrityError(
+                "invalid deletion-vector representation"
+            ) from exc
         path = str(getattr(tomb_def, "tombstone_path", "") or "")
         cache_key = str(getattr(tomb_def, "cache_key", "") or "")
         if not path:
@@ -3300,6 +3311,27 @@ class IslandDB:
         # reuse the same raw key can never alias inside a long-lived process.
         digest = str(getattr(tomb_def, "tombstone_digest", "") or "")
         rows = getattr(tomb_def, "expected_rows", None)
+        if getattr(tomb_def, "tombstone_format", None) == 2:
+            segments = getattr(tomb_def, "segments", ())
+            if self.storage is None or not cache_key:
+                raise IslandIntegrityError(
+                    "required v2 deletion vector cannot be read safely"
+                )
+            try:
+                return load_tombstone_segments(
+                    segments,
+                    storage=self.storage,
+                    cache_identity=(
+                        f"islanddb-dv-v2:{self._artifact_cache_namespace}:"
+                        f"{cache_key}:{digest}"
+                    ),
+                    expected_rows=rows,
+                    allowed_files=set(allowed),
+                )
+            except Exception as exc:
+                raise IslandIntegrityError(
+                    "required v2 deletion vector failed validation"
+                ) from exc
         identity_source = cache_key or os.path.realpath(path)
         cache_identity = (
             f"islanddb-dv-v1:{self._artifact_cache_namespace}:{identity_source}:"

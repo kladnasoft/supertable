@@ -36,6 +36,16 @@ from supertable.data_classes import (
     ResourceObjectSeal,
     ResourceStatsSeal,
     RowGroupSelection,
+    TombstoneSegmentDef,
+)
+from supertable.tombstone_manifest_v2 import (
+    MAX_JSON_EXACT_INTEGER,
+    MAX_TOMBSTONE_MANIFEST_V2_BYTES,
+    MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS,
+    TombstoneManifestV2,
+    TombstoneManifestV2Error,
+    load_tombstone_manifest_v2,
+    validate_logical_storage_path,
 )
 
 # Target row-group size for all Parquet writes.
@@ -7138,7 +7148,7 @@ def load_tombstone(
         return None
     identity = str(cache_identity or tombstone_cache_identity(tombstone_path))
     p = profiler or get_null_profiler()
-    cached_entry = _TOMBSTONE_CACHE.get_entry(identity)
+    cached_entry = _TOMBSTONE_CACHE.get_entry(identity) if allow_cache else None
     if cached_entry is not None:
         p.add("tombstone_cache_hit", 1)
         cached, metadata = cached_entry
@@ -7194,6 +7204,291 @@ def load_tombstone(
         )
         _TOMBSTONE_CACHE.put(identity, df, seal)
     return df
+
+
+def load_tombstone_manifest_from_storage(
+        storage: StorageInterface,
+        manifest_key: str,
+        *,
+        expected_organization: Optional[str] = None,
+        expected_super_name: Optional[str] = None,
+        expected_simple_name: Optional[str] = None,
+        pinned_snapshot_version: Optional[int] = None,
+        expected_total_rows: Optional[int] = None,
+        expected_digest: Optional[str] = None,
+        expected_segment_prefix: Optional[str] = None,
+) -> TombstoneManifestV2:
+    """Read one canonical v2 manifest through a bounded storage operation.
+
+    The provider-reported size is checked before ``read_bytes`` so a corrupt
+    pointer cannot turn correctness metadata into an unbounded allocation.
+    The returned body must match that observation exactly and must itself be
+    the canonical JSON representation sealed by the snapshot root digest.
+    """
+    if storage is None:
+        raise TombstoneManifestV2Error(
+            "v2 tombstone manifest requires a storage backend"
+        )
+    try:
+        key = validate_logical_storage_path(
+            manifest_key,
+            field_name="tombstone manifest pointer",
+            required_suffix=".json",
+        )
+    except TombstoneManifestV2Error:
+        raise
+    except (TypeError, ValueError) as exc:
+        # ``urllib.parse.urlsplit`` can raise a plain ValueError for malformed
+        # bracketed authorities. Keep provider/path parser details behind the
+        # manifest integrity boundary rather than leaking an alternate error
+        # type to callers.
+        raise TombstoneManifestV2Error(
+            "tombstone manifest pointer is not a valid logical storage path"
+        ) from exc
+    try:
+        raw_size = storage.size(key)
+    except Exception as exc:
+        raise TombstoneManifestV2Error(
+            "unable to observe the tombstone manifest size"
+        ) from exc
+    if (
+        not isinstance(raw_size, int)
+        or isinstance(raw_size, bool)
+        or raw_size <= 0
+        or raw_size > MAX_TOMBSTONE_MANIFEST_V2_BYTES
+    ):
+        raise TombstoneManifestV2Error(
+            "tombstone manifest size is outside the supported bound"
+        )
+    try:
+        body = storage.read_bytes(key)
+    except Exception as exc:
+        raise TombstoneManifestV2Error(
+            "unable to read the required tombstone manifest"
+        ) from exc
+    if not isinstance(body, (bytes, bytearray, memoryview)):
+        raise TombstoneManifestV2Error(
+            "tombstone manifest storage read did not return bytes"
+        )
+    exact_body = bytes(body)
+    if len(exact_body) != raw_size:
+        raise TombstoneManifestV2Error(
+            "tombstone manifest size changed during the bounded read"
+        )
+    try:
+        return load_tombstone_manifest_v2(
+            exact_body,
+            expected_organization=expected_organization,
+            expected_super_name=expected_super_name,
+            expected_simple_name=expected_simple_name,
+            pinned_snapshot_version=pinned_snapshot_version,
+            expected_total_rows=expected_total_rows,
+            expected_digest=expected_digest,
+            expected_segment_prefix=expected_segment_prefix,
+            require_canonical_json=True,
+        )
+    except TombstoneManifestV2Error:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise TombstoneManifestV2Error(
+            "tombstone manifest contains an invalid logical storage path"
+        ) from exc
+
+
+def _load_one_tombstone_segment(
+        segment: TombstoneSegmentDef,
+        *,
+        storage: StorageInterface,
+        allowed_files: Optional[Set[str]],
+) -> polars.DataFrame:
+    """Read and validate one manifest-sealed Parquet segment."""
+    if not isinstance(segment, TombstoneSegmentDef):
+        raise ValueError("v2 deletion-vector segments are malformed")
+    try:
+        observed_size = storage.size(segment.cache_key)
+    except Exception as exc:
+        raise ValueError(
+            "Unable to observe required deletion-vector segment size"
+        ) from exc
+    if (
+        not isinstance(observed_size, int)
+        or isinstance(observed_size, bool)
+        or observed_size <= 0
+        or observed_size != segment.file_size
+    ):
+        raise ValueError(
+            "Deletion-vector segment size does not match the manifest"
+        )
+
+    resolved = str(segment.tombstone_path or "")
+    if not resolved:
+        raise ValueError("Required deletion-vector segment has no resolved path")
+    try:
+        if "://" not in resolved and os.path.isfile(resolved):
+            local_size = os.path.getsize(resolved)
+            if local_size != segment.file_size:
+                raise ValueError(
+                    "Localized deletion-vector segment size does not match "
+                    "the manifest"
+                )
+            frame = polars.read_parquet(resolved, hive_partitioning=False)
+        else:
+            frame = polars.from_arrow(storage.read_parquet(segment.cache_key))
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(
+            "Unable to read required deletion-vector segment"
+        ) from exc
+    return validate_tombstone_frame(
+        frame,
+        expected_rows=segment.expected_rows,
+        expected_digest=segment.tombstone_digest,
+        allowed_files=allowed_files,
+        source=f"deletion-vector segment {segment.cache_key}",
+    )
+
+
+def load_tombstone_segments(
+        segments: Tuple[TombstoneSegmentDef, ...],
+        *,
+        storage: StorageInterface,
+        cache_identity: str,
+        expected_rows: int,
+        allowed_files: Optional[Set[str]] = None,
+        allow_cache: bool = True,
+        profiler: Optional[Profiler] = None,
+) -> polars.DataFrame:
+    """Load, seal, and union all segments of one v2 deletion vector.
+
+    ``cache_identity`` must bind the stable manifest key and its snapshot-root
+    digest.  Segment digests are the logical ``st-dv-v1`` values and are
+    checked independently.  The snapshot root is deliberately never compared
+    with the union's logical digest; it seals the canonical JSON manifest.
+    After concatenation the ordinary frame validator proves table-global rowid
+    uniqueness and snapshot-file membership across segment boundaries.
+    """
+    if not isinstance(segments, tuple) or not segments:
+        raise ValueError("Active v2 deletion vector has no segments")
+    if len(segments) > MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS:
+        raise ValueError("v2 deletion vector contains too many segments")
+    if any(not isinstance(segment, TombstoneSegmentDef) for segment in segments):
+        raise ValueError("v2 deletion-vector segments are malformed")
+    segment_keys: List[str] = []
+    segment_rows = 0
+    for segment in segments:
+        if (
+            not isinstance(segment.cache_key, str)
+            or not segment.cache_key
+            or not isinstance(segment.tombstone_path, str)
+            or not segment.tombstone_path
+            or not isinstance(segment.expected_rows, int)
+            or isinstance(segment.expected_rows, bool)
+            or not isinstance(segment.file_size, int)
+            or isinstance(segment.file_size, bool)
+            or segment.file_size <= 0
+            or segment.file_size > MAX_JSON_EXACT_INTEGER
+        ):
+            raise ValueError("v2 deletion-vector segment path/size is malformed")
+        try:
+            validate_logical_storage_path(
+                segment.cache_key,
+                field_name="segment cache key",
+                required_suffix=".parquet",
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "v2 deletion-vector segment cache key is malformed"
+            ) from exc
+        checked_rows = _checked_tombstone_expected_rows(
+            segment.expected_rows,
+            source="v2 deletion-vector segment",
+        )
+        if (
+            checked_rows is None
+            or checked_rows <= 0
+            or checked_rows > MAX_JSON_EXACT_INTEGER
+        ):
+            raise ValueError("v2 deletion-vector segment row count is malformed")
+        _checked_tombstone_expected_digest(
+            segment.tombstone_digest,
+            source="v2 deletion-vector segment",
+        )
+        segment_keys.append(segment.cache_key)
+        segment_rows += checked_rows
+    if segment_keys != sorted(segment_keys) or len(segment_keys) != len(
+        set(segment_keys)
+    ):
+        raise ValueError(
+            "v2 deletion-vector segments are not uniquely and canonically ordered"
+        )
+    if not isinstance(cache_identity, str) or not cache_identity:
+        raise ValueError("v2 deletion-vector cache identity is missing")
+    if not isinstance(expected_rows, int) or isinstance(expected_rows, bool):
+        raise ValueError("v2 deletion-vector union has invalid expected row count")
+    expected = _checked_tombstone_expected_rows(
+        expected_rows, source="v2 deletion-vector union",
+    )
+    if (
+        expected is None
+        or expected <= 0
+        or expected > MAX_JSON_EXACT_INTEGER
+    ):
+        raise ValueError("v2 deletion-vector union has invalid expected row count")
+    if segment_rows != expected:
+        raise ValueError(
+            "v2 deletion-vector segment rows do not match the manifest total"
+        )
+
+    # Keep the v2 union namespace disjoint from legacy single-file cache keys.
+    # The caller supplies ``manifest-key + root``; hashing prevents path/URL
+    # material from becoming a filesystem-like cache identity elsewhere.
+    descriptor_digest = hashlib.sha256(b"supertable-dv-v2-segments\n")
+    for segment in segments:
+        for value in (
+            segment.cache_key,
+            str(segment.expected_rows),
+            str(segment.file_size),
+            segment.tombstone_digest,
+        ):
+            encoded = str(value).encode("utf-8")
+            descriptor_digest.update(len(encoded).to_bytes(8, "big"))
+            descriptor_digest.update(encoded)
+    identity = (
+        "__supertable_tombstone_v2_union__/"
+        + hashlib.sha256(
+            cache_identity.encode("utf-8")
+            + b"\0"
+            + descriptor_digest.digest()
+        ).hexdigest()
+    )
+
+    def _loader() -> polars.DataFrame:
+        frames = [
+            _load_one_tombstone_segment(
+                segment,
+                storage=storage,
+                allowed_files=allowed_files,
+            )
+            for segment in segments
+        ]
+        return polars.concat(frames, how="vertical", rechunk=False)
+
+    frame = load_tombstone(
+        identity,
+        cache_identity=identity,
+        loader=_loader,
+        allow_cache=allow_cache,
+        required=True,
+        expected_rows=expected,
+        # A v2 root digest seals canonical manifest JSON, not DV logical rows.
+        expected_digest=None,
+        allowed_files=allowed_files,
+        profiler=profiler,
+    )
+    if frame is None:  # required loader and active segments make this defensive.
+        raise ValueError("Required v2 deletion vector was unavailable")
+    return frame
 
 
 def cache_tombstone(

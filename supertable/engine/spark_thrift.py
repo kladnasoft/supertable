@@ -992,6 +992,17 @@ def _spark_create_tombstone_view(
     Created on top of the reflection table (before RBAC), so the anti-join
     still has ``__rowid__`` and RBAC never sees the system columns.
     """
+    if (
+        tombstone_def is not None
+        and getattr(tombstone_def, "tombstone_format", None) == 2
+    ):
+        # Spark cannot bind its resolved input_file_name() values back to the
+        # stable logical keys stored in the deletion vector. Never interpret
+        # the JSON manifest as Parquet or silently ignore its segments.
+        raise RuntimeError(
+            "Spark does not support active tombstone_format=2 deletion vectors"
+        )
+
     describe_error = None
     src_desc = []
     try:
@@ -1671,6 +1682,18 @@ class SparkThriftExecutor:
         If the timeout fires the connection is forcibly closed, which unblocks any
         pending Thrift RPC and raises a RuntimeError to the caller.
         """
+        if any(
+            getattr(tombstone, "tombstone_format", None) == 2
+            for tombstone in (
+                getattr(reflection, "tombstone_views", None) or {}
+            ).values()
+        ):
+            # Reject before parser work, fleet selection, credentials, or a
+            # Thrift connection. AUTO already excludes active DVs; an explicit
+            # Spark request must fail closed just as early.
+            raise RuntimeError(
+                "Spark does not support active tombstone_format=2 deletion vectors"
+            )
         # This must precede cluster selection, connection establishment and
         # storage configuration.  In particular, AUTO requests are parsed with
         # DuckDB grammar and only learn that Spark won during routing.

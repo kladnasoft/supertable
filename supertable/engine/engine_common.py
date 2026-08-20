@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import duckdb
@@ -24,6 +24,11 @@ from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.config.homedir import get_app_home
 from supertable.engine.engine_config import normalize_memory_size
+from supertable.tombstone_manifest_v2 import (
+    MAX_JSON_EXACT_INTEGER,
+    MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS,
+    validate_logical_storage_path,
+)
 from supertable.utils.sql_parser import (
     _build_scoped_table_bindings,
     validate_read_query_ast,
@@ -2483,13 +2488,198 @@ class ValidatedTombstoneTable(str):
 
     def __new__(
             cls, value: str, row_count: int = -1, digest: Optional[str] = None,
-            referenced_files=None,
+            referenced_files=None, *, root_digest: Optional[str] = None,
+            cache_key: Optional[str] = None,
+            segment_fingerprint: Optional[str] = None,
     ):
         obj = str.__new__(cls, value)
         obj.row_count = int(row_count)
         obj.digest = digest
         obj.referenced_files = frozenset(referenced_files or ())
+        obj.root_digest = root_digest
+        obj.cache_key = cache_key
+        obj.segment_fingerprint = segment_fingerprint
         return obj
+
+
+def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
+    """Return a structurally closed v2 segment tuple or raise.
+
+    Legacy definitions must not carry segments.  This rejects discriminator
+    hybrids at the last SQL boundary even for direct engine callers that did
+    not pass through :class:`DataReader`.
+    """
+    if tombstone_def is None:
+        return ()
+    tombstone_format = getattr(tombstone_def, "tombstone_format", None)
+    segments = getattr(tombstone_def, "segments", ())
+    if not isinstance(segments, tuple):
+        raise RuntimeError("Invalid deletion-vector segment definition")
+    if (
+        tombstone_format is not None
+        and (
+            isinstance(tombstone_format, bool)
+            or not isinstance(tombstone_format, int)
+            or tombstone_format not in (1, 2)
+        )
+    ):
+        raise RuntimeError("Invalid deletion-vector format discriminator")
+    if tombstone_format != 2:
+        if segments:
+            raise RuntimeError(
+                "Deletion-vector segments require tombstone_format=2"
+            )
+        if str(getattr(tombstone_def, "tombstone_path", "") or "").endswith(
+            ".json"
+        ):
+            raise RuntimeError(
+                "A JSON deletion-vector pointer requires tombstone_format=2"
+            )
+        return ()
+    if not getattr(tombstone_def, "tombstone_path", None) or not segments:
+        raise RuntimeError("Active v2 deletion vector has no sealed segments")
+    if len(segments) > MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS:
+        raise RuntimeError("Deletion vector contains too many sealed segments")
+
+    manifest_key = getattr(tombstone_def, "cache_key", None)
+    try:
+        validate_logical_storage_path(
+            manifest_key,
+            field_name="tombstone manifest cache key",
+            required_suffix=".json",
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Invalid v2 deletion-vector manifest cache key") from exc
+
+    keys: List[str] = []
+    row_total = 0
+    for segment in segments:
+        key = getattr(segment, "cache_key", None)
+        path = getattr(segment, "tombstone_path", None)
+        rows = getattr(segment, "expected_rows", None)
+        file_size = getattr(segment, "file_size", None)
+        digest = getattr(segment, "tombstone_digest", None)
+        if not isinstance(key, str) or not key or not isinstance(path, str) or not path:
+            raise RuntimeError("Invalid deletion-vector segment path")
+        try:
+            validate_logical_storage_path(
+                key,
+                field_name="tombstone segment cache key",
+                required_suffix=".parquet",
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Invalid deletion-vector segment cache key") from exc
+        if (
+            not isinstance(rows, int) or isinstance(rows, bool) or rows <= 0
+            or rows > MAX_JSON_EXACT_INTEGER
+            or not isinstance(file_size, int) or isinstance(file_size, bool)
+            or file_size <= 0
+            or file_size > MAX_JSON_EXACT_INTEGER
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise RuntimeError("Invalid deletion-vector segment seal")
+        keys.append(key)
+        row_total += rows
+    if keys != sorted(keys) or len(keys) != len(set(keys)):
+        raise RuntimeError(
+            "Deletion-vector segments are not uniquely and canonically ordered"
+        )
+    expected_rows = getattr(tombstone_def, "expected_rows", None)
+    if (
+        not isinstance(expected_rows, int)
+        or isinstance(expected_rows, bool)
+        or expected_rows <= 0
+        or expected_rows > MAX_JSON_EXACT_INTEGER
+        or row_total != expected_rows
+    ):
+        raise RuntimeError(
+            "Deletion-vector segment rows do not match the pinned snapshot"
+        )
+    root_digest = getattr(tombstone_def, "tombstone_digest", None)
+    if (
+        not isinstance(root_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", root_digest) is None
+    ):
+        raise RuntimeError("Invalid v2 deletion-vector manifest root digest")
+    return segments
+
+
+def _v2_segment_fingerprint(segments: Tuple[object, ...]) -> str:
+    """Seal the logical segment descriptors used to populate a cache entry.
+
+    Resolved paths are deliberately excluded: presigned URLs may rotate while
+    the manifest's stable key/row/size/digest descriptors remain identical.
+    """
+    digest = hashlib.sha256(b"supertable-dv-v2-segments\n")
+    for segment in segments:
+        fields = (
+            str(segment.cache_key),
+            str(int(segment.expected_rows)),
+            str(int(segment.file_size)),
+            str(segment.tombstone_digest),
+        )
+        for value in fields:
+            encoded = value.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+    return digest.hexdigest()
+
+
+def tombstone_data_paths(tombstone_def) -> List[str]:
+    """Return only Parquet paths an executor may consume for a DV."""
+    segments = _v2_tombstone_segments(tombstone_def)
+    if segments:
+        return [str(segment.tombstone_path) for segment in segments]
+    path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
+    return [str(path)] if path else []
+
+
+def _v2_union_relation(relations: List[str]) -> str:
+    file_col = quote_if_needed(TOMBSTONE_FILE_COL)
+    rowid_col = quote_if_needed(ROWID_COL)
+    return "(" + " UNION ALL ".join(
+        f"SELECT {file_col}, {rowid_col} FROM {relation}"
+        for relation in relations
+    ) + ")"
+
+
+def _validate_v2_tombstone_relations(
+        con: duckdb.DuckDBPyConnection,
+        tombstone_def,
+        *,
+        allowed_files: Optional[List[str]] = None,
+) -> tuple[str, int, str, frozenset[str]]:
+    """Validate every segment and their global union.
+
+    Per-segment digests are logical ``st-dv-v1`` seals.  The snapshot digest
+    is intentionally absent from the union validation because it seals the
+    canonical standalone manifest, not the concatenated logical row stream.
+    """
+    segments = _v2_tombstone_segments(tombstone_def)
+    relations: List[str] = []
+    for segment in segments:
+        escaped = escape_parquet_path(str(segment.tombstone_path))
+        relation = f"read_parquet('{escaped}', hive_partitioning=false)"
+        _validate_tombstone_relation_details(
+            con,
+            relation,
+            expected_rows=int(segment.expected_rows),
+            expected_digest=str(segment.tombstone_digest),
+            allowed_files=allowed_files,
+            validate_rows=True,
+        )
+        relations.append(relation)
+    union_relation = _v2_union_relation(relations)
+    rows, digest, referenced = _validate_tombstone_relation_details(
+        con,
+        union_relation,
+        expected_rows=getattr(tombstone_def, "expected_rows", None),
+        expected_digest=None,
+        allowed_files=allowed_files,
+        validate_rows=True,
+    )
+    return union_relation, rows, digest, referenced
 
 
 def _describe_relation(
@@ -2762,6 +2952,8 @@ def create_tombstone_view(
     tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
     expected_rows = getattr(tombstone_def, "expected_rows", None) if tombstone_def else None
     expected_digest = getattr(tombstone_def, "tombstone_digest", None) if tombstone_def else None
+    v2_segments = _v2_tombstone_segments(tombstone_def)
+    is_v2 = bool(v2_segments)
     resource_keys = list(getattr(tombstone_def, "resource_keys", ()) or ()) if tombstone_def else []
     raw_snapshot_keys = (
         getattr(tombstone_def, "snapshot_resource_keys", None)
@@ -2825,11 +3017,23 @@ def create_tombstone_view(
         # here instead of being able to smuggle a partial/malformed relation
         # into the anti-join.
         if not isinstance(dv_table, ValidatedTombstoneTable):
+            direct_expected_digest = expected_digest
+            if is_v2:
+                (
+                    _segment_relation,
+                    _segment_rows,
+                    direct_expected_digest,
+                    _segment_files,
+                ) = _validate_v2_tombstone_relations(
+                    con,
+                    tombstone_def,
+                    allowed_files=allowed_dv_files,
+                )
             _, _, referenced_dv_files = _validate_tombstone_relation_details(
                 con,
                 quote_if_needed(str(dv_table)),
                 expected_rows=expected_rows,
-                expected_digest=expected_digest,
+                expected_digest=direct_expected_digest,
                 allowed_files=allowed_dv_files,
                 validate_rows=True,
             )
@@ -2844,14 +3048,24 @@ def create_tombstone_view(
                 "Invalid deletion-vector row count: expected "
                 f"{int(expected_rows)}, got {dv_table.row_count}"
             )
+        if isinstance(dv_table, ValidatedTombstoneTable) and expected_digest is not None:
+            cached_seal = (
+                dv_table.root_digest if is_v2 else dv_table.digest
+            )
+            if cached_seal != expected_digest:
+                raise RuntimeError(
+                    "Invalid deletion-vector digest: cached artifact does not "
+                    "match the pinned snapshot"
+                )
         if (
             isinstance(dv_table, ValidatedTombstoneTable)
-            and expected_digest is not None
-            and dv_table.digest != expected_digest
+            and is_v2
+            and dv_table.segment_fingerprint
+            != _v2_segment_fingerprint(v2_segments)
         ):
             raise RuntimeError(
-                "Invalid deletion-vector digest: cached artifact does not match "
-                "the pinned snapshot"
+                "Invalid deletion-vector cache entry: segment descriptors "
+                "do not match the pinned manifest"
             )
         if (
             isinstance(dv_table, ValidatedTombstoneTable)
@@ -2879,19 +3093,30 @@ def create_tombstone_view(
             f"ON {join_clause};"
         )
     elif tomb_path:
-        escaped = escape_parquet_path(tomb_path)
-        # Tombstones are physically stored below Hive-looking
-        # year=/month=/day=/hour= directories.  Those path components are not
-        # DV columns; inference would widen the relation's sealed two-column
-        # schema and can make cached/inline validation disagree.
-        relation = (
-            f"read_parquet('{escaped}', hive_partitioning=false)"
-        )
-        _, _, referenced_dv_files = _validate_tombstone_relation_details(
-            con, relation, expected_rows=expected_rows,
-            expected_digest=expected_digest,
-            allowed_files=allowed_dv_files, validate_rows=True,
-        )
+        if is_v2:
+            (
+                relation,
+                _row_count,
+                _logical_digest,
+                referenced_dv_files,
+            ) = _validate_v2_tombstone_relations(
+                con,
+                tombstone_def,
+                allowed_files=allowed_dv_files,
+            )
+        else:
+            escaped = escape_parquet_path(tomb_path)
+            # Tombstones are physically stored below Hive-looking
+            # year=/month=/day=/hour= directories. Those path components are
+            # not DV columns; inference would widen the sealed schema.
+            relation = (
+                f"read_parquet('{escaped}', hive_partitioning=false)"
+            )
+            _, _, referenced_dv_files = _validate_tombstone_relation_details(
+                con, relation, expected_rows=expected_rows,
+                expected_digest=expected_digest,
+                allowed_files=allowed_dv_files, validate_rows=True,
+            )
         dv_projection = f"DISTINCT {rid}"
         join_clause = f"{source_table}.{rid} = __dv__.{rid}"
         if resource_keys:
@@ -2904,7 +3129,7 @@ def create_tombstone_view(
             f"CREATE OR REPLACE VIEW {view_name} AS "
             f"SELECT {live_cols} FROM {source_table} "
             f"ANTI JOIN (SELECT {dv_projection} FROM "
-            f"read_parquet('{escaped}', hive_partitioning=false)) AS __dv__ "
+            f"{relation}) AS __dv__ "
             f"ON {join_clause};"
         )
     else:
@@ -3033,6 +3258,9 @@ class TombstoneCache:
             duckdb_path: Optional[str],
             expected_rows: Optional[int] = None,
             expected_digest: Optional[str] = None,
+            *,
+            tombstone_def=None,
+            allowed_files: Optional[List[str]] = None,
     ) -> Optional[str]:
         """Return the DV table name for *cache_key*, materialising it on miss,
         refreshing its idle TTL, and incrementing its ref count.  Returns
@@ -3040,12 +3268,37 @@ class TombstoneCache:
         caller then falls back to the inline ``read_parquet`` path, preserving
         exact legacy behaviour.
         """
-        if not self.enabled or not cache_key or not duckdb_path:
+        validated_segments = (
+            _v2_tombstone_segments(tombstone_def)
+            if tombstone_def is not None else ()
+        )
+        is_v2 = bool(validated_segments)
+        segment_fingerprint = None
+        if is_v2:
+            segment_fingerprint = _v2_segment_fingerprint(
+                validated_segments
+            )
+            if (
+                not isinstance(expected_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+            ):
+                raise RuntimeError(
+                    "Invalid v2 deletion-vector manifest root digest"
+                )
+        if (
+            not self.enabled
+            or not cache_key
+            or (not is_v2 and not duckdb_path)
+        ):
             return None
+        registry_key = (
+            f"dv-v2:{cache_key}:{expected_digest}"
+            if is_v2 else cache_key
+        )
         with self._lock:
-            entry = self._registry.get(cache_key)
+            entry = self._registry.get(registry_key)
             if entry is None:
-                base_table_name = dv_table_name(cache_key)
+                base_table_name = dv_table_name(registry_key)
                 table_name = base_table_name
                 occupied_names = {
                     str(existing.table_name)
@@ -3055,10 +3308,23 @@ class TombstoneCache:
                     table_name = f"{base_table_name}_{uuid.uuid4().hex}"
                 rid = quote_if_needed(ROWID_COL)
                 file_col = quote_if_needed(TOMBSTONE_FILE_COL)
-                escaped = escape_parquet_path(duckdb_path)
-                relation = (
-                    f"read_parquet('{escaped}', hive_partitioning=false)"
-                )
+                validated_v2_digest = None
+                if is_v2:
+                    (
+                        relation,
+                        _,
+                        validated_v2_digest,
+                        _,
+                    ) = _validate_v2_tombstone_relations(
+                        con,
+                        tombstone_def,
+                        allowed_files=allowed_files,
+                    )
+                else:
+                    escaped = escape_parquet_path(duckdb_path)
+                    relation = (
+                        f"read_parquet('{escaped}', hive_partitioning=false)"
+                    )
                 # Materialise privately, validate, and only then publish a
                 # registry entry.  Validating the table (rather than scanning
                 # the parquet first and then CTAS-ing it) keeps a cache miss to
@@ -3091,7 +3357,10 @@ class TombstoneCache:
                     ) = _validate_tombstone_relation_details(
                         con, quote_if_needed(table_name),
                         expected_rows=expected_rows,
-                        expected_digest=expected_digest,
+                        expected_digest=(
+                            validated_v2_digest if is_v2 else expected_digest
+                        ),
+                        allowed_files=allowed_files,
                         validate_rows=True,
                     )
                 except Exception:
@@ -3104,11 +3373,25 @@ class TombstoneCache:
                     table_name=ValidatedTombstoneTable(
                         table_name, row_count, digest,
                         referenced_files,
+                        root_digest=(expected_digest if is_v2 else None),
+                        cache_key=registry_key,
+                        segment_fingerprint=segment_fingerprint,
                     ),
-                    cache_key=cache_key,
+                    cache_key=registry_key,
                     table_id=dv_table_id(cache_key),
                 )
-                self._registry[cache_key] = entry
+                self._registry[registry_key] = entry
+
+            if (
+                is_v2
+                and getattr(
+                    entry.table_name, "segment_fingerprint", None,
+                ) != segment_fingerprint
+            ):
+                raise RuntimeError(
+                    "Invalid deletion-vector cache entry: segment descriptors "
+                    "do not match the pinned manifest"
+                )
 
             if expected_rows is not None:
                 table_count = getattr(entry.table_name, "row_count", -1)
@@ -3123,11 +3406,27 @@ class TombstoneCache:
                     )
 
             if expected_digest is not None:
-                cached_digest = getattr(entry.table_name, "digest", None)
+                cached_digest = getattr(
+                    entry.table_name,
+                    "root_digest" if is_v2 else "digest",
+                    None,
+                )
                 if cached_digest != expected_digest:
                     raise RuntimeError(
                         "Invalid deletion-vector digest: cached artifact does "
                         "not match the pinned snapshot"
+                    )
+
+            if allowed_files is not None:
+                referenced_files = getattr(
+                    entry.table_name, "referenced_files", frozenset(),
+                )
+                if not referenced_files.issubset(
+                    {str(path) for path in allowed_files}
+                ):
+                    raise RuntimeError(
+                        "Invalid deletion vector: __file__ contains resources "
+                        "outside the pinned table snapshot"
                     )
 
             entry.ref_count += 1
