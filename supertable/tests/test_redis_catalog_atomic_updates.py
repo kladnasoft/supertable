@@ -51,6 +51,17 @@ def _seed_root(client) -> None:
     )
 
 
+def _snapshot_payload(version: int) -> dict:
+    return {
+        "snapshot_version": version,
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "_row_filter": None,
+    }
+
+
 def _coordinate_first_reads(monkeypatch, client, key: str) -> None:
     original_pipeline = client.pipeline
     barrier = threading.Barrier(2)
@@ -274,7 +285,7 @@ def test_snapshot_commit_rejects_leaf_identity_above_lua_exact_range(field):
     with pytest.raises(RuntimeError, match="Corrupt Redis catalog JSON"):
         catalog.commit_snapshot(
             "acme", "lake", "orders",
-            {"resources": [], "_row_filter": None},
+            _snapshot_payload(1),
             "snapshots/v1.json",
             expected_version=0,
             expected_path="snapshots/v0.json",
@@ -303,7 +314,7 @@ def test_snapshot_commit_cannot_increment_root_at_lua_exact_ceiling():
     with pytest.raises(RuntimeError, match="numeric identity is exhausted"):
         catalog.commit_snapshot(
             "acme", "lake", "orders",
-            {"resources": [], "_row_filter": None},
+            _snapshot_payload(1),
             "snapshots/v1.json",
             expected_version=0,
             expected_path="snapshots/v0.json",
@@ -416,7 +427,7 @@ def test_snapshot_commit_rejects_mirror_enable_after_writer_config_read():
     ):
         catalog.commit_snapshot(
             "acme", "lake", "orders",
-            {"resources": [], "_row_filter": None},
+            _snapshot_payload(1),
             "snapshots/v1.json",
             expected_version=0,
             expected_path="snapshots/v0.json",
@@ -505,7 +516,7 @@ def test_namespace_scoped_mutations_cannot_recreate_state_without_root():
         )
     with pytest.raises(FileNotFoundError, match="SuperTable does not exist"):
         catalog.commit_snapshot(
-            "acme", "lake", "orders", {"resources": []},
+            "acme", "lake", "orders", _snapshot_payload(0),
             "snapshots/v0.json", expected_version=-1, expected_path="",
             lock_token="owner", commit_id="stale-commit",
         )
@@ -549,7 +560,7 @@ def test_leaf_and_linked_share_mutations_reject_invalid_root(root_value):
         )
     with pytest.raises(RuntimeError, match="Corrupt Redis catalog JSON"):
         catalog.commit_snapshot(
-            "acme", "lake", "orders", {"resources": []},
+            "acme", "lake", "orders", _snapshot_payload(0),
             "snapshots/v0.json", expected_version=-1, expected_path="",
             lock_token="owner", commit_id="stale-commit",
         )
@@ -693,7 +704,7 @@ def test_readonly_transition_atomically_fences_snapshot_and_stage_publication():
     with pytest.raises(ReadOnlyCatalogError):
         catalog.commit_snapshot(
             "acme", "lake", "orders",
-            {"resources": [], "_row_filter": None},
+            _snapshot_payload(1),
             "snapshots/v1.json",
             expected_version=0,
             expected_path="snapshots/v0.json",

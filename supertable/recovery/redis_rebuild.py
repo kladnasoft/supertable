@@ -32,11 +32,11 @@ from supertable.redis_catalog import (
     validate_username,
 )
 from supertable.tombstone_manifest_v2 import (
-    MAX_TOMBSTONE_MANIFEST_V2_BYTES,
     TombstoneManifestV2Error,
 )
 from supertable.utils.snapshot import (
     complete_snapshot_payload,
+    read_bounded_tombstone_manifest_bytes,
     referenced_snapshot_artifacts,
     snapshot_cache_payload,
 )
@@ -550,18 +550,22 @@ def _validate_snapshot(
         )
     if leaf_version != complete["snapshot_version"]:
         raise RecoveryError(f"leaf {super_name}/{simple_name} version differs from snapshot")
+    manifest_sizes: dict[str, int] = {}
+
+    def load_manifest(manifest_path: str) -> bytes:
+        payload = read_bounded_tombstone_manifest_bytes(
+            storage, manifest_path,
+        )
+        manifest_sizes[manifest_path] = len(payload)
+        return payload
+
     try:
         artifact_references = referenced_snapshot_artifacts(
             complete,
             organization=organization,
             super_name=super_name,
             simple_name=simple_name,
-            manifest_loader=lambda manifest_path: _read_bytes(
-                storage,
-                manifest_path,
-                maximum=MAX_TOMBSTONE_MANIFEST_V2_BYTES,
-                label="tombstone manifest",
-            ),
+            manifest_loader=load_manifest,
             require_canonical_manifest=True,
         )
     except (TypeError, TombstoneManifestV2Error) as exc:
@@ -572,15 +576,32 @@ def _validate_snapshot(
     artifact_seals: dict[str, dict[str, Any]] = {}
     for reference in artifact_references:
         artifact = reference.path
-        size, content_sha256 = _content_seal(
-            storage, artifact, declared_size=reference.declared_size,
-        )
-        if (
-            reference.kind == "tombstone_manifest"
-            and content_sha256 != reference.declared_digest
-        ):
-            raise RecoveryError(
-                f"tombstone manifest {artifact!r} changed after root validation"
+        if reference.kind == "tombstone_manifest":
+            validated_size = manifest_sizes.get(artifact)
+            if validated_size is None:
+                raise RecoveryError(
+                    f"tombstone manifest {artifact!r} has no bounded root observation"
+                )
+            try:
+                sealed_manifest = read_bounded_tombstone_manifest_bytes(
+                    storage,
+                    artifact,
+                    expected_size=validated_size,
+                )
+            except TombstoneManifestV2Error as exc:
+                raise RecoveryError(
+                    f"tombstone manifest {artifact!r} changed after root validation: "
+                    f"{exc}"
+                ) from exc
+            size = len(sealed_manifest)
+            content_sha256 = _sha256(sealed_manifest)
+            if content_sha256 != reference.declared_digest:
+                raise RecoveryError(
+                    f"tombstone manifest {artifact!r} changed after root validation"
+                )
+        else:
+            size, content_sha256 = _content_seal(
+                storage, artifact, declared_size=reference.declared_size,
             )
         seal = {
             "path": artifact,

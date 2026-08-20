@@ -10,6 +10,7 @@ from supertable import redis_keys as RK
 from supertable.data_writer import DataWriter
 from supertable.errors import LockLostError, SnapshotCommitConflictError
 from supertable.redis_catalog import DeletionIntentConflictError, RedisCatalog
+from supertable.tombstone_manifest_v2 import MAX_JSON_EXACT_INTEGER
 
 
 def _catalog():
@@ -55,12 +56,25 @@ def _seed_current_snapshot(
     fake.set(RK.meta_leaf("org", "lake", "table"), json.dumps(leaf))
 
 
+def _snapshot_payload(**updates):
+    payload = {
+        "snapshot_version": 5,
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+    }
+    payload.update(updates)
+    return payload
+
+
 def test_snapshot_commit_atomically_updates_leaf_and_root():
     catalog, fake = _catalog()
     _seed(fake)
 
     assert catalog.commit_snapshot(
-        "org", "lake", "table", {"resources": [{"file": "f"}]}, "snap/5.json",
+        "org", "lake", "table",
+        _snapshot_payload(resources=[{"file": "f"}]), "snap/5.json",
         expected_version=4, expected_path="snap/4.json", lock_token="token",
         commit_id="commit-5", now_ms=123,
     ) == (5, 10)
@@ -72,7 +86,11 @@ def test_snapshot_commit_atomically_updates_leaf_and_root():
         "ts": 123,
         "path": "snap/5.json",
         "payload": {
+            "snapshot_version": 5,
             "resources": [{"file": "f"}],
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
             "_row_filter": None,
         },
         "commit_id": "commit-5",
@@ -80,6 +98,228 @@ def test_snapshot_commit_atomically_updates_leaf_and_root():
     assert root["version"] == 10
     assert root["commit_id"] == "commit-5"
     assert root["read_only"] is False
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"tombstone_rows": 1},
+        {"tombstone": "org/lake/tables/table/tombstone/deleted.parquet"},
+        {
+            "tombstone": "org/lake/tables/table/tombstone/root.json",
+            "tombstone_rows": 1,
+            "tombstone_digest": "0" * 64,
+        },
+        {
+            "tombstone_format": 2,
+            "tombstone": "org/lake/tables/other/tombstone/root.json",
+            "tombstone_rows": 1,
+            "tombstone_digest": "0" * 64,
+        },
+        {
+            "tombstone_format": 2,
+            "tombstone": "org/lake/tables/table/tombstone/root.json",
+            "tombstone_rows": 10**14,
+            "tombstone_digest": "0" * 64,
+        },
+    ],
+)
+def test_snapshot_commit_rejects_invalid_tombstone_state_before_mutation(changes):
+    catalog, fake = _catalog()
+    _seed(fake)
+    leaf_key = RK.meta_leaf("org", "lake", "table")
+    root_key = RK.meta_root("org", "lake")
+    before_leaf = fake.get(leaf_key)
+    before_root = fake.get(root_key)
+
+    with pytest.raises(
+        ValueError, match="deletion-vector state|namespace|row.?count",
+    ):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(**changes),
+            "snap/5.json", expected_version=4,
+            expected_path="snap/4.json", lock_token="token",
+        )
+
+    assert fake.get(leaf_key) == before_leaf
+    assert fake.get(root_key) == before_root
+    assert not fake.exists(RK.schema("org", "lake", "table"))
+    assert not fake.exists(RK.meta_table_names("org", "lake"))
+
+
+@pytest.mark.parametrize(
+    "missing_field", ["tombstone", "tombstone_rows", "tombstone_digest"],
+)
+def test_snapshot_commit_requires_explicit_tombstone_fields(missing_field):
+    catalog, fake = _catalog()
+    _seed(fake)
+    payload = _snapshot_payload()
+    del payload[missing_field]
+    before = (
+        fake.get(RK.meta_leaf("org", "lake", "table")),
+        fake.get(RK.meta_root("org", "lake")),
+    )
+
+    with pytest.raises(ValueError, match="explicit deletion-vector state"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", payload, "snap/5.json",
+            expected_version=4, expected_path="snap/4.json",
+            lock_token="token",
+        )
+
+    assert before == (
+        fake.get(RK.meta_leaf("org", "lake", "table")),
+        fake.get(RK.meta_root("org", "lake")),
+    )
+
+
+@pytest.mark.parametrize("snapshot_version", [None, True, 4, 5.0, 6])
+def test_snapshot_commit_rejects_non_successor_payload_version_without_mutation(
+        snapshot_version,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    leaf_key = RK.meta_leaf("org", "lake", "table")
+    root_key = RK.meta_root("org", "lake")
+    before = (fake.get(leaf_key), fake.get(root_key))
+
+    with pytest.raises(ValueError, match="exact successor"):
+        catalog.commit_snapshot(
+            "org", "lake", "table",
+            _snapshot_payload(snapshot_version=snapshot_version),
+            "snap/5.json", expected_version=4,
+            expected_path="snap/4.json", lock_token="token",
+        )
+
+    assert (fake.get(leaf_key), fake.get(root_key)) == before
+    assert not fake.exists(RK.schema("org", "lake", "table"))
+    assert not fake.exists(RK.meta_table_names("org", "lake"))
+
+
+@pytest.mark.parametrize("fast_path", [False, True])
+@pytest.mark.parametrize(
+    "lua_rejection", ["foreign-v2", "wrong-version", "oversize-v2"],
+)
+def test_both_snapshot_commit_lua_paths_repeat_payload_guards(
+        monkeypatch, fast_path, lua_rejection,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    leaf_key = RK.meta_leaf("org", "lake", "table")
+    root_key = RK.meta_root("org", "lake")
+    before = (fake.get(leaf_key), fake.get(root_key))
+    payload = _snapshot_payload()
+    if lua_rejection == "foreign-v2":
+        payload.update({
+            "tombstone_format": 2,
+            "tombstone": "org/lake/tables/other/tombstone/root.json",
+            "tombstone_rows": 1,
+            "tombstone_digest": "0" * 64,
+        })
+        # Bypass only the Python tombstone gate to exercise the Lua boundary.
+        monkeypatch.setattr(
+            "supertable.redis_catalog.validate_snapshot_tombstone_state",
+            lambda *_args, **_kwargs: 1,
+        )
+    elif lua_rejection == "wrong-version":
+        # The public argument passes Python's version check; corrupt the cache
+        # serialization result to prove Lua independently binds the payload.
+        monkeypatch.setattr(
+            "supertable.redis_catalog.snapshot_cache_payload",
+            lambda value: {**value, "snapshot_version": 99},
+        )
+    else:
+        payload.update({
+            "tombstone_format": 2,
+            "tombstone": "org/lake/tables/table/tombstone/root.json",
+            "tombstone_rows": 1,
+            "tombstone_digest": "0" * 64,
+        })
+        monkeypatch.setattr(
+            "supertable.redis_catalog.snapshot_cache_payload",
+            lambda value: {**value, "tombstone_rows": 10**14},
+        )
+
+    kwargs = {
+        "expected_mirrors": [],
+    }
+    if fast_path:
+        kwargs["expected_mirror_pin"] = None
+    with pytest.raises(ValueError, match="invalid snapshot payload"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", payload, "snap/5.json",
+            expected_version=4, expected_path="snap/4.json",
+            lock_token="token", **kwargs,
+        )
+
+    assert (fake.get(leaf_key), fake.get(root_key)) == before
+    assert not fake.exists(RK.schema("org", "lake", "table"))
+    assert not fake.exists(RK.meta_table_names("org", "lake"))
+
+
+@pytest.mark.parametrize("fast_path", [False, True])
+def test_both_snapshot_commit_paths_accept_table_bound_v2_manifest(fast_path):
+    catalog, fake = _catalog()
+    _seed(fake)
+    payload = _snapshot_payload(
+        tombstone_format=2,
+        tombstone="org/lake/tables/table/tombstone/generation/root.json",
+        tombstone_rows=1,
+        tombstone_digest="0" * 64,
+    )
+    kwargs = {"expected_mirrors": []}
+    if fast_path:
+        kwargs["expected_mirror_pin"] = None
+
+    assert catalog.commit_snapshot(
+        "org", "lake", "table", payload, "snap/5.json",
+        expected_version=4, expected_path="snap/4.json",
+        lock_token="token", **kwargs,
+    ) == (5, 10)
+
+
+def test_v2_row_count_round_trips_at_redis_cjson_precision_ceiling():
+    catalog, fake = _catalog()
+    _seed(fake)
+    payload = _snapshot_payload(
+        tombstone_format=2,
+        tombstone="org/lake/tables/table/tombstone/generation/root.json",
+        tombstone_rows=MAX_JSON_EXACT_INTEGER,
+        tombstone_digest="0" * 64,
+    )
+
+    catalog.commit_snapshot(
+        "org", "lake", "table", payload, "snap/5.json",
+        expected_version=4, expected_path="snap/4.json",
+        lock_token="token", expected_mirrors=[],
+    )
+
+    stored = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    assert stored["payload"]["tombstone_rows"] == MAX_JSON_EXACT_INTEGER
+    assert type(stored["payload"]["tombstone_rows"]) is int
+
+
+def test_snapshot_zero_cannot_publish_active_v2_manifest_lineage():
+    catalog, fake = _catalog()
+    _seed(fake)
+    fake.delete(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+
+    with pytest.raises(ValueError, match="invalid version"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(
+                snapshot_version=0,
+                tombstone_format=2,
+                tombstone="org/lake/tables/table/tombstone/root.json",
+                tombstone_rows=1,
+                tombstone_digest="0" * 64,
+            ),
+            "snap/0.json", expected_version=-1, expected_path="",
+            lock_token="token",
+        )
+
+    assert not fake.exists(RK.meta_leaf("org", "lake", "table"))
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
 
 
 def test_snapshot_commit_atomically_persists_unresolved_quality_generation():
@@ -90,7 +330,7 @@ def test_snapshot_commit_atomically_persists_unresolved_quality_generation():
     )
 
     catalog.commit_snapshot(
-        "org", "lake", "table", {"resources": []}, "snap/5.json",
+        "org", "lake", "table", _snapshot_payload(), "snap/5.json",
         expected_version=4,
         expected_path="snap/4.json",
         lock_token="token",
@@ -115,7 +355,7 @@ def test_pinned_absent_mirrors_use_small_atomic_commit_path(monkeypatch):
         "org",
         "lake",
         "table",
-        {"schema": [{"id": "long"}], "resources": []},
+        _snapshot_payload(schema=[{"id": "long"}]),
         "snap/5.json",
         expected_version=4,
         expected_path="snap/4.json",
@@ -160,7 +400,7 @@ def test_pinned_empty_mirror_document_uses_small_commit_path(monkeypatch):
     monkeypatch.setattr(catalog, "_snapshot_commit", general_commit)
 
     assert catalog.commit_snapshot(
-        "org", "lake", "table", {"resources": []}, "snap/5.json",
+        "org", "lake", "table", _snapshot_payload(), "snap/5.json",
         expected_version=4,
         expected_path="snap/4.json",
         lock_token="token",
@@ -187,7 +427,7 @@ def test_pinned_no_mirror_commit_rejects_concurrent_enable():
         SnapshotCommitConflictError, match="Mirror configuration changed",
     ):
         catalog.commit_snapshot(
-            "org", "lake", "table", {"resources": []}, "snap/5.json",
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
             expected_version=4,
             expected_path="snap/4.json",
             lock_token="token",
@@ -213,7 +453,7 @@ def test_pinned_no_mirror_commit_rejects_disable_enable_aba():
         SnapshotCommitConflictError, match="Mirror configuration changed",
     ):
         catalog.commit_snapshot(
-            "org", "lake", "table", {"resources": []}, "snap/5.json",
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
             expected_version=4,
             expected_path="snap/4.json",
             lock_token="token",
@@ -233,7 +473,7 @@ def test_pinned_no_mirror_commit_rejects_corrupt_current_key_type():
 
     with pytest.raises(RuntimeError, match="Corrupt mirror configuration"):
         catalog.commit_snapshot(
-            "org", "lake", "table", {"resources": []}, "snap/5.json",
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
             expected_version=4,
             expected_path="snap/4.json",
             lock_token="token",
@@ -250,7 +490,7 @@ def test_no_mirror_fast_path_rejects_nonempty_raw_pin():
 
     with pytest.raises(ValueError, match="empty mirror configuration"):
         catalog.commit_snapshot(
-            "org", "lake", "table", {}, "snap/5.json",
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
             expected_version=4,
             expected_path="snap/4.json",
             lock_token="token",
@@ -310,7 +550,9 @@ def test_no_mirror_fast_path_retains_publication_fences(race, error_type):
 
     with pytest.raises(error_type):
         catalog.commit_snapshot(
-            "org", "lake", "table", {"schema": [], "resources": []},
+            "org", "lake", "table", _snapshot_payload(
+                snapshot_version=expected_version + 1, schema=[],
+            ),
             "snap/5.json",
             expected_version=expected_version,
             expected_path="snap/4.json",
@@ -355,7 +597,9 @@ def test_failed_snapshot_commit_never_publishes_quality_generation(failure):
 
     with pytest.raises(expected_error):
         catalog.commit_snapshot(
-            "org", "lake", "table", {}, "snap/5.json",
+            "org", "lake", "table",
+            _snapshot_payload(snapshot_version=expected_version + 1),
+            "snap/5.json",
             expected_version=expected_version,
             expected_path="snap/4.json",
             lock_token=lock_token,
@@ -383,7 +627,7 @@ def test_reply_loss_after_atomic_commit_cannot_lose_quality_generation(
     monkeypatch.setattr(catalog, "_snapshot_commit", commit_then_lose_reply)
     with pytest.raises(redis.TimeoutError, match="reply lost"):
         catalog.commit_snapshot(
-            "org", "lake", "table", {}, "snap/5.json",
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
             expected_version=4,
             expected_path="snap/4.json",
             lock_token="token",
@@ -402,7 +646,7 @@ def test_disabled_then_enabled_resolution_preserves_committed_generation():
     catalog, fake = _catalog()
     _seed(fake)
     catalog.commit_snapshot(
-        "org", "lake", "table", {}, "snap/5.json",
+        "org", "lake", "table", _snapshot_payload(), "snap/5.json",
         expected_version=4,
         expected_path="snap/4.json",
         lock_token="token",
@@ -436,7 +680,7 @@ def test_concurrent_resolver_cannot_consume_newer_committed_generation():
     catalog, fake = _catalog()
     _seed(fake)
     catalog.commit_snapshot(
-        "org", "lake", "table", {}, "snap/5.json",
+        "org", "lake", "table", _snapshot_payload(), "snap/5.json",
         expected_version=4,
         expected_path="snap/4.json",
         lock_token="token",
@@ -463,7 +707,8 @@ def test_concurrent_resolver_cannot_consume_newer_committed_generation():
             ):
                 self.committed = True
                 catalog.commit_snapshot(
-                    "org", "lake", "table", {}, "snap/6.json",
+                    "org", "lake", "table",
+                    _snapshot_payload(snapshot_version=6), "snap/6.json",
                     expected_version=5,
                     expected_path="snap/5.json",
                     lock_token="token",
@@ -499,7 +744,7 @@ def test_mirror_intent_and_core_commit_transition_are_durable_and_atomic():
     assert prepared["core_committed"] is False
 
     catalog.commit_snapshot(
-        "org", "lake", "table", {"resources": [{"file": "f"}]},
+        "org", "lake", "table", _snapshot_payload(resources=[{"file": "f"}]),
         "snap/5.json", expected_version=4, expected_path="snap/4.json",
         lock_token="token", commit_id="commit-5",
         mirror_publication=True, now_ms=123,
@@ -550,7 +795,7 @@ def test_mirror_tracked_commit_without_prepared_intent_changes_nothing():
 
     with pytest.raises(RuntimeError, match="Missing or mismatched mirror"):
         catalog.commit_snapshot(
-            "org", "lake", "table", {}, "snap/5.json",
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
             expected_version=4, expected_path="snap/4.json", lock_token="token",
             commit_id="commit-5", mirror_publication=True,
         )
@@ -568,7 +813,7 @@ def test_failed_mirror_record_retains_exact_core_commit_and_blocks_overwrite():
         lock_token="token", now_ms=120,
     )
     catalog.commit_snapshot(
-        "org", "lake", "table", {}, "snap/5.json",
+        "org", "lake", "table", _snapshot_payload(), "snap/5.json",
         expected_version=4, expected_path="snap/4.json", lock_token="token",
         commit_id="commit-5", mirror_publication=True, now_ms=123,
     )
@@ -599,7 +844,7 @@ def test_completed_mirror_record_allows_next_publication():
         snapshot_path="snap/5.json", mirrors=["DELTA"], lock_token="token",
     )
     catalog.commit_snapshot(
-        "org", "lake", "table", {}, "snap/5.json",
+        "org", "lake", "table", _snapshot_payload(), "snap/5.json",
         expected_version=4, expected_path="snap/4.json", lock_token="token",
         commit_id="commit-5", mirror_publication=True,
     )
@@ -643,7 +888,7 @@ def test_mirror_owner_blocks_stale_a_and_new_c_until_safe_rebind():
     assert prepared["publisher_quiesced"] is False
     assert prepared["owner_generation"] == 0
     catalog.commit_snapshot(
-        "org", "lake", "table", {}, "snap/5.json",
+        "org", "lake", "table", _snapshot_payload(), "snap/5.json",
         expected_version=4, expected_path="snap/4.json",
         lock_token="publisher-a", commit_id="commit-5",
         mirror_publication=True, now_ms=123,
@@ -747,7 +992,7 @@ def test_only_provably_non_mirror_io_failures_are_auto_claimable(safe_stage):
     )
     if safe_stage == "outbox_complete":
         catalog.commit_snapshot(
-            "org", "lake", "table", {}, "snap/5.json",
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
             expected_version=4, expected_path="snap/4.json",
             lock_token="publisher-a", commit_id="commit-5",
             mirror_publication=True,
@@ -1174,7 +1419,8 @@ def test_snapshot_commit_rejects_stale_base_without_changing_catalog():
 
     with pytest.raises(SnapshotCommitConflictError):
         catalog.commit_snapshot(
-            "org", "lake", "table", {}, "snap/stale.json",
+            "org", "lake", "table",
+            _snapshot_payload(snapshot_version=4), "snap/stale.json",
             expected_version=3, expected_path="snap/3.json", lock_token="token",
         )
 
@@ -1189,7 +1435,7 @@ def test_snapshot_commit_rejects_lost_fencing_lock_without_changing_catalog():
 
     with pytest.raises(LockLostError):
         catalog.commit_snapshot(
-            "org", "lake", "table", {}, "snap/5.json",
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
             expected_version=4, expected_path="snap/4.json", lock_token="old-owner",
         )
 
@@ -1463,6 +1709,113 @@ def test_begin_table_mutation_pins_context_and_reserves_in_one_boundary():
     assert fake.get(RK.meta_rowid_seq("org", "lake", "table")) == "104"
 
 
+@pytest.mark.parametrize(
+    "config_raw",
+    [
+        '{"deletion_vector_format":2}',
+        '{"dv_v2_reader_fleet_confirmed":true}',
+        (
+            '{"deletion_vector_format":"2",'
+            '"dv_v2_reader_fleet_confirmed":true}'
+        ),
+        (
+            '{"deletion_vector_format":2.0,'
+            '"dv_v2_reader_fleet_confirmed":true}'
+        ),
+        (
+            '{"deletion_vector_format":2e0,'
+            '"dv_v2_reader_fleet_confirmed":true}'
+        ),
+        (
+            '{"deletion_vector_format":true,'
+            '"dv_v2_reader_fleet_confirmed":true}'
+        ),
+        (
+            '{"deletion_vector_format":2,'
+            '"dv_v2_reader_fleet_confirmed":1}'
+        ),
+        (
+            '{"deletion_vector_format":2,'
+            '"dv_v2_reader_fleet_confirmed":false}'
+        ),
+        (
+            '{"deletion_vector_format":2,'
+            '"dv_v2_reader_fleet_confirmed":true,'
+            '"deletion_vector_format":2}'
+        ),
+        (
+            '{"deletion_vector_form\\u0061t":2,'
+            '"dv_v2_reader_fleet_confirmed":true}'
+        ),
+    ],
+)
+def test_begin_rejects_nonexact_activation_before_any_catalog_mutation(config_raw):
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    config_key = RK.meta_table_config("org", "lake", "table")
+    leaf_key = RK.meta_leaf("org", "lake", "table")
+    root_key = RK.meta_root("org", "lake")
+    rowid_key = RK.meta_rowid_seq("org", "lake", "table")
+    fake.set(config_key, config_raw)
+    before = (fake.get(config_key), fake.get(leaf_key), fake.get(root_key))
+
+    with pytest.raises(RuntimeError, match="Corrupt table configuration"):
+        catalog.begin_table_mutation(
+            "org", "lake", "table", lock_token="token", reserve_count=4,
+        )
+
+    assert (fake.get(config_key), fake.get(leaf_key), fake.get(root_key)) == before
+    assert not fake.exists(rowid_key)
+    assert not fake.exists(RK.meta_table_names("org", "lake"))
+
+
+def test_begin_python_decoder_repeats_exact_activation_validation(monkeypatch):
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    rowid_key = RK.meta_rowid_seq("org", "lake", "table")
+    monkeypatch.setattr(
+        catalog,
+        "_begin_table_mutation",
+        lambda **_kwargs: [
+            0,
+            "",
+            '{"deletion_vector_format":2.0,'
+            '"dv_v2_reader_fleet_confirmed":true}',
+            "",
+            "0",
+            "",
+            "0",
+            "",
+            "",
+            "0",
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="Corrupt table configuration"):
+        catalog.begin_table_mutation(
+            "org", "lake", "table", lock_token="token", reserve_count=4,
+        )
+    assert not fake.exists(rowid_key)
+
+
+def test_begin_accepts_only_exact_durable_v2_activation_pair():
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    fake.set(
+        RK.meta_table_config("org", "lake", "table"),
+        '{"deletion_vector_format":2,'
+        '"dv_v2_reader_fleet_confirmed":true}',
+    )
+
+    context = catalog.begin_table_mutation(
+        "org", "lake", "table", lock_token="token", reserve_count=2,
+    )
+
+    assert context["table_config"]["deletion_vector_format"] == 2
+    assert context["table_config"]["dv_v2_reader_fleet_confirmed"] is True
+    assert context["rowid_reservation"] == (101, 102)
+
+
 @pytest.mark.parametrize("active", [False, True])
 def test_begin_table_mutation_lua_accepts_explicit_v2_snapshot_state(active):
     catalog, fake = _catalog()
@@ -1518,7 +1871,7 @@ def test_begin_table_mutation_lua_accepts_explicit_v2_snapshot_state(active):
         {
             "tombstone_format": 2,
             "tombstone": "org/lake/tables/table/tombstone/manifest.json",
-            "tombstone_rows": (1 << 53),
+            "tombstone_rows": 10**14,
             "tombstone_digest": "0" * 64,
         },
         {

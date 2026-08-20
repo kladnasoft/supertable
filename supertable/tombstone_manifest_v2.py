@@ -33,7 +33,11 @@ TOMBSTONE_MANIFEST_V2_FORMAT = "supertable-tombstone-manifest-v2"
 MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS = 32
 MAX_TOMBSTONE_MANIFEST_V2_BYTES = 256 * 1024
 MAX_TOMBSTONE_SEGMENT_PATH_BYTES = 4_096
-MAX_JSON_EXACT_INTEGER = (1 << 53) - 1
+# Redis' bundled Lua CJSON encoder is configured for 14 significant digits.
+# Snapshot publication decodes and re-encodes the payload inside Lua, so the
+# v2 format must use the stricter all-integers round-trip ceiling rather than
+# IEEE-754's wider exact-binary range.
+MAX_JSON_EXACT_INTEGER = 10**14 - 1
 
 _SHA256_HEX = frozenset("0123456789abcdef")
 _MANIFEST_FIELDS = frozenset({
@@ -136,7 +140,16 @@ def validate_logical_storage_path(
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise TombstoneManifestV2Error(f"{field_name} contains control characters")
 
-    split = urlsplit(value)
+    try:
+        split = urlsplit(value)
+    except ValueError as exc:
+        # ``urlsplit`` raises for malformed bracketed authorities and a few
+        # NFKC-unsafe netloc spellings.  Keep every invalid logical path behind
+        # this module's one fail-closed error contract so cache/recovery callers
+        # cannot accidentally treat parser-specific exceptions differently.
+        raise TombstoneManifestV2Error(
+            f"{field_name} is not a valid logical storage path"
+        ) from exc
     if split.scheme or split.netloc or split.query or split.fragment:
         raise TombstoneManifestV2Error(
             f"{field_name} must not be a URI or carry URL parameters"

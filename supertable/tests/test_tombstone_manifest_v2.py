@@ -11,12 +11,14 @@ import pytest
 
 from supertable.data_classes import SuperSnapshot, TombstoneDef
 from supertable.tombstone_manifest_v2 import (
+    MAX_JSON_EXACT_INTEGER,
     MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS,
     TOMBSTONE_MANIFEST_V2_FORMAT,
     TombstoneManifestV2,
     TombstoneManifestV2Error,
     TombstoneSegment,
     load_tombstone_manifest_v2,
+    validate_logical_storage_path,
     validate_tombstone_manifest_v2,
     validate_tombstone_segment_observation,
 )
@@ -188,6 +190,30 @@ def test_manifest_segment_count_has_a_hard_format_bound() -> None:
         load_tombstone_manifest_v2(document)
 
 
+def test_manifest_integer_fields_use_redis_cjson_round_trip_ceiling() -> None:
+    document = _document()
+    document.update({
+        "base_snapshot_version": MAX_JSON_EXACT_INTEGER - 1,
+        "snapshot_version": MAX_JSON_EXACT_INTEGER,
+        "total_rows": MAX_JSON_EXACT_INTEGER,
+        "segments": [{
+            "file": (
+                "acme/sales/tables/events/tombstone/segment-max.parquet"
+            ),
+            "rows": MAX_JSON_EXACT_INTEGER,
+            "file_size": MAX_JSON_EXACT_INTEGER,
+            "digest": _DIGEST_A,
+        }],
+    })
+    assert load_tombstone_manifest_v2(document).total_rows == (
+        MAX_JSON_EXACT_INTEGER
+    )
+
+    document["segments"][0]["file_size"] = MAX_JSON_EXACT_INTEGER + 1
+    with pytest.raises(TombstoneManifestV2Error, match="between"):
+        load_tombstone_manifest_v2(document)
+
+
 def test_raw_json_rejects_duplicate_keys_bom_and_non_json_numbers() -> None:
     canonical = _load().canonical_bytes().decode("utf-8")
     duplicate = canonical.replace(
@@ -322,6 +348,16 @@ def test_python_snapshot_completeness_accepts_v1_and_explicit_v2(payload) -> Non
     ],
 )
 def test_python_snapshot_completeness_rejects_malformed_hybrids(payload) -> None:
+    assert complete_snapshot_payload(payload, expected_version=5) is None
+
+
+def test_malformed_bracketed_path_uses_manifest_error_boundary() -> None:
+    with pytest.raises(TombstoneManifestV2Error, match="valid logical"):
+        validate_logical_storage_path("//[.json", required_suffix=".json")
+
+    payload = _snapshot_state(
+        "//[.json", 1, "0" * 64, tombstone_format=2,
+    )
     assert complete_snapshot_payload(payload, expected_version=5) is None
 
 

@@ -10,7 +10,15 @@ from supertable.tombstone_manifest_v2 import (
     TombstoneManifestV2Error,
     TombstoneSegment,
 )
-from supertable.utils.snapshot import referenced_snapshot_artifacts
+from supertable.storage.storage_interface import (
+    ObjectIdentityMismatch,
+    ObjectMetadata,
+)
+from supertable.storage.local_storage import LocalStorage
+from supertable.utils.snapshot import (
+    read_bounded_tombstone_manifest_bytes,
+    referenced_snapshot_artifacts,
+)
 
 
 ORG = "acme"
@@ -110,10 +118,13 @@ def test_gc_storage_loader_checks_manifest_size_before_reading():
     class OversizeStorage:
         reads = 0
 
-        def size(self, _path):
-            return MAX_TOMBSTONE_MANIFEST_V2_BYTES + 1
+        def stat_object(self, _path):
+            return ObjectMetadata(
+                size=MAX_TOMBSTONE_MANIFEST_V2_BYTES + 1,
+                version="oversize",
+            )
 
-        def read_bytes(self, _path):
+        def read_range(self, _path, _offset, _length, *, expected=None):
             self.reads += 1
             raise AssertionError("oversize manifest must not be read")
 
@@ -127,6 +138,94 @@ def test_gc_storage_loader_checks_manifest_size_before_reading():
             simple_name=TABLE,
         )
     assert storage.reads == 0
+
+
+def test_bounded_manifest_reader_rejects_legacy_whole_object_adapter():
+    class WholeObjectStorage:
+        reads = 0
+
+        def size(self, _path):
+            return 1
+
+        def read_bytes(self, _path):
+            self.reads += 1
+            raise AssertionError("whole-object fallback must not be used")
+
+    storage = WholeObjectStorage()
+    with pytest.raises(TombstoneManifestV2Error, match="stat_object and read_range"):
+        read_bounded_tombstone_manifest_bytes(storage, MANIFEST_PATH)
+    assert storage.reads == 0
+
+
+def test_bounded_manifest_reader_accepts_production_storage_interface(tmp_path):
+    storage = LocalStorage(root=tmp_path)
+    payload = _manifest().canonical_bytes()
+    storage.write_bytes(MANIFEST_PATH, payload)
+
+    assert read_bounded_tombstone_manifest_bytes(
+        storage, MANIFEST_PATH,
+    ) == payload
+
+
+def test_bounded_manifest_reader_never_follows_stat_read_growth():
+    manifest = _manifest().canonical_bytes()
+
+    class GrowingStorage:
+        range_lengths = []
+
+        def __init__(self):
+            self.payload = manifest
+
+        def stat_object(self, _path):
+            observed = self.payload
+            metadata = ObjectMetadata(
+                size=len(observed),
+                version=str(hash(observed)),
+            )
+            self.payload = b"x" * (MAX_TOMBSTONE_MANIFEST_V2_BYTES + 1)
+            return metadata
+
+        def read_range(self, _path, _offset, length, *, expected=None):
+            self.range_lengths.append(length)
+            current = ObjectMetadata(
+                size=len(self.payload),
+                version=str(hash(self.payload)),
+            )
+            if current.identity_token() != expected.identity_token():
+                raise ObjectIdentityMismatch("conditional version mismatch")
+            raise AssertionError("changed manifest must not be returned")
+
+    storage = GrowingStorage()
+    with pytest.raises(TombstoneManifestV2Error, match="conditionally read"):
+        read_bounded_tombstone_manifest_bytes(storage, MANIFEST_PATH)
+    assert storage.range_lengths == [len(manifest)]
+    assert storage.range_lengths[0] <= MAX_TOMBSTONE_MANIFEST_V2_BYTES
+
+
+def test_bounded_manifest_reader_reseals_identity_after_range_read():
+    manifest = _manifest().canonical_bytes()
+
+    class PostReadSwapStorage:
+        def __init__(self):
+            self.payload = manifest
+
+        def stat_object(self, _path):
+            return ObjectMetadata(
+                size=len(self.payload),
+                version=str(hash(self.payload)),
+            )
+
+        def read_range(self, _path, offset, length, *, expected=None):
+            current = self.stat_object(_path)
+            assert current == expected
+            payload = self.payload[offset:offset + length]
+            self.payload = payload.replace(b'"total_rows":3', b'"total_rows":4')
+            return payload
+
+    with pytest.raises(TombstoneManifestV2Error, match="changed during"):
+        read_bounded_tombstone_manifest_bytes(
+            PostReadSwapStorage(), MANIFEST_PATH,
+        )
 
 
 @pytest.mark.parametrize("mutation", ["noncanonical", "wrong_table", "wrong_count"])

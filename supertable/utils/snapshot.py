@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 
+from supertable.storage.storage_interface import ObjectMetadata
 from supertable.tombstone_manifest_v2 import (
     MAX_TOMBSTONE_MANIFEST_V2_BYTES,
     TombstoneManifestV2Error,
@@ -55,6 +56,110 @@ def _positive_artifact_size(value: object, *, field: str) -> int:
     return value
 
 
+def read_bounded_tombstone_manifest_bytes(
+    storage: object,
+    path: str,
+    *,
+    expected_size: Optional[int] = None,
+) -> bytes:
+    """Conditionally read one v2 manifest without whole-object allocation.
+
+    A separate ``size()`` followed by ``read_bytes()`` is not a bounded read:
+    the logical key can be replaced or grow between those operations.  Require
+    the storage backend's immutable metadata token and conditional range API,
+    cap the requested response before I/O, and verify the exact returned body.
+    Backends which cannot provide that contract are rejected at this safety
+    boundary rather than falling back to an unbounded whole-object read.
+
+    ``expected_size`` binds a later re-read to an earlier validated body.  It
+    is used by disaster recovery's independent second root seal.
+    """
+    manifest_path = validate_logical_storage_path(
+        path,
+        field_name="tombstone manifest path",
+        required_suffix=".json",
+    )
+    stat_object = getattr(storage, "stat_object", None)
+    read_range = getattr(storage, "read_range", None)
+    if not callable(stat_object) or not callable(read_range):
+        raise TombstoneManifestV2Error(
+            "bounded tombstone manifest reads require stat_object and read_range"
+        )
+    if expected_size is not None and (
+        type(expected_size) is not int
+        or not 1 <= expected_size <= MAX_TOMBSTONE_MANIFEST_V2_BYTES
+    ):
+        raise TombstoneManifestV2Error(
+            "expected tombstone manifest size is outside the supported bound"
+        )
+
+    try:
+        metadata = stat_object(manifest_path)
+    except Exception as exc:
+        raise TombstoneManifestV2Error(
+            f"cannot observe tombstone manifest {manifest_path!r}"
+        ) from exc
+    if not isinstance(metadata, ObjectMetadata):
+        raise TombstoneManifestV2Error(
+            "tombstone manifest storage returned invalid object metadata"
+        )
+    observed_size = metadata.size
+    if (
+        type(observed_size) is not int
+        or not 1 <= observed_size <= MAX_TOMBSTONE_MANIFEST_V2_BYTES
+    ):
+        raise TombstoneManifestV2Error(
+            "tombstone manifest size is outside the supported bound"
+        )
+    if expected_size is not None and observed_size != expected_size:
+        raise TombstoneManifestV2Error(
+            "tombstone manifest size changed after validation"
+        )
+
+    try:
+        sealed_identity = metadata.identity_token()
+    except Exception as exc:
+        raise TombstoneManifestV2Error(
+            "tombstone manifest returned an invalid object identity seal"
+        ) from exc
+    if not isinstance(sealed_identity, str) or not sealed_identity:
+        raise TombstoneManifestV2Error(
+            "tombstone manifest storage metadata has no immutable identity seal"
+        )
+
+    try:
+        payload = read_range(
+            manifest_path,
+            0,
+            observed_size,
+            expected=metadata,
+        )
+    except Exception as exc:
+        raise TombstoneManifestV2Error(
+            f"cannot conditionally read tombstone manifest {manifest_path!r}"
+        ) from exc
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise TombstoneManifestV2Error(
+            "bounded tombstone manifest read did not return bytes"
+        )
+    payload = bytes(payload)
+    if len(payload) != observed_size:
+        raise TombstoneManifestV2Error(
+            "tombstone manifest bytes differ from the bounded range"
+        )
+    try:
+        after = stat_object(manifest_path)
+    except Exception as exc:
+        raise TombstoneManifestV2Error(
+            f"cannot reseal tombstone manifest {manifest_path!r}"
+        ) from exc
+    if not isinstance(after, ObjectMetadata) or after != metadata:
+        raise TombstoneManifestV2Error(
+            "tombstone manifest object changed during the bounded read"
+        )
+    return payload
+
+
 def referenced_snapshot_artifacts(
     snapshot: Mapping[str, Any],
     storage: Optional[object] = None,
@@ -73,46 +178,20 @@ def referenced_snapshot_artifacts(
     segment named by that root.  V2 expansion is mandatory: omitting a loader
     is an error rather than permission to return an incomplete live set.
 
-    ``storage`` is an ergonomic adapter for objects exposing ``size`` and
-    ``read_bytes``; callers with a bounded or conditional reader can supply
-    ``manifest_loader`` instead.  Active v2 traversal also requires the pinned
-    table identity so the root and all reachable paths can be confined and the
-    manifest's identity and lineage can be validated.
+    ``storage`` is an ergonomic adapter for backends exposing stable
+    ``ObjectMetadata`` plus conditional ``read_range``; callers with their own
+    bounded reader can supply ``manifest_loader`` instead.  Active v2 traversal
+    also requires the pinned table identity so the root and all reachable paths
+    can be confined and the manifest's identity and lineage can be validated.
     """
     if not isinstance(snapshot, Mapping):
         raise TombstoneManifestV2Error("snapshot must be an object")
     if manifest_loader is not None and storage is not None:
         raise TypeError("provide storage or manifest_loader, not both")
     if manifest_loader is None and storage is not None:
-        read_bytes = getattr(storage, "read_bytes", None)
-        size = getattr(storage, "size", None)
-        if not callable(read_bytes) or not callable(size):
-            raise TypeError(
-                "storage must provide size(path) and read_bytes(path) for "
-                "bounded manifest reads"
-            )
-
-        def bounded_storage_manifest_loader(path: str) -> bytes:
-            observed_size = size(path)
-            if (
-                isinstance(observed_size, bool)
-                or not isinstance(observed_size, int)
-                or not 1 <= observed_size <= MAX_TOMBSTONE_MANIFEST_V2_BYTES
-            ):
-                raise TombstoneManifestV2Error(
-                    "tombstone manifest size is outside the supported bound"
-                )
-            payload = read_bytes(path)
-            if (
-                not isinstance(payload, bytes)
-                or len(payload) != observed_size
-            ):
-                raise TombstoneManifestV2Error(
-                    "tombstone manifest bytes differ from the bounded size"
-                )
-            return payload
-
-        manifest_loader = bounded_storage_manifest_loader
+        manifest_loader = lambda path: read_bounded_tombstone_manifest_bytes(
+            storage, path,
+        )
 
     identity_values = (organization, super_name, simple_name)
     if any(value is not None for value in identity_values) and not all(

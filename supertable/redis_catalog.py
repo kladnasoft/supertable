@@ -30,6 +30,12 @@ from supertable.utils.snapshot import (
     complete_snapshot_payload,
     snapshot_cache_payload,
 )
+from supertable.tombstone_manifest_v2 import (
+    MAX_JSON_EXACT_INTEGER as MAX_TOMBSTONE_JSON_EXACT_INTEGER,
+    TOMBSTONE_FORMAT_V2,
+    TombstoneManifestV2Error,
+    validate_snapshot_tombstone_state,
+)
 
 
 def _now_ms() -> int:
@@ -294,6 +300,80 @@ local function root_document_state(root, target_super)
       or (clone_type ~= nil and clone_type ~= cjson.null)
       or (source ~= nil and source ~= cjson.null) then return 0 end
   return 1
+end
+"""
+
+
+# Snapshot publication has two final Lua paths.  Both prepend this exact
+# discriminator so monkey-patched/older Python callers still cannot publish a
+# partial, hybrid, future, or foreign-table deletion-vector state.
+_LUA_SNAPSHOT_TOMBSTONE_GUARD = r"""
+local TOMBSTONE_JSON_MAX_EXACT_INTEGER = 99999999999999
+
+local function snapshot_v2_manifest_path_ok(path, expected_prefix)
+  if type(path) ~= 'string' or path == ''
+      or type(expected_prefix) ~= 'string' or expected_prefix == ''
+      or string.len(path) > 4096
+      or string.sub(path, 1, 1) == '/'
+      or string.sub(path, -1) == '/'
+      or string.sub(path, -5) ~= '.json'
+      or string.sub(path, 1, string.len(expected_prefix)) ~= expected_prefix
+      or string.find(path, string.char(92), 1, true)
+      or string.find(path, '//', 1, true)
+      or string.find(path, '?', 1, true)
+      or string.find(path, '#', 1, true)
+      or string.find(path, '://', 1, true)
+      or string.match(path, '^[%a][%w+%.%-]*:')
+      or string.match(path, '[%c]')
+      or string.match(path, '^%s')
+      or string.match(path, '%s$') then return false end
+  local components = 0
+  for component in string.gmatch(path, '[^/]+') do
+    if component == '.' or component == '..' then return false end
+    components = components + 1
+  end
+  return components > 0
+end
+
+local function snapshot_tombstone_state_ok(candidate, expected_v2_prefix)
+  if type(candidate) ~= 'table' then return false end
+  local pointer = candidate['tombstone']
+  local tombstone_rows = candidate['tombstone_rows']
+  local digest = candidate['tombstone_digest']
+  local format_marker = candidate['tombstone_format']
+  local tombstone_format = 1
+  if format_marker == nil then
+    tombstone_format = 1
+  elseif type(format_marker) == 'number'
+      and format_marker == math.floor(format_marker)
+      and (format_marker == 1 or format_marker == 2) then
+    tombstone_format = format_marker
+  else
+    return false
+  end
+
+  if pointer == cjson.null then
+    return type(tombstone_rows) == 'number'
+        and tombstone_rows == 0
+        and digest == cjson.null
+  end
+  if type(pointer) ~= 'string' or pointer == ''
+      or type(tombstone_rows) ~= 'number'
+      or tombstone_rows <= 0
+      or tombstone_rows ~= math.floor(tombstone_rows)
+      or type(digest) ~= 'string'
+      or string.len(digest) ~= 64
+      or not string.match(digest, '^[0-9a-f]+$') then
+    return false
+  end
+  if tombstone_format == 2 then
+    return type(candidate['snapshot_version']) == 'number'
+        and candidate['snapshot_version'] >= 1
+        and tombstone_rows <= TOMBSTONE_JSON_MAX_EXACT_INTEGER
+        and snapshot_v2_manifest_path_ok(pointer, expected_v2_prefix)
+  end
+  -- Old readers interpret a missing/1 discriminator as one Parquet vector.
+  return string.sub(pointer, -5) ~= '.json'
 end
 """
 
@@ -1909,6 +1989,7 @@ local leaf_token = ARGV[1]
 local reserve_count = ARGV[2]
 local expected_leaf_raw = ARGV[3]
 local prepared_floor = ARGV[4]
+local tombstone_json_max_exact_integer = 99999999999999
 
 if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
   return {-1}
@@ -1926,11 +2007,127 @@ local root_state = root_document_state(root, nil)
 if root_state == -1 then return {-5} end
 if root_state == 0 then return {-6} end
 
-local config_raw = redis.call('GET', config_key) or ''
+local config_type = redis.call('TYPE', config_key)
+if type(config_type) == 'table' then config_type = config_type['ok'] end
+if config_type ~= 'none' and config_type ~= 'string' then return {-8} end
+local config_raw = ''
+if config_type == 'string' then
+  config_raw = redis.call('GET', config_key)
+  if config_raw == '' then return {-8} end
+end
 if config_raw ~= '' then
+  -- cjson represents every JSON number as a Lua number, so its decoded value
+  -- cannot distinguish the required integer token `2` from `2.0` or `2e0`.
+  -- Locate top-level member value tokens without being confused by nested
+  -- objects or quoted text.  This also makes duplicate activation keys and
+  -- escaped aliases fail closed instead of letting Python reject them only
+  -- after the row-ID allocator has already changed.
+  local function json_skip_space(raw, index)
+    while index <= string.len(raw) do
+      local byte = string.byte(raw, index)
+      if byte ~= 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then break end
+      index = index + 1
+    end
+    return index
+  end
+  local function json_string_end(raw, index)
+    if string.byte(raw, index) ~= 34 then return nil end
+    index = index + 1
+    while index <= string.len(raw) do
+      local byte = string.byte(raw, index)
+      if byte == 34 then return index + 1 end
+      if byte == 92 then index = index + 1 end
+      index = index + 1
+    end
+    return nil
+  end
+  local function top_level_json_token(raw, member_literal)
+    local length = string.len(raw)
+    local index = json_skip_space(raw, 1)
+    if string.byte(raw, index) ~= 123 then return 0, nil end
+    index = index + 1
+    local matches = 0
+    local matched_token = nil
+    while true do
+      index = json_skip_space(raw, index)
+      if string.byte(raw, index) == 125 then
+        return matches, matched_token
+      end
+      local key_start = index
+      local key_end = json_string_end(raw, index)
+      if not key_end then return -1, nil end
+      local key_token = string.sub(raw, key_start, key_end - 1)
+      index = json_skip_space(raw, key_end)
+      if string.byte(raw, index) ~= 58 then return -1, nil end
+      index = json_skip_space(raw, index + 1)
+      local value_start = index
+      local nested = 0
+      local quoted = false
+      while index <= length do
+        local byte = string.byte(raw, index)
+        if quoted then
+          if byte == 92 then
+            index = index + 1
+          elseif byte == 34 then
+            quoted = false
+          end
+        elseif byte == 34 then
+          quoted = true
+        elseif byte == 123 or byte == 91 then
+          nested = nested + 1
+        elseif byte == 125 then
+          if nested == 0 then break end
+          nested = nested - 1
+        elseif byte == 93 then
+          if nested == 0 then return -1, nil end
+          nested = nested - 1
+        elseif byte == 44 and nested == 0 then
+          break
+        end
+        index = index + 1
+      end
+      local value_end = index - 1
+      while value_end >= value_start do
+        local byte = string.byte(raw, value_end)
+        if byte ~= 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then break end
+        value_end = value_end - 1
+      end
+      if key_token == member_literal then
+        matches = matches + 1
+        matched_token = string.sub(raw, value_start, value_end)
+      end
+      if string.byte(raw, index) == 44 then
+        index = index + 1
+      elseif string.byte(raw, index) == 125 then
+        return matches, matched_token
+      else
+        return -1, nil
+      end
+    end
+  end
   local config_ok, config = pcall(cjson.decode, config_raw)
   if not string.match(config_raw, '^%s*{')
       or not config_ok or type(config) ~= 'table' then return {-8} end
+  local format_marker = config['deletion_vector_format']
+  local fleet_marker = config['dv_v2_reader_fleet_confirmed']
+  local format_present = format_marker ~= nil
+  local fleet_present = fleet_marker ~= nil
+  if format_present ~= fleet_present then return {-8} end
+  local format_count, format_token = top_level_json_token(
+    config_raw, '"deletion_vector_format"'
+  )
+  local fleet_count, fleet_token = top_level_json_token(
+    config_raw, '"dv_v2_reader_fleet_confirmed"'
+  )
+  if format_count < 0 or fleet_count < 0 then return {-8} end
+  if format_present then
+    if type(format_marker) ~= 'number' or format_marker ~= 2
+        or fleet_marker ~= true or format_count ~= 1
+        or format_token ~= '2' or fleet_count ~= 1
+        or fleet_token ~= 'true' then return {-8} end
+  elseif format_count ~= 0 or fleet_count ~= 0 then
+    return {-8}
+  end
 end
 
 -- Validate the mirror document at the same linearization point as the leaf.
@@ -2053,7 +2250,7 @@ else
         and type(digest) == 'string' and string.len(digest) == 64
         and string.match(digest, '^[0-9a-f]+$') then
       if tombstone_format == 2 then
-        tombstone_ok = tombstone_rows <= ROOT_MAX_SAFE_INTEGER
+        tombstone_ok = tombstone_rows <= tombstone_json_max_exact_integer
             and v2_manifest_path_ok(pointer)
       else
         -- A JSON root without the explicit v2 discriminator is a malformed
@@ -2648,7 +2845,8 @@ return removed_meta + removed_index + 1
     #  -9  durable SimpleTable deletion intent exists
     # -10  mirror publication is owned by another publisher
     # -11  SuperTable root no longer exists
-    _LUA_SNAPSHOT_COMMIT = _LUA_ROOT_DOCUMENT_GUARD + """
+    _LUA_SNAPSHOT_COMMIT = (
+        _LUA_ROOT_DOCUMENT_GUARD + _LUA_SNAPSHOT_TOMBSTONE_GUARD + """
 local leaf_key = KEYS[1]
 local root_key = KEYS[2]
 local lock_key = KEYS[3]
@@ -2672,6 +2870,7 @@ local simple_name = ARGV[9]
 local schema_json = ARGV[10]
 local expected_mirrors_json = ARGV[11]
 local quality_generation = ARGV[12]
+local expected_v2_prefix = ARGV[13]
 
 if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or now_ms ~= math.floor(now_ms)
@@ -2812,7 +3011,11 @@ if old_version ~= expected_version or old_path ~= expected_path then
 end
 
 local okp, payload = pcall(cjson.decode, payload_json)
-if not okp or type(payload) ~= 'table' then
+if not okp or type(payload) ~= 'table'
+    or type(payload['snapshot_version']) ~= 'number'
+    or payload['snapshot_version'] ~= math.floor(payload['snapshot_version'])
+    or payload['snapshot_version'] ~= old_version + 1
+    or not snapshot_tombstone_state_ok(payload, expected_v2_prefix) then
   return {-4, 0, 0}
 end
 local oks, schema = pcall(cjson.decode, schema_json)
@@ -2898,7 +3101,7 @@ if quality_generation ~= '' then
   redis.call('SET', quality_unresolved_key, quality_generation)
 end
 return {1, new_leaf_version, new_root_version}
-"""
+""")
 
     # No-mirror snapshot publication hot path.  The begin-mutation boundary
     # already validated the raw mirror document and proved that its format set
@@ -2907,7 +3110,8 @@ return {1, new_leaf_version, new_root_version}
     # normalizing mirror configuration, and no publication intent can exist
     # for a commit with an empty mirror set.  Every core publication invariant
     # remains identical to _LUA_SNAPSHOT_COMMIT.
-    _LUA_SNAPSHOT_COMMIT_NO_MIRRORS = _LUA_ROOT_DOCUMENT_GUARD + """
+    _LUA_SNAPSHOT_COMMIT_NO_MIRRORS = (
+        _LUA_ROOT_DOCUMENT_GUARD + _LUA_SNAPSHOT_TOMBSTONE_GUARD + """
 local leaf_key = KEYS[1]
 local root_key = KEYS[2]
 local lock_key = KEYS[3]
@@ -2931,6 +3135,7 @@ local schema_json = ARGV[9]
 local quality_generation = ARGV[10]
 local mirror_pin_present = ARGV[11]
 local expected_mirror_raw = ARGV[12]
+local expected_v2_prefix = ARGV[13]
 
 if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or now_ms ~= math.floor(now_ms)
@@ -3024,7 +3229,11 @@ if old_version ~= expected_version or old_path ~= expected_path then
 end
 
 local okp, payload = pcall(cjson.decode, payload_json)
-if not okp or type(payload) ~= 'table' then
+if not okp or type(payload) ~= 'table'
+    or type(payload['snapshot_version']) ~= 'number'
+    or payload['snapshot_version'] ~= math.floor(payload['snapshot_version'])
+    or payload['snapshot_version'] ~= old_version + 1
+    or not snapshot_tombstone_state_ok(payload, expected_v2_prefix) then
   return {-4, 0, 0}
 end
 local oks, schema = pcall(cjson.decode, schema_json)
@@ -3057,7 +3266,7 @@ if quality_generation ~= '' then
   redis.call('SET', quality_unresolved_key, quality_generation)
 end
 return {1, new_leaf_version, new_root_version}
-"""
+""")
 
     _LUA_MIRROR_PUBLICATION_PREPARE = _LUA_ROOT_DOCUMENT_GUARD + """
 local state_key = KEYS[1]
@@ -5205,6 +5414,14 @@ return 1
             raise RuntimeError(
                 f"Corrupt table configuration for {org}/{sup}/{simple}"
             )
+        if config is not None:
+            try:
+                config = _validate_table_config_document(config)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Corrupt table configuration for {org}/{sup}/{simple}: "
+                    f"{exc}"
+                ) from exc
 
         mirror_pin_raw = raw[3]
         if isinstance(mirror_pin_raw, bytes):
@@ -6358,6 +6575,56 @@ return 1
             field="expected snapshot version",
             minimum=-1,
         )
+        if not isinstance(payload, Mapping):
+            raise ValueError("snapshot payload must be a JSON object")
+        if not {
+            "tombstone", "tombstone_rows", "tombstone_digest",
+        }.issubset(payload):
+            raise ValueError(
+                "snapshot payload must carry an explicit deletion-vector state"
+            )
+        successor_version = base_version + 1
+        if (
+            type(payload.get("snapshot_version")) is not int
+            or payload["snapshot_version"] != successor_version
+        ):
+            raise ValueError(
+                "snapshot payload version must be the exact successor of "
+                "expected_version"
+            )
+        try:
+            tombstone_format = validate_snapshot_tombstone_state(
+                payload.get("tombstone"),
+                payload.get("tombstone_rows"),
+                payload.get("tombstone_digest"),
+                format_present="tombstone_format" in payload,
+                tombstone_format=payload.get("tombstone_format"),
+            )
+        except (TypeError, TombstoneManifestV2Error) as exc:
+            raise ValueError(
+                "snapshot payload has an invalid deletion-vector state"
+            ) from exc
+        if (
+            tombstone_format == TOMBSTONE_FORMAT_V2
+            and payload.get("tombstone") is not None
+            and (
+                successor_version < 1
+                or payload["tombstone_rows"] > MAX_TOMBSTONE_JSON_EXACT_INTEGER
+            )
+        ):
+            raise ValueError(
+                "active snapshot v2 state has an invalid version or row-count "
+                "bound"
+            )
+        tombstone_prefix = f"{org}/{sup}/tables/{simple}/tombstone/"
+        if (
+            tombstone_format == TOMBSTONE_FORMAT_V2
+            and payload.get("tombstone") is not None
+            and not payload["tombstone"].startswith(tombstone_prefix)
+        ):
+            raise ValueError(
+                "snapshot v2 manifest pointer escapes the table tombstone namespace"
+            )
         try:
             payload = snapshot_cache_payload(payload)
             payload_json = json.dumps(payload)
@@ -6453,6 +6720,7 @@ return 1
                         quality_generation,
                         "1" if mirror_pin_present else "0",
                         mirror_pin_raw,
+                        tombstone_prefix,
                     ],
                 )
             else:
@@ -6485,6 +6753,7 @@ return 1
                         schema_json,
                         json.dumps(normalized_mirrors),
                         quality_generation,
+                        tombstone_prefix,
                     ],
                 )
         except redis.RedisError as exc:

@@ -27,6 +27,10 @@ from supertable.recovery.redis_rebuild import (
 )
 from supertable.redis_catalog import RedisCatalog
 from supertable.redis_catalog import _canonicalize_role_document
+from supertable.storage.storage_interface import (
+    ObjectIdentityMismatch,
+    ObjectMetadata,
+)
 from supertable.tombstone_manifest_v2 import (
     TombstoneManifestV2,
     TombstoneSegment,
@@ -58,6 +62,19 @@ class MemoryStorage:
 
     def read_bytes(self, path):
         return self.files[path]
+
+    def stat_object(self, path):
+        payload = self.files[path]
+        return ObjectMetadata(
+            size=len(payload),
+            version=hashlib.sha256(payload).hexdigest(),
+        )
+
+    def read_range(self, path, offset, length, *, expected=None):
+        current = self.stat_object(path)
+        if expected is not None and current.identity_token() != expected.identity_token():
+            raise ObjectIdentityMismatch(f"object changed: {path}")
+        return self.files[path][offset:offset + length]
 
     def write_bytes(self, path, payload):
         self.files[path] = bytes(payload)
@@ -767,18 +784,32 @@ def test_recovery_seals_v2_root_and_every_segment_and_detects_replacement():
 def test_checkpoint_rejects_v2_manifest_swap_between_validation_and_seal():
     class SwappingStorage(MemoryStorage):
         manifest_reads = 0
+        manifest_stats = 0
 
-        def read_bytes(self, path):
-            payload = super().read_bytes(path)
+        def stat_object(self, path):
+            metadata = super().stat_object(path)
             if path == DV_ROOT:
-                self.manifest_reads += 1
-                if self.manifest_reads == 1:
-                    self.files[path] = payload.replace(
+                self.manifest_stats += 1
+                # Return the stable post-read observation, then replace the
+                # key in the TOCTOU gap before recovery's independent seal.
+                if self.manifest_stats == 2:
+                    self.files[path] = self.files[path].replace(
                         b'"digest":"dddddddd',
                         b'"digest":"eeeeeeee',
                         1,
                     )
-            return payload
+            return metadata
+
+        def read_range(self, path, offset, length, *, expected=None):
+            if path == DV_ROOT:
+                self.manifest_reads += 1
+            current = MemoryStorage.stat_object(self, path)
+            if (
+                expected is not None
+                and current.identity_token() != expected.identity_token()
+            ):
+                raise ObjectIdentityMismatch(f"object changed: {path}")
+            return self.files[path][offset:offset + length]
 
     source = _redis()
     storage = SwappingStorage()
@@ -787,6 +818,39 @@ def test_checkpoint_rejects_v2_manifest_swap_between_validation_and_seal():
     with pytest.raises(RecoveryError, match="changed after root validation"):
         _checkpoint(source, storage)
     assert storage.manifest_reads == 2
+
+
+def test_checkpoint_caps_second_manifest_seal_before_content_read():
+    class GrowingStorage(MemoryStorage):
+        manifest_reads = 0
+        manifest_stats = 0
+
+        def stat_object(self, path):
+            metadata = super().stat_object(path)
+            if path == DV_ROOT:
+                self.manifest_stats += 1
+                if self.manifest_stats == 2:
+                    self.files[path] = b"x" * (256 * 1024 + 1)
+            return metadata
+
+        def read_range(self, path, offset, length, *, expected=None):
+            if path == DV_ROOT:
+                self.manifest_reads += 1
+            current = MemoryStorage.stat_object(self, path)
+            if (
+                expected is not None
+                and current.identity_token() != expected.identity_token()
+            ):
+                raise ObjectIdentityMismatch(f"object changed: {path}")
+            return self.files[path][offset:offset + length]
+
+    source = _redis()
+    storage = GrowingStorage()
+    _seed_v2_catalog(source, storage)
+
+    with pytest.raises(RecoveryError, match="changed after root validation"):
+        _checkpoint(source, storage)
+    assert storage.manifest_reads == 1
 
 
 @pytest.mark.parametrize(
