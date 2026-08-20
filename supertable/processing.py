@@ -63,12 +63,75 @@ _STATS_CACHE_IDENTITY_PREFIX = "__supertable_stats_cache__/"
 _TOMBSTONE_CACHE_IDENTITY_PREFIX = "__supertable_tombstone_cache__/"
 
 
+@dataclass(frozen=True)
+class _LocalArtifactCacheIdentityState:
+    """Inputs that make one built-in local-storage cache scope reusable."""
+
+    process_id: int
+    organization: str
+    storage_id: int
+    storage_root: str
+
+
+def _local_artifact_cache_identity_state(
+        organization: str,
+        storage: object,
+) -> Optional[_LocalArtifactCacheIdentityState]:
+    """Return a cacheable state only for the exact built-in LocalStorage.
+
+    Remote and third-party adapters may rotate credentials behind a stable
+    Python object.  They deliberately stay on FileCache's live namespace/auth
+    sampling path below.  LocalStorage has no credential scope, exposes a
+    canonical absolute root, and has a frozen ``{"provider": "local"}``
+    namespace, so its identity inputs can safely be retained by one writer.
+    """
+    try:
+        from supertable.storage.local_storage import LocalStorage
+
+        if type(storage) is not LocalStorage:
+            return None
+        if storage.cache_namespace() != {"provider": "local"}:
+            return None
+        if storage.is_local_storage() is not True:
+            return None
+        root = storage.root
+        if type(root) is not str or not root or not os.path.isabs(root):
+            return None
+    except Exception:
+        return None
+    return _LocalArtifactCacheIdentityState(
+        process_id=os.getpid(),
+        organization=str(organization or ""),
+        storage_id=id(storage),
+        storage_root=root,
+    )
+
+
+def _local_artifact_cache_scope(
+        state: _LocalArtifactCacheIdentityState,
+) -> str:
+    """Hash the non-secret, process-local LocalStorage cache boundary."""
+    payload = {
+        "organization": state.organization,
+        "process_id": state.process_id,
+        "storage_namespace": {"provider": "local"},
+        "storage_root": state.storage_root,
+    }
+    return hashlib.sha256(json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+
+
 def _artifact_cache_identity(
         artifact_path: str,
         *,
         prefix: str,
         organization: str = "",
         storage: Optional[object] = None,
+        identity_scope: Optional[str] = None,
 ) -> str:
     """Return an organization/storage/auth-scoped immutable artifact key."""
     value = str(artifact_path or "")
@@ -80,21 +143,30 @@ def _artifact_cache_identity(
             active_storage = _get_storage()
         except Exception:
             active_storage = None
-    try:
-        # FileCache owns the hardened namespace contract for every built-in
-        # backend, including credential fingerprints and opaque-client isolation.
-        # Constructing it with max_bytes=0 computes hashes without touching disk.
-        from supertable.engine.file_cache import FileCache
-        namespace = FileCache(
-            active_storage, organization, max_bytes=0, workers=1,
+    scope = identity_scope
+    if scope is None:
+        local_state = _local_artifact_cache_identity_state(
+            organization, active_storage,
         )
-        scope = f"{namespace._organization_hash}{namespace._storage_hash}"
-    except Exception:
-        fallback = (
-            f"{organization}\0{type(active_storage).__module__}."
-            f"{type(active_storage).__qualname__}\0{id(active_storage)}"
-        )
-        scope = hashlib.sha256(fallback.encode("utf-8")).hexdigest()
+        if local_state is not None:
+            scope = _local_artifact_cache_scope(local_state)
+        else:
+            try:
+                # Remote/custom adapters stay byte-for-byte on FileCache's
+                # hardened namespace contract, including live credential
+                # fingerprints and opaque-client isolation.  Do not retain this
+                # result: refreshable authorization may change between calls.
+                from supertable.engine.file_cache import FileCache
+                namespace = FileCache(
+                    active_storage, organization, max_bytes=0, workers=1,
+                )
+                scope = f"{namespace._organization_hash}{namespace._storage_hash}"
+            except Exception:
+                fallback = (
+                    f"{organization}\0{type(active_storage).__module__}."
+                    f"{type(active_storage).__qualname__}\0{id(active_storage)}"
+                )
+                scope = hashlib.sha256(fallback.encode("utf-8")).hexdigest()
     table_key = _PathKeyedFrameCache._key(value) if value else ""
     table_hash = hashlib.sha256(table_key.encode("utf-8")).hexdigest()
     version_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -132,6 +204,86 @@ def tombstone_cache_identity(
         organization=organization,
         storage=storage,
     )
+
+
+class _WriterArtifactCacheIdentities:
+    """Reuse only the immutable built-in LocalStorage identity per writer."""
+
+    def __init__(self) -> None:
+        self._process_id = os.getpid()
+        self._state: Optional[_LocalArtifactCacheIdentityState] = None
+        self._scope: Optional[str] = None
+        self._lock = threading.Lock()
+
+    def _local_scope(
+            self,
+            organization: str,
+            storage: object,
+    ) -> Optional[str]:
+        process_id = os.getpid()
+        if process_id != self._process_id:
+            # A lock inherited while another parent thread held it can never be
+            # released in the child.  Replace both synchronization and cached
+            # identity before examining the forked writer.
+            self._lock = threading.Lock()
+            self._process_id = process_id
+            self._state = None
+            self._scope = None
+
+        state = _local_artifact_cache_identity_state(organization, storage)
+        if state is None:
+            return None
+        with self._lock:
+            if state != self._state:
+                self._state = state
+                self._scope = _local_artifact_cache_scope(state)
+            return self._scope
+
+    def stats(
+            self,
+            path: str,
+            *,
+            organization: str,
+            storage: object,
+    ) -> str:
+        value = str(path or "")
+        if value.startswith(_STATS_CACHE_IDENTITY_PREFIX):
+            return value
+        scope = self._local_scope(organization, storage)
+        if scope is None:
+            return stats_cache_identity(
+                value, organization=organization, storage=storage,
+            )
+        return _artifact_cache_identity(
+            value,
+            prefix=_STATS_CACHE_IDENTITY_PREFIX,
+            organization=organization,
+            storage=storage,
+            identity_scope=scope,
+        )
+
+    def tombstone(
+            self,
+            path: str,
+            *,
+            organization: str,
+            storage: object,
+    ) -> str:
+        value = str(path or "")
+        if value.startswith(_TOMBSTONE_CACHE_IDENTITY_PREFIX):
+            return value
+        scope = self._local_scope(organization, storage)
+        if scope is None:
+            return tombstone_cache_identity(
+                value, organization=organization, storage=storage,
+            )
+        return _artifact_cache_identity(
+            value,
+            prefix=_TOMBSTONE_CACHE_IDENTITY_PREFIX,
+            organization=organization,
+            storage=storage,
+            identity_scope=scope,
+        )
 
 
 def _resolve_limits(table_config: Optional[dict]) -> Tuple[int, int]:

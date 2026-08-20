@@ -62,8 +62,7 @@ from supertable.processing import (
     tombstone_digest,
     stats_for_complete_files,
     resource_stats_seal,
-    stats_cache_identity,
-    tombstone_cache_identity,
+    _WriterArtifactCacheIdentities,
     LoadedTombstoneState,
     ROWID_COL,
     TOMBSTONE_FILE_COL,
@@ -108,6 +107,32 @@ class DataWriter:
         self.super_table = SuperTable(super_name, organization)
         self.catalog = RedisCatalog()
         self._table_config_cache: dict = {}
+        self._artifact_cache_identities = _WriterArtifactCacheIdentities()
+
+    def _artifact_identities(self) -> _WriterArtifactCacheIdentities:
+        """Return this writer's lazy, fork-safe local artifact identity cache."""
+        identities = getattr(self, "_artifact_cache_identities", None)
+        if not isinstance(identities, _WriterArtifactCacheIdentities):
+            # Several compatibility tests and adapters construct DataWriter via
+            # ``__new__``. Preserve that supported shape without making normal
+            # writes pay a branch after the first identity request.
+            identities = _WriterArtifactCacheIdentities()
+            self._artifact_cache_identities = identities
+        return identities
+
+    def _stats_cache_identity(self, path: str) -> str:
+        return self._artifact_identities().stats(
+            path,
+            organization=self.super_table.organization,
+            storage=self.super_table.storage,
+        )
+
+    def _tombstone_cache_identity(self, path: str) -> str:
+        return self._artifact_identities().tombstone(
+            path,
+            organization=self.super_table.organization,
+            storage=self.super_table.storage,
+        )
 
     timer = Timer()
 
@@ -280,11 +305,7 @@ class DataWriter:
         if tombstone_path:
             tombstone_df = load_tombstone(
                 tombstone_path,
-                cache_identity=tombstone_cache_identity(
-                    tombstone_path,
-                    organization=self.super_table.organization,
-                    storage=self.super_table.storage,
-                ),
+                cache_identity=self._tombstone_cache_identity(tombstone_path),
                 allow_cache=True,
                 required=True,
                 expected_rows=self._declared_tombstone_rows(snapshot),
@@ -1306,10 +1327,8 @@ class DataWriter:
             if overwrite_columns:
                 stats_file = last_simple_table.get("stats_file")
                 if stats_file:
-                    current_stats_cache_identity = stats_cache_identity(
+                    current_stats_cache_identity = self._stats_cache_identity(
                         stats_file,
-                        organization=self.super_table.organization,
-                        storage=self.super_table.storage,
                     )
                     stored_stats_df = load_stats(
                         stats_file,
@@ -1379,10 +1398,8 @@ class DataWriter:
             prev_dv_df = (
                 load_tombstone(
                     prev_tombstone_path,
-                    cache_identity=tombstone_cache_identity(
+                    cache_identity=self._tombstone_cache_identity(
                         prev_tombstone_path,
-                        organization=self.super_table.organization,
-                        storage=self.super_table.storage,
                     ),
                     allow_cache=True,
                     required=True,
@@ -1892,10 +1909,8 @@ class DataWriter:
                             ] = {}
                             dv_to_drain = load_tombstone(
                                 tombstone_path,
-                                cache_identity=tombstone_cache_identity(
+                                cache_identity=self._tombstone_cache_identity(
                                     tombstone_path,
-                                    organization=self.super_table.organization,
-                                    storage=self.super_table.storage,
                                 ),
                                 allow_cache=True,
                                 required=True,
@@ -2182,11 +2197,7 @@ class DataWriter:
                         if combined_tombstone_df is not None else prev_dv_df
                     ),
                     cache_identity=(
-                        tombstone_cache_identity(
-                            tombstone_path,
-                            organization=self.super_table.organization,
-                            storage=self.super_table.storage,
-                        )
+                        self._tombstone_cache_identity(tombstone_path)
                         if tombstone_path else None
                     ),
                     expected_rows=tombstone_rows if tombstone_path else None,
@@ -2331,10 +2342,8 @@ class DataWriter:
                         compression_level=compression_level,
                         profiler=profiler,
                         prev_cache_identity=(
-                            stats_cache_identity(
+                            self._stats_cache_identity(
                                 last_simple_table.get("stats_file"),
-                                organization=self.super_table.organization,
-                                storage=self.super_table.storage,
                             )
                             if last_simple_table.get("stats_file") else None
                         ),
@@ -2353,11 +2362,7 @@ class DataWriter:
                     cache_stats(
                         stats_path,
                         combined_stats_df,
-                        cache_identity=stats_cache_identity(
-                            stats_path,
-                            organization=self.super_table.organization,
-                            storage=self.super_table.storage,
-                        ),
+                        cache_identity=self._stats_cache_identity(stats_path),
                         validation=stats_validation_out.get("validation"),
                     )
                 mark("build_stats")
@@ -2439,10 +2444,8 @@ class DataWriter:
                 if prev_tombstone_path and prev_tombstone_path != tombstone_path:
                     evict_tombstone(
                         prev_tombstone_path,
-                        cache_identity=tombstone_cache_identity(
+                        cache_identity=self._tombstone_cache_identity(
                             prev_tombstone_path,
-                            organization=self.super_table.organization,
-                            storage=self.super_table.storage,
                         ),
                     )
                 mark("bump_root")
@@ -2894,10 +2897,8 @@ class DataWriter:
                 compact_state_out: dict[str, LoadedTombstoneState] = {}
                 tombstone_df = load_tombstone(
                     tombstone_path,
-                    cache_identity=tombstone_cache_identity(
+                    cache_identity=self._tombstone_cache_identity(
                         tombstone_path,
-                        organization=self.super_table.organization,
-                        storage=self.super_table.storage,
                     ),
                     allow_cache=True,
                     required=True,
@@ -3212,11 +3213,7 @@ class DataWriter:
                             and tombstone_path else residual_dv
                         ),
                         cache_identity=(
-                            tombstone_cache_identity(
-                                tombstone_path,
-                                organization=self.super_table.organization,
-                                storage=self.super_table.storage,
-                            )
+                            self._tombstone_cache_identity(tombstone_path)
                             if tombstone_path else None
                         ),
                         expected_rows=(
@@ -3256,10 +3253,8 @@ class DataWriter:
                     removed_files=all_sunset,
                     compression_level=compression_level,
                     prev_cache_identity=(
-                        stats_cache_identity(
+                        self._stats_cache_identity(
                             last_simple_table.get("stats_file"),
-                            organization=self.super_table.organization,
-                            storage=self.super_table.storage,
                         )
                         if last_simple_table.get("stats_file") else None
                     ),
@@ -3275,11 +3270,7 @@ class DataWriter:
                     cache_stats(
                         stats_path,
                         combined_stats_df,
-                        cache_identity=stats_cache_identity(
-                            stats_path,
-                            organization=self.super_table.organization,
-                            storage=self.super_table.storage,
-                        ),
+                        cache_identity=self._stats_cache_identity(stats_path),
                         validation=stats_validation_out.get("validation"),
                     )
                 mark("build_stats")
@@ -3325,10 +3316,8 @@ class DataWriter:
                 ):
                     evict_tombstone(
                         previous_tombstone_path,
-                        cache_identity=tombstone_cache_identity(
+                        cache_identity=self._tombstone_cache_identity(
                             previous_tombstone_path,
-                            organization=self.super_table.organization,
-                            storage=self.super_table.storage,
                         ),
                     )
                 mark("bump_root")
