@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import duckdb
 import polars as pl
@@ -37,6 +37,7 @@ from supertable.tombstone_manifest_v2 import (
 from supertable.simple_table import SimpleTable
 from supertable.storage.local_storage import LocalStorage
 from supertable.storage.storage_interface import ObjectMetadata
+from supertable.utils.snapshot import read_bounded_tombstone_manifest_bytes
 
 
 class _MemoryStorage:
@@ -45,6 +46,7 @@ class _MemoryStorage:
         self.frames = dict(frames or {})
         self.sizes = dict(sizes or {})
         self.read_bytes_calls = []
+        self.read_range_calls = []
         self.read_parquet_calls = []
 
     def size(self, key):
@@ -63,6 +65,20 @@ class _MemoryStorage:
     def read_bytes(self, key):
         self.read_bytes_calls.append(key)
         return self.blobs[key]
+
+    def stat_object(self, key):
+        body = self.blobs.get(key, b"")
+        return ObjectMetadata(
+            size=self.sizes[key],
+            version=f"memory:{key}:{body.hex()}",
+        )
+
+    def read_range(self, key, offset, length, *, expected=None):
+        self.read_range_calls.append((key, offset, length, expected))
+        current = self.stat_object(key)
+        if current != expected:
+            raise OSError("object identity changed")
+        return self.blobs[key][offset:offset + length]
 
     def read_parquet(self, key, columns=None):
         self.read_parquet_calls.append(key)
@@ -167,9 +183,11 @@ def test_manifest_loader_rejects_noncanonical_and_oversized_before_read() -> Non
 
     storage.sizes[manifest_key] = MAX_TOMBSTONE_MANIFEST_V2_BYTES + 1
     storage.read_bytes_calls.clear()
+    storage.read_range_calls.clear()
     with pytest.raises(TombstoneManifestV2Error, match="size"):
         load_tombstone_manifest_from_storage(storage, manifest_key)
     assert storage.read_bytes_calls == []
+    assert storage.read_range_calls == []
 
 
 def test_manifest_loader_normalizes_malformed_uri_parser_error() -> None:
@@ -177,6 +195,37 @@ def test_manifest_loader_normalizes_malformed_uri_parser_error() -> None:
     with pytest.raises(TombstoneManifestV2Error, match="logical storage path"):
         load_tombstone_manifest_from_storage(storage, "//[.json")
     assert storage.read_bytes_calls == []
+
+
+def test_manifest_loader_requires_conditional_bounded_storage() -> None:
+    class WholeObjectOnly:
+        reads = 0
+
+        def size(self, _key):
+            return 1
+
+        def read_bytes(self, _key):
+            self.reads += 1
+            raise AssertionError("whole-object fallback must not run")
+
+    storage = WholeObjectOnly()
+    with pytest.raises(
+        TombstoneManifestV2Error,
+        match="stat_object and read_range",
+    ):
+        read_bounded_tombstone_manifest_bytes(
+            storage,
+            "org/s/tables/t/tombstone/manifest.json",
+        )
+    with pytest.raises(
+        TombstoneManifestV2Error,
+        match="stat_object and read_range",
+    ):
+        load_tombstone_manifest_from_storage(
+            storage,
+            "org/s/tables/t/tombstone/manifest.json",
+        )
+    assert storage.reads == 0
 
 
 def test_segment_union_rejects_cross_segment_duplicate_and_size_mismatch() -> None:
@@ -303,6 +352,98 @@ def test_islanddb_v2_union_parity_and_missing_or_tampered_segment() -> None:
         engine._load_tombstone(tampered)
 
 
+def _island_source_relation() -> pl.LazyFrame:
+    return pl.DataFrame({
+        "id": pl.Series([10], dtype=pl.Int64),
+        "__rowid__": pl.Series([1], dtype=pl.Int64),
+        "__timestamp__": pl.Series([1], dtype=pl.Int64),
+        "__supertable_source_file__": pl.Series(
+            ["data/a.parquet"], dtype=pl.String,
+        ),
+    }).lazy()
+
+
+def test_islanddb_accepts_only_exact_empty_v2_state() -> None:
+    engine = IslandDB.__new__(IslandDB)
+    engine._load_tombstone = MagicMock(
+        side_effect=AssertionError("empty state must not load a tombstone"),
+    )
+    empty = TombstoneDef(
+        tombstone_path=None,
+        cache_key=None,
+        expected_rows=0,
+        tombstone_digest=None,
+        tombstone_format=2,
+        segments=(),
+    )
+
+    result = engine._apply_tombstone(
+        _island_source_relation(),
+        SuperSnapshot("s", "t", 1),
+        empty,
+    ).collect()
+
+    assert result.to_dict(as_series=False) == {"id": [10]}
+    engine._load_tombstone.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        TombstoneDef(tombstone_format=2),
+        TombstoneDef(
+            expected_rows=0,
+            tombstone_format=2,
+            segments=(
+                TombstoneSegmentDef(
+                    cache_key="org/s/tables/t/tombstone/a.parquet",
+                    tombstone_path="/tmp/a.parquet",
+                    expected_rows=1,
+                    file_size=1,
+                    tombstone_digest="0" * 64,
+                ),
+            ),
+        ),
+        TombstoneDef(
+            tombstone_path="/resolved/manifest.json",
+            cache_key="org/s/tables/t/tombstone/manifest.json",
+            expected_rows=1,
+            tombstone_digest="0" * 64,
+            tombstone_format=2,
+            segments=(),
+        ),
+        TombstoneDef(
+            tombstone_path="/resolved/dv.parquet",
+            cache_key="org/s/tables/t/tombstone/dv.parquet",
+            expected_rows=1,
+            tombstone_digest="0" * 64,
+            tombstone_format=3,
+        ),
+        TombstoneDef(
+            tombstone_path="",
+            cache_key="org/s/tables/t/tombstone/dv.parquet",
+            expected_rows=1,
+            tombstone_digest="0" * 64,
+        ),
+    ],
+)
+def test_islanddb_rejects_malformed_empty_and_active_states_before_io(
+    malformed,
+) -> None:
+    engine = IslandDB.__new__(IslandDB)
+    engine._load_tombstone = MagicMock(
+        side_effect=AssertionError("malformed state must fail before I/O"),
+    )
+
+    with pytest.raises(IslandIntegrityError, match="invalid"):
+        engine._apply_tombstone(
+            _island_source_relation(),
+            SuperSnapshot("s", "t", 1),
+            malformed,
+        )
+    engine._load_tombstone.assert_not_called()
+
+
 def _duckdb_v2(tmp_path):
     frames = (
         _frame("data/a.parquet", [1]),
@@ -349,6 +490,19 @@ def _source(con) -> None:
     )
 
 
+class _TrackedDuckDBConnection:
+    def __init__(self, connection, paths):
+        self.connection = connection
+        self.path_reads = {str(path): 0 for path in paths}
+
+    def execute(self, sql, *args, **kwargs):
+        statement = str(sql)
+        for path in self.path_reads:
+            if path in statement:
+                self.path_reads[path] += 1
+        return self.connection.execute(sql, *args, **kwargs)
+
+
 def test_duckdb_v2_inline_and_cached_paths_are_equal(tmp_path) -> None:
     definition = _duckdb_v2(tmp_path)
     con = duckdb.connect()
@@ -374,6 +528,76 @@ def test_duckdb_v2_inline_and_cached_paths_are_equal(tmp_path) -> None:
     cached = con.execute("SELECT id FROM cached_live ORDER BY id").fetchall()
     assert inline == cached == [(20,), (40,)]
     cache.release(con, cached_table.cache_key)
+
+
+def test_duckdb_v2_capacity_zero_reads_once_and_survives_replacement(
+    tmp_path,
+) -> None:
+    definition = _duckdb_v2(tmp_path)
+    paths = [segment.tombstone_path for segment in definition.segments]
+    raw_connection = duckdb.connect()
+    con = _TrackedDuckDBConnection(raw_connection, paths)
+    _source(con)
+    cache = TombstoneCache(capacity=0, ttl_seconds=60)
+
+    table = cache.acquire(
+        con,
+        definition.cache_key,
+        definition.tombstone_path,
+        expected_rows=definition.expected_rows,
+        expected_digest=definition.tombstone_digest,
+        tombstone_def=definition,
+        allowed_files=list(definition.snapshot_resource_keys or ()),
+    )
+    assert table is not None
+    create_tombstone_view(
+        con, "src", "zero_capacity_live", definition, dv_table=table,
+    )
+
+    # Replace both external files after the view exists. A path-backed view
+    # would now resurrect the originally deleted rows; the validated private
+    # table must remain bound to the bytes read during acquire().
+    _frame("data/a.parquet", [2]).write_parquet(paths[0])
+    _frame("data/b.parquet", [4]).write_parquet(paths[1])
+    assert raw_connection.execute(
+        "SELECT id FROM zero_capacity_live ORDER BY id"
+    ).fetchall() == [(20,), (40,)]
+    assert con.path_reads == {path: 1 for path in paths}
+
+    table_name = str(table)
+    cache.release(con, table.cache_key)
+    assert cache.snapshot() == []
+    with pytest.raises(duckdb.CatalogException):
+        raw_connection.execute(f'SELECT * FROM "{table_name}"')
+
+
+def test_duckdb_v2_persistent_cache_reads_each_segment_once(tmp_path) -> None:
+    definition = _duckdb_v2(tmp_path)
+    paths = [segment.tombstone_path for segment in definition.segments]
+    raw_connection = duckdb.connect()
+    con = _TrackedDuckDBConnection(raw_connection, paths)
+    cache = TombstoneCache(capacity=2, ttl_seconds=60)
+
+    first = cache.acquire(
+        con,
+        definition.cache_key,
+        definition.tombstone_path,
+        expected_rows=definition.expected_rows,
+        expected_digest=definition.tombstone_digest,
+        tombstone_def=definition,
+    )
+    second = cache.acquire(
+        con,
+        definition.cache_key,
+        definition.tombstone_path,
+        expected_rows=definition.expected_rows,
+        expected_digest=definition.tombstone_digest,
+        tombstone_def=definition,
+    )
+    assert first == second
+    assert con.path_reads == {path: 1 for path in paths}
+    cache.release(con, first.cache_key)
+    cache.release(con, second.cache_key)
 
 
 def test_duckdb_cache_hit_rejects_changed_segment_descriptors(tmp_path) -> None:
@@ -421,6 +645,32 @@ def test_direct_duckdb_caller_rejects_missing_v2_segments() -> None:
     _source(con)
     with pytest.raises(RuntimeError, match="no sealed segments"):
         create_tombstone_view(con, "src", "live", malformed)
+
+
+def test_direct_duckdb_rejects_resolved_json_hybrid_and_accepts_empty_v2() -> None:
+    con = duckdb.connect()
+    _source(con)
+    hybrid = TombstoneDef(
+        tombstone_path="https://objects.example/manifest?signature=secret",
+        cache_key="org/s/tables/t/tombstone/manifest.json",
+        expected_rows=1,
+        tombstone_digest="0" * 64,
+    )
+    with pytest.raises(RuntimeError, match="requires tombstone_format=2"):
+        create_tombstone_view(con, "src", "hybrid_live", hybrid)
+
+    empty_v2 = TombstoneDef(
+        tombstone_path=None,
+        cache_key=None,
+        expected_rows=0,
+        tombstone_digest=None,
+        tombstone_format=2,
+        segments=(),
+    )
+    create_tombstone_view(con, "src", "empty_v2_live", empty_v2)
+    assert con.execute(
+        "SELECT id FROM empty_v2_live ORDER BY id"
+    ).fetchall() == [(10,), (20,), (30,), (40,)]
 
 
 def test_duckdb_path_collection_uses_every_segment_not_manifest(tmp_path) -> None:
@@ -500,6 +750,135 @@ def test_explicit_spark_rejects_fake_empty_v2_before_connection() -> None:
 
     executor._select_cluster.assert_not_called()
     executor._get_connection.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        TombstoneDef(
+            tombstone_path="/resolved/dv.parquet",
+            cache_key="org/s/tables/t/tombstone/dv.parquet",
+            expected_rows=1,
+            tombstone_digest="0" * 64,
+            tombstone_format=True,
+        ),
+        TombstoneDef(
+            tombstone_path="/resolved/manifest.json",
+            cache_key="org/s/tables/t/tombstone/manifest.json",
+            expected_rows=1,
+            tombstone_digest="0" * 64,
+            tombstone_format=None,
+        ),
+        TombstoneDef(
+            tombstone_path="/resolved/manifest.json",
+            cache_key="org/s/tables/t/tombstone/manifest.json",
+            expected_rows=1,
+            tombstone_digest="0" * 64,
+            tombstone_format=2,
+            segments=(),
+        ),
+        TombstoneDef(
+            tombstone_path="",
+            cache_key="org/s/tables/t/tombstone/dv.parquet",
+            expected_rows=1,
+            tombstone_digest="0" * 64,
+        ),
+    ],
+)
+def test_spark_rejects_malformed_tombstone_hybrid_before_setup(
+    malformed,
+) -> None:
+    reflection = Reflection(
+        storage_type="local",
+        reflection_bytes=1,
+        total_reflections=1,
+        supers=[SuperSnapshot("s", "t", 1)],
+        tombstone_views={"t": malformed},
+    )
+    executor = SparkThriftExecutor.__new__(SparkThriftExecutor)
+    executor._select_cluster = MagicMock()
+    executor._get_connection = MagicMock()
+
+    with pytest.raises(RuntimeError, match="Invalid Spark deletion-vector"):
+        executor.execute(
+            reflection,
+            parser=None,
+            query_manager=None,
+            timer_capture=lambda _phase: None,
+        )
+
+    executor._select_cluster.assert_not_called()
+    executor._get_connection.assert_not_called()
+
+
+def test_data_reader_rejects_manifest_root_outside_pinned_table() -> None:
+    import importlib
+    import supertable.data_reader as reader_module
+
+    observations_module = importlib.import_module(
+        "supertable.engine.query_observations"
+    )
+
+    table = SimpleNamespace(alias="t", super_name="s", simple_name="t")
+    parser = MagicMock(
+        original_query="SELECT * FROM t",
+    )
+    parser.get_table_tuples.return_value = [table]
+    parser.get_physical_tables.return_value = [table]
+    parser.get_predicate_constraints.return_value = {}
+    parser.get_join_edges.return_value = []
+    foreign_manifest = "org/s/tables/other/tombstone/manifest.json"
+    reflection = Reflection(
+        storage_type="local",
+        reflection_bytes=1,
+        total_reflections=1,
+        supers=[SuperSnapshot(
+            super_name="s",
+            simple_name="t",
+            simple_version=7,
+            files=["org/s/tables/t/data/a.parquet"],
+            columns={"id"},
+            tombstone_key=foreign_manifest,
+            tombstone_rows=1,
+            tombstone_digest="0" * 64,
+            tombstone_format=2,
+        )],
+    )
+    estimator = MagicMock()
+    estimator.estimate.return_value = reflection
+    estimator._to_duckdb_path.side_effect = AssertionError(
+        "out-of-scope manifest must fail before path resolution"
+    )
+    executor = MagicMock()
+    storage = MagicMock()
+
+    with (
+        patch.object(reader_module, "get_storage", return_value=storage),
+        patch.object(reader_module, "SQLParser", return_value=parser),
+        patch.object(reader_module, "DataEstimator", return_value=estimator),
+        patch.object(reader_module, "Executor", return_value=executor),
+        patch.object(reader_module, "restrict_read_access", return_value={}),
+        patch.object(reader_module, "validate_rbac_binding_stability"),
+        patch.object(reader_module, "QueryPlanManager") as query_plan,
+        patch.object(reader_module, "Timer") as timer,
+        patch.object(reader_module, "PlanStats") as plan_stats,
+        patch.object(reader_module, "extend_execution_plan"),
+        patch.object(
+            observations_module, "QueryObservationStore",
+        ) as observations,
+    ):
+        query_plan.return_value = MagicMock(query_id="q", query_hash="h")
+        timer.return_value = MagicMock(timings=[])
+        plan_stats.return_value = MagicMock()
+        observations.return_value = MagicMock(enabled=False)
+        reader = reader_module.DataReader("s", "org", "SELECT * FROM t")
+        reader._assert_targets_exist = MagicMock()
+        _frame_result, status, message = reader.execute("admin")
+
+    assert status is reader_module.Status.ERROR
+    assert "manifest pointer escapes the pinned table" in str(message)
+    estimator._to_duckdb_path.assert_not_called()
+    executor.execute.assert_not_called()
 
 
 class _LocalStorage:
@@ -687,5 +1066,27 @@ def test_simple_table_export_missing_v2_segment_writes_nothing(
 
     with pytest.raises(ValueError, match="segment size"):
         table.export_to("exports/missing")
+
+    assert not target.exists()
+
+
+def test_simple_table_export_rejects_manifest_root_outside_table(
+    tmp_path, monkeypatch,
+) -> None:
+    table, storage = _local_export_table(tmp_path)
+    snapshot, snapshot_path = table.get_simple_table_snapshot()
+    original_manifest = snapshot["tombstone"]
+    foreign_manifest = "org/s/tables/other/tombstone/manifest.json"
+    storage.write_bytes(
+        foreign_manifest,
+        storage.read_bytes(original_manifest),
+    )
+    snapshot["tombstone"] = foreign_manifest
+    table.get_simple_table_snapshot = lambda: (snapshot, snapshot_path)
+    monkeypatch.setattr(processing, "_storage", storage)
+    target = tmp_path / "exports" / "foreign-root"
+
+    with pytest.raises(ValueError, match="escapes the pinned simple table"):
+        table.export_to("exports/foreign-root")
 
     assert not target.exists()

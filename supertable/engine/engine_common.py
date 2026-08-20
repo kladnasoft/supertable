@@ -2484,8 +2484,9 @@ class ValidatedTombstoneTable(str):
 
     It deliberately remains a ``str`` so existing engine/view plumbing stays
     simple.  The marker lets ``create_tombstone_view`` avoid an O(N) validation
-    scan on every cache hit while still fully validating an arbitrary table
-    name supplied by a direct caller.
+    scan on every cache hit. A plain direct-caller table remains valid for v1;
+    v2 requires this marker because only the materializer can prove each sealed
+    external segment without reading it a second time.
     """
 
     def __new__(
@@ -2519,6 +2520,10 @@ def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
     segments = getattr(tombstone_def, "segments", ())
     if not isinstance(segments, tuple):
         raise RuntimeError("Invalid deletion-vector segment definition")
+    if tombstone_path is not None and (
+        not isinstance(tombstone_path, str) or not tombstone_path
+    ):
+        raise RuntimeError("Invalid resolved deletion-vector path")
     if (
         tombstone_format is not None
         and (
@@ -2546,7 +2551,7 @@ def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
             raise RuntimeError(
                 "Deletion-vector segments require tombstone_format=2"
             )
-        if str(tombstone_path or "").endswith(".json"):
+        if str(cache_key or tombstone_path or "").endswith(".json"):
             raise RuntimeError(
                 "A JSON deletion-vector pointer requires tombstone_format=2"
             )
@@ -2998,11 +3003,10 @@ def create_tombstone_view(
          * *dv_table* — a validated, pre-materialised
            ``(__file__, __rowid__)`` table (see :class:`TombstoneCache`). Built
            once and reused across queries, avoiding a parquet re-read per query.
-         * *tombstone_def.tombstone_path* — inline ``read_parquet`` of the
-           deletion-vector parquet.  Used when the cache is disabled or has
-           no stable key.  This is the legacy path and is semantically
-           identical to the cached one (same composite identities, same
-           anti-join, same ``__dv__`` alias).
+         * *tombstone_def.tombstone_path* — inline ``read_parquet`` of a legacy
+           v1 deletion-vector parquet. Segmented v2 vectors always use a
+           validated private table, including when persistent cache capacity
+           is zero.
 
     This view sits directly on top of the reflection table (before RBAC),
     so the anti-join still has ``__rowid__`` available and RBAC never sees
@@ -3093,6 +3097,7 @@ def create_tombstone_view(
             )
 
     referenced_dv_files: frozenset[str] = frozenset()
+    owned_direct_v2_table: Optional[str] = None
     if active_v2 and not dv_table:
         # Direct helper callers do not have a TombstoneCache lifecycle. Keep a
         # private connection-local table behind the created view; it disappears
@@ -3117,6 +3122,7 @@ def create_tombstone_view(
             cache_key=getattr(tombstone_def, "cache_key", None),
             segment_fingerprint=_v2_segment_fingerprint(v2_segments),
         )
+        owned_direct_v2_table = table_name
     if dv_table:
         # Tables returned by TombstoneCache were fully checked once when they
         # were materialised.  Direct callers receive the same full validation
@@ -3227,14 +3233,25 @@ def create_tombstone_view(
             f"CREATE OR REPLACE VIEW {view_name} AS "
             f"SELECT {live_cols} FROM {source_table};"
         )
-    if tomb_path:
-        _validate_tombstone_source_rowids(
-            con,
-            source_table,
-            selected_resource_keys=resource_keys,
-            referenced_dv_files=referenced_dv_files,
-        )
-    con.execute(sql)
+    try:
+        if tomb_path:
+            _validate_tombstone_source_rowids(
+                con,
+                source_table,
+                selected_resource_keys=resource_keys,
+                referenced_dv_files=referenced_dv_files,
+            )
+        con.execute(sql)
+    except Exception:
+        if owned_direct_v2_table is not None:
+            try:
+                con.execute(
+                    f"DROP TABLE IF EXISTS "
+                    f"{quote_if_needed(owned_direct_v2_table)};"
+                )
+            except Exception:
+                pass
+        raise
 
 
 # =========================================================
@@ -3378,6 +3395,27 @@ class TombstoneCache:
             segment_fingerprint = _v2_segment_fingerprint(
                 validated_segments
             )
+            pinned_cache_key = getattr(tombstone_def, "cache_key", None)
+            pinned_rows = getattr(tombstone_def, "expected_rows", None)
+            pinned_digest = getattr(tombstone_def, "tombstone_digest", None)
+            if cache_key != pinned_cache_key:
+                raise RuntimeError(
+                    "V2 deletion-vector cache key does not match the pinned "
+                    "manifest"
+                )
+            if expected_rows is not None and (
+                type(expected_rows) is not int
+                or expected_rows != pinned_rows
+            ):
+                raise RuntimeError(
+                    "V2 deletion-vector row count does not match the pinned "
+                    "manifest"
+                )
+            if expected_digest != pinned_digest:
+                raise RuntimeError(
+                    "V2 deletion-vector digest does not match the pinned "
+                    "manifest"
+                )
             if (
                 not isinstance(expected_digest, str)
                 or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None

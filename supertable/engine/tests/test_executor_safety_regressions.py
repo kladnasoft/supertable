@@ -859,23 +859,22 @@ def test_catalog_parser_rejects_non_query_commands(query):
         SQLParser("s", query, "duckdb")
 
 
-def test_spark_describe_failure_with_tombstone_fails_closed():
+def test_spark_describe_failure_without_tombstone_fails_closed():
     cursor = MagicMock()
     cursor.execute.side_effect = RuntimeError("metastore unavailable")
-    tomb = TombstoneDef(
-        "s3://bucket/dv.parquet", "raw/dv", 1,
-        resource_keys=("raw/f",),
-    )
     with pytest.raises(RuntimeError, match="Cannot validate source schema"):
-        _spark_create_tombstone_view(cursor, "src", "live", tomb)
+        _spark_create_tombstone_view(cursor, "src", "live", None)
 
 
 def test_spark_active_tombstone_rejected_until_composite_identity_exists():
     cursor = MagicMock()
     cursor.fetchall.return_value = [("id", "int"), ("__rowid__", "bigint")]
-    tomb = TombstoneDef("s3://bucket/dv.parquet", "raw/dv", 2)
+    tomb = TombstoneDef(
+        "s3://bucket/dv.parquet", "raw/dv", 2, "0" * 64,
+    )
     with pytest.raises(RuntimeError, match="composite source-file"):
         _spark_create_tombstone_view(cursor, "src", "live", tomb)
+    cursor.execute.assert_not_called()
 
 
 def test_spark_protected_projection_quotes_embedded_backtick_column():

@@ -43,6 +43,7 @@ from supertable.tombstone_manifest_v2 import (
     validate_tombstone_segment_observation,
 )
 from supertable.utils.profiler import Profiler, get_null_profiler
+from supertable.utils.snapshot import read_bounded_tombstone_manifest_bytes
 from supertable.data_classes import (
     IntegerDomainBound,
     PredInterval,
@@ -7913,10 +7914,11 @@ def load_tombstone_manifest_from_storage(
 ) -> TombstoneManifestV2:
     """Read one canonical v2 manifest through a bounded conditional range.
 
-    The shared manifest reader requires an immutable provider identity, checks
-    the reported size before allocation, conditionally reads exactly that
-    range, and fences the identity again afterward.  The returned body must
-    itself be the canonical JSON representation sealed by the snapshot root.
+    The shared reader seals the object with ``stat_object``, issues one
+    conditional ``read_range`` for no more than 256 KiB, and reseals metadata
+    afterward. Backends without that bounded identity contract are rejected.
+    The body must itself be the canonical JSON representation sealed by the
+    snapshot root digest.
     """
     if storage is None:
         raise TombstoneManifestV2Error(
@@ -7938,24 +7940,7 @@ def load_tombstone_manifest_from_storage(
         raise TombstoneManifestV2Error(
             "tombstone manifest pointer is not a valid logical storage path"
         ) from exc
-    try:
-        exact_body = _read_tombstone_manifest_v2(
-            key,
-            storage=storage,
-            loader=None,
-            required=True,
-        )
-    except TombstoneManifestV2Error:
-        raise
-    except Exception as exc:
-        raise TombstoneManifestV2Error(
-            "unable to read the required tombstone manifest with a sealed "
-            "bounded operation"
-        ) from exc
-    if not isinstance(exact_body, (bytes, bytearray, memoryview)):
-        raise TombstoneManifestV2Error(
-            "bounded tombstone manifest read did not return bytes"
-        )
+    exact_body = read_bounded_tombstone_manifest_bytes(storage, key)
     try:
         return load_tombstone_manifest_v2(
             bytes(exact_body),

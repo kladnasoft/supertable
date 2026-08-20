@@ -988,6 +988,10 @@ def _validate_spark_tombstone_definition(tombstone_def) -> tuple[bool, int]:
     digest = getattr(tombstone_def, "tombstone_digest", None)
     tombstone_format = getattr(tombstone_def, "tombstone_format", None)
     segments = getattr(tombstone_def, "segments", ())
+    if pointer is not None and (
+        not isinstance(pointer, str) or not pointer
+    ):
+        raise RuntimeError("Invalid Spark deletion-vector resolved path")
     try:
         normalized_format = validate_snapshot_tombstone_state(
             cache_key if pointer is not None else None,

@@ -119,6 +119,10 @@ def _validate_island_tombstone_definition(tomb_def) -> bool:
     digest = getattr(tomb_def, "tombstone_digest", None)
     tombstone_format = getattr(tomb_def, "tombstone_format", None)
     segments = getattr(tomb_def, "segments", ())
+    if pointer is not None and (
+        not isinstance(pointer, str) or not pointer
+    ):
+        raise IslandIntegrityError("invalid resolved deletion-vector path")
     try:
         validate_snapshot_tombstone_state(
             cache_key if pointer is not None else None,
