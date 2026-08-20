@@ -1035,6 +1035,17 @@ class DataReader:
                     )
 
                 if tombstone_key:
+                    if tombstone_format == TOMBSTONE_FORMAT_V2:
+                        manifest_prefix = (
+                            f"{self.organization}/{sup.super_name}/tables/"
+                            f"{sup.simple_name}/tombstone/"
+                        )
+                        if not tombstone_key.startswith(manifest_prefix):
+                            raise RuntimeError(
+                                "Deletion-vector manifest pointer escapes the "
+                                f"pinned table {sup.super_name}."
+                                f"{sup.simple_name}"
+                            )
                     resolved_entry = resolved_tombstones.get(table_key)
                     if resolved_entry is None:
                         resolved_tombstone = (

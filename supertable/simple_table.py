@@ -624,6 +624,14 @@ class SimpleTable:
                 if isinstance(resource, dict) and resource.get("file")
             }
             if tombstone_format == TOMBSTONE_FORMAT_V2:
+                manifest_prefix = (
+                    f"{self.simple_dir.rstrip('/')}/tombstone/"
+                )
+                if not tombstone_path.startswith(manifest_prefix):
+                    raise ValueError(
+                        "Deletion-vector manifest pointer escapes the pinned "
+                        "simple table"
+                    )
                 manifest = load_tombstone_manifest_from_storage(
                     self.storage,
                     tombstone_path,

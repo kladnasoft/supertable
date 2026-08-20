@@ -7949,7 +7949,8 @@ def load_tombstone_manifest_from_storage(
         raise
     except Exception as exc:
         raise TombstoneManifestV2Error(
-            "unable to read the required tombstone manifest"
+            "unable to read the required tombstone manifest with a sealed "
+            "bounded operation"
         ) from exc
     if not isinstance(exact_body, (bytes, bytearray, memoryview)):
         raise TombstoneManifestV2Error(

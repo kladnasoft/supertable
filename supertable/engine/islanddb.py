@@ -83,6 +83,9 @@ from supertable.engine.island_spill import (
     external_sort,
 )
 from supertable.storage.storage_interface import ObjectMetadata
+from supertable.tombstone_manifest_v2 import (
+    validate_snapshot_tombstone_state,
+)
 
 
 _monotonic = time.monotonic
@@ -98,6 +101,50 @@ class IslandExecutionTimeout(IslandUnsupportedError, TimeoutError):
 
 class IslandIntegrityError(RuntimeError):
     """Pinned data or deletion metadata failed a correctness boundary."""
+
+
+def _validate_island_tombstone_definition(tomb_def) -> bool:
+    """Validate one direct executor definition and return whether it is active.
+
+    Production definitions come from ``DataReader``, but IslandDB is also a
+    callable engine boundary. Validate the snapshot discriminator before a
+    truthiness check can silently reinterpret a malformed active/empty hybrid
+    as "no tombstone".
+    """
+    if tomb_def is None:
+        return False
+    pointer = getattr(tomb_def, "tombstone_path", None)
+    cache_key = getattr(tomb_def, "cache_key", None)
+    rows = getattr(tomb_def, "expected_rows", None)
+    digest = getattr(tomb_def, "tombstone_digest", None)
+    tombstone_format = getattr(tomb_def, "tombstone_format", None)
+    segments = getattr(tomb_def, "segments", ())
+    try:
+        validate_snapshot_tombstone_state(
+            cache_key if pointer is not None else None,
+            rows,
+            digest,
+            format_present=tombstone_format is not None,
+            tombstone_format=tombstone_format,
+        )
+    except (TypeError, ValueError) as exc:
+        raise IslandIntegrityError(
+            "invalid deletion-vector snapshot state"
+        ) from exc
+
+    if pointer is None:
+        if cache_key is not None or segments != ():
+            raise IslandIntegrityError(
+                "invalid empty deletion-vector representation"
+            )
+        return False
+    try:
+        tombstone_data_paths(tomb_def)
+    except Exception as exc:
+        raise IslandIntegrityError(
+            "invalid deletion-vector representation"
+        ) from exc
+    return True
 
 
 @dataclass(frozen=True)
@@ -3290,15 +3337,10 @@ class IslandDB:
         )
 
     def _load_tombstone(self, tomb_def) -> pl.DataFrame:
-        # Validate the discriminator/segment hybrid before selecting a loader;
-        # in particular, never let a direct caller route a JSON pointer through
-        # the legacy Parquet path.
-        try:
-            tombstone_data_paths(tomb_def)
-        except Exception as exc:
+        if not _validate_island_tombstone_definition(tomb_def):
             raise IslandIntegrityError(
-                "invalid deletion-vector representation"
-            ) from exc
+                "active deletion-vector definition has no path"
+            )
         path = str(getattr(tomb_def, "tombstone_path", "") or "")
         cache_key = str(getattr(tomb_def, "cache_key", "") or "")
         if not path:
@@ -3539,7 +3581,7 @@ class IslandDB:
         range_metrics_out: Optional[_QueryRangeMetrics] = None,
         execution_metrics_out: Optional[_QueryExecutionMetrics] = None,
     ) -> pl.LazyFrame:
-        if tomb_def is not None and getattr(tomb_def, "tombstone_path", None):
+        if _validate_island_tombstone_definition(tomb_def):
             dv = self._load_tombstone(tomb_def)
             query_marker = (
                 id(snapshot),
