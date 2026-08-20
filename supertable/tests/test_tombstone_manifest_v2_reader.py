@@ -571,6 +571,110 @@ def test_duckdb_v2_capacity_zero_reads_once_and_survives_replacement(
         raw_connection.execute(f'SELECT * FROM "{table_name}"')
 
 
+def test_duckdb_v2_capacity_zero_isolates_two_cursor_tables(tmp_path) -> None:
+    definition = _duckdb_v2(tmp_path)
+    root = duckdb.connect()
+    _source(root)
+    first_con = root.cursor()
+    second_con = root.cursor()
+    cache = TombstoneCache(capacity=0, ttl_seconds=60)
+
+    first = cache.acquire(
+        first_con,
+        definition.cache_key,
+        definition.tombstone_path,
+        expected_rows=definition.expected_rows,
+        expected_digest=definition.tombstone_digest,
+        tombstone_def=definition,
+        allowed_files=list(definition.snapshot_resource_keys or ()),
+    )
+    second = cache.acquire(
+        second_con,
+        definition.cache_key,
+        definition.tombstone_path,
+        expected_rows=definition.expected_rows,
+        expected_digest=definition.tombstone_digest,
+        tombstone_def=definition,
+        allowed_files=list(definition.snapshot_resource_keys or ()),
+    )
+
+    assert first is not None and second is not None
+    assert first != second
+    create_tombstone_view(
+        first_con, "src", "first_live", definition, dv_table=first,
+    )
+    create_tombstone_view(
+        second_con, "src", "second_live", definition, dv_table=second,
+    )
+    assert first_con.execute(
+        "SELECT id FROM first_live ORDER BY id"
+    ).fetchall() == [(20,), (40,)]
+    assert second_con.execute(
+        "SELECT id FROM second_live ORDER BY id"
+    ).fetchall() == [(20,), (40,)]
+
+    # A capacity-zero table is TEMPORARY: neither sibling cursor may receive a
+    # registry hit for a table that exists only in the creating cursor.
+    with pytest.raises(duckdb.CatalogException):
+        second_con.execute(f'SELECT * FROM "{first}"')
+    with pytest.raises(duckdb.CatalogException):
+        first_con.execute(f'SELECT * FROM "{second}"')
+
+    first_con.execute("DROP VIEW first_live")
+    second_con.execute("DROP VIEW second_live")
+    cache.release(first_con, first.cache_key)
+    cache.release(second_con, second.cache_key)
+    assert cache.snapshot() == []
+
+
+def test_duckdb_v2_capacity_zero_refcounts_per_cursor_and_drops_owner_table(
+    tmp_path,
+) -> None:
+    definition = _duckdb_v2(tmp_path)
+    root = duckdb.connect()
+    first_con = root.cursor()
+    second_con = root.cursor()
+    cache = TombstoneCache(capacity=0, ttl_seconds=60)
+
+    def acquire(con):
+        return cache.acquire(
+            con,
+            definition.cache_key,
+            definition.tombstone_path,
+            expected_rows=definition.expected_rows,
+            expected_digest=definition.tombstone_digest,
+            tombstone_def=definition,
+            allowed_files=list(definition.snapshot_resource_keys or ()),
+        )
+
+    first = acquire(first_con)
+    first_again = acquire(first_con)
+    second = acquire(second_con)
+    assert first is not None and second is not None
+    assert first_again == first
+    assert first.cache_key == first_again.cache_key
+    assert first.cache_key != second.cache_key
+    assert sorted(entry["ref_count"] for entry in cache.snapshot()) == [1, 2]
+
+    cache.release(first_con, first.cache_key)
+    by_key = {entry["cache_key"]: entry for entry in cache.snapshot()}
+    assert by_key[first.cache_key]["ref_count"] == 1
+    assert first_con.execute(f'SELECT count(*) FROM "{first}"').fetchone() == (2,)
+
+    cache.release(second_con, second.cache_key)
+    assert {entry["cache_key"] for entry in cache.snapshot()} == {
+        first.cache_key,
+    }
+    with pytest.raises(duckdb.CatalogException):
+        second_con.execute(f'SELECT * FROM "{second}"')
+    assert first_con.execute(f'SELECT count(*) FROM "{first}"').fetchone() == (2,)
+
+    cache.release(first_con, first.cache_key)
+    assert cache.snapshot() == []
+    with pytest.raises(duckdb.CatalogException):
+        first_con.execute(f'SELECT * FROM "{first}"')
+
+
 def test_duckdb_v2_persistent_cache_reads_each_segment_once(tmp_path) -> None:
     definition = _duckdb_v2(tmp_path)
     paths = [segment.tombstone_path for segment in definition.segments]

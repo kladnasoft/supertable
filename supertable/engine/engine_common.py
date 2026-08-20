@@ -3264,6 +3264,11 @@ class _DVCacheEntry:
     table_name: str          # DuckDB table name (e.g. dv_a3f8c1...)
     cache_key: str           # stable tombstone path this DV was built from
     table_id: str            # logical table this version belongs to
+    # Capacity-zero v2 tables are TEMPORARY and therefore visible only through
+    # the cursor that created them.  Retaining that cursor both prevents its
+    # ``id`` from being reused while the entry is live and lets eviction issue
+    # the DROP against the correct connection context.
+    owner_connection: object = None
     ref_count: int = 0       # in-flight queries currently anti-joining it
     last_used: int = 0       # monotonic tick — per-table LRU ordering
     expires_at: float = 0.0  # idle deadline; refreshed on every acquire
@@ -3429,9 +3434,19 @@ class TombstoneCache:
             or (not active_v2 and not self.enabled)
         ):
             return None
-        registry_key = (
+        shared_registry_key = (
             f"dv-v2:{cache_key}:{expected_digest}"
             if active_v2 else cache_key
+        )
+        # DuckDB TEMP tables are cursor-local.  Persistent cache entries can be
+        # shared by every cursor on the root connection, but capacity-zero v2
+        # entries must only be reused within the cursor that materialised them.
+        # Keeping the cursor on the entry prevents Python from recycling its id
+        # before release and gives the eviction path the correct DROP context.
+        connection_local = active_v2 and not self.enabled
+        registry_key = (
+            f"{shared_registry_key}:connection:{id(con):x}"
+            if connection_local else shared_registry_key
         )
         with self._lock:
             entry = self._registry.get(registry_key)
@@ -3513,6 +3528,7 @@ class TombstoneCache:
                     ),
                     cache_key=registry_key,
                     table_id=dv_table_id(cache_key),
+                    owner_connection=(con if connection_local else None),
                 )
                 self._registry[registry_key] = entry
 
@@ -3598,7 +3614,12 @@ class TombstoneCache:
             self, con: duckdb.DuckDBPyConnection, entry: _DVCacheEntry,
     ) -> None:
         try:
-            con.execute(f"DROP TABLE IF EXISTS {entry.table_name};")
+            drop_con = (
+                entry.owner_connection
+                if entry.owner_connection is not None
+                else con
+            )
+            drop_con.execute(f"DROP TABLE IF EXISTS {entry.table_name};")
         except Exception:
             pass
         self._registry.pop(entry.cache_key, None)
