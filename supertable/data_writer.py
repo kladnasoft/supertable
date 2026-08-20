@@ -85,6 +85,7 @@ from supertable.mirroring.mirror_formats import (
 from supertable.tombstone_manifest_v2 import (
     MAX_JSON_EXACT_INTEGER,
     TOMBSTONE_FORMAT_V2,
+    normalize_snapshot_tombstone_state,
     validate_logical_storage_path,
     validate_snapshot_tombstone_state,
 )
@@ -142,20 +143,12 @@ class DataWriter:
         unambiguously empty and is made explicit in the successor.  Any
         partial state or explicit format marker remains strict corruption.
         """
-        fields = {"tombstone", "tombstone_rows", "tombstone_digest"}
-        if fields.isdisjoint(snapshot) and "tombstone_format" not in snapshot:
-            snapshot.update({
-                "tombstone": None,
-                "tombstone_rows": 0,
-                "tombstone_digest": None,
-            })
-        validate_snapshot_tombstone_state(
-            snapshot.get("tombstone"),
-            snapshot.get("tombstone_rows"),
-            snapshot.get("tombstone_digest"),
-            format_present="tombstone_format" in snapshot,
-            tombstone_format=snapshot.get("tombstone_format"),
-        )
+        state = normalize_snapshot_tombstone_state(snapshot)
+        snapshot.update({
+            "tombstone": state.pointer,
+            "tombstone_rows": state.rows,
+            "tombstone_digest": state.digest,
+        })
 
     @staticmethod
     def _declared_tombstone_rows(snapshot: dict):

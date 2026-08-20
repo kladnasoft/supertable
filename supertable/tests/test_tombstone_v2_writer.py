@@ -86,6 +86,30 @@ def test_precommit_snapshot_validation_accepts_exact_empty_v2():
     )
 
 
+def test_pinned_snapshot_validation_normalizes_pre_dv_document():
+    snapshot = {"snapshot_version": 1, "schema": {}, "resources": []}
+
+    DataWriter._validate_pinned_tombstone_state(snapshot)
+
+    assert snapshot["tombstone"] is None
+    assert snapshot["tombstone_rows"] == 0
+    assert snapshot["tombstone_digest"] is None
+    assert "tombstone_format" not in snapshot
+
+
+@pytest.mark.parametrize(
+    "partial_state",
+    [
+        {"tombstone_rows": 0},
+        {"tombstone": None, "tombstone_rows": 0},
+        {"tombstone_format": TOMBSTONE_FORMAT_V1},
+    ],
+)
+def test_pinned_snapshot_validation_rejects_partial_empty_state(partial_state):
+    with pytest.raises(TombstoneManifestV2Error, match="all present"):
+        DataWriter._validate_pinned_tombstone_state(partial_state)
+
+
 @pytest.mark.parametrize(
     "payload,match",
     [

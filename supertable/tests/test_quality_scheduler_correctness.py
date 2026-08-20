@@ -1054,11 +1054,20 @@ def test_snapshot_metadata_reports_only_sealed_live_row_count():
         5,
     )
 
+    pre_dv = {
+        "last_updated_ms": 1_786_665_600_000,
+        "resources": [{"file_size": 20, "rows": 3}],
+    }
+    assert scheduler._table_snapshot_metadata(Metadata(pre_dv), TABLE) == (
+        1_786_665_600_000,
+        20,
+        3,
+    )
+
 
 @pytest.mark.parametrize(
     "deletion_state",
     [
-        {},
         {
             "tombstone": None,
             "tombstone_rows": "0",

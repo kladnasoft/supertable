@@ -16,6 +16,7 @@ from supertable.tombstone_manifest_v2 import (
     MAX_TOMBSTONE_MANIFEST_V2_BYTES,
     TombstoneManifestV2Error,
     load_tombstone_manifest_v2,
+    normalize_snapshot_tombstone_state,
     validate_logical_storage_path,
     validate_snapshot_tombstone_state,
 )
@@ -253,16 +254,11 @@ def referenced_snapshot_artifacts(
             ),
         ))
 
-    pointer = snapshot.get("tombstone")
-    rows = snapshot.get("tombstone_rows")
-    digest = snapshot.get("tombstone_digest")
-    tombstone_format = validate_snapshot_tombstone_state(
-        pointer,
-        rows,
-        digest,
-        format_present="tombstone_format" in snapshot,
-        tombstone_format=snapshot.get("tombstone_format"),
-    )
+    tombstone_state = normalize_snapshot_tombstone_state(snapshot)
+    pointer = tombstone_state.pointer
+    rows = tombstone_state.rows
+    digest = tombstone_state.digest
+    tombstone_format = tombstone_state.tombstone_format
     if pointer is not None and tombstone_format == 1:
         retain(SnapshotArtifactReference(
             path=pointer,

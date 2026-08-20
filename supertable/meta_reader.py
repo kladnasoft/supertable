@@ -23,7 +23,7 @@ from supertable.super_table import SuperTable
 from supertable.simple_table import SimpleTable
 from supertable.tombstone_manifest_v2 import (
     TombstoneManifestV2Error,
-    validate_snapshot_tombstone_state,
+    normalize_snapshot_tombstone_state,
 )
 from supertable.utils.snapshot import complete_snapshot_payload
 
@@ -145,20 +145,13 @@ def _validated_live_row_count(
 ) -> int:
     """Return exact live rows without coercing malformed DV state to zero."""
     try:
-        validate_snapshot_tombstone_state(
-            snapshot.get("tombstone"),
-            snapshot.get("tombstone_rows"),
-            snapshot.get("tombstone_digest"),
-            format_present="tombstone_format" in snapshot,
-            tombstone_format=snapshot.get("tombstone_format"),
-        )
+        state = normalize_snapshot_tombstone_state(snapshot)
     except (TypeError, TombstoneManifestV2Error) as exc:
         raise RuntimeError("Snapshot has an invalid deletion-vector state") from exc
 
-    pointer = snapshot.get("tombstone")
-    if pointer is None:
+    if state.pointer is None:
         return physical_rows
-    deleted_rows = snapshot["tombstone_rows"]
+    deleted_rows = state.rows
     if deleted_rows > physical_rows:
         raise RuntimeError(
             "Snapshot deletion-vector rows exceed physical resource rows"

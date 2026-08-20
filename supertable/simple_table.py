@@ -596,7 +596,7 @@ class SimpleTable:
         from supertable.data_classes import TombstoneSegmentDef
         from supertable.tombstone_manifest_v2 import (
             TOMBSTONE_FORMAT_V2,
-            validate_snapshot_tombstone_state,
+            normalize_snapshot_tombstone_state,
         )
 
         snapshot, _path = self.get_simple_table_snapshot()
@@ -609,14 +609,9 @@ class SimpleTable:
         # Read the deletion-vector (if any) so its rows are dropped from
         # the export rather than copied verbatim.
         dead_rowids_by_file = None
-        tombstone_path = snapshot.get("tombstone")
-        tombstone_format = validate_snapshot_tombstone_state(
-            tombstone_path,
-            snapshot.get("tombstone_rows"),
-            snapshot.get("tombstone_digest"),
-            format_present="tombstone_format" in snapshot,
-            tombstone_format=snapshot.get("tombstone_format"),
-        )
+        tombstone_state = normalize_snapshot_tombstone_state(snapshot)
+        tombstone_path = tombstone_state.pointer
+        tombstone_format = tombstone_state.tombstone_format
         if tombstone_path:
             allowed_files = {
                 resource.get("file")
@@ -639,8 +634,8 @@ class SimpleTable:
                     expected_super_name=self.super_table.super_name,
                     expected_simple_name=self.simple_name,
                     pinned_snapshot_version=snapshot.get("snapshot_version"),
-                    expected_total_rows=snapshot.get("tombstone_rows"),
-                    expected_digest=snapshot.get("tombstone_digest"),
+                    expected_total_rows=tombstone_state.rows,
+                    expected_digest=tombstone_state.digest,
                     expected_segment_prefix=os.path.join(
                         self.simple_dir, "tombstone",
                     ),
@@ -666,9 +661,9 @@ class SimpleTable:
                     cache_identity=(
                         "export-dv-v2:"
                         f"{manifest_cache_identity}:"
-                        f"{snapshot.get('tombstone_digest')}"
+                        f"{tombstone_state.digest}"
                     ),
-                    expected_rows=snapshot.get("tombstone_rows"),
+                    expected_rows=tombstone_state.rows,
                     allowed_files=allowed_files,
                     allow_cache=False,
                 )
@@ -682,8 +677,8 @@ class SimpleTable:
                     ),
                     allow_cache=False,
                     required=True,
-                    expected_rows=snapshot.get("tombstone_rows"),
-                    expected_digest=snapshot.get("tombstone_digest"),
+                    expected_rows=tombstone_state.rows,
+                    expected_digest=tombstone_state.digest,
                     allowed_files=allowed_files,
                 )
             if tomb_df is None:  # defensive: required=True must raise instead

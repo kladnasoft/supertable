@@ -18,6 +18,7 @@ from supertable.tombstone_manifest_v2 import (
     TombstoneManifestV2Error,
     TombstoneSegment,
     load_tombstone_manifest_v2,
+    normalize_snapshot_tombstone_state,
     validate_logical_storage_path,
     validate_tombstone_manifest_v2,
     validate_tombstone_segment_observation,
@@ -296,6 +297,58 @@ def _snapshot_state(
     if tombstone_format != "absent":
         payload["tombstone_format"] = tombstone_format
     return payload
+
+
+def test_authoritative_snapshot_normalizer_accepts_only_pre_dv_omission() -> None:
+    snapshot = {
+        "snapshot_version": 1,
+        "schema": [],
+        "resources": [],
+    }
+
+    state = normalize_snapshot_tombstone_state(snapshot)
+
+    assert (
+        state.pointer,
+        state.rows,
+        state.digest,
+        state.tombstone_format,
+        state.format_present,
+    ) == (None, 0, None, 1, False)
+    assert "tombstone" not in snapshot
+    # Cached payloads remain strict: historical compatibility is only for an
+    # authoritative immutable snapshot document.
+    assert complete_snapshot_payload(snapshot, expected_version=1) is None
+
+
+@pytest.mark.parametrize(
+    "present_fields",
+    [
+        ("tombstone",),
+        ("tombstone_rows",),
+        ("tombstone_digest",),
+        ("tombstone", "tombstone_rows"),
+        ("tombstone", "tombstone_digest"),
+        ("tombstone_rows", "tombstone_digest"),
+    ],
+)
+def test_authoritative_snapshot_normalizer_rejects_every_partial_empty_state(
+    present_fields,
+) -> None:
+    empty_state = {
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+    }
+    snapshot = {field: empty_state[field] for field in present_fields}
+
+    with pytest.raises(TombstoneManifestV2Error, match="all present"):
+        normalize_snapshot_tombstone_state(snapshot)
+
+
+def test_authoritative_snapshot_normalizer_rejects_format_only_state() -> None:
+    with pytest.raises(TombstoneManifestV2Error, match="all present"):
+        normalize_snapshot_tombstone_state({"tombstone_format": 1})
 
 
 @pytest.mark.parametrize(

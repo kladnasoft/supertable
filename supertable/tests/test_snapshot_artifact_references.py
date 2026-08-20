@@ -288,3 +288,23 @@ def test_gc_traversal_preserves_legacy_single_vector_shape():
         (f"{TABLE_PREFIX}/data/part.parquet", "data"),
         (f"{TABLE_PREFIX}/tombstone/deleted.parquet", "tombstone"),
     ]
+
+
+def test_gc_traversal_accepts_authoritative_pre_dv_snapshot():
+    data_path = f"{TABLE_PREFIX}/data/part.parquet"
+    snapshot = {
+        "snapshot_version": 1,
+        "resources": [{"file": data_path, "file_size": 101}],
+        "stats_file": None,
+    }
+
+    references = referenced_snapshot_artifacts(
+        snapshot,
+        organization=ORG,
+        super_name=SUPER,
+        simple_name=TABLE,
+    )
+
+    assert [(item.path, item.kind) for item in references] == [
+        (data_path, "data"),
+    ]

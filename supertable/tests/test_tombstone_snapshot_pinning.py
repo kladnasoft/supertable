@@ -148,6 +148,44 @@ def test_estimator_pins_tombstone_from_path_only_snapshot(monkeypatch):
     )
 
 
+def test_estimator_reads_authoritative_pre_dv_snapshot(monkeypatch):
+    """Historical heavy JSON may omit the entire deletion-vector state."""
+    estimator_module = importlib.import_module("supertable.engine.data_estimator")
+    heavy_snapshot = {
+        "snapshot_version": 1,
+        "schema": {"id": "Int64"},
+        "resources": [
+            {"file": "data/v1.parquet", "file_size": 123, "rows": 2},
+        ],
+    }
+    catalog = MagicMock()
+    catalog.scan_leaf_items.return_value = [{
+        "simple": "t",
+        "path": "snapshots/v1.json",
+        "version": 1,
+        "ts": 11,
+    }]
+    monkeypatch.setattr(estimator_module, "RedisCatalog", lambda: catalog)
+    super_table = MagicMock()
+    super_table.read_simple_table_snapshot.return_value = heavy_snapshot
+    monkeypatch.setattr(
+        estimator_module, "SuperTable", lambda *a, **k: super_table,
+    )
+
+    reflection = estimator_module.DataEstimator(
+        "org",
+        _LocalLikeStorage(),
+        [TableDefinition("s", "t", "t", columns=["id"])],
+    ).estimate()
+
+    snapshot = reflection.supers[0]
+    assert snapshot.files == ["data/v1.parquet"]
+    assert snapshot.tombstone_key is None
+    assert snapshot.tombstone_rows == 0
+    assert snapshot.tombstone_digest is None
+    assert snapshot.tombstone_format is None
+
+
 def test_estimator_pins_explicit_v2_format_with_manifest_pointer(monkeypatch):
     estimator_module = importlib.import_module("supertable.engine.data_estimator")
     snapshot = {

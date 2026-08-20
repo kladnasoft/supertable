@@ -47,7 +47,7 @@ from supertable.processing import (
     TIMESTAMP_COL,
 )
 from supertable.tombstone_manifest_v2 import (
-    validate_snapshot_tombstone_state,
+    normalize_snapshot_tombstone_state,
 )
 
 
@@ -1258,16 +1258,8 @@ class DataEstimator:
                         "tombstone_digest"
                     )
                     try:
-                        validate_snapshot_tombstone_state(
-                            raw_tombstone,
-                            raw_tombstone_rows,
-                            raw_tombstone_digest,
-                            format_present=(
-                                "tombstone_format" in current_snapshot_data
-                            ),
-                            tombstone_format=current_snapshot_data.get(
-                                "tombstone_format"
-                            ),
+                        tombstone_state = normalize_snapshot_tombstone_state(
+                            current_snapshot_data,
                         )
                     except (TypeError, ValueError) as exc:
                         if raw_tombstone is not None and not (
@@ -1295,14 +1287,14 @@ class DataEstimator:
                         ) from exc
 
                     tombstone_key = (
-                        str(raw_tombstone)
-                        if raw_tombstone is not None
+                        str(tombstone_state.pointer)
+                        if tombstone_state.pointer is not None
                         else None
                     )
-                    tombstone_rows = int(raw_tombstone_rows)
+                    tombstone_rows = tombstone_state.rows
                     tombstone_digest = (
-                        str(raw_tombstone_digest)
-                        if raw_tombstone_digest is not None
+                        str(tombstone_state.digest)
+                        if tombstone_state.digest is not None
                         else None
                     )
                     # Preserve the legacy absence spelling after validation so

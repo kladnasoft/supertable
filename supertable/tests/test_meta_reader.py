@@ -1159,6 +1159,14 @@ class TestGetSuperMeta:
         assert result["super"]["rows"] == 300
         assert result["super"]["size"] == 3000
 
+    def test_pre_dv_snapshot_live_rows_are_all_physical_rows(self):
+        from supertable.meta_reader import _validated_live_row_count
+
+        assert _validated_live_row_count(
+            {"snapshot_version": 1, "schema": {}, "resources": []},
+            37,
+        ) == 37
+
     @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_META)

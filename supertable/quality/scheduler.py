@@ -51,7 +51,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from supertable.quality.serialization import normalize_json_value
 from supertable.tombstone_manifest_v2 import (
     TombstoneManifestV2Error,
-    validate_snapshot_tombstone_state,
+    normalize_snapshot_tombstone_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -2762,25 +2762,17 @@ def _table_snapshot_metadata_with_presence(
 
     if rows_complete:
         try:
-            validate_snapshot_tombstone_state(
-                snapshot.get("tombstone"),
-                snapshot.get("tombstone_rows"),
-                snapshot.get("tombstone_digest"),
-                format_present="tombstone_format" in snapshot,
-                tombstone_format=snapshot.get("tombstone_format"),
-            )
+            tombstone_state = normalize_snapshot_tombstone_state(snapshot)
         except (TypeError, TombstoneManifestV2Error):
             # Incomplete, hybrid, future, or otherwise malformed state is
             # unknown.  Never let truthiness/int coercion turn it into zero.
             rows_complete = False
         else:
-            tombstone = snapshot.get("tombstone")
-            tombstone_rows = snapshot["tombstone_rows"]
-            if tombstone is not None:
-                if tombstone_rows > total_rows:
+            if tombstone_state.pointer is not None:
+                if tombstone_state.rows > total_rows:
                     rows_complete = False
                 else:
-                    total_rows -= tombstone_rows
+                    total_rows -= tombstone_state.rows
 
     return (
         True,

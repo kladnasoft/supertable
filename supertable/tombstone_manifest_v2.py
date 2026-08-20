@@ -51,6 +51,11 @@ _MANIFEST_FIELDS = frozenset({
     "segments",
 })
 _SEGMENT_FIELDS = frozenset({"file", "rows", "file_size", "digest"})
+_SNAPSHOT_TOMBSTONE_FIELDS = frozenset({
+    "tombstone",
+    "tombstone_rows",
+    "tombstone_digest",
+})
 _RawManifest = Union[Mapping[str, Any], str, bytes, bytearray, memoryview]
 
 
@@ -234,6 +239,67 @@ def validate_snapshot_tombstone_state(
             "a JSON tombstone pointer requires tombstone_format=2"
         )
     return normalized_format
+
+
+@dataclass(frozen=True)
+class NormalizedSnapshotTombstoneState:
+    """Validated deletion-vector state from one authoritative snapshot."""
+
+    pointer: Optional[str]
+    rows: int
+    digest: Optional[str]
+    tombstone_format: int
+    format_present: bool
+
+
+def normalize_snapshot_tombstone_state(
+    snapshot: Mapping[str, Any],
+) -> NormalizedSnapshotTombstoneState:
+    """Validate an authoritative snapshot, including its historical shape.
+
+    Snapshots written before deletion-vector metadata existed omitted all
+    three state fields and the format discriminator.  That exact document
+    shape is unambiguously the legacy empty state.  Once any state field or
+    the discriminator is present, all three state fields are required and the
+    scalar validator remains strict.  In particular, explicit nulls and
+    partial mappings are never confused with historical omission.
+
+    This helper is intentionally for immutable authoritative documents.  A
+    cached snapshot payload must still require explicit deletion-vector state
+    before it can be treated as complete.
+    """
+    if not isinstance(snapshot, Mapping):
+        raise TypeError("snapshot must be a mapping")
+
+    present_fields = _SNAPSHOT_TOMBSTONE_FIELDS.intersection(snapshot)
+    format_present = "tombstone_format" in snapshot
+    if not present_fields and not format_present:
+        pointer = None
+        rows = 0
+        digest = None
+    else:
+        if present_fields != _SNAPSHOT_TOMBSTONE_FIELDS:
+            raise TombstoneManifestV2Error(
+                "snapshot tombstone state fields must be all present or all absent"
+            )
+        pointer = snapshot.get("tombstone")
+        rows = snapshot.get("tombstone_rows")
+        digest = snapshot.get("tombstone_digest")
+
+    normalized_format = validate_snapshot_tombstone_state(
+        pointer,
+        rows,
+        digest,
+        format_present=format_present,
+        tombstone_format=snapshot.get("tombstone_format"),
+    )
+    return NormalizedSnapshotTombstoneState(
+        pointer=pointer,
+        rows=rows,
+        digest=digest,
+        tombstone_format=normalized_format,
+        format_present=format_present,
+    )
 
 
 @dataclass(frozen=True)
@@ -678,12 +744,14 @@ __all__ = [
     "TOMBSTONE_FORMAT_V1",
     "TOMBSTONE_FORMAT_V2",
     "TOMBSTONE_MANIFEST_V2_FORMAT",
+    "NormalizedSnapshotTombstoneState",
     "TombstoneManifestV2",
     "TombstoneManifestV2Error",
     "TombstoneSegment",
     "canonical_tombstone_manifest_v2_bytes",
     "load",
     "load_tombstone_manifest_v2",
+    "normalize_snapshot_tombstone_state",
     "validate",
     "validate_logical_storage_path",
     "validate_snapshot_tombstone_state",

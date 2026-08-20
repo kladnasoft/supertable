@@ -1161,6 +1161,31 @@ def test_simple_table_export_v2_matches_logical_live_rows(
     assert exported.sort("id").get_column("id").to_list() == [20, 40]
 
 
+def test_simple_table_export_accepts_authoritative_pre_dv_snapshot(
+        tmp_path, monkeypatch,
+) -> None:
+    table, storage = _local_export_table(tmp_path)
+    snapshot, snapshot_path = table.get_simple_table_snapshot()
+    for field in (
+        "tombstone",
+        "tombstone_rows",
+        "tombstone_digest",
+        "tombstone_format",
+    ):
+        snapshot.pop(field, None)
+    table.get_simple_table_snapshot = lambda: (snapshot, snapshot_path)
+    monkeypatch.setattr(processing, "_storage", storage)
+
+    result = table.export_to("exports/pre-dv")
+
+    exported = pl.concat([
+        pl.from_arrow(storage.read_parquet(path))
+        for path in result["files"]
+    ])
+    assert result["total_rows"] == 4
+    assert exported.sort("id").get_column("id").to_list() == [10, 20, 30, 40]
+
+
 def test_simple_table_export_missing_v2_segment_writes_nothing(
         tmp_path, monkeypatch,
 ) -> None:
