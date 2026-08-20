@@ -1473,7 +1473,7 @@ def test_ambiguous_atomic_commit_error_is_never_retried_as_path_only():
         writer._publish_snapshot(
             simple_table=table,
             simple_name="table",
-            payload={"resources": []},
+            payload=_snapshot_payload(),
             path="snap/5.json",
             base_path="snap/4.json",
             lock_token="token",
@@ -1515,7 +1515,7 @@ def test_typed_catalog_rejection_returns_batch_to_safe_orphan_cleanup():
         writer._publish_snapshot(
             simple_table=table,
             simple_name="table",
-            payload={"resources": []},
+            payload=_snapshot_payload(),
             path="snap/5.json",
             base_path="snap/4.json",
             lock_token="token",
@@ -1549,7 +1549,7 @@ def test_writer_passes_pinned_empty_mirror_generation_to_capable_catalog():
     writer._publish_snapshot(
         simple_table=table,
         simple_name="table",
-        payload={"resources": []},
+        payload=_snapshot_payload(),
         path="snap/5.json",
         base_path="snap/4.json",
         lock_token="token",
@@ -1619,7 +1619,7 @@ def test_legacy_catalog_adapter_uses_lightweight_quality_fallback():
     writer._publish_snapshot(
         simple_table=table,
         simple_name="table",
-        payload={"resources": []},
+        payload=_snapshot_payload(),
         path="snap/5.json",
         base_path="snap/4.json",
         lock_token="token",
