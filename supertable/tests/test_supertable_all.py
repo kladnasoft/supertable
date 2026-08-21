@@ -1247,7 +1247,8 @@ class TestDataWriterWrite:
         mock_simple.data_dir = "/tmp/data"
         snapshot = _dummy_snapshot("tbl", resources=[])
         mock_simple.get_simple_table_snapshot.return_value = (snapshot, "snap.json")
-        mock_simple.update.return_value = (snapshot, "new_snap.json")
+        successor = _dummy_snapshot("tbl", resources=[], version=1)
+        mock_simple.update.return_value = (successor, "new_snap.json")
         mock_simple._last_snapshot_leaf = {"version": 0, "path": "snap.json"}
         mock_simple_cls.return_value = mock_simple
 
@@ -1415,7 +1416,8 @@ class TestDataWriterWrite:
         mock_simple.data_dir = "/tmp/data"
         snapshot = _dummy_snapshot("tbl")
         mock_simple.get_simple_table_snapshot.return_value = (snapshot, "s.json")
-        mock_simple.update.return_value = (snapshot, "ns.json")
+        successor = _dummy_snapshot("tbl", version=1)
+        mock_simple.update.return_value = (successor, "ns.json")
         mock_simple._last_snapshot_leaf = {"version": 0, "path": "s.json"}
         mock_simple_cls.return_value = mock_simple
 
@@ -1486,7 +1488,8 @@ class TestDataWriterWrite:
         mock_simple.data_dir = "/tmp/data"
         snapshot = _dummy_snapshot("tbl")
         mock_simple.get_simple_table_snapshot.return_value = (snapshot, "s.json")
-        mock_simple.update.return_value = (snapshot, "ns.json")
+        successor = _dummy_snapshot("tbl", version=1)
+        mock_simple.update.return_value = (successor, "ns.json")
         mock_simple._last_snapshot_leaf = {"version": 0, "path": "s.json"}
         mock_simple_cls.return_value = mock_simple
 
@@ -1548,7 +1551,8 @@ class TestDataWriterWrite:
         mock_simple.data_dir = "/tmp/data"
         snapshot = _dummy_snapshot("tbl")
         mock_simple.get_simple_table_snapshot.return_value = (snapshot, "s.json")
-        mock_simple.update.return_value = (snapshot, "ns.json")
+        successor = _dummy_snapshot("tbl", version=1)
+        mock_simple.update.return_value = (successor, "ns.json")
         mock_simple._last_snapshot_leaf = {"version": 0, "path": "s.json"}
         mock_simple_cls.return_value = mock_simple
 
