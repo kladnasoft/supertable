@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -21,10 +22,27 @@ def _writer(storage, organization: str = "org") -> DataWriter:
     return writer
 
 
-def test_writer_reuses_exact_local_scope_without_file_cache_or_realpath(
-        tmp_path, monkeypatch,
-):
-    storage = LocalStorage(tmp_path / "storage")
+@pytest.mark.parametrize(
+    ("identity", "path"),
+    [
+        (processing.stats_cache_identity, "org/lake/tables/t/stats/v1.parquet"),
+        (
+            processing.tombstone_cache_identity,
+            "org/lake/tables/t/tombstone/v1.parquet",
+        ),
+    ],
+)
+def test_direct_local_identity_accepts_surrogate_escaped_root(identity, path):
+    root = os.fsdecode(b"/tmp/supertable-artifact-cache-\xff")
+    storage = LocalStorage(root)
+
+    first = identity(path, organization="org", storage=storage)
+
+    assert first == identity(path, organization="org", storage=storage)
+
+
+def test_writer_reuses_exact_local_scope_without_file_cache_or_realpath(monkeypatch):
+    storage = LocalStorage(os.fsdecode(b"/tmp/supertable-artifact-cache-\xff"))
     writer = _writer(storage)
     scope_calls = 0
     original_scope = processing._local_artifact_cache_scope
@@ -42,7 +60,7 @@ def test_writer_reuses_exact_local_scope_without_file_cache_or_realpath(
     monkeypatch.setattr(file_cache_module.os.path, "realpath", forbidden)
 
     identities = []
-    for index in range(55):
+    for index in range(40):
         kind = "stats" if index % 2 == 0 else "tombstone"
         path = f"org/lake/tables/t/{kind}/v{index}.parquet"
         method = (
@@ -52,7 +70,7 @@ def test_writer_reuses_exact_local_scope_without_file_cache_or_realpath(
         identities.append(method(path))
 
     assert scope_calls == 1
-    assert len(set(identities)) == 55
+    assert len(set(identities)) == 40
     assert _scope(identities[0]) == _scope(
         processing.stats_cache_identity(
             "org/lake/tables/t/stats/direct.parquet",

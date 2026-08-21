@@ -121,8 +121,11 @@ def _local_artifact_cache_scope(
         payload,
         sort_keys=True,
         separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")).hexdigest()
+        # Local filesystem roots may contain surrogate-escaped bytes returned
+        # by os.fsdecode().  ASCII JSON escaping preserves those code points
+        # deterministically while keeping the hash input encodable.
+        ensure_ascii=True,
+    ).encode("ascii")).hexdigest()
 
 
 def _artifact_cache_identity(
