@@ -1449,6 +1449,59 @@ class TestWriteMonitoring:
 
 class TestWriteErrorPropagation:
 
+    def test_custom_catalog_get_only_mutation_context_remains_supported(
+        self, writer, fake_catalog, monkeypatch,
+    ):
+        class GetOnlyContext:
+            def __init__(self, values):
+                self.values = values
+
+            def get(self, key, default=None):
+                return self.values.get(key, default)
+
+        fake_catalog.supports_one_shot_table_creation = True
+        monkeypatch.setattr(
+            type(fake_catalog),
+            "acquire_namespace_lock",
+            lambda self, *args, **kwargs: "namespace-token",
+            raising=False,
+        )
+        monkeypatch.setattr(
+            type(fake_catalog),
+            "release_namespace_lock",
+            lambda self, *args, **kwargs: True,
+            raising=False,
+        )
+
+        def begin_mutation(
+                self, org, sup, simple, *, lock_token, reserve_count=0,
+                namespace_token="",
+        ):
+            assert namespace_token == "namespace-token"
+            return GetOnlyContext({
+                "leaf": None,
+                "table_config": {},
+                "mirrors": [],
+                "mirror_pin": None,
+                "rowid_floor": 0,
+                "rowid_reservation": (1, reserve_count),
+                # A custom adapter may use similarly named keys. The writer's
+                # exact-type gate must neither read nor delete them.
+                "_initial_compact_begin_calls": "adapter-owned",
+            })
+
+        monkeypatch.setattr(
+            type(fake_catalog), "begin_table_mutation", begin_mutation,
+            raising=False,
+        )
+
+        assert writer.write(
+            "admin", "new_table", _simple_arrow(3), overwrite_columns=[],
+        ) is not None
+        assert "initial_compact_begin_calls" not in (
+            writer._mocks["monitor"].metrics[0]["counts"]
+        )
+
     def test_first_write_uses_one_shot_expected_absent_snapshot(
         self, writer, fake_catalog, monkeypatch,
     ):
@@ -1458,6 +1511,7 @@ class TestWriteErrorPropagation:
         original_simple_acquire = fake_catalog.acquire_simple_lock
         original_process = writer._mocks["process"].side_effect
         commit_calls = []
+        begin_contexts = []
 
         def acquire_namespace(self, org, sup, ttl_s=30, timeout_s=60):
             events.append("namespace.acquire")
@@ -1480,14 +1534,19 @@ class TestWriteErrorPropagation:
         ):
             events.append("begin")
             assert namespace_token == "namespace-token"
-            return {
+            context = {
                 "leaf": None,
                 "table_config": {},
                 "mirrors": [],
                 "mirror_pin": None,
                 "rowid_floor": 0,
                 "rowid_reservation": (1, reserve_count),
+                "_initial_compact_begin_calls": 2,
+                "_initial_compact_begin_pin_retries": 1,
+                "_initial_compact_begin_general_fallbacks": 1,
             }
+            begin_contexts.append(context)
+            return context
 
         original_commit = type(fake_catalog).commit_snapshot
 
@@ -1519,7 +1578,12 @@ class TestWriteErrorPropagation:
         )
         writer._mocks["process"].side_effect = process
 
-        writer.write("admin", "new_table", _simple_arrow(3), overwrite_columns=[])
+        # Model the exact built-in type gate while retaining this test's
+        # intentionally lightweight catalog implementation.
+        with patch("supertable.data_writer.RedisCatalog", type(fake_catalog)):
+            writer.write(
+                "admin", "new_table", _simple_arrow(3), overwrite_columns=[],
+            )
 
         assert events[:5] == [
             "namespace.acquire",
@@ -1540,6 +1604,11 @@ class TestWriteErrorPropagation:
         assert commit_calls[0]["expected_version"] == -1
         assert commit_calls[0]["expected_path"] == ""
         assert commit_calls[0]["one_shot_initial"] is True
+        counts = writer._mocks["monitor"].metrics[0]["counts"]
+        assert counts["initial_compact_begin_calls"] == 2
+        assert counts["initial_compact_begin_pin_retries"] == 1
+        assert counts["initial_compact_begin_general_fallbacks"] == 1
+        assert begin_contexts[0]["_initial_compact_begin_calls"] == 2
 
     def test_first_write_storage_failure_never_publishes_leaf(
         self, writer, fake_catalog, monkeypatch,

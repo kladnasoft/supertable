@@ -1216,6 +1216,29 @@ class DataWriter:
                     simple_name,
                     **begin_kwargs,
                 )
+                # Only the concrete built-in catalog emits these private,
+                # non-authoritative route diagnostics. Keep third-party
+                # Mapping-like contexts untouched (they need only support the
+                # established ``get`` contract), and never mutate even the
+                # built-in context merely to collect telemetry.
+                if type(self.catalog) is RedisCatalog:
+                    for private_key, counter_name in (
+                        (
+                            "_initial_compact_begin_calls",
+                            "initial_compact_begin_calls",
+                        ),
+                        (
+                            "_initial_compact_begin_pin_retries",
+                            "initial_compact_begin_pin_retries",
+                        ),
+                        (
+                            "_initial_compact_begin_general_fallbacks",
+                            "initial_compact_begin_general_fallbacks",
+                        ),
+                    ):
+                        value = mutation_context.get(private_key, 0)
+                        if type(value) is int and value > 0:
+                            profiler.add(counter_name, value)
                 locked_target_exists = mutation_context.get("leaf") is not None
             else:
                 mutation_fence = getattr(

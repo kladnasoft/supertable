@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import time
@@ -80,6 +81,175 @@ def _validate_table_config_document(
             "dv_v2_reader_fleet_confirmed=true together"
         )
     return document
+
+
+def _strict_json_object_with_tokens(
+        raw: Any, *, field: str,
+) -> tuple[str, Dict[str, Any], Dict[str, tuple[str, str]]]:
+    """Decode one JSON object without accepting ambiguous member syntax.
+
+    ``json.loads`` deliberately accepts duplicate object members and non-JSON
+    constants such as ``NaN``.  Neither is a safe pin for a later atomic Redis
+    mutation: the Python and Lua decoders can select different values.  Keep
+    the exact source text, reject semantic duplicates (including escaped key
+    aliases), and expose the top-level key/value tokens needed by activation
+    fields whose spelling is itself part of the durable contract.
+    """
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{field} is not valid UTF-8 JSON") from exc
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"{field} must be a non-empty JSON object")
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"{field} contains invalid JSON constant {value!r}")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> Dict[str, Any]:
+        document: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in document:
+                raise ValueError(f"{field} contains duplicate member {key!r}")
+            document[key] = value
+        return document
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
+    try:
+        document = decoder.decode(raw)
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"{field} is not valid JSON") from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"{field} must be a JSON object")
+
+    def validate_interoperable_value(value: Any) -> None:
+        if isinstance(value, str):
+            if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+                raise ValueError(f"{field} contains an invalid Unicode surrogate")
+            return
+        if value is None or type(value) in (bool, int):
+            return
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError(f"{field} contains a non-finite number")
+            return
+        if isinstance(value, list):
+            for item in value:
+                validate_interoperable_value(item)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                validate_interoperable_value(key)
+                validate_interoperable_value(item)
+            return
+        raise ValueError(f"{field} contains an unsupported JSON value")
+
+    validate_interoperable_value(document)
+
+    # Scan the already-validated top-level object with raw_decode so exact
+    # tokens are available without implementing a second JSON grammar.
+    token_decoder = json.JSONDecoder(parse_constant=reject_constant)
+    length = len(raw)
+
+    def skip_space(index: int) -> int:
+        while index < length and raw[index] in " \t\r\n":
+            index += 1
+        return index
+
+    index = skip_space(0)
+    if index >= length or raw[index] != "{":  # guarded by decode; defensive
+        raise ValueError(f"{field} must be a JSON object")
+    index += 1
+    tokens: Dict[str, tuple[str, str]] = {}
+    while True:
+        index = skip_space(index)
+        if index < length and raw[index] == "}":
+            index += 1
+            break
+        key_start = index
+        try:
+            key, key_end = token_decoder.raw_decode(raw, index)
+        except json.JSONDecodeError as exc:  # pragma: no cover - decoded above
+            raise ValueError(f"{field} is not valid JSON") from exc
+        if not isinstance(key, str):  # pragma: no cover - JSON object grammar
+            raise ValueError(f"{field} has a non-string member name")
+        index = skip_space(key_end)
+        if index >= length or raw[index] != ":":  # pragma: no cover
+            raise ValueError(f"{field} is not valid JSON")
+        index = skip_space(index + 1)
+        value_start = index
+        try:
+            _, value_end = token_decoder.raw_decode(raw, index)
+        except json.JSONDecodeError as exc:  # pragma: no cover - decoded above
+            raise ValueError(f"{field} is not valid JSON") from exc
+        tokens[key] = (raw[key_start:key_end], raw[value_start:value_end])
+        index = skip_space(value_end)
+        if index < length and raw[index] == ",":
+            index += 1
+            continue
+        if index < length and raw[index] == "}":
+            index += 1
+            break
+        raise ValueError(f"{field} is not valid JSON")  # pragma: no cover
+    if skip_space(index) != length:  # pragma: no cover - decoded above
+        raise ValueError(f"{field} is not valid JSON")
+    return raw, document, tokens
+
+
+def _validate_initial_table_config_pin(raw: Any) -> tuple[str, Dict[str, Any]]:
+    raw, document, tokens = _strict_json_object_with_tokens(
+        raw, field="table configuration",
+    )
+    document = _validate_table_config_document(document)
+    if _DV_V2_FORMAT_CONFIG_KEY in document:
+        format_tokens = tokens.get(_DV_V2_FORMAT_CONFIG_KEY)
+        fleet_tokens = tokens.get(_DV_V2_FLEET_CONFIG_KEY)
+        if (
+            format_tokens != ('"deletion_vector_format"', "2")
+            or fleet_tokens
+            != ('"dv_v2_reader_fleet_confirmed"', "true")
+        ):
+            raise ValueError(
+                "DV-v2 activation fields must use exact JSON tokens"
+            )
+    return raw, document
+
+
+def _validate_initial_mirror_pin(raw: Any) -> tuple[str, List[str]]:
+    raw, document, tokens = _strict_json_object_with_tokens(
+        raw, field="mirror configuration",
+    )
+    formats = document.get("formats")
+    timestamp = document.get("ts")
+    # ``list`` plus the captured leading token proves an array rather than the
+    # empty-object/empty-array ambiguity of Redis Lua's cjson tables.
+    format_member_token, format_token = tokens.get("formats", ("", ""))
+    timestamp_member_token, timestamp_token = tokens.get("ts", ("", ""))
+    if (
+        not isinstance(formats, list)
+        or format_member_token != '"formats"'
+        or not format_token.startswith("[")
+        or type(timestamp) is not int
+        or timestamp < 0
+        or timestamp > _REDIS_LUA_MAX_SAFE_INTEGER
+        or timestamp_member_token != '"ts"'
+        or not re.fullmatch(r"(?:0|[1-9][0-9]*)", timestamp_token)
+    ):
+        raise ValueError("mirror configuration is invalid")
+    mirrors: List[str] = []
+    for value in formats:
+        if not isinstance(value, str):
+            raise ValueError("mirror configuration is invalid")
+        normalized = value.upper()
+        if normalized not in ("DELTA", "ICEBERG", "PARQUET"):
+            raise ValueError("mirror configuration is invalid")
+        if normalized in mirrors:
+            raise ValueError("mirror configuration is invalid")
+        mirrors.append(normalized)
+    return raw, mirrors
 
 
 class _PreparedTableMutationLeaf:
@@ -2362,6 +2532,118 @@ return {
   1, prepared_match and '' or leaf_raw, config_raw, mirrors_raw,
   floor_available and '1' or '0', floor, reserved,
   previous, new_value, prepared_match and '1' or '0'
+}
+"""
+
+    # Expected-absent creation has already strictly validated its small
+    # configuration documents in Python. This boundary only repeats a cjson
+    # grammar-compatibility decode (not the general script's recursive policy
+    # checks), then proves the exact raw pins at the same instant as leaf
+    # absence and the first row-ID reservation.
+    #
+    # Status 2 is a no-write config/mirror race (the caller may re-pin once).
+    # Status 3 is a no-write creator race (the caller uses the general begin
+    # with reserve_count=0 so CREATE -> WRITE reauthorization remains exact).
+    _LUA_BEGIN_INITIAL_TABLE_MUTATION = _LUA_ROOT_DOCUMENT_GUARD + """
+local leaf_lock = KEYS[1]
+local namespace_intent = KEYS[2]
+local simple_intent = KEYS[3]
+local root_key = KEYS[4]
+local leaf_key = KEYS[5]
+local config_key = KEYS[6]
+local mirrors_key = KEYS[7]
+local rowid_key = KEYS[8]
+local namespace_lock = KEYS[9]
+
+local leaf_token = ARGV[1]
+local reserve_count = ARGV[2]
+local namespace_token = ARGV[3]
+local config_present = ARGV[4]
+local config_raw = ARGV[5]
+local config_valid = ARGV[6]
+local mirrors_present = ARGV[7]
+local mirrors_raw = ARGV[8]
+local mirrors_valid = ARGV[9]
+
+if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
+  return {-1}
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return {-2} end
+if redis.call('EXISTS', simple_intent) == 1 then return {-3} end
+if namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= namespace_token then
+  return {-10}
+end
+
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return {-4} end
+if root_type ~= 'string' then return {-5} end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return {-5} end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return {-5} end
+if root_state == 0 then return {-6} end
+
+local config_type = redis.call('TYPE', config_key)
+if type(config_type) == 'table' then config_type = config_type['ok'] end
+if config_type ~= 'none' and config_type ~= 'string' then return {-8} end
+if config_present ~= '0' and config_present ~= '1' then return {-8} end
+if (config_present == '1') ~= (config_type == 'string') then return {2} end
+if config_present == '1' and redis.call('GET', config_key) ~= config_raw then
+  return {2}
+end
+if config_valid ~= '1' then return {-8} end
+if config_present == '1' then
+  -- Backstop the Python decoder with Redis' own cjson grammar. This preserves
+  -- the general boundary's rejection of values (for example over-wide number
+  -- tokens) that Python can represent but Redis cjson cannot.
+  local config_ok, config = pcall(cjson.decode, config_raw)
+  if not string.match(config_raw, '^%s*{')
+      or not config_ok or type(config) ~= 'table' then return {-8} end
+end
+
+local mirrors_type = redis.call('TYPE', mirrors_key)
+if type(mirrors_type) == 'table' then mirrors_type = mirrors_type['ok'] end
+if mirrors_type ~= 'none' and mirrors_type ~= 'string' then return {-9} end
+if mirrors_present ~= '0' and mirrors_present ~= '1' then return {-9} end
+if (mirrors_present == '1') ~= (mirrors_type == 'string') then return {2} end
+if mirrors_present == '1' and redis.call('GET', mirrors_key) ~= mirrors_raw then
+  return {2}
+end
+if mirrors_valid ~= '1' then return {-9} end
+if mirrors_present == '1' then
+  local mirrors_ok, mirrors = pcall(cjson.decode, mirrors_raw)
+  if not string.match(mirrors_raw, '^%s*{')
+      or not mirrors_ok or type(mirrors) ~= 'table' then return {-9} end
+end
+
+local leaf_type = redis.call('TYPE', leaf_key)
+if type(leaf_type) == 'table' then leaf_type = leaf_type['ok'] end
+if leaf_type == 'string' then return {3} end
+if leaf_type ~= 'none' then return {-7} end
+
+local rowid_type = redis.call('TYPE', rowid_key)
+if type(rowid_type) == 'table' then rowid_type = rowid_type['ok'] end
+if rowid_type ~= 'none' and rowid_type ~= 'string' then return {-11} end
+local current = redis.call('GET', rowid_key) or '0'
+if not string.match(current, '^%d+$')
+    or not string.match(reserve_count, '^%d+$') then return {-11} end
+local normalized = string.gsub(current, '^0+', '')
+if normalized == '' then normalized = '0' end
+local reserved = '0'
+local new_value = normalized
+if reserve_count ~= '0' then
+  -- The only mutating command in this script. Redis rejects signed-Int64
+  -- overflow without modifying the existing sequence.
+  redis.call('INCRBY', rowid_key, reserve_count)
+  new_value = redis.call('GET', rowid_key)
+  reserved = '1'
+end
+return {
+  0, '', config_present == '1' and config_raw or '',
+  mirrors_present == '1' and mirrors_raw or '',
+  '1', normalized, reserved, normalized, new_value, '0'
 }
 """
 
@@ -5189,6 +5471,9 @@ return 1
         self._begin_table_mutation = self.r.register_script(
             self._LUA_BEGIN_TABLE_MUTATION
         )
+        self._begin_initial_table_mutation = self.r.register_script(
+            self._LUA_BEGIN_INITIAL_TABLE_MUTATION
+        )
         self._assert_initialization_allowed = self.r.register_script(
             self._LUA_ASSERT_INITIALIZATION_ALLOWED
         )
@@ -5406,6 +5691,58 @@ return 1
         if result != 1:
             raise RuntimeError(f"Invalid mutation fence result: {result}")
 
+    def _read_initial_table_mutation_pins(
+            self, org: str, sup: str, simple: str,
+    ) -> tuple[
+        Any, Dict[str, Any], bool,
+        Any, List[str], bool,
+    ]:
+        """Read and strictly parse the two expected-absent context pins.
+
+        This helper conveys no authority and its result is never accepted from
+        a caller. ``begin_table_mutation`` invokes the class implementation
+        directly, then proves both exact raw values again inside Lua. Invalid
+        documents are represented by validity flags so lock/root/deletion
+        failure precedence remains atomic and no row IDs are allocated.
+        """
+        try:
+            values = self.r.mget([
+                RK.meta_table_config(org, sup, simple),
+                RK.meta_mirrors(org, sup),
+            ])
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] initial mutation pin read error: %s", exc)
+            raise
+        if not isinstance(values, (list, tuple)) or len(values) != 2:
+            raise RuntimeError(f"Invalid initial mutation pin result: {values!r}")
+        config_raw, mirrors_raw = values
+
+        config: Dict[str, Any] = {}
+        config_valid = True
+        if config_raw is not None:
+            try:
+                config_raw, config = _validate_initial_table_config_pin(
+                    config_raw,
+                )
+            except (ValueError, RecursionError):
+                config_valid = False
+
+        mirrors: List[str] = []
+        mirrors_valid = True
+        if mirrors_raw is not None:
+            try:
+                mirrors_raw, mirrors = _validate_initial_mirror_pin(mirrors_raw)
+            except (ValueError, RecursionError):
+                mirrors_valid = False
+        return (
+            config_raw,
+            config,
+            config_valid,
+            mirrors_raw,
+            mirrors,
+            mirrors_valid,
+        )
+
     def begin_table_mutation(
             self,
             org: str,
@@ -5453,26 +5790,109 @@ return 1
                 prepared_floor,
             ) = prepared_leaf.take(self)
 
-        raw = self._begin_table_mutation(
-            keys=[
-                RK.lock_leaf(org, sup, simple),
-                RK.meta_namespace_deletion_intent(org, sup),
-                RK.meta_simple_deletion_intent(org, sup, simple),
-                RK.meta_root(org, sup),
-                RK.meta_leaf(org, sup, simple),
-                RK.meta_table_config(org, sup, simple),
-                RK.meta_mirrors(org, sup),
-                RK.meta_rowid_seq(org, sup, simple),
-                RK.lock_namespace(org, sup),
-            ],
-            args=[
-                lock_token or "",
-                str(reserve_count),
-                prepared_raw,
-                "" if prepared_floor is None else str(prepared_floor),
-                namespace_token or "",
-            ],
+        mutation_keys = [
+            RK.lock_leaf(org, sup, simple),
+            RK.meta_namespace_deletion_intent(org, sup),
+            RK.meta_simple_deletion_intent(org, sup, simple),
+            RK.meta_root(org, sup),
+            RK.meta_leaf(org, sup, simple),
+            RK.meta_table_config(org, sup, simple),
+            RK.meta_mirrors(org, sup),
+            RK.meta_rowid_seq(org, sup, simple),
+            RK.lock_namespace(org, sup),
+        ]
+
+        def general_begin(count: int):
+            return self._begin_table_mutation(
+                keys=mutation_keys,
+                args=[
+                    lock_token or "",
+                    str(count),
+                    prepared_raw,
+                    "" if prepared_floor is None else str(prepared_floor),
+                    namespace_token or "",
+                ],
+            )
+
+        compact_pins: Optional[tuple[
+            Any, Dict[str, Any], bool,
+            Any, List[str], bool,
+        ]] = None
+        compact_calls = 0
+        compact_pin_retries = 0
+        compact_general_fallbacks = 0
+        use_compact_initial = bool(
+            type(self) is RedisCatalog
+            and namespace_token
+            and prepared_leaf is None
         )
+        if use_compact_initial:
+            # One bounded re-pin absorbs an ordinary config generation race.
+            # A second mismatch is churn, not a state from which this mutation
+            # can safely derive one authoritative context.
+            for pin_attempt in range(2):
+                try:
+                    pins = RedisCatalog._read_initial_table_mutation_pins(
+                        self, org, sup, simple,
+                    )
+                except UnicodeDecodeError:
+                    # A decode_responses client can fail before exposing the
+                    # invalid bytes needed for an exact pin. The existing Lua
+                    # boundary still establishes fence/root failure precedence;
+                    # zero reservation keeps its later Python decode fail-closed.
+                    compact_general_fallbacks += 1
+                    raw = general_begin(0)
+                    break
+                (
+                    config_pin_raw,
+                    config_pin,
+                    config_pin_valid,
+                    mirrors_pin_raw,
+                    mirrors_pin,
+                    mirrors_pin_valid,
+                ) = pins
+                compact_calls += 1
+                raw = self._begin_initial_table_mutation(
+                    keys=mutation_keys,
+                    args=[
+                        lock_token or "",
+                        str(reserve_count),
+                        namespace_token or "",
+                        "1" if config_pin_raw is not None else "0",
+                        config_pin_raw or "",
+                        "1" if config_pin_valid else "0",
+                        "1" if mirrors_pin_raw is not None else "0",
+                        mirrors_pin_raw or "",
+                        "1" if mirrors_pin_valid else "0",
+                    ],
+                )
+                if isinstance(raw, (list, tuple)) and len(raw) == 1:
+                    try:
+                        compact_status = int(raw[0])
+                    except (TypeError, ValueError):
+                        compact_status = None
+                    if compact_status == 2:
+                        if pin_attempt == 0:
+                            compact_pin_retries += 1
+                            continue
+                        raise SnapshotCommitConflictError(
+                            "Initial table configuration changed repeatedly "
+                            f"while beginning {org}/{sup}/{simple}"
+                        )
+                    if compact_status == 3:
+                        # A creator appeared after CREATE authorization. The
+                        # general boundary must pin that exact live leaf, but a
+                        # zero reservation ensures Python validates every raw
+                        # config before any IDs can be consumed. DataWriter then
+                        # performs WRITE reauthorization and its ordinary exact
+                        # floor-fenced reservation if permitted.
+                        compact_general_fallbacks += 1
+                        raw = general_begin(0)
+                        break
+                compact_pins = pins
+                break
+        else:
+            raw = general_begin(reserve_count)
         if not isinstance(raw, (list, tuple)) or not raw:
             raise RuntimeError(f"Invalid table mutation context: {raw!r}")
         try:
@@ -5516,6 +5936,85 @@ return 1
             )
         if status not in (0, 1) or len(raw) != 10:
             raise RuntimeError(f"Invalid table mutation context: {raw!r}")
+
+        if compact_pins is not None:
+            (
+                config_pin_raw,
+                config_pin,
+                config_pin_valid,
+                mirrors_pin_raw,
+                mirrors_pin,
+                mirrors_pin_valid,
+            ) = compact_pins
+
+            def compact_text(value: Any) -> str:
+                if isinstance(value, bytes):
+                    try:
+                        return value.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise RuntimeError(
+                            f"Invalid table mutation context: {raw!r}"
+                        ) from exc
+                if isinstance(value, str):
+                    return value
+                raise RuntimeError(f"Invalid table mutation context: {raw!r}")
+
+            text_fields = [compact_text(value) for value in raw[1:]]
+            expected_config_raw = config_pin_raw or ""
+            expected_mirrors_raw = mirrors_pin_raw or ""
+            if (
+                type(raw[0]) is not int
+                or status != 0
+                or not config_pin_valid
+                or not mirrors_pin_valid
+                or text_fields[0] != ""
+                or text_fields[1] != expected_config_raw
+                or text_fields[2] != expected_mirrors_raw
+                or text_fields[3] != "1"
+                or text_fields[5] not in ("0", "1")
+                or text_fields[8] != "0"
+                or not re.fullmatch(r"(?:0|[1-9][0-9]*)", text_fields[4])
+                or not re.fullmatch(r"(?:0|[1-9][0-9]*)", text_fields[6])
+                or not re.fullmatch(r"(?:0|[1-9][0-9]*)", text_fields[7])
+            ):
+                raise RuntimeError(f"Invalid table mutation context: {raw!r}")
+            try:
+                floor = int(text_fields[4])
+                previous = int(text_fields[6])
+                new_high = int(text_fields[7])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Invalid initial rowid reservation: {raw!r}"
+                ) from exc
+            reserved = text_fields[5] == "1"
+            if (
+                floor > (1 << 63) - 1
+                or previous != floor
+                or (reserve_count == 0 and (
+                    reserved or new_high != floor
+                ))
+                or (reserve_count > 0 and (
+                    not reserved
+                    or new_high != floor + reserve_count
+                    or new_high > (1 << 63) - 1
+                ))
+            ):
+                raise RuntimeError(f"Unsafe initial rowid reservation: {raw!r}")
+            return {
+                "leaf": None,
+                "table_config": dict(config_pin),
+                "mirrors": list(mirrors_pin),
+                "mirror_pin": mirrors_pin_raw,
+                "rowid_floor": floor,
+                "rowid_reservation": (
+                    (floor + 1, new_high) if reserved else None
+                ),
+                "_initial_compact_begin_calls": compact_calls,
+                "_initial_compact_begin_pin_retries": compact_pin_retries,
+                "_initial_compact_begin_general_fallbacks": (
+                    compact_general_fallbacks
+                ),
+            }
 
         def decode_json(value: Any, *, field: str) -> Any:
             if value in (None, "", b""):
@@ -5688,6 +6187,14 @@ return 1
             "rowid_floor": rowid_floor,
             "rowid_reservation": rowid_reservation,
         }
+        if use_compact_initial:
+            context.update({
+                "_initial_compact_begin_calls": compact_calls,
+                "_initial_compact_begin_pin_retries": compact_pin_retries,
+                "_initial_compact_begin_general_fallbacks": (
+                    compact_general_fallbacks
+                ),
+            })
         if validated_snapshot is not None:
             context["validated_snapshot"] = validated_snapshot
         return context
