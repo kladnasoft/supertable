@@ -935,6 +935,36 @@ def rbac_role_type_index(org: str, sup: str, role_type: str) -> str:
     )
 
 
+# --- OData endpoints -------------------------------------------------------- #
+
+def odata_endpoint_index(org: str, sup: str) -> str:
+    """Endpoint IDs exposing one SuperTable as an OData feed (SET)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:odata:endpoints:index"
+    )
+
+
+def odata_endpoint_doc(org: str, sup: str, endpoint_id: str) -> str:
+    """OData endpoint document — label, role, token hash, enabled (HASH)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:odata:endpoints:doc:{_safe('endpoint_id', endpoint_id)}"
+    )
+
+
+def odata_token(org: str, sup: str, token_hash: str) -> str:
+    """sha256(bearer token) → endpoint-context JSON reverse lookup (STRING).
+
+    Lake-scoped so a token minted for one supertable can never resolve
+    under another — the OData routes know ``{org}/{sup}`` from the URL.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:odata:token:{_safe('token_hash', token_hash)}"
+    )
+
+
 # --- Schema ---------------------------------------------------------------- #
 
 def schema(org: str, sup: str, simple: str) -> str:

@@ -366,7 +366,7 @@ class Settings:
     SUPERTABLE_UI_HOST: str = "0.0.0.0"          # SUPERTABLE_UI_HOST
     SUPERTABLE_UI_PORT: int = 8050               # SUPERTABLE_UI_PORT
     SUPERTABLE_STATIC_DIR: str = ""              # SUPERTABLE_STATIC_DIR
-    SUPERTABLE_ODATA_BASE_URL: str = "/api/v1/reflection"  # SUPERTABLE_ODATA_BASE_URL
+    SUPERTABLE_ODATA_BASE_URL: str = ""  # SUPERTABLE_ODATA_BASE_URL — absolute public URL of the OData service; empty = derive from ODATA host/port
     SUPERTABLE_ODATA_HOST: str = "0.0.0.0"               # SUPERTABLE_ODATA_HOST
     SUPERTABLE_ODATA_PORT: int = 8052                     # SUPERTABLE_ODATA_PORT
     SUPERTABLE_REFLECTION_STATE_DIR: str = "/tmp/supertable_reflection"  # SUPERTABLE_REFLECTION_STATE_DIR
@@ -759,7 +759,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_UI_HOST=_env_str("SUPERTABLE_UI_HOST", "0.0.0.0"),
         SUPERTABLE_UI_PORT=_env_int("SUPERTABLE_UI_PORT", 8050),
         SUPERTABLE_STATIC_DIR=_env_str("SUPERTABLE_STATIC_DIR"),
-        SUPERTABLE_ODATA_BASE_URL=_env_str("SUPERTABLE_ODATA_BASE_URL", "/api/v1/reflection"),
+        SUPERTABLE_ODATA_BASE_URL=_env_str("SUPERTABLE_ODATA_BASE_URL", ""),
         SUPERTABLE_ODATA_HOST=_env_str("SUPERTABLE_ODATA_HOST") or "0.0.0.0",
         SUPERTABLE_ODATA_PORT=_env_int("SUPERTABLE_ODATA_PORT", 8052),
         SUPERTABLE_REFLECTION_STATE_DIR=_env_str("SUPERTABLE_REFLECTION_STATE_DIR", "/tmp/supertable_reflection"),
