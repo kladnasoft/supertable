@@ -488,6 +488,115 @@ def test_snapshot_commit_atomically_persists_unresolved_quality_generation():
     assert fake.ttl(unresolved_key) == -1
 
 
+def test_expected_absent_commit_publishes_complete_first_snapshot_atomically():
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "lake"),
+        json.dumps({"version": 9, "ts": 1, "read_only": False}),
+    )
+    fake.set(RK.lock_leaf("org", "lake", "table"), "token", ex=30)
+    payload = {
+        "snapshot_version": 0,
+        "schema": {"id": "Int64"},
+        "resources": [{"file": "data/first.parquet", "rows": 3}],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "rowid_high_watermark": 3,
+        "_row_filter": None,
+    }
+
+    assert catalog.commit_snapshot(
+        "org",
+        "lake",
+        "table",
+        payload,
+        "snap/first.json",
+        expected_version=-1,
+        expected_path="",
+        lock_token="token",
+        commit_id="first-commit",
+        expected_mirrors=[],
+        expected_mirror_pin=None,
+        quality_generation="first-commit",
+        now_ms=123,
+    ) == (0, 10)
+
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    root = json.loads(fake.get(RK.meta_root("org", "lake")))
+    assert leaf["version"] == 0
+    assert leaf["path"] == "snap/first.json"
+    assert leaf["payload"] == payload
+    assert root["version"] == 10
+    assert root["commit_id"] == "first-commit"
+    assert json.loads(fake.get(RK.schema("org", "lake", "table"))) == {
+        "id": "Int64",
+    }
+    assert fake.smembers(RK.meta_table_names("org", "lake")) == {"table"}
+    assert fake.get(catalog._quality_key(
+        "org", "lake", "pending_unresolved", "table",
+    )) == "first-commit"
+
+
+def test_expected_absent_commit_loses_to_concurrent_creator_without_overwrite():
+    catalog, fake = _catalog()
+    _seed(fake, version=0, path="snap/concurrent.json")
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+
+    with pytest.raises(SnapshotCommitConflictError, match="Snapshot base changed"):
+        catalog.commit_snapshot(
+            "org",
+            "lake",
+            "table",
+            {"resources": []},
+            "snap/ours.json",
+            expected_version=-1,
+            expected_path="",
+            lock_token="token",
+            commit_id="ours",
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+
+
+@pytest.mark.parametrize("fence", ["namespace-lock", "namespace-intent"])
+def test_expected_absent_commit_is_blocked_by_namespace_deletion(fence):
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "lake"),
+        json.dumps({"version": 9, "ts": 1, "read_only": False}),
+    )
+    fake.set(RK.lock_leaf("org", "lake", "table"), "token", ex=30)
+    if fence == "namespace-lock":
+        fake.set(RK.lock_namespace("org", "lake"), "deleter", ex=30)
+        expected_error = RuntimeError
+    else:
+        fake.set(
+            RK.meta_namespace_deletion_intent("org", "lake"),
+            json.dumps({"intent_id": "delete-1"}),
+        )
+        expected_error = DeletionIntentConflictError
+
+    with pytest.raises(expected_error):
+        catalog.commit_snapshot(
+            "org",
+            "lake",
+            "table",
+            {"resources": []},
+            "snap/first.json",
+            expected_version=-1,
+            expected_path="",
+            lock_token="token",
+            commit_id="first",
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) is None
+    assert not fake.sismember(RK.meta_table_names("org", "lake"), "table")
+    assert fake.get(RK.schema("org", "lake", "table")) is None
+
+
 def test_pinned_absent_mirrors_use_small_atomic_commit_path(monkeypatch):
     catalog, fake = _catalog()
     _seed(fake)
@@ -770,19 +879,45 @@ def test_reply_loss_after_atomic_commit_cannot_lose_quality_generation(
         raise redis.TimeoutError("reply lost after commit")
 
     monkeypatch.setattr(catalog, "_snapshot_commit", commit_then_lose_reply)
-    with pytest.raises(redis.TimeoutError, match="reply lost"):
-        catalog.commit_snapshot(
-            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
-            expected_version=4,
-            expected_path="snap/4.json",
-            lock_token="token",
-            commit_id="commit-5",
-            quality_generation="commit-5",
-        )
+    assert catalog.commit_snapshot(
+        "org", "lake", "table", _snapshot_payload(), "snap/5.json",
+        expected_version=4,
+        expected_path="snap/4.json",
+        lock_token="token",
+        commit_id="commit-5",
+        quality_generation="commit-5",
+    ) == (5, 10)
 
     leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
     assert leaf["commit_id"] == "commit-5"
     assert fake.get(unresolved_key) == "commit-5"
+
+
+def test_timeout_before_atomic_commit_is_not_false_positive_reconciled(
+    monkeypatch,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+
+    def lose_before_commit(*args, **kwargs):
+        raise redis.TimeoutError("request never reached Redis")
+
+    monkeypatch.setattr(catalog, "_snapshot_commit", lose_before_commit)
+    with pytest.raises(redis.TimeoutError, match="never reached"):
+        catalog.commit_snapshot(
+            "org",
+            "lake",
+            "table",
+            {},
+            "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            commit_id="commit-5",
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
 
 
 def test_disabled_then_enabled_resolution_preserves_committed_generation():
@@ -2250,6 +2385,86 @@ def test_begin_table_mutation_returns_absent_leaf_without_creating_state():
         "rowid_reservation": None,
     }
     assert not fake.exists(RK.meta_rowid_seq("org", "lake", "table"))
+
+
+def test_namespace_fenced_begin_reserves_first_ids_without_creating_leaf():
+    catalog, fake = _catalog()
+    _seed(fake)
+    fake.delete(RK.meta_leaf("org", "lake", "table"))
+    fake.set(RK.lock_namespace("org", "lake"), "namespace-token", ex=30)
+    fake.set(RK.meta_rowid_seq("org", "lake", "table"), "7")
+
+    context = catalog.begin_table_mutation(
+        "org",
+        "lake",
+        "table",
+        lock_token="token",
+        namespace_token="namespace-token",
+        reserve_count=4,
+    )
+
+    assert context["leaf"] is None
+    assert context["rowid_floor"] == 7
+    assert context["rowid_reservation"] == (8, 11)
+    assert fake.get(RK.meta_rowid_seq("org", "lake", "table")) == "11"
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) is None
+
+
+def test_namespace_fenced_begin_rejects_lost_creation_lock_before_reserving():
+    catalog, fake = _catalog()
+    _seed(fake)
+    fake.delete(RK.meta_leaf("org", "lake", "table"))
+    fake.set(RK.lock_namespace("org", "lake"), "new-owner", ex=30)
+
+    with pytest.raises(LockLostError, match="namespace creation lock"):
+        catalog.begin_table_mutation(
+            "org",
+            "lake",
+            "table",
+            lock_token="token",
+            namespace_token="stale-owner",
+            reserve_count=4,
+        )
+
+    assert not fake.exists(RK.meta_rowid_seq("org", "lake", "table"))
+
+
+def test_crash_after_first_id_reservation_leaves_no_discoverable_table():
+    catalog, fake = _catalog()
+    _seed(fake)
+    fake.delete(RK.meta_leaf("org", "lake", "table"))
+    fake.set(RK.lock_namespace("org", "lake"), "namespace-token", ex=30)
+
+    context = catalog.begin_table_mutation(
+        "org",
+        "lake",
+        "table",
+        lock_token="token",
+        namespace_token="namespace-token",
+        reserve_count=4,
+    )
+    assert context["rowid_reservation"] == (1, 4)
+
+    # Model process death before any final snapshot commit.  Only an invisible
+    # sequence gap may remain; readers/index scans cannot discover the table.
+    assert fake.get(RK.meta_rowid_seq("org", "lake", "table")) == "4"
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) is None
+    assert not fake.sismember(RK.meta_table_names("org", "lake"), "table")
+    assert fake.get(RK.schema("org", "lake", "table")) is None
+    assert fake.get(catalog._quality_key(
+        "org", "lake", "pending_unresolved", "table",
+    )) is None
+
+    retry = catalog.begin_table_mutation(
+        "org",
+        "lake",
+        "table",
+        lock_token="token",
+        namespace_token="namespace-token",
+        reserve_count=2,
+    )
+    assert retry["rowid_floor"] == 4
+    assert retry["rowid_reservation"] == (5, 6)
 
 
 @pytest.mark.parametrize(

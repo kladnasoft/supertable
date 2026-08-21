@@ -1448,6 +1448,139 @@ class TestWriteMonitoring:
 
 class TestWriteErrorPropagation:
 
+    def test_first_write_uses_one_shot_expected_absent_snapshot(
+        self, writer, fake_catalog, monkeypatch,
+    ):
+        events = []
+        namespace_token = "namespace-token"
+        fake_catalog.supports_one_shot_table_creation = True
+        original_simple_acquire = fake_catalog.acquire_simple_lock
+        original_process = writer._mocks["process"].side_effect
+        commit_calls = []
+
+        def acquire_namespace(self, org, sup, ttl_s=30, timeout_s=60):
+            events.append("namespace.acquire")
+            return namespace_token
+
+        def release_namespace(self, org, sup, token):
+            assert token == namespace_token
+            events.append("namespace.release")
+            return True
+
+        def acquire_simple(org, sup, simple, ttl_s=30, timeout_s=60):
+            events.append("leaf.acquire")
+            return original_simple_acquire(
+                org, sup, simple, ttl_s=ttl_s, timeout_s=timeout_s,
+            )
+
+        def begin_mutation(
+            self, org, sup, simple, *, lock_token, reserve_count=0,
+            namespace_token="",
+        ):
+            events.append("begin")
+            assert namespace_token == "namespace-token"
+            return {
+                "leaf": None,
+                "table_config": {},
+                "mirrors": [],
+                "mirror_pin": None,
+                "rowid_floor": 0,
+                "rowid_reservation": (1, reserve_count),
+            }
+
+        original_commit = type(fake_catalog).commit_snapshot
+
+        def commit_snapshot(self, *args, **kwargs):
+            commit_calls.append(kwargs)
+            return original_commit(self, *args, **kwargs)
+
+        def process(*args, **kwargs):
+            events.append("storage.write")
+            return original_process(*args, **kwargs)
+
+        monkeypatch.setattr(
+            type(fake_catalog), "acquire_namespace_lock", acquire_namespace,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            type(fake_catalog), "release_namespace_lock", release_namespace,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            type(fake_catalog), "begin_table_mutation", begin_mutation,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            type(fake_catalog), "commit_snapshot", commit_snapshot,
+        )
+        monkeypatch.setattr(
+            fake_catalog, "acquire_simple_lock", acquire_simple,
+        )
+        writer._mocks["process"].side_effect = process
+
+        writer.write("admin", "new_table", _simple_arrow(3), overwrite_columns=[])
+
+        assert events[:5] == [
+            "namespace.acquire",
+            "leaf.acquire",
+            "begin",
+            "namespace.release",
+            "storage.write",
+        ]
+        simple_call = writer._mocks["SimpleTable"].call_args
+        assert simple_call.kwargs["create_if_missing"] is False
+        assert simple_call.kwargs["_live_leaf_verified"] is True
+        writer._mocks["simple_inst"].get_simple_table_snapshot.assert_not_called()
+        assert commit_calls[0]["expected_version"] == -1
+        assert commit_calls[0]["expected_path"] == ""
+
+    def test_first_write_storage_failure_never_publishes_leaf(
+        self, writer, fake_catalog, monkeypatch,
+    ):
+        fake_catalog.supports_one_shot_table_creation = True
+
+        monkeypatch.setattr(
+            type(fake_catalog),
+            "acquire_namespace_lock",
+            lambda self, *args, **kwargs: "namespace-token",
+            raising=False,
+        )
+        monkeypatch.setattr(
+            type(fake_catalog),
+            "release_namespace_lock",
+            lambda self, *args, **kwargs: True,
+            raising=False,
+        )
+
+        def begin_mutation(
+            self, org, sup, simple, *, lock_token, reserve_count=0,
+            namespace_token="",
+        ):
+            return {
+                "leaf": None,
+                "table_config": {},
+                "mirrors": [],
+                "mirror_pin": None,
+                "rowid_floor": 0,
+                "rowid_reservation": (1, reserve_count),
+            }
+
+        monkeypatch.setattr(
+            type(fake_catalog), "begin_table_mutation", begin_mutation,
+            raising=False,
+        )
+        writer._mocks["process"].side_effect = RuntimeError(
+            "crash before snapshot"
+        )
+
+        with pytest.raises(RuntimeError, match="crash before snapshot"):
+            writer.write(
+                "admin", "new_table", _simple_arrow(3), overwrite_columns=[],
+            )
+
+        assert not fake_catalog.set_leaf_payload_cas_calls
+        assert not fake_catalog.bump_root_calls
+
     def test_concurrent_create_requires_write_authorization_after_lock(
         self, writer, fake_catalog, monkeypatch,
     ):

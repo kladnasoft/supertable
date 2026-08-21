@@ -1126,6 +1126,11 @@ class RedisCatalog:
     # DataWriter may pass the exact raw mirror configuration returned by
     # begin_table_mutation to select the no-mirror commit hot path.
     supports_pinned_no_mirror_commit = True
+    # A writer that observed an absent leaf may acquire the namespace lock
+    # before its table lock and pass that exact token to begin_table_mutation.
+    # The fused boundary can then reserve the first row-id range without first
+    # publishing an empty bootstrap snapshot.
+    supports_one_shot_table_creation = True
     _STAGE_LOCK_SCAN_COUNT = 256
     _STAGE_LOCK_DRAIN_LIMIT = 10_000
     _STAGE_LOCK_SCAN_CALL_LIMIT = 100_000
@@ -1996,10 +2001,12 @@ local leaf_key = KEYS[5]
 local config_key = KEYS[6]
 local mirrors_key = KEYS[7]
 local rowid_key = KEYS[8]
+local namespace_lock = KEYS[9]
 local leaf_token = ARGV[1]
 local reserve_count = ARGV[2]
 local expected_leaf_raw = ARGV[3]
 local prepared_floor = ARGV[4]
+local namespace_token = ARGV[5]
 local tombstone_json_max_exact_integer = 99999999999999
 
 if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
@@ -2007,6 +2014,10 @@ if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
 end
 if redis.call('EXISTS', namespace_intent) == 1 then return {-2} end
 if redis.call('EXISTS', simple_intent) == 1 then return {-3} end
+if namespace_token ~= ''
+    and redis.call('GET', namespace_lock) ~= namespace_token then
+  return {-10}
+end
 
 local root_type = redis.call('TYPE', root_key)
 if type(root_type) == 'table' then root_type = root_type['ok'] end
@@ -2172,7 +2183,33 @@ end
 local leaf_type = redis.call('TYPE', leaf_key)
 if type(leaf_type) == 'table' then leaf_type = leaf_type['ok'] end
 if leaf_type == 'none' then
-  return {0, '', config_raw, mirrors_raw, '0', '', '0', '', '', '0'}
+  -- Only a canonical namespace->leaf lock holder may allocate IDs for an
+  -- expected-absent table.  The reservation can safely precede immutable
+  -- storage I/O: a failed attempt leaves a gap, never a duplicate ID.
+  if namespace_token == '' then
+    return {0, '', config_raw, mirrors_raw, '0', '', '0', '', '', '0'}
+  end
+  local rowid_type = redis.call('TYPE', rowid_key)
+  if type(rowid_type) == 'table' then rowid_type = rowid_type['ok'] end
+  if rowid_type ~= 'none' and rowid_type ~= 'string' then return {-11} end
+  local current = redis.call('GET', rowid_key) or '0'
+  if not string.match(current, '^%d+$')
+      or not string.match(reserve_count, '^%d+$') then
+    return redis.error_reply('invalid non-negative rowid sequence')
+  end
+  local normalized = string.gsub(current, '^0+', '')
+  if normalized == '' then normalized = '0' end
+  local reserved = '0'
+  local new_value = normalized
+  if reserve_count ~= '0' then
+    redis.call('INCRBY', rowid_key, reserve_count)
+    new_value = redis.call('GET', rowid_key)
+    reserved = '1'
+  end
+  return {
+    0, '', config_raw, mirrors_raw,
+    '1', normalized, reserved, normalized, new_value, '0'
+  }
 end
 if leaf_type ~= 'string' then return {-7} end
 local leaf_raw = redis.call('GET', leaf_key)
@@ -5322,6 +5359,7 @@ return 1
             lock_token: str,
             reserve_count: int = 0,
             prepared_leaf: Optional[_PreparedTableMutationLeaf] = None,
+            namespace_token: str = "",
     ) -> Dict[str, Any]:
         """Pin one write context and reserve ordinary row IDs atomically.
 
@@ -5331,7 +5369,9 @@ return 1
         ``reserve_count`` is allocated in this same command.  Legacy,
         incomplete, or large-Int64 floors return no reservation so the writer
         can use :meth:`reserve_rowids_at_least` after deriving the immutable
-        storage floor.
+        storage floor.  For an absent leaf, passing the namespace lock acquired
+        before ``lock_token`` proves a canonical creation boundary and reserves
+        above any exact orphaned sequence left by an earlier failed attempt.
 
         This is an early optimization boundary, not the publication boundary:
         :meth:`commit_snapshot` still repeats the live lock, root/deletion,
@@ -5367,12 +5407,14 @@ return 1
                 RK.meta_table_config(org, sup, simple),
                 RK.meta_mirrors(org, sup),
                 RK.meta_rowid_seq(org, sup, simple),
+                RK.lock_namespace(org, sup),
             ],
             args=[
                 lock_token or "",
                 str(reserve_count),
                 prepared_raw,
                 "" if prepared_floor is None else str(prepared_floor),
+                namespace_token or "",
             ],
         )
         if not isinstance(raw, (list, tuple)) or not raw:
@@ -5406,6 +5448,15 @@ return 1
         if status == -9:
             raise ValueError(
                 f"Mirror configuration is invalid for {org}/{sup}"
+            )
+        if status == -10:
+            raise LockLostError(
+                f"Lost namespace creation lock before mutating "
+                f"{org}/{sup}/{simple}"
+            )
+        if status == -11:
+            raise RuntimeError(
+                f"Corrupt Redis rowid sequence for {org}/{sup}/{simple}"
             )
         if status not in (0, 1) or len(raw) != 10:
             raise RuntimeError(f"Invalid table mutation context: {raw!r}")
@@ -5539,6 +5590,39 @@ return 1
                                 f"Unsafe rowid reservation result: {raw!r}"
                             )
                         rowid_reservation = (start, new_high)
+        elif str(raw[4]) == "1":
+            # An absent leaf has no snapshot payload from which to derive a
+            # floor.  The namespace-fenced Lua branch instead returns the exact
+            # Redis integer strings it observed/reserved before any storage I/O.
+            try:
+                candidate_floor = int(raw[5])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Invalid initial rowid floor: {raw!r}"
+                ) from exc
+            if not 0 <= candidate_floor <= (1 << 63) - 1:
+                raise RuntimeError(f"Unsafe initial rowid floor: {raw!r}")
+            rowid_floor = candidate_floor
+            if str(raw[6]) == "1":
+                try:
+                    previous = int(raw[7])
+                    new_high = int(raw[8])
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"Invalid initial rowid reservation: {raw!r}"
+                    ) from exc
+                start = previous + 1
+                if (
+                    reserve_count <= 0
+                    or previous != candidate_floor
+                    or start <= candidate_floor
+                    or new_high != previous + reserve_count
+                    or new_high > (1 << 63) - 1
+                ):
+                    raise RuntimeError(
+                        f"Unsafe initial rowid reservation: {raw!r}"
+                    )
+                rowid_reservation = (start, new_high)
 
         context = {
             "leaf": leaf,
@@ -6562,10 +6646,10 @@ return 1
         invalidation happen in one Redis transaction, so readers can never
         combine a new leaf with an old root generation (or vice versa).
 
-        Ambiguous client/network failures are deliberately propagated.  The
-        immutable ``commit_id`` stored in both documents lets a caller or
-        operator reconcile whether such a commit reached Redis; retrying as a
-        different, payload-less write would be unsafe.
+        An ambiguous client/network failure is reconciled once against the
+        exact immutable leaf ``commit_id``, version, path, and payload.  A
+        mismatch or second read failure is still propagated; blindly retrying
+        as a different write would be unsafe.
 
         ``quality_generation``, when present, must be this commit's opaque ID.
         The same transaction persists it as unresolved post-ingest work.  The
@@ -6776,6 +6860,30 @@ return 1
                     ],
                 )
         except redis.RedisError as exc:
+            # A timeout/disconnect can arrive after Redis executed the atomic
+            # script.  Reconcile against the immutable commit identity before
+            # telling the caller that creation/update failed; blindly retrying
+            # an expected-absent first write would otherwise conflict with its
+            # own successfully-created leaf.
+            reconciled = self._reconcile_snapshot_commit(
+                org,
+                sup,
+                simple,
+                payload=payload,
+                path=path,
+                expected_version=base_version,
+                commit_id=cid,
+            )
+            if reconciled is not None:
+                logger.warning(
+                    "[redis-catalog] reconciled ambiguous snapshot commit "
+                    "for %s/%s/%s commit %s",
+                    org,
+                    sup,
+                    simple,
+                    cid,
+                )
+                return reconciled
             logger.error(f"[redis-catalog] snapshot commit error: {exc}")
             raise
 
@@ -6846,6 +6954,51 @@ return 1
                 f"{org}/{sup}/{simple}"
             )
         raise RuntimeError(f"Unknown snapshot commit status {code}")
+
+    def _reconcile_snapshot_commit(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            *,
+            payload: Dict[str, Any],
+            path: str,
+            expected_version: int,
+            commit_id: str,
+    ) -> Optional[tuple[int, int]]:
+        """Return committed versions when an ambiguous reply actually landed.
+
+        The exact leaf commit id, path, successor version, and normalized cache
+        payload are sufficient proof: the Redis script writes the leaf, root,
+        schema/index, and quality marker atomically.  The root may already have
+        advanced because a different table has its own lock, so only require a
+        structurally valid current root.
+        Any read ambiguity or mismatch returns ``None`` and preserves the
+        original transport exception.
+        """
+        try:
+            raw_leaf, raw_root = self.r.mget([
+                RK.meta_leaf(org, sup, simple),
+                RK.meta_root(org, sup),
+            ])
+            if raw_leaf is None or raw_root is None:
+                return None
+            leaf = _validate_leaf_document(json.loads(raw_leaf))
+            root = _validate_root_document(
+                json.loads(raw_root), org=org, sup=sup,
+            )
+            successor = expected_version + 1
+            if (
+                leaf.get("commit_id") != commit_id
+                or leaf.get("path") != path
+                or leaf.get("version") != successor
+                or leaf.get("payload") != snapshot_cache_payload(payload)
+                or root.get("version", -1) < 0
+            ):
+                return None
+            return successor, int(root["version"])
+        except Exception:
+            return None
 
     def prepare_mirror_publication(
             self,

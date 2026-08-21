@@ -225,6 +225,30 @@ class DataWriter:
         }
 
     @staticmethod
+    def _uncommitted_initial_snapshot(
+            simple_table: SimpleTable, *, rowid_floor: int,
+    ) -> dict[str, Any]:
+        """Return the in-memory base for an expected-absent first commit."""
+        return {
+            "simple_name": simple_table.simple_name,
+            "location": simple_table.simple_dir,
+            # SimpleTable.update advances this synthetic base to version zero,
+            # matching the expected-absent Redis leaf version.
+            "snapshot_version": -1,
+            "last_updated_ms": int(datetime.now(timezone.utc).timestamp() * 1000),
+            "previous_snapshot": None,
+            "schema": [],
+            "resources": [],
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+            "rowid_high_watermark": rowid_floor,
+            "stats_file": None,
+            "stats_rows": 0,
+            "_row_filter": None,
+        }
+
+    @staticmethod
     def _tombstone_referenced_files(frame: polars.DataFrame) -> set[str]:
         """Materialize only distinct file keys into Python memory."""
         return set(
@@ -1029,6 +1053,7 @@ class DataWriter:
             t_last = now
 
         token = None
+        namespace_token = None
         result_tuple = None
         stats_payload = None
         mirror_error: Exception | None = None
@@ -1111,7 +1136,33 @@ class DataWriter:
                 )
             mark("dedup_ts")
 
-            # --- Per-simple Redis lock ----------------------------------------
+            # --- Namespace/table Redis locks ---------------------------------
+            # Expected-absent creation takes the canonical namespace -> leaf
+            # order.  Once the fused context has pinned the absent leaf and
+            # reserved IDs, release the namespace lock before storage I/O: a
+            # concurrent namespace delete then persists its intent and drains
+            # this still-held leaf lease, while the final commit fails closed.
+            one_shot_creation = bool(
+                not target_existed
+                and getattr(
+                    self.catalog,
+                    "supports_one_shot_table_creation",
+                    False,
+                ) is True
+            )
+            if one_shot_creation:
+                namespace_token = self.catalog.acquire_namespace_lock(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    ttl_s=30,
+                    timeout_s=60,
+                )
+                if not namespace_token:
+                    raise TimeoutError(
+                        "Could not acquire namespace creation lock for "
+                        f"{self.super_table.organization}/"
+                        f"{self.super_table.super_name}"
+                    )
             token = self.catalog.acquire_simple_lock(
                 self.super_table.organization, self.super_table.super_name, simple_name,
                 ttl_s=30, timeout_s=60
@@ -1131,6 +1182,8 @@ class DataWriter:
                 }
                 if prepared_mutation_leaf is not None:
                     begin_kwargs["prepared_leaf"] = prepared_mutation_leaf
+                if one_shot_creation:
+                    begin_kwargs["namespace_token"] = namespace_token
                 mutation_context = self.catalog.begin_table_mutation(
                     self.super_table.organization,
                     self.super_table.super_name,
@@ -1166,6 +1219,37 @@ class DataWriter:
             if not target_existed and locked_target_exists:
                 check_write_access(**access_args)
 
+            # WRITE authority cannot recreate a table that disappeared before
+            # its table lease was acquired.  The caller must retry through the
+            # CREATE authorization path against the now-absent target.
+            if target_existed and not locked_target_exists:
+                raise TableNotFoundError(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    simple_name,
+                )
+
+            initial_creation = bool(
+                one_shot_creation
+                and mutation_context is not None
+                and not locked_target_exists
+            )
+
+            if namespace_token is not None:
+                released = self.catalog.release_namespace_lock(
+                    self.super_table.organization,
+                    self.super_table.super_name,
+                    namespace_token,
+                )
+                namespace_token = None
+                if not released:
+                    # A release ambiguity is safe to abort before immutable I/O;
+                    # proceeding could only create orphan objects while the
+                    # still-live namespace lock makes publication fail.
+                    raise RuntimeError(
+                        "Could not release namespace creation lock before write"
+                    )
+
             # --- Read last snapshot (via leaf pointer) ------------------------
             # A target that existed at authorization time must not be
             # implicitly recreated if another actor deletes it before we take
@@ -1173,9 +1257,13 @@ class DataWriter:
             simple_table = SimpleTable(
                 self.super_table,
                 simple_name,
-                create_if_missing=not locked_target_exists,
+                create_if_missing=(
+                    not locked_target_exists and not initial_creation
+                ),
                 catalog=self.catalog,
-                _live_leaf_verified=bool(locked_target_exists),
+                _live_leaf_verified=bool(
+                    locked_target_exists or initial_creation
+                ),
                 _pinned_leaf=(
                     mutation_context.get("leaf")
                     if mutation_context is not None and locked_target_exists
@@ -1187,7 +1275,11 @@ class DataWriter:
                     else None
                 ),
             )
-            if mutation_context is not None and not locked_target_exists:
+            if (
+                mutation_context is not None
+                and not locked_target_exists
+                and not initial_creation
+            ):
                 # Initialization publishes the first exact leaf under the
                 # namespace fence. Re-enter the single atomic context boundary
                 # after it releases that fence so the first write can pin and
@@ -1217,7 +1309,26 @@ class DataWriter:
             else:
                 table_config = self._get_table_config(simple_name)
 
-            last_simple_table, last_simple_table_path = simple_table.get_simple_table_snapshot()
+            if initial_creation:
+                if mutation_context is None:  # pragma: no cover - definition above
+                    raise RuntimeError("Initial creation lost its mutation context")
+                initial_floor = mutation_context.get("rowid_floor")
+                if type(initial_floor) is not int or initial_floor < 0:
+                    raise RuntimeError(
+                        "Initial table creation has no exact rowid floor"
+                    )
+                last_simple_table = self._uncommitted_initial_snapshot(
+                    simple_table, rowid_floor=initial_floor,
+                )
+                last_simple_table_path = ""
+                simple_table._last_snapshot_leaf = {
+                    "version": -1,
+                    "path": "",
+                }
+            else:
+                last_simple_table, last_simple_table_path = (
+                    simple_table.get_simple_table_snapshot()
+                )
             self._validate_pinned_tombstone_state(last_simple_table)
             # A current deletion-vector is immutable correctness metadata.  Do
             # not let a mutation bless a legacy/unsealed pointer into a new
@@ -1266,18 +1377,21 @@ class DataWriter:
             )
             snapshot_floor = last_simple_table.get("rowid_high_watermark")
             if (
-                type(pinned_floor) is int
+                reserve_count > 0
+                and type(pinned_floor) is int
                 and type(snapshot_floor) is int
                 and pinned_floor == snapshot_floor
-                and (
-                    (reserve_count > 0 and pinned_reservation is not None)
-                    or reserve_count == 0
-                )
+                and isinstance(pinned_reservation, tuple)
+                and len(pinned_reservation) == 2
             ):
-                if reserve_count > 0:
-                    start_rowid, rowid_high_watermark = pinned_reservation
-                else:
-                    start_rowid, rowid_high_watermark = 0, pinned_floor
+                start_rowid, rowid_high_watermark = pinned_reservation
+            elif (
+                reserve_count == 0
+                and type(pinned_floor) is int
+                and type(snapshot_floor) is int
+                and pinned_floor == snapshot_floor
+            ):
+                start_rowid, rowid_high_watermark = 0, pinned_floor
             else:
                 start_rowid, rowid_high_watermark = self._reserve_snapshot_rowids(
                     snapshot=last_simple_table,
@@ -2358,7 +2472,7 @@ class DataWriter:
                 last_simple_table["stats_rows"] = stats_rows
                 # Seed the in-process cache so the next read (this process's next
                 # overwrite/delete or query) needs no storage round-trip.
-                if combined_stats_df is not None:
+                if combined_stats_df is not None and stats_path:
                     cache_stats(
                         stats_path,
                         combined_stats_df,
@@ -2574,16 +2688,34 @@ class DataWriter:
                     if durability_batch is not None:
                         durability_batch.close()
                 finally:
-                    # Release per-simple lock after rollback/durability cleanup.
-                    if token:
-                        try:
-                            ok = self.catalog.release_simple_lock(
-                                self.super_table.organization, self.super_table.super_name, simple_name, token
-                            )
-                            if not ok:
-                                logger.debug(lp("Lock release skipped (token mismatch or already expired)."))
-                        except Exception:
-                            pass
+                    try:
+                        # Release the per-simple lock after rollback/durability
+                        # cleanup, then release any creation namespace lock.
+                        if token:
+                            try:
+                                ok = self.catalog.release_simple_lock(
+                                    self.super_table.organization,
+                                    self.super_table.super_name,
+                                    simple_name,
+                                    token,
+                                )
+                                if not ok:
+                                    logger.debug(lp(
+                                        "Lock release skipped (token mismatch or "
+                                        "already expired)."
+                                    ))
+                            except Exception:
+                                pass
+                    finally:
+                        if namespace_token:
+                            try:
+                                self.catalog.release_namespace_lock(
+                                    self.super_table.organization,
+                                    self.super_table.super_name,
+                                    namespace_token,
+                                )
+                            except Exception:
+                                pass
 
         # ---------- LOCK IS RELEASED HERE ----------
         # Monitoring enqueue + flush is fully outside any data locks.
