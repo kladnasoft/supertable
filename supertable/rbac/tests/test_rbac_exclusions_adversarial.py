@@ -986,7 +986,13 @@ def test_write_authorization_cannot_race_into_implicit_table_creation(
     # This request was authorized for WRITE on an existing target, not CREATE.
     # If the leaf disappears before construction, fail with TableNotFound
     # instead of silently minting a replacement under weaker permission.
-    assert simple_table.call_args.kwargs == {"create_if_missing": False}
+    assert simple_table.call_args.kwargs == {
+        "create_if_missing": False,
+        "catalog": writer.catalog,
+        "_live_leaf_verified": True,
+        "_pinned_leaf": None,
+        "_pinned_snapshot": None,
+    }
 
 
 def _simple_table_shell(*, simple_name: str = "account"):
