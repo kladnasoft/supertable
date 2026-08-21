@@ -191,8 +191,12 @@ def test_real_write_all_quality_modes_are_truthful_and_auto_certified(
         mode: scheduler._pending_key(ORG, SUPER, table, mode)
         for mode in scheduler.QUALITY_MODES
     }
-    assert fake.get(scheduler._pending_key(ORG, SUPER, table)) is not None
-    assert all(fake.get(key) is not None for key in mode_keys.values())
+    # Snapshot commit persists one unresolved generation atomically; the
+    # scheduler resolves configured mode keys under pinned catalog identity.
+    unresolved_key = scheduler._unresolved_pending_key(ORG, SUPER, table)
+    assert fake.get(unresolved_key) is not None
+    assert fake.get(scheduler._pending_key(ORG, SUPER, table)) is None
+    assert all(fake.get(key) is None for key in mode_keys.values())
 
     executions = []
     original_execute = scheduler._execute_quality_statement
@@ -238,6 +242,7 @@ def test_real_write_all_quality_modes_are_truthful_and_auto_certified(
 
     assert all(fake.get(key) is None for key in mode_keys.values())
     assert fake.get(scheduler._pending_key(ORG, SUPER, table)) is None
+    assert fake.get(unresolved_key) is None
     for mode in scheduler.QUALITY_MODES:
         key = scheduler._cooldown_key(ORG, SUPER, table, mode)
         assert fake.get(key) is not None
