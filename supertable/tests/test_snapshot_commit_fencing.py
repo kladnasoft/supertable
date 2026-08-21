@@ -145,6 +145,253 @@ def test_normal_snapshot_commit_does_not_hash_or_persist_payload_digest(
     assert "payload_digest" not in leaf
 
 
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_unflagged_expected_absent_retains_legacy_version_zero(
+    pinned_no_mirrors, monkeypatch,
+):
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "lake"),
+        json.dumps({"version": 9, "ts": 1, "read_only": False}),
+    )
+    fake.set(RK.lock_leaf("org", "lake", "table"), "token", ex=30)
+    monkeypatch.setattr(
+        hashlib,
+        "sha256",
+        MagicMock(side_effect=AssertionError("legacy payload was hashed")),
+    )
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    assert catalog.commit_snapshot(
+        "org", "lake", "table", _snapshot_payload(snapshot_version=0),
+        "snap/0.json",
+        expected_version=-1,
+        expected_path="",
+        lock_token="token",
+        commit_id="legacy-initial",
+        **kwargs,
+    ) == (0, 10)
+
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    assert leaf["version"] == leaf["payload"]["snapshot_version"] == 0
+    assert "payload_digest" not in leaf
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_unflagged_expected_absent_reply_loss_is_not_reconciled(
+    pinned_no_mirrors, monkeypatch,
+):
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "lake"),
+        json.dumps({"version": 9, "ts": 1, "read_only": False}),
+    )
+    fake.set(RK.lock_leaf("org", "lake", "table"), "token", ex=30)
+    script_name = (
+        "_snapshot_commit_no_mirrors"
+        if pinned_no_mirrors
+        else "_snapshot_commit"
+    )
+    real_script = getattr(catalog, script_name)
+
+    def commit_then_lose_reply(*args, **kwargs):
+        real_script(*args, **kwargs)
+        raise redis.TimeoutError("legacy reply lost after commit")
+
+    reconcile = MagicMock(side_effect=AssertionError("legacy commit reconciled"))
+    monkeypatch.setattr(catalog, script_name, commit_then_lose_reply)
+    monkeypatch.setattr(catalog, "_reconcile_snapshot_commit", reconcile)
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    with pytest.raises(redis.TimeoutError, match="legacy reply lost"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(snapshot_version=0),
+            "snap/0.json",
+            expected_version=-1,
+            expected_path="",
+            lock_token="token",
+            commit_id="legacy-initial",
+            **kwargs,
+        )
+
+    reconcile.assert_not_called()
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    assert leaf["version"] == leaf["payload"]["snapshot_version"] == 0
+    assert "payload_digest" not in leaf
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_unflagged_expected_absent_keeps_namespace_lock_fence(
+    pinned_no_mirrors, monkeypatch,
+):
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "lake"),
+        json.dumps({"version": 9, "ts": 1, "read_only": False}),
+    )
+    fake.set(RK.lock_leaf("org", "lake", "table"), "token", ex=30)
+    fake.set(RK.lock_namespace("org", "lake"), "other-owner", ex=30)
+    script_name = (
+        "_snapshot_commit_no_mirrors"
+        if pinned_no_mirrors
+        else "_snapshot_commit"
+    )
+    script = MagicMock(wraps=getattr(catalog, script_name))
+    monkeypatch.setattr(catalog, script_name, script)
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    with pytest.raises(RuntimeError, match="namespace is fenced"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(snapshot_version=0),
+            "snap/0.json",
+            expected_version=-1,
+            expected_path="",
+            lock_token="token",
+            commit_id="legacy-initial",
+            **kwargs,
+        )
+
+    script.assert_called_once()
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) is None
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_unflagged_expected_absent_reaches_terminal_deletion_fence(
+    pinned_no_mirrors, monkeypatch,
+):
+    catalog, fake = _catalog()
+    fake.set(
+        RK.meta_root("org", "lake"),
+        json.dumps({"version": 9, "ts": 1, "read_only": False}),
+    )
+    fake.set(RK.lock_leaf("org", "lake", "table"), "token", ex=30)
+    fake.set(
+        RK.meta_simple_deletion_intent("org", "lake", "table"),
+        json.dumps({"intent_id": "terminal-delete"}),
+    )
+    script_name = (
+        "_snapshot_commit_no_mirrors"
+        if pinned_no_mirrors
+        else "_snapshot_commit"
+    )
+    script = MagicMock(wraps=getattr(catalog, script_name))
+    monkeypatch.setattr(catalog, script_name, script)
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    with pytest.raises(DeletionIntentConflictError):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(snapshot_version=0),
+            "snap/0.json",
+            expected_version=-1,
+            expected_path="",
+            lock_token="token",
+            commit_id="stale-writer",
+            **kwargs,
+        )
+
+    script.assert_called_once()
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) is None
+
+
+@pytest.mark.parametrize("one_shot_initial", [None, 0, 1, "1"])
+def test_snapshot_commit_rejects_non_boolean_one_shot_flag_before_redis(
+    one_shot_initial, monkeypatch,
+):
+    catalog, _ = _catalog()
+    general = MagicMock(side_effect=AssertionError("Redis should not run"))
+    fast = MagicMock(side_effect=AssertionError("Redis should not run"))
+    monkeypatch.setattr(catalog, "_snapshot_commit", general)
+    monkeypatch.setattr(catalog, "_snapshot_commit_no_mirrors", fast)
+
+    with pytest.raises(TypeError, match="one_shot_initial must be a boolean"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(snapshot_version=0),
+            "snap/0.json",
+            expected_version=-1,
+            expected_path="",
+            lock_token="token",
+            one_shot_initial=one_shot_initial,
+        )
+
+    general.assert_not_called()
+    fast.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "expected_version,expected_path",
+    [(0, "snap/0.json"), (-1, "snap/not-empty.json"), (-1, None)],
+)
+def test_snapshot_commit_rejects_invalid_one_shot_base_before_redis(
+    expected_version, expected_path, monkeypatch,
+):
+    catalog, _ = _catalog()
+    general = MagicMock(side_effect=AssertionError("Redis should not run"))
+    fast = MagicMock(side_effect=AssertionError("Redis should not run"))
+    monkeypatch.setattr(catalog, "_snapshot_commit", general)
+    monkeypatch.setattr(catalog, "_snapshot_commit_no_mirrors", fast)
+
+    with pytest.raises(ValueError, match="requires expected_version=-1"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(snapshot_version=1),
+            "snap/first.json",
+            expected_version=expected_version,
+            expected_path=expected_path,
+            lock_token="token",
+            one_shot_initial=True,
+        )
+
+    general.assert_not_called()
+    fast.assert_not_called()
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+@pytest.mark.parametrize("wire_flag", ["invalid", "1"])
+def test_both_snapshot_lua_paths_reject_invalid_one_shot_wire_state(
+    pinned_no_mirrors, wire_flag, monkeypatch,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    leaf_key = RK.meta_leaf("org", "lake", "table")
+    root_key = RK.meta_root("org", "lake")
+    before = (fake.get(leaf_key), fake.get(root_key))
+    script_name = (
+        "_snapshot_commit_no_mirrors"
+        if pinned_no_mirrors
+        else "_snapshot_commit"
+    )
+    real_script = getattr(catalog, script_name)
+
+    def corrupt_wire_flag(*args, **kwargs):
+        script_args = list(kwargs["args"])
+        script_args[-1] = wire_flag
+        return real_script(keys=kwargs["keys"], args=script_args)
+
+    monkeypatch.setattr(catalog, script_name, corrupt_wire_flag)
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    with pytest.raises(ValueError, match="invalid one-shot initial"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            commit_id="commit-5",
+            **kwargs,
+        )
+
+    assert (fake.get(leaf_key), fake.get(root_key)) == before
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -546,6 +793,7 @@ def test_expected_absent_commit_publishes_complete_first_snapshot_atomically():
         expected_mirror_pin=None,
         quality_generation="first-commit",
         now_ms=123,
+        one_shot_initial=True,
     ) == (1, 10)
 
     leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
@@ -601,6 +849,7 @@ def test_one_shot_bootstrap_and_successor_keep_pinned_no_mirror_fast_path(
         expected_mirrors=[],
         expected_mirror_pin=None,
         now_ms=123,
+        one_shot_initial=True,
     ) == (1, 10)
 
     context = catalog.begin_table_mutation(
@@ -672,6 +921,7 @@ def test_expected_absent_reply_loss_reconciles_compatibility_generation(
         expected_mirrors=[],
         expected_mirror_pin=None,
         now_ms=123,
+        one_shot_initial=True,
     ) == (1, 10)
 
     leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
@@ -713,7 +963,7 @@ def test_reply_loss_reconciliation_uses_exact_pre_lua_payload_digest(
         "rowid_high_watermark": (1 << 53) + 1,
         "_row_filter": None,
     }
-    kwargs = {"expected_mirrors": []}
+    kwargs = {"expected_mirrors": [], "one_shot_initial": True}
     if pinned_no_mirrors:
         kwargs["expected_mirror_pin"] = None
 
@@ -754,6 +1004,8 @@ def test_snapshot_commit_rejects_payload_generation_mismatch_before_redis(
     before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
     before_root = fake.get(RK.meta_root("org", "lake"))
     kwargs = {"expected_mirrors": []}
+    if expected_version == -1:
+        kwargs["one_shot_initial"] = True
     if pinned_no_mirrors:
         kwargs["expected_mirror_pin"] = None
 
@@ -793,6 +1045,7 @@ def test_expected_absent_commit_loses_to_concurrent_creator_without_overwrite():
             expected_path="",
             lock_token="token",
             commit_id="ours",
+            one_shot_initial=True,
         )
 
     assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
@@ -822,6 +1075,7 @@ def test_expected_absent_commit_is_blocked_by_durable_namespace_deletion():
             expected_path="",
             lock_token="token",
             commit_id="first",
+            one_shot_initial=True,
         )
 
     assert fake.get(RK.meta_leaf("org", "lake", "table")) is None
@@ -903,6 +1157,7 @@ def test_waiting_first_creator_does_not_wound_current_publisher(
             lock_token=current_leaf,
             commit_id="current",
             now_ms=123,
+            one_shot_initial=True,
             **kwargs,
         ) == (1, 10)
     finally:
@@ -2208,11 +2463,44 @@ def test_durable_delete_rejection_removes_first_write_objects(tmp_path):
                 mirror_pin_available=True,
                 mirror_pin=None,
                 durability_batch=batch,
+                one_shot_initial=True,
             )
 
     assert not storage.exists(data_path)
     assert not storage.exists(snapshot_path)
     assert fake.get(RK.meta_leaf("org", "lake", "table")) is None
+
+
+def test_writer_does_not_infer_one_shot_from_expected_absent_leaf():
+    class Catalog:
+        def __init__(self):
+            self.kwargs = None
+
+        def commit_snapshot(self, *args, **kwargs):
+            self.kwargs = kwargs
+            return 0, 10
+
+    writer = DataWriter.__new__(DataWriter)
+    writer.super_table = SimpleNamespace(organization="org", super_name="lake")
+    writer.catalog = Catalog()
+    table = SimpleNamespace(
+        _last_snapshot_leaf={"version": -1, "path": ""},
+    )
+
+    writer._publish_snapshot(
+        simple_table=table,
+        simple_name="table",
+        payload=_snapshot_payload(snapshot_version=0, schema={}),
+        path="snap/0.json",
+        base_path="",
+        lock_token="token",
+        commit_id="legacy-initial",
+        now_ms=123,
+    )
+
+    assert writer.catalog.kwargs["expected_version"] == -1
+    assert writer.catalog.kwargs["expected_path"] == ""
+    assert "one_shot_initial" not in writer.catalog.kwargs
 
 
 def test_writer_passes_pinned_empty_mirror_generation_to_capable_catalog():

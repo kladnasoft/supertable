@@ -174,6 +174,7 @@ class FakeCatalog:
             self, org, sup, simple, payload, path, *, expected_version,
             expected_path, lock_token, commit_id=None,
             mirror_publication=False, expected_mirrors=None, now_ms=None,
+            one_shot_initial=False,
     ):
         """Test-double implementation of the production atomic primitive."""
         key = f"{org}:{sup}:{simple}"
@@ -1538,6 +1539,7 @@ class TestWriteErrorPropagation:
         assert initial_base["previous_snapshot"] is None
         assert commit_calls[0]["expected_version"] == -1
         assert commit_calls[0]["expected_path"] == ""
+        assert commit_calls[0]["one_shot_initial"] is True
 
     def test_first_write_storage_failure_never_publishes_leaf(
         self, writer, fake_catalog, monkeypatch,

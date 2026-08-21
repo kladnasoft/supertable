@@ -2898,6 +2898,7 @@ return removed_meta + removed_index + 1
     # -14  mirror configuration changed after the writer pinned it
     # -15  mirror configuration is corrupt
     # -16  payload snapshot_version mismatches the fenced successor
+    # -17  invalid one-shot initial publication flag or base identity
     _LUA_SNAPSHOT_COMMIT = (
         _LUA_ROOT_DOCUMENT_GUARD + _LUA_SNAPSHOT_TOMBSTONE_GUARD + """
 local leaf_key = KEYS[1]
@@ -2925,6 +2926,7 @@ local expected_mirrors_json = ARGV[11]
 local quality_generation = ARGV[12]
 local expected_v2_prefix = ARGV[13]
 local payload_digest = ARGV[14]
+local one_shot_initial = ARGV[15]
 
 if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or now_ms ~= math.floor(now_ms)
@@ -2933,7 +2935,14 @@ if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or expected_version ~= math.floor(expected_version) then
   return {-13, 0, 0}
 end
-if expected_version == -1 then
+if one_shot_initial ~= '0' and one_shot_initial ~= '1' then
+  return {-17, 0, 0}
+end
+if one_shot_initial == '1'
+    and (expected_version ~= -1 or expected_path ~= '') then
+  return {-17, 0, 0}
+end
+if one_shot_initial == '1' then
   if string.len(payload_digest) ~= 64
       or not string.match(payload_digest, '^[0-9a-f]+$') then
     return {-4, 0, 0}
@@ -3020,10 +3029,10 @@ if not held_token or held_token ~= lock_token then
   return {-2, 0, 0}
 end
 -- A waiting first-time creator may hold the namespace lock while blocked on
--- this writer's leaf lease.  It must not wound the current expected-absent
+-- this writer's leaf lease.  It must not wound the current flagged one-shot
 -- publisher.  A real delete linearizes by persisting namespace_delete before
 -- draining this lease; that durable intent remains an unconditional fence.
-if expected_version ~= -1
+if one_shot_initial ~= '1'
     and redis.call('EXISTS', namespace_lock) == 1 then
   return {-7, 0, 0}
 end
@@ -3083,7 +3092,7 @@ if not okp or type(payload) ~= 'table'
   return {-4, 0, 0}
 end
 local new_leaf_version = old_version + 1
-if old_version == -1 then new_leaf_version = 1 end
+if one_shot_initial == '1' then new_leaf_version = 1 end
 if type(payload['snapshot_version']) ~= 'number'
     or payload['snapshot_version'] ~= math.floor(payload['snapshot_version'])
     or payload['snapshot_version'] ~= new_leaf_version then
@@ -3144,7 +3153,7 @@ local leaf = {
   payload = payload,
   commit_id = commit_id
 }
-if expected_version == -1 then leaf['payload_digest'] = payload_digest end
+if one_shot_initial == '1' then leaf['payload_digest'] = payload_digest end
 root['version'] = new_root_version
 root['ts'] = now_ms
 root['commit_id'] = commit_id
@@ -3208,6 +3217,7 @@ local mirror_pin_present = ARGV[11]
 local expected_mirror_raw = ARGV[12]
 local expected_v2_prefix = ARGV[13]
 local payload_digest = ARGV[14]
+local one_shot_initial = ARGV[15]
 
 if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or now_ms ~= math.floor(now_ms)
@@ -3216,7 +3226,14 @@ if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or expected_version ~= math.floor(expected_version) then
   return {-13, 0, 0}
 end
-if expected_version == -1 then
+if one_shot_initial ~= '0' and one_shot_initial ~= '1' then
+  return {-17, 0, 0}
+end
+if one_shot_initial == '1'
+    and (expected_version ~= -1 or expected_path ~= '') then
+  return {-17, 0, 0}
+end
+if one_shot_initial == '1' then
   if string.len(payload_digest) ~= 64
       or not string.match(payload_digest, '^[0-9a-f]+$') then
     return {-4, 0, 0}
@@ -3257,7 +3274,7 @@ if not held_token or held_token ~= lock_token then
 end
 -- Do not let a waiting creator's namespace lock wound the current first
 -- publisher.  Namespace deletion is still fenced by its durable intent below.
-if expected_version ~= -1
+if one_shot_initial ~= '1'
     and redis.call('EXISTS', namespace_lock) == 1 then
   return {-7, 0, 0}
 end
@@ -3317,7 +3334,7 @@ if not okp or type(payload) ~= 'table'
   return {-4, 0, 0}
 end
 local new_leaf_version = old_version + 1
-if old_version == -1 then new_leaf_version = 1 end
+if one_shot_initial == '1' then new_leaf_version = 1 end
 if type(payload['snapshot_version']) ~= 'number'
     or payload['snapshot_version'] ~= math.floor(payload['snapshot_version'])
     or payload['snapshot_version'] ~= new_leaf_version then
@@ -3340,7 +3357,7 @@ local leaf = {
   payload = payload,
   commit_id = commit_id
 }
-if expected_version == -1 then leaf['payload_digest'] = payload_digest end
+if one_shot_initial == '1' then leaf['payload_digest'] = payload_digest end
 root['version'] = new_root_version
 root['ts'] = now_ms
 root['commit_id'] = commit_id
@@ -6675,20 +6692,23 @@ return 1
             expected_mirror_pin: Any = _UNPINNED_MIRROR_CONFIG,
             quality_generation: Optional[str] = None,
             now_ms: Optional[int] = None,
+            one_shot_initial: bool = False,
     ) -> tuple[int, int]:
         """Atomically publish one fenced table snapshot and bump its root.
 
         ``expected_version`` and ``expected_path`` identify the exact leaf
         snapshot from which the writer derived its immutable successor.
-        An expected-absent base (``-1``/empty path) publishes the first visible
-        snapshot as version one, preserving the legacy generation after its
-        removed empty version-zero bootstrap.
+        When ``one_shot_initial`` is explicitly true, an expected-absent base
+        (``-1``/empty path) publishes the first visible snapshot as version
+        one, preserving the legacy generation after its removed empty
+        version-zero bootstrap. Unflagged expected-absent calls retain the
+        ordinary version-zero contract.
         ``lock_token`` must still own the per-table Redis lock when the Lua
         script executes.  The comparison, fencing check, leaf update, and root
         invalidation happen in one Redis transaction, so readers can never
         combine a new leaf with an old root generation (or vice versa).
 
-        An ambiguous expected-absent creation is reconciled once against its
+        An ambiguous flagged one-shot creation is reconciled once against its
         exact immutable leaf ``commit_id``, version, path, and payload digest;
         blindly retrying it would conflict with its own created leaf. Normal
         mutation ambiguity retains the established propagation behavior.
@@ -6706,15 +6726,24 @@ return 1
         """
         if not lock_token:
             raise LockLostError("snapshot publication requires a fencing lock token")
+        if type(one_shot_initial) is not bool:
+            raise TypeError("one_shot_initial must be a boolean")
         timestamp = _publication_timestamp(now_ms)
         base_version = _lua_safe_integer(
             expected_version,
             field="expected snapshot version",
             minimum=-1,
         )
+        if one_shot_initial and (
+            base_version != -1 or expected_path != ""
+        ):
+            raise ValueError(
+                "one_shot_initial requires expected_version=-1 and an empty "
+                "expected_path"
+            )
         if not isinstance(payload, Mapping):
             raise ValueError("snapshot payload must be a JSON object")
-        successor_version = 1 if base_version == -1 else base_version + 1
+        successor_version = 1 if one_shot_initial else base_version + 1
         if (
             type(payload.get("snapshot_version")) is not int
             or payload["snapshot_version"] != successor_version
@@ -6777,7 +6806,7 @@ return 1
             raise ValueError(
                 "snapshot payload is not JSON serializable"
             ) from exc
-        if base_version == -1:
+        if one_shot_initial:
             payload_version = payload.get("snapshot_version")
             if payload_version is not None and (
                 type(payload_version) is not int
@@ -6790,7 +6819,7 @@ return 1
                 )
         payload_digest = (
             hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
-            if base_version == -1
+            if one_shot_initial
             else ""
         )
 
@@ -6885,6 +6914,7 @@ return 1
                         mirror_pin_raw,
                         tombstone_prefix,
                         payload_digest,
+                        "1" if one_shot_initial else "0",
                     ],
                 )
             else:
@@ -6919,16 +6949,17 @@ return 1
                         quality_generation,
                         tombstone_prefix,
                         payload_digest,
+                        "1" if one_shot_initial else "0",
                     ],
                 )
         except redis.RedisError as exc:
             # A timeout/disconnect can arrive after Redis executed the atomic
-            # script. Expected-absent creation cannot be blindly retried: it
-            # would conflict with its own successfully-created leaf, so prove
-            # that exact first commit from its persisted payload digest. Normal
-            # mutations retain the established ambiguous-error behavior and
-            # leaf shape; they do not pay a hash/reconciliation cost.
-            if base_version == -1:
+            # script. A flagged one-shot creation cannot be blindly retried:
+            # it would conflict with its own successfully-created leaf, so
+            # prove that exact first commit from its persisted payload digest.
+            # Normal mutations retain the established ambiguous-error behavior
+            # and leaf shape; they do not pay a hash/reconciliation cost.
+            if one_shot_initial:
                 reconciled = self._reconcile_snapshot_commit(
                     org,
                     sup,
@@ -7026,6 +7057,11 @@ return 1
                 "Redis rejected invalid snapshot payload: generation does not "
                 f"match its fenced successor for {org}/{sup}/{simple}"
             )
+        if code == -17:
+            raise ValueError(
+                "Redis rejected an invalid one-shot initial publication flag "
+                f"or base identity for {org}/{sup}/{simple}"
+            )
         raise RuntimeError(f"Unknown snapshot commit status {code}")
 
     def _reconcile_snapshot_commit(
@@ -7041,7 +7077,8 @@ return 1
     ) -> Optional[tuple[int, int]]:
         """Return committed versions when an ambiguous reply actually landed.
 
-        This proof is intentionally restricted to expected-absent creation.
+        This proof is intentionally restricted by the caller to a flagged
+        one-shot expected-absent creation.
         The exact leaf commit id, path, version-one successor, and digest of
         the original payload JSON are written atomically with root/schema/index
         state. Comparing the digest rather than Lua's decoded/re-encoded cache

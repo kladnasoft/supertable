@@ -430,6 +430,7 @@ class DataWriter:
             *,
             simple_table: SimpleTable,
             expected_version: int,
+            one_shot_initial: bool = False,
     ) -> None:
         """Fail closed before Redis can expose an invalid snapshot cache.
 
@@ -451,9 +452,16 @@ class DataWriter:
                 + ", ".join(sorted(missing))
             )
 
+        if type(one_shot_initial) is not bool:
+            raise TypeError("one_shot_initial must be a boolean")
+        if one_shot_initial and expected_version != -1:
+            raise ValueError(
+                "one-shot initial publication requires an absent base"
+            )
+
         snapshot_version = payload.get("snapshot_version")
         successor_version = (
-            1 if expected_version == -1 else expected_version + 1
+            1 if one_shot_initial else expected_version + 1
         )
         if (
             type(snapshot_version) is not int
@@ -513,6 +521,7 @@ class DataWriter:
         mirror_pin: str | None = None,
         notify_quality: bool = False,
         durability_batch: Any | None = None,
+        one_shot_initial: bool = False,
     ) -> None:
         """Publish a snapshot through the fenced atomic catalog primitive.
 
@@ -521,6 +530,8 @@ class DataWriter:
         could let a late writer overwrite a newer deletion vector, resurrecting
         rows.  Catalog adapters must implement the same atomic contract.
         """
+        if type(one_shot_initial) is not bool:
+            raise TypeError("one_shot_initial must be a boolean")
         atomic_commit = getattr(type(self.catalog), "commit_snapshot", None)
         if callable(atomic_commit):
             leaf = getattr(simple_table, "_last_snapshot_leaf", None)
@@ -541,10 +552,17 @@ class DataWriter:
                 or (expected_version == -1 and expected_path)
             ):
                 raise RuntimeError("Current leaf has an invalid version")
+            if one_shot_initial and (
+                expected_version != -1 or expected_path != ""
+            ):
+                raise ValueError(
+                    "one-shot initial publication requires an absent base"
+                )
             self._validate_snapshot_for_publish(
                 payload,
                 simple_table=simple_table,
                 expected_version=expected_version,
+                one_shot_initial=one_shot_initial,
             )
             mirror_formats = list(mirrors or [])
             if mirror_formats:
@@ -595,6 +613,8 @@ class DataWriter:
             )
             if atomic_quality:
                 commit_kwargs["quality_generation"] = commit_id
+            if one_shot_initial:
+                commit_kwargs["one_shot_initial"] = True
             try:
                 if durability_batch is not None:
                     # The directory barrier is complete at this point.  Mark
@@ -2561,6 +2581,7 @@ class DataWriter:
                             and simple_name.endswith("__")
                         ),
                         durability_batch=durability_batch,
+                        one_shot_initial=initial_creation,
                     )
                 if prev_tombstone_path and prev_tombstone_path != tombstone_path:
                     evict_tombstone(
