@@ -49,6 +49,10 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from supertable.quality.serialization import normalize_json_value
+from supertable.tombstone_manifest_v2 import (
+    TombstoneManifestV2Error,
+    normalize_snapshot_tombstone_state,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2757,21 +2761,18 @@ def _table_snapshot_metadata_with_presence(
             total_rows += rows
 
     if rows_complete:
-        tombstone = snapshot.get("tombstone")
-        tombstone_rows = snapshot.get("tombstone_rows")
-        if tombstone:
-            if (
-                isinstance(tombstone_rows, bool)
-                or not isinstance(tombstone_rows, int)
-                or tombstone_rows <= 0
-                or tombstone_rows > total_rows
-            ):
-                rows_complete = False
-            else:
-                total_rows -= tombstone_rows
-        elif tombstone_rows not in (None, 0):
-            # A count without an active deletion-vector pointer is ambiguous.
+        try:
+            tombstone_state = normalize_snapshot_tombstone_state(snapshot)
+        except (TypeError, TombstoneManifestV2Error):
+            # Incomplete, hybrid, future, or otherwise malformed state is
+            # unknown.  Never let truthiness/int coercion turn it into zero.
             rows_complete = False
+        else:
+            if tombstone_state.pointer is not None:
+                if tombstone_state.rows > total_rows:
+                    rows_complete = False
+                else:
+                    total_rows -= tombstone_state.rows
 
     return (
         True,

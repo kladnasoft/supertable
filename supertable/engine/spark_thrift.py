@@ -28,7 +28,12 @@ from supertable.engine.engine_common import (
     rewrite_query_with_hashed_tables,
     redact_url_credentials,
     snapshot_spark_type,
+    tombstone_data_paths,
     validate_rbac_binding_stability,
+)
+from supertable.tombstone_manifest_v2 import (
+    TOMBSTONE_FORMAT_V2,
+    validate_snapshot_tombstone_state,
 )
 
 from urllib.parse import urlparse, unquote
@@ -973,6 +978,46 @@ _SPARK_CANONICAL_RESERVED = {
 }
 
 
+def _validate_spark_tombstone_definition(tombstone_def) -> tuple[bool, int]:
+    """Return ``(active, format)`` after closing malformed direct states."""
+    if tombstone_def is None:
+        return False, 1
+    pointer = getattr(tombstone_def, "tombstone_path", None)
+    cache_key = getattr(tombstone_def, "cache_key", None)
+    rows = getattr(tombstone_def, "expected_rows", None)
+    digest = getattr(tombstone_def, "tombstone_digest", None)
+    tombstone_format = getattr(tombstone_def, "tombstone_format", None)
+    segments = getattr(tombstone_def, "segments", ())
+    if pointer is not None and (
+        not isinstance(pointer, str) or not pointer
+    ):
+        raise RuntimeError("Invalid Spark deletion-vector resolved path")
+    try:
+        normalized_format = validate_snapshot_tombstone_state(
+            cache_key if pointer is not None else None,
+            rows,
+            digest,
+            format_present=tombstone_format is not None,
+            tombstone_format=tombstone_format,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Invalid Spark deletion-vector snapshot state") from exc
+
+    if pointer is None:
+        if cache_key is not None or segments != ():
+            raise RuntimeError(
+                "Invalid empty Spark deletion-vector representation"
+            )
+        return False, normalized_format
+    try:
+        tombstone_data_paths(tombstone_def)
+    except Exception as exc:
+        raise RuntimeError(
+            "Invalid Spark deletion-vector representation"
+        ) from exc
+    return True, normalized_format
+
+
 def _spark_create_tombstone_view(
         cursor,
         source_table: str,
@@ -992,6 +1037,25 @@ def _spark_create_tombstone_view(
     Created on top of the reflection table (before RBAC), so the anti-join
     still has ``__rowid__`` and RBAC never sees the system columns.
     """
+    active_tombstone, tombstone_format = (
+        _validate_spark_tombstone_definition(tombstone_def)
+    )
+    if tombstone_format == TOMBSTONE_FORMAT_V2:
+        # Spark cannot bind its resolved input_file_name() values back to the
+        # stable logical keys stored in the deletion vector. Never interpret
+        # the JSON manifest as Parquet or silently ignore its segments.
+        raise RuntimeError(
+            "Spark does not support active tombstone_format=2 deletion vectors"
+        )
+    if active_tombstone:
+        # Spark's input_file_name() exposes resolved s3a/gs/abfss or signed
+        # URLs, while the DV stores raw catalog keys. Reject before DESCRIBE or
+        # any other source setup rather than applying a rowid-only anti-join.
+        raise RuntimeError(
+            "Spark deletion-vector reads require composite source-file + "
+            "row-id identity and are not supported safely"
+        )
+
     describe_error = None
     src_desc = []
     try:
@@ -1671,6 +1735,27 @@ class SparkThriftExecutor:
         If the timeout fires the connection is forcibly closed, which unblocks any
         pending Thrift RPC and raises a RuntimeError to the caller.
         """
+        for tombstone in (
+            getattr(reflection, "tombstone_views", None) or {}
+        ).values():
+            active_tombstone, tombstone_format = (
+                _validate_spark_tombstone_definition(tombstone)
+            )
+            if tombstone_format == TOMBSTONE_FORMAT_V2:
+                # Preserve the current format-2 policy (including a valid
+                # explicit empty state), but only after validating the full
+                # discriminated state. Malformed hybrids must not reach setup.
+                raise RuntimeError(
+                    "Spark does not support active tombstone_format=2 "
+                    "deletion vectors"
+                )
+            if active_tombstone:
+                # Reject before parser work, fleet selection, credentials, or
+                # a Thrift connection. AUTO already excludes active DVs.
+                raise RuntimeError(
+                    "Spark deletion-vector reads require composite source-file "
+                    "+ row-id identity and are not supported safely"
+                )
         # This must precede cluster selection, connection establishment and
         # storage configuration.  In particular, AUTO requests are parsed with
         # DuckDB grammar and only learn that Spark won during routing.

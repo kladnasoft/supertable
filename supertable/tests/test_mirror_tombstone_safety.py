@@ -11,7 +11,19 @@ from supertable.mirroring.mirror_iceberg import write_iceberg_table
 @pytest.mark.parametrize(
     "snapshot",
     [
-        {"resources": [], "tombstone": "table/tombstone/deleted.parquet", "tombstone_rows": 1},
+        {
+            "resources": [],
+            "tombstone": "table/tombstone/deleted.parquet",
+            "tombstone_rows": 1,
+            "tombstone_digest": "a" * 64,
+        },
+        {
+            "resources": [],
+            "tombstone": "table/tombstone/manifest.json",
+            "tombstone_rows": 1,
+            "tombstone_digest": "b" * 64,
+            "tombstone_format": 2,
+        },
         {"resources": [], "tombstone": None, "tombstone_rows": 1},
     ],
 )
@@ -36,7 +48,12 @@ def test_mirror_rejects_any_active_deletion_vector(snapshot):
 
 def test_mirror_accepts_a_fully_drained_snapshot():
     super_table = MagicMock()
-    snapshot = {"resources": [], "tombstone": None, "tombstone_rows": 0}
+    snapshot = {
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+    }
 
     with patch(
         "supertable.mirroring.mirror_formats.write_parquet_table"
@@ -51,9 +68,95 @@ def test_mirror_accepts_a_fully_drained_snapshot():
     write_parquet.assert_called_once_with(super_table, "events", snapshot)
 
 
+def test_mirror_accepts_authoritative_pre_dv_snapshot():
+    super_table = MagicMock()
+    snapshot = {"resources": []}
+
+    with patch(
+        "supertable.mirroring.mirror_formats.write_parquet_table"
+    ) as write_parquet:
+        MirrorFormats.mirror_if_enabled(
+            super_table,
+            "events",
+            snapshot,
+            mirrors=["PARQUET"],
+        )
+
+    write_parquet.assert_called_once_with(super_table, "events", snapshot)
+
+
+def test_mirror_accepts_the_exact_drained_v2_state():
+    super_table = MagicMock()
+    snapshot = {
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "tombstone_format": 2,
+    }
+
+    with patch(
+        "supertable.mirroring.mirror_formats.write_parquet_table"
+    ) as write_parquet:
+        MirrorFormats.mirror_if_enabled(
+            super_table,
+            "events",
+            snapshot,
+            mirrors=["PARQUET"],
+        )
+
+    write_parquet.assert_called_once_with(super_table, "events", snapshot)
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        {
+            "resources": [],
+            "tombstone": None,
+            "tombstone_rows": "0",
+            "tombstone_digest": None,
+        },
+        {
+            "resources": [],
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+            "tombstone_format": "2",
+        },
+        {
+            "resources": [],
+            "tombstone": "table/tombstone/manifest.json",
+            "tombstone_rows": 1,
+            "tombstone_digest": "a" * 64,
+        },
+    ],
+)
+def test_mirror_never_coerces_malformed_deletion_state_to_empty(snapshot):
+    super_table = MagicMock()
+
+    with (
+        patch("supertable.mirroring.mirror_formats.write_parquet_table") as writer,
+        pytest.raises(RuntimeError, match="active deletion vector"),
+    ):
+        MirrorFormats.mirror_if_enabled(
+            super_table,
+            "events",
+            snapshot,
+            mirrors=["PARQUET"],
+        )
+
+    writer.assert_not_called()
+
+
 def test_dispatch_reports_exact_failed_and_completed_formats():
     super_table = MagicMock()
-    snapshot = {"resources": [], "tombstone": None, "tombstone_rows": 0}
+    snapshot = {
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+    }
     with (
         patch("supertable.mirroring.mirror_formats.write_delta_table") as delta,
         patch("supertable.mirroring.mirror_formats.verify_delta_table") as verify_delta,
@@ -81,7 +184,12 @@ def test_dispatch_reports_exact_failed_and_completed_formats():
 
 def test_dispatch_verifies_normal_publication_before_reporting_success():
     super_table = MagicMock()
-    snapshot = {"resources": [], "tombstone": None, "tombstone_rows": 0}
+    snapshot = {
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+    }
     with (
         patch("supertable.mirroring.mirror_formats.write_iceberg_table") as writer,
         patch(

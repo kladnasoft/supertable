@@ -1028,6 +1028,7 @@ def test_snapshot_metadata_reports_only_sealed_live_row_count():
         ],
         "tombstone": "deletions.parquet",
         "tombstone_rows": 2,
+        "tombstone_digest": "a" * 64,
     }
     assert scheduler._table_snapshot_metadata(Metadata(complete), TABLE) == (
         1_786_665_600_000,
@@ -1039,6 +1040,71 @@ def test_snapshot_metadata_reports_only_sealed_live_row_count():
     assert scheduler._table_snapshot_metadata(Metadata(ambiguous), TABLE) == (
         1_786_665_600_000,
         50,
+        None,
+    )
+
+    v2 = dict(
+        complete,
+        tombstone="table/tombstone/manifest.json",
+        tombstone_format=2,
+    )
+    assert scheduler._table_snapshot_metadata(Metadata(v2), TABLE) == (
+        1_786_665_600_000,
+        50,
+        5,
+    )
+
+    pre_dv = {
+        "last_updated_ms": 1_786_665_600_000,
+        "resources": [{"file_size": 20, "rows": 3}],
+    }
+    assert scheduler._table_snapshot_metadata(Metadata(pre_dv), TABLE) == (
+        1_786_665_600_000,
+        20,
+        3,
+    )
+
+
+@pytest.mark.parametrize(
+    "deletion_state",
+    [
+        {
+            "tombstone": None,
+            "tombstone_rows": "0",
+            "tombstone_digest": None,
+        },
+        {
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+            "tombstone_format": "2",
+        },
+        {
+            "tombstone": "table/tombstone/manifest.json",
+            "tombstone_rows": 1,
+            "tombstone_digest": "a" * 64,
+        },
+        {
+            "tombstone": "deletions.parquet",
+            "tombstone_rows": 1,
+            "tombstone_digest": None,
+        },
+    ],
+)
+def test_snapshot_metadata_never_coerces_malformed_deletion_state_to_zero(
+    deletion_state,
+):
+    class Metadata:
+        def get_table_stats(self, *_args):
+            return [{
+                "last_updated_ms": 1_786_665_600_000,
+                "resources": [{"file_size": 20, "rows": 3}],
+                **deletion_state,
+            }]
+
+    assert scheduler._table_snapshot_metadata(Metadata(), TABLE) == (
+        1_786_665_600_000,
+        20,
         None,
     )
 

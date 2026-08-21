@@ -29,13 +29,28 @@ from supertable.config.defaults import default
 from supertable.config.settings import settings
 from supertable.storage.storage_factory import get_storage
 from supertable.storage.storage_interface import ObjectMetadata, StorageInterface
+from supertable.tombstone_manifest_v2 import (
+    MAX_JSON_EXACT_INTEGER,
+    MAX_TOMBSTONE_MANIFEST_V2_BYTES,
+    MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS,
+    TOMBSTONE_FORMAT_V1,
+    TOMBSTONE_FORMAT_V2,
+    TombstoneManifestV2,
+    TombstoneManifestV2Error,
+    TombstoneSegment,
+    load_tombstone_manifest_v2,
+    validate_logical_storage_path,
+    validate_tombstone_segment_observation,
+)
 from supertable.utils.profiler import Profiler, get_null_profiler
+from supertable.utils.snapshot import read_bounded_tombstone_manifest_bytes
 from supertable.data_classes import (
     IntegerDomainBound,
     PredInterval,
     ResourceObjectSeal,
     ResourceStatsSeal,
     RowGroupSelection,
+    TombstoneSegmentDef,
 )
 
 # Target row-group size for all Parquet writes.
@@ -48,12 +63,78 @@ _STATS_CACHE_IDENTITY_PREFIX = "__supertable_stats_cache__/"
 _TOMBSTONE_CACHE_IDENTITY_PREFIX = "__supertable_tombstone_cache__/"
 
 
+@dataclass(frozen=True)
+class _LocalArtifactCacheIdentityState:
+    """Inputs that make one built-in local-storage cache scope reusable."""
+
+    process_id: int
+    organization: str
+    storage_id: int
+    storage_root: str
+
+
+def _local_artifact_cache_identity_state(
+        organization: str,
+        storage: object,
+) -> Optional[_LocalArtifactCacheIdentityState]:
+    """Return a cacheable state only for the exact built-in LocalStorage.
+
+    Remote and third-party adapters may rotate credentials behind a stable
+    Python object.  They deliberately stay on FileCache's live namespace/auth
+    sampling path below.  LocalStorage has no credential scope, exposes a
+    canonical absolute root, and has a frozen ``{"provider": "local"}``
+    namespace, so its identity inputs can safely be retained by one writer.
+    """
+    try:
+        from supertable.storage.local_storage import LocalStorage
+
+        if type(storage) is not LocalStorage:
+            return None
+        if storage.cache_namespace() != {"provider": "local"}:
+            return None
+        if storage.is_local_storage() is not True:
+            return None
+        root = storage.root
+        if type(root) is not str or not root or not os.path.isabs(root):
+            return None
+    except Exception:
+        return None
+    return _LocalArtifactCacheIdentityState(
+        process_id=os.getpid(),
+        organization=str(organization or ""),
+        storage_id=id(storage),
+        storage_root=root,
+    )
+
+
+def _local_artifact_cache_scope(
+        state: _LocalArtifactCacheIdentityState,
+) -> str:
+    """Hash the non-secret, process-local LocalStorage cache boundary."""
+    payload = {
+        "organization": state.organization,
+        "process_id": state.process_id,
+        "storage_namespace": {"provider": "local"},
+        "storage_root": state.storage_root,
+    }
+    return hashlib.sha256(json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        # Local filesystem roots may contain surrogate-escaped bytes returned
+        # by os.fsdecode().  ASCII JSON escaping preserves those code points
+        # deterministically while keeping the hash input encodable.
+        ensure_ascii=True,
+    ).encode("ascii")).hexdigest()
+
+
 def _artifact_cache_identity(
         artifact_path: str,
         *,
         prefix: str,
         organization: str = "",
         storage: Optional[object] = None,
+        identity_scope: Optional[str] = None,
 ) -> str:
     """Return an organization/storage/auth-scoped immutable artifact key."""
     value = str(artifact_path or "")
@@ -65,21 +146,30 @@ def _artifact_cache_identity(
             active_storage = _get_storage()
         except Exception:
             active_storage = None
-    try:
-        # FileCache owns the hardened namespace contract for every built-in
-        # backend, including credential fingerprints and opaque-client isolation.
-        # Constructing it with max_bytes=0 computes hashes without touching disk.
-        from supertable.engine.file_cache import FileCache
-        namespace = FileCache(
-            active_storage, organization, max_bytes=0, workers=1,
+    scope = identity_scope
+    if scope is None:
+        local_state = _local_artifact_cache_identity_state(
+            organization, active_storage,
         )
-        scope = f"{namespace._organization_hash}{namespace._storage_hash}"
-    except Exception:
-        fallback = (
-            f"{organization}\0{type(active_storage).__module__}."
-            f"{type(active_storage).__qualname__}\0{id(active_storage)}"
-        )
-        scope = hashlib.sha256(fallback.encode("utf-8")).hexdigest()
+        if local_state is not None:
+            scope = _local_artifact_cache_scope(local_state)
+        else:
+            try:
+                # Remote/custom adapters stay byte-for-byte on FileCache's
+                # hardened namespace contract, including live credential
+                # fingerprints and opaque-client isolation.  Do not retain this
+                # result: refreshable authorization may change between calls.
+                from supertable.engine.file_cache import FileCache
+                namespace = FileCache(
+                    active_storage, organization, max_bytes=0, workers=1,
+                )
+                scope = f"{namespace._organization_hash}{namespace._storage_hash}"
+            except Exception:
+                fallback = (
+                    f"{organization}\0{type(active_storage).__module__}."
+                    f"{type(active_storage).__qualname__}\0{id(active_storage)}"
+                )
+                scope = hashlib.sha256(fallback.encode("utf-8")).hexdigest()
     table_key = _PathKeyedFrameCache._key(value) if value else ""
     table_hash = hashlib.sha256(table_key.encode("utf-8")).hexdigest()
     version_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -117,6 +207,86 @@ def tombstone_cache_identity(
         organization=organization,
         storage=storage,
     )
+
+
+class _WriterArtifactCacheIdentities:
+    """Reuse only the immutable built-in LocalStorage identity per writer."""
+
+    def __init__(self) -> None:
+        self._process_id = os.getpid()
+        self._state: Optional[_LocalArtifactCacheIdentityState] = None
+        self._scope: Optional[str] = None
+        self._lock = threading.Lock()
+
+    def _local_scope(
+            self,
+            organization: str,
+            storage: object,
+    ) -> Optional[str]:
+        process_id = os.getpid()
+        if process_id != self._process_id:
+            # A lock inherited while another parent thread held it can never be
+            # released in the child.  Replace both synchronization and cached
+            # identity before examining the forked writer.
+            self._lock = threading.Lock()
+            self._process_id = process_id
+            self._state = None
+            self._scope = None
+
+        state = _local_artifact_cache_identity_state(organization, storage)
+        if state is None:
+            return None
+        with self._lock:
+            if state != self._state:
+                self._state = state
+                self._scope = _local_artifact_cache_scope(state)
+            return self._scope
+
+    def stats(
+            self,
+            path: str,
+            *,
+            organization: str,
+            storage: object,
+    ) -> str:
+        value = str(path or "")
+        if value.startswith(_STATS_CACHE_IDENTITY_PREFIX):
+            return value
+        scope = self._local_scope(organization, storage)
+        if scope is None:
+            return stats_cache_identity(
+                value, organization=organization, storage=storage,
+            )
+        return _artifact_cache_identity(
+            value,
+            prefix=_STATS_CACHE_IDENTITY_PREFIX,
+            organization=organization,
+            storage=storage,
+            identity_scope=scope,
+        )
+
+    def tombstone(
+            self,
+            path: str,
+            *,
+            organization: str,
+            storage: object,
+    ) -> str:
+        value = str(path or "")
+        if value.startswith(_TOMBSTONE_CACHE_IDENTITY_PREFIX):
+            return value
+        scope = self._local_scope(organization, storage)
+        if scope is None:
+            return tombstone_cache_identity(
+                value, organization=organization, storage=storage,
+            )
+        return _artifact_cache_identity(
+            value,
+            prefix=_TOMBSTONE_CACHE_IDENTITY_PREFIX,
+            organization=organization,
+            storage=storage,
+            identity_scope=scope,
+        )
 
 
 def _resolve_limits(table_config: Optional[dict]) -> Tuple[int, int]:
@@ -2452,10 +2622,33 @@ TOMBSTONE_SCHEMA: Dict[str, polars.DataType] = {
     ROWID_COL: polars.Int64,
 }
 
-# (logical row count, canonical digest, referenced immutable data-file keys).
-# Stored next to an immutable cached frame so a cache hit can re-check the
-# pinned snapshot contract without scanning the deletion vector again.
-_TombstoneCacheSeal = Tuple[int, str, FrozenSet[str]]
+@dataclass(frozen=True)
+class LoadedTombstoneState:
+    """Validated physical representation behind one snapshot DV pointer.
+
+    ``frame`` is the logical union consumed by existing writer/compaction APIs.
+    For v2, ``segments`` and ``root_digest`` retain the independently sealed
+    manifest state so a later writer can append one segment without rereading
+    or rewriting the previous union.  A v1 state has exactly one synthetic
+    segment descriptor when a caller requests migration metadata.  Explicit
+    empty v2 state has no pointer, digest, or segments.
+    """
+
+    frame: polars.DataFrame
+    tombstone_format: int
+    tombstone_path: Optional[str]
+    root_digest: Optional[str]
+    segments: Tuple[TombstoneSegment, ...] = ()
+
+
+@dataclass(frozen=True)
+class _TombstoneCacheSeal:
+    """Immutable validation metadata stored beside one cached DV frame."""
+
+    rows: int
+    digest: str
+    referenced_files: FrozenSet[str]
+    state: Optional[LoadedTombstoneState] = None
 
 
 def _empty_tombstone_df() -> polars.DataFrame:
@@ -2657,6 +2850,7 @@ def _tombstone_cache_seal(
         df: polars.DataFrame,
         *,
         known_digest: Optional[str] = None,
+        state: Optional[LoadedTombstoneState] = None,
         source: str,
 ) -> _TombstoneCacheSeal:
     """Build immutable cache metadata for an already validated frame."""
@@ -2666,7 +2860,12 @@ def _tombstone_cache_seal(
     referenced = frozenset(
         df.get_column(TOMBSTONE_FILE_COL).unique().to_list()
     ) if df.height else frozenset()
-    return int(df.height), digest, referenced
+    return _TombstoneCacheSeal(
+        rows=int(df.height),
+        digest=digest,
+        referenced_files=referenced,
+        state=state,
+    )
 
 
 def _validate_cached_tombstone_seal(
@@ -2678,7 +2877,14 @@ def _validate_cached_tombstone_seal(
         source: str,
 ) -> None:
     """Validate a pinned snapshot against cached immutable metadata only."""
-    rows, digest, referenced = seal
+    if isinstance(seal, tuple):
+        # Compatibility with entries seeded by a pre-v2 process in the same
+        # interpreter during rolling tests/upgrades.
+        rows, digest, referenced = seal[:3]
+    else:
+        rows = seal.rows
+        digest = seal.digest
+        referenced = seal.referenced_files
     expected = _checked_tombstone_expected_rows(expected_rows, source=source)
     wanted_digest = _checked_tombstone_expected_digest(
         expected_digest, source=source,
@@ -2716,6 +2922,7 @@ def _write_df_parquet(
         path: str,
         compression_level: int = 1,
         profiler: Optional[Profiler] = None,
+        storage: Optional[object] = None,
 ) -> int:
     """Write a Polars DataFrame to a single parquet file on the active storage.
 
@@ -2723,9 +2930,9 @@ def _write_df_parquet(
     no column statistics or Hive partitioning. Returns the file size in bytes.
     """
     p = profiler or get_null_profiler()
-    storage = _get_storage()
-    write_bytes = getattr(storage, "write_bytes", None)
-    write_parquet = getattr(storage, "write_parquet", None)
+    active_storage = storage if storage is not None else _get_storage()
+    write_bytes = getattr(active_storage, "write_bytes", None)
+    write_parquet = getattr(active_storage, "write_parquet", None)
 
     data: Optional[bytes] = None
     arrow_tbl: Optional[pa.Table] = None
@@ -2780,7 +2987,7 @@ def _write_df_parquet(
     if wrote_exact_bytes and data is not None:
         return len(data)
     try:
-        return int(_get_storage().size(path))
+        return int(active_storage.size(path))
     except Exception:
         try:
             return os.path.getsize(path)
@@ -4444,7 +4651,13 @@ def resolve_overwrite_writes(
     return filtered, pairs
 
 
-def _partitioned_new_path(base_dir: str, alias: str) -> str:
+def _partitioned_new_artifact_path(
+        base_dir: str,
+        alias: str,
+        extension: str,
+        *,
+        storage: Optional[object] = None,
+) -> str:
     """Return a fresh versioned artifact path under an hour-partitioned subdir.
 
     Spreads immutable tombstone/stats artifacts across
@@ -4459,10 +4672,16 @@ def _partitioned_new_path(base_dir: str, alias: str) -> str:
     part_dir = os.path.join(base_dir, hourly_partition_subpath())
     try:
         # Direct makedirs (idempotent local, no-op object) — avoids a 404 prefix HEAD.
-        _get_storage().makedirs(part_dir)
+        active_storage = storage if storage is not None else _get_storage()
+        active_storage.makedirs(part_dir)
     except Exception:
         pass
-    return os.path.join(part_dir, generate_filename(alias, "parquet"))
+    return os.path.join(part_dir, generate_filename(alias, extension))
+
+
+def _partitioned_new_path(base_dir: str, alias: str) -> str:
+    """Backward-compatible Parquet spelling for existing metadata writers."""
+    return _partitioned_new_artifact_path(base_dir, alias, "parquet")
 
 
 def build_tombstone_file(
@@ -4561,6 +4780,277 @@ def persist_tombstone_frame(
     return new_path, validated
 
 
+def persist_tombstone_segment_v2(
+        tombstone_dir: str,
+        frame: polars.DataFrame,
+        compression_level: int,
+        profiler: Optional[Profiler] = None,
+        *,
+        known_digest: Optional[str] = None,
+        storage: Optional[object] = None,
+) -> TombstoneSegment:
+    """Persist one non-empty immutable v2 segment and return all its seals."""
+    p = profiler or get_null_profiler()
+    with p.span("tombstone_v2.segment_validate"):
+        validated = validate_tombstone_frame(
+            frame, source="deletion-vector v2 segment to persist"
+        )
+    if validated.height == 0:
+        raise ValueError("Cannot persist an empty deletion-vector segment")
+    digest = _checked_tombstone_expected_digest(
+        known_digest, source="deletion-vector v2 segment"
+    )
+    if digest is None:
+        with p.span("tombstone_v2.segment_digest"):
+            digest = tombstone_digest(validated, assume_valid=True)
+    path = _partitioned_new_artifact_path(
+        tombstone_dir, "segment", "parquet", storage=storage,
+    )
+    with p.span("tombstone_v2.segment_encode_write"):
+        file_size = _write_df_parquet(
+            validated,
+            path,
+            compression_level,
+            profiler=p,
+            storage=storage,
+        )
+    p.add("tombstone_v2_segment_rows", validated.height)
+    p.add("tombstone_v2_segment_bytes", file_size)
+    p.add("tombstone_v2_segments_written", 1)
+    return TombstoneSegment(
+        file=path,
+        rows=int(validated.height),
+        file_size=int(file_size),
+        digest=digest,
+    )
+
+
+def persist_tombstone_manifest_v2(
+        tombstone_dir: str,
+        *,
+        organization: str,
+        super_name: str,
+        simple_name: str,
+        base_snapshot_version: int,
+        snapshot_version: int,
+        segments: Tuple[TombstoneSegment, ...],
+        profiler: Optional[Profiler] = None,
+        storage: Optional[object] = None,
+) -> Tuple[str, TombstoneManifestV2]:
+    """Persist one canonical standalone v2 manifest.
+
+    Segment descriptors are sorted by immutable logical path before the strict
+    core constructor validates the hard format cap and total cardinality.  The
+    canonical bytes are written directly so every backend stores the same root
+    representation; the snapshot pins ``manifest.digest()``.
+    """
+    p = profiler or get_null_profiler()
+    with p.span("tombstone_v2.manifest_encode"):
+        ordered = tuple(sorted(segments, key=lambda segment: segment.file))
+        manifest = TombstoneManifestV2(
+            organization=organization,
+            super_name=super_name,
+            simple_name=simple_name,
+            base_snapshot_version=base_snapshot_version,
+            snapshot_version=snapshot_version,
+            total_rows=sum(segment.rows for segment in ordered),
+            segments=ordered,
+        )
+        canonical = manifest.canonical_bytes()
+    path = _partitioned_new_artifact_path(
+        tombstone_dir, "manifest", "json", storage=storage,
+    )
+    active_storage = storage if storage is not None else _get_storage()
+    write_bytes = getattr(active_storage, "write_bytes", None)
+    if not callable(write_bytes):
+        raise RuntimeError(
+            "Configured storage provides no exact-byte manifest write method"
+        )
+    with p.span("tombstone_v2.manifest_write"):
+        write_bytes(path, canonical)
+    p.add("tombstone_v2_manifest_bytes", len(canonical))
+    p.add("tombstone_v2_manifests_written", 1)
+    p.add("tombstone_v2_segment_count", len(ordered))
+    return path, manifest
+
+
+def persist_tombstone_v2_frame(
+        tombstone_dir: str,
+        frame: polars.DataFrame,
+        compression_level: int,
+        *,
+        organization: str,
+        super_name: str,
+        simple_name: str,
+        base_snapshot_version: int,
+        snapshot_version: int,
+        profiler: Optional[Profiler] = None,
+        storage: Optional[object] = None,
+) -> Tuple[Optional[str], polars.DataFrame, LoadedTombstoneState]:
+    """Persist a materialised successor as one segment plus one v2 root.
+
+    This is used after reclamation/physical compaction changes an arbitrary set
+    of old segments.  Exact empty v2 state writes no object at all.
+    """
+    p = profiler or get_null_profiler()
+    with p.span("tombstone_v2.union_integrity"):
+        validated = validate_tombstone_frame(
+            frame, source="deletion-vector v2 successor to persist"
+        )
+    p.add("tombstone_v2_union_rows", validated.height)
+    if validated.height == 0:
+        return None, validated, LoadedTombstoneState(
+            frame=validated,
+            tombstone_format=TOMBSTONE_FORMAT_V2,
+            tombstone_path=None,
+            root_digest=None,
+            segments=(),
+        )
+    segment = persist_tombstone_segment_v2(
+        tombstone_dir,
+        validated,
+        compression_level,
+        profiler=p,
+        storage=storage,
+    )
+    path, manifest = persist_tombstone_manifest_v2(
+        tombstone_dir,
+        organization=organization,
+        super_name=super_name,
+        simple_name=simple_name,
+        base_snapshot_version=base_snapshot_version,
+        snapshot_version=snapshot_version,
+        segments=(segment,),
+        profiler=p,
+        storage=storage,
+    )
+    return path, validated, LoadedTombstoneState(
+        frame=validated,
+        tombstone_format=TOMBSTONE_FORMAT_V2,
+        tombstone_path=path,
+        root_digest=manifest.digest(),
+        segments=manifest.segments,
+    )
+
+
+def build_tombstone_v2(
+        tombstone_dir: str,
+        previous_state: Optional[LoadedTombstoneState],
+        new_pairs: List[Tuple[str, int]],
+        compression_level: int,
+        *,
+        organization: str,
+        super_name: str,
+        simple_name: str,
+        base_snapshot_version: int,
+        snapshot_version: int,
+        profiler: Optional[Profiler] = None,
+        persist: bool = True,
+        validation_out: Optional[Dict[str, Any]] = None,
+        storage: Optional[object] = None,
+) -> Tuple[Optional[str], Optional[polars.DataFrame], Optional[LoadedTombstoneState]]:
+    """Append one logical delta segment and publish a new standalone root.
+
+    The prior union stays immutable.  At the hard 32-segment format cap the
+    complete validated union is consolidated into one replacement segment.
+    ``persist=False`` materialises only the union for an immediately following
+    physical drain and emits neither a segment nor a manifest.
+    """
+    if not new_pairs:
+        return (
+            previous_state.tombstone_path if previous_state is not None else None,
+            None,
+            previous_state,
+        )
+
+    p = profiler or get_null_profiler()
+    with p.span("tombstone_v2.delta_validate"):
+        new_df = polars.DataFrame(
+            {
+                TOMBSTONE_FILE_COL: [file for file, _rowid in new_pairs],
+                ROWID_COL: [int(rowid) for _file, rowid in new_pairs],
+            },
+            schema=TOMBSTONE_SCHEMA,
+        )
+        new_df = validate_tombstone_frame(
+            new_df, source="new deletion-vector v2 segment"
+        )
+    p.add("tombstone_v2_delta_rows", new_df.height)
+    previous_frame = (
+        previous_state.frame
+        if previous_state is not None else _empty_tombstone_df()
+    )
+    prior_segments = (
+        previous_state.segments if previous_state is not None else ()
+    )
+    if previous_state is not None:
+        _normalized_tombstone_format(previous_state.tombstone_format)
+        if len(prior_segments) > MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS:
+            raise ValueError("Previous deletion-vector exceeds the segment cap")
+        if sum(segment.rows for segment in prior_segments) != previous_frame.height:
+            raise ValueError(
+                "Previous deletion-vector segment rows do not match its union"
+            )
+        if previous_frame.height and not prior_segments:
+            raise ValueError("Previous deletion-vector state has no segment seal")
+    delta = new_df
+    with p.span("tombstone_v2.union_integrity"):
+        combined = polars.concat(
+            [previous_frame, delta], how="vertical",
+        ) if previous_frame.height else delta
+        combined = validate_tombstone_frame(
+            combined, source="new deletion-vector v2 union"
+        )
+    p.add("tombstone_v2_union_rows", combined.height)
+    if validation_out is not None:
+        validation_out["frame"] = combined
+    if not persist:
+        return None, combined, None
+
+    if len(prior_segments) >= MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS:
+        p.add("tombstone_v2_consolidations", 1)
+        segments = (
+            persist_tombstone_segment_v2(
+                tombstone_dir,
+                combined,
+                compression_level,
+                profiler=profiler,
+                storage=storage,
+            ),
+        )
+    else:
+        delta_segment = persist_tombstone_segment_v2(
+            tombstone_dir,
+            delta,
+            compression_level,
+            profiler=profiler,
+            storage=storage,
+        )
+        segments = prior_segments + (delta_segment,)
+    path, manifest = persist_tombstone_manifest_v2(
+        tombstone_dir,
+        organization=organization,
+        super_name=super_name,
+        simple_name=simple_name,
+        base_snapshot_version=base_snapshot_version,
+        snapshot_version=snapshot_version,
+        segments=segments,
+        profiler=p,
+        storage=storage,
+    )
+    state = LoadedTombstoneState(
+        frame=combined,
+        tombstone_format=TOMBSTONE_FORMAT_V2,
+        tombstone_path=path,
+        root_digest=manifest.digest(),
+        segments=manifest.segments,
+    )
+    if validation_out is not None:
+        validation_out["state"] = state
+        validation_out["digest"] = state.root_digest
+    return path, combined, state
+
+
 def reclaim_fully_dead_files(
         resources: List[Dict],
         combined_dv: polars.DataFrame,
@@ -4655,6 +5145,8 @@ def reclaim_fully_dead_files(
     if not fully_dead:
         return set(), None, None
 
+    p.add("reclaimed_dead_files", len(fully_dead))
+
     survivors = combined_dv.filter(
         ~polars.col(TOMBSTONE_FILE_COL).is_in(list(fully_dead))
     )
@@ -4666,7 +5158,6 @@ def reclaim_fully_dead_files(
 
     new_path = _partitioned_new_path(tombstone_dir, "deleted")
     _write_df_parquet(survivors, new_path, compression_level, profiler=p)
-    p.add("reclaimed_dead_files", len(fully_dead))
     return fully_dead, new_path, survivors
 
 
@@ -6848,6 +7339,19 @@ def _cache_metadata_estimated_bytes(metadata: Any) -> int:
             else:
                 total += 64
         return total
+    if isinstance(metadata, _TombstoneCacheSeal):
+        state = metadata.state
+        return (
+            256
+            + sum(
+                256 + len(segment.file.encode("utf-8"))
+                for segment in (state.segments if state is not None else ())
+            )
+            + sum(
+                96 + len(item.encode("utf-8"))
+                for item in metadata.referenced_files
+            )
+        )
     return 1024
 
 
@@ -7103,19 +7607,297 @@ def cache_stats(
         _STATS_CACHE.put(identity, df, metadata)
 
 
+def _normalized_tombstone_format(value: Optional[int]) -> int:
+    if value is None:
+        return TOMBSTONE_FORMAT_V1
+    if type(value) is int and value == TOMBSTONE_FORMAT_V1:
+        return TOMBSTONE_FORMAT_V1
+    if type(value) is int and value == TOMBSTONE_FORMAT_V2:
+        return TOMBSTONE_FORMAT_V2
+    raise TombstoneManifestV2Error("tombstone_format must be integer 1 or 2")
+
+
+def _v1_loaded_tombstone_state(
+        *,
+        path: str,
+        frame: polars.DataFrame,
+        digest: Optional[str],
+        storage: Optional[object],
+        expected_segment_prefix: Optional[str],
+) -> LoadedTombstoneState:
+    logical_digest = _checked_tombstone_expected_digest(
+        digest, source=f"legacy deletion-vector {path}"
+    ) or tombstone_digest(frame, assume_valid=True)
+    active_storage = storage if storage is not None else _get_storage()
+    try:
+        file_size = int(active_storage.size(path))
+    except Exception as exc:
+        raise TombstoneManifestV2Error(
+            f"Unable to seal legacy deletion-vector size at {path!r}"
+        ) from exc
+    if expected_segment_prefix is not None:
+        prefix = validate_logical_storage_path(
+            expected_segment_prefix.rstrip("/"),
+            field_name="expected_segment_prefix",
+        ) + "/"
+        logical_path = validate_logical_storage_path(
+            path,
+            field_name="legacy deletion-vector path",
+            required_suffix=".parquet",
+        )
+        if not logical_path.startswith(prefix):
+            raise TombstoneManifestV2Error(
+                "legacy deletion-vector escapes the expected table prefix"
+            )
+    segment = TombstoneSegment(
+        file=path,
+        rows=int(frame.height),
+        file_size=file_size,
+        digest=logical_digest,
+    )
+    return LoadedTombstoneState(
+        frame=frame,
+        tombstone_format=TOMBSTONE_FORMAT_V1,
+        tombstone_path=path,
+        root_digest=logical_digest,
+        segments=(segment,),
+    )
+
+
+def _read_tombstone_manifest_v2(
+        path: str,
+        *,
+        storage: Optional[object],
+        loader: Optional[Callable[[], Any]],
+        required: bool,
+) -> Optional[Any]:
+    try:
+        if loader is not None:
+            raw = loader()
+            if isinstance(raw, str):
+                raw_size = len(raw.encode("utf-8"))
+            elif isinstance(raw, (bytes, bytearray, memoryview)):
+                raw_size = len(raw)
+            else:
+                # The strict canonical boundary below rejects decoded mappings.
+                # Do not attempt to serialize an arbitrary loader result here.
+                return raw
+            if not 1 <= raw_size <= MAX_TOMBSTONE_MANIFEST_V2_BYTES:
+                raise TombstoneManifestV2Error(
+                    "manifest JSON size is outside the supported bound"
+                )
+            return raw
+        active_storage = storage if storage is not None else _get_storage()
+        stat_object = getattr(active_storage, "stat_object", None)
+        read_range = getattr(active_storage, "read_range", None)
+        if not callable(stat_object) or not callable(read_range):
+            raise TombstoneManifestV2Error(
+                "Configured storage provides no bounded manifest read"
+            )
+        before = stat_object(path)
+        if not isinstance(before, ObjectMetadata):
+            raise TombstoneManifestV2Error(
+                "Configured storage returned invalid manifest metadata"
+            )
+        if before.identity_token() is None:
+            raise TombstoneManifestV2Error(
+                "Manifest metadata has no immutable provider identity"
+            )
+        manifest_size = before.size
+        if (
+            type(manifest_size) is not int
+            or not 1 <= manifest_size <= MAX_TOMBSTONE_MANIFEST_V2_BYTES
+        ):
+            raise TombstoneManifestV2Error(
+                "manifest JSON size is outside the supported bound"
+            )
+        raw = read_range(path, 0, manifest_size, expected=before)
+        if not isinstance(raw, (bytes, bytearray, memoryview)):
+            raise TombstoneManifestV2Error(
+                "bounded manifest read did not return bytes"
+            )
+        raw = bytes(raw)
+        if len(raw) != manifest_size:
+            raise TombstoneManifestV2Error(
+                "bounded manifest read returned a short or oversized payload"
+            )
+        after = stat_object(path)
+        if not isinstance(after, ObjectMetadata) or after != before:
+            raise TombstoneManifestV2Error(
+                "manifest object changed during the bounded read"
+            )
+        return raw
+    except Exception:
+        if required:
+            raise
+        logging.warning("[read] failed to read tombstone manifest at %s", path)
+        return None
+
+
+def _load_tombstone_manifest_v2_state(
+        tombstone_path: str,
+        *,
+        storage: Optional[object],
+        manifest_loader: Optional[Callable[[], Any]],
+        segment_loader: Optional[Callable[[TombstoneSegment], Any]],
+        required: bool,
+        expected_rows: Optional[int],
+        expected_digest: Optional[str],
+        allowed_files: Optional[Set[str]],
+        expected_organization: Optional[str],
+        expected_super_name: Optional[str],
+        expected_simple_name: Optional[str],
+        pinned_snapshot_version: Optional[int],
+        expected_segment_prefix: Optional[str],
+        profiler: Profiler,
+) -> Optional[LoadedTombstoneState]:
+    with profiler.span("tombstone_v2.manifest_read"):
+        raw = _read_tombstone_manifest_v2(
+            tombstone_path,
+            storage=storage,
+            loader=manifest_loader,
+            required=required,
+        )
+    if raw is None:
+        return None
+    with profiler.span("tombstone_v2.manifest_validate"):
+        manifest = load_tombstone_manifest_v2(
+            raw,
+            expected_organization=expected_organization,
+            expected_super_name=expected_super_name,
+            expected_simple_name=expected_simple_name,
+            pinned_snapshot_version=pinned_snapshot_version,
+            expected_total_rows=expected_rows,
+            expected_digest=expected_digest,
+            expected_segment_prefix=expected_segment_prefix,
+            require_canonical_json=True,
+        )
+    profiler.add("tombstone_v2_segments_loaded", len(manifest.segments))
+    profiler.add("tombstone_v2_manifest_rows", manifest.total_rows)
+    active_storage = storage if storage is not None else _get_storage()
+    stat_object = getattr(active_storage, "stat_object", None)
+    if not callable(stat_object):
+        raise TombstoneManifestV2Error(
+            "Configured storage provides no segment identity metadata"
+        )
+    frames: List[polars.DataFrame] = []
+    for segment in manifest.segments:
+        observed_size: Optional[int] = None
+        try:
+            before = stat_object(segment.file)
+            if not isinstance(before, ObjectMetadata):
+                raise TombstoneManifestV2Error(
+                    "Configured storage returned invalid segment metadata"
+                )
+            if before.identity_token() is None:
+                raise TombstoneManifestV2Error(
+                    "Segment metadata has no immutable provider identity"
+                )
+            if (
+                type(before.size) is not int
+                or before.size != segment.file_size
+            ):
+                raise TombstoneManifestV2Error(
+                    f"segment {segment.file!r} file_size does not match "
+                    "the manifest"
+                )
+            observed_size = before.size
+            loaded = (
+                segment_loader(segment)
+                if segment_loader is not None else None
+            )
+            if isinstance(loaded, tuple) and len(loaded) == 2:
+                segment_frame, observed_size = loaded
+            elif loaded is not None:
+                segment_frame = loaded
+            else:
+                segment_frame = _read_parquet_safe(
+                    segment.file,
+                    profiler=profiler,
+                    file_size=segment.file_size,
+                    required=True,
+                    storage=active_storage,
+                )
+            if segment_frame is None:
+                raise FileNotFoundError(
+                    f"Required deletion-vector segment is missing: {segment.file}"
+                )
+            with profiler.span("tombstone_v2.segment_validate"):
+                segment_frame = validate_tombstone_frame(
+                    segment_frame,
+                    expected_rows=segment.rows,
+                    expected_digest=segment.digest,
+                    allowed_files=allowed_files,
+                    source=f"deletion-vector segment {segment.file}",
+                )
+            validate_tombstone_segment_observation(
+                segment,
+                file_size=observed_size,
+                rows=segment_frame.height,
+                digest=segment.digest,
+            )
+            after = stat_object(segment.file)
+            if not isinstance(after, ObjectMetadata):
+                raise TombstoneManifestV2Error(
+                    "Configured storage returned invalid segment metadata"
+                )
+            if (
+                type(after.size) is not int
+                or after.size != segment.file_size
+                or after != before
+            ):
+                raise TombstoneManifestV2Error(
+                    f"segment {segment.file!r} changed during read"
+                )
+            frames.append(segment_frame)
+        except Exception:
+            if required:
+                raise
+            logging.warning(
+                "[read] failed to validate tombstone segment at %s",
+                segment.file,
+            )
+            return None
+    with profiler.span("tombstone_v2.union_integrity"):
+        combined = polars.concat(frames, how="vertical")
+        combined = validate_tombstone_frame(
+            combined,
+            expected_rows=manifest.total_rows,
+            allowed_files=allowed_files,
+            source=f"deletion-vector manifest union {tombstone_path}",
+        )
+    return LoadedTombstoneState(
+        frame=combined,
+        tombstone_format=TOMBSTONE_FORMAT_V2,
+        tombstone_path=tombstone_path,
+        root_digest=manifest.digest(),
+        segments=manifest.segments,
+    )
+
+
 def load_tombstone(
         tombstone_path: Optional[str],
         *,
         cache_identity: Optional[str] = None,
         loader: Optional[Callable[[], Optional[polars.DataFrame]]] = None,
+        manifest_loader: Optional[Callable[[], Any]] = None,
+        segment_loader: Optional[Callable[[TombstoneSegment], Any]] = None,
         allow_cache: bool = True,
         required: bool = False,
         expected_rows: Optional[int] = None,
         expected_digest: Optional[str] = None,
         allowed_files: Optional[Set[str]] = None,
         profiler: Optional[Profiler] = None,
+        tombstone_format: Optional[int] = None,
+        state_out: Optional[Dict[str, LoadedTombstoneState]] = None,
+        storage: Optional[object] = None,
+        expected_organization: Optional[str] = None,
+        expected_super_name: Optional[str] = None,
+        expected_simple_name: Optional[str] = None,
+        pinned_snapshot_version: Optional[int] = None,
+        expected_segment_prefix: Optional[str] = None,
 ) -> Optional[polars.DataFrame]:
-    """Load a table's deletion-vector parquet, serving the latest from memory.
+    """Load a v1 Parquet DV or v2 manifest union, preserving old return type.
 
     ``cache_identity`` may provide a stable, authorization-scoped raw object
     identity when ``tombstone_path`` is a rotating presigned URL. It controls
@@ -7134,21 +7916,37 @@ def load_tombstone(
     ``expected_rows`` seals the immutable snapshot pointer to its declared row
     count.  A cache hit is validated against the same schema/count contract.
     """
+    normalized_format = _normalized_tombstone_format(tombstone_format)
     if not tombstone_path:
         return None
     identity = str(cache_identity or tombstone_cache_identity(tombstone_path))
     p = profiler or get_null_profiler()
-    cached_entry = _TOMBSTONE_CACHE.get_entry(identity)
+    cached_entry = _TOMBSTONE_CACHE.get_entry(identity) if allow_cache else None
     if cached_entry is not None:
-        p.add("tombstone_cache_hit", 1)
         cached, metadata = cached_entry
         source = f"cached deletion-vector {identity}"
-        if not (
-            isinstance(metadata, tuple)
-            and len(metadata) == 3
-            and isinstance(metadata[0], int)
-            and isinstance(metadata[1], str)
-            and isinstance(metadata[2], frozenset)
+        metadata_state = (
+            metadata.state
+            if isinstance(metadata, _TombstoneCacheSeal) else None
+        )
+        # A legacy three-tuple cannot prove a v2 root/segment manifest. Treat it
+        # as a miss rather than comparing the root digest to the union digest.
+        if normalized_format == TOMBSTONE_FORMAT_V2 and (
+            metadata_state is None
+            or metadata_state.tombstone_format != TOMBSTONE_FORMAT_V2
+        ):
+            cached_entry = None
+        else:
+            p.add("tombstone_cache_hit", 1)
+        if cached_entry is not None and not (
+            isinstance(metadata, _TombstoneCacheSeal)
+            or (
+                isinstance(metadata, tuple)
+                and len(metadata) >= 3
+                and isinstance(metadata[0], int)
+                and isinstance(metadata[1], str)
+                and isinstance(metadata[2], frozenset)
+            )
         ):
             # Backward-compatible repair for an entry inserted through the
             # generic frame-cache API.  Validate/hash once, then all later hits
@@ -7164,36 +7962,371 @@ def load_tombstone(
                 cached, known_digest=expected_digest, source=source,
             )
             _TOMBSTONE_CACHE.put(identity, cached, metadata)
-        _validate_cached_tombstone_seal(
-            metadata,
-            expected_rows=expected_rows,
-            expected_digest=expected_digest,
-            allowed_files=allowed_files,
-            source=source,
-        )
-        return cached
+        if cached_entry is not None:
+            _validate_cached_tombstone_seal(
+                metadata,
+                expected_rows=expected_rows,
+                expected_digest=expected_digest,
+                allowed_files=allowed_files,
+                source=source,
+            )
+            if state_out is not None:
+                state = (
+                    metadata.state
+                    if isinstance(metadata, _TombstoneCacheSeal) else None
+                )
+                if state is None:
+                    state = _v1_loaded_tombstone_state(
+                        path=tombstone_path,
+                        frame=cached,
+                        digest=expected_digest,
+                        storage=storage,
+                        expected_segment_prefix=expected_segment_prefix,
+                    )
+                    metadata = _tombstone_cache_seal(
+                        cached,
+                        known_digest=state.root_digest,
+                        state=state,
+                        source=source,
+                    )
+                    _TOMBSTONE_CACHE.put(identity, cached, metadata)
+                state_out["state"] = state
+            return cached
     p.add("tombstone_cache_miss", 1)
-    df = (
-        loader()
-        if loader is not None
-        else _read_parquet_safe(tombstone_path, profiler=p, required=required)
-    )
-    if df is not None:
-        df = validate_tombstone_frame(
-            df,
+    loaded_state: Optional[LoadedTombstoneState] = None
+    if normalized_format == TOMBSTONE_FORMAT_V2:
+        loaded_state = _load_tombstone_manifest_v2_state(
+            tombstone_path,
+            storage=storage,
+            manifest_loader=manifest_loader,
+            segment_loader=segment_loader,
+            required=required,
             expected_rows=expected_rows,
             expected_digest=expected_digest,
             allowed_files=allowed_files,
-            source=f"deletion-vector {tombstone_path}",
+            expected_organization=expected_organization,
+            expected_super_name=expected_super_name,
+            expected_simple_name=expected_simple_name,
+            pinned_snapshot_version=pinned_snapshot_version,
+            expected_segment_prefix=expected_segment_prefix,
+            profiler=p,
         )
+        df = loaded_state.frame if loaded_state is not None else None
+    else:
+        df = (
+            loader()
+            if loader is not None
+            else _read_parquet_safe(
+                tombstone_path,
+                profiler=p,
+                required=required,
+                storage=storage,
+            )
+        )
+        if df is not None:
+            df = validate_tombstone_frame(
+                df,
+                expected_rows=expected_rows,
+                expected_digest=expected_digest,
+                allowed_files=allowed_files,
+                source=f"deletion-vector {tombstone_path}",
+            )
+            if state_out is not None:
+                loaded_state = _v1_loaded_tombstone_state(
+                    path=tombstone_path,
+                    frame=df,
+                    digest=expected_digest,
+                    storage=storage,
+                    expected_segment_prefix=expected_segment_prefix,
+                )
+    if loaded_state is not None and state_out is not None:
+        state_out["state"] = loaded_state
     if df is not None and allow_cache:
         seal = _tombstone_cache_seal(
             df,
-            known_digest=expected_digest,
+            known_digest=(
+                loaded_state.root_digest
+                if loaded_state is not None else expected_digest
+            ),
+            state=loaded_state,
             source=f"deletion-vector cache entry {tombstone_path}",
         )
         _TOMBSTONE_CACHE.put(identity, df, seal)
     return df
+
+
+def load_tombstone_manifest_from_storage(
+        storage: StorageInterface,
+        manifest_key: str,
+        *,
+        expected_organization: Optional[str] = None,
+        expected_super_name: Optional[str] = None,
+        expected_simple_name: Optional[str] = None,
+        pinned_snapshot_version: Optional[int] = None,
+        expected_total_rows: Optional[int] = None,
+        expected_digest: Optional[str] = None,
+        expected_segment_prefix: Optional[str] = None,
+) -> TombstoneManifestV2:
+    """Read one canonical v2 manifest through a bounded conditional range.
+
+    The shared reader seals the object with ``stat_object``, issues one
+    conditional ``read_range`` for no more than 256 KiB, and reseals metadata
+    afterward. Backends without that bounded identity contract are rejected.
+    The body must itself be the canonical JSON representation sealed by the
+    snapshot root digest.
+    """
+    if storage is None:
+        raise TombstoneManifestV2Error(
+            "v2 tombstone manifest requires a storage backend"
+        )
+    try:
+        key = validate_logical_storage_path(
+            manifest_key,
+            field_name="tombstone manifest pointer",
+            required_suffix=".json",
+        )
+    except TombstoneManifestV2Error:
+        raise
+    except (TypeError, ValueError) as exc:
+        # ``urllib.parse.urlsplit`` can raise a plain ValueError for malformed
+        # bracketed authorities. Keep provider/path parser details behind the
+        # manifest integrity boundary rather than leaking an alternate error
+        # type to callers.
+        raise TombstoneManifestV2Error(
+            "tombstone manifest pointer is not a valid logical storage path"
+        ) from exc
+    exact_body = read_bounded_tombstone_manifest_bytes(storage, key)
+    try:
+        return load_tombstone_manifest_v2(
+            bytes(exact_body),
+            expected_organization=expected_organization,
+            expected_super_name=expected_super_name,
+            expected_simple_name=expected_simple_name,
+            pinned_snapshot_version=pinned_snapshot_version,
+            expected_total_rows=expected_total_rows,
+            expected_digest=expected_digest,
+            expected_segment_prefix=expected_segment_prefix,
+            require_canonical_json=True,
+        )
+    except TombstoneManifestV2Error:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise TombstoneManifestV2Error(
+            "tombstone manifest contains an invalid logical storage path"
+        ) from exc
+
+
+def _load_one_tombstone_segment(
+        segment: TombstoneSegmentDef,
+        *,
+        storage: StorageInterface,
+        allowed_files: Optional[Set[str]],
+) -> polars.DataFrame:
+    """Read and validate one manifest-sealed Parquet segment."""
+    if not isinstance(segment, TombstoneSegmentDef):
+        raise ValueError("v2 deletion-vector segments are malformed")
+    try:
+        observed_size = storage.size(segment.cache_key)
+    except Exception as exc:
+        raise ValueError(
+            "Unable to observe required deletion-vector segment size"
+        ) from exc
+    if (
+        not isinstance(observed_size, int)
+        or isinstance(observed_size, bool)
+        or observed_size <= 0
+        or observed_size != segment.file_size
+    ):
+        raise ValueError(
+            "Deletion-vector segment size does not match the manifest"
+        )
+
+    resolved = str(segment.tombstone_path or "")
+    if not resolved:
+        raise ValueError("Required deletion-vector segment has no resolved path")
+    try:
+        if "://" not in resolved and os.path.isfile(resolved):
+            local_size = os.path.getsize(resolved)
+            if local_size != segment.file_size:
+                raise ValueError(
+                    "Localized deletion-vector segment size does not match "
+                    "the manifest"
+                )
+            frame = polars.read_parquet(resolved, hive_partitioning=False)
+        else:
+            frame = polars.from_arrow(storage.read_parquet(segment.cache_key))
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(
+            "Unable to read required deletion-vector segment"
+        ) from exc
+    return validate_tombstone_frame(
+        frame,
+        expected_rows=segment.expected_rows,
+        expected_digest=segment.tombstone_digest,
+        allowed_files=allowed_files,
+        source=f"deletion-vector segment {segment.cache_key}",
+    )
+
+
+def load_tombstone_segments(
+        segments: Tuple[TombstoneSegmentDef, ...],
+        *,
+        storage: StorageInterface,
+        cache_identity: str,
+        expected_rows: int,
+        allowed_files: Optional[Set[str]] = None,
+        allow_cache: bool = True,
+        profiler: Optional[Profiler] = None,
+) -> polars.DataFrame:
+    """Load, seal, and union all segments of one v2 deletion vector.
+
+    ``cache_identity`` must bind the stable manifest key and its snapshot-root
+    digest.  Segment digests are the logical ``st-dv-v1`` values and are
+    checked independently.  The snapshot root is deliberately never compared
+    with the union's logical digest; it seals the canonical JSON manifest.
+    After concatenation the ordinary frame validator proves table-global rowid
+    uniqueness and snapshot-file membership across segment boundaries.
+    """
+    if not isinstance(segments, tuple) or not segments:
+        raise ValueError("Active v2 deletion vector has no segments")
+    if len(segments) > MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS:
+        raise ValueError("v2 deletion vector contains too many segments")
+    if any(not isinstance(segment, TombstoneSegmentDef) for segment in segments):
+        raise ValueError("v2 deletion-vector segments are malformed")
+    segment_keys: List[str] = []
+    segment_rows = 0
+    for segment in segments:
+        if (
+            not isinstance(segment.cache_key, str)
+            or not segment.cache_key
+            or not isinstance(segment.tombstone_path, str)
+            or not segment.tombstone_path
+            or not isinstance(segment.expected_rows, int)
+            or isinstance(segment.expected_rows, bool)
+            or not isinstance(segment.file_size, int)
+            or isinstance(segment.file_size, bool)
+            or segment.file_size <= 0
+            or segment.file_size > MAX_JSON_EXACT_INTEGER
+        ):
+            raise ValueError("v2 deletion-vector segment path/size is malformed")
+        try:
+            validate_logical_storage_path(
+                segment.cache_key,
+                field_name="segment cache key",
+                required_suffix=".parquet",
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "v2 deletion-vector segment cache key is malformed"
+            ) from exc
+        checked_rows = _checked_tombstone_expected_rows(
+            segment.expected_rows,
+            source="v2 deletion-vector segment",
+        )
+        if (
+            checked_rows is None
+            or checked_rows <= 0
+            or checked_rows > MAX_JSON_EXACT_INTEGER
+        ):
+            raise ValueError("v2 deletion-vector segment row count is malformed")
+        _checked_tombstone_expected_digest(
+            segment.tombstone_digest,
+            source="v2 deletion-vector segment",
+        )
+        segment_keys.append(segment.cache_key)
+        segment_rows += checked_rows
+    if segment_keys != sorted(segment_keys) or len(segment_keys) != len(
+        set(segment_keys)
+    ):
+        raise ValueError(
+            "v2 deletion-vector segments are not uniquely and canonically ordered"
+        )
+    if not isinstance(cache_identity, str) or not cache_identity:
+        raise ValueError("v2 deletion-vector cache identity is missing")
+    if not isinstance(expected_rows, int) or isinstance(expected_rows, bool):
+        raise ValueError("v2 deletion-vector union has invalid expected row count")
+    expected = _checked_tombstone_expected_rows(
+        expected_rows, source="v2 deletion-vector union",
+    )
+    if (
+        expected is None
+        or expected <= 0
+        or expected > MAX_JSON_EXACT_INTEGER
+    ):
+        raise ValueError("v2 deletion-vector union has invalid expected row count")
+    if segment_rows != expected:
+        raise ValueError(
+            "v2 deletion-vector segment rows do not match the manifest total"
+        )
+
+    # Keep the v2 union namespace disjoint from legacy single-file cache keys.
+    # The caller supplies ``manifest-key + root``; hashing prevents path/URL
+    # material from becoming a filesystem-like cache identity elsewhere.
+    descriptor_digest = hashlib.sha256(b"supertable-dv-v2-segments\n")
+    for segment in segments:
+        for value in (
+            segment.cache_key,
+            str(segment.expected_rows),
+            str(segment.file_size),
+            segment.tombstone_digest,
+        ):
+            encoded = str(value).encode("utf-8")
+            descriptor_digest.update(len(encoded).to_bytes(8, "big"))
+            descriptor_digest.update(encoded)
+    identity = (
+        "__supertable_tombstone_v2_union__/"
+        + hashlib.sha256(
+            cache_identity.encode("utf-8")
+            + b"\0"
+            + descriptor_digest.digest()
+        ).hexdigest()
+    )
+
+    def _loader() -> polars.DataFrame:
+        frames = [
+            _load_one_tombstone_segment(
+                segment,
+                storage=storage,
+                allowed_files=allowed_files,
+            )
+            for segment in segments
+        ]
+        return polars.concat(frames, how="vertical", rechunk=False)
+
+    frame = load_tombstone(
+        identity,
+        cache_identity=identity,
+        loader=_loader,
+        allow_cache=allow_cache,
+        required=True,
+        expected_rows=expected,
+        # A v2 root digest seals canonical manifest JSON, not DV logical rows.
+        expected_digest=None,
+        allowed_files=allowed_files,
+        profiler=profiler,
+    )
+    if frame is None:  # required loader and active segments make this defensive.
+        raise ValueError("Required v2 deletion vector was unavailable")
+    return frame
+
+
+def load_tombstone_state(
+        tombstone_path: Optional[str], **kwargs: Any,
+) -> Optional[LoadedTombstoneState]:
+    """State-returning companion to :func:`load_tombstone`."""
+    if not tombstone_path:
+        return None
+    state_out: Dict[str, LoadedTombstoneState] = {}
+    kwargs["state_out"] = state_out
+    frame = load_tombstone(tombstone_path, **kwargs)
+    if frame is None:
+        return None
+    state = state_out.get("state")
+    if state is None:  # pragma: no cover - every successful path sets it
+        raise RuntimeError("Deletion-vector load produced no physical state")
+    return state
 
 
 def cache_tombstone(
@@ -7204,6 +8337,8 @@ def cache_tombstone(
         expected_rows: Optional[int] = None,
         expected_digest: Optional[str] = None,
         assume_valid: bool = False,
+        loaded_state: Optional[LoadedTombstoneState] = None,
+        tombstone_format: Optional[int] = None,
 ) -> None:
     """Seed the cache with a freshly built latest-version deletion-vector frame.
 
@@ -7214,6 +8349,10 @@ def cache_tombstone(
     """
     if tombstone_path and df is not None:
         source = f"deletion-vector cache seed {tombstone_path}"
+        normalized_format = _normalized_tombstone_format(
+            loaded_state.tombstone_format
+            if loaded_state is not None else tombstone_format
+        )
         if assume_valid:
             # Internal writer fast path: the exact frame was validated and
             # hashed immediately before this call.  Retain cheap structural and
@@ -7237,15 +8376,39 @@ def cache_tombstone(
                 )
             validated = df
         else:
-            validated = validate_tombstone_frame(
-                df,
-                expected_rows=expected_rows,
-                expected_digest=expected_digest,
-                source=source,
-            )
-            checked_digest = expected_digest
+            if normalized_format == TOMBSTONE_FORMAT_V2:
+                validated = validate_tombstone_frame(
+                    df,
+                    expected_rows=expected_rows,
+                    source=source,
+                )
+                checked_digest = _checked_tombstone_expected_digest(
+                    expected_digest, source=source,
+                )
+            else:
+                validated = validate_tombstone_frame(
+                    df,
+                    expected_rows=expected_rows,
+                    expected_digest=expected_digest,
+                    source=source,
+                )
+                checked_digest = expected_digest
+        if normalized_format == TOMBSTONE_FORMAT_V2:
+            if (
+                loaded_state is None
+                or loaded_state.tombstone_format != TOMBSTONE_FORMAT_V2
+                or loaded_state.frame is not df
+                or loaded_state.tombstone_path != tombstone_path
+                or loaded_state.root_digest != checked_digest
+            ):
+                raise ValueError(
+                    "format-2 tombstone cache seeds require the exact loaded state"
+                )
         seal = _tombstone_cache_seal(
-            validated, known_digest=checked_digest, source=source,
+            validated,
+            known_digest=checked_digest,
+            state=loaded_state,
+            source=source,
         )
         identity = str(cache_identity or tombstone_cache_identity(tombstone_path))
         _TOMBSTONE_CACHE.put(identity, validated, seal)

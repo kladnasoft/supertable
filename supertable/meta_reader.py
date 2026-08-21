@@ -21,6 +21,10 @@ from supertable import redis_keys as RK
 
 from supertable.super_table import SuperTable
 from supertable.simple_table import SimpleTable
+from supertable.tombstone_manifest_v2 import (
+    TombstoneManifestV2Error,
+    normalize_snapshot_tombstone_state,
+)
 from supertable.utils.snapshot import complete_snapshot_payload
 
 logger = logging.getLogger(__name__)
@@ -133,6 +137,26 @@ def _complete_leaf_snapshot(leaf: object) -> Optional[Dict[str, Any]]:
 def _leaf_has_complete_policy_context(leaf: object) -> bool:
     """Whether Redis alone proves the selected snapshot's policy metadata."""
     return _complete_leaf_snapshot(leaf) is not None
+
+
+def _validated_live_row_count(
+    snapshot: Dict[str, Any],
+    physical_rows: int,
+) -> int:
+    """Return exact live rows without coercing malformed DV state to zero."""
+    try:
+        state = normalize_snapshot_tombstone_state(snapshot)
+    except (TypeError, TombstoneManifestV2Error) as exc:
+        raise RuntimeError("Snapshot has an invalid deletion-vector state") from exc
+
+    if state.pointer is None:
+        return physical_rows
+    deleted_rows = state.rows
+    if deleted_rows > physical_rows:
+        raise RuntimeError(
+            "Snapshot deletion-vector rows exceed physical resource rows"
+        )
+    return physical_rows - deleted_rows
 
 
 def _sanitize_snapshot_stats(snapshot: Dict[str, Any], entry: dict) -> Dict[str, Any]:
@@ -751,13 +775,21 @@ class MetaReader:
                 # Calculate table stats
                 resources = st_data.get("resources", []) if isinstance(st_data, dict) else []
                 table_files = len(resources) if isinstance(resources, list) else 0
-                table_rows = sum(res.get("rows", 0) for res in resources if isinstance(res, dict))
+                physical_rows = sum(
+                    res.get("rows", 0)
+                    for res in resources
+                    if isinstance(res, dict)
+                )
                 # Deduct logically-deleted (tombstoned) rows: the deletion-vector
                 # model keeps dead rows physically present in the parquet files
                 # until threshold compaction, so the resource row sums over-count
-                # live rows by the persisted deletion-vector size.
-                tombstone_rows = st_data.get("tombstone_rows", 0) if isinstance(st_data, dict) else 0
-                table_rows = max(0, table_rows - int(tombstone_rows or 0))
+                # live rows by the persisted deletion-vector size.  Validate
+                # the full v1/v2 discriminated state before using that count;
+                # malformed/missing metadata is never interpreted as zero.
+                table_rows = _validated_live_row_count(
+                    st_data,
+                    physical_rows,
+                )
                 table_size = sum(res.get("file_size", 0) for res in resources if isinstance(res, dict))
 
                 # Count only role-visible columns. Resource-level integer

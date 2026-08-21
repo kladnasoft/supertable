@@ -88,7 +88,13 @@ def test_simple_delete_is_terminal_cleans_mirrors_and_requires_confirmed_recover
     try:
         with pytest.raises(DeletionIntentConflictError):
             catalog.commit_snapshot(
-                "acme", "lake", "events", {}, "stale.json",
+                "acme", "lake", "events", {
+                    "snapshot_version": 0,
+                    "resources": [],
+                    "tombstone": None,
+                    "tombstone_rows": 0,
+                    "tombstone_digest": None,
+                }, "stale.json",
                 expected_version=-1,
                 expected_path="",
                 lock_token=stale_token,

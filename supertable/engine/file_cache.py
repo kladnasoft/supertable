@@ -28,7 +28,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, BinaryIO, Dict, Iterator, List, Optional, Tuple
 
@@ -481,6 +481,40 @@ class FileCache:
                 declared_sizes[normalized] = declared if prior is None else prior
 
         for tombstone in (getattr(reflection, "tombstone_views", {}) or {}).values():
+            if getattr(tombstone, "tombstone_format", None) == 2:
+                # The JSON root is small metadata already loaded and validated
+                # through the storage SDK. Only immutable Parquet segments
+                # belong in the shared whole-file cache.
+                segments = getattr(tombstone, "segments", ())
+                if not isinstance(segments, tuple) or not segments:
+                    malformed += 1
+                    continue
+                for segment in segments:
+                    path = getattr(segment, "tombstone_path", None)
+                    key = getattr(segment, "cache_key", None)
+                    declared = getattr(segment, "file_size", None)
+                    if (
+                        not path or not key
+                        or not isinstance(declared, int)
+                        or isinstance(declared, bool)
+                        or declared <= 0
+                    ):
+                        malformed += 1
+                        continue
+                    normalized = str(key)
+                    if normalized in invalid_keys:
+                        continue
+                    prior = declared_sizes.get(normalized)
+                    if prior is not None and prior != declared:
+                        malformed += 1
+                        invalid_keys.add(normalized)
+                        raw_keys.pop(normalized, None)
+                        declared_sizes.pop(normalized, None)
+                        continue
+                    raw_keys.setdefault(normalized, None)
+                    declared_sizes[normalized] = int(declared)
+                continue
+
             path = getattr(tombstone, "tombstone_path", None)
             key = getattr(tombstone, "cache_key", None)
             if path and key:
@@ -566,6 +600,22 @@ class FileCache:
                 ]
 
             for tombstone in (getattr(target, "tombstone_views", {}) or {}).values():
+                if getattr(tombstone, "tombstone_format", None) == 2:
+                    localized_segments = []
+                    for segment in getattr(tombstone, "segments", ()) or ():
+                        resolution = resolutions.get(str(segment.cache_key))
+                        localized_segments.append(
+                            replace(
+                                segment,
+                                tombstone_path=(
+                                    resolution.path
+                                    if resolution and resolution.path
+                                    else segment.tombstone_path
+                                ),
+                            )
+                        )
+                    tombstone.segments = tuple(localized_segments)
+                    continue
                 key = getattr(tombstone, "cache_key", None)
                 if key:
                     resolution = resolutions.get(str(key))
@@ -594,6 +644,15 @@ class FileCache:
                 info = os.stat(path, follow_symlinks=True)
                 if not stat.S_ISREG(info.st_mode):
                     raise OSError("local parquet path is not a regular file")
+                if declared_size is not None and (
+                    not isinstance(declared_size, int)
+                    or isinstance(declared_size, bool)
+                    or int(info.st_size) != declared_size
+                ):
+                    raise FileCacheIntegrityError(
+                        "snapshot-declared object size does not match the "
+                        "local immutable object"
+                    )
                 metrics.localized_files = metrics.local_no_copy = 1
                 metrics.localized_bytes = int(info.st_size)
                 return _Resolution(path, None, metrics)

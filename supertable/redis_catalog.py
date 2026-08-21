@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import time
@@ -30,6 +31,12 @@ from supertable.utils.snapshot import (
     complete_snapshot_payload,
     snapshot_cache_payload,
 )
+from supertable.tombstone_manifest_v2 import (
+    MAX_JSON_EXACT_INTEGER as MAX_TOMBSTONE_JSON_EXACT_INTEGER,
+    TOMBSTONE_FORMAT_V2,
+    TombstoneManifestV2Error,
+    validate_snapshot_tombstone_state,
+)
 
 
 def _now_ms() -> int:
@@ -39,6 +46,210 @@ def _now_ms() -> int:
 _ROOT_CLONE_TYPES = frozenset({"readonly", "replica"})
 _REDIS_LUA_MAX_SAFE_INTEGER = (1 << 53) - 1
 _UNPINNED_MIRROR_CONFIG = object()
+_DV_V2_FORMAT_CONFIG_KEY = "deletion_vector_format"
+_DV_V2_FLEET_CONFIG_KEY = "dv_v2_reader_fleet_confirmed"
+
+
+def _validate_table_config_document(
+    config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Return a table config whose durable DV-v2 activation is unambiguous.
+
+    Legacy documents contain neither activation field and remain valid.  Once
+    either marker appears, both must carry the exact rollout proof emitted by
+    ``DataWriter.configure_table``.  In particular, Python/JSON booleans do
+    not pass as integer format values and integer/string truthy values do not
+    pass as the fleet confirmation.
+    """
+    if not isinstance(config, Mapping):
+        raise ValueError("table configuration must be an object")
+    document = dict(config)
+    format_present = _DV_V2_FORMAT_CONFIG_KEY in document
+    fleet_present = _DV_V2_FLEET_CONFIG_KEY in document
+    if format_present != fleet_present:
+        raise ValueError(
+            "DV-v2 activation requires deletion_vector_format=2 and "
+            "dv_v2_reader_fleet_confirmed=true together"
+        )
+    if format_present and (
+        type(document[_DV_V2_FORMAT_CONFIG_KEY]) is not int
+        or document[_DV_V2_FORMAT_CONFIG_KEY] != 2
+        or document[_DV_V2_FLEET_CONFIG_KEY] is not True
+    ):
+        raise ValueError(
+            "DV-v2 activation requires deletion_vector_format=2 and "
+            "dv_v2_reader_fleet_confirmed=true together"
+        )
+    return document
+
+
+def _strict_json_object_with_tokens(
+        raw: Any, *, field: str,
+) -> tuple[str, Dict[str, Any], Dict[str, tuple[str, str]]]:
+    """Decode one JSON object without accepting ambiguous member syntax.
+
+    ``json.loads`` deliberately accepts duplicate object members and non-JSON
+    constants such as ``NaN``.  Neither is a safe pin for a later atomic Redis
+    mutation: the Python and Lua decoders can select different values.  Keep
+    the exact source text, reject semantic duplicates (including escaped key
+    aliases), and expose the top-level key/value tokens needed by activation
+    fields whose spelling is itself part of the durable contract.
+    """
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{field} is not valid UTF-8 JSON") from exc
+    if not isinstance(raw, str) or not raw:
+        raise ValueError(f"{field} must be a non-empty JSON object")
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"{field} contains invalid JSON constant {value!r}")
+
+    def unique_object(pairs: list[tuple[str, Any]]) -> Dict[str, Any]:
+        document: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in document:
+                raise ValueError(f"{field} contains duplicate member {key!r}")
+            document[key] = value
+        return document
+
+    decoder = json.JSONDecoder(
+        object_pairs_hook=unique_object,
+        parse_constant=reject_constant,
+    )
+    try:
+        document = decoder.decode(raw)
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"{field} is not valid JSON") from exc
+    if not isinstance(document, dict):
+        raise ValueError(f"{field} must be a JSON object")
+
+    def validate_interoperable_value(value: Any) -> None:
+        if isinstance(value, str):
+            if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+                raise ValueError(f"{field} contains an invalid Unicode surrogate")
+            return
+        if value is None or type(value) in (bool, int):
+            return
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError(f"{field} contains a non-finite number")
+            return
+        if isinstance(value, list):
+            for item in value:
+                validate_interoperable_value(item)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                validate_interoperable_value(key)
+                validate_interoperable_value(item)
+            return
+        raise ValueError(f"{field} contains an unsupported JSON value")
+
+    validate_interoperable_value(document)
+
+    # Scan the already-validated top-level object with raw_decode so exact
+    # tokens are available without implementing a second JSON grammar.
+    token_decoder = json.JSONDecoder(parse_constant=reject_constant)
+    length = len(raw)
+
+    def skip_space(index: int) -> int:
+        while index < length and raw[index] in " \t\r\n":
+            index += 1
+        return index
+
+    index = skip_space(0)
+    if index >= length or raw[index] != "{":  # guarded by decode; defensive
+        raise ValueError(f"{field} must be a JSON object")
+    index += 1
+    tokens: Dict[str, tuple[str, str]] = {}
+    while True:
+        index = skip_space(index)
+        if index < length and raw[index] == "}":
+            index += 1
+            break
+        key_start = index
+        try:
+            key, key_end = token_decoder.raw_decode(raw, index)
+        except json.JSONDecodeError as exc:  # pragma: no cover - decoded above
+            raise ValueError(f"{field} is not valid JSON") from exc
+        if not isinstance(key, str):  # pragma: no cover - JSON object grammar
+            raise ValueError(f"{field} has a non-string member name")
+        index = skip_space(key_end)
+        if index >= length or raw[index] != ":":  # pragma: no cover
+            raise ValueError(f"{field} is not valid JSON")
+        index = skip_space(index + 1)
+        value_start = index
+        try:
+            _, value_end = token_decoder.raw_decode(raw, index)
+        except json.JSONDecodeError as exc:  # pragma: no cover - decoded above
+            raise ValueError(f"{field} is not valid JSON") from exc
+        tokens[key] = (raw[key_start:key_end], raw[value_start:value_end])
+        index = skip_space(value_end)
+        if index < length and raw[index] == ",":
+            index += 1
+            continue
+        if index < length and raw[index] == "}":
+            index += 1
+            break
+        raise ValueError(f"{field} is not valid JSON")  # pragma: no cover
+    if skip_space(index) != length:  # pragma: no cover - decoded above
+        raise ValueError(f"{field} is not valid JSON")
+    return raw, document, tokens
+
+
+def _validate_initial_table_config_pin(raw: Any) -> tuple[str, Dict[str, Any]]:
+    raw, document, tokens = _strict_json_object_with_tokens(
+        raw, field="table configuration",
+    )
+    document = _validate_table_config_document(document)
+    if _DV_V2_FORMAT_CONFIG_KEY in document:
+        format_tokens = tokens.get(_DV_V2_FORMAT_CONFIG_KEY)
+        fleet_tokens = tokens.get(_DV_V2_FLEET_CONFIG_KEY)
+        if (
+            format_tokens != ('"deletion_vector_format"', "2")
+            or fleet_tokens
+            != ('"dv_v2_reader_fleet_confirmed"', "true")
+        ):
+            raise ValueError(
+                "DV-v2 activation fields must use exact JSON tokens"
+            )
+    return raw, document
+
+
+def _validate_initial_mirror_pin(raw: Any) -> tuple[str, List[str]]:
+    raw, document, tokens = _strict_json_object_with_tokens(
+        raw, field="mirror configuration",
+    )
+    formats = document.get("formats")
+    timestamp = document.get("ts")
+    # ``list`` plus the captured leading token proves an array rather than the
+    # empty-object/empty-array ambiguity of Redis Lua's cjson tables.
+    format_member_token, format_token = tokens.get("formats", ("", ""))
+    timestamp_member_token, timestamp_token = tokens.get("ts", ("", ""))
+    if (
+        not isinstance(formats, list)
+        or format_member_token != '"formats"'
+        or not format_token.startswith("[")
+        or type(timestamp) is not int
+        or timestamp < 0
+        or timestamp > _REDIS_LUA_MAX_SAFE_INTEGER
+        or timestamp_member_token != '"ts"'
+        or not re.fullmatch(r"(?:0|[1-9][0-9]*)", timestamp_token)
+    ):
+        raise ValueError("mirror configuration is invalid")
+    mirrors: List[str] = []
+    for value in formats:
+        if not isinstance(value, str):
+            raise ValueError("mirror configuration is invalid")
+        normalized = value.upper()
+        if normalized not in ("DELTA", "ICEBERG", "PARQUET"):
+            raise ValueError("mirror configuration is invalid")
+        if normalized in mirrors:
+            raise ValueError("mirror configuration is invalid")
+        mirrors.append(normalized)
+    return raw, mirrors
 
 
 class _PreparedTableMutationLeaf:
@@ -259,6 +470,91 @@ local function root_document_state(root, target_super)
       or (clone_type ~= nil and clone_type ~= cjson.null)
       or (source ~= nil and source ~= cjson.null) then return 0 end
   return 1
+end
+"""
+
+
+# Snapshot publication has two final Lua paths.  Both prepend this exact
+# discriminator so monkey-patched/older Python callers still cannot publish a
+# partial, hybrid, future, or foreign-table deletion-vector state.
+_LUA_SNAPSHOT_TOMBSTONE_GUARD = r"""
+local TOMBSTONE_JSON_MAX_EXACT_INTEGER = 99999999999999
+
+local function snapshot_v2_manifest_path_ok(path, expected_prefix)
+  if type(path) ~= 'string' or path == ''
+      or type(expected_prefix) ~= 'string' or expected_prefix == ''
+      or string.len(path) > 4096
+      or string.sub(path, 1, 1) == '/'
+      or string.sub(path, -1) == '/'
+      or string.sub(path, -5) ~= '.json'
+      or string.sub(path, 1, string.len(expected_prefix)) ~= expected_prefix
+      or string.find(path, string.char(92), 1, true)
+      or string.find(path, '//', 1, true)
+      or string.find(path, '?', 1, true)
+      or string.find(path, '#', 1, true)
+      or string.find(path, '://', 1, true)
+      or string.match(path, '^[%a][%w+%.%-]*:')
+      or string.match(path, '[%c]')
+      or string.match(path, '^%s')
+      or string.match(path, '%s$') then return false end
+  local components = 0
+  for component in string.gmatch(path, '[^/]+') do
+    if component == '.' or component == '..' then return false end
+    components = components + 1
+  end
+  return components > 0
+end
+
+local function snapshot_tombstone_state_ok(candidate, expected_v2_prefix)
+  if type(candidate) ~= 'table' then return false end
+  local pointer = candidate['tombstone']
+  local tombstone_rows = candidate['tombstone_rows']
+  local digest = candidate['tombstone_digest']
+  local format_marker = candidate['tombstone_format']
+  local tombstone_format = 1
+  if format_marker == nil then
+    tombstone_format = 1
+  elseif type(format_marker) == 'number'
+      and format_marker == math.floor(format_marker)
+      and (format_marker == 1 or format_marker == 2) then
+    tombstone_format = format_marker
+  else
+    return false
+  end
+
+  if tombstone_format == 2
+      and (type(candidate['snapshot_version']) ~= 'number'
+          or candidate['snapshot_version'] < 0
+          or candidate['snapshot_version'] ~= math.floor(
+            candidate['snapshot_version']
+          )
+          or candidate['snapshot_version']
+            > TOMBSTONE_JSON_MAX_EXACT_INTEGER) then
+    return false
+  end
+
+  if pointer == cjson.null then
+    return type(tombstone_rows) == 'number'
+        and tombstone_rows == 0
+        and digest == cjson.null
+  end
+  if type(pointer) ~= 'string' or pointer == ''
+      or type(tombstone_rows) ~= 'number'
+      or tombstone_rows <= 0
+      or tombstone_rows ~= math.floor(tombstone_rows)
+      or type(digest) ~= 'string'
+      or string.len(digest) ~= 64
+      or not string.match(digest, '^[0-9a-f]+$') then
+    return false
+  end
+  if tombstone_format == 2 then
+    return type(candidate['snapshot_version']) == 'number'
+        and candidate['snapshot_version'] >= 1
+        and tombstone_rows <= TOMBSTONE_JSON_MAX_EXACT_INTEGER
+        and snapshot_v2_manifest_path_ok(pointer, expected_v2_prefix)
+  end
+  -- Old readers interpret a missing/1 discriminator as one Parquet vector.
+  return string.sub(pointer, -5) ~= '.json'
 end
 """
 
@@ -1000,6 +1296,11 @@ class RedisCatalog:
     # DataWriter may pass the exact raw mirror configuration returned by
     # begin_table_mutation to select the no-mirror commit hot path.
     supports_pinned_no_mirror_commit = True
+    # A writer that observed an absent leaf may acquire the namespace lock
+    # before its table lock and pass that exact token to begin_table_mutation.
+    # The fused boundary can then reserve the first row-id range without first
+    # publishing an empty bootstrap snapshot.
+    supports_one_shot_table_creation = True
     _STAGE_LOCK_SCAN_COUNT = 256
     _STAGE_LOCK_DRAIN_LIMIT = 10_000
     _STAGE_LOCK_SCAN_CALL_LIMIT = 100_000
@@ -1870,16 +2171,23 @@ local leaf_key = KEYS[5]
 local config_key = KEYS[6]
 local mirrors_key = KEYS[7]
 local rowid_key = KEYS[8]
+local namespace_lock = KEYS[9]
 local leaf_token = ARGV[1]
 local reserve_count = ARGV[2]
 local expected_leaf_raw = ARGV[3]
 local prepared_floor = ARGV[4]
+local namespace_token = ARGV[5]
+local tombstone_json_max_exact_integer = 99999999999999
 
 if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
   return {-1}
 end
 if redis.call('EXISTS', namespace_intent) == 1 then return {-2} end
 if redis.call('EXISTS', simple_intent) == 1 then return {-3} end
+if namespace_token ~= ''
+    and redis.call('GET', namespace_lock) ~= namespace_token then
+  return {-10}
+end
 
 local root_type = redis.call('TYPE', root_key)
 if type(root_type) == 'table' then root_type = root_type['ok'] end
@@ -1891,11 +2199,127 @@ local root_state = root_document_state(root, nil)
 if root_state == -1 then return {-5} end
 if root_state == 0 then return {-6} end
 
-local config_raw = redis.call('GET', config_key) or ''
+local config_type = redis.call('TYPE', config_key)
+if type(config_type) == 'table' then config_type = config_type['ok'] end
+if config_type ~= 'none' and config_type ~= 'string' then return {-8} end
+local config_raw = ''
+if config_type == 'string' then
+  config_raw = redis.call('GET', config_key)
+  if config_raw == '' then return {-8} end
+end
 if config_raw ~= '' then
+  -- cjson represents every JSON number as a Lua number, so its decoded value
+  -- cannot distinguish the required integer token `2` from `2.0` or `2e0`.
+  -- Locate top-level member value tokens without being confused by nested
+  -- objects or quoted text.  This also makes duplicate activation keys and
+  -- escaped aliases fail closed instead of letting Python reject them only
+  -- after the row-ID allocator has already changed.
+  local function json_skip_space(raw, index)
+    while index <= string.len(raw) do
+      local byte = string.byte(raw, index)
+      if byte ~= 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then break end
+      index = index + 1
+    end
+    return index
+  end
+  local function json_string_end(raw, index)
+    if string.byte(raw, index) ~= 34 then return nil end
+    index = index + 1
+    while index <= string.len(raw) do
+      local byte = string.byte(raw, index)
+      if byte == 34 then return index + 1 end
+      if byte == 92 then index = index + 1 end
+      index = index + 1
+    end
+    return nil
+  end
+  local function top_level_json_token(raw, member_literal)
+    local length = string.len(raw)
+    local index = json_skip_space(raw, 1)
+    if string.byte(raw, index) ~= 123 then return 0, nil end
+    index = index + 1
+    local matches = 0
+    local matched_token = nil
+    while true do
+      index = json_skip_space(raw, index)
+      if string.byte(raw, index) == 125 then
+        return matches, matched_token
+      end
+      local key_start = index
+      local key_end = json_string_end(raw, index)
+      if not key_end then return -1, nil end
+      local key_token = string.sub(raw, key_start, key_end - 1)
+      index = json_skip_space(raw, key_end)
+      if string.byte(raw, index) ~= 58 then return -1, nil end
+      index = json_skip_space(raw, index + 1)
+      local value_start = index
+      local nested = 0
+      local quoted = false
+      while index <= length do
+        local byte = string.byte(raw, index)
+        if quoted then
+          if byte == 92 then
+            index = index + 1
+          elseif byte == 34 then
+            quoted = false
+          end
+        elseif byte == 34 then
+          quoted = true
+        elseif byte == 123 or byte == 91 then
+          nested = nested + 1
+        elseif byte == 125 then
+          if nested == 0 then break end
+          nested = nested - 1
+        elseif byte == 93 then
+          if nested == 0 then return -1, nil end
+          nested = nested - 1
+        elseif byte == 44 and nested == 0 then
+          break
+        end
+        index = index + 1
+      end
+      local value_end = index - 1
+      while value_end >= value_start do
+        local byte = string.byte(raw, value_end)
+        if byte ~= 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then break end
+        value_end = value_end - 1
+      end
+      if key_token == member_literal then
+        matches = matches + 1
+        matched_token = string.sub(raw, value_start, value_end)
+      end
+      if string.byte(raw, index) == 44 then
+        index = index + 1
+      elseif string.byte(raw, index) == 125 then
+        return matches, matched_token
+      else
+        return -1, nil
+      end
+    end
+  end
   local config_ok, config = pcall(cjson.decode, config_raw)
   if not string.match(config_raw, '^%s*{')
       or not config_ok or type(config) ~= 'table' then return {-8} end
+  local format_marker = config['deletion_vector_format']
+  local fleet_marker = config['dv_v2_reader_fleet_confirmed']
+  local format_present = format_marker ~= nil
+  local fleet_present = fleet_marker ~= nil
+  if format_present ~= fleet_present then return {-8} end
+  local format_count, format_token = top_level_json_token(
+    config_raw, '"deletion_vector_format"'
+  )
+  local fleet_count, fleet_token = top_level_json_token(
+    config_raw, '"dv_v2_reader_fleet_confirmed"'
+  )
+  if format_count < 0 or fleet_count < 0 then return {-8} end
+  if format_present then
+    if type(format_marker) ~= 'number' or format_marker ~= 2
+        or fleet_marker ~= true or format_count ~= 1
+        or format_token ~= '2' or fleet_count ~= 1
+        or fleet_token ~= 'true' then return {-8} end
+  elseif format_count ~= 0 or fleet_count ~= 0 then
+    return {-8}
+  end
 end
 
 -- Validate the mirror document at the same linearization point as the leaf.
@@ -1929,7 +2353,33 @@ end
 local leaf_type = redis.call('TYPE', leaf_key)
 if type(leaf_type) == 'table' then leaf_type = leaf_type['ok'] end
 if leaf_type == 'none' then
-  return {0, '', config_raw, mirrors_raw, '0', '', '0', '', '', '0'}
+  -- Only a canonical namespace->leaf lock holder may allocate IDs for an
+  -- expected-absent table.  The reservation can safely precede immutable
+  -- storage I/O: a failed attempt leaves a gap, never a duplicate ID.
+  if namespace_token == '' then
+    return {0, '', config_raw, mirrors_raw, '0', '', '0', '', '', '0'}
+  end
+  local rowid_type = redis.call('TYPE', rowid_key)
+  if type(rowid_type) == 'table' then rowid_type = rowid_type['ok'] end
+  if rowid_type ~= 'none' and rowid_type ~= 'string' then return {-11} end
+  local current = redis.call('GET', rowid_key) or '0'
+  if not string.match(current, '^%d+$')
+      or not string.match(reserve_count, '^%d+$') then
+    return redis.error_reply('invalid non-negative rowid sequence')
+  end
+  local normalized = string.gsub(current, '^0+', '')
+  if normalized == '' then normalized = '0' end
+  local reserved = '0'
+  local new_value = normalized
+  if reserve_count ~= '0' then
+    redis.call('INCRBY', rowid_key, reserve_count)
+    new_value = redis.call('GET', rowid_key)
+    reserved = '1'
+  end
+  return {
+    0, '', config_raw, mirrors_raw,
+    '1', normalized, reserved, normalized, new_value, '0'
+  }
 end
 if leaf_type ~= 'string' then return {-7} end
 local leaf_raw = redis.call('GET', leaf_key)
@@ -1974,17 +2424,57 @@ else
     local pointer = candidate['tombstone']
     local tombstone_rows = candidate['tombstone_rows']
     local digest = candidate['tombstone_digest']
+    local format_marker = candidate['tombstone_format']
+    local tombstone_format = 1
+    local format_ok = false
+    if format_marker == nil then
+      format_ok = true
+    elseif type(format_marker) == 'number'
+        and format_marker == math.floor(format_marker)
+        and (format_marker == 1 or format_marker == 2) then
+      tombstone_format = format_marker
+      format_ok = true
+    end
+    local function v2_manifest_path_ok(path)
+      if type(path) ~= 'string' or path == ''
+          or string.len(path) > 4096
+          or string.sub(path, 1, 1) == '/'
+          or string.sub(path, -1) == '/'
+          or string.sub(path, -5) ~= '.json'
+          or string.find(path, string.char(92), 1, true)
+          or string.find(path, '//', 1, true)
+          or string.find(path, '?', 1, true)
+          or string.find(path, '#', 1, true)
+          or string.find(path, '://', 1, true)
+          or string.match(path, '^[%a][%w+%.%-]*:')
+          or string.match(path, '[%c]')
+          or string.match(path, '^%s')
+          or string.match(path, '%s$') then return false end
+      local components = 0
+      for component in string.gmatch(path, '[^/]+') do
+        if component == '.' or component == '..' then return false end
+        components = components + 1
+      end
+      return components > 0
+    end
     local tombstone_ok = false
-    if pointer == cjson.null and type(tombstone_rows) == 'number'
+    if format_ok and pointer == cjson.null and type(tombstone_rows) == 'number'
         and tombstone_rows == 0 and digest == cjson.null then
       tombstone_ok = true
-    elseif type(pointer) == 'string' and pointer ~= ''
+    elseif format_ok and type(pointer) == 'string' and pointer ~= ''
         and type(tombstone_rows) == 'number'
         and tombstone_rows > 0
         and tombstone_rows == math.floor(tombstone_rows)
         and type(digest) == 'string' and string.len(digest) == 64
         and string.match(digest, '^[0-9a-f]+$') then
-      tombstone_ok = true
+      if tombstone_format == 2 then
+        tombstone_ok = tombstone_rows <= tombstone_json_max_exact_integer
+            and v2_manifest_path_ok(pointer)
+      else
+        -- A JSON root without the explicit v2 discriminator is a malformed
+        -- hybrid that an old reader would try to open as Parquet.
+        tombstone_ok = string.sub(pointer, -5) ~= '.json'
+      end
     end
     local raw_floor = candidate['rowid_high_watermark']
     if type(candidate['snapshot_version']) == 'number'
@@ -2042,6 +2532,118 @@ return {
   1, prepared_match and '' or leaf_raw, config_raw, mirrors_raw,
   floor_available and '1' or '0', floor, reserved,
   previous, new_value, prepared_match and '1' or '0'
+}
+"""
+
+    # Expected-absent creation has already strictly validated its small
+    # configuration documents in Python. This boundary only repeats a cjson
+    # grammar-compatibility decode (not the general script's recursive policy
+    # checks), then proves the exact raw pins at the same instant as leaf
+    # absence and the first row-ID reservation.
+    #
+    # Status 2 is a no-write config/mirror race (the caller may re-pin once).
+    # Status 3 is a no-write creator race (the caller uses the general begin
+    # with reserve_count=0 so CREATE -> WRITE reauthorization remains exact).
+    _LUA_BEGIN_INITIAL_TABLE_MUTATION = _LUA_ROOT_DOCUMENT_GUARD + """
+local leaf_lock = KEYS[1]
+local namespace_intent = KEYS[2]
+local simple_intent = KEYS[3]
+local root_key = KEYS[4]
+local leaf_key = KEYS[5]
+local config_key = KEYS[6]
+local mirrors_key = KEYS[7]
+local rowid_key = KEYS[8]
+local namespace_lock = KEYS[9]
+
+local leaf_token = ARGV[1]
+local reserve_count = ARGV[2]
+local namespace_token = ARGV[3]
+local config_present = ARGV[4]
+local config_raw = ARGV[5]
+local config_valid = ARGV[6]
+local mirrors_present = ARGV[7]
+local mirrors_raw = ARGV[8]
+local mirrors_valid = ARGV[9]
+
+if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
+  return {-1}
+end
+if redis.call('EXISTS', namespace_intent) == 1 then return {-2} end
+if redis.call('EXISTS', simple_intent) == 1 then return {-3} end
+if namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= namespace_token then
+  return {-10}
+end
+
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return {-4} end
+if root_type ~= 'string' then return {-5} end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return {-5} end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return {-5} end
+if root_state == 0 then return {-6} end
+
+local config_type = redis.call('TYPE', config_key)
+if type(config_type) == 'table' then config_type = config_type['ok'] end
+if config_type ~= 'none' and config_type ~= 'string' then return {-8} end
+if config_present ~= '0' and config_present ~= '1' then return {-8} end
+if (config_present == '1') ~= (config_type == 'string') then return {2} end
+if config_present == '1' and redis.call('GET', config_key) ~= config_raw then
+  return {2}
+end
+if config_valid ~= '1' then return {-8} end
+if config_present == '1' then
+  -- Backstop the Python decoder with Redis' own cjson grammar. This preserves
+  -- the general boundary's rejection of values (for example over-wide number
+  -- tokens) that Python can represent but Redis cjson cannot.
+  local config_ok, config = pcall(cjson.decode, config_raw)
+  if not string.match(config_raw, '^%s*{')
+      or not config_ok or type(config) ~= 'table' then return {-8} end
+end
+
+local mirrors_type = redis.call('TYPE', mirrors_key)
+if type(mirrors_type) == 'table' then mirrors_type = mirrors_type['ok'] end
+if mirrors_type ~= 'none' and mirrors_type ~= 'string' then return {-9} end
+if mirrors_present ~= '0' and mirrors_present ~= '1' then return {-9} end
+if (mirrors_present == '1') ~= (mirrors_type == 'string') then return {2} end
+if mirrors_present == '1' and redis.call('GET', mirrors_key) ~= mirrors_raw then
+  return {2}
+end
+if mirrors_valid ~= '1' then return {-9} end
+if mirrors_present == '1' then
+  local mirrors_ok, mirrors = pcall(cjson.decode, mirrors_raw)
+  if not string.match(mirrors_raw, '^%s*{')
+      or not mirrors_ok or type(mirrors) ~= 'table' then return {-9} end
+end
+
+local leaf_type = redis.call('TYPE', leaf_key)
+if type(leaf_type) == 'table' then leaf_type = leaf_type['ok'] end
+if leaf_type == 'string' then return {3} end
+if leaf_type ~= 'none' then return {-7} end
+
+local rowid_type = redis.call('TYPE', rowid_key)
+if type(rowid_type) == 'table' then rowid_type = rowid_type['ok'] end
+if rowid_type ~= 'none' and rowid_type ~= 'string' then return {-11} end
+local current = redis.call('GET', rowid_key) or '0'
+if not string.match(current, '^%d+$')
+    or not string.match(reserve_count, '^%d+$') then return {-11} end
+local normalized = string.gsub(current, '^0+', '')
+if normalized == '' then normalized = '0' end
+local reserved = '0'
+local new_value = normalized
+if reserve_count ~= '0' then
+  -- The only mutating command in this script. Redis rejects signed-Int64
+  -- overflow without modifying the existing sequence.
+  redis.call('INCRBY', rowid_key, reserve_count)
+  new_value = redis.call('GET', rowid_key)
+  reserved = '1'
+end
+return {
+  0, '', config_present == '1' and config_raw or '',
+  mirrors_present == '1' and mirrors_raw or '',
+  '1', normalized, reserved, normalized, new_value, '0'
 }
 """
 
@@ -2573,7 +3175,14 @@ return removed_meta + removed_index + 1
     #  -9  durable SimpleTable deletion intent exists
     # -10  mirror publication is owned by another publisher
     # -11  SuperTable root no longer exists
-    _LUA_SNAPSHOT_COMMIT = _LUA_ROOT_DOCUMENT_GUARD + """
+    # -12  SuperTable root is read-only
+    # -13  leaf/root numeric identity is invalid or exhausted
+    # -14  mirror configuration changed after the writer pinned it
+    # -15  mirror configuration is corrupt
+    # -16  payload snapshot_version mismatches the fenced successor
+    # -17  invalid one-shot initial publication flag or base identity
+    _LUA_SNAPSHOT_COMMIT = (
+        _LUA_ROOT_DOCUMENT_GUARD + _LUA_SNAPSHOT_TOMBSTONE_GUARD + """
 local leaf_key = KEYS[1]
 local root_key = KEYS[2]
 local lock_key = KEYS[3]
@@ -2597,6 +3206,9 @@ local simple_name = ARGV[9]
 local schema_json = ARGV[10]
 local expected_mirrors_json = ARGV[11]
 local quality_generation = ARGV[12]
+local expected_v2_prefix = ARGV[13]
+local payload_digest = ARGV[14]
+local one_shot_initial = ARGV[15]
 
 if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or now_ms ~= math.floor(now_ms)
@@ -2604,6 +3216,21 @@ if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or expected_version > ROOT_MAX_SAFE_INTEGER
     or expected_version ~= math.floor(expected_version) then
   return {-13, 0, 0}
+end
+if one_shot_initial ~= '0' and one_shot_initial ~= '1' then
+  return {-17, 0, 0}
+end
+if one_shot_initial == '1'
+    and (expected_version ~= -1 or expected_path ~= '') then
+  return {-17, 0, 0}
+end
+if one_shot_initial == '1' then
+  if string.len(payload_digest) ~= 64
+      or not string.match(payload_digest, '^[0-9a-f]+$') then
+    return {-4, 0, 0}
+  end
+elseif payload_digest ~= '' then
+  return {-4, 0, 0}
 end
 
 local early_held_token = redis.call('GET', lock_key)
@@ -2683,7 +3310,12 @@ local held_token = redis.call('GET', lock_key)
 if not held_token or held_token ~= lock_token then
   return {-2, 0, 0}
 end
-if redis.call('EXISTS', namespace_lock) == 1 then
+-- A waiting first-time creator may hold the namespace lock while blocked on
+-- this writer's leaf lease.  It must not wound the current flagged one-shot
+-- publisher.  A real delete linearizes by persisting namespace_delete before
+-- draining this lease; that durable intent remains an unconditional fence.
+if one_shot_initial ~= '1'
+    and redis.call('EXISTS', namespace_lock) == 1 then
   return {-7, 0, 0}
 end
 if redis.call('EXISTS', namespace_delete) == 1 then
@@ -2737,8 +3369,16 @@ if old_version ~= expected_version or old_path ~= expected_path then
 end
 
 local okp, payload = pcall(cjson.decode, payload_json)
-if not okp or type(payload) ~= 'table' then
+if not okp or type(payload) ~= 'table'
+    or not snapshot_tombstone_state_ok(payload, expected_v2_prefix) then
   return {-4, 0, 0}
+end
+local new_leaf_version = old_version + 1
+if one_shot_initial == '1' then new_leaf_version = 1 end
+if type(payload['snapshot_version']) ~= 'number'
+    or payload['snapshot_version'] ~= math.floor(payload['snapshot_version'])
+    or payload['snapshot_version'] ~= new_leaf_version then
+  return {-16, 0, 0}
 end
 local oks, schema = pcall(cjson.decode, schema_json)
 if not oks or type(schema) ~= 'table' then
@@ -2787,7 +3427,6 @@ if old_version >= ROOT_MAX_SAFE_INTEGER
     or root_version >= ROOT_MAX_SAFE_INTEGER then
   return {-13, 0, 0}
 end
-local new_leaf_version = old_version + 1
 local new_root_version = root_version + 1
 local leaf = {
   version = new_leaf_version,
@@ -2796,6 +3435,7 @@ local leaf = {
   payload = payload,
   commit_id = commit_id
 }
+if one_shot_initial == '1' then leaf['payload_digest'] = payload_digest end
 root['version'] = new_root_version
 root['ts'] = now_ms
 root['commit_id'] = commit_id
@@ -2823,7 +3463,7 @@ if quality_generation ~= '' then
   redis.call('SET', quality_unresolved_key, quality_generation)
 end
 return {1, new_leaf_version, new_root_version}
-"""
+""")
 
     # No-mirror snapshot publication hot path.  The begin-mutation boundary
     # already validated the raw mirror document and proved that its format set
@@ -2832,7 +3472,8 @@ return {1, new_leaf_version, new_root_version}
     # normalizing mirror configuration, and no publication intent can exist
     # for a commit with an empty mirror set.  Every core publication invariant
     # remains identical to _LUA_SNAPSHOT_COMMIT.
-    _LUA_SNAPSHOT_COMMIT_NO_MIRRORS = _LUA_ROOT_DOCUMENT_GUARD + """
+    _LUA_SNAPSHOT_COMMIT_NO_MIRRORS = (
+        _LUA_ROOT_DOCUMENT_GUARD + _LUA_SNAPSHOT_TOMBSTONE_GUARD + """
 local leaf_key = KEYS[1]
 local root_key = KEYS[2]
 local lock_key = KEYS[3]
@@ -2856,6 +3497,9 @@ local schema_json = ARGV[9]
 local quality_generation = ARGV[10]
 local mirror_pin_present = ARGV[11]
 local expected_mirror_raw = ARGV[12]
+local expected_v2_prefix = ARGV[13]
+local payload_digest = ARGV[14]
+local one_shot_initial = ARGV[15]
 
 if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or now_ms ~= math.floor(now_ms)
@@ -2863,6 +3507,21 @@ if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or expected_version > ROOT_MAX_SAFE_INTEGER
     or expected_version ~= math.floor(expected_version) then
   return {-13, 0, 0}
+end
+if one_shot_initial ~= '0' and one_shot_initial ~= '1' then
+  return {-17, 0, 0}
+end
+if one_shot_initial == '1'
+    and (expected_version ~= -1 or expected_path ~= '') then
+  return {-17, 0, 0}
+end
+if one_shot_initial == '1' then
+  if string.len(payload_digest) ~= 64
+      or not string.match(payload_digest, '^[0-9a-f]+$') then
+    return {-4, 0, 0}
+  end
+elseif payload_digest ~= '' then
+  return {-4, 0, 0}
 end
 
 local early_held_token = redis.call('GET', lock_key)
@@ -2895,7 +3554,10 @@ local held_token = redis.call('GET', lock_key)
 if not held_token or held_token ~= lock_token then
   return {-2, 0, 0}
 end
-if redis.call('EXISTS', namespace_lock) == 1 then
+-- Do not let a waiting creator's namespace lock wound the current first
+-- publisher.  Namespace deletion is still fenced by its durable intent below.
+if one_shot_initial ~= '1'
+    and redis.call('EXISTS', namespace_lock) == 1 then
   return {-7, 0, 0}
 end
 if redis.call('EXISTS', namespace_delete) == 1 then
@@ -2949,8 +3611,16 @@ if old_version ~= expected_version or old_path ~= expected_path then
 end
 
 local okp, payload = pcall(cjson.decode, payload_json)
-if not okp or type(payload) ~= 'table' then
+if not okp or type(payload) ~= 'table'
+    or not snapshot_tombstone_state_ok(payload, expected_v2_prefix) then
   return {-4, 0, 0}
+end
+local new_leaf_version = old_version + 1
+if one_shot_initial == '1' then new_leaf_version = 1 end
+if type(payload['snapshot_version']) ~= 'number'
+    or payload['snapshot_version'] ~= math.floor(payload['snapshot_version'])
+    or payload['snapshot_version'] ~= new_leaf_version then
+  return {-16, 0, 0}
 end
 local oks, schema = pcall(cjson.decode, schema_json)
 if not oks or type(schema) ~= 'table' then
@@ -2961,7 +3631,6 @@ if old_version >= ROOT_MAX_SAFE_INTEGER
   return {-13, 0, 0}
 end
 
-local new_leaf_version = old_version + 1
 local new_root_version = root_version + 1
 local leaf = {
   version = new_leaf_version,
@@ -2970,6 +3639,7 @@ local leaf = {
   payload = payload,
   commit_id = commit_id
 }
+if one_shot_initial == '1' then leaf['payload_digest'] = payload_digest end
 root['version'] = new_root_version
 root['ts'] = now_ms
 root['commit_id'] = commit_id
@@ -2982,7 +3652,7 @@ if quality_generation ~= '' then
   redis.call('SET', quality_unresolved_key, quality_generation)
 end
 return {1, new_leaf_version, new_root_version}
-"""
+""")
 
     _LUA_MIRROR_PUBLICATION_PREPARE = _LUA_ROOT_DOCUMENT_GUARD + """
 local state_key = KEYS[1]
@@ -4801,6 +5471,9 @@ return 1
         self._begin_table_mutation = self.r.register_script(
             self._LUA_BEGIN_TABLE_MUTATION
         )
+        self._begin_initial_table_mutation = self.r.register_script(
+            self._LUA_BEGIN_INITIAL_TABLE_MUTATION
+        )
         self._assert_initialization_allowed = self.r.register_script(
             self._LUA_ASSERT_INITIALIZATION_ALLOWED
         )
@@ -5018,6 +5691,58 @@ return 1
         if result != 1:
             raise RuntimeError(f"Invalid mutation fence result: {result}")
 
+    def _read_initial_table_mutation_pins(
+            self, org: str, sup: str, simple: str,
+    ) -> tuple[
+        Any, Dict[str, Any], bool,
+        Any, List[str], bool,
+    ]:
+        """Read and strictly parse the two expected-absent context pins.
+
+        This helper conveys no authority and its result is never accepted from
+        a caller. ``begin_table_mutation`` invokes the class implementation
+        directly, then proves both exact raw values again inside Lua. Invalid
+        documents are represented by validity flags so lock/root/deletion
+        failure precedence remains atomic and no row IDs are allocated.
+        """
+        try:
+            values = self.r.mget([
+                RK.meta_table_config(org, sup, simple),
+                RK.meta_mirrors(org, sup),
+            ])
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] initial mutation pin read error: %s", exc)
+            raise
+        if not isinstance(values, (list, tuple)) or len(values) != 2:
+            raise RuntimeError(f"Invalid initial mutation pin result: {values!r}")
+        config_raw, mirrors_raw = values
+
+        config: Dict[str, Any] = {}
+        config_valid = True
+        if config_raw is not None:
+            try:
+                config_raw, config = _validate_initial_table_config_pin(
+                    config_raw,
+                )
+            except (ValueError, RecursionError):
+                config_valid = False
+
+        mirrors: List[str] = []
+        mirrors_valid = True
+        if mirrors_raw is not None:
+            try:
+                mirrors_raw, mirrors = _validate_initial_mirror_pin(mirrors_raw)
+            except (ValueError, RecursionError):
+                mirrors_valid = False
+        return (
+            config_raw,
+            config,
+            config_valid,
+            mirrors_raw,
+            mirrors,
+            mirrors_valid,
+        )
+
     def begin_table_mutation(
             self,
             org: str,
@@ -5027,6 +5752,7 @@ return 1
             lock_token: str,
             reserve_count: int = 0,
             prepared_leaf: Optional[_PreparedTableMutationLeaf] = None,
+            namespace_token: str = "",
     ) -> Dict[str, Any]:
         """Pin one write context and reserve ordinary row IDs atomically.
 
@@ -5036,7 +5762,9 @@ return 1
         ``reserve_count`` is allocated in this same command.  Legacy,
         incomplete, or large-Int64 floors return no reservation so the writer
         can use :meth:`reserve_rowids_at_least` after deriving the immutable
-        storage floor.
+        storage floor.  For an absent leaf, passing the namespace lock acquired
+        before ``lock_token`` proves a canonical creation boundary and reserves
+        above any exact orphaned sequence left by an earlier failed attempt.
 
         This is an early optimization boundary, not the publication boundary:
         :meth:`commit_snapshot` still repeats the live lock, root/deletion,
@@ -5062,24 +5790,109 @@ return 1
                 prepared_floor,
             ) = prepared_leaf.take(self)
 
-        raw = self._begin_table_mutation(
-            keys=[
-                RK.lock_leaf(org, sup, simple),
-                RK.meta_namespace_deletion_intent(org, sup),
-                RK.meta_simple_deletion_intent(org, sup, simple),
-                RK.meta_root(org, sup),
-                RK.meta_leaf(org, sup, simple),
-                RK.meta_table_config(org, sup, simple),
-                RK.meta_mirrors(org, sup),
-                RK.meta_rowid_seq(org, sup, simple),
-            ],
-            args=[
-                lock_token or "",
-                str(reserve_count),
-                prepared_raw,
-                "" if prepared_floor is None else str(prepared_floor),
-            ],
+        mutation_keys = [
+            RK.lock_leaf(org, sup, simple),
+            RK.meta_namespace_deletion_intent(org, sup),
+            RK.meta_simple_deletion_intent(org, sup, simple),
+            RK.meta_root(org, sup),
+            RK.meta_leaf(org, sup, simple),
+            RK.meta_table_config(org, sup, simple),
+            RK.meta_mirrors(org, sup),
+            RK.meta_rowid_seq(org, sup, simple),
+            RK.lock_namespace(org, sup),
+        ]
+
+        def general_begin(count: int):
+            return self._begin_table_mutation(
+                keys=mutation_keys,
+                args=[
+                    lock_token or "",
+                    str(count),
+                    prepared_raw,
+                    "" if prepared_floor is None else str(prepared_floor),
+                    namespace_token or "",
+                ],
+            )
+
+        compact_pins: Optional[tuple[
+            Any, Dict[str, Any], bool,
+            Any, List[str], bool,
+        ]] = None
+        compact_calls = 0
+        compact_pin_retries = 0
+        compact_general_fallbacks = 0
+        use_compact_initial = bool(
+            type(self) is RedisCatalog
+            and namespace_token
+            and prepared_leaf is None
         )
+        if use_compact_initial:
+            # One bounded re-pin absorbs an ordinary config generation race.
+            # A second mismatch is churn, not a state from which this mutation
+            # can safely derive one authoritative context.
+            for pin_attempt in range(2):
+                try:
+                    pins = RedisCatalog._read_initial_table_mutation_pins(
+                        self, org, sup, simple,
+                    )
+                except UnicodeDecodeError:
+                    # A decode_responses client can fail before exposing the
+                    # invalid bytes needed for an exact pin. The existing Lua
+                    # boundary still establishes fence/root failure precedence;
+                    # zero reservation keeps its later Python decode fail-closed.
+                    compact_general_fallbacks += 1
+                    raw = general_begin(0)
+                    break
+                (
+                    config_pin_raw,
+                    config_pin,
+                    config_pin_valid,
+                    mirrors_pin_raw,
+                    mirrors_pin,
+                    mirrors_pin_valid,
+                ) = pins
+                compact_calls += 1
+                raw = self._begin_initial_table_mutation(
+                    keys=mutation_keys,
+                    args=[
+                        lock_token or "",
+                        str(reserve_count),
+                        namespace_token or "",
+                        "1" if config_pin_raw is not None else "0",
+                        config_pin_raw or "",
+                        "1" if config_pin_valid else "0",
+                        "1" if mirrors_pin_raw is not None else "0",
+                        mirrors_pin_raw or "",
+                        "1" if mirrors_pin_valid else "0",
+                    ],
+                )
+                if isinstance(raw, (list, tuple)) and len(raw) == 1:
+                    try:
+                        compact_status = int(raw[0])
+                    except (TypeError, ValueError):
+                        compact_status = None
+                    if compact_status == 2:
+                        if pin_attempt == 0:
+                            compact_pin_retries += 1
+                            continue
+                        raise SnapshotCommitConflictError(
+                            "Initial table configuration changed repeatedly "
+                            f"while beginning {org}/{sup}/{simple}"
+                        )
+                    if compact_status == 3:
+                        # A creator appeared after CREATE authorization. The
+                        # general boundary must pin that exact live leaf, but a
+                        # zero reservation ensures Python validates every raw
+                        # config before any IDs can be consumed. DataWriter then
+                        # performs WRITE reauthorization and its ordinary exact
+                        # floor-fenced reservation if permitted.
+                        compact_general_fallbacks += 1
+                        raw = general_begin(0)
+                        break
+                compact_pins = pins
+                break
+        else:
+            raw = general_begin(reserve_count)
         if not isinstance(raw, (list, tuple)) or not raw:
             raise RuntimeError(f"Invalid table mutation context: {raw!r}")
         try:
@@ -5112,8 +5925,96 @@ return 1
             raise ValueError(
                 f"Mirror configuration is invalid for {org}/{sup}"
             )
+        if status == -10:
+            raise LockLostError(
+                f"Lost namespace creation lock before mutating "
+                f"{org}/{sup}/{simple}"
+            )
+        if status == -11:
+            raise RuntimeError(
+                f"Corrupt Redis rowid sequence for {org}/{sup}/{simple}"
+            )
         if status not in (0, 1) or len(raw) != 10:
             raise RuntimeError(f"Invalid table mutation context: {raw!r}")
+
+        if compact_pins is not None:
+            (
+                config_pin_raw,
+                config_pin,
+                config_pin_valid,
+                mirrors_pin_raw,
+                mirrors_pin,
+                mirrors_pin_valid,
+            ) = compact_pins
+
+            def compact_text(value: Any) -> str:
+                if isinstance(value, bytes):
+                    try:
+                        return value.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise RuntimeError(
+                            f"Invalid table mutation context: {raw!r}"
+                        ) from exc
+                if isinstance(value, str):
+                    return value
+                raise RuntimeError(f"Invalid table mutation context: {raw!r}")
+
+            text_fields = [compact_text(value) for value in raw[1:]]
+            expected_config_raw = config_pin_raw or ""
+            expected_mirrors_raw = mirrors_pin_raw or ""
+            if (
+                type(raw[0]) is not int
+                or status != 0
+                or not config_pin_valid
+                or not mirrors_pin_valid
+                or text_fields[0] != ""
+                or text_fields[1] != expected_config_raw
+                or text_fields[2] != expected_mirrors_raw
+                or text_fields[3] != "1"
+                or text_fields[5] not in ("0", "1")
+                or text_fields[8] != "0"
+                or not re.fullmatch(r"(?:0|[1-9][0-9]*)", text_fields[4])
+                or not re.fullmatch(r"(?:0|[1-9][0-9]*)", text_fields[6])
+                or not re.fullmatch(r"(?:0|[1-9][0-9]*)", text_fields[7])
+            ):
+                raise RuntimeError(f"Invalid table mutation context: {raw!r}")
+            try:
+                floor = int(text_fields[4])
+                previous = int(text_fields[6])
+                new_high = int(text_fields[7])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Invalid initial rowid reservation: {raw!r}"
+                ) from exc
+            reserved = text_fields[5] == "1"
+            if (
+                floor > (1 << 63) - 1
+                or previous != floor
+                or (reserve_count == 0 and (
+                    reserved or new_high != floor
+                ))
+                or (reserve_count > 0 and (
+                    not reserved
+                    or new_high != floor + reserve_count
+                    or new_high > (1 << 63) - 1
+                ))
+            ):
+                raise RuntimeError(f"Unsafe initial rowid reservation: {raw!r}")
+            return {
+                "leaf": None,
+                "table_config": dict(config_pin),
+                "mirrors": list(mirrors_pin),
+                "mirror_pin": mirrors_pin_raw,
+                "rowid_floor": floor,
+                "rowid_reservation": (
+                    (floor + 1, new_high) if reserved else None
+                ),
+                "_initial_compact_begin_calls": compact_calls,
+                "_initial_compact_begin_pin_retries": compact_pin_retries,
+                "_initial_compact_begin_general_fallbacks": (
+                    compact_general_fallbacks
+                ),
+            }
 
         def decode_json(value: Any, *, field: str) -> Any:
             if value in (None, "", b""):
@@ -5130,6 +6031,14 @@ return 1
             raise RuntimeError(
                 f"Corrupt table configuration for {org}/{sup}/{simple}"
             )
+        if config is not None:
+            try:
+                config = _validate_table_config_document(config)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Corrupt table configuration for {org}/{sup}/{simple}: "
+                    f"{exc}"
+                ) from exc
 
         mirror_pin_raw = raw[3]
         if isinstance(mirror_pin_raw, bytes):
@@ -5236,6 +6145,39 @@ return 1
                                 f"Unsafe rowid reservation result: {raw!r}"
                             )
                         rowid_reservation = (start, new_high)
+        elif str(raw[4]) == "1":
+            # An absent leaf has no snapshot payload from which to derive a
+            # floor.  The namespace-fenced Lua branch instead returns the exact
+            # Redis integer strings it observed/reserved before any storage I/O.
+            try:
+                candidate_floor = int(raw[5])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Invalid initial rowid floor: {raw!r}"
+                ) from exc
+            if not 0 <= candidate_floor <= (1 << 63) - 1:
+                raise RuntimeError(f"Unsafe initial rowid floor: {raw!r}")
+            rowid_floor = candidate_floor
+            if str(raw[6]) == "1":
+                try:
+                    previous = int(raw[7])
+                    new_high = int(raw[8])
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"Invalid initial rowid reservation: {raw!r}"
+                    ) from exc
+                start = previous + 1
+                if (
+                    reserve_count <= 0
+                    or previous != candidate_floor
+                    or start <= candidate_floor
+                    or new_high != previous + reserve_count
+                    or new_high > (1 << 63) - 1
+                ):
+                    raise RuntimeError(
+                        f"Unsafe initial rowid reservation: {raw!r}"
+                    )
+                rowid_reservation = (start, new_high)
 
         context = {
             "leaf": leaf,
@@ -5245,6 +6187,14 @@ return 1
             "rowid_floor": rowid_floor,
             "rowid_reservation": rowid_reservation,
         }
+        if use_compact_initial:
+            context.update({
+                "_initial_compact_begin_calls": compact_calls,
+                "_initial_compact_begin_pin_retries": compact_pin_retries,
+                "_initial_compact_begin_general_fallbacks": (
+                    compact_general_fallbacks
+                ),
+            })
         if validated_snapshot is not None:
             context["validated_snapshot"] = validated_snapshot
         return context
@@ -6249,20 +7199,26 @@ return 1
             expected_mirror_pin: Any = _UNPINNED_MIRROR_CONFIG,
             quality_generation: Optional[str] = None,
             now_ms: Optional[int] = None,
+            one_shot_initial: bool = False,
     ) -> tuple[int, int]:
         """Atomically publish one fenced table snapshot and bump its root.
 
         ``expected_version`` and ``expected_path`` identify the exact leaf
         snapshot from which the writer derived its immutable successor.
+        When ``one_shot_initial`` is explicitly true, an expected-absent base
+        (``-1``/empty path) publishes the first visible snapshot as version
+        one, preserving the legacy generation after its removed empty
+        version-zero bootstrap. Unflagged expected-absent calls retain the
+        ordinary version-zero contract.
         ``lock_token`` must still own the per-table Redis lock when the Lua
         script executes.  The comparison, fencing check, leaf update, and root
         invalidation happen in one Redis transaction, so readers can never
         combine a new leaf with an old root generation (or vice versa).
 
-        Ambiguous client/network failures are deliberately propagated.  The
-        immutable ``commit_id`` stored in both documents lets a caller or
-        operator reconcile whether such a commit reached Redis; retrying as a
-        different, payload-less write would be unsafe.
+        An ambiguous flagged one-shot creation is reconciled once against its
+        exact immutable leaf ``commit_id``, version, path, and payload digest;
+        blindly retrying it would conflict with its own created leaf. Normal
+        mutation ambiguity retains the established propagation behavior.
 
         ``quality_generation``, when present, must be this commit's opaque ID.
         The same transaction persists it as unresolved post-ingest work.  The
@@ -6277,17 +7233,102 @@ return 1
         """
         if not lock_token:
             raise LockLostError("snapshot publication requires a fencing lock token")
+        if type(one_shot_initial) is not bool:
+            raise TypeError("one_shot_initial must be a boolean")
         timestamp = _publication_timestamp(now_ms)
         base_version = _lua_safe_integer(
             expected_version,
             field="expected snapshot version",
             minimum=-1,
         )
+        if one_shot_initial and (
+            base_version != -1 or expected_path != ""
+        ):
+            raise ValueError(
+                "one_shot_initial requires expected_version=-1 and an empty "
+                "expected_path"
+            )
+        if not isinstance(payload, Mapping):
+            raise ValueError("snapshot payload must be a JSON object")
+        successor_version = 1 if one_shot_initial else base_version + 1
+        if (
+            type(payload.get("snapshot_version")) is not int
+            or payload["snapshot_version"] != successor_version
+        ):
+            raise ValueError(
+                "snapshot payload has an invalid version: payload generation "
+                "does not match the exact successor fenced by expected_version"
+            )
+        if not {
+            "tombstone", "tombstone_rows", "tombstone_digest",
+        }.issubset(payload):
+            raise ValueError(
+                "snapshot payload must carry an explicit deletion-vector state"
+            )
+        try:
+            tombstone_format = validate_snapshot_tombstone_state(
+                payload.get("tombstone"),
+                payload.get("tombstone_rows"),
+                payload.get("tombstone_digest"),
+                format_present="tombstone_format" in payload,
+                tombstone_format=payload.get("tombstone_format"),
+            )
+        except (TypeError, TombstoneManifestV2Error) as exc:
+            raise ValueError(
+                "snapshot payload has an invalid deletion-vector state"
+            ) from exc
+        if (
+            tombstone_format == TOMBSTONE_FORMAT_V2
+            and successor_version > MAX_TOMBSTONE_JSON_EXACT_INTEGER
+        ):
+            raise ValueError(
+                "explicit snapshot v2 version exceeds Redis JSON's exact "
+                "integer range"
+            )
+        if (
+            tombstone_format == TOMBSTONE_FORMAT_V2
+            and payload.get("tombstone") is not None
+            and (
+                successor_version < 1
+                or payload["tombstone_rows"] > MAX_TOMBSTONE_JSON_EXACT_INTEGER
+            )
+        ):
+            raise ValueError(
+                "active snapshot v2 state has an invalid version or row-count "
+                "bound"
+            )
+        tombstone_prefix = f"{org}/{sup}/tables/{simple}/tombstone/"
+        if (
+            tombstone_format == TOMBSTONE_FORMAT_V2
+            and payload.get("tombstone") is not None
+            and not payload["tombstone"].startswith(tombstone_prefix)
+        ):
+            raise ValueError(
+                "snapshot v2 manifest pointer escapes the table tombstone namespace"
+            )
         try:
             payload = snapshot_cache_payload(payload)
             payload_json = json.dumps(payload)
         except Exception as exc:
-            raise ValueError("snapshot payload is not JSON serializable") from exc
+            raise ValueError(
+                "snapshot payload is not JSON serializable"
+            ) from exc
+        if one_shot_initial:
+            payload_version = payload.get("snapshot_version")
+            if payload_version is not None and (
+                type(payload_version) is not int
+                or payload_version != successor_version
+            ):
+                raise ValueError(
+                    "invalid snapshot payload: payload generation does not "
+                    "match its fenced successor: expected "
+                    f"{successor_version}, got {payload_version!r}"
+                )
+        payload_digest = (
+            hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+            if one_shot_initial
+            else ""
+        )
 
         if mirror_publication and not commit_id:
             raise ValueError(
@@ -6378,6 +7419,9 @@ return 1
                         quality_generation,
                         "1" if mirror_pin_present else "0",
                         mirror_pin_raw,
+                        tombstone_prefix,
+                        payload_digest,
+                        "1" if one_shot_initial else "0",
                     ],
                 )
             else:
@@ -6410,9 +7454,38 @@ return 1
                         schema_json,
                         json.dumps(normalized_mirrors),
                         quality_generation,
+                        tombstone_prefix,
+                        payload_digest,
+                        "1" if one_shot_initial else "0",
                     ],
                 )
         except redis.RedisError as exc:
+            # A timeout/disconnect can arrive after Redis executed the atomic
+            # script. A flagged one-shot creation cannot be blindly retried:
+            # it would conflict with its own successfully-created leaf, so
+            # prove that exact first commit from its persisted payload digest.
+            # Normal mutations retain the established ambiguous-error behavior
+            # and leaf shape; they do not pay a hash/reconciliation cost.
+            if one_shot_initial:
+                reconciled = self._reconcile_snapshot_commit(
+                    org,
+                    sup,
+                    simple,
+                    path=path,
+                    expected_version=base_version,
+                    commit_id=cid,
+                    payload_digest=payload_digest,
+                )
+                if reconciled is not None:
+                    logger.warning(
+                        "[redis-catalog] reconciled ambiguous initial snapshot "
+                        "commit for %s/%s/%s commit %s",
+                        org,
+                        sup,
+                        simple,
+                        cid,
+                    )
+                    return reconciled
             logger.error(f"[redis-catalog] snapshot commit error: {exc}")
             raise
 
@@ -6433,9 +7506,13 @@ return 1
                 f"Lost fencing lock before publishing {org}/{sup}/{simple}"
             )
         if code == -3:
-            raise RuntimeError(f"Corrupt Redis catalog JSON for {org}/{sup}/{simple}")
+            raise RuntimeError(
+                f"Corrupt Redis catalog JSON for {org}/{sup}/{simple}"
+            )
         if code == -4:
-            raise ValueError("Redis rejected invalid snapshot payload JSON")
+            raise ValueError(
+                "Redis rejected invalid snapshot payload JSON"
+            )
         if code == -5:
             raise RuntimeError(
                 f"Missing or mismatched mirror publication intent for "
@@ -6482,7 +7559,67 @@ return 1
                 f"Corrupt mirror configuration during snapshot publication: "
                 f"{org}/{sup}/{simple}"
             )
+        if code == -16:
+            raise ValueError(
+                "Redis rejected invalid snapshot payload: generation does not "
+                f"match its fenced successor for {org}/{sup}/{simple}"
+            )
+        if code == -17:
+            raise ValueError(
+                "Redis rejected an invalid one-shot initial publication flag "
+                f"or base identity for {org}/{sup}/{simple}"
+            )
         raise RuntimeError(f"Unknown snapshot commit status {code}")
+
+    def _reconcile_snapshot_commit(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            *,
+            path: str,
+            expected_version: int,
+            commit_id: str,
+            payload_digest: str,
+    ) -> Optional[tuple[int, int]]:
+        """Return committed versions when an ambiguous reply actually landed.
+
+        This proof is intentionally restricted by the caller to a flagged
+        one-shot expected-absent creation.
+        The exact leaf commit id, path, version-one successor, and digest of
+        the original payload JSON are written atomically with root/schema/index
+        state. Comparing the digest rather than Lua's decoded/re-encoded cache
+        stays exact for Int64 values and empty JSON object/array normalization.
+        The root may already have advanced because another table has its own
+        lock, so only require a structurally valid current root.
+        Any read ambiguity or mismatch returns ``None`` and preserves the
+        original transport exception.
+        """
+        if expected_version != -1:
+            return None
+        try:
+            raw_leaf, raw_root = self.r.mget([
+                RK.meta_leaf(org, sup, simple),
+                RK.meta_root(org, sup),
+            ])
+            if raw_leaf is None or raw_root is None:
+                return None
+            leaf = _validate_leaf_document(json.loads(raw_leaf))
+            root = _validate_root_document(
+                json.loads(raw_root), org=org, sup=sup,
+            )
+            successor = 1 if expected_version == -1 else expected_version + 1
+            if (
+                leaf.get("commit_id") != commit_id
+                or leaf.get("path") != path
+                or leaf.get("version") != successor
+                or leaf.get("payload_digest") != payload_digest
+                or root.get("version", -1) < 0
+            ):
+                return None
+            return successor, int(root["version"])
+        except Exception:
+            return None
 
     def prepare_mirror_publication(
             self,
@@ -11947,7 +13084,7 @@ return 1
         if not (org and sup and simple):
             return False
         try:
-            doc = dict(config)
+            doc = _validate_table_config_document(config)
             doc["modified_ms"] = _now_ms()
             result = int(self._set_table_config_fenced(
                 keys=[
@@ -12016,7 +13153,12 @@ return 1
             raise RuntimeError(
                 f"Corrupt table configuration for {org}/{sup}/{simple}"
             )
-        return document
+        try:
+            return _validate_table_config_document(document)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Corrupt table configuration for {org}/{sup}/{simple}: {exc}"
+            ) from exc
 
     # ========================================================================= #
     # Engine runtime configuration (DuckDB memory, threads, caches, thresholds)

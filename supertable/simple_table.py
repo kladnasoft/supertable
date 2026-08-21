@@ -589,7 +589,14 @@ class SimpleTable:
             ROWID_COL,
             TOMBSTONE_FILE_COL,
             load_tombstone,
+            load_tombstone_manifest_from_storage,
+            load_tombstone_segments,
             tombstone_cache_identity,
+        )
+        from supertable.data_classes import TombstoneSegmentDef
+        from supertable.tombstone_manifest_v2 import (
+            TOMBSTONE_FORMAT_V2,
+            normalize_snapshot_tombstone_state,
         )
 
         snapshot, _path = self.get_simple_table_snapshot()
@@ -602,25 +609,78 @@ class SimpleTable:
         # Read the deletion-vector (if any) so its rows are dropped from
         # the export rather than copied verbatim.
         dead_rowids_by_file = None
-        tombstone_path = snapshot.get("tombstone")
+        tombstone_state = normalize_snapshot_tombstone_state(snapshot)
+        tombstone_path = tombstone_state.pointer
+        tombstone_format = tombstone_state.tombstone_format
         if tombstone_path:
-            tomb_df = load_tombstone(
-                tombstone_path,
-                cache_identity=tombstone_cache_identity(
+            allowed_files = {
+                resource.get("file")
+                for resource in (snapshot.get("resources") or [])
+                if isinstance(resource, dict) and resource.get("file")
+            }
+            if tombstone_format == TOMBSTONE_FORMAT_V2:
+                manifest_prefix = (
+                    f"{self.simple_dir.rstrip('/')}/tombstone/"
+                )
+                if not tombstone_path.startswith(manifest_prefix):
+                    raise ValueError(
+                        "Deletion-vector manifest pointer escapes the pinned "
+                        "simple table"
+                    )
+                manifest = load_tombstone_manifest_from_storage(
+                    self.storage,
+                    tombstone_path,
+                    expected_organization=self.super_table.organization,
+                    expected_super_name=self.super_table.super_name,
+                    expected_simple_name=self.simple_name,
+                    pinned_snapshot_version=snapshot.get("snapshot_version"),
+                    expected_total_rows=tombstone_state.rows,
+                    expected_digest=tombstone_state.digest,
+                    expected_segment_prefix=os.path.join(
+                        self.simple_dir, "tombstone",
+                    ),
+                )
+                segment_defs = tuple(
+                    TombstoneSegmentDef(
+                        cache_key=segment.file,
+                        tombstone_path=segment.file,
+                        expected_rows=segment.rows,
+                        file_size=segment.file_size,
+                        tombstone_digest=segment.digest,
+                    )
+                    for segment in manifest.segments
+                )
+                manifest_cache_identity = tombstone_cache_identity(
                     tombstone_path,
                     organization=self.super_table.organization,
                     storage=self.storage,
-                ),
-                allow_cache=False,
-                required=True,
-                expected_rows=snapshot.get("tombstone_rows"),
-                expected_digest=snapshot.get("tombstone_digest"),
-                allowed_files={
-                    resource.get("file")
-                    for resource in (snapshot.get("resources") or [])
-                    if isinstance(resource, dict) and resource.get("file")
-                },
-            )
+                )
+                tomb_df = load_tombstone_segments(
+                    segment_defs,
+                    storage=self.storage,
+                    cache_identity=(
+                        "export-dv-v2:"
+                        f"{manifest_cache_identity}:"
+                        f"{tombstone_state.digest}"
+                    ),
+                    expected_rows=tombstone_state.rows,
+                    allowed_files=allowed_files,
+                    allow_cache=False,
+                )
+            else:
+                tomb_df = load_tombstone(
+                    tombstone_path,
+                    cache_identity=tombstone_cache_identity(
+                        tombstone_path,
+                        organization=self.super_table.organization,
+                        storage=self.storage,
+                    ),
+                    allow_cache=False,
+                    required=True,
+                    expected_rows=tombstone_state.rows,
+                    expected_digest=tombstone_state.digest,
+                    allowed_files=allowed_files,
+                )
             if tomb_df is None:  # defensive: required=True must raise instead
                 raise RuntimeError("Required deletion-vector could not be loaded")
             dead_rowids_by_file = {}
@@ -685,7 +745,11 @@ class SimpleTable:
             last_simple_table["resources"] = updated_resources
 
         # Update metadata
-        last_simple_table["previous_snapshot"] = last_simple_table_path
+        # An expected-absent one-shot write uses an in-memory compatibility
+        # version-zero base and an empty CAS path. Its first durable snapshot is
+        # version one but has no predecessor object; ordinary updates retain the
+        # exact immutable predecessor pointer.
+        last_simple_table["previous_snapshot"] = last_simple_table_path or None
         last_simple_table["last_updated_ms"] = int(datetime.now().timestamp() * 1000)
         last_simple_table["snapshot_version"] = int(last_simple_table.get("snapshot_version", 0)) + 1
 

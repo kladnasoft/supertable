@@ -55,10 +55,12 @@ from supertable.engine.engine_common import (
     SOURCE_FILE_COL,
     TIMESTAMP_COL,
     rewrite_query_with_hashed_tables,
+    tombstone_data_paths,
 )
 from supertable.processing import (
     TOMBSTONE_FILE_COL,
     load_tombstone,
+    load_tombstone_segments,
     parquet_footer_sha256,
 )
 from supertable.engine.island_resources import (
@@ -81,6 +83,9 @@ from supertable.engine.island_spill import (
     external_sort,
 )
 from supertable.storage.storage_interface import ObjectMetadata
+from supertable.tombstone_manifest_v2 import (
+    validate_snapshot_tombstone_state,
+)
 
 
 _monotonic = time.monotonic
@@ -96,6 +101,54 @@ class IslandExecutionTimeout(IslandUnsupportedError, TimeoutError):
 
 class IslandIntegrityError(RuntimeError):
     """Pinned data or deletion metadata failed a correctness boundary."""
+
+
+def _validate_island_tombstone_definition(tomb_def) -> bool:
+    """Validate one direct executor definition and return whether it is active.
+
+    Production definitions come from ``DataReader``, but IslandDB is also a
+    callable engine boundary. Validate the snapshot discriminator before a
+    truthiness check can silently reinterpret a malformed active/empty hybrid
+    as "no tombstone".
+    """
+    if tomb_def is None:
+        return False
+    pointer = getattr(tomb_def, "tombstone_path", None)
+    cache_key = getattr(tomb_def, "cache_key", None)
+    rows = getattr(tomb_def, "expected_rows", None)
+    digest = getattr(tomb_def, "tombstone_digest", None)
+    tombstone_format = getattr(tomb_def, "tombstone_format", None)
+    segments = getattr(tomb_def, "segments", ())
+    if pointer is not None and (
+        not isinstance(pointer, str) or not pointer
+    ):
+        raise IslandIntegrityError("invalid resolved deletion-vector path")
+    try:
+        validate_snapshot_tombstone_state(
+            cache_key if pointer is not None else None,
+            rows,
+            digest,
+            format_present=tombstone_format is not None,
+            tombstone_format=tombstone_format,
+        )
+    except (TypeError, ValueError) as exc:
+        raise IslandIntegrityError(
+            "invalid deletion-vector snapshot state"
+        ) from exc
+
+    if pointer is None:
+        if cache_key is not None or segments != ():
+            raise IslandIntegrityError(
+                "invalid empty deletion-vector representation"
+            )
+        return False
+    try:
+        tombstone_data_paths(tomb_def)
+    except Exception as exc:
+        raise IslandIntegrityError(
+            "invalid deletion-vector representation"
+        ) from exc
+    return True
 
 
 @dataclass(frozen=True)
@@ -3288,6 +3341,10 @@ class IslandDB:
         )
 
     def _load_tombstone(self, tomb_def) -> pl.DataFrame:
+        if not _validate_island_tombstone_definition(tomb_def):
+            raise IslandIntegrityError(
+                "active deletion-vector definition has no path"
+            )
         path = str(getattr(tomb_def, "tombstone_path", "") or "")
         cache_key = str(getattr(tomb_def, "cache_key", "") or "")
         if not path:
@@ -3300,6 +3357,27 @@ class IslandDB:
         # reuse the same raw key can never alias inside a long-lived process.
         digest = str(getattr(tomb_def, "tombstone_digest", "") or "")
         rows = getattr(tomb_def, "expected_rows", None)
+        if getattr(tomb_def, "tombstone_format", None) == 2:
+            segments = getattr(tomb_def, "segments", ())
+            if self.storage is None or not cache_key:
+                raise IslandIntegrityError(
+                    "required v2 deletion vector cannot be read safely"
+                )
+            try:
+                return load_tombstone_segments(
+                    segments,
+                    storage=self.storage,
+                    cache_identity=(
+                        f"islanddb-dv-v2:{self._artifact_cache_namespace}:"
+                        f"{cache_key}:{digest}"
+                    ),
+                    expected_rows=rows,
+                    allowed_files=set(allowed),
+                )
+            except Exception as exc:
+                raise IslandIntegrityError(
+                    "required v2 deletion vector failed validation"
+                ) from exc
         identity_source = cache_key or os.path.realpath(path)
         cache_identity = (
             f"islanddb-dv-v1:{self._artifact_cache_namespace}:{identity_source}:"
@@ -3507,7 +3585,7 @@ class IslandDB:
         range_metrics_out: Optional[_QueryRangeMetrics] = None,
         execution_metrics_out: Optional[_QueryExecutionMetrics] = None,
     ) -> pl.LazyFrame:
-        if tomb_def is not None and getattr(tomb_def, "tombstone_path", None):
+        if _validate_island_tombstone_definition(tomb_def):
             dv = self._load_tombstone(tomb_def)
             query_marker = (
                 id(snapshot),

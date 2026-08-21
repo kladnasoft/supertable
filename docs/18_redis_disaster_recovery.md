@@ -28,7 +28,10 @@ is ahead of or behind that archive position, has pending deliveries, or changes
 during capture. The command reads the catalog twice and fails if it is changing.
 It computes and records the exact byte size and SHA-256 of every selected data,
 tombstone, and statistics artifact rather than accepting object existence or a
-reused key as proof.
+reused key as proof. For a deletion-vector v2 snapshot it first validates the
+canonical manifest root, table identity, creation lineage, total row count and
+snapshot root digest, then independently content-seals both that manifest and
+every immutable segment it references.
 
 Run this after every catalog/control-plane change or from a supervised job.
 Test restore into a disposable Redis instance regularly; a checkpoint is not a

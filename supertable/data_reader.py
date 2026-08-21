@@ -42,9 +42,20 @@ from supertable.rbac.access_control import restrict_read_access  # noqa: F401
 from supertable.engine.data_estimator import DataEstimator
 from supertable.engine.executor import Executor
 from supertable.engine.engine_enum import Engine as engine
-from supertable.data_classes import TombstoneDef, RbacViewDef
+from supertable.data_classes import (
+    MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES,
+    RbacViewDef,
+    TombstoneDef,
+    TombstoneSegmentDef,
+)
+from supertable.processing import load_tombstone_manifest_from_storage
 from supertable.redis_catalog import RedisCatalog
 from supertable.system_query import classify_query, CommandKind
+from supertable.tombstone_manifest_v2 import (
+    TOMBSTONE_FORMAT_V1,
+    TOMBSTONE_FORMAT_V2,
+    validate_snapshot_tombstone_state,
+)
 
 
 class Status(Enum):
@@ -928,6 +939,37 @@ class DataReader:
                 for sup in reflection.supers
             }
             resolved_tombstones = {}
+
+            def _resolve_required_tombstone_artifact(
+                    raw_key: str, *, super_name: str, simple_name: str,
+            ) -> str:
+                try:
+                    resolved = estimator._to_duckdb_path(raw_key)
+                except Exception as resolve_err:
+                    raise RuntimeError(
+                        f"Unable to resolve required deletion-vector for "
+                        f"{super_name}.{simple_name}"
+                    ) from resolve_err
+                if not isinstance(resolved, str) or not resolved:
+                    raise RuntimeError(
+                        f"Unable to resolve required deletion-vector for "
+                        f"{super_name}.{simple_name}"
+                    )
+                # A bare relative key is a valid LOCAL path, but for an
+                # object-store reflection it means every URL/presign resolver
+                # failed. Do not let an executor read a same-named local file.
+                storage_type = (reflection.storage_type or "").lower()
+                if (
+                    "://" not in resolved
+                    and not resolved.startswith("/")
+                    and "local" not in storage_type
+                ):
+                    raise RuntimeError(
+                        f"Unable to resolve required deletion-vector for "
+                        f"{super_name}.{simple_name}"
+                    )
+                return resolved
+
             for td in tables:
                 table_key = (td.super_name.lower(), td.simple_name.lower())
                 sup = snapshots_by_key.get(table_key)
@@ -938,6 +980,38 @@ class DataReader:
                 tombstone_key = getattr(sup, "tombstone_key", None)
                 tombstone_rows = getattr(sup, "tombstone_rows", None)
                 tombstone_digest = getattr(sup, "tombstone_digest", None)
+                raw_tombstone_format = getattr(
+                    sup, "tombstone_format", None,
+                )
+                if tombstone_key or raw_tombstone_format is not None:
+                    try:
+                        tombstone_format = validate_snapshot_tombstone_state(
+                            tombstone_key,
+                            tombstone_rows,
+                            tombstone_digest,
+                            format_present=(raw_tombstone_format is not None),
+                            tombstone_format=raw_tombstone_format,
+                        )
+                    except (TypeError, ValueError) as state_err:
+                        if tombstone_key and not (
+                            isinstance(tombstone_rows, int)
+                            and not isinstance(tombstone_rows, bool)
+                            and tombstone_rows > 0
+                        ):
+                            raise RuntimeError(
+                                f"Snapshot for {td.super_name}."
+                                f"{td.simple_name} references a deletion "
+                                "vector without a positive row count"
+                            ) from state_err
+                        raise RuntimeError(
+                            f"Invalid deletion-vector state for "
+                            f"{td.super_name}.{td.simple_name}"
+                        ) from state_err
+                else:
+                    # Legacy/direct Reflection callers may omit the canonical
+                    # empty-state count. Production estimator snapshots always
+                    # carry the fully validated normalized format.
+                    tombstone_format = TOMBSTONE_FORMAT_V1
                 if tombstone_key and not (
                     isinstance(tombstone_rows, int)
                     and not isinstance(tombstone_rows, bool)
@@ -962,40 +1036,106 @@ class DataReader:
                     )
 
                 if tombstone_key:
-                    resolved_tombstone = resolved_tombstones.get(table_key)
-                    if resolved_tombstone is None:
-                        try:
-                            resolved_tombstone = estimator._to_duckdb_path(
-                                tombstone_key
-                            )
-                        except Exception as resolve_err:
+                    if tombstone_format == TOMBSTONE_FORMAT_V2:
+                        manifest_prefix = (
+                            f"{self.organization}/{sup.super_name}/tables/"
+                            f"{sup.simple_name}/tombstone/"
+                        )
+                        if not tombstone_key.startswith(manifest_prefix):
                             raise RuntimeError(
-                                f"Unable to resolve required deletion-vector for "
-                                f"{td.super_name}.{td.simple_name}"
-                            ) from resolve_err
-                        if (
-                            not isinstance(resolved_tombstone, str)
-                            or not resolved_tombstone
-                        ):
-                            raise RuntimeError(
-                                f"Unable to resolve required deletion-vector for "
-                                f"{td.super_name}.{td.simple_name}"
+                                "Deletion-vector manifest pointer escapes the "
+                                f"pinned table {sup.super_name}."
+                                f"{sup.simple_name}"
                             )
-                        # A bare relative key is a valid LOCAL path, but for an
-                        # object-store reflection it means every URL/presign
-                        # resolver failed.  Do not let DuckDB accidentally read
-                        # a same-named local file and apply a foreign DV.
-                        storage_type = (reflection.storage_type or "").lower()
-                        if (
-                            "://" not in resolved_tombstone
-                            and not resolved_tombstone.startswith("/")
-                            and "local" not in storage_type
-                        ):
-                            raise RuntimeError(
-                                f"Unable to resolve required deletion-vector for "
-                                f"{td.super_name}.{td.simple_name}"
+                    resolved_entry = resolved_tombstones.get(table_key)
+                    if resolved_entry is None:
+                        resolved_tombstone = (
+                            _resolve_required_tombstone_artifact(
+                                tombstone_key,
+                                super_name=td.super_name,
+                                simple_name=td.simple_name,
                             )
-                        resolved_tombstones[table_key] = resolved_tombstone
+                        )
+                        resolved_segments: Tuple[
+                            TombstoneSegmentDef, ...
+                        ] = ()
+                        if tombstone_format == TOMBSTONE_FORMAT_V2:
+                            manifest = load_tombstone_manifest_from_storage(
+                                self.storage,
+                                tombstone_key,
+                                expected_organization=self.organization,
+                                expected_super_name=sup.super_name,
+                                expected_simple_name=sup.simple_name,
+                                pinned_snapshot_version=sup.simple_version,
+                                expected_total_rows=tombstone_rows,
+                                expected_digest=tombstone_digest,
+                                expected_segment_prefix=(
+                                    f"{self.organization}/{sup.super_name}/"
+                                    f"tables/{sup.simple_name}/tombstone"
+                                ),
+                            )
+                            segment_defs = []
+                            for segment in manifest.segments:
+                                try:
+                                    metadata = self.storage.stat_object(
+                                        segment.file
+                                    )
+                                    observed_size = getattr(
+                                        metadata, "size", None,
+                                    )
+                                    identity_fn = getattr(
+                                        metadata, "identity_token", None,
+                                    )
+                                    provider_identity = (
+                                        identity_fn()
+                                        if callable(identity_fn) else None
+                                    )
+                                except Exception as size_err:
+                                    raise RuntimeError(
+                                        "Unable to observe required "
+                                        "deletion-vector segment"
+                                    ) from size_err
+                                if (
+                                    not isinstance(observed_size, int)
+                                    or isinstance(observed_size, bool)
+                                    or observed_size != segment.file_size
+                                ):
+                                    raise RuntimeError(
+                                        "Deletion-vector segment size does not "
+                                        "match the manifest"
+                                    )
+                                if (
+                                    not isinstance(provider_identity, str)
+                                    or not provider_identity
+                                    or "\x00" in provider_identity
+                                    or len(provider_identity.encode("utf-8"))
+                                    > MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES
+                                ):
+                                    raise RuntimeError(
+                                        "Deletion-vector segment has no stable "
+                                        "provider identity"
+                                    )
+                                segment_defs.append(TombstoneSegmentDef(
+                                    cache_key=segment.file,
+                                    tombstone_path=(
+                                        _resolve_required_tombstone_artifact(
+                                            segment.file,
+                                            super_name=td.super_name,
+                                            simple_name=td.simple_name,
+                                        )
+                                    ),
+                                    expected_rows=segment.rows,
+                                    file_size=segment.file_size,
+                                    tombstone_digest=segment.digest,
+                                    provider_identity=provider_identity,
+                                ))
+                            resolved_segments = tuple(segment_defs)
+                        resolved_entry = (
+                            resolved_tombstone,
+                            resolved_segments,
+                        )
+                        resolved_tombstones[table_key] = resolved_entry
+                    resolved_tombstone, resolved_segments = resolved_entry
                     reflection.tombstone_views[td.alias] = TombstoneDef(
                         tombstone_path=resolved_tombstone,
                         cache_key=tombstone_key,
@@ -1007,6 +1147,12 @@ class DataReader:
                             if getattr(sup, "snapshot_resource_keys", None) is None
                             else tuple(getattr(sup, "snapshot_resource_keys"))
                         ),
+                        tombstone_format=(
+                            raw_tombstone_format
+                            if raw_tombstone_format is not None
+                            else None
+                        ),
+                        segments=resolved_segments,
                     )
 
                 # Linked-share policy is pinned alongside the same resources.

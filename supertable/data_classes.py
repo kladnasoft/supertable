@@ -2,6 +2,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
 
+MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES = 4096
+
+
 class PredInterval(NamedTuple):
     """A closed/open range of values a column is *allowed* to take, derived from
     a SQL WHERE predicate, used for read-path file pruning.
@@ -330,6 +333,12 @@ class SuperSnapshot:
     # zero.  Trailing fields preserve the positional constructor contract.
     candidate_row_groups: int = 0
     candidate_row_groups_complete: bool = False
+    # Deletion-vector representation pinned by this snapshot.  ``None`` and
+    # ``1`` are the legacy single-Parquet artifact; explicit ``2`` means an
+    # active pointer names a standalone, content-sealed segment manifest.  A
+    # drained v2 table may retain format 2 with the exact empty state.
+    # Kept last to preserve every existing positional constructor.
+    tombstone_format: Optional[int] = None
 
 
 @dataclass
@@ -353,6 +362,43 @@ class RbacViewDef:
     where_clause: str = ""
     excluded_columns: List[str] = field(default_factory=list)
     filter_spec: object = None
+
+
+@dataclass(frozen=True)
+class TombstoneSegmentDef:
+    """One resolved immutable segment of a v2 deletion vector.
+
+    ``cache_key`` remains the stable logical object key sealed by the
+    standalone manifest while ``tombstone_path`` is the executor-facing path
+    (and may therefore be a short-lived presigned URL or a local cache path).
+    The digest is the established ``st-dv-v1`` logical row-stream digest for
+    this segment, never a hash of the encoded Parquet bytes.
+    """
+
+    cache_key: str
+    tombstone_path: str
+    expected_rows: int
+    file_size: int
+    tombstone_digest: str
+    # Stable identity observed through ``storage.stat_object(cache_key)`` by
+    # DataReader. Local/cache paths are fenced directly with ``stat`` and do
+    # not require this provider proof.
+    provider_identity: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        identity = self.provider_identity
+        if identity is None:
+            return
+        if (
+            not isinstance(identity, str)
+            or not identity
+            or "\x00" in identity
+            or len(identity.encode("utf-8"))
+            > MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES
+        ):
+            raise ValueError(
+                "provider_identity must be a bounded non-empty string"
+            )
 
 
 @dataclass
@@ -387,6 +433,11 @@ class TombstoneDef:
     # row with a coincidentally equal row id.
     resource_keys: Tuple[str, ...] = field(default_factory=tuple)
     snapshot_resource_keys: Optional[Tuple[str, ...]] = None
+    # Trailing for positional compatibility; see SuperSnapshot above.
+    tombstone_format: Optional[int] = None
+    # Resolved immutable Parquet segments for explicit format 2.  The legacy
+    # format keeps this empty and continues to consume ``tombstone_path``.
+    segments: Tuple[TombstoneSegmentDef, ...] = field(default_factory=tuple)
 
 
 @dataclass

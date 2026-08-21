@@ -46,6 +46,9 @@ from supertable.processing import (
     ROWID_COL,
     TIMESTAMP_COL,
 )
+from supertable.tombstone_manifest_v2 import (
+    normalize_snapshot_tombstone_state,
+)
 
 
 def _safe_path_for_log(value: object) -> str:
@@ -1248,74 +1251,60 @@ class DataEstimator:
                     # path-only Redis leaves take this branch and therefore do
                     # not lose tombstones that live only in the heavy JSON.
                     raw_tombstone = current_snapshot_data.get("tombstone")
-                    if raw_tombstone is not None and not isinstance(raw_tombstone, str):
-                        raise RuntimeError(
-                            f"Invalid tombstone pointer for {super_name}.{simple_name}"
-                        )
-                    tombstone_key = raw_tombstone or None
-
-                    raw_tombstone_rows = current_snapshot_data.get("tombstone_rows")
-                    tombstone_rows: Optional[int]
-                    if raw_tombstone_rows is None:
-                        if tombstone_key:
-                            raise RuntimeError(
-                                f"Snapshot for {super_name}.{simple_name} references "
-                                "a deletion vector without an exact row count"
-                            )
-                        tombstone_rows = None
-                    elif (
-                        isinstance(raw_tombstone_rows, int)
-                        and not isinstance(raw_tombstone_rows, bool)
-                        and raw_tombstone_rows >= 0
-                    ):
-                        tombstone_rows = int(raw_tombstone_rows)
-                    else:
-                        # Tombstone metadata is a sealed state machine even when
-                        # the pointer is absent.  Treating malformed/positive
-                        # counts as a legacy placeholder would erase evidence of
-                        # deletes and expose their physical rows.  Only missing,
-                        # None, or the exact non-bool integer zero is valid.
-                        raise RuntimeError(
-                            f"Invalid tombstone row count for "
-                            f"{super_name}.{simple_name}"
-                        )
-
-                    if tombstone_key and not tombstone_rows:
-                        # The writer never publishes an active pointer for an
-                        # empty deletion vector.  Accepting pointer+0 would let
-                        # an attacker/corrupt snapshot attach an unsealed file
-                        # while claiming there is nothing to validate.
-                        raise RuntimeError(
-                            f"Snapshot for {super_name}.{simple_name} references "
-                            "a deletion vector without a positive row count"
-                        )
-
-                    if not tombstone_key and tombstone_rows and tombstone_rows > 0:
-                        raise RuntimeError(
-                            f"Snapshot for {super_name}.{simple_name} records "
-                            f"{tombstone_rows} tombstoned rows but no tombstone pointer"
-                        )
-
+                    raw_tombstone_rows = current_snapshot_data.get(
+                        "tombstone_rows"
+                    )
                     raw_tombstone_digest = current_snapshot_data.get(
                         "tombstone_digest"
                     )
-                    if tombstone_key:
-                        if not (
-                            isinstance(raw_tombstone_digest, str)
-                            and re.fullmatch(r"[0-9a-f]{64}", raw_tombstone_digest)
+                    try:
+                        tombstone_state = normalize_snapshot_tombstone_state(
+                            current_snapshot_data,
+                        )
+                    except (TypeError, ValueError) as exc:
+                        if raw_tombstone is not None and not (
+                            isinstance(raw_tombstone_rows, int)
+                            and not isinstance(raw_tombstone_rows, bool)
+                            and raw_tombstone_rows > 0
                         ):
                             raise RuntimeError(
-                                f"Snapshot for {super_name}.{simple_name} references "
-                                "a deletion vector without a valid SHA-256 digest"
-                            )
-                        tombstone_digest = raw_tombstone_digest
-                    else:
-                        if raw_tombstone_digest not in (None, ""):
+                                f"Snapshot for {super_name}.{simple_name} "
+                                "references a deletion vector without a "
+                                "positive row count"
+                            ) from exc
+                        if raw_tombstone is None and not (
+                            isinstance(raw_tombstone_rows, int)
+                            and not isinstance(raw_tombstone_rows, bool)
+                            and raw_tombstone_rows == 0
+                        ):
                             raise RuntimeError(
-                                f"Snapshot for {super_name}.{simple_name} records "
-                                "a deletion-vector digest without a pointer"
-                            )
-                        tombstone_digest = None
+                                f"Invalid tombstone row count for "
+                                f"{super_name}.{simple_name}"
+                            ) from exc
+                        raise RuntimeError(
+                            f"Invalid deletion-vector state for "
+                            f"{super_name}.{simple_name}"
+                        ) from exc
+
+                    tombstone_key = (
+                        str(tombstone_state.pointer)
+                        if tombstone_state.pointer is not None
+                        else None
+                    )
+                    tombstone_rows = tombstone_state.rows
+                    tombstone_digest = (
+                        str(tombstone_state.digest)
+                        if tombstone_state.digest is not None
+                        else None
+                    )
+                    # Preserve the legacy absence spelling after validation so
+                    # v1 Reflection/TombstoneDef payloads stay byte-for-byte
+                    # compatible. Explicit 1 and 2 remain pinned as written.
+                    tombstone_format = (
+                        current_snapshot_data.get("tombstone_format")
+                        if "tombstone_format" in current_snapshot_data
+                        else None
+                    )
 
                     # Policy overlays have existed in all three wrappers
                     # across catalog versions.  Never let a newer/outer marker
@@ -1335,6 +1324,7 @@ class DataEstimator:
                         "tombstone_key": tombstone_key,
                         "tombstone_rows": tombstone_rows,
                         "tombstone_digest": tombstone_digest,
+                        "tombstone_format": tombstone_format,
                         "share_row_filter": share_row_filter,
                     })
 
@@ -2037,6 +2027,7 @@ class DataEstimator:
                     tombstone_key=pinned.get("tombstone_key"),
                     tombstone_rows=pinned.get("tombstone_rows"),
                     tombstone_digest=pinned.get("tombstone_digest"),
+                    tombstone_format=pinned.get("tombstone_format"),
                     share_row_filter=pinned.get("share_row_filter"),
                     row_group_selections=literal_row_groups,
                     candidate_rows=(selected_rows if selected_rows_complete else 0),

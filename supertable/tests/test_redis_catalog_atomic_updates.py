@@ -51,6 +51,17 @@ def _seed_root(client) -> None:
     )
 
 
+def _snapshot_payload(version: int) -> dict:
+    return {
+        "snapshot_version": version,
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "_row_filter": None,
+    }
+
+
 def _coordinate_first_reads(monkeypatch, client, key: str) -> None:
     original_pipeline = client.pipeline
     barrier = threading.Barrier(2)
@@ -274,7 +285,7 @@ def test_snapshot_commit_rejects_leaf_identity_above_lua_exact_range(field):
     with pytest.raises(RuntimeError, match="Corrupt Redis catalog JSON"):
         catalog.commit_snapshot(
             "acme", "lake", "orders",
-            {"resources": [], "_row_filter": None},
+            _snapshot_payload(1),
             "snapshots/v1.json",
             expected_version=0,
             expected_path="snapshots/v0.json",
@@ -303,7 +314,7 @@ def test_snapshot_commit_cannot_increment_root_at_lua_exact_ceiling():
     with pytest.raises(RuntimeError, match="numeric identity is exhausted"):
         catalog.commit_snapshot(
             "acme", "lake", "orders",
-            {"resources": [], "_row_filter": None},
+            _snapshot_payload(1),
             "snapshots/v1.json",
             expected_version=0,
             expected_path="snapshots/v0.json",
@@ -416,7 +427,7 @@ def test_snapshot_commit_rejects_mirror_enable_after_writer_config_read():
     ):
         catalog.commit_snapshot(
             "acme", "lake", "orders",
-            {"resources": [], "_row_filter": None},
+            _snapshot_payload(1),
             "snapshots/v1.json",
             expected_version=0,
             expected_path="snapshots/v0.json",
@@ -505,7 +516,7 @@ def test_namespace_scoped_mutations_cannot_recreate_state_without_root():
         )
     with pytest.raises(FileNotFoundError, match="SuperTable does not exist"):
         catalog.commit_snapshot(
-            "acme", "lake", "orders", {"resources": []},
+            "acme", "lake", "orders", _snapshot_payload(0),
             "snapshots/v0.json", expected_version=-1, expected_path="",
             lock_token="owner", commit_id="stale-commit",
         )
@@ -549,7 +560,7 @@ def test_leaf_and_linked_share_mutations_reject_invalid_root(root_value):
         )
     with pytest.raises(RuntimeError, match="Corrupt Redis catalog JSON"):
         catalog.commit_snapshot(
-            "acme", "lake", "orders", {"resources": []},
+            "acme", "lake", "orders", _snapshot_payload(0),
             "snapshots/v0.json", expected_version=-1, expected_path="",
             lock_token="owner", commit_id="stale-commit",
         )
@@ -693,7 +704,7 @@ def test_readonly_transition_atomically_fences_snapshot_and_stage_publication():
     with pytest.raises(ReadOnlyCatalogError):
         catalog.commit_snapshot(
             "acme", "lake", "orders",
-            {"resources": [], "_row_filter": None},
+            _snapshot_payload(1),
             "snapshots/v1.json",
             expected_version=0,
             expected_path="snapshots/v0.json",
@@ -738,6 +749,88 @@ def test_readonly_root_rejects_namespace_child_control_mutations():
 def test_table_config_read_rejects_corrupt_or_nonobject_state(raw):
     catalog, client = _catalog()
     client.set(RK.meta_table_config("acme", "lake", "orders"), raw)
+
+    with pytest.raises(RuntimeError, match="Corrupt table configuration"):
+        catalog.get_table_config("acme", "lake", "orders")
+
+
+def test_dv_v2_activation_config_round_trips_with_exact_json_types():
+    catalog, client = _catalog()
+    _seed_root(client)
+    client.set(
+        RK.meta_leaf("acme", "lake", "orders"),
+        json.dumps({"version": 0, "ts": 1, "path": "snapshots/v0.json"}),
+    )
+    client.set(RK.lock_leaf("acme", "lake", "orders"), "owner")
+
+    assert catalog.set_table_config(
+        "acme",
+        "lake",
+        "orders",
+        {
+            "max_overlapping_files": 4,
+            "deletion_vector_format": 2,
+            "dv_v2_reader_fleet_confirmed": True,
+        },
+        lock_token="owner",
+    )
+
+    restored = catalog.get_table_config("acme", "lake", "orders")
+    assert restored is not None
+    assert restored["deletion_vector_format"] == 2
+    assert type(restored["deletion_vector_format"]) is int
+    assert restored["dv_v2_reader_fleet_confirmed"] is True
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"deletion_vector_format": 2},
+        {"dv_v2_reader_fleet_confirmed": True},
+        {
+            "deletion_vector_format": True,
+            "dv_v2_reader_fleet_confirmed": True,
+        },
+        {
+            "deletion_vector_format": "2",
+            "dv_v2_reader_fleet_confirmed": True,
+        },
+        {
+            "deletion_vector_format": 2,
+            "dv_v2_reader_fleet_confirmed": 1,
+        },
+        {
+            "deletion_vector_format": 2,
+            "dv_v2_reader_fleet_confirmed": False,
+        },
+    ],
+)
+def test_table_config_write_rejects_partial_or_coerced_v2_activation(config):
+    catalog, client = _catalog()
+
+    with pytest.raises(ValueError, match="DV-v2 activation"):
+        catalog.set_table_config(
+            "acme", "lake", "orders", config, lock_token="owner",
+        )
+    assert not client.exists(RK.meta_table_config("acme", "lake", "orders"))
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"deletion_vector_format": 2},
+        {
+            "deletion_vector_format": 2,
+            "dv_v2_reader_fleet_confirmed": "true",
+        },
+    ],
+)
+def test_table_config_read_rejects_ambiguous_v2_activation(config):
+    catalog, client = _catalog()
+    client.set(
+        RK.meta_table_config("acme", "lake", "orders"),
+        json.dumps(config),
+    )
 
     with pytest.raises(RuntimeError, match="Corrupt table configuration"):
         catalog.get_table_config("acme", "lake", "orders")

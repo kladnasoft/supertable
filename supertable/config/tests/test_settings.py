@@ -59,6 +59,7 @@ def fresh_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
         "MAX_OVERLAPPING_FILES",
         "MAX_TOMBSTONE_ROWS",
         "TOMBSTONE_COMPACTION_WORKERS",
+        "SUPERTABLE_DV_V2_WRITES_ENABLED",
         "DEFAULT_TIMEOUT_SEC",
         "DEFAULT_LOCK_DURATION_SEC",
         "IS_SHOW_TIMING",
@@ -291,6 +292,7 @@ class TestSettingsDataclass:
         assert s.MAX_OVERLAPPING_FILES == 100
         assert s.MAX_TOMBSTONE_ROWS == 1_000_000
         assert s.TOMBSTONE_COMPACTION_WORKERS == 2
+        assert s.SUPERTABLE_DV_V2_WRITES_ENABLED is False
         assert s.DEFAULT_TIMEOUT_SEC == 60
         assert s.DEFAULT_LOCK_DURATION_SEC == 30
 
@@ -440,6 +442,7 @@ class TestBuildSettings:
     def test_int_and_bool_parsing(self, fresh_env: pytest.MonkeyPatch) -> None:
         fresh_env.setenv("MAX_OVERLAPPING_FILES", "37")
         fresh_env.setenv("TOMBSTONE_COMPACTION_WORKERS", "6")
+        fresh_env.setenv("SUPERTABLE_DV_V2_WRITES_ENABLED", "yes")
         fresh_env.setenv("IS_SHOW_TIMING", "no")
         fresh_env.setenv("STORAGE_FORCE_PATH_STYLE", "yes")
         fresh_env.setenv("STORAGE_USE_SSL", "true")
@@ -448,10 +451,21 @@ class TestBuildSettings:
         s = _build_settings()
         assert s.MAX_OVERLAPPING_FILES == 37
         assert s.TOMBSTONE_COMPACTION_WORKERS == 6
+        assert s.SUPERTABLE_DV_V2_WRITES_ENABLED is True
         assert s.IS_SHOW_TIMING is False
         assert s.STORAGE_FORCE_PATH_STYLE is True
         assert s.STORAGE_USE_SSL is True
         assert s.SUPERTABLE_REDIS_PORT == 6380
+
+    def test_dv_v2_write_gate_rejects_ambiguous_boolean(
+        self, fresh_env: pytest.MonkeyPatch,
+    ) -> None:
+        fresh_env.setenv("SUPERTABLE_DV_V2_WRITES_ENABLED", "enabled")
+
+        with pytest.raises(
+            ValueError, match="SUPERTABLE_DV_V2_WRITES_ENABLED must be one of"
+        ):
+            _build_settings()
 
     def test_duckdb_write_probe_selection_overrides(
         self, fresh_env: pytest.MonkeyPatch,

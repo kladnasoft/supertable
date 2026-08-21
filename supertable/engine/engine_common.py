@@ -6,12 +6,13 @@ import hashlib
 import ast
 import os
 import re
+import stat
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 import duckdb
 import sqlglot
@@ -23,7 +24,15 @@ from sqlglot.optimizer.scope import traverse_scope
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.config.homedir import get_app_home
+from supertable.data_classes import MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES
 from supertable.engine.engine_config import normalize_memory_size
+from supertable.tombstone_manifest_v2 import (
+    MAX_JSON_EXACT_INTEGER,
+    MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS,
+    TOMBSTONE_FORMAT_V2,
+    validate_logical_storage_path,
+    validate_snapshot_tombstone_state,
+)
 from supertable.utils.sql_parser import (
     _build_scoped_table_bindings,
     validate_read_query_ast,
@@ -2477,19 +2486,435 @@ class ValidatedTombstoneTable(str):
 
     It deliberately remains a ``str`` so existing engine/view plumbing stays
     simple.  The marker lets ``create_tombstone_view`` avoid an O(N) validation
-    scan on every cache hit while still fully validating an arbitrary table
-    name supplied by a direct caller.
+    scan on every cache hit. A plain direct-caller table remains valid for v1;
+    v2 requires this marker because only the materializer can prove each sealed
+    external segment without reading it a second time.
     """
 
     def __new__(
             cls, value: str, row_count: int = -1, digest: Optional[str] = None,
-            referenced_files=None,
+            referenced_files=None, *, root_digest: Optional[str] = None,
+            cache_key: Optional[str] = None,
+            segment_fingerprint: Optional[str] = None,
     ):
         obj = str.__new__(cls, value)
         obj.row_count = int(row_count)
         obj.digest = digest
         obj.referenced_files = frozenset(referenced_files or ())
+        obj.root_digest = root_digest
+        obj.cache_key = cache_key
+        obj.segment_fingerprint = segment_fingerprint
         return obj
+
+
+def _duckdb_parquet_path_is_glob(path: str) -> bool:
+    """Return whether one resolved path can expand to multiple objects.
+
+    Signed HTTP URLs legitimately use ``?`` (and may use brackets or stars)
+    in their credential query, which DuckDB does not treat as the object path.
+    Native provider URIs and local paths have no such query convention here,
+    so inspect their full spelling instead of accidentally hiding a wildcard
+    parsed as a URL query delimiter.
+    """
+    try:
+        parsed = urlsplit(path)
+    except ValueError as exc:
+        raise RuntimeError("Invalid resolved deletion-vector path") from exc
+    candidate = (
+        parsed.path
+        if parsed.scheme.casefold() in {"http", "https"}
+        else path
+    )
+    return any(character in candidate for character in ("*", "?", "[", "]"))
+
+
+def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
+    """Return a structurally closed v2 segment tuple or raise.
+
+    Legacy definitions must not carry segments.  This rejects discriminator
+    hybrids at the last SQL boundary even for direct engine callers that did
+    not pass through :class:`DataReader`.
+    """
+    if tombstone_def is None:
+        return ()
+    tombstone_format = getattr(tombstone_def, "tombstone_format", None)
+    tombstone_path = getattr(tombstone_def, "tombstone_path", None)
+    cache_key = getattr(tombstone_def, "cache_key", None)
+    segments = getattr(tombstone_def, "segments", ())
+    if not isinstance(segments, tuple):
+        raise RuntimeError("Invalid deletion-vector segment definition")
+    if tombstone_path is not None and (
+        not isinstance(tombstone_path, str) or not tombstone_path
+    ):
+        raise RuntimeError("Invalid resolved deletion-vector path")
+    if (
+        tombstone_format is not None
+        and (
+            isinstance(tombstone_format, bool)
+            or not isinstance(tombstone_format, int)
+            or tombstone_format not in (1, 2)
+        )
+    ):
+        raise RuntimeError("Invalid deletion-vector format discriminator")
+    if tombstone_format is not None:
+        try:
+            validate_snapshot_tombstone_state(
+                cache_key if tombstone_path is not None else None,
+                getattr(tombstone_def, "expected_rows", None),
+                getattr(tombstone_def, "tombstone_digest", None),
+                format_present=True,
+                tombstone_format=tombstone_format,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Invalid deletion-vector snapshot state"
+            ) from exc
+    if tombstone_format != TOMBSTONE_FORMAT_V2:
+        if segments:
+            raise RuntimeError(
+                "Deletion-vector segments require tombstone_format=2"
+            )
+        if str(cache_key or tombstone_path or "").endswith(".json"):
+            raise RuntimeError(
+                "A JSON deletion-vector pointer requires tombstone_format=2"
+            )
+        return ()
+    if tombstone_path is None:
+        if cache_key is not None or segments:
+            raise RuntimeError("Invalid empty v2 deletion-vector definition")
+        return ()
+    if not segments:
+        raise RuntimeError("Active v2 deletion vector has no sealed segments")
+    if len(segments) > MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS:
+        raise RuntimeError("Deletion vector contains too many sealed segments")
+
+    manifest_key = cache_key
+    try:
+        validate_logical_storage_path(
+            manifest_key,
+            field_name="tombstone manifest cache key",
+            required_suffix=".json",
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Invalid v2 deletion-vector manifest cache key") from exc
+
+    keys: List[str] = []
+    row_total = 0
+    for segment in segments:
+        key = getattr(segment, "cache_key", None)
+        path = getattr(segment, "tombstone_path", None)
+        rows = getattr(segment, "expected_rows", None)
+        file_size = getattr(segment, "file_size", None)
+        digest = getattr(segment, "tombstone_digest", None)
+        provider_identity = getattr(segment, "provider_identity", None)
+        if not isinstance(key, str) or not key or not isinstance(path, str) or not path:
+            raise RuntimeError("Invalid deletion-vector segment path")
+        if _duckdb_parquet_path_is_glob(path):
+            raise RuntimeError(
+                "Deletion-vector segment must resolve to one exact object path"
+            )
+        try:
+            validate_logical_storage_path(
+                key,
+                field_name="tombstone segment cache key",
+                required_suffix=".parquet",
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Invalid deletion-vector segment cache key") from exc
+        if (
+            not isinstance(rows, int) or isinstance(rows, bool) or rows <= 0
+            or rows > MAX_JSON_EXACT_INTEGER
+            or not isinstance(file_size, int) or isinstance(file_size, bool)
+            or file_size <= 0
+            or file_size > MAX_JSON_EXACT_INTEGER
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise RuntimeError("Invalid deletion-vector segment seal")
+        if provider_identity is not None and (
+            not isinstance(provider_identity, str)
+            or not provider_identity
+            or "\x00" in provider_identity
+            or len(provider_identity.encode("utf-8"))
+            > MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES
+        ):
+            raise RuntimeError(
+                "Invalid deletion-vector segment provider identity"
+            )
+        keys.append(key)
+        row_total += rows
+    if keys != sorted(keys) or len(keys) != len(set(keys)):
+        raise RuntimeError(
+            "Deletion-vector segments are not uniquely and canonically ordered"
+        )
+    expected_rows = getattr(tombstone_def, "expected_rows", None)
+    if (
+        not isinstance(expected_rows, int)
+        or isinstance(expected_rows, bool)
+        or expected_rows <= 0
+        or expected_rows > MAX_JSON_EXACT_INTEGER
+        or row_total != expected_rows
+    ):
+        raise RuntimeError(
+            "Deletion-vector segment rows do not match the pinned snapshot"
+        )
+    root_digest = getattr(tombstone_def, "tombstone_digest", None)
+    if (
+        not isinstance(root_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", root_digest) is None
+    ):
+        raise RuntimeError("Invalid v2 deletion-vector manifest root digest")
+    return segments
+
+
+def _v2_segment_fingerprint(segments: Tuple[object, ...]) -> str:
+    """Seal the logical segment descriptors used to populate a cache entry.
+
+    Resolved paths are deliberately excluded: presigned URLs may rotate while
+    the manifest's stable key/row/size/digest descriptors remain identical.
+    """
+    digest = hashlib.sha256(b"supertable-dv-v2-segments\n")
+    for segment in segments:
+        fields = (
+            str(segment.cache_key),
+            str(int(segment.expected_rows)),
+            str(int(segment.file_size)),
+            str(segment.tombstone_digest),
+            str(getattr(segment, "provider_identity", None) or ""),
+        )
+        for value in fields:
+            encoded = value.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+    return digest.hexdigest()
+
+
+def tombstone_data_paths(tombstone_def) -> List[str]:
+    """Return only Parquet paths an executor may consume for a DV."""
+    segments = _v2_tombstone_segments(tombstone_def)
+    if segments:
+        return [str(segment.tombstone_path) for segment in segments]
+    path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
+    return [str(path)] if path else []
+
+
+def _v2_union_relation(relations: List[str]) -> str:
+    file_col = quote_if_needed(TOMBSTONE_FILE_COL)
+    rowid_col = quote_if_needed(ROWID_COL)
+    return "(" + " UNION ALL ".join(
+        f"SELECT {file_col}, {rowid_col} FROM {relation}"
+        for relation in relations
+    ) + ")"
+
+
+def _local_parquet_file_identity(path: str) -> Optional[tuple[int, ...]]:
+    """Return a stable local-file identity, or ``None`` for provider paths.
+
+    DuckDB opens provider-resolved S3/GCS/Azure/HTTP paths through its own
+    filesystem implementations, so attempting to reinterpret those URLs as
+    local paths would either inspect the wrong object or reject valid reads.
+    Plain paths (the normal LocalStorage/cache representation) and local file
+    URLs can be fenced with the host filesystem around the DuckDB statement.
+    """
+    parsed = urlsplit(path)
+    if parsed.scheme:
+        if parsed.scheme.casefold() != "file":
+            return None
+        if parsed.query or parsed.fragment or parsed.netloc not in ("", "localhost"):
+            raise RuntimeError("Invalid local deletion-vector segment path")
+        local_path = unquote(parsed.path)
+    else:
+        local_path = path
+
+    try:
+        observed = os.stat(local_path, follow_symlinks=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "Unable to inspect local deletion-vector segment"
+        ) from exc
+    if not stat.S_ISREG(observed.st_mode):
+        raise RuntimeError("Local deletion-vector segment is not a regular file")
+    return (
+        int(observed.st_dev),
+        int(observed.st_ino),
+        int(observed.st_size),
+        int(observed.st_mtime_ns),
+        int(observed.st_ctime_ns),
+    )
+
+
+def _provider_parquet_file_identity(
+        storage: object, cache_key: str,
+) -> tuple[int, str]:
+    """Observe one logical provider object without reading its row bytes."""
+    stat_object = getattr(storage, "stat_object", None)
+    if not callable(stat_object):
+        raise RuntimeError(
+            "Remote deletion-vector segments require provider identity support"
+        )
+    try:
+        metadata = stat_object(cache_key)
+        size = getattr(metadata, "size", None)
+        identity_fn = getattr(metadata, "identity_token", None)
+        identity = identity_fn() if callable(identity_fn) else None
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to observe remote deletion-vector segment"
+        ) from exc
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size < 0
+        or not isinstance(identity, str)
+        or not identity
+        or "\x00" in identity
+        or len(identity.encode("utf-8"))
+        > MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES
+    ):
+        raise RuntimeError(
+            "Remote deletion-vector segment has no stable provider identity"
+        )
+    return int(size), identity
+
+
+def _materialize_v2_tombstone_table(
+        con: duckdb.DuckDBPyConnection,
+        tombstone_def,
+        *,
+        base_table_name: str,
+        occupied_table_names: set[str],
+        allowed_files: Optional[List[str]] = None,
+        temporary: bool = False,
+        storage: Optional[object] = None,
+) -> tuple[str, int, str, frozenset[str]]:
+    """Read each v2 segment exactly once into a private validated table.
+
+    Each external Parquet object is first materialised into its own private
+    staging table. Validation then runs against that immutable table, so the
+    exact schema/count/logical digest seal belongs to the same bytes later
+    unioned into the query-lifetime cache table. This deliberately avoids the
+    unsafe validate-path-then-CTAS-path pattern: a mutable or inconsistent
+    backend never gets a second external read in which to substitute rows or
+    redistribute them between otherwise valid segments.
+    """
+    segments = _v2_tombstone_segments(tombstone_def)
+    staging_tables: List[str] = []
+    final_table: Optional[str] = None
+    try:
+        for index, segment in enumerate(segments):
+            staging = (
+                f"{base_table_name}_segment_{index}_{uuid.uuid4().hex}"
+            )
+            segment_path = str(segment.tombstone_path)
+            escaped = escape_parquet_path(segment_path)
+            relation = f"read_parquet('{escaped}', hive_partitioning=false)"
+            expected_size = int(segment.file_size)
+            local_identity = _local_parquet_file_identity(segment_path)
+            provider_identity: Optional[tuple[int, str]] = None
+            if local_identity is not None:
+                if local_identity[2] != expected_size:
+                    raise RuntimeError(
+                        "Deletion-vector segment file_size does not match "
+                        "the manifest"
+                    )
+            else:
+                expected_provider_identity = getattr(
+                    segment, "provider_identity", None,
+                )
+                if storage is None or expected_provider_identity is None:
+                    raise RuntimeError(
+                        "Remote deletion-vector segment lacks a pinned "
+                        "provider identity"
+                    )
+                provider_identity = _provider_parquet_file_identity(
+                    storage, str(segment.cache_key),
+                )
+                if provider_identity[0] != expected_size:
+                    raise RuntimeError(
+                        "Deletion-vector segment file_size does not match "
+                        "the manifest"
+                    )
+                if provider_identity[1] != expected_provider_identity:
+                    raise RuntimeError(
+                        "Deletion-vector segment provider identity does not "
+                        "match the pinned observation"
+                    )
+            con.execute(
+                f"CREATE TEMPORARY TABLE {quote_if_needed(staging)} AS "
+                f"SELECT * FROM {relation};"
+            )
+            staging_tables.append(staging)
+            if local_identity is not None:
+                if _local_parquet_file_identity(segment_path) != local_identity:
+                    raise RuntimeError(
+                        "Deletion-vector segment changed while being read"
+                    )
+            elif _provider_parquet_file_identity(
+                storage, str(segment.cache_key),
+            ) != provider_identity:
+                raise RuntimeError(
+                    "Deletion-vector segment changed while being read"
+                )
+            _validate_tombstone_relation_details(
+                con,
+                quote_if_needed(staging),
+                expected_rows=int(segment.expected_rows),
+                expected_digest=str(segment.tombstone_digest),
+                allowed_files=allowed_files,
+                validate_rows=True,
+            )
+
+        union_relation = _v2_union_relation([
+            quote_if_needed(table) for table in staging_tables
+        ])
+        candidate = base_table_name
+        if candidate in occupied_table_names:
+            candidate = f"{base_table_name}_{uuid.uuid4().hex}"
+        while True:
+            try:
+                temporary_sql = "TEMPORARY " if temporary else ""
+                con.execute(
+                    f"CREATE {temporary_sql}TABLE "
+                    f"{quote_if_needed(candidate)} AS "
+                    f"SELECT * FROM {union_relation};"
+                )
+                final_table = candidate
+                break
+            except duckdb.CatalogException as create_err:
+                if "already exists" not in str(create_err).lower():
+                    raise
+                candidate = f"{base_table_name}_{uuid.uuid4().hex}"
+
+        row_count, digest, referenced_files = (
+            _validate_tombstone_relation_details(
+                con,
+                quote_if_needed(final_table),
+                expected_rows=getattr(tombstone_def, "expected_rows", None),
+                # The snapshot digest seals canonical manifest JSON, not the
+                # logical union. Per-segment digests were checked above.
+                expected_digest=None,
+                allowed_files=allowed_files,
+                validate_rows=True,
+            )
+        )
+        return final_table, row_count, digest, referenced_files
+    except Exception:
+        if final_table is not None:
+            try:
+                con.execute(
+                    f"DROP TABLE IF EXISTS {quote_if_needed(final_table)};"
+                )
+            except Exception:
+                pass
+        raise
+    finally:
+        for staging in reversed(staging_tables):
+            try:
+                con.execute(
+                    f"DROP TABLE IF EXISTS {quote_if_needed(staging)};"
+                )
+            except Exception:
+                pass
 
 
 def _describe_relation(
@@ -2731,11 +3156,10 @@ def create_tombstone_view(
          * *dv_table* — a validated, pre-materialised
            ``(__file__, __rowid__)`` table (see :class:`TombstoneCache`). Built
            once and reused across queries, avoiding a parquet re-read per query.
-         * *tombstone_def.tombstone_path* — inline ``read_parquet`` of the
-           deletion-vector parquet.  Used when the cache is disabled or has
-           no stable key.  This is the legacy path and is semantically
-           identical to the cached one (same composite identities, same
-           anti-join, same ``__dv__`` alias).
+         * *tombstone_def.tombstone_path* — inline ``read_parquet`` of a legacy
+           v1 deletion-vector parquet. Segmented v2 vectors always use a
+           validated private table, including when persistent cache capacity
+           is zero.
 
     This view sits directly on top of the reflection table (before RBAC),
     so the anti-join still has ``__rowid__`` available and RBAC never sees
@@ -2762,6 +3186,13 @@ def create_tombstone_view(
     tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
     expected_rows = getattr(tombstone_def, "expected_rows", None) if tombstone_def else None
     expected_digest = getattr(tombstone_def, "tombstone_digest", None) if tombstone_def else None
+    v2_segments = _v2_tombstone_segments(tombstone_def)
+    is_v2 = (
+        tombstone_def is not None
+        and getattr(tombstone_def, "tombstone_format", None)
+        == TOMBSTONE_FORMAT_V2
+    )
+    active_v2 = is_v2 and tomb_path is not None
     resource_keys = list(getattr(tombstone_def, "resource_keys", ()) or ()) if tombstone_def else []
     raw_snapshot_keys = (
         getattr(tombstone_def, "snapshot_resource_keys", None)
@@ -2819,12 +3250,46 @@ def create_tombstone_view(
             )
 
     referenced_dv_files: frozenset[str] = frozenset()
+    owned_direct_v2_table: Optional[str] = None
+    if active_v2 and not dv_table:
+        # Direct helper callers do not have a TombstoneCache lifecycle. Keep a
+        # private connection-local table behind the created view; it disappears
+        # with the caller's connection. Executor callers always supply the
+        # cache-owned (or query-lifetime capacity=0) table instead.
+        table_name, row_count, digest, referenced_dv_files = (
+            _materialize_v2_tombstone_table(
+                con,
+                tombstone_def,
+                base_table_name=f"dv_direct_{uuid.uuid4().hex}",
+                occupied_table_names=set(),
+                allowed_files=allowed_dv_files,
+                temporary=True,
+            )
+        )
+        dv_table = ValidatedTombstoneTable(
+            table_name,
+            row_count,
+            digest,
+            referenced_dv_files,
+            root_digest=expected_digest,
+            cache_key=getattr(tombstone_def, "cache_key", None),
+            segment_fingerprint=_v2_segment_fingerprint(v2_segments),
+        )
+        owned_direct_v2_table = table_name
     if dv_table:
         # Tables returned by TombstoneCache were fully checked once when they
         # were materialised.  Direct callers receive the same full validation
         # here instead of being able to smuggle a partial/malformed relation
         # into the anti-join.
         if not isinstance(dv_table, ValidatedTombstoneTable):
+            if active_v2:
+                # A plain table name has no proof tying its contents to every
+                # manifest-sealed segment. Re-reading those external paths to
+                # manufacture that proof would recreate the substitution race
+                # this boundary is designed to remove.
+                raise RuntimeError(
+                    "V2 deletion vectors require a validated materialized table"
+                )
             _, _, referenced_dv_files = _validate_tombstone_relation_details(
                 con,
                 quote_if_needed(str(dv_table)),
@@ -2844,14 +3309,24 @@ def create_tombstone_view(
                 "Invalid deletion-vector row count: expected "
                 f"{int(expected_rows)}, got {dv_table.row_count}"
             )
+        if isinstance(dv_table, ValidatedTombstoneTable) and expected_digest is not None:
+            cached_seal = (
+                dv_table.root_digest if active_v2 else dv_table.digest
+            )
+            if cached_seal != expected_digest:
+                raise RuntimeError(
+                    "Invalid deletion-vector digest: cached artifact does not "
+                    "match the pinned snapshot"
+                )
         if (
             isinstance(dv_table, ValidatedTombstoneTable)
-            and expected_digest is not None
-            and dv_table.digest != expected_digest
+            and active_v2
+            and dv_table.segment_fingerprint
+            != _v2_segment_fingerprint(v2_segments)
         ):
             raise RuntimeError(
-                "Invalid deletion-vector digest: cached artifact does not match "
-                "the pinned snapshot"
+                "Invalid deletion-vector cache entry: segment descriptors "
+                "do not match the pinned manifest"
             )
         if (
             isinstance(dv_table, ValidatedTombstoneTable)
@@ -2881,9 +3356,8 @@ def create_tombstone_view(
     elif tomb_path:
         escaped = escape_parquet_path(tomb_path)
         # Tombstones are physically stored below Hive-looking
-        # year=/month=/day=/hour= directories.  Those path components are not
-        # DV columns; inference would widen the relation's sealed two-column
-        # schema and can make cached/inline validation disagree.
+        # year=/month=/day=/hour= directories. Those path components are
+        # not DV columns; inference would widen the sealed schema.
         relation = (
             f"read_parquet('{escaped}', hive_partitioning=false)"
         )
@@ -2904,7 +3378,7 @@ def create_tombstone_view(
             f"CREATE OR REPLACE VIEW {view_name} AS "
             f"SELECT {live_cols} FROM {source_table} "
             f"ANTI JOIN (SELECT {dv_projection} FROM "
-            f"read_parquet('{escaped}', hive_partitioning=false)) AS __dv__ "
+            f"{relation}) AS __dv__ "
             f"ON {join_clause};"
         )
     else:
@@ -2912,14 +3386,25 @@ def create_tombstone_view(
             f"CREATE OR REPLACE VIEW {view_name} AS "
             f"SELECT {live_cols} FROM {source_table};"
         )
-    if tomb_path:
-        _validate_tombstone_source_rowids(
-            con,
-            source_table,
-            selected_resource_keys=resource_keys,
-            referenced_dv_files=referenced_dv_files,
-        )
-    con.execute(sql)
+    try:
+        if tomb_path:
+            _validate_tombstone_source_rowids(
+                con,
+                source_table,
+                selected_resource_keys=resource_keys,
+                referenced_dv_files=referenced_dv_files,
+            )
+        con.execute(sql)
+    except Exception:
+        if owned_direct_v2_table is not None:
+            try:
+                con.execute(
+                    f"DROP TABLE IF EXISTS "
+                    f"{quote_if_needed(owned_direct_v2_table)};"
+                )
+            except Exception:
+                pass
+        raise
 
 
 # =========================================================
@@ -2932,6 +3417,11 @@ class _DVCacheEntry:
     table_name: str          # DuckDB table name (e.g. dv_a3f8c1...)
     cache_key: str           # stable tombstone path this DV was built from
     table_id: str            # logical table this version belongs to
+    # Capacity-zero v2 tables are TEMPORARY and therefore visible only through
+    # the cursor that created them.  Retaining that cursor both prevents its
+    # ``id`` from being reused while the entry is live and lets eviction issue
+    # the DROP against the correct connection context.
+    owner_connection: object = None
     ref_count: int = 0       # in-flight queries currently anti-joining it
     last_used: int = 0       # monotonic tick — per-table LRU ordering
     expires_at: float = 0.0  # idle deadline; refreshed on every acquire
@@ -2994,8 +3484,10 @@ class TombstoneCache:
         retained per table; the sweep evicts the least-recently-used
         unreferenced ones beyond that.  A burst of rewrites (e.g. 1000 updates
         in 5 minutes) keeps only the last ``capacity`` versions of *that* table
-        and touches no other table.  ``capacity <= 0`` disables the cache
-        entirely (callers fall back to the inline ``read_parquet`` path).
+        and touches no other table.  ``capacity <= 0`` disables persistence;
+        segmented v2 vectors are still materialised once for the lifetime of
+        the query and dropped on release, while legacy v1 keeps its inline
+        ``read_parquet`` fallback.
 
       * **Global cap.** At most ``global_capacity`` entries remain resident;
         the oldest unreferenced entry is evicted across tables when necessary.
@@ -3013,11 +3505,13 @@ class TombstoneCache:
             global_capacity: int = 128,
             *,
             time_fn: Callable[[], float] = time.monotonic,
+            storage: Optional[object] = None,
     ):
         self.capacity = capacity
         self.ttl_seconds = ttl_seconds
         self.global_capacity = global_capacity
         self._time = time_fn
+        self.storage = storage
         self._lock = threading.Lock()
         self._registry: Dict[str, _DVCacheEntry] = {}   # cache_key -> entry
         self._tick = 0
@@ -3033,19 +3527,86 @@ class TombstoneCache:
             duckdb_path: Optional[str],
             expected_rows: Optional[int] = None,
             expected_digest: Optional[str] = None,
+            *,
+            tombstone_def=None,
+            allowed_files: Optional[List[str]] = None,
     ) -> Optional[str]:
         """Return the DV table name for *cache_key*, materialising it on miss,
-        refreshing its idle TTL, and incrementing its ref count.  Returns
-        ``None`` when caching is disabled or the inputs are incomplete — the
-        caller then falls back to the inline ``read_parquet`` path, preserving
-        exact legacy behaviour.
+        refreshing its idle TTL, and incrementing its ref count.  Segmented v2
+        vectors always get a query-lifetime table, even when persistent cache
+        capacity is zero. Legacy v1 returns ``None`` when caching is disabled
+        or its inputs are incomplete, preserving its inline fallback.
         """
-        if not self.enabled or not cache_key or not duckdb_path:
+        validated_segments = (
+            _v2_tombstone_segments(tombstone_def)
+            if tombstone_def is not None else ()
+        )
+        is_v2 = (
+            tombstone_def is not None
+            and getattr(tombstone_def, "tombstone_format", None)
+            == TOMBSTONE_FORMAT_V2
+        )
+        active_v2 = (
+            is_v2
+            and getattr(tombstone_def, "tombstone_path", None) is not None
+        )
+        segment_fingerprint = None
+        if active_v2:
+            segment_fingerprint = _v2_segment_fingerprint(
+                validated_segments
+            )
+            pinned_cache_key = getattr(tombstone_def, "cache_key", None)
+            pinned_rows = getattr(tombstone_def, "expected_rows", None)
+            pinned_digest = getattr(tombstone_def, "tombstone_digest", None)
+            if cache_key != pinned_cache_key:
+                raise RuntimeError(
+                    "V2 deletion-vector cache key does not match the pinned "
+                    "manifest"
+                )
+            if expected_rows is not None and (
+                type(expected_rows) is not int
+                or expected_rows != pinned_rows
+            ):
+                raise RuntimeError(
+                    "V2 deletion-vector row count does not match the pinned "
+                    "manifest"
+                )
+            if expected_digest != pinned_digest:
+                raise RuntimeError(
+                    "V2 deletion-vector digest does not match the pinned "
+                    "manifest"
+                )
+            if (
+                not isinstance(expected_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+            ):
+                raise RuntimeError(
+                    "Invalid v2 deletion-vector manifest root digest"
+                )
+        if (
+            not cache_key
+            or (not active_v2 and not duckdb_path)
+            or (not active_v2 and not self.enabled)
+        ):
             return None
+        shared_registry_key = (
+            f"dv-v2:{cache_key}:{expected_digest}"
+            if active_v2 else cache_key
+        )
+        # DuckDB TEMP tables are cursor-local.  Persistent cache entries can be
+        # shared by every cursor on the root connection, but capacity-zero v2
+        # entries must only be reused within the cursor that materialised them.
+        # Keeping the cursor on the entry prevents Python from recycling its id
+        # before release and gives the eviction path the correct DROP context.
+        connection_local = active_v2 and not self.enabled
+        registry_key = (
+            f"{shared_registry_key}:connection:{id(con):x}"
+            if connection_local else shared_registry_key
+        )
         with self._lock:
-            entry = self._registry.get(cache_key)
+            entry = self._registry.get(registry_key)
             if entry is None:
-                base_table_name = dv_table_name(cache_key)
+                base_table_name = dv_table_name(registry_key)
                 table_name = base_table_name
                 occupied_names = {
                     str(existing.table_name)
@@ -3053,62 +3614,90 @@ class TombstoneCache:
                 }
                 if table_name in occupied_names:
                     table_name = f"{base_table_name}_{uuid.uuid4().hex}"
-                rid = quote_if_needed(ROWID_COL)
-                file_col = quote_if_needed(TOMBSTONE_FILE_COL)
-                escaped = escape_parquet_path(duckdb_path)
-                relation = (
-                    f"read_parquet('{escaped}', hive_partitioning=false)"
-                )
-                # Materialise privately, validate, and only then publish a
-                # registry entry.  Validating the table (rather than scanning
-                # the parquet first and then CTAS-ing it) keeps a cache miss to
-                # one remote read. CTAS retains both fields because DuckDB
-                # reflections expose the stable key required by the composite
-                # anti-join.
-                # CREATE (never CREATE OR REPLACE) is the ownership boundary:
-                # an unregistered table can still be referenced by an
-                # in-flight cursor after a connection/cache reset.  If the
-                # deterministic name is already present, allocate a private
-                # suffix and retry; never overwrite or DROP the unknown table.
-                while True:
-                    try:
-                        con.execute(
-                            f"CREATE TABLE {table_name} AS "
-                            f"SELECT {file_col}, {rid} FROM {relation};"
-                        )
-                        break
-                    except duckdb.CatalogException as create_err:
-                        if "already exists" not in str(create_err).lower():
-                            raise
-                        table_name = (
-                            f"{base_table_name}_{uuid.uuid4().hex}"
-                        )
-                try:
+                if active_v2:
                     (
+                        table_name,
                         row_count,
                         digest,
                         referenced_files,
-                    ) = _validate_tombstone_relation_details(
-                        con, quote_if_needed(table_name),
-                        expected_rows=expected_rows,
-                        expected_digest=expected_digest,
-                        validate_rows=True,
+                    ) = _materialize_v2_tombstone_table(
+                        con,
+                        tombstone_def,
+                        base_table_name=table_name,
+                        occupied_table_names=occupied_names,
+                        allowed_files=allowed_files,
+                        temporary=not self.enabled,
+                        storage=self.storage,
                     )
-                except Exception:
+                else:
+                    rid = quote_if_needed(ROWID_COL)
+                    file_col = quote_if_needed(TOMBSTONE_FILE_COL)
+                    escaped = escape_parquet_path(duckdb_path)
+                    relation = (
+                        f"read_parquet('{escaped}', hive_partitioning=false)"
+                    )
                     try:
-                        con.execute(f"DROP TABLE IF EXISTS {table_name};")
+                        # Materialise privately, validate, and only then
+                        # publish a registry entry. CREATE (never CREATE OR
+                        # REPLACE) is the ownership boundary: an unregistered
+                        # table may still be referenced by an in-flight cursor.
+                        while True:
+                            try:
+                                con.execute(
+                                    f"CREATE TABLE {table_name} AS "
+                                    f"SELECT {file_col}, {rid} FROM {relation};"
+                                )
+                                break
+                            except duckdb.CatalogException as create_err:
+                                if "already exists" not in str(create_err).lower():
+                                    raise
+                                table_name = (
+                                    f"{base_table_name}_{uuid.uuid4().hex}"
+                                )
+                        (
+                            row_count,
+                            digest,
+                            referenced_files,
+                        ) = _validate_tombstone_relation_details(
+                            con, quote_if_needed(table_name),
+                            expected_rows=expected_rows,
+                            expected_digest=expected_digest,
+                            allowed_files=allowed_files,
+                            validate_rows=True,
+                        )
                     except Exception:
-                        pass
-                    raise
+                        try:
+                            con.execute(
+                                f"DROP TABLE IF EXISTS "
+                                f"{quote_if_needed(table_name)};"
+                            )
+                        except Exception:
+                            pass
+                        raise
                 entry = _DVCacheEntry(
                     table_name=ValidatedTombstoneTable(
                         table_name, row_count, digest,
                         referenced_files,
+                        root_digest=(expected_digest if active_v2 else None),
+                        cache_key=registry_key,
+                        segment_fingerprint=segment_fingerprint,
                     ),
-                    cache_key=cache_key,
+                    cache_key=registry_key,
                     table_id=dv_table_id(cache_key),
+                    owner_connection=(con if connection_local else None),
                 )
-                self._registry[cache_key] = entry
+                self._registry[registry_key] = entry
+
+            if (
+                active_v2
+                and getattr(
+                    entry.table_name, "segment_fingerprint", None,
+                ) != segment_fingerprint
+            ):
+                raise RuntimeError(
+                    "Invalid deletion-vector cache entry: segment descriptors "
+                    "do not match the pinned manifest"
+                )
 
             if expected_rows is not None:
                 table_count = getattr(entry.table_name, "row_count", -1)
@@ -3123,11 +3712,27 @@ class TombstoneCache:
                     )
 
             if expected_digest is not None:
-                cached_digest = getattr(entry.table_name, "digest", None)
+                cached_digest = getattr(
+                    entry.table_name,
+                    "root_digest" if active_v2 else "digest",
+                    None,
+                )
                 if cached_digest != expected_digest:
                     raise RuntimeError(
                         "Invalid deletion-vector digest: cached artifact does "
                         "not match the pinned snapshot"
+                    )
+
+            if allowed_files is not None:
+                referenced_files = getattr(
+                    entry.table_name, "referenced_files", frozenset(),
+                )
+                if not referenced_files.issubset(
+                    {str(path) for path in allowed_files}
+                ):
+                    raise RuntimeError(
+                        "Invalid deletion vector: __file__ contains resources "
+                        "outside the pinned table snapshot"
                     )
 
             entry.ref_count += 1
@@ -3143,7 +3748,7 @@ class TombstoneCache:
             cache_key: Optional[str],
     ) -> None:
         """Decrement the ref count for *cache_key* and run the lazy sweep."""
-        if not self.enabled or not cache_key:
+        if not cache_key:
             return
         with self._lock:
             entry = self._registry.get(cache_key)
@@ -3165,7 +3770,12 @@ class TombstoneCache:
             self, con: duckdb.DuckDBPyConnection, entry: _DVCacheEntry,
     ) -> None:
         try:
-            con.execute(f"DROP TABLE IF EXISTS {entry.table_name};")
+            drop_con = (
+                entry.owner_connection
+                if entry.owner_connection is not None
+                else con
+            )
+            drop_con.execute(f"DROP TABLE IF EXISTS {entry.table_name};")
         except Exception:
             pass
         self._registry.pop(entry.cache_key, None)

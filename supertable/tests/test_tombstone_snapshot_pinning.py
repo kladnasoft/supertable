@@ -15,6 +15,11 @@ from supertable import redis_keys as RK
 from supertable.data_classes import Reflection, SuperSnapshot, TableDefinition
 from supertable.engine.engine_enum import Engine
 from supertable.redis_catalog import RedisCatalog
+from supertable.storage.storage_interface import ObjectMetadata
+from supertable.tombstone_manifest_v2 import (
+    TombstoneManifestV2,
+    TombstoneSegment,
+)
 from supertable.utils.snapshot import (
     collect_share_row_filters,
     complete_snapshot_payload,
@@ -22,6 +27,36 @@ from supertable.utils.snapshot import (
 
 
 _PINNED_DIGEST = "0" * 64
+
+
+def _seal_mock_manifest(
+    storage,
+    manifest_key: str,
+    body: bytes,
+    *,
+    segment_sizes=None,
+) -> None:
+    metadata = ObjectMetadata(size=len(body), version="manifest-v1")
+    segment_metadata = {
+        key: ObjectMetadata(size=size, version=f"segment-v1:{key}")
+        for key, size in dict(segment_sizes or {}).items()
+    }
+
+    def _stat_object(key):
+        if key == manifest_key:
+            return metadata
+        if key in segment_metadata:
+            return segment_metadata[key]
+        raise KeyError(key)
+
+    storage.stat_object.side_effect = _stat_object
+
+    def _read_range(key, offset, length, *, expected=None):
+        assert key == manifest_key
+        assert expected == metadata
+        return body[offset:offset + length]
+
+    storage.read_range.side_effect = _read_range
 
 
 class _LocalLikeStorage:
@@ -125,6 +160,84 @@ def test_estimator_pins_tombstone_from_path_only_snapshot(monkeypatch):
     super_table.read_simple_table_snapshot.assert_called_once_with(
         "snapshots/v4.json"
     )
+
+
+def test_estimator_reads_authoritative_pre_dv_snapshot(monkeypatch):
+    """Historical heavy JSON may omit the entire deletion-vector state."""
+    estimator_module = importlib.import_module("supertable.engine.data_estimator")
+    heavy_snapshot = {
+        "snapshot_version": 1,
+        "schema": {"id": "Int64"},
+        "resources": [
+            {"file": "data/v1.parquet", "file_size": 123, "rows": 2},
+        ],
+    }
+    catalog = MagicMock()
+    catalog.scan_leaf_items.return_value = [{
+        "simple": "t",
+        "path": "snapshots/v1.json",
+        "version": 1,
+        "ts": 11,
+    }]
+    monkeypatch.setattr(estimator_module, "RedisCatalog", lambda: catalog)
+    super_table = MagicMock()
+    super_table.read_simple_table_snapshot.return_value = heavy_snapshot
+    monkeypatch.setattr(
+        estimator_module, "SuperTable", lambda *a, **k: super_table,
+    )
+
+    reflection = estimator_module.DataEstimator(
+        "org",
+        _LocalLikeStorage(),
+        [TableDefinition("s", "t", "t", columns=["id"])],
+    ).estimate()
+
+    snapshot = reflection.supers[0]
+    assert snapshot.files == ["data/v1.parquet"]
+    assert snapshot.tombstone_key is None
+    assert snapshot.tombstone_rows == 0
+    assert snapshot.tombstone_digest is None
+    assert snapshot.tombstone_format is None
+
+
+def test_estimator_pins_explicit_v2_format_with_manifest_pointer(monkeypatch):
+    estimator_module = importlib.import_module("supertable.engine.data_estimator")
+    snapshot = {
+        "snapshot_version": 5,
+        "schema": {"id": "Int64"},
+        "resources": [
+            {"file": "data/v5.parquet", "file_size": 123, "rows": 2},
+        ],
+        "tombstone": "org/s/tables/t/tombstone/manifest.json",
+        "tombstone_rows": 1,
+        "tombstone_digest": _PINNED_DIGEST,
+        "tombstone_format": 2,
+    }
+    catalog = MagicMock()
+    catalog.scan_leaf_items.return_value = [{
+        "simple": "t",
+        "path": "snapshots/v5.json",
+        "version": 5,
+        "ts": 55,
+    }]
+    monkeypatch.setattr(estimator_module, "RedisCatalog", lambda: catalog)
+    super_table = MagicMock()
+    super_table.read_simple_table_snapshot.return_value = snapshot
+    monkeypatch.setattr(
+        estimator_module, "SuperTable", lambda *a, **k: super_table,
+    )
+
+    reflection = estimator_module.DataEstimator(
+        "org",
+        _LocalLikeStorage(),
+        [TableDefinition("s", "t", "t", columns=["id"])],
+    ).estimate()
+
+    pinned = reflection.supers[0]
+    assert pinned.tombstone_key == snapshot["tombstone"]
+    assert pinned.tombstone_rows == 1
+    assert pinned.tombstone_digest == _PINNED_DIGEST
+    assert pinned.tombstone_format == 2
 
 
 def test_estimator_partial_leaf_falls_back_to_heavy_active_tombstone(monkeypatch):
@@ -582,6 +695,176 @@ def test_reader_uses_coherent_pinned_pointer_without_second_leaf_lookup(monkeypa
     assert wired.resource_keys == ("data/v1.parquet",)
 
 
+def test_reader_loads_v2_manifest_once_for_self_join_and_resolves_segments(
+        monkeypatch,
+):
+    segment_key = "org/s/tables/t/tombstone/segment-a.parquet"
+    manifest_key = "org/s/tables/t/tombstone/manifest.json"
+    manifest = TombstoneManifestV2(
+        organization="org",
+        super_name="s",
+        simple_name="t",
+        base_snapshot_version=4,
+        snapshot_version=5,
+        total_rows=1,
+        segments=(TombstoneSegment(
+            file=segment_key,
+            rows=1,
+            file_size=123,
+            digest="1" * 64,
+        ),),
+    )
+    body = manifest.canonical_bytes()
+    reflection = Reflection(
+        storage_type="local",
+        reflection_bytes=10,
+        total_reflections=1,
+        supers=[SuperSnapshot(
+            "s", "t", 5, ["data/v5.parquet"], {"id"},
+            snapshot_path="snapshots/v5.json",
+            tombstone_key=manifest_key,
+            tombstone_rows=1,
+            tombstone_digest=manifest.digest(),
+            resource_keys=["data/v5.parquet"],
+            snapshot_resource_keys=["data/v5.parquet"],
+            tombstone_format=2,
+        )],
+    )
+    reader_module, catalog, estimator, executor = _install_reader_fakes(
+        monkeypatch,
+        reflection,
+        resolver=lambda key: f"/resolved/{key.rsplit('/', 1)[-1]}",
+    )
+
+    class _SelfJoinParser:
+        original_query = "SELECT a.id FROM t AS a JOIN t AS b ON a.id = b.id"
+
+        def __init__(self, *args, **kwargs):
+            self._tables = [
+                TableDefinition("s", "t", "a", columns=["id"]),
+                TableDefinition("s", "t", "b", columns=["id"]),
+            ]
+
+        def get_table_tuples(self):
+            return list(self._tables)
+
+        def get_physical_tables(self):
+            return list(self._tables)
+
+        @staticmethod
+        def get_predicate_constraints():
+            return {}
+
+        @staticmethod
+        def get_join_edges():
+            return []
+
+    monkeypatch.setattr(reader_module, "SQLParser", _SelfJoinParser)
+    reader = reader_module.DataReader(
+        "s",
+        "org",
+        "SELECT a.id FROM t AS a JOIN t AS b ON a.id = b.id",
+    )
+    _seal_mock_manifest(
+        reader.storage,
+        manifest_key,
+        body,
+        segment_sizes={segment_key: 123},
+    )
+
+    result, status, message = reader.execute("admin", engine=Engine.DUCKDB)
+
+    assert status is reader_module.Status.OK
+    assert message is None
+    assert result["id"].tolist() == [1]
+    reader.storage.read_bytes.assert_not_called()
+    reader.storage.read_range.assert_called_once()
+    assert reader.storage.stat_object.call_count == 3
+    reader.storage.size.assert_not_called()
+    assert [item.args for item in estimator._to_duckdb_path.call_args_list] == [
+        (manifest_key,),
+        (segment_key,),
+    ]
+    views = executor.execute.call_args.kwargs["reflection"].tombstone_views
+    assert set(views) == {"a", "b"}
+    for definition in views.values():
+        assert definition.tombstone_path == "/resolved/manifest.json"
+        assert definition.cache_key == manifest_key
+        assert definition.tombstone_format == 2
+        assert len(definition.segments) == 1
+        assert definition.segments[0].cache_key == segment_key
+        assert definition.segments[0].tombstone_path == "/resolved/segment-a.parquet"
+        assert definition.segments[0].provider_identity == (
+            f"size=123|version=segment-v1:{segment_key}"
+        )
+    catalog.get_leaf.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["size", "resolution"])
+def test_reader_aborts_when_any_v2_segment_cannot_be_proved(
+        monkeypatch, failure,
+):
+    segment_key = "org/s/tables/t/tombstone/segment-a.parquet"
+    manifest_key = "org/s/tables/t/tombstone/manifest.json"
+    manifest = TombstoneManifestV2(
+        organization="org",
+        super_name="s",
+        simple_name="t",
+        base_snapshot_version=4,
+        snapshot_version=5,
+        total_rows=1,
+        segments=(TombstoneSegment(
+            file=segment_key,
+            rows=1,
+            file_size=123,
+            digest="1" * 64,
+        ),),
+    )
+    body = manifest.canonical_bytes()
+    reflection = Reflection(
+        storage_type="local",
+        reflection_bytes=10,
+        total_reflections=1,
+        supers=[SuperSnapshot(
+            "s", "t", 5, ["data/v5.parquet"], {"id"},
+            tombstone_key=manifest_key,
+            tombstone_rows=1,
+            tombstone_digest=manifest.digest(),
+            resource_keys=["data/v5.parquet"],
+            snapshot_resource_keys=["data/v5.parquet"],
+            tombstone_format=2,
+        )],
+    )
+
+    def _resolve(key):
+        if failure == "resolution" and key == segment_key:
+            raise OSError("segment resolver unavailable")
+        return f"/resolved/{key.rsplit('/', 1)[-1]}"
+
+    reader_module, _catalog, _estimator, executor = _install_reader_fakes(
+        monkeypatch, reflection, resolver=_resolve,
+    )
+    reader = reader_module.DataReader("s", "org", "SELECT * FROM t")
+    _seal_mock_manifest(
+        reader.storage,
+        manifest_key,
+        body,
+        segment_sizes={
+            segment_key: (122 if failure == "size" else 123),
+        },
+    )
+
+    result, status, message = reader.execute("admin", engine=Engine.DUCKDB)
+
+    assert status is reader_module.Status.ERROR
+    assert result.empty
+    if failure == "size":
+        assert "segment size does not match" in message
+    else:
+        assert "Unable to resolve required deletion-vector" in message
+    executor.execute.assert_not_called()
+
+
 def test_reader_fails_closed_when_pinned_tombstone_resolution_fails(monkeypatch):
     reflection = Reflection(
         storage_type="object",
@@ -662,6 +945,38 @@ def test_snapshot_without_tombstone_remains_backward_compatible(monkeypatch):
     estimator._to_duckdb_path.assert_not_called()
     executor.execute.assert_called_once()
     catalog.get_leaf.assert_not_called()
+
+
+def test_reader_accepts_exact_empty_v2_without_synthesizing_tombstone(monkeypatch):
+    reflection = Reflection(
+        storage_type="local",
+        reflection_bytes=10,
+        total_reflections=1,
+        supers=[SuperSnapshot(
+            "s",
+            "t",
+            5,
+            ["data/v5.parquet"],
+            {"id"},
+            tombstone_key=None,
+            tombstone_rows=0,
+            tombstone_digest=None,
+            tombstone_format=2,
+        )],
+    )
+    reader_module, _catalog, estimator, executor = _install_reader_fakes(
+        monkeypatch, reflection, resolver=lambda key: key,
+    )
+
+    _result, status, message = reader_module.DataReader(
+        "s", "org", "SELECT * FROM t"
+    ).execute("admin", engine=Engine.DUCKDB)
+
+    assert status is reader_module.Status.OK
+    assert message is None
+    estimator._to_duckdb_path.assert_not_called()
+    wired = executor.execute.call_args.kwargs["reflection"]
+    assert wired.tombstone_views == {}
 
 
 def test_reader_executes_authoritative_zero_resource_reflection(monkeypatch):

@@ -153,6 +153,7 @@ def _complete_leaf(
     *,
     schema=None,
     tombstone_rows=0,
+    tombstone_format=None,
     last_updated_ms=0,
 ):
     """Build a Redis leaf whose payload is safe for the metadata fast path."""
@@ -162,11 +163,17 @@ def _complete_leaf(
         "schema": schema or {},
         "resources": resources,
         "last_updated_ms": last_updated_ms,
-        "tombstone": "dv.parquet" if has_tombstone else None,
+        "tombstone": (
+            "table/tombstone/manifest.json"
+            if has_tombstone and tombstone_format == 2
+            else "dv.parquet" if has_tombstone else None
+        ),
         "tombstone_rows": tombstone_rows,
         "tombstone_digest": "0" * 64 if has_tombstone else None,
         "_row_filter": None,
     }
+    if tombstone_format is not None:
+        snapshot["tombstone_format"] = tombstone_format
     return {
         "version": 1,
         "path": "snapshots/v1.json",
@@ -1016,7 +1023,13 @@ class TestGetSuperMeta:
 
         mock_st = MagicMock()
         mock_st.get_simple_table_snapshot.return_value = (
-            {"resources": [{"file": "f", "rows": 50, "file_size": 2000}], "last_updated_ms": 500},
+            {
+                "resources": [{"file": "f", "rows": 50, "file_size": 2000}],
+                "last_updated_ms": 500,
+                "tombstone": None,
+                "tombstone_rows": 0,
+                "tombstone_digest": None,
+            },
             "/path",
         )
         MockST.return_value = mock_st
@@ -1146,6 +1159,14 @@ class TestGetSuperMeta:
         assert result["super"]["rows"] == 300
         assert result["super"]["size"] == 3000
 
+    def test_pre_dv_snapshot_live_rows_are_all_physical_rows(self):
+        from supertable.meta_reader import _validated_live_row_count
+
+        assert _validated_live_row_count(
+            {"snapshot_version": 1, "schema": {}, "resources": []},
+            37,
+        ) == 37
+
     @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_META)
@@ -1173,8 +1194,32 @@ class TestGetSuperMeta:
     @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_META)
-    def test_tombstone_rows_clamped_to_zero(self, mock_check, MockST, mock_ttl):
-        """tombstone_rows exceeding physical rows clamps the total to 0."""
+    def test_v2_tombstone_rows_deducted_from_total(
+        self, mock_check, MockST, mock_ttl,
+    ):
+        reader = _make_reader("sup", "org")
+        reader.catalog.get_root.return_value = {"version": 1, "ts": 0}
+        _wire_catalog_scan(
+            reader.catalog,
+            "supertable:org:lakes:sup:meta:leaf:doc:events",
+        )
+        leaf = json.dumps(_complete_leaf(
+            [{"file": "f1", "rows": 100, "file_size": 5000}],
+            tombstone_rows=30,
+            tombstone_format=2,
+        ))
+        reader.catalog.r.mget.return_value = [leaf.encode()]
+
+        result = reader.get_super_meta("admin")
+
+        assert result["super"]["rows"] == 70
+
+    @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_META)
+    def test_tombstone_rows_exceeding_physical_rows_is_rejected(
+        self, mock_check, MockST, mock_ttl,
+    ):
         reader = _make_reader("sup", "org")
         reader.catalog.get_root.return_value = {"version": 1, "ts": 0}
         _wire_catalog_scan(
@@ -1187,8 +1232,44 @@ class TestGetSuperMeta:
         ))
         reader.catalog.r.mget.return_value = [leaf.encode()]
 
-        result = reader.get_super_meta("admin")
-        assert result["super"]["rows"] == 0
+        with pytest.raises(RuntimeError, match="exceed physical"):
+            reader.get_super_meta("admin")
+
+    @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_META)
+    def test_malformed_tombstone_state_is_never_counted_as_zero(
+        self, mock_check, MockST, mock_ttl,
+    ):
+        reader = _make_reader("sup", "org")
+        reader.catalog.get_root.return_value = {"version": 1, "ts": 0}
+        _wire_catalog_scan(
+            reader.catalog,
+            "supertable:org:lakes:sup:meta:leaf:doc:events",
+        )
+        malformed = {
+            "snapshot_version": 1,
+            "schema": {},
+            "resources": [{"file": "f", "rows": 20, "file_size": 100}],
+            "tombstone": None,
+            "tombstone_rows": "0",
+            "tombstone_digest": None,
+            "_row_filter": None,
+        }
+        # Redis rejects this as a complete cache, then the immutable fallback
+        # must reject the same malformed state rather than report 20 live rows.
+        reader.catalog.r.mget.return_value = [json.dumps({
+            "version": 1,
+            "path": "snapshot.json",
+            "payload": malformed,
+        }).encode()]
+        MockST.return_value.get_simple_table_snapshot.return_value = (
+            malformed,
+            "snapshot.json",
+        )
+
+        with pytest.raises(RuntimeError, match="invalid deletion-vector"):
+            reader.get_super_meta("admin")
 
     @patch(_P_CHECK_META)
     def test_cache_hit_returns_cached_result(self, mock_check):
