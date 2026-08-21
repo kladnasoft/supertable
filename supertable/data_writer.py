@@ -18,7 +18,8 @@ from polars import DataFrame
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.errors import (
-    DefiniteCatalogCommitRejection,
+    LockLostError,
+    SnapshotCommitConflictError,
     SuperTableNotFoundError,
     TableNotFoundError,
 )
@@ -71,6 +72,8 @@ from supertable.rbac.access_control import (  # noqa: F401
     check_write_access,
 )
 from supertable.redis_catalog import (
+    DeletionIntentConflictError,
+    ReadOnlyCatalogError,
     RedisCatalog,
     persist_unresolved_quality_generation,
 )
@@ -457,8 +460,8 @@ class DataWriter:
             or snapshot_version != successor_version
         ):
             raise ValueError(
-                "Snapshot publication version must match the exact fenced "
-                "successor generation"
+                "Snapshot publication version must advance to the exact "
+                "fenced successor generation"
             )
 
         normalized_format = validate_snapshot_tombstone_state(
@@ -611,7 +614,13 @@ class DataWriter:
                     durability_batch.catalog_commit_succeeded()
             except Exception as exc:
                 if durability_batch is not None and isinstance(
-                    exc, DefiniteCatalogCommitRejection,
+                    exc,
+                    (
+                        SnapshotCommitConflictError,
+                        LockLostError,
+                        DeletionIntentConflictError,
+                        ReadOnlyCatalogError,
+                    ),
                 ):
                     # These typed responses prove the fenced Lua transaction
                     # rejected the commit. Unlike a transport timeout, cleanup
@@ -2445,18 +2454,19 @@ class DataWriter:
                         new_data_files, profiler=profiler, footer_md_cache=footer_md_cache
                     )
                     stats_validation_out: dict[str, Any] = {}
+                    previous_stats_path: Any = last_simple_table.get("stats_file")
                     stats_path, combined_stats_df = build_stats_file(
                         stats_dir=stats_dir,
-                        prev_stats_path=last_simple_table.get("stats_file"),
+                        prev_stats_path=previous_stats_path,
                         new_rows=new_stats_rows,
                         removed_files=sunset_files,
                         compression_level=compression_level,
                         profiler=profiler,
                         prev_cache_identity=(
                             self._stats_cache_identity(
-                                last_simple_table.get("stats_file"),
+                                previous_stats_path,
                             )
-                            if last_simple_table.get("stats_file") else None
+                            if previous_stats_path else None
                         ),
                         validation_out=stats_validation_out,
                     )

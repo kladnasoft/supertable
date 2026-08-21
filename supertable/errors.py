@@ -15,8 +15,6 @@ Hierarchy
             ├── SuperTableNotFoundError
             └── TableNotFoundError
 
-    DefiniteCatalogCommitRejection               (marker mixin)
-
     RuntimeError
       ├── SnapshotCommitConflictError
       ├── LockLostError
@@ -75,19 +73,7 @@ class TableNotFoundError(SupertableLookupError):
         self.simple_name = simple_name
 
 
-class DefiniteCatalogCommitRejection:
-    """Marker for a typed response proving catalog publication did not occur.
-
-    Writers use this distinction only after entering the Redis ambiguity
-    boundary.  A marked exception came from a completed, rejecting catalog
-    command, so newly-created immutable objects may be rolled back safely.
-    Transport/protocol failures deliberately do not carry this marker.
-    """
-
-
-class SnapshotCommitConflictError(
-        DefiniteCatalogCommitRejection, RuntimeError,
-):
+class SnapshotCommitConflictError(RuntimeError):
     """Raised when a writer tries to publish from a stale base snapshot.
 
     Snapshot data files are immutable, so a rejected writer may leave
@@ -96,7 +82,7 @@ class SnapshotCommitConflictError(
     """
 
 
-class LockLostError(DefiniteCatalogCommitRejection, RuntimeError):
+class LockLostError(RuntimeError):
     """Raised when a mutation no longer owns its table fencing lock."""
 
 
@@ -111,7 +97,6 @@ class TombstoneIntegrityError(RuntimeError):
 
 
 __all__ = [
-    "DefiniteCatalogCommitRejection",
     "SupertableLookupError",
     "SuperTableNotFoundError",
     "TableNotFoundError",

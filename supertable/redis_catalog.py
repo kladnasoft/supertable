@@ -13,11 +13,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 
 import redis
 from supertable.config.defaults import logger
-from supertable.errors import (
-    DefiniteCatalogCommitRejection,
-    LockLostError,
-    SnapshotCommitConflictError,
-)
+from supertable.errors import LockLostError, SnapshotCommitConflictError
 
 try:
     from .redis_connector import RedisConnector, RedisOptions
@@ -521,32 +517,12 @@ class RbacIntegrityError(RuntimeError):
     """Persisted RBAC state failed a deterministic integrity check."""
 
 
-class DeletionIntentConflictError(
-        DefiniteCatalogCommitRejection, RuntimeError,
-):
+class DeletionIntentConflictError(RuntimeError):
     """A durable delete intent fences ordinary creation or mutation."""
 
 
-class ReadOnlyCatalogError(DefiniteCatalogCommitRejection, PermissionError):
+class ReadOnlyCatalogError(PermissionError):
     """The atomic catalog boundary observed a non-writable root."""
-
-
-class _SnapshotCommitRejectedError(
-        DefiniteCatalogCommitRejection, RuntimeError,
-):
-    """A completed snapshot Lua command rejected publication."""
-
-
-class _SnapshotCommitPayloadRejectedError(
-        DefiniteCatalogCommitRejection, ValueError,
-):
-    """A completed snapshot Lua command rejected its proposed payload."""
-
-
-class _SnapshotCommitNamespaceNotFoundError(
-        DefiniteCatalogCommitRejection, FileNotFoundError,
-):
-    """A completed snapshot Lua command observed no parent namespace."""
 
 
 _RBAC_ATTEMPT_IDENTITIES = {
@@ -2957,8 +2933,12 @@ if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or expected_version ~= math.floor(expected_version) then
   return {-13, 0, 0}
 end
-if string.len(payload_digest) ~= 64
-    or not string.match(payload_digest, '^[0-9a-f]+$') then
+if expected_version == -1 then
+  if string.len(payload_digest) ~= 64
+      or not string.match(payload_digest, '^[0-9a-f]+$') then
+    return {-4, 0, 0}
+  end
+elseif payload_digest ~= '' then
   return {-4, 0, 0}
 end
 
@@ -3162,9 +3142,9 @@ local leaf = {
   ts = now_ms,
   path = new_path,
   payload = payload,
-  payload_digest = payload_digest,
   commit_id = commit_id
 }
+if expected_version == -1 then leaf['payload_digest'] = payload_digest end
 root['version'] = new_root_version
 root['ts'] = now_ms
 root['commit_id'] = commit_id
@@ -3236,8 +3216,12 @@ if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or expected_version ~= math.floor(expected_version) then
   return {-13, 0, 0}
 end
-if string.len(payload_digest) ~= 64
-    or not string.match(payload_digest, '^[0-9a-f]+$') then
+if expected_version == -1 then
+  if string.len(payload_digest) ~= 64
+      or not string.match(payload_digest, '^[0-9a-f]+$') then
+    return {-4, 0, 0}
+  end
+elseif payload_digest ~= '' then
   return {-4, 0, 0}
 end
 
@@ -3354,9 +3338,9 @@ local leaf = {
   ts = now_ms,
   path = new_path,
   payload = payload,
-  payload_digest = payload_digest,
   commit_id = commit_id
 }
+if expected_version == -1 then leaf['payload_digest'] = payload_digest end
 root['version'] = new_root_version
 root['ts'] = now_ms
 root['commit_id'] = commit_id
@@ -6704,10 +6688,10 @@ return 1
         invalidation happen in one Redis transaction, so readers can never
         combine a new leaf with an old root generation (or vice versa).
 
-        An ambiguous client/network failure is reconciled once against the
-        exact immutable leaf ``commit_id``, version, path, and payload.  A
-        mismatch or second read failure is still propagated; blindly retrying
-        as a different write would be unsafe.
+        An ambiguous expected-absent creation is reconciled once against its
+        exact immutable leaf ``commit_id``, version, path, and payload digest;
+        blindly retrying it would conflict with its own created leaf. Normal
+        mutation ambiguity retains the established propagation behavior.
 
         ``quality_generation``, when present, must be this commit's opaque ID.
         The same transaction persists it as unresolved post-ingest work.  The
@@ -6730,20 +6714,20 @@ return 1
         )
         if not isinstance(payload, Mapping):
             raise ValueError("snapshot payload must be a JSON object")
-        if not {
-            "tombstone", "tombstone_rows", "tombstone_digest",
-        }.issubset(payload):
-            raise ValueError(
-                "snapshot payload must carry an explicit deletion-vector state"
-            )
         successor_version = 1 if base_version == -1 else base_version + 1
         if (
             type(payload.get("snapshot_version")) is not int
             or payload["snapshot_version"] != successor_version
         ):
             raise ValueError(
-                "snapshot payload version must be the exact successor of "
-                "expected_version"
+                "snapshot payload has an invalid version: payload generation "
+                "does not match the exact successor fenced by expected_version"
+            )
+        if not {
+            "tombstone", "tombstone_rows", "tombstone_digest",
+        }.issubset(payload):
+            raise ValueError(
+                "snapshot payload must carry an explicit deletion-vector state"
             )
         try:
             tombstone_format = validate_snapshot_tombstone_state(
@@ -6788,24 +6772,27 @@ return 1
             )
         try:
             payload = snapshot_cache_payload(payload)
+            payload_json = json.dumps(payload)
+        except Exception as exc:
+            raise ValueError(
+                "snapshot payload is not JSON serializable"
+            ) from exc
+        if base_version == -1:
             payload_version = payload.get("snapshot_version")
             if payload_version is not None and (
                 type(payload_version) is not int
                 or payload_version != successor_version
             ):
-                raise _SnapshotCommitPayloadRejectedError(
-                    "Snapshot payload generation does not match its fenced "
-                    f"successor: expected {successor_version}, got "
-                    f"{payload_version!r}"
+                raise ValueError(
+                    "invalid snapshot payload: payload generation does not "
+                    "match its fenced successor: expected "
+                    f"{successor_version}, got {payload_version!r}"
                 )
-            payload_json = json.dumps(payload)
-        except _SnapshotCommitPayloadRejectedError:
-            raise
-        except Exception as exc:
-            raise _SnapshotCommitPayloadRejectedError(
-                "snapshot payload is not JSON serializable"
-            ) from exc
-        payload_digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        payload_digest = (
+            hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+            if base_version == -1
+            else ""
+        )
 
         if mirror_publication and not commit_id:
             raise ValueError(
@@ -6936,29 +6923,31 @@ return 1
                 )
         except redis.RedisError as exc:
             # A timeout/disconnect can arrive after Redis executed the atomic
-            # script.  Reconcile against the immutable commit identity before
-            # telling the caller that creation/update failed; blindly retrying
-            # an expected-absent first write would otherwise conflict with its
-            # own successfully-created leaf.
-            reconciled = self._reconcile_snapshot_commit(
-                org,
-                sup,
-                simple,
-                path=path,
-                expected_version=base_version,
-                commit_id=cid,
-                payload_digest=payload_digest,
-            )
-            if reconciled is not None:
-                logger.warning(
-                    "[redis-catalog] reconciled ambiguous snapshot commit "
-                    "for %s/%s/%s commit %s",
+            # script. Expected-absent creation cannot be blindly retried: it
+            # would conflict with its own successfully-created leaf, so prove
+            # that exact first commit from its persisted payload digest. Normal
+            # mutations retain the established ambiguous-error behavior and
+            # leaf shape; they do not pay a hash/reconciliation cost.
+            if base_version == -1:
+                reconciled = self._reconcile_snapshot_commit(
                     org,
                     sup,
                     simple,
-                    cid,
+                    path=path,
+                    expected_version=base_version,
+                    commit_id=cid,
+                    payload_digest=payload_digest,
                 )
-                return reconciled
+                if reconciled is not None:
+                    logger.warning(
+                        "[redis-catalog] reconciled ambiguous initial snapshot "
+                        "commit for %s/%s/%s commit %s",
+                        org,
+                        sup,
+                        simple,
+                        cid,
+                    )
+                    return reconciled
             logger.error(f"[redis-catalog] snapshot commit error: {exc}")
             raise
 
@@ -6979,25 +6968,25 @@ return 1
                 f"Lost fencing lock before publishing {org}/{sup}/{simple}"
             )
         if code == -3:
-            raise _SnapshotCommitRejectedError(
+            raise RuntimeError(
                 f"Corrupt Redis catalog JSON for {org}/{sup}/{simple}"
             )
         if code == -4:
-            raise _SnapshotCommitPayloadRejectedError(
+            raise ValueError(
                 "Redis rejected invalid snapshot payload JSON"
             )
         if code == -5:
-            raise _SnapshotCommitRejectedError(
+            raise RuntimeError(
                 f"Missing or mismatched mirror publication intent for "
                 f"{org}/{sup}/{simple} commit {cid}"
             )
         if code == -6:
-            raise _SnapshotCommitRejectedError(
+            raise RuntimeError(
                 f"Mirror publication intent is not prepared for "
                 f"{org}/{sup}/{simple} commit {cid}"
             )
         if code == -7:
-            raise _SnapshotCommitRejectedError(
+            raise RuntimeError(
                 f"SuperTable namespace is fenced for deletion: {org}/{sup}"
             )
         if code in (-8, -9):
@@ -7010,7 +6999,7 @@ return 1
                 f"{org}/{sup}/{simple} commit {cid}"
             )
         if code == -11:
-            raise _SnapshotCommitNamespaceNotFoundError(
+            raise FileNotFoundError(
                 f"SuperTable does not exist: {org}/{sup}"
             )
         if code == -12:
@@ -7018,7 +7007,7 @@ return 1
                 f"SuperTable is read-only: {org}/{sup}"
             )
         if code == -13:
-            raise _SnapshotCommitRejectedError(
+            raise RuntimeError(
                 f"Redis snapshot numeric identity is exhausted or invalid: "
                 f"{org}/{sup}/{simple}"
             )
@@ -7028,14 +7017,14 @@ return 1
                 f"{org}/{sup}/{simple}"
             )
         if code == -15:
-            raise _SnapshotCommitRejectedError(
+            raise RuntimeError(
                 f"Corrupt mirror configuration during snapshot publication: "
                 f"{org}/{sup}/{simple}"
             )
         if code == -16:
-            raise _SnapshotCommitPayloadRejectedError(
-                "Snapshot payload generation does not match its fenced "
-                f"successor for {org}/{sup}/{simple}"
+            raise ValueError(
+                "Redis rejected invalid snapshot payload: generation does not "
+                f"match its fenced successor for {org}/{sup}/{simple}"
             )
         raise RuntimeError(f"Unknown snapshot commit status {code}")
 
@@ -7052,17 +7041,18 @@ return 1
     ) -> Optional[tuple[int, int]]:
         """Return committed versions when an ambiguous reply actually landed.
 
-        The exact leaf commit id, path, successor version, and digest of the
-        original payload JSON are sufficient proof: the Redis script writes
-        that digest with the leaf, root, schema/index, and quality marker
-        atomically.  Comparing the digest rather than Lua's decoded/re-encoded
-        cache stays exact for Int64 values beyond Lua's numeric range and for
-        empty JSON object/array normalization.  The root may already have
-        advanced because a different table has its own lock, so only require a
-        structurally valid current root.
+        This proof is intentionally restricted to expected-absent creation.
+        The exact leaf commit id, path, version-one successor, and digest of
+        the original payload JSON are written atomically with root/schema/index
+        state. Comparing the digest rather than Lua's decoded/re-encoded cache
+        stays exact for Int64 values and empty JSON object/array normalization.
+        The root may already have advanced because another table has its own
+        lock, so only require a structurally valid current root.
         Any read ambiguity or mismatch returns ``None`` and preserves the
         original transport exception.
         """
+        if expected_version != -1:
+            return None
         try:
             raw_leaf, raw_root = self.r.mget([
                 RK.meta_leaf(org, sup, simple),

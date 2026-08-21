@@ -516,7 +516,7 @@ def test_namespace_scoped_mutations_cannot_recreate_state_without_root():
         )
     with pytest.raises(FileNotFoundError, match="SuperTable does not exist"):
         catalog.commit_snapshot(
-            "acme", "lake", "orders", _snapshot_payload(0),
+            "acme", "lake", "orders", _snapshot_payload(1),
             "snapshots/v0.json", expected_version=-1, expected_path="",
             lock_token="owner", commit_id="stale-commit",
         )
@@ -560,7 +560,7 @@ def test_leaf_and_linked_share_mutations_reject_invalid_root(root_value):
         )
     with pytest.raises(RuntimeError, match="Corrupt Redis catalog JSON"):
         catalog.commit_snapshot(
-            "acme", "lake", "orders", _snapshot_payload(0),
+            "acme", "lake", "orders", _snapshot_payload(1),
             "snapshots/v0.json", expected_version=-1, expected_path="",
             lock_token="owner", commit_id="stale-commit",
         )

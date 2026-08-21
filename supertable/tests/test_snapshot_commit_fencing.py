@@ -10,11 +10,7 @@ import redis
 
 from supertable import redis_keys as RK
 from supertable.data_writer import DataWriter
-from supertable.errors import (
-    DefiniteCatalogCommitRejection,
-    LockLostError,
-    SnapshotCommitConflictError,
-)
+from supertable.errors import LockLostError, SnapshotCommitConflictError
 from supertable.redis_catalog import (
     DeletionIntentConflictError,
     ReadOnlyCatalogError,
@@ -98,9 +94,6 @@ def _explicit_v2_payload(snapshot_version, *, active):
 def test_snapshot_commit_atomically_updates_leaf_and_root():
     catalog, fake = _catalog()
     _seed(fake)
-    expected_payload = _snapshot_payload(resources=[{"file": "f"}])
-    expected_payload["_row_filter"] = None
-
     assert catalog.commit_snapshot(
         "org", "lake", "table",
         _snapshot_payload(resources=[{"file": "f"}]), "snap/5.json",
@@ -114,15 +107,42 @@ def test_snapshot_commit_atomically_updates_leaf_and_root():
         "version": 5,
         "ts": 123,
         "path": "snap/5.json",
-        "payload": expected_payload,
-        "payload_digest": hashlib.sha256(
-            json.dumps(expected_payload).encode("utf-8")
-        ).hexdigest(),
+        "payload": {
+            "snapshot_version": 5,
+            "resources": [{"file": "f"}],
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+            "_row_filter": None,
+        },
         "commit_id": "commit-5",
     }
     assert root["version"] == 10
     assert root["commit_id"] == "commit-5"
     assert root["read_only"] is False
+
+
+def test_normal_snapshot_commit_does_not_hash_or_persist_payload_digest(
+    monkeypatch,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    monkeypatch.setattr(
+        hashlib,
+        "sha256",
+        MagicMock(side_effect=AssertionError("normal payload was hashed")),
+    )
+
+    assert catalog.commit_snapshot(
+        "org", "lake", "table", _snapshot_payload(), "snap/5.json",
+        expected_version=4,
+        expected_path="snap/4.json",
+        lock_token="token",
+        commit_id="commit-5",
+    ) == (5, 10)
+
+    leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
+    assert "payload_digest" not in leaf
 
 
 @pytest.mark.parametrize(
@@ -739,10 +759,10 @@ def test_snapshot_commit_rejects_payload_generation_mismatch_before_redis(
 
     with pytest.raises(
         ValueError, match="payload generation does not match",
-    ) as raised:
+    ):
         catalog.commit_snapshot(
             "org", "lake", "table",
-            {"snapshot_version": payload_version, "resources": []},
+            _snapshot_payload(snapshot_version=payload_version),
             "snap/new.json",
             expected_version=expected_version,
             expected_path=expected_path,
@@ -750,7 +770,6 @@ def test_snapshot_commit_rejects_payload_generation_mismatch_before_redis(
             **kwargs,
         )
 
-    assert isinstance(raised.value, DefiniteCatalogCommitRejection)
     general.assert_not_called()
     fast.assert_not_called()
     assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
@@ -768,7 +787,7 @@ def test_expected_absent_commit_loses_to_concurrent_creator_without_overwrite():
             "org",
             "lake",
             "table",
-            {"resources": []},
+            _snapshot_payload(snapshot_version=1),
             "snap/ours.json",
             expected_version=-1,
             expected_path="",
@@ -797,7 +816,7 @@ def test_expected_absent_commit_is_blocked_by_durable_namespace_deletion():
             "org",
             "lake",
             "table",
-            {"resources": []},
+            _snapshot_payload(snapshot_version=1),
             "snap/first.json",
             expected_version=-1,
             expected_path="",
@@ -1193,17 +1212,22 @@ def test_reply_loss_after_atomic_commit_cannot_lose_quality_generation(
         raise redis.TimeoutError("reply lost after commit")
 
     monkeypatch.setattr(catalog, "_snapshot_commit", commit_then_lose_reply)
-    assert catalog.commit_snapshot(
-        "org", "lake", "table", _snapshot_payload(), "snap/5.json",
-        expected_version=4,
-        expected_path="snap/4.json",
-        lock_token="token",
-        commit_id="commit-5",
-        quality_generation="commit-5",
-    ) == (5, 10)
+    reconcile = MagicMock(side_effect=AssertionError("normal commit reconciled"))
+    monkeypatch.setattr(catalog, "_reconcile_snapshot_commit", reconcile)
+    with pytest.raises(redis.TimeoutError, match="reply lost"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            commit_id="commit-5",
+            quality_generation="commit-5",
+        )
 
+    reconcile.assert_not_called()
     leaf = json.loads(fake.get(RK.meta_leaf("org", "lake", "table")))
     assert leaf["commit_id"] == "commit-5"
+    assert "payload_digest" not in leaf
     assert fake.get(unresolved_key) == "commit-5"
 
 
@@ -1223,7 +1247,7 @@ def test_timeout_before_atomic_commit_is_not_false_positive_reconciled(
             "org",
             "lake",
             "table",
-            {},
+            _snapshot_payload(),
             "snap/5.json",
             expected_version=4,
             expected_path="snap/4.json",
