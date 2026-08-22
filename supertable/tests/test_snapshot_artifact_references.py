@@ -9,6 +9,7 @@ from supertable.tombstone_manifest_v2 import (
     TombstoneManifestV2,
     TombstoneManifestV2Error,
     TombstoneSegment,
+    tombstone_v3_artifact_digest,
 )
 from supertable.storage.storage_interface import (
     ObjectIdentityMismatch,
@@ -288,6 +289,44 @@ def test_gc_traversal_preserves_legacy_single_vector_shape():
         (f"{TABLE_PREFIX}/data/part.parquet", "data"),
         (f"{TABLE_PREFIX}/tombstone/deleted.parquet", "tombstone"),
     ]
+
+
+def test_gc_traversal_seals_one_table_bound_v3_parquet():
+    path = f"{TABLE_PREFIX}/tombstone/deleted-v3.parquet"
+    payload = b"immutable-v3-parquet"
+    snapshot = {
+        "snapshot_version": 4,
+        "resources": [{
+            "file": f"{TABLE_PREFIX}/data/part.parquet",
+            "file_size": 101,
+        }],
+        "tombstone": path,
+        "tombstone_rows": 2,
+        "tombstone_digest": tombstone_v3_artifact_digest(payload),
+        "tombstone_format": 3,
+        "stats_file": None,
+    }
+
+    references = referenced_snapshot_artifacts(
+        snapshot,
+        organization=ORG,
+        super_name=SUPER,
+        simple_name=TABLE,
+    )
+    by_path = {item.path: item for item in references}
+    assert by_path[path].kind == "tombstone_v3"
+    assert by_path[path].declared_digest == tombstone_v3_artifact_digest(
+        payload
+    )
+
+    snapshot["tombstone"] = f"{TABLE_PREFIX}/data/not-a-tombstone.parquet"
+    with pytest.raises(TombstoneManifestV2Error, match="tombstone namespace"):
+        referenced_snapshot_artifacts(
+            snapshot,
+            organization=ORG,
+            super_name=SUPER,
+            simple_name=TABLE,
+        )
 
 
 def test_gc_traversal_accepts_authoritative_pre_dv_snapshot():

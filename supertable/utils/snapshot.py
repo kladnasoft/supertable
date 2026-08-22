@@ -14,6 +14,9 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 from supertable.storage.storage_interface import ObjectMetadata
 from supertable.tombstone_manifest_v2 import (
     MAX_TOMBSTONE_MANIFEST_V2_BYTES,
+    TOMBSTONE_FORMAT_V1,
+    TOMBSTONE_FORMAT_V2,
+    TOMBSTONE_FORMAT_V3,
     TombstoneManifestV2Error,
     load_tombstone_manifest_v2,
     normalize_snapshot_tombstone_state,
@@ -31,9 +34,11 @@ class SnapshotArtifactReference:
 
     ``declared_digest`` is representation-specific provenance, not always a
     byte hash: data/statistics objects have no snapshot-level digest, v1 and
-    v2 segments use the logical deletion-vector digest, and a v2 manifest uses
-    the SHA-256 of its canonical JSON.  Consumers that need a raw content seal
-    (notably disaster recovery) must hash the referenced object independently.
+    v2 segments use the logical deletion-vector digest, a v2 manifest uses the
+    SHA-256 of its canonical JSON, and v3 uses the SHA-256 of the exact Parquet
+    bytes. Consumers that need an independent raw content
+    seal (notably disaster recovery) must still hash the referenced object
+    under their own recovery contract.
     """
 
     path: str
@@ -174,10 +179,11 @@ def referenced_snapshot_artifacts(
     """Return every immutable object reachable from one snapshot.
 
     The traversal is the retention boundary for recovery and external garbage
-    collectors.  Legacy v1 snapshots contribute their single Parquet deletion
-    vector.  An active v2 snapshot contributes both the JSON root and every
-    segment named by that root.  V2 expansion is mandatory: omitting a loader
-    is an error rather than permission to return an incomplete live set.
+    collectors. Legacy v1 and immutable v3 snapshots contribute their single
+    Parquet deletion vector. An active v2 snapshot contributes both the JSON
+    root and every segment named by that root. V2 expansion is mandatory:
+    omitting a loader is an error rather than permission to return an
+    incomplete live set.
 
     ``storage`` is an ergonomic adapter for backends exposing stable
     ``ObjectMetadata`` plus conditional ``read_range``; callers with their own
@@ -259,13 +265,27 @@ def referenced_snapshot_artifacts(
     rows = tombstone_state.rows
     digest = tombstone_state.digest
     tombstone_format = tombstone_state.tombstone_format
-    if pointer is not None and tombstone_format == 1:
+    if pointer is not None and tombstone_format == TOMBSTONE_FORMAT_V1:
         retain(SnapshotArtifactReference(
             path=pointer,
             kind="tombstone",
             declared_digest=digest,
         ))
-    elif pointer is not None:
+    elif pointer is not None and tombstone_format == TOMBSTONE_FORMAT_V3:
+        if tombstone_prefix is None:
+            raise TombstoneManifestV2Error(
+                "active tombstone_format=3 requires the pinned table identity"
+            )
+        if not pointer.startswith(tombstone_prefix):
+            raise TombstoneManifestV2Error(
+                "format-3 tombstone escapes the pinned tombstone namespace"
+            )
+        retain(SnapshotArtifactReference(
+            path=pointer,
+            kind="tombstone_v3",
+            declared_digest=digest,
+        ))
+    elif pointer is not None and tombstone_format == TOMBSTONE_FORMAT_V2:
         if table_prefix is None or tombstone_prefix is None:
             raise TombstoneManifestV2Error(
                 "active tombstone_format=2 requires the pinned table identity"

@@ -347,6 +347,10 @@ def configure_table(
     max_overlapping_files: int | None = None,
     max_tombstone_rows: int | None = None,
     tombstone_compaction_workers: int | None = None,
+    deletion_vector_format: int | None = None,
+    *,
+    confirm_dv_v2_reader_fleet: bool = False,
+    confirm_dv_v3_reader_fleet: bool = False,
 ) -> None
 ```
 
@@ -359,6 +363,7 @@ Persists table-level configuration in Redis via `catalog.set_table_config()`. Th
 | `max_overlapping_files` | 100 | File-count threshold that triggers compaction of small files |
 | `max_tombstone_rows` | 1,000,000 | Maximum deletion-vector rows before physical compaction is triggered |
 | `tombstone_compaction_workers` | 2 | Bounded worker count for independent tombstone rewrites; valid range 1–8 |
+| `deletion_vector_format` | legacy | `2` selects segmented manifests; `3` selects one immutable Parquet per snapshot. Both require the matching reader-fleet confirmation and writer environment gate. |
 
 Configuration is persisted in Redis. A process-local copy is retained for
 observability, but every write refreshes the authoritative configuration after
@@ -382,6 +387,27 @@ fields together: `deletion_vector_format=2` and
 are rejected. Do not roll old readers or the old GC back into service while
 any retained snapshot can reference format 2; removing the config does not
 rewrite already-published snapshots.
+
+### Immutable single-file deletion-vector v3
+
+Format 3 retains one tombstone Parquet referenced by each snapshot. Ordinary
+delete/upsert writes treat the pinned predecessor as immutable, validate only
+the newly derived `(file, rowid)` delta, and encode one successor Parquet. The
+normal writer reuses the overwrite resolver's proof that these exact rows were
+selected after applying the predecessor vector; unproved/internal callers use
+a native row-ID semi-join as a conservative fallback.
+It does **not** sort, validate, or logically hash the complete million-row union
+again. A SHA-256 fingerprint is taken over the Parquet byte buffer in one bulk
+native call while that buffer is already in memory; this is object-identity
+checking, not another logical row scan. Cold recovery verifies the pinned exact
+bytes, while physical compaction paths that subtract arbitrary old entries
+retain full logical validation.
+
+Enable the process gate `SUPERTABLE_DV_V3_WRITES_ENABLED=true`, then atomically
+configure the table with `deletion_vector_format=3` and
+`confirm_dv_v3_reader_fleet=True`. Format 3 is a reader-fleet boundary: old
+readers must not be reintroduced while a retained snapshot references it.
+Legacy v1 and segmented v2 snapshots keep their existing semantics.
 
 ---
 

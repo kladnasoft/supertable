@@ -39,8 +39,10 @@ from supertable.processing import (
     identify_all_rowids,
     build_tombstone_file,
     build_tombstone_v2,
+    build_tombstone_v3,
     persist_tombstone_frame,
     persist_tombstone_v2_frame,
+    persist_tombstone_v3_frame,
     reclaim_fully_dead_files,
     build_stats_file,
     extract_stats_rows,
@@ -84,6 +86,7 @@ from supertable.mirroring.mirror_formats import (
 from supertable.tombstone_manifest_v2 import (
     MAX_JSON_EXACT_INTEGER,
     TOMBSTONE_FORMAT_V2,
+    TOMBSTONE_FORMAT_V3,
     normalize_snapshot_tombstone_state,
     validate_logical_storage_path,
     validate_snapshot_tombstone_state,
@@ -144,6 +147,14 @@ class DataWriter:
             and snapshot.get("tombstone_format") == TOMBSTONE_FORMAT_V2
         )
 
+    @staticmethod
+    def _snapshot_uses_tombstone_v3(snapshot: dict) -> bool:
+        """Return whether the pinned snapshot is explicitly format 3."""
+        return (
+            type(snapshot.get("tombstone_format")) is int
+            and snapshot.get("tombstone_format") == TOMBSTONE_FORMAT_V3
+        )
+
     @classmethod
     def _tombstone_v2_transition_enabled(
             cls, snapshot: dict, table_config: dict,
@@ -151,12 +162,35 @@ class DataWriter:
         """Keep active v2 sticky; gate only the first v1 -> v2 publish."""
         if cls._snapshot_uses_tombstone_v2(snapshot):
             return True
+        # A direct immutable v3 table remains v3 even if an old/stale rollout
+        # config still requests v2. There is no implicit cross-format downgrade.
+        if cls._snapshot_uses_tombstone_v3(snapshot):
+            return False
         return bool(
             settings.SUPERTABLE_DV_V2_WRITES_ENABLED is True
             and type(table_config.get("deletion_vector_format")) is int
             and table_config.get("deletion_vector_format")
             == TOMBSTONE_FORMAT_V2
             and table_config.get("dv_v2_reader_fleet_confirmed") is True
+        )
+
+    @classmethod
+    def _tombstone_v3_transition_enabled(
+            cls, snapshot: dict, table_config: dict,
+    ) -> bool:
+        """Keep active v3 sticky; gate only the first legacy -> v3 publish."""
+        if cls._snapshot_uses_tombstone_v3(snapshot):
+            return True
+        # A segmented v2 table remains v2 until an explicit consolidation
+        # migration is implemented; never reinterpret its manifest as one file.
+        if cls._snapshot_uses_tombstone_v2(snapshot):
+            return False
+        return bool(
+            settings.SUPERTABLE_DV_V3_WRITES_ENABLED is True
+            and type(table_config.get("deletion_vector_format")) is int
+            and table_config.get("deletion_vector_format")
+            == TOMBSTONE_FORMAT_V3
+            and table_config.get("dv_v3_reader_fleet_confirmed") is True
         )
 
     @staticmethod
@@ -480,21 +514,24 @@ class DataWriter:
             tombstone_format=payload.get("tombstone_format"),
         )
         if (
-            normalized_format == TOMBSTONE_FORMAT_V2
+            normalized_format in (TOMBSTONE_FORMAT_V2, TOMBSTONE_FORMAT_V3)
             and snapshot_version > MAX_JSON_EXACT_INTEGER
         ):
             raise ValueError(
-                "Snapshot publication version exceeds the v2 exact-integer "
-                "boundary"
+                "Snapshot publication version exceeds the "
+                f"v{normalized_format} exact-integer boundary"
             )
         pointer = payload.get("tombstone")
-        if normalized_format != TOMBSTONE_FORMAT_V2 or pointer is None:
+        if (
+            normalized_format not in (TOMBSTONE_FORMAT_V2, TOMBSTONE_FORMAT_V3)
+            or pointer is None
+        ):
             return
 
         simple_dir = getattr(simple_table, "simple_dir", None)
         if not isinstance(simple_dir, str) or not simple_dir:
             raise ValueError(
-                "Cannot prove the table prefix for a v2 tombstone manifest"
+                "Cannot prove the table prefix for the deletion-vector artifact"
             )
         tombstone_prefix = validate_logical_storage_path(
             os.path.join(simple_dir, "tombstone").rstrip("/"),
@@ -502,7 +539,8 @@ class DataWriter:
         )
         if not pointer.startswith(tombstone_prefix + "/"):
             raise ValueError(
-                "V2 tombstone manifest escapes the expected table prefix"
+                f"Format-{normalized_format} tombstone artifact escapes the "
+                "expected table prefix"
             )
 
     def _publish_snapshot(
@@ -753,6 +791,7 @@ class DataWriter:
             deletion_vector_format: int | None = None,
             *,
             confirm_dv_v2_reader_fleet: bool = False,
+            confirm_dv_v3_reader_fleet: bool = False,
     ) -> None:
         """Set per-table limit overrides.
 
@@ -780,13 +819,15 @@ class DataWriter:
             tombstone_compaction_workers: Bounded worker count for independent
                 tombstone file rewrites. Must be an integer from 1 through 8.
                 The global default remains 2 for bounded memory use.
-            deletion_vector_format: Set to 2 to prime this table for segmented
-                deletion-vector manifests.  The writer-wide transition switch
-                remains independently default-off.
+            deletion_vector_format: Set to 2 for segmented manifests or 3 for
+                one immutable Parquet tombstone per snapshot. The matching
+                writer-wide transition switch remains independently off.
             confirm_dv_v2_reader_fleet: Required exact ``True`` in the same
                 call as ``deletion_vector_format=2``.  This acknowledgement and
                 the format request are persisted atomically; it cannot be set
                 on its own.
+            confirm_dv_v3_reader_fleet: Required exact ``True`` in the same
+                call as ``deletion_vector_format=3``.
         """
         check_write_access(
             super_name=self.super_table.super_name,
@@ -838,23 +879,45 @@ class DataWriter:
                 )
             updates["tombstone_compaction_workers"] = tombstone_compaction_workers
         if deletion_vector_format is None:
-            if confirm_dv_v2_reader_fleet is not False:
+            if (
+                confirm_dv_v2_reader_fleet is not False
+                or confirm_dv_v3_reader_fleet is not False
+            ):
                 raise ValueError(
-                    "confirm_dv_v2_reader_fleet cannot be set independently"
+                    "reader-fleet confirmation cannot be set independently"
                 )
         else:
             if (
                 type(deletion_vector_format) is not int
-                or deletion_vector_format != TOMBSTONE_FORMAT_V2
-            ):
-                raise ValueError("deletion_vector_format must be integer 2")
-            if confirm_dv_v2_reader_fleet is not True:
-                raise ValueError(
-                    "deletion_vector_format=2 requires "
-                    "confirm_dv_v2_reader_fleet=True"
+                or deletion_vector_format not in (
+                    TOMBSTONE_FORMAT_V2, TOMBSTONE_FORMAT_V3,
                 )
-            updates["deletion_vector_format"] = TOMBSTONE_FORMAT_V2
-            updates["dv_v2_reader_fleet_confirmed"] = True
+            ):
+                raise ValueError("deletion_vector_format must be integer 2 or 3")
+            if deletion_vector_format == TOMBSTONE_FORMAT_V2:
+                if (
+                    confirm_dv_v2_reader_fleet is not True
+                    or confirm_dv_v3_reader_fleet is not False
+                ):
+                    raise ValueError(
+                        "deletion_vector_format=2 requires only "
+                        "confirm_dv_v2_reader_fleet=True"
+                    )
+                updates["deletion_vector_format"] = TOMBSTONE_FORMAT_V2
+                updates["dv_v2_reader_fleet_confirmed"] = True
+                updates.pop("dv_v3_reader_fleet_confirmed", None)
+            elif (
+                confirm_dv_v3_reader_fleet is not True
+                or confirm_dv_v2_reader_fleet is not False
+            ):
+                raise ValueError(
+                    "deletion_vector_format=3 requires only "
+                    "confirm_dv_v3_reader_fleet=True"
+                )
+            else:
+                updates["deletion_vector_format"] = TOMBSTONE_FORMAT_V3
+                updates["dv_v3_reader_fleet_confirmed"] = True
+                updates.pop("dv_v2_reader_fleet_confirmed", None)
 
         token = self.catalog.acquire_simple_lock(
             self.super_table.organization,
@@ -878,6 +941,10 @@ class DataWriter:
                 simple_name,
             ) or {}
             config = dict(existing)
+            if deletion_vector_format == TOMBSTONE_FORMAT_V2:
+                config.pop("dv_v3_reader_fleet_confirmed", None)
+            elif deletion_vector_format == TOMBSTONE_FORMAT_V3:
+                config.pop("dv_v2_reader_fleet_confirmed", None)
             config.update(updates)
             self.catalog.set_table_config(
                 self.super_table.organization,
@@ -1387,8 +1454,16 @@ class DataWriter:
             snapshot_was_tombstone_v2 = self._snapshot_uses_tombstone_v2(
                 last_simple_table
             )
+            snapshot_was_tombstone_v3 = self._snapshot_uses_tombstone_v3(
+                last_simple_table
+            )
             tombstone_v2_transition_enabled = (
                 self._tombstone_v2_transition_enabled(
+                    last_simple_table, table_config,
+                )
+            )
+            tombstone_v3_transition_enabled = (
+                self._tombstone_v3_transition_enabled(
                     last_simple_table, table_config,
                 )
             )
@@ -1573,7 +1648,10 @@ class DataWriter:
                     tombstone_format=last_simple_table.get("tombstone_format"),
                     state_out=(
                         prior_tombstone_state_out
-                        if tombstone_v2_transition_enabled else None
+                        if (
+                            tombstone_v2_transition_enabled
+                            or tombstone_v3_transition_enabled
+                        ) else None
                     ),
                     storage=self.super_table.storage,
                     expected_organization=self.super_table.organization,
@@ -1618,6 +1696,9 @@ class DataWriter:
                     profiler=profiler,
                     existing_tombstones=prev_dv_df,
                     storage=self.super_table.storage,
+                    require_global_tombstone_disjoint_proof=(
+                        tombstone_v3_transition_enabled
+                    ),
                 )
                 mark("resolve_overwrite")
                 _counts = profiler.counts
@@ -1771,6 +1852,16 @@ class DataWriter:
                         and (new_delete_pairs or delete_all)
                     )
                 )
+                publish_tombstone_v3 = bool(
+                    not publish_tombstone_v2
+                    and (
+                        snapshot_was_tombstone_v3
+                        or (
+                            tombstone_v3_transition_enabled
+                            and (new_delete_pairs or delete_all)
+                        )
+                    )
+                )
                 projected_tombstone_rows = (
                     (prev_dv_df.height if prev_dv_df is not None else 0)
                     + len(new_delete_pairs)
@@ -1833,6 +1924,23 @@ class DataWriter:
                                 tombstone_validation_out
                                 if not defer_tombstone_upload else None
                             ),
+                            storage=self.super_table.storage,
+                        )
+                        return tp, cdf, state, sub, time.perf_counter() - t
+                    if publish_tombstone_v3:
+                        tp, cdf, state = build_tombstone_v3(
+                            tombstone_dir=tombstone_dir,
+                            prev_tombstone_path=prev_tombstone_path,
+                            new_pairs=new_delete_pairs,
+                            compression_level=compression_level,
+                            profiler=sub,
+                            prev_df=prev_dv_df,
+                            previous_state=previous_tombstone_state,
+                            expected_previous_rows=prior_tombstone_rows,
+                            allowed_files=self._snapshot_resource_files(
+                                last_simple_table
+                            ),
+                            persist=not defer_tombstone_upload,
                             storage=self.super_table.storage,
                         )
                         return tp, cdf, state, sub, time.perf_counter() - t
@@ -1955,6 +2063,7 @@ class DataWriter:
                             persist=(
                                 not defer_tombstone_upload
                                 and not publish_tombstone_v2
+                                and not publish_tombstone_v3
                             ),
                             assume_valid=True,
                         )
@@ -1993,6 +2102,31 @@ class DataWriter:
                                     snapshot_version=(
                                         last_simple_table["snapshot_version"] + 1
                                     ),
+                                    profiler=profiler,
+                                    storage=self.super_table.storage,
+                                )
+                            else:
+                                tombstone_path = None
+                                current_tombstone_state = None
+                        elif publish_tombstone_v3:
+                            residual_frame = (
+                                reclaimed_dv
+                                if reclaimed_dv is not None else polars.DataFrame(
+                                    schema={
+                                        TOMBSTONE_FILE_COL: polars.Utf8,
+                                        ROWID_COL: polars.Int64,
+                                    }
+                                )
+                            )
+                            if not defer_tombstone_upload or residual_frame.height == 0:
+                                (
+                                    tombstone_path,
+                                    combined_tombstone_df,
+                                    current_tombstone_state,
+                                ) = persist_tombstone_v3_frame(
+                                    tombstone_dir=tombstone_dir,
+                                    frame=residual_frame,
+                                    compression_level=compression_level,
                                     profiler=profiler,
                                     storage=self.super_table.storage,
                                 )
@@ -2090,11 +2224,16 @@ class DataWriter:
                                 tombstone_format=(
                                     TOMBSTONE_FORMAT_V2
                                     if publish_tombstone_v2 else
+                                    TOMBSTONE_FORMAT_V3
+                                    if publish_tombstone_v3 else
                                     last_simple_table.get("tombstone_format")
                                 ),
                                 state_out=(
                                     drain_state_out
-                                    if publish_tombstone_v2 else None
+                                    if (
+                                        publish_tombstone_v2
+                                        or publish_tombstone_v3
+                                    ) else None
                                 ),
                                 storage=self.super_table.storage,
                                 expected_organization=(
@@ -2107,7 +2246,7 @@ class DataWriter:
                                 ),
                                 expected_segment_prefix=tombstone_dir,
                             )
-                            if publish_tombstone_v2:
+                            if publish_tombstone_v2 or publish_tombstone_v3:
                                 current_tombstone_state = drain_state_out.get(
                                     "state"
                                 )
@@ -2228,6 +2367,18 @@ class DataWriter:
                                         profiler=profiler,
                                         storage=self.super_table.storage,
                                     )
+                                elif publish_tombstone_v3:
+                                    (
+                                        tombstone_path,
+                                        combined_tombstone_df,
+                                        current_tombstone_state,
+                                    ) = persist_tombstone_v3_frame(
+                                        tombstone_dir=tombstone_dir,
+                                        frame=residual_dv,
+                                        compression_level=compression_level,
+                                        profiler=profiler,
+                                        storage=self.super_table.storage,
+                                    )
                                 else:
                                     tombstone_path, combined_tombstone_df = (
                                         persist_tombstone_frame(
@@ -2246,7 +2397,7 @@ class DataWriter:
                             tombstone_path = None
                             combined_tombstone_df = None
                             tombstone_rows = 0
-                            if publish_tombstone_v2:
+                            if publish_tombstone_v2 or publish_tombstone_v3:
                                 current_tombstone_state = LoadedTombstoneState(
                                     frame=polars.DataFrame(
                                         schema={
@@ -2254,7 +2405,11 @@ class DataWriter:
                                             ROWID_COL: polars.Int64,
                                         }
                                     ),
-                                    tombstone_format=TOMBSTONE_FORMAT_V2,
+                                    tombstone_format=(
+                                        TOMBSTONE_FORMAT_V2
+                                        if publish_tombstone_v2 else
+                                        TOMBSTONE_FORMAT_V3
+                                    ),
                                     tombstone_path=None,
                                     root_digest=None,
                                     segments=(),
@@ -2309,6 +2464,35 @@ class DataWriter:
                             raise RuntimeError(
                                 "Cannot seal format-2 deletion-vector without "
                                 "its manifest state"
+                            )
+                    else:
+                        last_simple_table["tombstone_digest"] = None
+                elif publish_tombstone_v3:
+                    last_simple_table["tombstone_format"] = TOMBSTONE_FORMAT_V3
+                    if tombstone_path:
+                        if current_tombstone_state is not None:
+                            if (
+                                current_tombstone_state.tombstone_format
+                                != TOMBSTONE_FORMAT_V3
+                                or current_tombstone_state.tombstone_path
+                                != tombstone_path
+                                or current_tombstone_state.root_digest is None
+                            ):
+                                raise RuntimeError(
+                                    "Format-3 deletion-vector state does not "
+                                    "match its successor object"
+                                )
+                            last_simple_table["tombstone_digest"] = (
+                                current_tombstone_state.root_digest
+                            )
+                        elif tombstone_path == prev_tombstone_path:
+                            last_simple_table["tombstone_digest"] = (
+                                prior_tombstone_digest
+                            )
+                        else:
+                            raise RuntimeError(
+                                "Cannot seal format-3 deletion-vector without "
+                                "its exact-byte artifact state"
                             )
                     else:
                         last_simple_table["tombstone_digest"] = None
@@ -2371,10 +2555,13 @@ class DataWriter:
                     assume_valid=bool(tombstone_path),
                     loaded_state=(
                         current_tombstone_state
-                        if publish_tombstone_v2 else None
+                        if (
+                            publish_tombstone_v2 or publish_tombstone_v3
+                        ) else None
                     ),
                     tombstone_format=(
-                        TOMBSTONE_FORMAT_V2 if publish_tombstone_v2 else None
+                        TOMBSTONE_FORMAT_V2 if publish_tombstone_v2 else
+                        TOMBSTONE_FORMAT_V3 if publish_tombstone_v3 else None
                     ),
                 )
                 mark("compact_tombstones")
@@ -3039,6 +3226,9 @@ class DataWriter:
             compact_tombstone_v2 = self._snapshot_uses_tombstone_v2(
                 last_simple_table
             )
+            compact_tombstone_v3 = self._snapshot_uses_tombstone_v3(
+                last_simple_table
+            )
             footer_md_cache = {}
             files_before = len(last_simple_table.get("resources") or [])
             result["files_before"] = files_before
@@ -3076,7 +3266,9 @@ class DataWriter:
             # write-path carry-forward read (required=True) above. Validation also
             # seals schema, non-null/uniqueness, and the snapshot-declared count.
             compact_tombstone_state: LoadedTombstoneState | None = None
-            if tombstone_path and compact_tombstone_v2:
+            if tombstone_path and (
+                compact_tombstone_v2 or compact_tombstone_v3
+            ):
                 compact_state_out: dict[str, LoadedTombstoneState] = {}
                 tombstone_df = load_tombstone(
                     tombstone_path,
@@ -3091,7 +3283,10 @@ class DataWriter:
                         last_simple_table
                     ),
                     profiler=compaction_profiler,
-                    tombstone_format=TOMBSTONE_FORMAT_V2,
+                    tombstone_format=(
+                        TOMBSTONE_FORMAT_V2
+                        if compact_tombstone_v2 else TOMBSTONE_FORMAT_V3
+                    ),
                     state_out=compact_state_out,
                     storage=self.super_table.storage,
                     expected_organization=self.super_table.organization,
@@ -3214,6 +3409,20 @@ class DataWriter:
                                 profiler=compaction_profiler,
                                 storage=self.super_table.storage,
                             )
+                        elif compact_tombstone_v3:
+                            (
+                                tombstone_path,
+                                residual_dv,
+                                compact_tombstone_state,
+                            ) = persist_tombstone_v3_frame(
+                                tombstone_dir=os.path.join(
+                                    simple_table.simple_dir, "tombstone"
+                                ),
+                                frame=residual_dv,
+                                compression_level=compression_level,
+                                profiler=compaction_profiler,
+                                storage=self.super_table.storage,
+                            )
                         else:
                             tombstone_path, residual_dv = persist_tombstone_frame(
                                 tombstone_dir=os.path.join(
@@ -3224,10 +3433,13 @@ class DataWriter:
                             )
                 else:
                     tombstone_path = None
-                    if compact_tombstone_v2:
+                    if compact_tombstone_v2 or compact_tombstone_v3:
                         compact_tombstone_state = LoadedTombstoneState(
                             frame=residual_dv,
-                            tombstone_format=TOMBSTONE_FORMAT_V2,
+                            tombstone_format=(
+                                TOMBSTONE_FORMAT_V2
+                                if compact_tombstone_v2 else TOMBSTONE_FORMAT_V3
+                            ),
                             tombstone_path=None,
                             root_digest=None,
                             segments=(),
@@ -3364,16 +3576,22 @@ class DataWriter:
                     last_simple_table["tombstone"] = tombstone_path
                     last_simple_table["tombstone_rows"] = residual_dv.height
                     if tombstone_path:
-                        if compact_tombstone_v2:
+                        if compact_tombstone_v2 or compact_tombstone_v3:
                             if (
                                 compact_tombstone_state is None
+                                or compact_tombstone_state.tombstone_format
+                                != (
+                                    TOMBSTONE_FORMAT_V2
+                                    if compact_tombstone_v2
+                                    else TOMBSTONE_FORMAT_V3
+                                )
                                 or compact_tombstone_state.tombstone_path
                                 != tombstone_path
                                 or compact_tombstone_state.root_digest is None
                             ):
                                 raise RuntimeError(
-                                    "Cannot seal compacted format-2 deletion-vector "
-                                    "without its manifest state"
+                                    "Cannot seal compacted immutable "
+                                    "deletion-vector without its physical state"
                                 )
                             last_simple_table["tombstone_digest"] = (
                                 compact_tombstone_state.root_digest
@@ -3384,9 +3602,10 @@ class DataWriter:
                             )
                     else:
                         last_simple_table["tombstone_digest"] = None
-                    if compact_tombstone_v2:
+                    if compact_tombstone_v2 or compact_tombstone_v3:
                         last_simple_table["tombstone_format"] = (
                             TOMBSTONE_FORMAT_V2
+                            if compact_tombstone_v2 else TOMBSTONE_FORMAT_V3
                         )
                     cache_tombstone(
                         tombstone_path,
@@ -3409,11 +3628,15 @@ class DataWriter:
                         assume_valid=bool(tombstone_path),
                         loaded_state=(
                             compact_tombstone_state
-                            if compact_tombstone_v2 else None
+                            if (
+                                compact_tombstone_v2 or compact_tombstone_v3
+                            ) else None
                         ),
                         tombstone_format=(
                             TOMBSTONE_FORMAT_V2
-                            if compact_tombstone_v2 else None
+                            if compact_tombstone_v2 else
+                            TOMBSTONE_FORMAT_V3
+                            if compact_tombstone_v3 else None
                         ),
                     )
 

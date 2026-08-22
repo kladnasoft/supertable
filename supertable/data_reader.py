@@ -54,6 +54,7 @@ from supertable.system_query import classify_query, CommandKind
 from supertable.tombstone_manifest_v2 import (
     TOMBSTONE_FORMAT_V1,
     TOMBSTONE_FORMAT_V2,
+    TOMBSTONE_FORMAT_V3,
     validate_snapshot_tombstone_state,
 )
 
@@ -1036,14 +1037,22 @@ class DataReader:
                     )
 
                 if tombstone_key:
-                    if tombstone_format == TOMBSTONE_FORMAT_V2:
-                        manifest_prefix = (
+                    if tombstone_format in (
+                        TOMBSTONE_FORMAT_V2,
+                        TOMBSTONE_FORMAT_V3,
+                    ):
+                        tombstone_prefix = (
                             f"{self.organization}/{sup.super_name}/tables/"
                             f"{sup.simple_name}/tombstone/"
                         )
-                        if not tombstone_key.startswith(manifest_prefix):
+                        if not tombstone_key.startswith(tombstone_prefix):
+                            pointer_kind = (
+                                "manifest pointer"
+                                if tombstone_format == TOMBSTONE_FORMAT_V2
+                                else "pointer"
+                            )
                             raise RuntimeError(
-                                "Deletion-vector manifest pointer escapes the "
+                                f"Deletion-vector {pointer_kind} escapes the "
                                 f"pinned table {sup.super_name}."
                                 f"{sup.simple_name}"
                             )

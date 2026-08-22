@@ -37,6 +37,10 @@ import pyarrow.parquet as pq
 from supertable.config.homedir import get_app_home
 from supertable.config.settings import settings
 from supertable.storage.storage_interface import StorageInterface
+from supertable.tombstone_manifest_v2 import (
+    TOMBSTONE_FORMAT_V2,
+    TOMBSTONE_FORMAT_V3,
+)
 
 
 _CACHE_FORMAT_VERSION = 1
@@ -438,6 +442,7 @@ class FileCache:
 
         raw_keys: Dict[str, None] = {}
         declared_sizes: Dict[str, Optional[int]] = {}
+        declared_checksums: Dict[str, Optional[str]] = {}
         invalid_keys = set()
         malformed = 0
         for sup in getattr(reflection, "supers", ()) or ():
@@ -459,12 +464,14 @@ class FileCache:
                         invalid_keys.add(normalized)
                         raw_keys.pop(normalized, None)
                         declared_sizes.pop(normalized, None)
+                        declared_checksums.pop(normalized, None)
                         continue
                     if declared < 0:
                         malformed += 1
                         invalid_keys.add(normalized)
                         raw_keys.pop(normalized, None)
                         declared_sizes.pop(normalized, None)
+                        declared_checksums.pop(normalized, None)
                         continue
                     if declared == 0:
                         declared = None
@@ -476,12 +483,14 @@ class FileCache:
                     invalid_keys.add(normalized)
                     raw_keys.pop(normalized, None)
                     declared_sizes.pop(normalized, None)
+                    declared_checksums.pop(normalized, None)
                     continue
                 raw_keys.setdefault(normalized, None)
                 declared_sizes[normalized] = declared if prior is None else prior
 
         for tombstone in (getattr(reflection, "tombstone_views", {}) or {}).values():
-            if getattr(tombstone, "tombstone_format", None) == 2:
+            tombstone_format = getattr(tombstone, "tombstone_format", None)
+            if tombstone_format == TOMBSTONE_FORMAT_V2:
                 # The JSON root is small metadata already loaded and validated
                 # through the storage SDK. Only immutable Parquet segments
                 # belong in the shared whole-file cache.
@@ -510,6 +519,7 @@ class FileCache:
                         invalid_keys.add(normalized)
                         raw_keys.pop(normalized, None)
                         declared_sizes.pop(normalized, None)
+                        declared_checksums.pop(normalized, None)
                         continue
                     raw_keys.setdefault(normalized, None)
                     declared_sizes[normalized] = int(declared)
@@ -517,9 +527,43 @@ class FileCache:
 
             path = getattr(tombstone, "tombstone_path", None)
             key = getattr(tombstone, "cache_key", None)
+            if tombstone_format == TOMBSTONE_FORMAT_V3 and (
+                getattr(tombstone, "segments", ()) != ()
+                or not isinstance(key, str)
+                or not key.endswith(".parquet")
+            ):
+                malformed += 1
+                continue
             if path and key:
+                # Keep the logical key as the cache/artifact identity. On a
+                # hit ``tombstone_path`` is replaced below with a local file,
+                # while v3 readers still receive this key as ``artifact_key``.
                 normalized = str(key)
                 if normalized not in invalid_keys:
+                    if tombstone_format == TOMBSTONE_FORMAT_V3:
+                        checksum = getattr(tombstone, "tombstone_digest", None)
+                        if (
+                            not isinstance(checksum, str)
+                            or _HEX_SHA256.fullmatch(checksum) is None
+                        ):
+                            malformed += 1
+                            invalid_keys.add(normalized)
+                            raw_keys.pop(normalized, None)
+                            declared_sizes.pop(normalized, None)
+                            declared_checksums.pop(normalized, None)
+                            continue
+                        prior_checksum = declared_checksums.get(normalized)
+                        if (
+                            prior_checksum is not None
+                            and prior_checksum != checksum
+                        ):
+                            malformed += 1
+                            invalid_keys.add(normalized)
+                            raw_keys.pop(normalized, None)
+                            declared_sizes.pop(normalized, None)
+                            declared_checksums.pop(normalized, None)
+                            continue
+                        declared_checksums[normalized] = checksum
                     raw_keys.setdefault(normalized, None)
             elif path:
                 malformed += 1
@@ -541,6 +585,7 @@ class FileCache:
                             populate,
                             tolerate_corrupt_hits,
                             declared_sizes.get(raw_key),
+                            declared_checksums.get(raw_key),
                         ): raw_key
                         for raw_key in raw_keys
                     }
@@ -600,7 +645,10 @@ class FileCache:
                 ]
 
             for tombstone in (getattr(target, "tombstone_views", {}) or {}).values():
-                if getattr(tombstone, "tombstone_format", None) == 2:
+                if (
+                    getattr(tombstone, "tombstone_format", None)
+                    == TOMBSTONE_FORMAT_V2
+                ):
                     localized_segments = []
                     for segment in getattr(tombstone, "segments", ()) or ():
                         resolution = resolutions.get(str(segment.cache_key))
@@ -631,6 +679,7 @@ class FileCache:
         populate: bool,
         tolerate_corrupt_hits: bool = False,
         declared_size: Optional[int] = None,
+        declared_checksum: Optional[str] = None,
     ) -> _Resolution:
         metrics = CacheMetrics()
         if not raw_key or "://" in raw_key:
@@ -680,7 +729,11 @@ class FileCache:
             paths = self._entry_paths(raw_key, metadata)
             try:
                 resolution = self._acquire(
-                    paths, raw_key, metadata, populate=populate,
+                    paths,
+                    raw_key,
+                    metadata,
+                    populate=populate,
+                    declared_checksum=declared_checksum,
                 )
             except FileCacheIntegrityError:
                 if tolerate_corrupt_hits and not populate:
@@ -709,12 +762,15 @@ class FileCache:
         metadata: object,
         *,
         populate: bool,
+        declared_checksum: Optional[str] = None,
     ) -> _Resolution:
         metrics = CacheMetrics()
         size = _metadata_size(metadata)
 
         self._validate_existing_directory_chain(paths.directory)
-        hit = self._open_committed(paths, metadata)
+        hit = self._open_committed(
+            paths, metadata, declared_checksum=declared_checksum,
+        )
         if hit is not None:
             metrics.hits = metrics.localized_files = 1
             metrics.localized_bytes = size
@@ -734,7 +790,9 @@ class FileCache:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             if self._is_committed(paths):
-                self._validate_committed(paths, metadata)
+                self._validate_committed(
+                    paths, metadata, declared_checksum=declared_checksum,
+                )
                 self._touch(paths.access)
                 fcntl.flock(fd, fcntl.LOCK_SH)
                 metrics.hits = metrics.localized_files = 1
@@ -822,6 +880,10 @@ class FileCache:
                     f"downloaded Parquet size mismatch: expected {size}, got {actual_size}"
                 )
             expected_checksum = _metadata_checksum(metadata)
+            if declared_checksum and actual_digest != declared_checksum:
+                raise FileCacheIntegrityError(
+                    "downloaded Parquet does not match its snapshot SHA-256"
+                )
             if expected_checksum and actual_digest != expected_checksum:
                 raise FileCacheIntegrityError("downloaded Parquet SHA-256 mismatch")
 
@@ -892,7 +954,11 @@ class FileCache:
         raise FileCacheUnavailable("cache acquire did not complete")
 
     def _open_committed(
-        self, paths: _EntryPaths, metadata: object,
+        self,
+        paths: _EntryPaths,
+        metadata: object,
+        *,
+        declared_checksum: Optional[str] = None,
     ) -> Optional[_Lease]:
         if not self._is_committed(paths) or not os.path.exists(paths.lock):
             return None
@@ -903,7 +969,9 @@ class FileCache:
                 fcntl.flock(fd, fcntl.LOCK_UN)
                 os.close(fd)
                 return None
-            self._validate_committed(paths, metadata)
+            self._validate_committed(
+                paths, metadata, declared_checksum=declared_checksum,
+            )
             return _Lease(paths.data, fd)
         except Exception:
             try:
@@ -1126,7 +1194,13 @@ class FileCache:
     def _is_committed(paths: _EntryPaths) -> bool:
         return os.path.isfile(paths.data) and os.path.isfile(paths.manifest)
 
-    def _validate_committed(self, paths: _EntryPaths, metadata: object) -> None:
+    def _validate_committed(
+        self,
+        paths: _EntryPaths,
+        metadata: object,
+        *,
+        declared_checksum: Optional[str] = None,
+    ) -> None:
         try:
             if os.path.islink(paths.data) or os.path.islink(paths.manifest):
                 raise FileCacheIntegrityError("cache entry contains a symbolic link")
@@ -1145,6 +1219,13 @@ class FileCache:
                 or manifest.get("data_ctime_ns") != int(data_stat.st_ctime_ns)
             ):
                 raise FileCacheIntegrityError("committed cache entry seal mismatch")
+            if (
+                declared_checksum is not None
+                and manifest.get("sha256") != declared_checksum
+            ):
+                raise FileCacheIntegrityError(
+                    "committed cache entry does not match its snapshot SHA-256"
+                )
             pq.read_metadata(paths.data)
         except FileCacheIntegrityError:
             raise

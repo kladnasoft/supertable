@@ -596,6 +596,7 @@ class SimpleTable:
         from supertable.data_classes import TombstoneSegmentDef
         from supertable.tombstone_manifest_v2 import (
             TOMBSTONE_FORMAT_V2,
+            TOMBSTONE_FORMAT_V3,
             normalize_snapshot_tombstone_state,
         )
 
@@ -668,6 +669,15 @@ class SimpleTable:
                     allow_cache=False,
                 )
             else:
+                if tombstone_format == TOMBSTONE_FORMAT_V3:
+                    tombstone_prefix = (
+                        f"{self.simple_dir.rstrip('/')}/tombstone/"
+                    )
+                    if not tombstone_path.startswith(tombstone_prefix):
+                        raise ValueError(
+                            "Format-3 deletion-vector pointer escapes the "
+                            "pinned simple table"
+                        )
                 tomb_df = load_tombstone(
                     tombstone_path,
                     cache_identity=tombstone_cache_identity(
@@ -680,6 +690,9 @@ class SimpleTable:
                     expected_rows=tombstone_state.rows,
                     expected_digest=tombstone_state.digest,
                     allowed_files=allowed_files,
+                    tombstone_format=tombstone_format,
+                    storage=self.storage,
+                    artifact_key=tombstone_path,
                 )
             if tomb_df is None:  # defensive: required=True must raise instead
                 raise RuntimeError("Required deletion-vector could not be loaded")

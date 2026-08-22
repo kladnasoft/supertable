@@ -1,4 +1,4 @@
-"""Strict, storage-independent tombstone manifest v2 primitives.
+"""Strict, storage-independent deletion-vector format primitives.
 
 The v2 deletion-vector root is a small canonical JSON document.  A snapshot
 stores the manifest's logical object key in ``tombstone`` and the SHA-256 of
@@ -10,6 +10,13 @@ This module deliberately contains no writer or reader policy.  In particular,
 the presence of these definitions does not make v2 safe to emit to a mixed
 fleet.  Publication remains disabled until every reader, recovery tool,
 exporter, mirror, and garbage collector understands ``tombstone_format=2``.
+
+Format 3 keeps the original one-Parquet-per-snapshot layout, but makes the
+immutability contract explicit. Its snapshot digest is SHA-256 over the exact
+encoded Parquet bytes, computed in one native call; it is intentionally not a
+second sorted logical-row scan. Correctness comes from validating the new
+delta, writing a fresh immutable object, and fencing the atomic snapshot
+publication. Existing v1/v2 semantics remain unchanged.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ from supertable import redis_keys as RK
 
 TOMBSTONE_FORMAT_V1 = 1
 TOMBSTONE_FORMAT_V2 = 2
+TOMBSTONE_FORMAT_V3 = 3
 TOMBSTONE_MANIFEST_V2_FORMAT = "supertable-tombstone-manifest-v2"
 
 # These are format bounds, not tunables.  Raising them requires a format bump
@@ -178,6 +186,21 @@ def validate_logical_storage_path(
     return value
 
 
+def tombstone_v3_artifact_digest(payload: object) -> str:
+    """Return the exact-byte seal for one immutable format-3 Parquet object.
+
+    The encoder already owns the complete byte buffer, so this is one bulk
+    OpenSSL call and no Python iteration over logical rows. The explicit format
+    discriminator distinguishes this byte fingerprint from legacy logical
+    ``st-dv-v1`` seals.
+    """
+    if not isinstance(payload, (bytes, bytearray, memoryview)):
+        raise TombstoneManifestV2Error(
+            "format-3 tombstone payload must be bytes"
+        )
+    return hashlib.sha256(payload).hexdigest()
+
+
 def validate_snapshot_tombstone_state(
     pointer: object,
     rows: object,
@@ -186,12 +209,13 @@ def validate_snapshot_tombstone_state(
     format_present: bool,
     tombstone_format: object = None,
 ) -> int:
-    """Validate the snapshot-level v1/v2 discriminated tombstone state.
+    """Validate the snapshot-level v1/v2/v3 discriminated tombstone state.
 
     Missing ``tombstone_format`` and explicit integer ``1`` denote the legacy
     single-Parquet representation.  Only explicit integer ``2`` activates the
-    standalone JSON manifest.  JSON null, booleans, strings, future versions,
-    and pointer/format hybrids are rejected rather than guessed.
+    standalone JSON manifest.  Explicit integer ``3`` is the immutable
+    single-Parquet representation. JSON null, booleans, strings, future
+    versions, and pointer/format hybrids are rejected rather than guessed.
     """
     if not isinstance(format_present, bool):
         raise TypeError("format_present must be boolean")
@@ -199,10 +223,14 @@ def validate_snapshot_tombstone_state(
         if (
             isinstance(tombstone_format, bool)
             or not isinstance(tombstone_format, int)
-            or tombstone_format not in (TOMBSTONE_FORMAT_V1, TOMBSTONE_FORMAT_V2)
+            or tombstone_format not in (
+                TOMBSTONE_FORMAT_V1,
+                TOMBSTONE_FORMAT_V2,
+                TOMBSTONE_FORMAT_V3,
+            )
         ):
             raise TombstoneManifestV2Error(
-                "tombstone_format must be integer 1 or 2"
+                "tombstone_format must be integer 1, 2, or 3"
             )
         normalized_format = tombstone_format
     else:
@@ -231,6 +259,13 @@ def validate_snapshot_tombstone_state(
             pointer,
             field_name="tombstone manifest pointer",
             required_suffix=".json",
+        )
+    elif normalized_format == TOMBSTONE_FORMAT_V3:
+        _strict_integer(rows, field_name="tombstone_rows", minimum=1)
+        validate_logical_storage_path(
+            pointer,
+            field_name="tombstone format-3 pointer",
+            required_suffix=".parquet",
         )
     elif pointer.endswith(".json"):
         # A manifest-looking pointer without the v2 discriminator is unsafe:
@@ -743,6 +778,7 @@ __all__ = [
     "MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS",
     "TOMBSTONE_FORMAT_V1",
     "TOMBSTONE_FORMAT_V2",
+    "TOMBSTONE_FORMAT_V3",
     "TOMBSTONE_MANIFEST_V2_FORMAT",
     "NormalizedSnapshotTombstoneState",
     "TombstoneManifestV2",
@@ -755,6 +791,7 @@ __all__ = [
     "validate",
     "validate_logical_storage_path",
     "validate_snapshot_tombstone_state",
+    "tombstone_v3_artifact_digest",
     "validate_tombstone_manifest_v2",
     "validate_tombstone_segment_observation",
 ]

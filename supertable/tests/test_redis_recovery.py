@@ -35,6 +35,7 @@ from supertable.tombstone_manifest_v2 import (
     TombstoneManifestV2,
     TombstoneSegment,
     canonical_tombstone_manifest_v2_bytes,
+    tombstone_v3_artifact_digest,
 )
 
 
@@ -47,6 +48,7 @@ DV_ROOT = f"{ORG}/{SUP}/tables/{TABLE}/tombstone/generation-3/manifest.json"
 DV_SEGMENT = (
     f"{ORG}/{SUP}/tables/{TABLE}/tombstone/generation-3/segment.parquet"
 )
+DV_V3 = f"{ORG}/{SUP}/tables/{TABLE}/tombstone/deleted-v3.parquet"
 
 
 class MemoryStorage:
@@ -190,6 +192,24 @@ def _seed_v2_catalog(redis_client, storage) -> TombstoneManifestV2:
     leaf["payload"] = snapshot
     redis_client.set(RK.meta_leaf(ORG, SUP, TABLE), json.dumps(leaf))
     return manifest
+
+
+def _seed_v3_catalog(redis_client, storage) -> bytes:
+    _seed_catalog(redis_client, storage)
+    payload = b"sealed-single-file-v3-parquet"
+    storage.files[DV_V3] = payload
+    snapshot = json.loads(storage.files[SNAPSHOT_PATH])
+    snapshot.update({
+        "tombstone": DV_V3,
+        "tombstone_rows": 1,
+        "tombstone_digest": tombstone_v3_artifact_digest(payload),
+        "tombstone_format": 3,
+    })
+    storage.files[SNAPSHOT_PATH] = json.dumps(snapshot).encode()
+    leaf = json.loads(redis_client.get(RK.meta_leaf(ORG, SUP, TABLE)))
+    leaf["payload"] = snapshot
+    redis_client.set(RK.meta_leaf(ORG, SUP, TABLE), json.dumps(leaf))
+    return payload
 
 
 def _append_event(source, storage, *, sequence=1, archive=True):
@@ -778,6 +798,27 @@ def test_recovery_seals_v2_root_and_every_segment_and_detects_replacement():
     storage.files[DV_SEGMENT] = b"xxxxxx-v2-segment"
     assert len(storage.files[DV_SEGMENT]) == len(b"sealed-v2-segment")
     with pytest.raises(RecoveryError, match="snapshot seals differ"):
+        plan_redis_rebuild(storage, ORG)
+
+
+def test_recovery_compares_v3_parquet_to_snapshot_byte_seal():
+    source = _redis()
+    storage = MemoryStorage()
+    payload = _seed_v3_catalog(source, storage)
+
+    checkpoint = _checkpoint(source, storage)
+    document = json.loads(storage.files[checkpoint.path])
+    artifacts = {
+        item["path"]: item
+        for item in document["snapshots"][0]["artifacts"]
+    }
+    assert artifacts[DV_V3]["kind"] == "tombstone_v3"
+    assert artifacts[DV_V3]["sha256"] == tombstone_v3_artifact_digest(
+        payload
+    )
+
+    storage.files[DV_V3] = b"x" * len(payload)
+    with pytest.raises(RecoveryError, match="snapshot byte seal"):
         plan_redis_rebuild(storage, ORG)
 
 

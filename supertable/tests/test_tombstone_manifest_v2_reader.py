@@ -32,9 +32,11 @@ from supertable.processing import (
 from supertable.tombstone_manifest_v2 import (
     MAX_TOMBSTONE_MANIFEST_V2_BYTES,
     MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS,
+    TOMBSTONE_FORMAT_V3,
     TombstoneManifestV2,
     TombstoneManifestV2Error,
     TombstoneSegment,
+    tombstone_v3_artifact_digest,
 )
 from supertable.simple_table import SimpleTable
 from supertable.storage.local_storage import LocalStorage
@@ -1435,6 +1437,57 @@ def test_simple_table_export_v2_matches_logical_live_rows(
     ])
     assert result["total_rows"] == 2
     assert exported.sort("id").get_column("id").to_list() == [20, 40]
+
+
+def test_simple_table_export_v3_matches_logical_live_rows(
+        tmp_path, monkeypatch,
+) -> None:
+    table, storage = _local_export_table(tmp_path)
+    snapshot, snapshot_path = table.get_simple_table_snapshot()
+    data_key = snapshot["resources"][0]["file"]
+    tombstone_key = f"{table.simple_dir}/tombstone/deleted-v3.parquet"
+    storage.write_parquet(_frame(data_key, [1, 3]).to_arrow(), tombstone_key)
+    payload = storage.read_bytes(tombstone_key)
+    snapshot.update({
+        "tombstone": tombstone_key,
+        "tombstone_rows": 2,
+        "tombstone_digest": tombstone_v3_artifact_digest(payload),
+        "tombstone_format": TOMBSTONE_FORMAT_V3,
+    })
+    table.get_simple_table_snapshot = lambda: (snapshot, snapshot_path)
+    monkeypatch.setattr(processing, "_storage", storage)
+
+    result = table.export_to("exports/good-v3")
+
+    exported = pl.concat([
+        pl.from_arrow(storage.read_parquet(path))
+        for path in result["files"]
+    ])
+    assert result["total_rows"] == 2
+    assert exported.sort("id").get_column("id").to_list() == [20, 40]
+
+
+def test_simple_table_export_rejects_v3_artifact_outside_tombstone_prefix(
+        tmp_path, monkeypatch,
+) -> None:
+    table, storage = _local_export_table(tmp_path)
+    snapshot, snapshot_path = table.get_simple_table_snapshot()
+    data_key = snapshot["resources"][0]["file"]
+    tombstone_key = f"{table.simple_dir}/data/not-a-tombstone.parquet"
+    storage.write_parquet(_frame(data_key, [1]).to_arrow(), tombstone_key)
+    snapshot.update({
+        "tombstone": tombstone_key,
+        "tombstone_rows": 1,
+        "tombstone_digest": tombstone_v3_artifact_digest(
+            storage.read_bytes(tombstone_key)
+        ),
+        "tombstone_format": TOMBSTONE_FORMAT_V3,
+    })
+    table.get_simple_table_snapshot = lambda: (snapshot, snapshot_path)
+    monkeypatch.setattr(processing, "_storage", storage)
+
+    with pytest.raises(ValueError, match="escapes the pinned simple table"):
+        table.export_to("exports/foreign-v3")
 
 
 def test_simple_table_export_accepts_authoritative_pre_dv_snapshot(

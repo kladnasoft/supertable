@@ -21,6 +21,10 @@ from supertable.storage.storage_interface import (
     StorageInterface,
     write_all,
 )
+from supertable.tombstone_manifest_v2 import (
+    TOMBSTONE_FORMAT_V3,
+    tombstone_v3_artifact_digest,
+)
 
 
 def _parquet_bytes(seed: int = 1, rows: int = 8) -> bytes:
@@ -52,6 +56,28 @@ def _reflection(
             columns={"id", "value"},
         )],
         tombstone_views={"events": tombstone} if tombstone else {},
+    )
+
+
+def _v3_only_reflection(
+    resolved: str,
+    raw_key: str,
+    digest: str,
+) -> Reflection:
+    return Reflection(
+        storage_type="FakeRemote",
+        reflection_bytes=0,
+        total_reflections=0,
+        supers=[],
+        tombstone_views={
+            "events": TombstoneDef(
+                tombstone_path=resolved,
+                cache_key=raw_key,
+                expected_rows=1,
+                tombstone_digest=digest,
+                tombstone_format=TOMBSTONE_FORMAT_V3,
+            ),
+        },
     )
 
 
@@ -139,6 +165,64 @@ def test_populate_then_rotated_presign_hits_same_raw_object(tmp_path):
     assert warm_metrics.hits == 1
     assert warm_metrics.downloads == 0
     assert storage.downloads == 1
+
+
+def test_v3_snapshot_digest_rejects_download_before_footer_parse(
+    tmp_path, monkeypatch,
+):
+    key = "org/lake/tables/events/tombstone/dv-v3.parquet"
+    payload = _parquet_bytes()
+    storage = FakeRemote({key: payload})
+    cache = FileCache(storage, "org", root=str(tmp_path), workers=1)
+    reflection = _v3_only_reflection(
+        "https://signed.example/dv-v3", key, "0" * 64,
+    )
+
+    monkeypatch.setattr(
+        pq,
+        "read_metadata",
+        lambda *_args, **_kwargs: pytest.fail(
+            "snapshot-mismatched v3 bytes reached the Parquet parser"
+        ),
+    )
+    with pytest.raises(
+        FileCacheIntegrityError, match="snapshot SHA-256",
+    ):
+        cache.localize_reflection(reflection, populate=True)
+
+
+def test_v3_snapshot_digest_rejects_warm_hit_before_footer_parse(
+    tmp_path, monkeypatch,
+):
+    key = "org/lake/tables/events/tombstone/dv-v3.parquet"
+    payload = _parquet_bytes()
+    storage = FakeRemote({key: payload})
+    cache = FileCache(storage, "org", root=str(tmp_path), workers=1)
+    correct = _v3_only_reflection(
+        "https://signed.example/dv-v3",
+        key,
+        tombstone_v3_artifact_digest(payload),
+    )
+    localized, metrics = cache.localize_reflection(correct, populate=True)
+    assert metrics.downloads == 1
+    assert os.path.isfile(
+        localized.tombstone_views["events"].tombstone_path
+    )
+
+    mismatched = _v3_only_reflection(
+        "https://signed.example/dv-v3", key, "f" * 64,
+    )
+    monkeypatch.setattr(
+        pq,
+        "read_metadata",
+        lambda *_args, **_kwargs: pytest.fail(
+            "snapshot-mismatched cached v3 bytes reached the Parquet parser"
+        ),
+    )
+    with pytest.raises(
+        FileCacheIntegrityError, match="snapshot SHA-256",
+    ):
+        cache.localize_reflection(mismatched, populate=False)
 
 
 def test_local_storage_is_no_copy_and_reflection_is_cloned(tmp_path):

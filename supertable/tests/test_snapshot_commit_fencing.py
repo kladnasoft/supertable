@@ -2820,7 +2820,12 @@ def test_begin_table_mutation_lua_accepts_explicit_v2_snapshot_state(active):
     [
         {"tombstone_format": None},
         {"tombstone_format": True},
-        {"tombstone_format": 3},
+        {
+            "tombstone_format": 3,
+            "tombstone": "org/lake/tables/table/tombstone/manifest.json",
+            "tombstone_rows": 1,
+            "tombstone_digest": "0" * 64,
+        },
         {
             "tombstone_format": 2,
             "tombstone": "org/lake/tables/table/tombstone/deleted.parquet",

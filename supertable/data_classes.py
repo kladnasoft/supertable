@@ -279,8 +279,9 @@ class SuperSnapshot:
     # Exact row count recorded beside ``tombstone_key``.  ``None`` supports
     # snapshots written before the count was introduced.
     tombstone_rows: Optional[int] = None
-    # SHA-256 of the canonical deletion-vector row stream pinned beside the
-    # pointer/count. Required for active modern deletion vectors.
+    # Representation-specific SHA-256 pinned beside the pointer/count: the
+    # canonical logical row stream for v1, canonical manifest JSON for v2,
+    # and exact Parquet bytes for v3.
     tombstone_digest: Optional[str] = None
     # Linked-share policy is leaf payload metadata and must be pinned alongside
     # the data snapshot for the same split-read reason.
@@ -335,8 +336,9 @@ class SuperSnapshot:
     candidate_row_groups_complete: bool = False
     # Deletion-vector representation pinned by this snapshot.  ``None`` and
     # ``1`` are the legacy single-Parquet artifact; explicit ``2`` means an
-    # active pointer names a standalone, content-sealed segment manifest.  A
-    # drained v2 table may retain format 2 with the exact empty state.
+    # active pointer names a standalone, content-sealed segment manifest;
+    # explicit ``3`` is one exact-byte-sealed immutable Parquet artifact. A
+    # drained v2/v3 table may retain its format with the exact empty state.
     # Kept last to preserve every existing positional constructor.
     tombstone_format: Optional[int] = None
 
@@ -410,16 +412,16 @@ class TombstoneDef:
     ``__rowid__`` against the deletion-vector parquet, hiding rows that
     have been logically deleted but not yet physically compacted.
 
-    - tombstone_path: storage path of the deletion-vector parquet
+    - tombstone_path: executor-facing path of the deletion-vector parquet
       (columns ``__file__`` + ``__rowid__``).  ``None`` means no
       tombstone exists, so no anti-join is applied.  This may be a
       presigned/object-store URL that rotates per request, so it is
       *not* stable enough to use as a cache key.
     - cache_key: the bare, stable storage key of the same deletion-vector
-      parquet (no presign).  Stable across pure appends (carry-forward
-      returns the previous tombstone), so DuckDB engines use it to key the
-      materialised deletion-vector table cache.  ``None`` disables caching
-      for this alias (falls back to inline ``read_parquet``).
+      artifact (no presign). For v2 it names the JSON manifest while segments
+      name their own Parquet keys. For v1/v3 it remains the logical Parquet key
+      even when ``tombstone_path`` is a localized cache filename. DuckDB uses
+      it to key the materialised deletion-vector table cache.
     - expected_rows: snapshot-pinned deletion-vector cardinality, when the
       writer recorded it.  Executors can use this to validate the immutable
       artifact before applying it; ``None`` is the legacy/unknown case.
@@ -435,8 +437,8 @@ class TombstoneDef:
     snapshot_resource_keys: Optional[Tuple[str, ...]] = None
     # Trailing for positional compatibility; see SuperSnapshot above.
     tombstone_format: Optional[int] = None
-    # Resolved immutable Parquet segments for explicit format 2.  The legacy
-    # format keeps this empty and continues to consume ``tombstone_path``.
+    # Resolved immutable Parquet segments for explicit format 2. Formats 1
+    # and 3 keep this empty and consume the direct ``tombstone_path``.
     segments: Tuple[TombstoneSegmentDef, ...] = field(default_factory=tuple)
 
 

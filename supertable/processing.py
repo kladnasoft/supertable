@@ -15,7 +15,7 @@ from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from contextvars import copy_context
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, date, timezone
 from typing import Any, Callable, Dict, FrozenSet, Iterable, Iterator, List, Set, Tuple, Optional, cast
 
@@ -35,12 +35,15 @@ from supertable.tombstone_manifest_v2 import (
     MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS,
     TOMBSTONE_FORMAT_V1,
     TOMBSTONE_FORMAT_V2,
+    TOMBSTONE_FORMAT_V3,
     TombstoneManifestV2,
     TombstoneManifestV2Error,
     TombstoneSegment,
     load_tombstone_manifest_v2,
     validate_logical_storage_path,
+    validate_snapshot_tombstone_state,
     validate_tombstone_segment_observation,
+    tombstone_v3_artifact_digest,
 )
 from supertable.utils.profiler import Profiler, get_null_profiler
 from supertable.utils.snapshot import read_bounded_tombstone_manifest_bytes
@@ -2622,6 +2625,85 @@ TOMBSTONE_SCHEMA: Dict[str, polars.DataType] = {
     ROWID_COL: polars.Int64,
 }
 
+
+def _make_live_tombstone_delta_proof_api():
+    """Create closure-private issue/check operations for resolver provenance."""
+    token = object()
+
+    class _Pairs(list):
+        __slots__ = ("_proof_token", "_predecessor", "_sealed_pairs")
+
+        def __init__(
+            self,
+            pairs: Iterable[Tuple[str, int]],
+            predecessor: Optional[polars.DataFrame],
+        ) -> None:
+            super().__init__(pairs)
+            self._proof_token = token
+            self._predecessor = predecessor
+            self._sealed_pairs = tuple(self)
+
+    def issue(
+        pairs: Iterable[Tuple[str, int]],
+        predecessor: Optional[polars.DataFrame],
+    ) -> list:
+        """Mark exact pairs proved rowid-disjoint from one predecessor."""
+        return _Pairs(pairs, predecessor)
+
+    def matches(value: object, predecessor: polars.DataFrame) -> bool:
+        """Consume only an unchanged proof issued by this closure."""
+        if type(value) is not _Pairs:
+            return False
+        candidate = cast(Any, value)
+        return bool(
+            candidate._proof_token is token
+            and candidate._predecessor is predecessor
+            and tuple(candidate) == candidate._sealed_pairs
+        )
+
+    return issue, matches
+
+
+(
+    _live_tombstone_delta_pairs,
+    _is_proved_live_tombstone_delta,
+) = _make_live_tombstone_delta_proof_api()
+
+
+def _prove_live_tombstone_delta_pairs(
+        pairs: List[Tuple[str, int]],
+        predecessor: Optional[polars.DataFrame],
+        *,
+        profiler: Optional[Profiler] = None,
+) -> list:
+    """Issue resolver provenance after a narrow native global-rowid check.
+
+    The overwrite resolver already removes exact ``(file, rowid)`` pairs that
+    are tombstoned. A corrupt/reused rowid under a different file must still
+    fail closed because the table invariant is rowid-global. This check scans
+    only the predecessor's compact Int64 column in Polars; it never sorts,
+    hashes, validates, or expands the full tombstone frame into Python objects.
+    """
+    if predecessor is not None and predecessor.height and pairs:
+        p = profiler or get_null_profiler()
+        delta_rowids = polars.DataFrame({
+            ROWID_COL: polars.Series(
+                ROWID_COL,
+                [int(rowid) for _file, rowid in pairs],
+                dtype=polars.Int64,
+            )
+        }).unique(subset=[ROWID_COL])
+        with p.span("delete.prior_rowid_proof"):
+            overlap = predecessor.select(ROWID_COL).join(
+                delta_rowids, on=ROWID_COL, how="semi",
+            ).head(1)
+        if overlap.height:
+            raise ValueError(
+                "mutation candidate reuses a globally tombstoned rowid"
+            )
+    return _live_tombstone_delta_pairs(pairs, predecessor)
+
+
 @dataclass(frozen=True)
 class LoadedTombstoneState:
     """Validated physical representation behind one snapshot DV pointer.
@@ -2630,8 +2712,9 @@ class LoadedTombstoneState:
     For v2, ``segments`` and ``root_digest`` retain the independently sealed
     manifest state so a later writer can append one segment without rereading
     or rewriting the previous union.  A v1 state has exactly one synthetic
-    segment descriptor when a caller requests migration metadata.  Explicit
-    empty v2 state has no pointer, digest, or segments.
+    segment descriptor when a caller requests migration metadata. A v3 state
+    is one trusted immutable Parquet object and therefore has no segment
+    descriptors. Explicit empty v2/v3 state has no pointer or digest.
     """
 
     frame: polars.DataFrame
@@ -2639,6 +2722,7 @@ class LoadedTombstoneState:
     tombstone_path: Optional[str]
     root_digest: Optional[str]
     segments: Tuple[TombstoneSegment, ...] = ()
+    referenced_files: FrozenSet[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -2649,6 +2733,7 @@ class _TombstoneCacheSeal:
     digest: str
     referenced_files: FrozenSet[str]
     state: Optional[LoadedTombstoneState] = None
+    trusted_immutable: bool = False
 
 
 def _empty_tombstone_df() -> polars.DataFrame:
@@ -2811,6 +2896,36 @@ def validate_tombstone_frame(
     return df
 
 
+def validate_immutable_tombstone_frame(
+        df: polars.DataFrame,
+        *,
+        expected_rows: Optional[int] = None,
+        source: str = "immutable deletion-vector",
+) -> polars.DataFrame:
+    """Validate only the physical shape pinned by a format-3 snapshot.
+
+    Format 3 is an inductive contract: the committed predecessor was validated
+    when it was created, its object key is unique and immutable, and readers
+    pin that exact snapshot.  Re-scanning every old row for uniqueness and
+    re-hashing the complete logical set adds no concurrency safety.  A cold
+    read still rejects the wrong schema or cardinality before applying the
+    vector; only newly created delta rows receive full logical validation.
+    """
+    if not isinstance(df, polars.DataFrame):
+        raise ValueError(f"{source} is not a Polars DataFrame")
+    if list(df.columns) != list(TOMBSTONE_SCHEMA) or df.schema != TOMBSTONE_SCHEMA:
+        raise ValueError(
+            f"{source} has invalid schema {df.schema!r}; "
+            f"expected {TOMBSTONE_SCHEMA!r}"
+        )
+    expected = _checked_tombstone_expected_rows(expected_rows, source=source)
+    if expected is not None and df.height != expected:
+        raise ValueError(
+            f"{source} row-count mismatch: expected {expected}, got {df.height}"
+        )
+    return df
+
+
 def _tombstone_digest_validated(df: polars.DataFrame) -> str:
     """Hash a frame already validated against :data:`TOMBSTONE_SCHEMA`."""
     # Keep sorting in Polars' columnar engine instead of allocating a Python
@@ -2851,20 +2966,25 @@ def _tombstone_cache_seal(
         *,
         known_digest: Optional[str] = None,
         state: Optional[LoadedTombstoneState] = None,
+        trusted_immutable: bool = False,
         source: str,
 ) -> _TombstoneCacheSeal:
     """Build immutable cache metadata for an already validated frame."""
     digest = _checked_tombstone_expected_digest(known_digest, source=source)
     if digest is None:
         digest = _tombstone_digest_validated(df)
-    referenced = frozenset(
-        df.get_column(TOMBSTONE_FILE_COL).unique().to_list()
-    ) if df.height else frozenset()
+    referenced = (
+        state.referenced_files
+        if trusted_immutable and state is not None else
+        frozenset(df.get_column(TOMBSTONE_FILE_COL).unique().to_list())
+        if df.height else frozenset()
+    )
     return _TombstoneCacheSeal(
         rows=int(df.height),
         digest=digest,
         referenced_files=referenced,
         state=state,
+        trusted_immutable=trusted_immutable,
     )
 
 
@@ -2923,6 +3043,7 @@ def _write_df_parquet(
         compression_level: int = 1,
         profiler: Optional[Profiler] = None,
         storage: Optional[object] = None,
+        artifact_digest_out: Optional[Dict[str, str]] = None,
 ) -> int:
     """Write a Polars DataFrame to a single parquet file on the active storage.
 
@@ -2975,10 +3096,21 @@ def _write_df_parquet(
         # object key was created only on the writer's local filesystem.
         write_bytes(path, data)
         wrote_exact_bytes = True
+        if artifact_digest_out is not None:
+            artifact_digest_out["digest"] = tombstone_v3_artifact_digest(data)
     elif callable(write_parquet):
         if arrow_tbl is None:  # pragma: no cover - guarded above
             raise RuntimeError("Compatibility parquet backend requires Arrow")
         write_parquet(arrow_tbl, path)
+        if artifact_digest_out is not None:
+            read_bytes = getattr(active_storage, "read_bytes", None)
+            if not callable(read_bytes):
+                raise RuntimeError(
+                    "Format-3 tombstones require exact-byte storage reads"
+                )
+            artifact_digest_out["digest"] = tombstone_v3_artifact_digest(
+                read_bytes(path)
+            )
     else:
         raise RuntimeError("Configured storage provides no parquet write method")
     # Fast path: the write_bytes backend (MinIO/S3/local) stored precisely
@@ -4495,6 +4627,7 @@ def resolve_overwrite_writes(
         required: bool = True,
         existing_tombstones: Optional[polars.DataFrame] = None,
         storage: Optional[object] = None,
+        require_global_tombstone_disjoint_proof: bool = False,
 ) -> Tuple[polars.DataFrame, List[Tuple[str, int]]]:
     """Single-pass overwrite resolution: stale filtering + delete-vector pairs.
 
@@ -4516,6 +4649,10 @@ def resolve_overwrite_writes(
     so direct processing callers never construct or contact a backend merely to
     choose an optional accelerator.
     """
+    if type(require_global_tombstone_disjoint_proof) is not bool:
+        raise TypeError(
+            "require_global_tombstone_disjoint_proof must be a boolean"
+        )
     p = profiler or get_null_profiler()
     overlap_true = [(f, sz) for f, has_overlap, sz in overlapping_files if has_overlap]
     if not overlap_true or not overwrite_columns:
@@ -4589,11 +4726,18 @@ def resolve_overwrite_writes(
                     on=[TOMBSTONE_FILE_COL, ROWID_COL],
                     how="anti",
                 )
-            return _derive_stale_and_deletes(
+            filtered, pairs = _derive_stale_and_deletes(
                 incoming_df, matched, overwrite_columns, newer_than_col, profiler=p,
             )
         except Exception as e:
             logging.warning(f"[write-probe] derive failed, using polars path: {e}")
+        else:
+            return filtered, (
+                _prove_live_tombstone_delta_pairs(
+                    pairs, existing_tombstones, profiler=p,
+                )
+                if require_global_tombstone_disjoint_proof else pairs
+            )
 
     # ---- Fallback: original polars full-read path (semantics oracle) ----
     p.add("overwrite_resolve_fallback", 1)
@@ -4648,7 +4792,12 @@ def resolve_overwrite_writes(
         dead_rowids_by_file=dead_rowids_by_file,
         storage=storage,
     )
-    return filtered, pairs
+    return filtered, (
+        _prove_live_tombstone_delta_pairs(
+            pairs, existing_tombstones, profiler=p,
+        )
+        if require_global_tombstone_disjoint_proof else pairs
+    )
 
 
 def _partitioned_new_artifact_path(
@@ -4763,6 +4912,149 @@ def build_tombstone_file(
     return new_path, combined
 
 
+def build_tombstone_v3(
+        tombstone_dir: str,
+        prev_tombstone_path: Optional[str],
+        new_pairs: List[Tuple[str, int]],
+        compression_level: int,
+        profiler: Optional[Profiler] = None,
+        *,
+        prev_df: Optional[polars.DataFrame] = None,
+        previous_state: Optional[LoadedTombstoneState] = None,
+        expected_previous_rows: Optional[int] = None,
+        allowed_files: Optional[Set[str]] = None,
+        persist: bool = True,
+        storage: Optional[object] = None,
+) -> Tuple[Optional[str], Optional[polars.DataFrame], Optional[LoadedTombstoneState]]:
+    """Create one immutable single-file successor using an inductive proof.
+
+    The committed predecessor is trusted as an immutable snapshot artifact.
+    Only the incoming delta is fully validated. The overwrite resolver proves
+    with a narrow native row-ID join that the new rows do not repeat an old
+    tombstone; direct internal callers perform the same join here. The old rows
+    are then carried forward through native columnar concatenation without a
+    full union uniqueness scan or canonical logical digest.
+    """
+    if not new_pairs:
+        return prev_tombstone_path, None, None
+
+    p = profiler or get_null_profiler()
+    if prev_tombstone_path and prev_df is None:
+        raise ValueError(
+            "format-3 successor requires the pinned predecessor frame"
+        )
+    if prev_tombstone_path:
+        if previous_state is None:
+            raise ValueError(
+                "format-3 successor requires the pinned predecessor state"
+            )
+        if (
+            previous_state.frame is not prev_df
+            or previous_state.tombstone_path != prev_tombstone_path
+            or previous_state.tombstone_format not in (
+                TOMBSTONE_FORMAT_V1, TOMBSTONE_FORMAT_V3,
+            )
+            or previous_state.root_digest is None
+        ):
+            raise ValueError(
+                "format-3 predecessor state does not match the pinned frame"
+            )
+    previous = (
+        validate_immutable_tombstone_frame(
+            prev_df,
+            expected_rows=expected_previous_rows,
+            source=f"immutable predecessor {prev_tombstone_path}",
+        )
+        if prev_df is not None else _empty_tombstone_df()
+    )
+    live_delta_proved = bool(
+        previous.height
+        and _is_proved_live_tombstone_delta(new_pairs, previous)
+    )
+
+    with p.span("tombstone_v3.delta_validate"):
+        delta = polars.DataFrame(
+            {
+                TOMBSTONE_FILE_COL: [file for file, _rowid in new_pairs],
+                ROWID_COL: [int(rowid) for _file, rowid in new_pairs],
+            },
+            schema=TOMBSTONE_SCHEMA,
+        ).unique(
+            subset=[TOMBSTONE_FILE_COL, ROWID_COL],
+            keep="first",
+            maintain_order=True,
+        )
+        delta = validate_tombstone_frame(
+            delta,
+            allowed_files=allowed_files,
+            source="new immutable deletion-vector delta",
+        )
+
+    if previous.height:
+        if live_delta_proved:
+            # The resolver derived these exact pairs from pinned physical rows
+            # after anti-joining this exact predecessor frame. Re-scanning the
+            # unchanged million-row vector would prove the same fact twice.
+            p.add("tombstone_v3_prior_scan_elided", 1)
+        else:
+            # Direct/unproved processing callers retain the conservative native
+            # intersection boundary instead of gaining a caller-controlled skip.
+            with p.span("tombstone_v3.delta_intersection"):
+                overlap = delta.select(ROWID_COL).join(
+                    previous.select(ROWID_COL), on=ROWID_COL, how="semi",
+                )
+            if overlap.height:
+                raise ValueError(
+                    "new deletion-vector delta repeats an existing tombstone rowid"
+                )
+        combined = polars.concat([previous, delta], how="vertical", rechunk=False)
+        p.add("tombstone_v3_previous_rows_reused", previous.height)
+    else:
+        combined = delta
+
+    p.add("tombstone_v3_delta_rows", delta.height)
+    p.add("tombstone_v3_total_rows", combined.height)
+    if not persist:
+        return None, combined, None
+
+    path = _partitioned_new_path(tombstone_dir, "deleted-v3")
+    artifact_seal: Dict[str, str] = {}
+    artifact_bytes = _write_df_parquet(
+        combined, path, compression_level, profiler=p, storage=storage,
+        artifact_digest_out=artifact_seal,
+    )
+    p.add("tombstone_v3_artifacts_written", 1)
+    p.add("tombstone_v3_artifact_bytes", artifact_bytes)
+    digest = artifact_seal.get("digest")
+    if not isinstance(digest, str):
+        raise RuntimeError("Format-3 tombstone write produced no byte seal")
+    prior_referenced = (
+        previous_state.referenced_files
+        if previous_state is not None and previous_state.referenced_files else
+        frozenset(previous.get_column(TOMBSTONE_FILE_COL).unique().to_list())
+        if previous.height else frozenset()
+    )
+    referenced_files = prior_referenced.union(
+        delta.get_column(TOMBSTONE_FILE_COL).unique().to_list()
+    )
+    if allowed_files is not None:
+        foreign = referenced_files.difference(frozenset(allowed_files))
+        if foreign:
+            raise ValueError(
+                "format-3 successor references files outside the pinned snapshot: "
+                f"{sorted(foreign)!r}"
+            )
+    state = LoadedTombstoneState(
+        frame=combined,
+        tombstone_format=TOMBSTONE_FORMAT_V3,
+        tombstone_path=path,
+        root_digest=digest,
+        segments=(),
+        referenced_files=frozenset(referenced_files),
+    )
+    return path, combined, state
+
+
 def persist_tombstone_frame(
         tombstone_dir: str,
         frame: polars.DataFrame,
@@ -4778,6 +5070,54 @@ def persist_tombstone_frame(
     new_path = _partitioned_new_path(tombstone_dir, "deleted")
     _write_df_parquet(validated, new_path, compression_level, profiler=profiler)
     return new_path, validated
+
+
+def persist_tombstone_v3_frame(
+        tombstone_dir: str,
+        frame: polars.DataFrame,
+        compression_level: int,
+        profiler: Optional[Profiler] = None,
+        *,
+        storage: Optional[object] = None,
+) -> Tuple[Optional[str], polars.DataFrame, LoadedTombstoneState]:
+    """Persist a trusted internally-derived format-3 successor frame."""
+    # Residual/compaction paths subtract arbitrary old rows. They are not the
+    # append-only inductive hot path, so retain the complete logical boundary.
+    validated = validate_tombstone_frame(
+        frame, source="immutable deletion-vector successor to persist",
+    )
+    if validated.height == 0:
+        return None, validated, LoadedTombstoneState(
+            frame=validated,
+            tombstone_format=TOMBSTONE_FORMAT_V3,
+            tombstone_path=None,
+            root_digest=None,
+            segments=(),
+        )
+    path = _partitioned_new_path(tombstone_dir, "deleted-v3")
+    artifact_seal: Dict[str, str] = {}
+    artifact_bytes = _write_df_parquet(
+        validated, path, compression_level,
+        profiler=profiler, storage=storage,
+        artifact_digest_out=artifact_seal,
+    )
+    p = profiler or get_null_profiler()
+    p.add("tombstone_v3_artifacts_written", 1)
+    p.add("tombstone_v3_artifact_bytes", artifact_bytes)
+    digest = artifact_seal.get("digest")
+    if not isinstance(digest, str):
+        raise RuntimeError("Format-3 tombstone write produced no byte seal")
+    state = LoadedTombstoneState(
+        frame=validated,
+        tombstone_format=TOMBSTONE_FORMAT_V3,
+        tombstone_path=path,
+        root_digest=digest,
+        segments=(),
+        referenced_files=frozenset(
+            validated.get_column(TOMBSTONE_FILE_COL).unique().to_list()
+        ),
+    )
+    return path, validated, state
 
 
 def persist_tombstone_segment_v2(
@@ -7614,7 +7954,11 @@ def _normalized_tombstone_format(value: Optional[int]) -> int:
         return TOMBSTONE_FORMAT_V1
     if type(value) is int and value == TOMBSTONE_FORMAT_V2:
         return TOMBSTONE_FORMAT_V2
-    raise TombstoneManifestV2Error("tombstone_format must be integer 1 or 2")
+    if type(value) is int and value == TOMBSTONE_FORMAT_V3:
+        return TOMBSTONE_FORMAT_V3
+    raise TombstoneManifestV2Error(
+        "tombstone_format must be integer 1, 2, or 3"
+    )
 
 
 def _v1_loaded_tombstone_state(
@@ -7661,7 +8005,109 @@ def _v1_loaded_tombstone_state(
         tombstone_path=path,
         root_digest=logical_digest,
         segments=(segment,),
+        referenced_files=frozenset(
+            frame.get_column(TOMBSTONE_FILE_COL).unique().to_list()
+        ),
     )
+
+
+def _v3_loaded_tombstone_state(
+        *,
+        path: str,
+        frame: polars.DataFrame,
+        expected_rows: Optional[int],
+        digest: Optional[str],
+        observed_digest: str,
+        allowed_files: Optional[Set[str]],
+) -> LoadedTombstoneState:
+    rows = _checked_tombstone_expected_rows(
+        expected_rows, source=f"immutable deletion-vector {path}",
+    )
+    if rows is None or rows <= 0:
+        raise TombstoneManifestV2Error(
+            "active format-3 deletion-vector requires a positive row count"
+        )
+    checked = _checked_tombstone_expected_digest(
+        digest, source=f"immutable deletion-vector {path}",
+    )
+    if checked != observed_digest:
+        raise TombstoneManifestV2Error(
+            "format-3 deletion-vector bytes do not match the pinned snapshot"
+        )
+    validate_immutable_tombstone_frame(
+        frame,
+        expected_rows=rows,
+        source=f"immutable deletion-vector {path}",
+    )
+    referenced_files = frozenset(
+        frame.get_column(TOMBSTONE_FILE_COL).unique().to_list()
+    ) if frame.height else frozenset()
+    if allowed_files is not None:
+        foreign = referenced_files.difference(frozenset(allowed_files))
+        if foreign:
+            raise TombstoneManifestV2Error(
+                "format-3 deletion-vector references files outside the "
+                f"pinned snapshot: {sorted(foreign)!r}"
+            )
+    return LoadedTombstoneState(
+        frame=frame,
+        tombstone_format=TOMBSTONE_FORMAT_V3,
+        tombstone_path=path,
+        root_digest=checked,
+        segments=(),
+        referenced_files=referenced_files,
+    )
+
+
+def _read_tombstone_v3_artifact(
+        path: str,
+        *,
+        storage: Optional[object],
+        required: bool,
+        expected_digest: Optional[str],
+) -> Tuple[Optional[polars.DataFrame], Optional[str]]:
+    """Read, byte-seal, and decode one immutable format-3 Parquet object."""
+    active_storage = storage if storage is not None else _get_storage()
+    read_bytes = getattr(active_storage, "read_bytes", None)
+    if not callable(read_bytes):
+        if required:
+            raise RuntimeError(
+                "Format-3 tombstones require exact-byte storage reads"
+            )
+        return None, None
+    try:
+        raw = read_bytes(path)
+    except Exception:
+        if required:
+            raise
+        logging.warning("[read] failed to read format-3 tombstone at %s", path)
+        return None, None
+    if not isinstance(raw, (bytes, bytearray, memoryview)):
+        raise ValueError("Format-3 tombstone read did not return bytes")
+    raw = bytes(raw)
+    digest = tombstone_v3_artifact_digest(raw)
+    checked_digest = _checked_tombstone_expected_digest(
+        expected_digest, source=f"immutable deletion-vector {path}",
+    )
+    if checked_digest != digest:
+        # An optional/missing read may return None, but a present object whose
+        # bytes disagree with the pinned snapshot is an integrity failure in
+        # every mode and must never be downgraded to absence.
+        raise TombstoneManifestV2Error(
+            "format-3 deletion-vector bytes do not match the pinned snapshot"
+        )
+    # Decode only after the cheap exact-byte boundary. Corrupt/substituted
+    # native payloads never reach the Parquet parser.
+    try:
+        frame = polars.read_parquet(
+            io.BytesIO(raw), hive_partitioning=False,
+        )
+        return frame, digest
+    except Exception:
+        if required:
+            raise
+        logging.warning("[read] failed to read format-3 tombstone at %s", path)
+        return None, None
 
 
 def _read_tombstone_manifest_v2(
@@ -7896,8 +8342,9 @@ def load_tombstone(
         expected_simple_name: Optional[str] = None,
         pinned_snapshot_version: Optional[int] = None,
         expected_segment_prefix: Optional[str] = None,
+        artifact_key: Optional[str] = None,
 ) -> Optional[polars.DataFrame]:
-    """Load a v1 Parquet DV or v2 manifest union, preserving old return type.
+    """Load a v1/v3 Parquet DV or v2 manifest union.
 
     ``cache_identity`` may provide a stable, authorization-scoped raw object
     identity when ``tombstone_path`` is a rotating presigned URL. It controls
@@ -7919,6 +8366,15 @@ def load_tombstone(
     normalized_format = _normalized_tombstone_format(tombstone_format)
     if not tombstone_path:
         return None
+    logical_artifact_key = str(artifact_key or tombstone_path)
+    if normalized_format == TOMBSTONE_FORMAT_V3:
+        validate_snapshot_tombstone_state(
+            logical_artifact_key,
+            expected_rows,
+            expected_digest,
+            format_present=True,
+            tombstone_format=TOMBSTONE_FORMAT_V3,
+        )
     identity = str(cache_identity or tombstone_cache_identity(tombstone_path))
     p = profiler or get_null_profiler()
     cached_entry = _TOMBSTONE_CACHE.get_entry(identity) if allow_cache else None
@@ -7929,11 +8385,26 @@ def load_tombstone(
             metadata.state
             if isinstance(metadata, _TombstoneCacheSeal) else None
         )
-        # A legacy three-tuple cannot prove a v2 root/segment manifest. Treat it
-        # as a miss rather than comparing the root digest to the union digest.
-        if normalized_format == TOMBSTONE_FORMAT_V2 and (
-            metadata_state is None
-            or metadata_state.tombstone_format != TOMBSTONE_FORMAT_V2
+        # A cache entry issued under another representation cannot be reused:
+        # v1 seals logical rows, v2 seals a manifest, and v3 seals exact bytes.
+        # Legacy state-less tuples remain valid only for v1; they cannot prove
+        # a v2 root/segment manifest or a trusted immutable v3 object.
+        if (
+            (
+                metadata_state is not None
+                and metadata_state.tombstone_format != normalized_format
+            )
+            or (
+                normalized_format in (TOMBSTONE_FORMAT_V2, TOMBSTONE_FORMAT_V3)
+                and metadata_state is None
+            )
+            or (
+                normalized_format == TOMBSTONE_FORMAT_V3
+                and (
+                    not isinstance(metadata, _TombstoneCacheSeal)
+                    or not metadata.trusted_immutable
+                )
+            )
         ):
             cached_entry = None
         else:
@@ -7970,6 +8441,20 @@ def load_tombstone(
                 allowed_files=allowed_files,
                 source=source,
             )
+            if normalized_format == TOMBSTONE_FORMAT_V3:
+                # Never expose the cache-owned frame. Polars clones are shallow
+                # copy-on-write, so this is O(1) while preventing a caller's
+                # same-object ``replace_column`` from poisoning later reads.
+                returned = cached.clone()
+                cached_state = cast(_TombstoneCacheSeal, metadata).state
+                if cached_state is None:  # pragma: no cover - gated above
+                    raise RuntimeError(
+                        "Format-3 tombstone cache entry has no immutable state"
+                    )
+                returned_state = replace(cached_state, frame=returned)
+                if state_out is not None:
+                    state_out["state"] = returned_state
+                return returned
             if state_out is not None:
                 state = (
                     metadata.state
@@ -8012,6 +8497,24 @@ def load_tombstone(
             profiler=p,
         )
         df = loaded_state.frame if loaded_state is not None else None
+    elif normalized_format == TOMBSTONE_FORMAT_V3:
+        df, observed_digest = _read_tombstone_v3_artifact(
+            logical_artifact_key,
+            storage=storage,
+            required=required,
+            expected_digest=expected_digest,
+        )
+        if df is not None:
+            if observed_digest is None:  # pragma: no cover - coupled return
+                raise RuntimeError("Format-3 tombstone has no byte digest")
+            loaded_state = _v3_loaded_tombstone_state(
+                path=logical_artifact_key,
+                frame=df,
+                expected_rows=expected_rows,
+                digest=expected_digest,
+                observed_digest=observed_digest,
+                allowed_files=allowed_files,
+            )
     else:
         df = (
             loader()
@@ -8042,16 +8545,24 @@ def load_tombstone(
     if loaded_state is not None and state_out is not None:
         state_out["state"] = loaded_state
     if df is not None and allow_cache:
+        cache_frame = df
+        cache_state = loaded_state
+        if normalized_format == TOMBSTONE_FORMAT_V3:
+            if loaded_state is None:  # pragma: no cover - coupled v3 load
+                raise RuntimeError("Format-3 tombstone has no immutable state")
+            cache_frame = df.clone()
+            cache_state = replace(loaded_state, frame=cache_frame)
         seal = _tombstone_cache_seal(
-            df,
+            cache_frame,
             known_digest=(
-                loaded_state.root_digest
-                if loaded_state is not None else expected_digest
+                cache_state.root_digest
+                if cache_state is not None else expected_digest
             ),
-            state=loaded_state,
+            state=cache_state,
+            trusted_immutable=(normalized_format == TOMBSTONE_FORMAT_V3),
             source=f"deletion-vector cache entry {tombstone_path}",
         )
-        _TOMBSTONE_CACHE.put(identity, df, seal)
+        _TOMBSTONE_CACHE.put(identity, cache_frame, seal)
     return df
 
 
@@ -8385,6 +8896,15 @@ def cache_tombstone(
                 checked_digest = _checked_tombstone_expected_digest(
                     expected_digest, source=source,
                 )
+            elif normalized_format == TOMBSTONE_FORMAT_V3:
+                validated = validate_immutable_tombstone_frame(
+                    df,
+                    expected_rows=expected_rows,
+                    source=source,
+                )
+                checked_digest = _checked_tombstone_expected_digest(
+                    expected_digest, source=source,
+                )
             else:
                 validated = validate_tombstone_frame(
                     df,
@@ -8393,25 +8913,32 @@ def cache_tombstone(
                     source=source,
                 )
                 checked_digest = expected_digest
-        if normalized_format == TOMBSTONE_FORMAT_V2:
+        if normalized_format in (TOMBSTONE_FORMAT_V2, TOMBSTONE_FORMAT_V3):
             if (
                 loaded_state is None
-                or loaded_state.tombstone_format != TOMBSTONE_FORMAT_V2
+                or loaded_state.tombstone_format != normalized_format
                 or loaded_state.frame is not df
                 or loaded_state.tombstone_path != tombstone_path
                 or loaded_state.root_digest != checked_digest
             ):
                 raise ValueError(
-                    "format-2 tombstone cache seeds require the exact loaded state"
+                    f"format-{normalized_format} tombstone cache seeds require "
+                    "the exact loaded state"
                 )
+        cache_frame = validated
+        cache_state = loaded_state
+        if normalized_format == TOMBSTONE_FORMAT_V3:
+            cache_frame = validated.clone()
+            cache_state = replace(cast(LoadedTombstoneState, loaded_state), frame=cache_frame)
         seal = _tombstone_cache_seal(
-            validated,
+            cache_frame,
             known_digest=checked_digest,
-            state=loaded_state,
+            state=cache_state,
+            trusted_immutable=(normalized_format == TOMBSTONE_FORMAT_V3),
             source=source,
         )
         identity = str(cache_identity or tombstone_cache_identity(tombstone_path))
-        _TOMBSTONE_CACHE.put(identity, validated, seal)
+        _TOMBSTONE_CACHE.put(identity, cache_frame, seal)
 
 
 def evict_tombstone(

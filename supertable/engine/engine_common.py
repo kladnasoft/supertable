@@ -30,6 +30,7 @@ from supertable.tombstone_manifest_v2 import (
     MAX_JSON_EXACT_INTEGER,
     MAX_TOMBSTONE_MANIFEST_V2_SEGMENTS,
     TOMBSTONE_FORMAT_V2,
+    TOMBSTONE_FORMAT_V3,
     validate_logical_storage_path,
     validate_snapshot_tombstone_state,
 )
@@ -2487,8 +2488,9 @@ class ValidatedTombstoneTable(str):
     It deliberately remains a ``str`` so existing engine/view plumbing stays
     simple.  The marker lets ``create_tombstone_view`` avoid an O(N) validation
     scan on every cache hit. A plain direct-caller table remains valid for v1;
-    v2 requires this marker because only the materializer can prove each sealed
-    external segment without reading it a second time.
+    v2/v3 require this marker because only their materializers can bind the
+    cached relation to the snapshot-sealed external representation without a
+    second logical validation scan.
     """
 
     def __new__(
@@ -2529,7 +2531,7 @@ def _duckdb_parquet_path_is_glob(path: str) -> bool:
 
 
 def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
-    """Return a structurally closed v2 segment tuple or raise.
+    """Validate the representation and return a closed v2 segment tuple.
 
     Legacy definitions must not carry segments.  This rejects discriminator
     hybrids at the last SQL boundary even for direct engine callers that did
@@ -2552,7 +2554,7 @@ def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
         and (
             isinstance(tombstone_format, bool)
             or not isinstance(tombstone_format, int)
-            or tombstone_format not in (1, 2)
+            or tombstone_format not in (1, 2, 3)
         )
     ):
         raise RuntimeError("Invalid deletion-vector format discriminator")
@@ -2578,6 +2580,21 @@ def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
             raise RuntimeError(
                 "A JSON deletion-vector pointer requires tombstone_format=2"
             )
+        if tombstone_format == TOMBSTONE_FORMAT_V3 and tombstone_path is not None:
+            if _duckdb_parquet_path_is_glob(tombstone_path):
+                raise RuntimeError(
+                    "Format-3 deletion vector must resolve to one exact object"
+                )
+            try:
+                validate_logical_storage_path(
+                    cache_key,
+                    field_name="format-3 tombstone artifact key",
+                    required_suffix=".parquet",
+                )
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "Invalid format-3 deletion-vector artifact key"
+                ) from exc
         return ()
     if tombstone_path is None:
         if cache_key is not None or segments:
@@ -2707,6 +2724,18 @@ def _v2_union_relation(relations: List[str]) -> str:
     ) + ")"
 
 
+def _local_parquet_host_path(path: str) -> Optional[str]:
+    """Return the host path represented by ``path``, or ``None`` if remote."""
+    parsed = urlsplit(path)
+    if parsed.scheme:
+        if parsed.scheme.casefold() != "file":
+            return None
+        if parsed.query or parsed.fragment or parsed.netloc not in ("", "localhost"):
+            raise RuntimeError("Invalid local deletion-vector artifact path")
+        return unquote(parsed.path)
+    return path
+
+
 def _local_parquet_file_identity(path: str) -> Optional[tuple[int, ...]]:
     """Return a stable local-file identity, or ``None`` for provider paths.
 
@@ -2716,15 +2745,9 @@ def _local_parquet_file_identity(path: str) -> Optional[tuple[int, ...]]:
     Plain paths (the normal LocalStorage/cache representation) and local file
     URLs can be fenced with the host filesystem around the DuckDB statement.
     """
-    parsed = urlsplit(path)
-    if parsed.scheme:
-        if parsed.scheme.casefold() != "file":
-            return None
-        if parsed.query or parsed.fragment or parsed.netloc not in ("", "localhost"):
-            raise RuntimeError("Invalid local deletion-vector segment path")
-        local_path = unquote(parsed.path)
-    else:
-        local_path = path
+    local_path = _local_parquet_host_path(path)
+    if local_path is None:
+        return None
 
     try:
         observed = os.stat(local_path, follow_symlinks=True)
@@ -2741,6 +2764,118 @@ def _local_parquet_file_identity(path: str) -> Optional[tuple[int, ...]]:
         int(observed.st_mtime_ns),
         int(observed.st_ctime_ns),
     )
+
+
+class _PinnedLocalTombstoneStorage:
+    """Expose one local file as one logical immutable storage artifact.
+
+    ``processing.load_tombstone`` hashes and decodes the returned byte object,
+    so the bytes validated by the v3 seal are exactly the bytes converted into
+    the materialized relation. The before/after stat fence rejects a local
+    cache replacement or in-place mutation during the single bulk read.
+    """
+
+    def __init__(
+            self,
+            logical_key: str,
+            resolved_path: str,
+            identity: tuple[int, ...],
+    ) -> None:
+        self.logical_key = logical_key
+        local_path = _local_parquet_host_path(resolved_path)
+        if local_path is None:  # pragma: no cover - guarded by the caller
+            raise RuntimeError("Format-3 tombstone path is not local")
+        self.local_path = local_path
+        self.identity = identity
+
+    def read_bytes(self, path: str) -> bytes:
+        if path != self.logical_key:
+            raise RuntimeError("Format-3 tombstone artifact key changed")
+        if _local_parquet_file_identity(self.local_path) != self.identity:
+            raise RuntimeError(
+                "Local format-3 tombstone changed before its sealed read"
+            )
+        try:
+            with open(self.local_path, "rb") as handle:
+                payload = handle.read()
+        except OSError as exc:
+            raise RuntimeError(
+                "Unable to read local format-3 deletion vector"
+            ) from exc
+        if _local_parquet_file_identity(self.local_path) != self.identity:
+            raise RuntimeError(
+                "Local format-3 tombstone changed during its sealed read"
+            )
+        if len(payload) != self.identity[2]:
+            raise RuntimeError(
+                "Local format-3 tombstone byte count changed during its read"
+            )
+        return payload
+
+
+def _load_v3_tombstone_frame(
+        tombstone_def,
+        *,
+        storage: Optional[object],
+        allowed_files: Optional[List[str]],
+        cache_identity: str,
+):
+    """Byte-seal and shallow-validate one direct immutable v3 artifact.
+
+    Local/cache paths are bulk-read once behind a stat fence. Provider paths
+    are addressed by the stable logical key rather than a rotating resolved
+    URL. The processing cache retains the trusted exact-byte seal and native
+    referenced-file set, so a later hit never falls back to the v1 canonical
+    logical hash or uniqueness scan.
+    """
+    path = str(getattr(tombstone_def, "tombstone_path", "") or "")
+    artifact_key = str(getattr(tombstone_def, "cache_key", "") or "")
+    expected_rows = getattr(tombstone_def, "expected_rows", None)
+    expected_digest = getattr(tombstone_def, "tombstone_digest", None)
+    if not path or not artifact_key:
+        raise RuntimeError("Active format-3 tombstone has no artifact path")
+
+    local_identity = _local_parquet_file_identity(path)
+    artifact_storage = storage
+    if local_identity is not None:
+        artifact_storage = _PinnedLocalTombstoneStorage(
+            artifact_key,
+            path,
+            local_identity,
+        )
+    elif artifact_storage is None:
+        raise RuntimeError(
+            "Remote format-3 tombstone requires its storage backend"
+        )
+
+    # Import lazily: processing also imports engine data types and loading it
+    # at engine_common module import time would create a broad dependency cycle.
+    from supertable.processing import load_tombstone
+
+    state_out: Dict[str, object] = {}
+    frame = load_tombstone(
+        path,
+        cache_identity=cache_identity,
+        allow_cache=True,
+        required=True,
+        expected_rows=expected_rows,
+        expected_digest=expected_digest,
+        allowed_files=(
+            None if allowed_files is None else {str(item) for item in allowed_files}
+        ),
+        tombstone_format=TOMBSTONE_FORMAT_V3,
+        state_out=state_out,
+        storage=artifact_storage,
+        # ``path`` can be a local whole-file-cache entry while this remains the
+        # exact immutable object key pinned by the snapshot.
+        artifact_key=artifact_key,
+    )
+    state = state_out.get("state")
+    if frame is None or state is None:
+        raise RuntimeError("Required format-3 deletion vector was unavailable")
+    if getattr(state, "tombstone_format", None) != TOMBSTONE_FORMAT_V3:
+        raise RuntimeError("Format-3 deletion vector returned invalid sealed state")
+    return frame, frozenset(getattr(state, "referenced_files", frozenset()))
 
 
 def _provider_parquet_file_identity(
@@ -2775,6 +2910,80 @@ def _provider_parquet_file_identity(
             "Remote deletion-vector segment has no stable provider identity"
         )
     return int(size), identity
+
+
+def _materialize_v3_tombstone_table(
+        con: duckdb.DuckDBPyConnection,
+        tombstone_def,
+        *,
+        base_table_name: str,
+        occupied_table_names: set[str],
+        allowed_files: Optional[List[str]] = None,
+        temporary: bool = False,
+        storage: Optional[object] = None,
+) -> tuple[str, int, str, frozenset[str]]:
+    """Materialize one byte-sealed v3 artifact without logical revalidation."""
+    expected_rows = getattr(tombstone_def, "expected_rows", None)
+    expected_digest = getattr(tombstone_def, "tombstone_digest", None)
+    cache_key = str(getattr(tombstone_def, "cache_key", "") or "")
+    frame, referenced_files = _load_v3_tombstone_frame(
+        tombstone_def,
+        storage=storage,
+        allowed_files=allowed_files,
+        cache_identity=(
+            f"duckdb-dv-v3:{cache_key}:{expected_rows}:{expected_digest}"
+        ),
+    )
+
+    candidate = base_table_name
+    if candidate in occupied_table_names:
+        candidate = f"{base_table_name}_{uuid.uuid4().hex}"
+    registered = f"dv_v3_arrow_{uuid.uuid4().hex}"
+    final_table: Optional[str] = None
+    try:
+        # The Arrow registration is backed by the frame decoded from the same
+        # exact byte object whose v3 digest was checked. Never validate one
+        # external path and ask DuckDB to open that path a second time.
+        con.register(registered, frame.to_arrow())
+        while True:
+            try:
+                temporary_sql = "TEMPORARY " if temporary else ""
+                con.execute(
+                    f"CREATE {temporary_sql}TABLE "
+                    f"{quote_if_needed(candidate)} AS "
+                    f"SELECT {quote_if_needed(TOMBSTONE_FILE_COL)}, "
+                    f"{quote_if_needed(ROWID_COL)} FROM "
+                    f"{quote_if_needed(registered)};"
+                )
+                final_table = candidate
+                break
+            except duckdb.CatalogException as create_err:
+                if "already exists" not in str(create_err).lower():
+                    raise
+                candidate = f"{base_table_name}_{uuid.uuid4().hex}"
+    except Exception:
+        if final_table is not None:
+            try:
+                con.execute(
+                    f"DROP TABLE IF EXISTS {quote_if_needed(final_table)};"
+                )
+            except Exception:
+                pass
+        raise
+    finally:
+        try:
+            con.unregister(registered)
+        except Exception:
+            pass
+
+    if final_table is None:  # pragma: no cover - loop either creates or raises
+        raise RuntimeError("Unable to materialize format-3 deletion vector")
+    return (
+        final_table,
+        int(frame.height),
+        str(expected_digest),
+        referenced_files,
+    )
 
 
 def _materialize_v2_tombstone_table(
@@ -3157,9 +3366,9 @@ def create_tombstone_view(
            ``(__file__, __rowid__)`` table (see :class:`TombstoneCache`). Built
            once and reused across queries, avoiding a parquet re-read per query.
          * *tombstone_def.tombstone_path* — inline ``read_parquet`` of a legacy
-           v1 deletion-vector parquet. Segmented v2 vectors always use a
-           validated private table, including when persistent cache capacity
-           is zero.
+           v1 deletion-vector parquet. Segmented v2 and immutable v3 vectors
+           always use a validated private table, including when persistent
+           cache capacity is zero.
 
     This view sits directly on top of the reflection table (before RBAC),
     so the anti-join still has ``__rowid__`` available and RBAC never sees
@@ -3193,6 +3402,13 @@ def create_tombstone_view(
         == TOMBSTONE_FORMAT_V2
     )
     active_v2 = is_v2 and tomb_path is not None
+    is_v3 = (
+        tombstone_def is not None
+        and getattr(tombstone_def, "tombstone_format", None)
+        == TOMBSTONE_FORMAT_V3
+    )
+    active_v3 = is_v3 and tomb_path is not None
+    active_sealed_format = active_v2 or active_v3
     resource_keys = list(getattr(tombstone_def, "resource_keys", ()) or ()) if tombstone_def else []
     raw_snapshot_keys = (
         getattr(tombstone_def, "snapshot_resource_keys", None)
@@ -3250,22 +3466,34 @@ def create_tombstone_view(
             )
 
     referenced_dv_files: frozenset[str] = frozenset()
-    owned_direct_v2_table: Optional[str] = None
-    if active_v2 and not dv_table:
+    owned_direct_table: Optional[str] = None
+    if active_sealed_format and not dv_table:
         # Direct helper callers do not have a TombstoneCache lifecycle. Keep a
         # private connection-local table behind the created view; it disappears
         # with the caller's connection. Executor callers always supply the
         # cache-owned (or query-lifetime capacity=0) table instead.
-        table_name, row_count, digest, referenced_dv_files = (
-            _materialize_v2_tombstone_table(
-                con,
-                tombstone_def,
-                base_table_name=f"dv_direct_{uuid.uuid4().hex}",
-                occupied_table_names=set(),
-                allowed_files=allowed_dv_files,
-                temporary=True,
+        if active_v2:
+            table_name, row_count, digest, referenced_dv_files = (
+                _materialize_v2_tombstone_table(
+                    con,
+                    tombstone_def,
+                    base_table_name=f"dv_direct_{uuid.uuid4().hex}",
+                    occupied_table_names=set(),
+                    allowed_files=allowed_dv_files,
+                    temporary=True,
+                )
             )
-        )
+        else:
+            table_name, row_count, digest, referenced_dv_files = (
+                _materialize_v3_tombstone_table(
+                    con,
+                    tombstone_def,
+                    base_table_name=f"dv_direct_{uuid.uuid4().hex}",
+                    occupied_table_names=set(),
+                    allowed_files=allowed_dv_files,
+                    temporary=True,
+                )
+            )
         dv_table = ValidatedTombstoneTable(
             table_name,
             row_count,
@@ -3273,22 +3501,25 @@ def create_tombstone_view(
             referenced_dv_files,
             root_digest=expected_digest,
             cache_key=getattr(tombstone_def, "cache_key", None),
-            segment_fingerprint=_v2_segment_fingerprint(v2_segments),
+            segment_fingerprint=(
+                _v2_segment_fingerprint(v2_segments) if active_v2 else None
+            ),
         )
-        owned_direct_v2_table = table_name
+        owned_direct_table = table_name
     if dv_table:
         # Tables returned by TombstoneCache were fully checked once when they
         # were materialised.  Direct callers receive the same full validation
         # here instead of being able to smuggle a partial/malformed relation
         # into the anti-join.
         if not isinstance(dv_table, ValidatedTombstoneTable):
-            if active_v2:
+            if active_sealed_format:
                 # A plain table name has no proof tying its contents to every
                 # manifest-sealed segment. Re-reading those external paths to
                 # manufacture that proof would recreate the substitution race
                 # this boundary is designed to remove.
                 raise RuntimeError(
-                    "V2 deletion vectors require a validated materialized table"
+                    "V2/v3 deletion vectors require a validated materialized "
+                    "table"
                 )
             _, _, referenced_dv_files = _validate_tombstone_relation_details(
                 con,
@@ -3311,7 +3542,7 @@ def create_tombstone_view(
             )
         if isinstance(dv_table, ValidatedTombstoneTable) and expected_digest is not None:
             cached_seal = (
-                dv_table.root_digest if active_v2 else dv_table.digest
+                dv_table.root_digest if active_sealed_format else dv_table.digest
             )
             if cached_seal != expected_digest:
                 raise RuntimeError(
@@ -3396,11 +3627,11 @@ def create_tombstone_view(
             )
         con.execute(sql)
     except Exception:
-        if owned_direct_v2_table is not None:
+        if owned_direct_table is not None:
             try:
                 con.execute(
                     f"DROP TABLE IF EXISTS "
-                    f"{quote_if_needed(owned_direct_v2_table)};"
+                    f"{quote_if_needed(owned_direct_table)};"
                 )
             except Exception:
                 pass
@@ -3417,8 +3648,8 @@ class _DVCacheEntry:
     table_name: str          # DuckDB table name (e.g. dv_a3f8c1...)
     cache_key: str           # stable tombstone path this DV was built from
     table_id: str            # logical table this version belongs to
-    # Capacity-zero v2 tables are TEMPORARY and therefore visible only through
-    # the cursor that created them.  Retaining that cursor both prevents its
+    # Capacity-zero v2/v3 tables are TEMPORARY and visible only through the
+    # cursor that created them. Retaining that cursor both prevents its
     # ``id`` from being reused while the entry is live and lets eviction issue
     # the DROP against the correct connection context.
     owner_connection: object = None
@@ -3534,8 +3765,9 @@ class TombstoneCache:
         """Return the DV table name for *cache_key*, materialising it on miss,
         refreshing its idle TTL, and incrementing its ref count.  Segmented v2
         vectors always get a query-lifetime table, even when persistent cache
-        capacity is zero. Legacy v1 returns ``None`` when caching is disabled
-        or its inputs are incomplete, preserving its inline fallback.
+        capacity is zero. Immutable v3 receives the same query-lifetime
+        treatment. Legacy v1 returns ``None`` when caching is disabled or its
+        inputs are incomplete, preserving its inline fallback.
         """
         validated_segments = (
             _v2_tombstone_segments(tombstone_def)
@@ -3550,6 +3782,16 @@ class TombstoneCache:
             is_v2
             and getattr(tombstone_def, "tombstone_path", None) is not None
         )
+        is_v3 = (
+            tombstone_def is not None
+            and getattr(tombstone_def, "tombstone_format", None)
+            == TOMBSTONE_FORMAT_V3
+        )
+        active_v3 = (
+            is_v3
+            and getattr(tombstone_def, "tombstone_path", None) is not None
+        )
+        active_sealed_format = active_v2 or active_v3
         segment_fingerprint = None
         if active_v2:
             segment_fingerprint = _v2_segment_fingerprint(
@@ -3583,22 +3825,54 @@ class TombstoneCache:
                 raise RuntimeError(
                     "Invalid v2 deletion-vector manifest root digest"
                 )
+        if active_v3:
+            pinned_cache_key = getattr(tombstone_def, "cache_key", None)
+            pinned_rows = getattr(tombstone_def, "expected_rows", None)
+            pinned_digest = getattr(tombstone_def, "tombstone_digest", None)
+            if cache_key != pinned_cache_key:
+                raise RuntimeError(
+                    "V3 deletion-vector cache key does not match the pinned "
+                    "artifact"
+                )
+            if expected_rows is not None and (
+                type(expected_rows) is not int
+                or expected_rows != pinned_rows
+            ):
+                raise RuntimeError(
+                    "V3 deletion-vector row count does not match the pinned "
+                    "artifact"
+                )
+            if expected_digest != pinned_digest:
+                raise RuntimeError(
+                    "V3 deletion-vector digest does not match the pinned artifact"
+                )
+            if (
+                not isinstance(expected_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", expected_digest) is None
+            ):
+                raise RuntimeError(
+                    "Invalid v3 deletion-vector exact-byte digest"
+                )
         if (
             not cache_key
-            or (not active_v2 and not duckdb_path)
-            or (not active_v2 and not self.enabled)
+            or (not active_sealed_format and not duckdb_path)
+            or (not active_sealed_format and not self.enabled)
         ):
             return None
         shared_registry_key = (
             f"dv-v2:{cache_key}:{expected_digest}"
-            if active_v2 else cache_key
+            if active_v2
+            else (
+                f"dv-v3:{cache_key}:{expected_digest}"
+                if active_v3 else cache_key
+            )
         )
         # DuckDB TEMP tables are cursor-local.  Persistent cache entries can be
         # shared by every cursor on the root connection, but capacity-zero v2
         # entries must only be reused within the cursor that materialised them.
         # Keeping the cursor on the entry prevents Python from recycling its id
         # before release and gives the eviction path the correct DROP context.
-        connection_local = active_v2 and not self.enabled
+        connection_local = active_sealed_format and not self.enabled
         registry_key = (
             f"{shared_registry_key}:connection:{id(con):x}"
             if connection_local else shared_registry_key
@@ -3621,6 +3895,21 @@ class TombstoneCache:
                         digest,
                         referenced_files,
                     ) = _materialize_v2_tombstone_table(
+                        con,
+                        tombstone_def,
+                        base_table_name=table_name,
+                        occupied_table_names=occupied_names,
+                        allowed_files=allowed_files,
+                        temporary=not self.enabled,
+                        storage=self.storage,
+                    )
+                elif active_v3:
+                    (
+                        table_name,
+                        row_count,
+                        digest,
+                        referenced_files,
+                    ) = _materialize_v3_tombstone_table(
                         con,
                         tombstone_def,
                         base_table_name=table_name,
@@ -3678,7 +3967,9 @@ class TombstoneCache:
                     table_name=ValidatedTombstoneTable(
                         table_name, row_count, digest,
                         referenced_files,
-                        root_digest=(expected_digest if active_v2 else None),
+                        root_digest=(
+                            expected_digest if active_sealed_format else None
+                        ),
                         cache_key=registry_key,
                         segment_fingerprint=segment_fingerprint,
                     ),
@@ -3714,7 +4005,7 @@ class TombstoneCache:
             if expected_digest is not None:
                 cached_digest = getattr(
                     entry.table_name,
-                    "root_digest" if active_v2 else "digest",
+                    "root_digest" if active_sealed_format else "digest",
                     None,
                 )
                 if cached_digest != expected_digest:

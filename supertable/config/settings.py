@@ -155,6 +155,9 @@ class Settings:
     # deletion-vector manifests.  Existing format-2 snapshots remain writable
     # when this is false; the switch controls only the first v1 -> v2 publish.
     SUPERTABLE_DV_V2_WRITES_ENABLED: bool = False   # SUPERTABLE_DV_V2_WRITES_ENABLED
+    # Fleet gate for the immutable single-Parquet format-3 writer. Existing
+    # format-3 snapshots remain sticky when the transition switch is disabled.
+    SUPERTABLE_DV_V3_WRITES_ENABLED: bool = False   # SUPERTABLE_DV_V3_WRITES_ENABLED
     DEFAULT_TIMEOUT_SEC: int = 60                  # DEFAULT_TIMEOUT_SEC
     DEFAULT_LOCK_DURATION_SEC: int = 30            # DEFAULT_LOCK_DURATION_SEC
     IS_SHOW_TIMING: bool = False                   # IS_SHOW_TIMING
@@ -545,6 +548,9 @@ def _build_settings() -> Settings:
         ),
         SUPERTABLE_DV_V2_WRITES_ENABLED=_env_bool_strict(
             "SUPERTABLE_DV_V2_WRITES_ENABLED", False
+        ),
+        SUPERTABLE_DV_V3_WRITES_ENABLED=_env_bool_strict(
+            "SUPERTABLE_DV_V3_WRITES_ENABLED", False
         ),
         DEFAULT_TIMEOUT_SEC=_env_int("DEFAULT_TIMEOUT_SEC", 60),
         DEFAULT_LOCK_DURATION_SEC=_env_int("DEFAULT_LOCK_DURATION_SEC", 30),

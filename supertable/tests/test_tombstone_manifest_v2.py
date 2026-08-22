@@ -378,7 +378,7 @@ def test_python_snapshot_completeness_accepts_v1_and_explicit_v2(payload) -> Non
         _snapshot_state(tombstone_format=None),
         _snapshot_state(tombstone_format=True),
         _snapshot_state(tombstone_format="2"),
-        _snapshot_state(tombstone_format=3),
+        _snapshot_state(tombstone_format=4),
         _snapshot_state("table/tombstone/manifest.json", 1, "0" * 64),
         _snapshot_state(
             "table/tombstone/manifest.json", 1, "0" * 64,

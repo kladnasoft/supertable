@@ -407,7 +407,7 @@ def test_exact_empty_v2_successor_writes_no_segment_or_manifest(tmp_path):
 
 @pytest.mark.parametrize("value", [True, 1.0, 2.0, "2"])
 def test_tombstone_format_discriminator_requires_an_exact_integer(value):
-    with pytest.raises(TombstoneManifestV2Error, match="integer 1 or 2"):
+    with pytest.raises(TombstoneManifestV2Error, match="integer 1, 2, or 3"):
         load_tombstone(None, tombstone_format=value)
 
 

@@ -54,6 +54,7 @@ from supertable.engine.engine_common import (
     ROWID_COL,
     SOURCE_FILE_COL,
     TIMESTAMP_COL,
+    _load_v3_tombstone_frame,
     rewrite_query_with_hashed_tables,
     tombstone_data_paths,
 )
@@ -84,6 +85,8 @@ from supertable.engine.island_spill import (
 )
 from supertable.storage.storage_interface import ObjectMetadata
 from supertable.tombstone_manifest_v2 import (
+    TOMBSTONE_FORMAT_V2,
+    TOMBSTONE_FORMAT_V3,
     validate_snapshot_tombstone_state,
 )
 
@@ -142,6 +145,21 @@ def _validate_island_tombstone_definition(tomb_def) -> bool:
                 "invalid empty deletion-vector representation"
             )
         return False
+    if tombstone_format == TOMBSTONE_FORMAT_V3:
+        raw_resource_keys = getattr(tomb_def, "snapshot_resource_keys", None)
+        if raw_resource_keys is None:
+            raw_resource_keys = getattr(tomb_def, "resource_keys", ())
+        if (
+            not isinstance(raw_resource_keys, (tuple, list))
+            or not raw_resource_keys
+            or any(
+                not isinstance(item, str) or not item
+                for item in raw_resource_keys
+            )
+        ):
+            raise IslandIntegrityError(
+                "invalid deletion-vector snapshot resource identity"
+            )
     try:
         tombstone_data_paths(tomb_def)
     except Exception as exc:
@@ -3357,7 +3375,8 @@ class IslandDB:
         # reuse the same raw key can never alias inside a long-lived process.
         digest = str(getattr(tomb_def, "tombstone_digest", "") or "")
         rows = getattr(tomb_def, "expected_rows", None)
-        if getattr(tomb_def, "tombstone_format", None) == 2:
+        tombstone_format = getattr(tomb_def, "tombstone_format", None)
+        if tombstone_format == TOMBSTONE_FORMAT_V2:
             segments = getattr(tomb_def, "segments", ())
             if self.storage is None or not cache_key:
                 raise IslandIntegrityError(
@@ -3377,6 +3396,22 @@ class IslandDB:
             except Exception as exc:
                 raise IslandIntegrityError(
                     "required v2 deletion vector failed validation"
+                ) from exc
+        if tombstone_format == TOMBSTONE_FORMAT_V3:
+            try:
+                frame, _referenced_files = _load_v3_tombstone_frame(
+                    tomb_def,
+                    storage=self.storage,
+                    allowed_files=list(allowed),
+                    cache_identity=(
+                        f"islanddb-dv-v3:{self._artifact_cache_namespace}:"
+                        f"{cache_key}:{rows}:{digest}"
+                    ),
+                )
+                return frame
+            except Exception as exc:
+                raise IslandIntegrityError(
+                    "required v3 deletion vector failed exact-byte validation"
                 ) from exc
         identity_source = cache_key or os.path.realpath(path)
         cache_identity = (

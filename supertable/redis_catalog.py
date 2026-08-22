@@ -34,6 +34,7 @@ from supertable.utils.snapshot import (
 from supertable.tombstone_manifest_v2 import (
     MAX_JSON_EXACT_INTEGER as MAX_TOMBSTONE_JSON_EXACT_INTEGER,
     TOMBSTONE_FORMAT_V2,
+    TOMBSTONE_FORMAT_V3,
     TombstoneManifestV2Error,
     validate_snapshot_tombstone_state,
 )
@@ -46,39 +47,54 @@ def _now_ms() -> int:
 _ROOT_CLONE_TYPES = frozenset({"readonly", "replica"})
 _REDIS_LUA_MAX_SAFE_INTEGER = (1 << 53) - 1
 _UNPINNED_MIRROR_CONFIG = object()
-_DV_V2_FORMAT_CONFIG_KEY = "deletion_vector_format"
+_DV_FORMAT_CONFIG_KEY = "deletion_vector_format"
 _DV_V2_FLEET_CONFIG_KEY = "dv_v2_reader_fleet_confirmed"
+_DV_V3_FLEET_CONFIG_KEY = "dv_v3_reader_fleet_confirmed"
 
 
 def _validate_table_config_document(
     config: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """Return a table config whose durable DV-v2 activation is unambiguous.
+    """Return a table config whose durable DV activation is unambiguous.
 
     Legacy documents contain neither activation field and remain valid.  Once
-    either marker appears, both must carry the exact rollout proof emitted by
-    ``DataWriter.configure_table``.  In particular, Python/JSON booleans do
-    not pass as integer format values and integer/string truthy values do not
-    pass as the fleet confirmation.
+    any marker appears, the format and exactly its matching fleet proof must
+    carry the rollout values emitted by ``DataWriter.configure_table``.
+    Python/JSON booleans do not pass as integer format values and
+    integer/string truthy values do not pass as fleet confirmations.
     """
     if not isinstance(config, Mapping):
         raise ValueError("table configuration must be an object")
     document = dict(config)
-    format_present = _DV_V2_FORMAT_CONFIG_KEY in document
-    fleet_present = _DV_V2_FLEET_CONFIG_KEY in document
-    if format_present != fleet_present:
+    format_present = _DV_FORMAT_CONFIG_KEY in document
+    v2_fleet_present = _DV_V2_FLEET_CONFIG_KEY in document
+    v3_fleet_present = _DV_V3_FLEET_CONFIG_KEY in document
+    if not (format_present or v2_fleet_present or v3_fleet_present):
+        return document
+
+    format_value = document.get(_DV_FORMAT_CONFIG_KEY)
+    valid_v2 = (
+        format_present
+        and type(format_value) is int
+        and format_value == TOMBSTONE_FORMAT_V2
+        and v2_fleet_present
+        and document[_DV_V2_FLEET_CONFIG_KEY] is True
+        and not v3_fleet_present
+    )
+    valid_v3 = (
+        format_present
+        and type(format_value) is int
+        and format_value == TOMBSTONE_FORMAT_V3
+        and v3_fleet_present
+        and document[_DV_V3_FLEET_CONFIG_KEY] is True
+        and not v2_fleet_present
+    )
+    if not (valid_v2 or valid_v3):
         raise ValueError(
             "DV-v2 activation requires deletion_vector_format=2 and "
-            "dv_v2_reader_fleet_confirmed=true together"
-        )
-    if format_present and (
-        type(document[_DV_V2_FORMAT_CONFIG_KEY]) is not int
-        or document[_DV_V2_FORMAT_CONFIG_KEY] != 2
-        or document[_DV_V2_FLEET_CONFIG_KEY] is not True
-    ):
-        raise ValueError(
-            "DV-v2 activation requires deletion_vector_format=2 and "
-            "dv_v2_reader_fleet_confirmed=true together"
+            "dv_v2_reader_fleet_confirmed=true exclusively; DV-v3 activation "
+            "requires deletion_vector_format=3 and "
+            "dv_v3_reader_fleet_confirmed=true exclusively"
         )
     return document
 
@@ -204,16 +220,28 @@ def _validate_initial_table_config_pin(raw: Any) -> tuple[str, Dict[str, Any]]:
         raw, field="table configuration",
     )
     document = _validate_table_config_document(document)
-    if _DV_V2_FORMAT_CONFIG_KEY in document:
-        format_tokens = tokens.get(_DV_V2_FORMAT_CONFIG_KEY)
-        fleet_tokens = tokens.get(_DV_V2_FLEET_CONFIG_KEY)
+    if _DV_FORMAT_CONFIG_KEY in document:
+        format_value = document[_DV_FORMAT_CONFIG_KEY]
+        format_tokens = tokens.get(_DV_FORMAT_CONFIG_KEY)
+        if format_value == TOMBSTONE_FORMAT_V2:
+            fleet_tokens = tokens.get(_DV_V2_FLEET_CONFIG_KEY)
+            expected_format_token = "2"
+            expected_fleet_token = (
+                '"dv_v2_reader_fleet_confirmed"', "true"
+            )
+        else:  # _validate_table_config_document proved exact integer v3.
+            fleet_tokens = tokens.get(_DV_V3_FLEET_CONFIG_KEY)
+            expected_format_token = "3"
+            expected_fleet_token = (
+                '"dv_v3_reader_fleet_confirmed"', "true"
+            )
         if (
-            format_tokens != ('"deletion_vector_format"', "2")
-            or fleet_tokens
-            != ('"dv_v2_reader_fleet_confirmed"', "true")
+            format_tokens
+            != ('"deletion_vector_format"', expected_format_token)
+            or fleet_tokens != expected_fleet_token
         ):
             raise ValueError(
-                "DV-v2 activation fields must use exact JSON tokens"
+                "DV activation fields must use exact JSON tokens"
             )
     return raw, document
 
@@ -250,6 +278,44 @@ def _validate_initial_mirror_pin(raw: Any) -> tuple[str, List[str]]:
             raise ValueError("mirror configuration is invalid")
         mirrors.append(normalized)
     return raw, mirrors
+
+
+def _complete_table_bound_snapshot_payload(
+        payload: object,
+        *,
+        expected_version: int,
+        org: str,
+        sup: str,
+        simple: str,
+) -> Optional[Dict[str, Any]]:
+    """Return a complete Redis cache only when explicit DVs are table-bound."""
+    candidate = complete_snapshot_payload(
+        payload,
+        expected_version=expected_version,
+        require_policy_marker=True,
+    )
+    if candidate is None:
+        return None
+    tombstone_format = candidate.get("tombstone_format", 1)
+    if tombstone_format not in (TOMBSTONE_FORMAT_V2, TOMBSTONE_FORMAT_V3):
+        return candidate
+    pointer = candidate.get("tombstone")
+    if (
+        candidate["snapshot_version"] > MAX_TOMBSTONE_JSON_EXACT_INTEGER
+        or (
+            pointer is not None
+            and (
+                candidate["snapshot_version"] < 1
+                or candidate["tombstone_rows"]
+                > MAX_TOMBSTONE_JSON_EXACT_INTEGER
+                or not pointer.startswith(
+                    f"{org}/{sup}/tables/{simple}/tombstone/"
+                )
+            )
+        )
+    ):
+        return None
+    return candidate
 
 
 class _PreparedTableMutationLeaf:
@@ -480,13 +546,16 @@ end
 _LUA_SNAPSHOT_TOMBSTONE_GUARD = r"""
 local TOMBSTONE_JSON_MAX_EXACT_INTEGER = 99999999999999
 
-local function snapshot_v2_manifest_path_ok(path, expected_prefix)
+local function snapshot_table_artifact_path_ok(
+    path, expected_prefix, required_suffix
+)
   if type(path) ~= 'string' or path == ''
       or type(expected_prefix) ~= 'string' or expected_prefix == ''
+      or type(required_suffix) ~= 'string' or required_suffix == ''
       or string.len(path) > 4096
       or string.sub(path, 1, 1) == '/'
       or string.sub(path, -1) == '/'
-      or string.sub(path, -5) ~= '.json'
+      or string.sub(path, -string.len(required_suffix)) ~= required_suffix
       or string.sub(path, 1, string.len(expected_prefix)) ~= expected_prefix
       or string.find(path, string.char(92), 1, true)
       or string.find(path, '//', 1, true)
@@ -505,7 +574,7 @@ local function snapshot_v2_manifest_path_ok(path, expected_prefix)
   return components > 0
 end
 
-local function snapshot_tombstone_state_ok(candidate, expected_v2_prefix)
+local function snapshot_tombstone_state_ok(candidate, expected_prefix)
   if type(candidate) ~= 'table' then return false end
   local pointer = candidate['tombstone']
   local tombstone_rows = candidate['tombstone_rows']
@@ -516,13 +585,14 @@ local function snapshot_tombstone_state_ok(candidate, expected_v2_prefix)
     tombstone_format = 1
   elseif type(format_marker) == 'number'
       and format_marker == math.floor(format_marker)
-      and (format_marker == 1 or format_marker == 2) then
+      and (format_marker == 1 or format_marker == 2
+          or format_marker == 3) then
     tombstone_format = format_marker
   else
     return false
   end
 
-  if tombstone_format == 2
+  if (tombstone_format == 2 or tombstone_format == 3)
       and (type(candidate['snapshot_version']) ~= 'number'
           or candidate['snapshot_version'] < 0
           or candidate['snapshot_version'] ~= math.floor(
@@ -551,7 +621,17 @@ local function snapshot_tombstone_state_ok(candidate, expected_v2_prefix)
     return type(candidate['snapshot_version']) == 'number'
         and candidate['snapshot_version'] >= 1
         and tombstone_rows <= TOMBSTONE_JSON_MAX_EXACT_INTEGER
-        and snapshot_v2_manifest_path_ok(pointer, expected_v2_prefix)
+        and snapshot_table_artifact_path_ok(
+          pointer, expected_prefix, '.json'
+        )
+  end
+  if tombstone_format == 3 then
+    return type(candidate['snapshot_version']) == 'number'
+        and candidate['snapshot_version'] >= 1
+        and tombstone_rows <= TOMBSTONE_JSON_MAX_EXACT_INTEGER
+        and snapshot_table_artifact_path_ok(
+          pointer, expected_prefix, '.parquet'
+        )
   end
   -- Old readers interpret a missing/1 discriminator as one Parquet vector.
   return string.sub(pointer, -5) ~= '.json'
@@ -2177,6 +2257,7 @@ local reserve_count = ARGV[2]
 local expected_leaf_raw = ARGV[3]
 local prepared_floor = ARGV[4]
 local namespace_token = ARGV[5]
+local expected_tombstone_prefix = ARGV[6]
 local tombstone_json_max_exact_integer = 99999999999999
 
 if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then
@@ -2209,7 +2290,8 @@ if config_type == 'string' then
 end
 if config_raw ~= '' then
   -- cjson represents every JSON number as a Lua number, so its decoded value
-  -- cannot distinguish the required integer token `2` from `2.0` or `2e0`.
+  -- cannot distinguish the required integer tokens `2`/`3` from `2.0`,
+  -- `3.0`, or exponent notation.
   -- Locate top-level member value tokens without being confused by nested
   -- objects or quoted text.  This also makes duplicate activation keys and
   -- escaped aliases fail closed instead of letting Python reject them only
@@ -2233,24 +2315,36 @@ if config_raw ~= '' then
     end
     return nil
   end
-  local function top_level_json_token(raw, member_literal)
+  local function top_level_json_token(raw, member_name)
     local length = string.len(raw)
     local index = json_skip_space(raw, 1)
-    if string.byte(raw, index) ~= 123 then return 0, nil end
+    if string.byte(raw, index) ~= 123 then return 0, nil, nil end
     index = index + 1
+    local member_literal = '"' .. member_name .. '"'
     local matches = 0
+    local matched_key_token = nil
     local matched_token = nil
     while true do
       index = json_skip_space(raw, index)
       if string.byte(raw, index) == 125 then
-        return matches, matched_token
+        return matches, matched_key_token, matched_token
       end
       local key_start = index
       local key_end = json_string_end(raw, index)
-      if not key_end then return -1, nil end
+      if not key_end then return -1, nil, nil end
       local key_token = string.sub(raw, key_start, key_end - 1)
+      local key_value = nil
+      if key_token == member_literal then
+        key_value = member_name
+      elseif string.find(key_token, string.char(92), 1, true) then
+        local key_ok
+        key_ok, key_value = pcall(cjson.decode, key_token)
+        if not key_ok or type(key_value) ~= 'string' then
+          return -1, nil, nil
+        end
+      end
       index = json_skip_space(raw, key_end)
-      if string.byte(raw, index) ~= 58 then return -1, nil end
+      if string.byte(raw, index) ~= 58 then return -1, nil, nil end
       index = json_skip_space(raw, index + 1)
       local value_start = index
       local nested = 0
@@ -2271,7 +2365,7 @@ if config_raw ~= '' then
           if nested == 0 then break end
           nested = nested - 1
         elseif byte == 93 then
-          if nested == 0 then return -1, nil end
+          if nested == 0 then return -1, nil, nil end
           nested = nested - 1
         elseif byte == 44 and nested == 0 then
           break
@@ -2284,16 +2378,17 @@ if config_raw ~= '' then
         if byte ~= 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then break end
         value_end = value_end - 1
       end
-      if key_token == member_literal then
+      if key_value == member_name then
         matches = matches + 1
+        matched_key_token = key_token
         matched_token = string.sub(raw, value_start, value_end)
       end
       if string.byte(raw, index) == 44 then
         index = index + 1
       elseif string.byte(raw, index) == 125 then
-        return matches, matched_token
+        return matches, matched_key_token, matched_token
       else
-        return -1, nil
+        return -1, nil, nil
       end
     end
   end
@@ -2301,23 +2396,48 @@ if config_raw ~= '' then
   if not string.match(config_raw, '^%s*{')
       or not config_ok or type(config) ~= 'table' then return {-8} end
   local format_marker = config['deletion_vector_format']
-  local fleet_marker = config['dv_v2_reader_fleet_confirmed']
+  local v2_fleet_marker = config['dv_v2_reader_fleet_confirmed']
+  local v3_fleet_marker = config['dv_v3_reader_fleet_confirmed']
   local format_present = format_marker ~= nil
-  local fleet_present = fleet_marker ~= nil
-  if format_present ~= fleet_present then return {-8} end
-  local format_count, format_token = top_level_json_token(
-    config_raw, '"deletion_vector_format"'
+  local v2_fleet_present = v2_fleet_marker ~= nil
+  local v3_fleet_present = v3_fleet_marker ~= nil
+  local format_count, format_key_token, format_token = top_level_json_token(
+    config_raw, 'deletion_vector_format'
   )
-  local fleet_count, fleet_token = top_level_json_token(
-    config_raw, '"dv_v2_reader_fleet_confirmed"'
-  )
-  if format_count < 0 or fleet_count < 0 then return {-8} end
+  local v2_fleet_count, v2_fleet_key_token, v2_fleet_token =
+    top_level_json_token(
+      config_raw, 'dv_v2_reader_fleet_confirmed'
+    )
+  local v3_fleet_count, v3_fleet_key_token, v3_fleet_token =
+    top_level_json_token(
+      config_raw, 'dv_v3_reader_fleet_confirmed'
+    )
+  if format_count < 0 or v2_fleet_count < 0
+      or v3_fleet_count < 0 then return {-8} end
   if format_present then
-    if type(format_marker) ~= 'number' or format_marker ~= 2
-        or fleet_marker ~= true or format_count ~= 1
-        or format_token ~= '2' or fleet_count ~= 1
-        or fleet_token ~= 'true' then return {-8} end
-  elseif format_count ~= 0 or fleet_count ~= 0 then
+    if type(format_marker) ~= 'number' or format_count ~= 1 then
+      return {-8}
+    end
+    if format_marker == 2 then
+      if v2_fleet_marker ~= true or not v2_fleet_present
+          or v3_fleet_present or format_token ~= '2'
+          or format_key_token ~= '"deletion_vector_format"'
+          or v2_fleet_count ~= 1 or v2_fleet_token ~= 'true'
+          or v2_fleet_key_token ~= '"dv_v2_reader_fleet_confirmed"'
+          or v3_fleet_count ~= 0 then return {-8} end
+    elseif format_marker == 3 then
+      if v3_fleet_marker ~= true or not v3_fleet_present
+          or v2_fleet_present or format_token ~= '3'
+          or format_key_token ~= '"deletion_vector_format"'
+          or v3_fleet_count ~= 1 or v3_fleet_token ~= 'true'
+          or v3_fleet_key_token ~= '"dv_v3_reader_fleet_confirmed"'
+          or v2_fleet_count ~= 0 then return {-8} end
+    else
+      return {-8}
+    end
+  elseif v2_fleet_present or v3_fleet_present
+      or format_count ~= 0 or v2_fleet_count ~= 0
+      or v3_fleet_count ~= 0 then
     return {-8}
   end
 end
@@ -2416,10 +2536,127 @@ if prepared_match then
 else
   local payload = leaf['payload']
   if type(payload) == 'table' and payload['_row_filter'] ~= nil then
+    -- Redis cjson collapses integral JSON floats to Lua numbers. Recover the
+    -- raw v3 discriminator/count/version tokens before reserving IDs so the
+    -- atomic boundary enforces the same exact-integer contract as Python.
+    local function cached_top_level_json_token(raw, member_name)
+      if type(raw) ~= 'string' then return 0, nil, nil end
+      local length = string.len(raw)
+      local function skip_space(index)
+        while index <= length do
+          local byte = string.byte(raw, index)
+          if byte ~= 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then
+            break
+          end
+          index = index + 1
+        end
+        return index
+      end
+      local function string_end(index)
+        if string.byte(raw, index) ~= 34 then return nil end
+        index = index + 1
+        while index <= length do
+          local byte = string.byte(raw, index)
+          if byte == 34 then return index + 1 end
+          if byte == 92 then index = index + 1 end
+          index = index + 1
+        end
+        return nil
+      end
+      local index = skip_space(1)
+      if string.byte(raw, index) ~= 123 then return 0, nil, nil end
+      index = index + 1
+      local member_literal = '"' .. member_name .. '"'
+      local matches = 0
+      local matched_key_token = nil
+      local matched_value_token = nil
+      while true do
+        index = skip_space(index)
+        if string.byte(raw, index) == 125 then
+          return matches, matched_key_token, matched_value_token
+        end
+        local key_start = index
+        local key_end = string_end(index)
+        if not key_end then return -1, nil, nil end
+        local key_token = string.sub(raw, key_start, key_end - 1)
+        local key_value = nil
+        if key_token == member_literal then
+          key_value = member_name
+        elseif string.find(key_token, string.char(92), 1, true) then
+          local key_ok
+          key_ok, key_value = pcall(cjson.decode, key_token)
+          if not key_ok or type(key_value) ~= 'string' then
+            return -1, nil, nil
+          end
+        end
+        index = skip_space(key_end)
+        if string.byte(raw, index) ~= 58 then return -1, nil, nil end
+        index = skip_space(index + 1)
+        local value_start = index
+        local nested = 0
+        local quoted = false
+        while index <= length do
+          local byte = string.byte(raw, index)
+          if quoted then
+            if byte == 92 then
+              index = index + 1
+            elseif byte == 34 then
+              quoted = false
+            end
+          elseif byte == 34 then
+            quoted = true
+          elseif byte == 123 or byte == 91 then
+            nested = nested + 1
+          elseif byte == 125 then
+            if nested == 0 then break end
+            nested = nested - 1
+          elseif byte == 93 then
+            if nested == 0 then return -1, nil, nil end
+            nested = nested - 1
+          elseif byte == 44 and nested == 0 then
+            break
+          end
+          index = index + 1
+        end
+        local value_end = index - 1
+        while value_end >= value_start do
+          local byte = string.byte(raw, value_end)
+          if byte ~= 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then
+            break
+          end
+          value_end = value_end - 1
+        end
+        if key_value == member_name then
+          matches = matches + 1
+          matched_key_token = key_token
+          matched_value_token = string.sub(raw, value_start, value_end)
+        end
+        if string.byte(raw, index) == 44 then
+          index = index + 1
+        elseif string.byte(raw, index) == 125 then
+          return matches, matched_key_token, matched_value_token
+        else
+          return -1, nil, nil
+        end
+      end
+    end
+    local payload_count, payload_key_token, payload_raw =
+      cached_top_level_json_token(leaf_raw, 'payload')
+    local candidate_raw = nil
+    if payload_count == 1 and payload_key_token == '"payload"' then
+      candidate_raw = payload_raw
+    end
     local candidate = payload
     if type(candidate['resources']) ~= 'table'
         and type(payload['snapshot']) == 'table' then
       candidate = payload['snapshot']
+      local snapshot_count, snapshot_key_token, snapshot_raw =
+        cached_top_level_json_token(payload_raw, 'snapshot')
+      if snapshot_count == 1 and snapshot_key_token == '"snapshot"' then
+        candidate_raw = snapshot_raw
+      else
+        candidate_raw = nil
+      end
     end
     local pointer = candidate['tombstone']
     local tombstone_rows = candidate['tombstone_rows']
@@ -2431,16 +2668,50 @@ else
       format_ok = true
     elseif type(format_marker) == 'number'
         and format_marker == math.floor(format_marker)
-        and (format_marker == 1 or format_marker == 2) then
+        and (format_marker == 1 or format_marker == 2
+            or format_marker == 3) then
       tombstone_format = format_marker
       format_ok = true
     end
-    local function v2_manifest_path_ok(path)
+    local v3_exact_tokens_ok = true
+    if tombstone_format == 3 then
+      v3_exact_tokens_ok = false
+      if candidate_raw ~= nil then
+        local format_count, format_key_token, format_token =
+          cached_top_level_json_token(candidate_raw, 'tombstone_format')
+        local rows_count, rows_key_token, rows_token =
+          cached_top_level_json_token(candidate_raw, 'tombstone_rows')
+        local version_count, version_key_token, version_token =
+          cached_top_level_json_token(candidate_raw, 'snapshot_version')
+        local rows_token_ok = rows_token == '0'
+            or (type(rows_token) == 'string'
+                and string.match(rows_token, '^[1-9][0-9]*$'))
+        local version_token_ok = version_token == '0'
+            or (type(version_token) == 'string'
+                and string.match(version_token, '^[1-9][0-9]*$'))
+        v3_exact_tokens_ok = format_count == 1
+            and format_key_token == '"tombstone_format"'
+            and format_token == '3'
+            and rows_count == 1
+            and rows_key_token == '"tombstone_rows"'
+            and rows_token_ok
+            and version_count == 1
+            and version_key_token == '"snapshot_version"'
+            and version_token_ok
+      end
+    end
+    local function table_artifact_path_ok(
+        path, expected_prefix, required_suffix
+    )
       if type(path) ~= 'string' or path == ''
+          or type(expected_prefix) ~= 'string' or expected_prefix == ''
+          or type(required_suffix) ~= 'string' or required_suffix == ''
           or string.len(path) > 4096
           or string.sub(path, 1, 1) == '/'
           or string.sub(path, -1) == '/'
-          or string.sub(path, -5) ~= '.json'
+          or string.sub(path, -string.len(required_suffix)) ~= required_suffix
+          or string.sub(path, 1, string.len(expected_prefix))
+            ~= expected_prefix
           or string.find(path, string.char(92), 1, true)
           or string.find(path, '//', 1, true)
           or string.find(path, '?', 1, true)
@@ -2458,18 +2729,38 @@ else
       return components > 0
     end
     local tombstone_ok = false
-    if format_ok and pointer == cjson.null and type(tombstone_rows) == 'number'
+    local explicit_version_ok = tombstone_format == 1
+        or (type(candidate['snapshot_version']) == 'number'
+            and candidate['snapshot_version'] >= 0
+            and candidate['snapshot_version']
+              <= tombstone_json_max_exact_integer
+            and candidate['snapshot_version'] == math.floor(
+              candidate['snapshot_version']
+            ))
+    if format_ok and v3_exact_tokens_ok and explicit_version_ok
+        and pointer == cjson.null
+        and type(tombstone_rows) == 'number'
         and tombstone_rows == 0 and digest == cjson.null then
       tombstone_ok = true
-    elseif format_ok and type(pointer) == 'string' and pointer ~= ''
+    elseif format_ok and v3_exact_tokens_ok and explicit_version_ok
+        and type(pointer) == 'string' and pointer ~= ''
         and type(tombstone_rows) == 'number'
         and tombstone_rows > 0
         and tombstone_rows == math.floor(tombstone_rows)
         and type(digest) == 'string' and string.len(digest) == 64
         and string.match(digest, '^[0-9a-f]+$') then
       if tombstone_format == 2 then
-        tombstone_ok = tombstone_rows <= tombstone_json_max_exact_integer
-            and v2_manifest_path_ok(pointer)
+        tombstone_ok = candidate['snapshot_version'] >= 1
+            and tombstone_rows <= tombstone_json_max_exact_integer
+            and table_artifact_path_ok(
+              pointer, expected_tombstone_prefix, '.json'
+            )
+      elseif tombstone_format == 3 then
+        tombstone_ok = candidate['snapshot_version'] >= 1
+            and tombstone_rows <= tombstone_json_max_exact_integer
+            and table_artifact_path_ok(
+              pointer, expected_tombstone_prefix, '.parquet'
+            )
       else
         -- A JSON root without the explicit v2 discriminator is a malformed
         -- hybrid that an old reader would try to open as Parquet.
@@ -3206,7 +3497,7 @@ local simple_name = ARGV[9]
 local schema_json = ARGV[10]
 local expected_mirrors_json = ARGV[11]
 local quality_generation = ARGV[12]
-local expected_v2_prefix = ARGV[13]
+local expected_tombstone_prefix = ARGV[13]
 local payload_digest = ARGV[14]
 local one_shot_initial = ARGV[15]
 
@@ -3370,7 +3661,9 @@ end
 
 local okp, payload = pcall(cjson.decode, payload_json)
 if not okp or type(payload) ~= 'table'
-    or not snapshot_tombstone_state_ok(payload, expected_v2_prefix) then
+    or not snapshot_tombstone_state_ok(
+      payload, expected_tombstone_prefix
+    ) then
   return {-4, 0, 0}
 end
 local new_leaf_version = old_version + 1
@@ -3497,7 +3790,7 @@ local schema_json = ARGV[9]
 local quality_generation = ARGV[10]
 local mirror_pin_present = ARGV[11]
 local expected_mirror_raw = ARGV[12]
-local expected_v2_prefix = ARGV[13]
+local expected_tombstone_prefix = ARGV[13]
 local payload_digest = ARGV[14]
 local one_shot_initial = ARGV[15]
 
@@ -3612,7 +3905,9 @@ end
 
 local okp, payload = pcall(cjson.decode, payload_json)
 if not okp or type(payload) ~= 'table'
-    or not snapshot_tombstone_state_ok(payload, expected_v2_prefix) then
+    or not snapshot_tombstone_state_ok(
+      payload, expected_tombstone_prefix
+    ) then
   return {-4, 0, 0}
 end
 local new_leaf_version = old_version + 1
@@ -5811,6 +6106,7 @@ return 1
                     prepared_raw,
                     "" if prepared_floor is None else str(prepared_floor),
                     namespace_token or "",
+                    f"{org}/{sup}/tables/{simple}/tombstone/",
                 ],
             )
 
@@ -6111,10 +6407,12 @@ return 1
                         f"Corrupt Redis leaf JSON for {org}/{sup}/{simple}"
                     ) from exc
 
-                payload = complete_snapshot_payload(
+                payload = _complete_table_bound_snapshot_payload(
                     leaf.get("payload"),
                     expected_version=leaf["version"],
-                    require_policy_marker=True,
+                    org=org,
+                    sup=sup,
+                    simple=simple,
                 )
             validated_snapshot = payload
             floor_available = str(raw[4]) == "1"
@@ -6233,10 +6531,12 @@ return 1
             raise RuntimeError(
                 f"Corrupt Redis leaf JSON for {org}/{sup}/{simple}"
             ) from exc
-        snapshot = complete_snapshot_payload(
+        snapshot = _complete_table_bound_snapshot_payload(
             leaf.get("payload"),
             expected_version=leaf["version"],
-            require_policy_marker=True,
+            org=org,
+            sup=sup,
+            simple=simple,
         )
         floor: Optional[int] = None
         if snapshot is not None:
@@ -7277,16 +7577,20 @@ return 1
             raise ValueError(
                 "snapshot payload has an invalid deletion-vector state"
             ) from exc
+        explicit_immutable_format = tombstone_format in (
+            TOMBSTONE_FORMAT_V2,
+            TOMBSTONE_FORMAT_V3,
+        )
         if (
-            tombstone_format == TOMBSTONE_FORMAT_V2
+            explicit_immutable_format
             and successor_version > MAX_TOMBSTONE_JSON_EXACT_INTEGER
         ):
             raise ValueError(
-                "explicit snapshot v2 version exceeds Redis JSON's exact "
+                "explicit snapshot version exceeds Redis JSON's exact "
                 "integer range"
             )
         if (
-            tombstone_format == TOMBSTONE_FORMAT_V2
+            explicit_immutable_format
             and payload.get("tombstone") is not None
             and (
                 successor_version < 1
@@ -7294,17 +7598,17 @@ return 1
             )
         ):
             raise ValueError(
-                "active snapshot v2 state has an invalid version or row-count "
-                "bound"
+                "active explicit snapshot deletion-vector state has an "
+                "invalid version or row-count bound"
             )
         tombstone_prefix = f"{org}/{sup}/tables/{simple}/tombstone/"
         if (
-            tombstone_format == TOMBSTONE_FORMAT_V2
+            explicit_immutable_format
             and payload.get("tombstone") is not None
             and not payload["tombstone"].startswith(tombstone_prefix)
         ):
             raise ValueError(
-                "snapshot v2 manifest pointer escapes the table tombstone namespace"
+                "snapshot tombstone pointer escapes the table tombstone namespace"
             )
         try:
             payload = snapshot_cache_payload(payload)

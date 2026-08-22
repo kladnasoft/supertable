@@ -603,6 +603,14 @@ def _validate_snapshot(
             size, content_sha256 = _content_seal(
                 storage, artifact, declared_size=reference.declared_size,
             )
+            if (
+                reference.kind == "tombstone_v3"
+                and content_sha256 != reference.declared_digest
+            ):
+                raise RecoveryError(
+                    f"format-3 tombstone {artifact!r} differs from its "
+                    "snapshot byte seal"
+                )
         seal = {
             "path": artifact,
             "kind": reference.kind,
