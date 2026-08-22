@@ -4734,7 +4734,7 @@ def resolve_overwrite_writes(
         else:
             return filtered, (
                 _prove_live_tombstone_delta_pairs(
-                    pairs, existing_tombstones, profiler=p,
+                    pairs, existing_tombstones, profiler=profiler,
                 )
                 if require_global_tombstone_disjoint_proof else pairs
             )
@@ -4794,7 +4794,7 @@ def resolve_overwrite_writes(
     )
     return filtered, (
         _prove_live_tombstone_delta_pairs(
-            pairs, existing_tombstones, profiler=p,
+            pairs, existing_tombstones, profiler=profiler,
         )
         if require_global_tombstone_disjoint_proof else pairs
     )
@@ -5020,7 +5020,7 @@ def build_tombstone_v3(
     path = _partitioned_new_path(tombstone_dir, "deleted-v3")
     artifact_seal: Dict[str, str] = {}
     artifact_bytes = _write_df_parquet(
-        combined, path, compression_level, profiler=p, storage=storage,
+        combined, path, compression_level, profiler=profiler, storage=storage,
         artifact_digest_out=artifact_seal,
     )
     p.add("tombstone_v3_artifacts_written", 1)

@@ -27,7 +27,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import cast, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 import numpy as np
@@ -3398,11 +3398,14 @@ class IslandDB:
                     "required v2 deletion vector failed validation"
                 ) from exc
         if tombstone_format == TOMBSTONE_FORMAT_V3:
+            # _validate_island_tombstone_definition() proves that active v3
+            # snapshot resource keys are a non-empty sequence of strings.
+            v3_allowed = cast(Iterable[str], allowed)
             try:
                 frame, _referenced_files = _load_v3_tombstone_frame(
                     tomb_def,
                     storage=self.storage,
-                    allowed_files=list(allowed),
+                    allowed_files=list(v3_allowed),
                     cache_identity=(
                         f"islanddb-dv-v3:{self._artifact_cache_namespace}:"
                         f"{cache_key}:{rows}:{digest}"

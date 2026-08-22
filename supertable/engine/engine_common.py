@@ -2850,9 +2850,9 @@ def _load_v3_tombstone_frame(
 
     # Import lazily: processing also imports engine data types and loading it
     # at engine_common module import time would create a broad dependency cycle.
-    from supertable.processing import load_tombstone
+    from supertable.processing import LoadedTombstoneState, load_tombstone
 
-    state_out: Dict[str, object] = {}
+    state_out: Dict[str, LoadedTombstoneState] = {}
     frame = load_tombstone(
         path,
         cache_identity=cache_identity,
