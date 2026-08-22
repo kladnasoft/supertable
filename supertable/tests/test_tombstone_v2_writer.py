@@ -394,13 +394,15 @@ def test_exact_empty_v2_successor_writes_no_segment_or_manifest(tmp_path):
 
     assert path is None
     assert validated.height == 0
-    assert state == LoadedTombstoneState(
-        frame=validated,
-        tombstone_format=TOMBSTONE_FORMAT_V2,
-        tombstone_path=None,
-        root_digest=None,
-        segments=(),
-    )
+    # Python 3.13's dataclass equality evaluates the Polars frame comparison
+    # as a boolean, which Polars intentionally rejects as ambiguous.  Assert
+    # this state contract explicitly and keep the zero-copy identity proof.
+    assert state.frame is validated
+    assert state.tombstone_format == TOMBSTONE_FORMAT_V2
+    assert state.tombstone_path is None
+    assert state.root_digest is None
+    assert state.segments == ()
+    assert state.referenced_files == frozenset()
     assert not list(tmp_path.rglob("*.json"))
     assert not list(tmp_path.rglob("*.parquet"))
 

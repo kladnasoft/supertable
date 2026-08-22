@@ -4,10 +4,10 @@ pandas==2.1.0
 pyarrow==16.0.0
 pytz==2023.3
 tzdata==2023.3
-apscheduler==3.10.0
+apscheduler==3.11.3
 duckdb==1.5.1
 polars==1.36.1
-sqlglot==26.22.0
+sqlglot==26.33.0
 colorlog==6.9.0
 tqdm==4.66.0
 python-dotenv==1.0.0
