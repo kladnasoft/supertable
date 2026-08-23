@@ -435,11 +435,12 @@ with zipfile.ZipFile(archive_path) as archive:
         raise SystemExit(f"ERROR: CI artifact contents differ from the exact release pair: {sorted(names)}")
     payloads = {}
     for info in infos:
-        mode = (info.external_attr >> 16) & 0o170000
+        mode = (info.external_attr >> 16) & 0xFFFF
+        kind = stat.S_IFMT(mode)
         if (
             info.is_dir()
             or "/" in info.filename
-            or mode == stat.S_IFLNK
+            or kind not in {0, stat.S_IFREG}
             or info.file_size > 128 * 1024 * 1024
         ):
             raise SystemExit("ERROR: unsafe path or link in CI artifact")
@@ -448,22 +449,88 @@ with zipfile.ZipFile(archive_path) as archive:
 
 wheel_name = f"supertable-{version}-py3-none-any.whl"
 with zipfile.ZipFile(io.BytesIO(payloads[wheel_name])) as wheel:
-    metadata_names = [name for name in wheel.namelist() if name.endswith(".dist-info/METADATA")]
-    if len(metadata_names) != 1:
+    wheel_members = wheel.infolist()
+    wheel_names = {}
+    wheel_size = 0
+    for member in wheel_members:
+        raw_name = member.filename
+        logical_name = raw_name[:-1] if member.is_dir() and raw_name.endswith("/") else raw_name
+        path = pathlib.PurePosixPath(logical_name)
+        mode = (member.external_attr >> 16) & 0xFFFF
+        kind = stat.S_IFMT(mode)
+        expected_kinds = {0, stat.S_IFDIR} if member.is_dir() else {0, stat.S_IFREG}
+        if (
+            not logical_name
+            or "\\" in raw_name
+            or "\x00" in raw_name
+            or path.is_absolute()
+            or path.as_posix() != logical_name
+            or not path.parts
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or kind not in expected_kinds
+            or member.file_size > 128 * 1024 * 1024
+            or logical_name in wheel_names
+        ):
+            raise SystemExit("ERROR: wheel contains an unsafe or duplicate member")
+        wheel_names[logical_name] = member
+        wheel_size += member.file_size
+    if wheel_size > 256 * 1024 * 1024:
+        raise SystemExit("ERROR: wheel exceeds the uncompressed release size bound")
+    metadata_name = f"supertable-{version}.dist-info/METADATA"
+    metadata_member = wheel_names.get(metadata_name)
+    if metadata_member is None or metadata_member.is_dir():
         raise SystemExit("ERROR: wheel has no unique METADATA")
-    wheel_metadata = email.message_from_bytes(wheel.read(metadata_names[0]))
+    wheel_metadata = email.message_from_bytes(wheel.read(metadata_member))
     if wheel_metadata.get("Name") != "supertable" or wheel_metadata.get("Version") != version:
         raise SystemExit("ERROR: wheel metadata does not match the committed release")
 
 sdist_name = f"supertable-{version}.tar.gz"
 with tarfile.open(fileobj=io.BytesIO(payloads[sdist_name]), mode="r:gz") as sdist:
-    metadata_members = [member for member in sdist.getmembers() if member.name.endswith("/PKG-INFO")]
-    if len(metadata_members) != 1 or not metadata_members[0].isfile():
+    # A standards-compliant setuptools sdist contains both the authoritative
+    # root PKG-INFO and a generated ``supertable.egg-info/PKG-INFO`` copy.
+    # Validate the exact root member instead of requiring the suffix to be
+    # globally unique inside the archive.
+    sdist_root = f"supertable-{version}"
+    sdist_members = {}
+    sdist_size = 0
+    for member in sdist.getmembers():
+        raw_name = member.name
+        logical_name = raw_name[:-1] if member.isdir() and raw_name.endswith("/") else raw_name
+        path = pathlib.PurePosixPath(logical_name)
+        if (
+            not logical_name
+            or "\\" in raw_name
+            or "\x00" in raw_name
+            or path.is_absolute()
+            or path.as_posix() != logical_name
+            or not path.parts
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or path.parts[0] != sdist_root
+            or not (member.isfile() or member.isdir())
+            or member.size > 128 * 1024 * 1024
+            or logical_name in sdist_members
+        ):
+            raise SystemExit("ERROR: sdist contains an unsafe or duplicate member")
+        sdist_members[logical_name] = member
+        sdist_size += member.size
+    if sdist_size > 512 * 1024 * 1024:
+        raise SystemExit("ERROR: sdist exceeds the uncompressed release size bound")
+
+    metadata_path = f"{sdist_root}/PKG-INFO"
+    metadata_member = sdist_members.get(metadata_path)
+    if metadata_member is None or not metadata_member.isfile():
         raise SystemExit("ERROR: sdist has no unique PKG-INFO")
-    handle = sdist.extractfile(metadata_members[0])
+    handle = sdist.extractfile(metadata_member)
     if handle is None:
         raise SystemExit("ERROR: cannot read sdist PKG-INFO")
-    sdist_metadata = email.message_from_bytes(handle.read())
+    metadata_bytes = handle.read()
+    egg_metadata_path = f"{sdist_root}/supertable.egg-info/PKG-INFO"
+    egg_metadata_member = sdist_members.get(egg_metadata_path)
+    if egg_metadata_member is not None:
+        egg_handle = sdist.extractfile(egg_metadata_member)
+        if egg_handle is None or egg_handle.read() != metadata_bytes:
+            raise SystemExit("ERROR: sdist metadata copies disagree")
+    sdist_metadata = email.message_from_bytes(metadata_bytes)
     if sdist_metadata.get("Name") != "supertable" or sdist_metadata.get("Version") != version:
         raise SystemExit("ERROR: sdist metadata does not match the committed release")
 PY
