@@ -45,7 +45,7 @@ def _reflection(path: str = "s3://bucket/events.parquet") -> Reflection:
     )
 
 
-def test_top_level_exports_bounded_query_stream_without_version_change():
+def test_top_level_exports_bounded_query_stream_and_release_version():
     assert supertable.query_sql_stream is data_reader.query_sql_stream
     assert (
         supertable.query_sql_policy_fingerprint
@@ -53,7 +53,7 @@ def test_top_level_exports_bounded_query_stream_without_version_change():
     )
     assert "query_sql_stream" in supertable.__all__
     assert "query_sql_policy_fingerprint" in supertable.__all__
-    assert supertable.__version__ == "2.5.0"
+    assert supertable.__version__ == "2.5.1"
 
 
 def test_export_computes_one_deadline_and_guards_size_before_parse(monkeypatch):

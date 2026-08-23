@@ -280,7 +280,7 @@ spec:
       terminationGracePeriodSeconds: 120
       containers:
         - name: privileged-audit-worker
-          image: example/supertable:2.5.0
+          image: example/supertable:2.5.1
           command: ["supertable-privileged-audit-worker"]
           args:
             - --organization

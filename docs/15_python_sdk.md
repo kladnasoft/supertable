@@ -12,7 +12,7 @@ The current version is published as `__version__` on the top-level package:
 
 ```python
 import supertable
-print(supertable.__version__)   # "2.5.0"
+print(supertable.__version__)   # "2.5.1"
 ```
 
 All public classes can be imported directly from the top-level package:
