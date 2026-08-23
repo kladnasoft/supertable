@@ -6,6 +6,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 from tests.characterization.harness import REPO_ROOT
 
 
@@ -72,4 +74,49 @@ assert storage.root == expected_home
     )
     assert result.returncode == 0, (
         f"late bootstrap child failed\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+
+
+def test_fakeredis_teardown_releases_local_storage_descriptors():
+    """Repeated characterization fixtures must fit a modest descriptor limit."""
+    if os.name != "posix":
+        pytest.skip("RLIMIT_NOFILE is a POSIX descriptor-limit regression")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(REPO_ROOT), env.get("PYTHONPATH", "")))
+    )
+    # Keep developer/CI pytest defaults from changing the focused child run.
+    env.pop("PYTEST_ADDOPTS", None)
+    env.pop("PYTEST_PLUGINS", None)
+
+    code = """
+import resource
+import pytest
+
+_soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+if hard != resource.RLIM_INFINITY and hard < 64:
+    raise SystemExit(77)
+resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
+raise SystemExit(pytest.main([
+    "-q",
+    "-p", "no:cacheprovider",
+    "--keep-duplicates",
+    "tests/characterization/test_quality_nonfinite_numeric.py",
+    "tests/characterization/test_quality_nonfinite_numeric.py",
+]))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode == 77:
+        pytest.skip("hard RLIMIT_NOFILE is below the regression limit")
+    assert result.returncode == 0, (
+        "bounded-descriptor characterization child failed\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )

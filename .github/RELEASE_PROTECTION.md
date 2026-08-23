@@ -22,6 +22,22 @@ annotated tag. CI then tests, builds, installs, attests, and uploads artifacts
 from that exact tag. PyPI upload is the final job and cannot run if any gate
 fails.
 
+## Compatibility token upload
+
+Trusted Publishing remains the preferred production path. Existing maintainers
+may use `./push-pypi.sh --upload-token --token-file PATH` (or pass the already
+committed exact version, such as `./push-pypi.sh 2.5.0`) while that account-level
+configuration is unavailable. This mode never rebuilds locally: after all local
+gates pass, it requires the exact `master` commit's successful release-gate run,
+downloads its digest-pinned wheel and sdist artifact, revalidates both packages,
+and uploads only those files. It neither creates nor pushes a Git tag.
+
+The token file must be an owner-controlled, non-symlink regular file with mode
+`0600`; it may contain either a bare PyPI token or one `PYPI_TOKEN=` assignment.
+Without `--token-file`, the one-time 2.5.0 compatibility path uses
+`../../TOKEN`. Never commit the file. Rotate the credential after a compatibility
+upload and complete the Trusted Publisher setup above before the next release.
+
 ## Mypy debt baseline
 
 The type gate always runs against the complete `supertable` production package;

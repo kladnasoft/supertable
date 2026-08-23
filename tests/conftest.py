@@ -7,6 +7,7 @@ test process.  See ``tests/characterization/harness.py`` for why this matters.
 
 from __future__ import annotations
 
+import gc
 import sys
 from pathlib import Path
 
@@ -110,6 +111,18 @@ def hermetic_fakeredis(request):
         except Exception:
             pass
         reset_engine_singletons()
+        # fakeredis keeps its response parser alive with the pooled connection.
+        # A handled EVALSHA/NOSCRIPT response can therefore retain traceback
+        # frames (and any LocalStorage directory handles reachable from them)
+        # across tests unless the per-test pool is explicitly disconnected.
+        try:
+            fake.connection_pool.disconnect()
+        except Exception:
+            pass
+        # The parser/traceback cycle is now unreachable; collect it promptly so
+        # LocalStorage's intentionally pinned ancestor handles close between
+        # tests even when the process has a modest descriptor limit.
+        gc.collect()
 
 
 @pytest.fixture(autouse=True)
