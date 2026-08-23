@@ -324,7 +324,7 @@ def test_outer_limit_is_clamped_by_server_ceiling():
         "SELECT * FROM events LIMIT 999999999", 999999999,
     )
 
-    assert bounded == "SELECT * FROM events LIMIT 5000"
+    assert bounded == "SELECT * FROM events LIMIT 10000"
 
 
 def test_nested_limit_does_not_bypass_outer_limit():
@@ -332,7 +332,7 @@ def test_nested_limit_does_not_bypass_outer_limit():
         "SELECT * FROM (SELECT * FROM events LIMIT 1) AS nested", 999999999,
     )
 
-    assert bounded.endswith("LIMIT 5000")
+    assert bounded.endswith("LIMIT 10000")
 
 
 def test_query_sql_rejects_result_over_serialized_byte_cap(monkeypatch):
@@ -489,7 +489,7 @@ def test_query_sql_timestamptz_rows_and_metadata_are_session_timezone_stable(
 
 def test_data_reader_public_duckdb_stream_uses_normal_bounded_preflight(monkeypatch):
     parser = MagicMock()
-    parser.original_query = "SELECT * FROM events\nLIMIT 5000"
+    parser.original_query = "SELECT * FROM events\nLIMIT 10000"
     parser.get_table_tuples.return_value = []
     parser.get_physical_tables.return_value = []
     monkeypatch.setattr(data_reader, "SQLParser", MagicMock(return_value=parser))
@@ -537,7 +537,7 @@ def test_data_reader_public_duckdb_stream_uses_normal_bounded_preflight(monkeypa
     assert message is None
     executor.execute.assert_not_called()
     executor.execute_stream.assert_called_once()
-    assert data_reader.SQLParser.call_args.kwargs["query"].endswith("LIMIT 5000")
+    assert data_reader.SQLParser.call_args.kwargs["query"].endswith("LIMIT 10000")
     # Finalize while monkeypatches are live; abandoning the wrapper would defer
     # monitoring/engine cleanup to __del__ after fixture teardown.
     result.close()

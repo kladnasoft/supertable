@@ -182,8 +182,8 @@ endpoint/region values; these values are never installed with session `SET`.
 |----------|------|---------|-------------|
 | `SUPERTABLE_MCP_TOKEN` | str | _(empty)_ | MCP authentication token |
 | `SUPERTABLE_MCP_PORT` | int | `8000` | MCP server port |
-| `SUPERTABLE_DEFAULT_LIMIT` | int | `200` | Default query result limit |
-| `SUPERTABLE_MAX_LIMIT` | int | `5000` | Maximum query result limit |
+| `SUPERTABLE_DEFAULT_LIMIT` | int | `10000` | Default query result limit |
+| `SUPERTABLE_MAX_LIMIT` | int | `10000` | Maximum query result limit |
 | `SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC` | float | `60.0` | Default query timeout |
 | `SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES` | int | `16777216` | Maximum JSON response size before conversion aborts |
 | `SUPERTABLE_RESULT_STREAM_BATCH_ROWS` | int | `256` | DuckDB Arrow result fetch size; clamped to 1–4096 so byte-bounded response consumers never prefetch 64K wide rows |

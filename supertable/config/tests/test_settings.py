@@ -270,7 +270,8 @@ class TestSettingsDataclass:
         assert s.SUPERTABLE_REDIS_HOST == "localhost"
         assert s.SUPERTABLE_REDIS_PORT == 6379
         assert s.SUPERTABLE_API_PORT == 8051
-        assert s.SUPERTABLE_DEFAULT_LIMIT == 200
+        assert s.SUPERTABLE_DEFAULT_LIMIT == 10000
+        assert s.SUPERTABLE_MAX_LIMIT == 10000
         assert s.SUPERTABLE_DEFAULT_ENGINE == "AUTO"
         assert s.SUPERTABLE_DUCKDB_WRITE_PROBE is False
         assert s.SUPERTABLE_DUCKDB_WRITE_PROBE_LOCAL_AUTO is True

@@ -1101,7 +1101,7 @@ class DataReader:
 
         bounded_sql = command.sql
         if command.kind is CommandKind.SELECT:
-            result_limit = _positive_budget("SUPERTABLE_MAX_LIMIT", 5000)
+            result_limit = _positive_budget("SUPERTABLE_MAX_LIMIT", 10000)
             if _stream_row_limit is not None:
                 if not _streaming:
                     raise ValueError(
@@ -2053,7 +2053,7 @@ def _ensure_sql_limit(
         raise ValueError("Query limit must be an integer") from exc
     requested = max(0, requested)
     if maximum_limit is None:
-        maximum = _positive_budget("SUPERTABLE_MAX_LIMIT", 5000)
+        maximum = _positive_budget("SUPERTABLE_MAX_LIMIT", 10000)
     else:
         if (
             isinstance(maximum_limit, bool)
