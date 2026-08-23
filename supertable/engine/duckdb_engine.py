@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import math
 import re
+import time
 import uuid as _uuid
 from typing import Any, Optional, List
 from urllib.parse import urlsplit
@@ -37,6 +38,7 @@ from supertable.engine.engine_common import (
 )
 from supertable.engine.island_resources import (
     ArrowBatchStream,
+    ByteBoundedArrowBatchIterator,
     ResourceReservationCancelled,
 )
 
@@ -144,6 +146,40 @@ _SENSITIVE_SECRET_SQL_RE = re.compile(
 _MAX_PUBLIC_DUCKDB_ERROR_CHARS = 4096
 
 
+class DuckDBPresignRefreshRequired(RuntimeError):
+    """A remote credential failed before any result batch was exposed.
+
+    The exception deliberately carries no backend message or URL.  Executor is
+    the only layer with both the pinned reflection identity and the storage
+    authorization context required to perform one safe credential refresh.
+    """
+
+
+def _is_refreshable_remote_auth_error(exc: BaseException) -> bool:
+    """Recognize storage-auth failures for the pre-first-row retry boundary."""
+    try:
+        message = str(exc).casefold().replace("_", "")
+    except Exception:
+        return False
+    compact = " ".join(message.split())
+    named_failures = (
+        "accessdenied",
+        "signaturedoesnotmatch",
+        "expiredtoken",
+        "request has expired",
+        "authorizationqueryparameterserror",
+        "invalidaccesskeyid",
+    )
+    if any(token in compact for token in named_failures):
+        return True
+    http_failure = any(token in compact for token in (
+        "http error", "http get error", "http status", "status code",
+    ))
+    return http_failure and any(token in compact for token in (
+        " 400", "(400", " 403", "(403",
+    ))
+
+
 def _redact_duckdb_backend_message(value: object) -> str:
     """Return a bounded backend diagnostic with credential material removed."""
     message = redact_url_credentials(value)
@@ -243,15 +279,18 @@ class _DuckDBArrowBatchIterator:
         *,
         timed_out: threading.Event,
         timeout_value: float,
+        cancel_event: Optional[threading.Event] = None,
     ):
         self._reader = reader
         self._iterator = iter(reader)
         self._connection = connection
         self._timed_out = timed_out
         self._timeout_value = timeout_value
+        self._external_cancel_event = cancel_event
         self._cancelled = threading.Event()
         self._closed = False
         self._close_lock = threading.Lock()
+        self._batches_emitted = 0
 
     def __iter__(self):
         return self
@@ -262,6 +301,13 @@ class _DuckDBArrowBatchIterator:
                 f"DuckDB query timed out after {self._timeout_value:g} seconds"
             )
         if self._cancelled.is_set():
+            raise ResourceReservationCancelled(
+                "DuckDB Arrow result stream was cancelled"
+            )
+        if (
+            self._external_cancel_event is not None
+            and self._external_cancel_event.is_set()
+        ):
             raise ResourceReservationCancelled(
                 "DuckDB Arrow result stream was cancelled"
             )
@@ -283,18 +329,32 @@ class _DuckDBArrowBatchIterator:
                     f"DuckDB query timed out after "
                     f"{self._timeout_value:g} seconds"
                 ) from None
-            if self._cancelled.is_set():
+            if self._cancelled.is_set() or (
+                self._external_cancel_event is not None
+                and self._external_cancel_event.is_set()
+            ):
                 _scrub_exception_chain(
                     exc, replacement="DuckDB backend detail redacted"
                 )
                 raise ResourceReservationCancelled(
                     "DuckDB Arrow result stream was cancelled"
                 ) from None
+            if (
+                self._batches_emitted == 0
+                and _is_refreshable_remote_auth_error(exc)
+            ):
+                _scrub_exception_chain(
+                    exc, replacement="DuckDB backend detail redacted"
+                )
+                raise DuckDBPresignRefreshRequired(
+                    "DuckDB remote authorization expired before result delivery"
+                ) from None
             safe_error = _safe_duckdb_backend_exception(
                 exc, phase="result stream",
             )
             raise safe_error from None
         self._raise_if_stopped()
+        self._batches_emitted += 1
         return batch
 
     def cancel(self) -> None:
@@ -313,6 +373,410 @@ class _DuckDBArrowBatchIterator:
                 return
             self._closed = True
         self._reader.close()
+
+
+class _DuckDBSetupInterruptGuard:
+    """Interrupt one query-owned setup handle at cancel/deadline.
+
+    The persistent root connection can serve sibling cursors, so this guard is
+    deliberately never pointed at an existing shared root.  It observes a root
+    only while this query is creating it under the setup lock, then switches to
+    the query-private cursor before httpfs/storage setup.
+    """
+
+    def __init__(
+        self,
+        *,
+        deadline_monotonic: Optional[float],
+        timeout_value: float,
+        cancel_event: Optional[threading.Event],
+    ) -> None:
+        self._deadline = deadline_monotonic
+        self._timeout_value = timeout_value
+        self._cancel_event = cancel_event
+        self._timed_out = threading.Event()
+        self._cancelled = threading.Event()
+        self._stop = threading.Event()
+        self._target_lock = threading.Lock()
+        self._target = None
+        self._timer = None
+        self._watcher = None
+
+    def _interrupt(self) -> None:
+        with self._target_lock:
+            target = self._target
+        if target is not None:
+            try:
+                target.interrupt()
+            except Exception:
+                pass
+
+    def set_target(self, target) -> None:
+        with self._target_lock:
+            self._target = target
+            should_interrupt = (
+                self._timed_out.is_set()
+                or self._cancelled.is_set()
+                or (
+                    self._cancel_event is not None
+                    and self._cancel_event.is_set()
+                )
+            )
+        if should_interrupt:
+            self._interrupt()
+
+    def start(self) -> None:
+        if self._deadline is not None:
+            remaining = max(0.0, self._deadline - time.monotonic())
+
+            def expire() -> None:
+                self._timed_out.set()
+                self._interrupt()
+
+            if remaining <= 0:
+                expire()
+            else:
+                self._timer = threading.Timer(remaining, expire)
+                self._timer.daemon = True
+                self._timer.start()
+
+        if self._cancel_event is not None:
+            def watch() -> None:
+                while not self._stop.wait(0.05):
+                    if self._cancel_event.is_set():
+                        self._cancelled.set()
+                        self._interrupt()
+                        return
+
+            self._watcher = threading.Thread(
+                target=watch,
+                name="supertable-duckdb-setup-cancel",
+                daemon=True,
+            )
+            self._watcher.start()
+
+    def raise_if_stopped(self) -> None:
+        if self._cancelled.is_set() or (
+            self._cancel_event is not None and self._cancel_event.is_set()
+        ):
+            raise ResourceReservationCancelled("DuckDB query was cancelled")
+        if self._timed_out.is_set() or (
+            self._deadline is not None
+            and time.monotonic() >= self._deadline
+        ):
+            raise TimeoutError(
+                f"DuckDB query timed out after {self._timeout_value:g} seconds"
+            )
+
+    def close(self) -> None:
+        if self._timer is not None:
+            self._timer.cancel()
+            join_timer = getattr(self._timer, "join", None)
+            if (
+                callable(join_timer)
+                and self._timer is not threading.current_thread()
+            ):
+                join_timer(timeout=1.0)
+        self._stop.set()
+        if (
+            self._watcher is not None
+            and self._watcher is not threading.current_thread()
+        ):
+            self._watcher.join(timeout=1.0)
+        with self._target_lock:
+            self._target = None
+
+
+_DUCKDB_CONNECT_MAX_IN_FLIGHT = 8
+_duckdb_connect_slots = threading.BoundedSemaphore(
+    _DUCKDB_CONNECT_MAX_IN_FLIGHT
+)
+
+
+def _bounded_duckdb_connect(
+    *,
+    temp_dir: str,
+    setup_check,
+    setup_target_callback=None,
+):
+    """Create and initialize one connection behind a bounded orphan gate.
+
+    A native ``duckdb.connect()`` call cannot be interrupted before it returns a
+    handle. The request thread therefore stops waiting at its deadline/cancel
+    boundary while a daemon worker retains the global slot. If that worker
+    returns late, it closes its connection instead of publishing it to an engine
+    cache. At most a small fixed number of abandoned native calls can coexist.
+    """
+    check = setup_check if callable(setup_check) else (lambda: None)
+    slots = _duckdb_connect_slots
+    while True:
+        check()
+        if slots.acquire(timeout=0.05):
+            break
+    try:
+        check()
+    except BaseException:
+        slots.release()
+        raise
+
+    done = threading.Event()
+    state_lock = threading.Lock()
+    state: dict[str, object] = {"abandoned": False}
+
+    def clear_target() -> None:
+        if not callable(setup_target_callback):
+            return
+        try:
+            setup_target_callback(None)
+        except BaseException:
+            # Clearing a target is cleanup; preserve the request's original
+            # stop/backend exception rather than replacing it here.
+            pass
+
+    def close_connection(connection) -> None:
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+    def invoke() -> None:
+        connection = None
+        published = False
+        try:
+            connection = duckdb.connect()
+            with state_lock:
+                abandoned = bool(state["abandoned"])
+            if abandoned:
+                return
+            if callable(setup_target_callback):
+                published = True
+                setup_target_callback(connection)
+            init_connection(connection, temp_dir=temp_dir)
+            with state_lock:
+                if bool(state["abandoned"]):
+                    abandoned = True
+                else:
+                    state["connection"] = connection
+                    connection = None
+                    abandoned = False
+            if abandoned:
+                return
+        except BaseException as exc:
+            with state_lock:
+                if not bool(state["abandoned"]):
+                    state["error"] = exc
+        finally:
+            if connection is not None:
+                close_connection(connection)
+            if published and connection is not None:
+                clear_target()
+            try:
+                slots.release()
+            finally:
+                done.set()
+
+    worker = threading.Thread(
+        target=invoke,
+        name="supertable-duckdb-connect",
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except BaseException:
+        slots.release()
+        raise
+
+    def abandon() -> None:
+        connection = None
+        with state_lock:
+            state["abandoned"] = True
+            connection = state.pop("connection", None)
+        if connection is not None:
+            close_connection(connection)
+            clear_target()
+
+    try:
+        while not done.wait(0.05):
+            check()
+        check()
+        with state_lock:
+            error = state.pop("error", None)
+            connection = state.pop("connection", None)
+        if isinstance(error, BaseException):
+            raise error
+        if connection is None:
+            raise RuntimeError("DuckDB connection setup returned no handle")
+        return connection
+    except BaseException:
+        abandon()
+        raise
+
+
+class _DuckDBResultLifecycleStream:
+    """Finalize an idle DuckDB stream when its request stops being live.
+
+    ``ArrowBatchStream.close`` is cooperative while ``next()`` is active: it
+    records a close request and defers cursor/view cleanup until the producer
+    unwinds.  Driving that existing state machine from the deadline/cancel
+    watchers therefore reclaims an idle stream promptly without ever closing a
+    DuckDB cursor underneath an active Arrow fetch.
+
+    The terminal event is retained after cleanup so a later consumer call gets
+    the typed timeout/cancellation rather than mistaking the auto-closed stream
+    for successful exhaustion.
+    """
+
+    def __init__(
+        self,
+        inner: ArrowBatchStream,
+        *,
+        deadline_monotonic: Optional[float],
+        timeout_value: float,
+        cancel_event: Optional[threading.Event],
+    ) -> None:
+        self._inner = inner
+        self.schema = inner.schema
+        self._deadline = deadline_monotonic
+        self._timeout_value = timeout_value
+        self._cancel_event = cancel_event
+        self._timed_out = threading.Event()
+        self._cancelled = threading.Event()
+        self._stop = threading.Event()
+        self._watcher = None
+        self._start_monitors()
+
+    def __iter__(self):
+        return self
+
+    @property
+    def closed(self) -> bool:
+        return bool(getattr(self._inner, "closed", False))
+
+    def _start_monitors(self) -> None:
+        if self._deadline is None and self._cancel_event is None:
+            return
+
+        def watch() -> None:
+            while not self._stop.is_set():
+                if (
+                    self._cancel_event is not None
+                    and self._cancel_event.is_set()
+                ):
+                    self._cancelled.set()
+                    try:
+                        # cancel() uses DuckDB interrupt for an active fetch
+                        # and the same deferred-close path for its resources.
+                        self._inner.cancel()
+                    finally:
+                        self._stop.set()
+                    return
+
+                if (
+                    self._deadline is not None
+                    and time.monotonic() >= self._deadline
+                ):
+                    self._timed_out.set()
+                    try:
+                        # Safe for both states: idle streams finalize now; an
+                        # active next() only records close_requested and
+                        # finalizes after that producer unwinds.
+                        self._inner.close()
+                    finally:
+                        self._stop.set()
+                    return
+
+                if self._deadline is None:
+                    wait_for = 0.05
+                else:
+                    remaining = max(0.0, self._deadline - time.monotonic())
+                    wait_for = (
+                        min(0.05, remaining)
+                        if self._cancel_event is not None else remaining
+                    )
+                self._stop.wait(wait_for)
+
+        self._watcher = threading.Thread(
+            target=watch,
+            name="supertable-duckdb-result-lifecycle",
+            daemon=True,
+        )
+        self._watcher.start()
+
+    def _stop_monitors(self) -> None:
+        self._stop.set()
+        if (
+            self._watcher is not None
+            and self._watcher is not threading.current_thread()
+        ):
+            self._watcher.join(timeout=1.0)
+
+    def _raise_if_stopped(self) -> None:
+        if self._cancelled.is_set() or (
+            self._cancel_event is not None and self._cancel_event.is_set()
+        ):
+            self._cancelled.set()
+            # The watcher normally owns this call.  Calling it here closes the
+            # polling race when a consumer arrives immediately after set().
+            self._inner.cancel()
+            self._stop_monitors()
+            raise ResourceReservationCancelled(
+                "DuckDB Arrow result stream was cancelled"
+            )
+        if self._timed_out.is_set() or (
+            self._deadline is not None
+            and time.monotonic() >= self._deadline
+        ):
+            self._timed_out.set()
+            self._inner.close()
+            self._stop_monitors()
+            raise TimeoutError(
+                f"DuckDB query timed out after {self._timeout_value:g} seconds"
+            )
+
+    def __next__(self):
+        self._raise_if_stopped()
+        try:
+            batch = next(self._inner)
+        except StopIteration:
+            self._stop_monitors()
+            self._raise_if_stopped()
+            raise
+        except BaseException:
+            self._stop_monitors()
+            self._raise_if_stopped()
+            raise
+        try:
+            self._raise_if_stopped()
+        except BaseException:
+            # Never expose a batch that completed after cancel/deadline.
+            raise
+        return batch
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+        try:
+            self._inner.cancel()
+        finally:
+            self._stop_monitors()
+
+    def close(self) -> None:
+        self._stop_monitors()
+        self._inner.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc is not None:
+            self.cancel()
+        else:
+            self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _result_stream_batch_rows(max_batch_rows: Optional[int] = None) -> int:
@@ -336,6 +800,117 @@ def _result_stream_batch_rows(max_batch_rows: Optional[int] = None) -> int:
     if max_batch_rows < 1:
         raise ValueError("max_batch_rows must be a positive integer")
     return min(configured, max_batch_rows)
+
+
+def _result_stream_batch_bytes(max_batch_bytes: Optional[int] = None) -> int:
+    try:
+        configured = int(
+            getattr(
+                settings,
+                "SUPERTABLE_RESULT_STREAM_BATCH_BYTES",
+                4 * 1024 * 1024,
+            )
+        )
+    except (TypeError, ValueError, OverflowError):
+        configured = 4 * 1024 * 1024
+    if configured <= 0:
+        configured = 4 * 1024 * 1024
+    if max_batch_bytes is None:
+        return configured
+    if (
+        isinstance(max_batch_bytes, bool)
+        or not isinstance(max_batch_bytes, int)
+        or max_batch_bytes < 1
+    ):
+        raise ValueError("max_batch_bytes must be a positive integer")
+    return min(configured, max_batch_bytes)
+
+
+def _duckdb_fixed_result_row_bytes(description) -> Optional[int]:
+    """Return a conservative fixed-width row charge, or ``None``.
+
+    DuckDB chooses Arrow reader batches by row count only. Variable-width and
+    nested outputs therefore use a small configurable upstream fetch cap;
+    fixed-width results can safely retain the higher public row cap while the
+    final Arrow iterator enforces the exact logical-byte boundary.
+    """
+    widths = {
+        "BOOLEAN": 1,
+        "TINYINT": 1,
+        "UTINYINT": 1,
+        "SMALLINT": 2,
+        "USMALLINT": 2,
+        "INTEGER": 4,
+        "UINTEGER": 4,
+        "FLOAT": 4,
+        "DATE": 4,
+        "BIGINT": 8,
+        "UBIGINT": 8,
+        "DOUBLE": 8,
+        "TIME": 8,
+        "TIME WITH TIME ZONE": 8,
+        "TIMESTAMP": 8,
+        "TIMESTAMP WITH TIME ZONE": 8,
+        "TIMESTAMP_NS": 8,
+        "TIMESTAMP_MS": 8,
+        "TIMESTAMP_S": 8,
+        "HUGEINT": 16,
+        "UHUGEINT": 16,
+        "UUID": 16,
+        "INTERVAL": 16,
+    }
+    total = 0
+    try:
+        fields = tuple(description or ())
+    except TypeError:
+        return None
+    for field in fields:
+        try:
+            type_name = str(field[1]).strip().upper()
+        except (IndexError, TypeError):
+            return None
+        if type_name.startswith("DECIMAL("):
+            width = 16
+        else:
+            width = widths.get(type_name)
+        if width is None:
+            return None
+        # A full byte for validity is deliberately conservative relative to
+        # Arrow's one-bit bitmap and keeps the division stable for tiny types.
+        total += width + 1
+    return max(1, total)
+
+
+def _duckdb_stream_fetch_rows(
+    *,
+    max_batch_rows: int,
+    max_batch_bytes: int,
+    description,
+) -> int:
+    fixed_row_bytes = _duckdb_fixed_result_row_bytes(description)
+    if fixed_row_bytes is not None:
+        return max(
+            1,
+            min(max_batch_rows, max_batch_bytes // fixed_row_bytes),
+        )
+    try:
+        variable_cap = int(
+            getattr(
+                settings,
+                "SUPERTABLE_RESULT_STREAM_VARIABLE_FETCH_ROWS",
+                16,
+            )
+        )
+    except (TypeError, ValueError, OverflowError):
+        variable_cap = 16
+    if variable_cap <= 0:
+        variable_cap = 16
+    variable_cap = min(variable_cap, 4096)
+    # A valid MCP row can itself approach the page cap. Keeping only this many
+    # unknown-width rows in DuckDB's Arrow conversion bounds that transient to
+    # a small, configurable multiple of the response batch budget. The final
+    # iterator below still rejects/splits by actual Arrow bytes.
+    return max(1, min(max_batch_rows, variable_cap))
 
 
 class DuckDB:
@@ -368,6 +943,10 @@ class DuckDB:
         self._con: Optional[duckdb.DuckDBPyConnection] = None
         self._httpfs_configured = False
         self._s3_secret_configured = False
+        self._lifecycle_lock = threading.Lock()
+        self._active_queries = 0
+        self._cache_eviction_requested = False
+        self._setup_context = threading.local()
         # Shared deletion-vector table cache: per-table eviction (idle TTL +
         # per-table version cap), bounded by config. Tables live on the
         # persistent connection and are forgotten when it resets.
@@ -382,23 +961,65 @@ class DuckDB:
     # Connection lifecycle
     # ------------------------------------------------------------------
 
-    def _get_connection(self, temp_dir: str) -> duckdb.DuckDBPyConnection:
+    def _get_connection(
+        self,
+        temp_dir: str,
+        setup_target_callback=None,
+        setup_check_callback=None,
+    ) -> duckdb.DuckDBPyConnection:
         """Return the persistent connection, creating and configuring it once."""
         if self._con is not None:
             return self._con
 
-        con = duckdb.connect()
-        init_connection(con, temp_dir=temp_dir)
+        con = _bounded_duckdb_connect(
+            temp_dir=temp_dir,
+            setup_check=setup_check_callback,
+            setup_target_callback=setup_target_callback,
+        )
+        try:
+            if callable(setup_check_callback):
+                setup_check_callback()
+        except BaseException:
+            try:
+                con.close()
+            finally:
+                if callable(setup_target_callback):
+                    try:
+                        setup_target_callback(None)
+                    except BaseException:
+                        pass
+            raise
+        # Only the request thread may publish a fully initialized, still-live
+        # connection into the persistent cache. A late orphan worker never
+        # reaches this assignment.
+        self._con = con
         # httpfs (and both cache settings) are configured lazily on the first
         # query via _ensure_httpfs → configure_httpfs_and_s3.  They cannot be
         # applied here because the httpfs extension is not loaded yet.
-        self._con = con
         self._httpfs_configured = False
         self._s3_secret_configured = False
         logger.info("[duckdb] persistent connection created")
         return con
 
-    def _ensure_httpfs(self, con: duckdb.DuckDBPyConnection, paths: List[str]) -> None:
+    def _acquire_setup_lock(self, setup_check=None) -> None:
+        """Acquire the setup lock without waiting past cancel/deadline."""
+        if not callable(setup_check):
+            self._lock.acquire()
+            return
+        setup_check()
+        while not self._lock.acquire(timeout=0.05):
+            setup_check()
+        try:
+            setup_check()
+        except BaseException:
+            self._lock.release()
+            raise
+
+    def _ensure_httpfs(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        paths: List[str],
+    ) -> None:
         """Configure every query-private cursor under the setup lock.
 
         DuckDB cursor handles share database settings and the temporary secret
@@ -414,7 +1035,11 @@ class DuckDB:
         needs_s3 = any(
             str(path).lower().startswith(("s3://", "s3a://")) for path in paths
         )
-        with self._lock:
+        setup_check = getattr(self._setup_context, "check", None)
+        self._acquire_setup_lock(setup_check)
+        try:
+            if callable(setup_check):
+                setup_check()
             # Rebind the temporary secret for every S3 query. Credential
             # providers can rotate a session token while this persistent
             # connection remains alive; retaining an earlier secret would no
@@ -427,6 +1052,10 @@ class DuckDB:
                 self._s3_secret_configured = (
                     self._s3_secret_configured or needs_s3
                 )
+            if callable(setup_check):
+                setup_check()
+        finally:
+            self._lock.release()
 
     def _reset_connection(self) -> None:
         """Close and discard the connection on unrecoverable error."""
@@ -441,6 +1070,55 @@ class DuckDB:
             # Tables died with the connection — just forget the registry.
             self._tombstone_cache.clear_registry()
             logger.warning("[duckdb] connection reset")
+
+    def _begin_query_use(self) -> None:
+        """Pin this engine while setup, execution, or stream delivery is live."""
+        with self._lifecycle_lock:
+            self._active_queries += 1
+
+    def _finish_query_use(self) -> None:
+        with self._lifecycle_lock:
+            self._active_queries = max(0, self._active_queries - 1)
+            reset = (
+                self._active_queries == 0
+                and self._cache_eviction_requested
+            )
+            if reset:
+                # Keep the lifecycle gate closed until reset completes. A new
+                # query therefore cannot increment active_queries in the gap
+                # between the last stream release and connection close.
+                with self._lock:
+                    self._reset_connection()
+
+    def request_cache_eviction(self) -> bool:
+        """Close an idle evicted engine, or defer close through its last stream.
+
+        Returns ``True`` when the connection was idle and could be closed
+        immediately.  No caller should use this as an authorization decision;
+        it is cache telemetry only.
+        """
+        with self._lifecycle_lock:
+            self._cache_eviction_requested = True
+            idle = self._active_queries == 0
+            if idle:
+                # Atomic with respect to _begin_query_use; otherwise a query
+                # could start after the idle check and have its cursor closed.
+                with self._lock:
+                    self._reset_connection()
+        return idle
+
+    def cache_state(self) -> dict[str, object]:
+        """Return data-free lifecycle state for query telemetry."""
+        with self._lifecycle_lock:
+            active = self._active_queries
+            eviction_pending = self._cache_eviction_requested
+        with self._lock:
+            connection_open = self._con is not None
+        return {
+            "connection_open": connection_open,
+            "active_queries": active,
+            "eviction_pending": eviction_pending,
+        }
 
     # ------------------------------------------------------------------
     # Core execution
@@ -457,10 +1135,147 @@ class DuckDB:
             explain: bool = False,
             explain_options: str = "",
             timeout_sec: Optional[float] = None,
+            cancel_event: Optional[threading.Event] = None,
+            deadline_monotonic: Optional[float] = None,
             *,
             _streaming: bool = False,
             _stream_batch_rows: Optional[int] = None,
+            _stream_batch_bytes: Optional[int] = None,
     ) -> Any:
+        """Execute while holding a lifecycle lease through stream close."""
+        lifecycle_started = time.monotonic()
+        lifecycle_deadline = deadline_monotonic
+        lifecycle_timeout_value = 0.0
+        if lifecycle_deadline is None:
+            try:
+                supplied_timeout = (
+                    float(timeout_sec) if timeout_sec is not None else 0.0
+                )
+            except (TypeError, ValueError, OverflowError):
+                supplied_timeout = 0.0
+            if math.isfinite(supplied_timeout) and supplied_timeout > 0:
+                lifecycle_timeout_value = supplied_timeout
+                lifecycle_deadline = lifecycle_started + supplied_timeout
+        else:
+            try:
+                parsed_deadline = float(lifecycle_deadline)
+            except (TypeError, ValueError, OverflowError):
+                # _execute_unleased owns the public validation/error wording.
+                parsed_deadline = None
+            if parsed_deadline is not None and math.isfinite(parsed_deadline):
+                lifecycle_deadline = parsed_deadline
+                lifecycle_timeout_value = max(
+                    0.0, parsed_deadline - lifecycle_started,
+                )
+
+        self._begin_query_use()
+        stream_owns_lease = False
+        try:
+            result = self._execute_unleased(
+                reflection=reflection,
+                parser=parser,
+                query_manager=query_manager,
+                timer_capture=timer_capture,
+                log_prefix=log_prefix,
+                engine_config=engine_config,
+                explain=explain,
+                explain_options=explain_options,
+                timeout_sec=timeout_sec,
+                cancel_event=cancel_event,
+                deadline_monotonic=lifecycle_deadline,
+                _streaming=_streaming,
+                _stream_batch_rows=_stream_batch_rows,
+                _stream_batch_bytes=_stream_batch_bytes,
+            )
+            if not _streaming:
+                return result
+
+            inner = result
+
+            def release_stream_lease() -> None:
+                try:
+                    inner.close()
+                finally:
+                    self._finish_query_use()
+
+            wrapped = ArrowBatchStream(
+                inner.schema,
+                inner,
+                close_callback=release_stream_lease,
+                cancel_event=cancel_event,
+            )
+            # From here the inner stream callback owns the lifecycle lease even
+            # if monitor construction itself fails.
+            stream_owns_lease = True
+            try:
+                return _DuckDBResultLifecycleStream(
+                    wrapped,
+                    deadline_monotonic=(
+                        float(lifecycle_deadline)
+                        if lifecycle_deadline is not None else None
+                    ),
+                    timeout_value=lifecycle_timeout_value,
+                    cancel_event=cancel_event,
+                )
+            except BaseException:
+                wrapped.close()
+                raise
+        finally:
+            if not stream_owns_lease:
+                self._finish_query_use()
+
+    def _execute_unleased(
+            self,
+            reflection: Reflection,
+            parser: SQLParser,
+            query_manager: QueryPlanManager,
+            timer_capture,
+            log_prefix: str = "",
+            engine_config=None,
+            explain: bool = False,
+            explain_options: str = "",
+            timeout_sec: Optional[float] = None,
+            cancel_event: Optional[threading.Event] = None,
+            deadline_monotonic: Optional[float] = None,
+            *,
+            _streaming: bool = False,
+            _stream_batch_rows: Optional[int] = None,
+            _stream_batch_bytes: Optional[int] = None,
+    ) -> Any:
+        started_monotonic = time.monotonic()
+        try:
+            timeout_value = float(timeout_sec) if timeout_sec is not None else 0.0
+        except (TypeError, ValueError, OverflowError):
+            timeout_value = 0.0
+        if deadline_monotonic is None:
+            deadline_value = (
+                started_monotonic + timeout_value
+                if math.isfinite(timeout_value) and timeout_value > 0
+                else None
+            )
+        else:
+            try:
+                deadline_value = float(deadline_monotonic)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("query deadline must be finite") from exc
+            if not math.isfinite(deadline_value):
+                raise ValueError("query deadline must be finite")
+            timeout_value = max(0.0, deadline_value - started_monotonic)
+
+        def check_request_boundary() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise ResourceReservationCancelled("DuckDB query was cancelled")
+            if (
+                deadline_value is not None
+                and time.monotonic() >= deadline_value
+            ):
+                raise TimeoutError(
+                    f"DuckDB query timed out after {timeout_value:g} seconds"
+                )
+
+        # Cancellation and one absolute deadline cover parser/RBAC validation,
+        # connection creation, extension setup, query execution, and delivery.
+        check_request_boundary()
         if explain and str(explain_options or "").strip().casefold() == "analyze":
             raise ValueError(
                 "EXPLAIN ANALYZE is not available on the untrusted read path"
@@ -476,14 +1291,19 @@ class DuckDB:
             parser,
             getattr(reflection, "rbac_views", None) or {},
         )
+        check_request_boundary()
         if _streaming:
             # Keep request validation outside the backend-error boundary so a
             # malformed public batch cap remains a meaningful ValueError.
             resolved_stream_batch_rows = _result_stream_batch_rows(
                 _stream_batch_rows
             )
+            resolved_stream_batch_bytes = _result_stream_batch_bytes(
+                _stream_batch_bytes
+            )
         else:
             resolved_stream_batch_rows = None
+            resolved_stream_batch_bytes = None
         for view_def in (
             getattr(reflection, "rbac_views", None) or {}
         ).values():
@@ -525,34 +1345,71 @@ class DuckDB:
             )
         tried_presign = False
 
-        with self._lock:
+        connection_setup_guard = _DuckDBSetupInterruptGuard(
+            deadline_monotonic=deadline_value,
+            timeout_value=timeout_value,
+            cancel_event=cancel_event,
+        )
+
+        def publish_connection_setup_target(target) -> None:
+            connection_setup_guard.set_target(target)
+            connection_setup_guard.raise_if_stopped()
+
+        connection_setup_guard.start()
+        try:
+            self._acquire_setup_lock(
+                connection_setup_guard.raise_if_stopped,
+            )
             try:
-                root_con = self._get_connection(temp_dir=query_manager.temp_dir)
-            except Exception as initial_error:
-                self._reset_connection()
+                connection_setup_guard.raise_if_stopped()
                 try:
                     root_con = self._get_connection(
-                        temp_dir=query_manager.temp_dir
+                        temp_dir=query_manager.temp_dir,
+                        setup_target_callback=publish_connection_setup_target,
+                        setup_check_callback=(
+                            connection_setup_guard.raise_if_stopped
+                        ),
                     )
-                except BaseException as retry_error:
-                    if not isinstance(retry_error, Exception):
+                except Exception as initial_error:
+                    connection_setup_guard.raise_if_stopped()
+                    self._reset_connection()
+                    try:
+                        root_con = self._get_connection(
+                            temp_dir=query_manager.temp_dir,
+                            setup_target_callback=publish_connection_setup_target,
+                            setup_check_callback=(
+                                connection_setup_guard.raise_if_stopped
+                            ),
+                        )
+                    except BaseException as retry_error:
+                        if not isinstance(retry_error, Exception):
+                            raise
+                        connection_setup_guard.raise_if_stopped()
+                        # The first and retry failures can both retain connection
+                        # configuration in their traceback locals/cause chain.
+                        retry_error.__context__ = initial_error
+                        safe_error = _safe_duckdb_backend_exception(
+                            retry_error, phase="connection setup",
+                        )
+                        raise safe_error from None
+                try:
+                    con = root_con.cursor()
+                    connection_setup_guard.set_target(con)
+                except BaseException as cursor_error:
+                    if not isinstance(cursor_error, Exception):
                         raise
-                    # The first and retry failures can both retain connection
-                    # configuration in their traceback locals/cause chain.
-                    retry_error.__context__ = initial_error
+                    connection_setup_guard.raise_if_stopped()
                     safe_error = _safe_duckdb_backend_exception(
-                        retry_error, phase="connection setup",
+                        cursor_error, phase="connection setup",
                     )
                     raise safe_error from None
-            try:
-                con = root_con.cursor()
-            except BaseException as cursor_error:
-                if not isinstance(cursor_error, Exception):
-                    raise
-                safe_error = _safe_duckdb_backend_exception(
-                    cursor_error, phase="connection setup",
-                )
-                raise safe_error from None
+            finally:
+                self._lock.release()
+            connection_setup_guard.raise_if_stopped()
+        finally:
+            connection_setup_guard.close()
+
+        check_request_boundary()
 
         timer_capture("CONNECTING")
 
@@ -635,15 +1492,42 @@ class DuckDB:
             raise ValueError(
                 "EXPLAIN is unavailable for credential-bearing remote sources"
             )
-        try:
-            self._ensure_httpfs(
-                con,
-                [
-                    path
-                    for path in [*all_files, *tombstone_paths]
-                    if path
-                ],
+        setup_paths = [
+            path
+            for path in [*all_files, *tombstone_paths]
+            if path
+        ]
+        remote_setup = any(
+            str(path).lower().startswith(
+                ("s3://", "s3a://", "http://", "https://")
             )
+            for path in setup_paths
+        )
+        storage_setup_guard = (
+            _DuckDBSetupInterruptGuard(
+                deadline_monotonic=deadline_value,
+                timeout_value=timeout_value,
+                cancel_event=cancel_event,
+            )
+            if remote_setup else None
+        )
+        if storage_setup_guard is not None:
+            storage_setup_guard.set_target(con)
+            storage_setup_guard.start()
+        try:
+            if storage_setup_guard is not None:
+                storage_setup_guard.raise_if_stopped()
+            else:
+                check_request_boundary()
+            if storage_setup_guard is not None:
+                self._setup_context.check = (
+                    storage_setup_guard.raise_if_stopped
+                )
+            self._ensure_httpfs(con, setup_paths)
+            if storage_setup_guard is not None:
+                storage_setup_guard.raise_if_stopped()
+            else:
+                check_request_boundary()
         except BaseException as exc:
             # No view owns this query-private handle yet, so the main cleanup
             # block has not started. Do not leak cursors on a fail-closed auth
@@ -654,22 +1538,37 @@ class DuckDB:
                 pass
             if not isinstance(exc, Exception):
                 raise
+            if storage_setup_guard is not None:
+                storage_setup_guard.raise_if_stopped()
+            else:
+                check_request_boundary()
             safe_error = _safe_duckdb_backend_exception(
                 exc, phase="storage setup",
             )
             raise safe_error from None
+        finally:
+            try:
+                del self._setup_context.check
+            except AttributeError:
+                pass
+            if storage_setup_guard is not None:
+                storage_setup_guard.close()
 
         # Create per-query VIEWs. Dropped in finally regardless of outcome.
         created_views: List[str] = []
         # Deletion-vector cache keys acquired this query — released in finally.
         acquired_dv_keys: List[str] = []
         timed_out = threading.Event()
+        externally_cancelled = threading.Event()
+        cancel_watcher_stop = threading.Event()
+        cancel_watcher = None
         watchdog = None
-        try:
-            timeout_value = float(timeout_sec) if timeout_sec is not None else 0.0
-        except (TypeError, ValueError, OverflowError):
-            timeout_value = 0.0
-        if math.isfinite(timeout_value) and timeout_value > 0:
+        watchdog_seconds = (
+            max(0.0, deadline_value - time.monotonic())
+            if deadline_value is not None else 0.0
+        )
+        check_request_boundary()
+        if watchdog_seconds > 0:
             def interrupt_query() -> None:
                 timed_out.set()
                 try:
@@ -680,12 +1579,45 @@ class DuckDB:
                 except Exception:
                     pass
 
-            watchdog = threading.Timer(timeout_value, interrupt_query)
+            watchdog = threading.Timer(watchdog_seconds, interrupt_query)
             watchdog.daemon = True
             watchdog.start()
 
+        if cancel_event is not None:
+            def watch_for_cancellation() -> None:
+                while not cancel_watcher_stop.wait(0.05):
+                    if cancel_event.is_set():
+                        externally_cancelled.set()
+                        try:
+                            con.interrupt()
+                        except Exception:
+                            pass
+                        return
+
+            cancel_watcher = threading.Thread(
+                target=watch_for_cancellation,
+                name="supertable-duckdb-cancel",
+                daemon=True,
+            )
+            cancel_watcher.start()
+
         def check_deadline() -> None:
+            if (
+                externally_cancelled.is_set()
+                or (cancel_event is not None and cancel_event.is_set())
+            ):
+                raise ResourceReservationCancelled(
+                    "DuckDB query was cancelled"
+                )
             if timed_out.is_set():
+                raise TimeoutError(
+                    f"DuckDB query timed out after {timeout_value:g} seconds"
+                )
+            if (
+                deadline_value is not None
+                and time.monotonic() >= deadline_value
+            ):
+                timed_out.set()
                 raise TimeoutError(
                     f"DuckDB query timed out after {timeout_value:g} seconds"
                 )
@@ -710,6 +1642,12 @@ class DuckDB:
                     # already begun. Ensure a racing interrupt is finished
                     # before issuing cleanup DDL on the same cursor.
                     join_watchdog(timeout=1.0)
+            cancel_watcher_stop.set()
+            if (
+                cancel_watcher is not None
+                and cancel_watcher is not threading.current_thread()
+            ):
+                cancel_watcher.join(timeout=1.0)
             # Disable profiling so cleanup DDL is not captured.
             try:
                 con.execute("PRAGMA disable_profiling;")
@@ -884,28 +1822,43 @@ class DuckDB:
             check_deadline()
 
             if _streaming:
+                assert resolved_stream_batch_rows is not None
+                assert resolved_stream_batch_bytes is not None
+                producer_fetch_rows = _duckdb_stream_fetch_rows(
+                    max_batch_rows=resolved_stream_batch_rows,
+                    max_batch_bytes=resolved_stream_batch_bytes,
+                    description=getattr(query_result, "description", None),
+                )
                 to_arrow_reader = getattr(query_result, "to_arrow_reader", None)
                 if callable(to_arrow_reader):
                     arrow_reader = to_arrow_reader(
-                        batch_size=resolved_stream_batch_rows
+                        batch_size=producer_fetch_rows
                     )
                 else:
                     # DuckDB 1.1 compatibility; newer versions retain this as
                     # a deprecated alias for ``to_arrow_reader``.
                     arrow_reader = query_result.fetch_record_batch(
-                        rows_per_batch=resolved_stream_batch_rows,
+                        rows_per_batch=producer_fetch_rows,
                     )
                 check_deadline()
-                producer = _DuckDBArrowBatchIterator(
+                duckdb_producer = _DuckDBArrowBatchIterator(
                     arrow_reader,
                     con,
                     timed_out=timed_out,
                     timeout_value=timeout_value,
+                    cancel_event=cancel_event,
+                )
+                producer = ByteBoundedArrowBatchIterator(
+                    duckdb_producer,
+                    schema=arrow_reader.schema,
+                    max_batch_rows=resolved_stream_batch_rows,
+                    max_batch_bytes=resolved_stream_batch_bytes,
                 )
                 result = ArrowBatchStream(
                     arrow_reader.schema,
                     producer,
                     close_callback=cleanup_query,
+                    cancel_event=cancel_event,
                 )
                 # From this point the stream owns the cursor, views, watchdog,
                 # and DV references. The finally block must not invalidate them
@@ -923,12 +1876,28 @@ class DuckDB:
         except BaseException as exc:
             if not isinstance(exc, Exception):
                 raise
+            if externally_cancelled.is_set() or (
+                cancel_event is not None and cancel_event.is_set()
+            ):
+                _scrub_exception_chain(
+                    exc, replacement="DuckDB backend detail redacted"
+                )
+                raise ResourceReservationCancelled(
+                    "DuckDB query was cancelled"
+                ) from None
             if timed_out.is_set() and not isinstance(exc, TimeoutError):
                 _scrub_exception_chain(
                     exc, replacement="DuckDB backend detail redacted"
                 )
                 raise TimeoutError(
                     f"DuckDB query timed out after {timeout_value:g} seconds"
+                ) from None
+            if _is_refreshable_remote_auth_error(exc):
+                _scrub_exception_chain(
+                    exc, replacement="DuckDB backend detail redacted"
+                )
+                raise DuckDBPresignRefreshRequired(
+                    "DuckDB remote authorization expired before result delivery"
                 ) from None
             safe_error = _safe_duckdb_backend_exception(
                 exc, phase=backend_phase,
@@ -949,6 +1918,9 @@ class DuckDB:
             engine_config=None,
             timeout_sec: Optional[float] = None,
             max_batch_rows: Optional[int] = None,
+            max_batch_bytes: Optional[int] = None,
+            cancel_event: Optional[threading.Event] = None,
+            deadline_monotonic: Optional[float] = None,
     ) -> ArrowBatchStream:
         """Return a bounded-batch Arrow stream owning all query resources."""
         return self.execute(
@@ -959,6 +1931,9 @@ class DuckDB:
             log_prefix=log_prefix,
             engine_config=engine_config,
             timeout_sec=timeout_sec,
+            cancel_event=cancel_event,
+            deadline_monotonic=deadline_monotonic,
             _streaming=True,
             _stream_batch_rows=max_batch_rows,
+            _stream_batch_bytes=max_batch_bytes,
         )

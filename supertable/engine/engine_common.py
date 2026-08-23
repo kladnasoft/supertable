@@ -1044,7 +1044,13 @@ def url_to_key(url: str, bucket: Optional[str]) -> Optional[str]:
 
 
 def make_presigned_list(storage, paths: List[str]) -> List[str]:
-    """Attempt to presign each path; fall back to original on failure."""
+    """Presign one path set atomically.
+
+    A mixed list of fresh bearer URLs and stale/original paths is not a safe
+    retry plan: it can cross authorization contexts and makes a later failure
+    impossible to classify.  Callers either receive the complete replacement
+    set or an exception, with no partial result exposed.
+    """
     presign_fn = getattr(storage, "presign", None) if storage is not None else None
     if not callable(presign_fn):
         return paths
@@ -1056,13 +1062,14 @@ def make_presigned_list(storage, paths: List[str]) -> List[str]:
         key = url_to_key(p, bucket)
         if key:
             try:
-                out.append(presign_fn(key))
-            except Exception as e:
-                out.append(p)
-                logger.warning(
-                    f"[presign] failed for '{redact_url_credentials(p)}': "
-                    f"{redact_url_credentials(e)}"
+                refreshed = presign_fn(key)
+            except Exception:
+                raise RuntimeError("storage credential refresh failed") from None
+            if not isinstance(refreshed, str) or not refreshed.strip():
+                raise RuntimeError(
+                    "storage credential refresh returned no path"
                 )
+            out.append(refreshed)
         else:
             out.append(p)
 
@@ -1183,35 +1190,16 @@ def create_reflection_table_with_presign_retry(
         log_prefix: str = "",
         resource_keys: Optional[List[str]] = None,
 ) -> bool:
-    """
-    Create a reflection table with automatic presign fallback on HTTP errors.
-    Returns True if presign retry was used.
+    """Create a reflection table without performing an engine-local retry.
+
+    Credential refresh is owned by :class:`Executor`, which can atomically
+    rebuild the complete pinned reflection, enforce one attempt, preserve the
+    request deadline, and publish safe telemetry.  This compatibility wrapper
+    intentionally returns ``False`` and propagates backend failures.
     """
     configure_httpfs_and_s3(con, files, storage=storage)
-    tried_presign = False
-
-    try:
-        create_reflection_table(con, table_name, files, columns, resource_keys)
-    except Exception as e:
-        msg = str(e)
-        if any(tok in msg for tok in (
-                "HTTP Error", "HTTP GET error", "301", "Moved Permanently",
-                "AccessDenied", "SignatureDoesNotMatch", "403", "400",
-        )):
-            logger.warning(
-                f"{log_prefix}[duckdb.retry] presign fallback for {table_name}: "
-                f"{redact_url_credentials(msg)}"
-            )
-            tried_presign = True
-            presigned_files = make_presigned_list(storage, files)
-            configure_httpfs_and_s3(con, presigned_files, storage=storage)
-            create_reflection_table(
-                con, table_name, presigned_files, columns, resource_keys,
-            )
-        else:
-            raise
-
-    return tried_presign
+    create_reflection_table(con, table_name, files, columns, resource_keys)
+    return False
 
 
 # =========================================================
@@ -1263,14 +1251,15 @@ def create_reflection_view_with_presign_retry(
         resource_keys: Optional[List[str]] = None,
 ) -> bool:
     """
-    Create a lazy reflection VIEW with automatic presign fallback on HTTP errors.
+    Create a lazy reflection VIEW without an engine-local presign retry.
 
     Mirrors ``create_reflection_table_with_presign_retry`` but uses a VIEW so
     no data is read at creation time.  Controlled by the env var
     ``SUPERTABLE_DUCKDB_MATERIALIZE`` (default: ``view``; set to ``table`` to
     revert to the old eager-materialisation behaviour).
 
-    Returns True if the presign fallback was used.
+    Executor owns the single atomic refresh/replan boundary. Returns ``False``
+    for compatibility with the historical helper contract.
     """
     materialize = settings.SUPERTABLE_DUCKDB_MATERIALIZE
     if materialize == "table":
@@ -1279,30 +1268,8 @@ def create_reflection_view_with_presign_retry(
         )
 
     configure_httpfs_and_s3(con, files, storage=storage)
-    tried_presign = False
-
-    try:
-        create_reflection_view(con, view_name, files, columns, resource_keys)
-    except Exception as e:
-        msg = str(e)
-        if any(tok in msg for tok in (
-                "HTTP Error", "HTTP GET error", "301", "Moved Permanently",
-                "AccessDenied", "SignatureDoesNotMatch", "403", "400",
-        )):
-            logger.warning(
-                f"{log_prefix}[duckdb.retry] presign fallback (view) for {view_name}: "
-                f"{redact_url_credentials(msg)}"
-            )
-            tried_presign = True
-            presigned_files = make_presigned_list(storage, files)
-            configure_httpfs_and_s3(con, presigned_files, storage=storage)
-            create_reflection_view(
-                con, view_name, presigned_files, columns, resource_keys,
-            )
-        else:
-            raise
-
-    return tried_presign
+    create_reflection_view(con, view_name, files, columns, resource_keys)
+    return False
 
 
 # =========================================================

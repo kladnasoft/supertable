@@ -195,8 +195,18 @@ class Settings:
     SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE: bool = True  # SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE
     SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE: str = "5GB"  # SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE
     SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR: str = ""      # SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR
+    # Strong process-local cache of authorization-scoped DuckDB engines.
+    # Connections are expensive (extensions, metadata, and block cache), but
+    # an unbounded registry would retain one connection per credential scope.
+    SUPERTABLE_DUCKDB_ENGINE_CACHE_MAX_ENTRIES: int = 16  # SUPERTABLE_DUCKDB_ENGINE_CACHE_MAX_ENTRIES
     SUPERTABLE_DUCKDB_MATERIALIZE: str = "view"    # SUPERTABLE_DUCKDB_MATERIALIZE
     SUPERTABLE_DUCKDB_PRESIGNED: bool = False      # SUPERTABLE_DUCKDB_PRESIGNED
+    # A generated bearer URL must remain valid for the whole request deadline,
+    # plus a small clock/network margin.  The maximum prevents accidentally
+    # minting very long-lived credentials from an unreasonable query budget.
+    SUPERTABLE_PRESIGN_EXPIRY_MARGIN_SEC: int = 120  # SUPERTABLE_PRESIGN_EXPIRY_MARGIN_SEC
+    # Seven days minus the Azure delegation-key clock-skew/reuse envelope.
+    SUPERTABLE_PRESIGN_MAX_EXPIRY_SEC: int = 604200  # SUPERTABLE_PRESIGN_MAX_EXPIRY_SEC
     SUPERTABLE_DUCKDB_USE_HTTPFS: bool = False     # SUPERTABLE_DUCKDB_USE_HTTPFS
     # Allow DuckDB to DOWNLOAD a missing extension (httpfs) from
     # extensions.duckdb.org at query time.  Default OFF: httpfs is baked into
@@ -342,6 +352,8 @@ class Settings:
     SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC: float = 60.0  # SUPERTABLE_DEFAULT_QUERY_TIMEOUT_SEC
     SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES: int = 16 * 1024 * 1024  # SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES
     SUPERTABLE_RESULT_STREAM_BATCH_ROWS: int = 256  # SUPERTABLE_RESULT_STREAM_BATCH_ROWS
+    SUPERTABLE_RESULT_STREAM_BATCH_BYTES: int = 4 * 1024 * 1024  # SUPERTABLE_RESULT_STREAM_BATCH_BYTES
+    SUPERTABLE_RESULT_STREAM_VARIABLE_FETCH_ROWS: int = 16  # SUPERTABLE_RESULT_STREAM_VARIABLE_FETCH_ROWS
     SUPERTABLE_MAX_QUERY_BYTES: int = 64 * 1024   # SUPERTABLE_MAX_QUERY_BYTES
     SUPERTABLE_MAX_QUERY_AST_NODES: int = 4096    # SUPERTABLE_MAX_QUERY_AST_NODES
     SUPERTABLE_MAX_QUERY_JOINS: int = 32          # SUPERTABLE_MAX_QUERY_JOINS
@@ -589,8 +601,17 @@ def _build_settings() -> Settings:
         SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE=_env_bool("SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE", True),
         SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE=_env_str("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE"),
         SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR=_env_str("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR"),
+        SUPERTABLE_DUCKDB_ENGINE_CACHE_MAX_ENTRIES=_env_int(
+            "SUPERTABLE_DUCKDB_ENGINE_CACHE_MAX_ENTRIES", 16,
+        ),
         SUPERTABLE_DUCKDB_MATERIALIZE=_env_str("SUPERTABLE_DUCKDB_MATERIALIZE", "view"),
         SUPERTABLE_DUCKDB_PRESIGNED=_env_bool("SUPERTABLE_DUCKDB_PRESIGNED", False),
+        SUPERTABLE_PRESIGN_EXPIRY_MARGIN_SEC=_env_int(
+            "SUPERTABLE_PRESIGN_EXPIRY_MARGIN_SEC", 120,
+        ),
+        SUPERTABLE_PRESIGN_MAX_EXPIRY_SEC=_env_int(
+            "SUPERTABLE_PRESIGN_MAX_EXPIRY_SEC", 604200,
+        ),
         SUPERTABLE_DUCKDB_USE_HTTPFS=_env_bool("SUPERTABLE_DUCKDB_USE_HTTPFS", False),
         SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=_env_bool("SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD", False),
         SUPERTABLE_DUCKDB_WRITE_PROBE=_env_bool("SUPERTABLE_DUCKDB_WRITE_PROBE", False),
@@ -729,6 +750,18 @@ def _build_settings() -> Settings:
         ),
         SUPERTABLE_RESULT_STREAM_BATCH_ROWS=_env_int(
             "SUPERTABLE_RESULT_STREAM_BATCH_ROWS", 256,
+        ),
+        SUPERTABLE_RESULT_STREAM_BATCH_BYTES=_env_int_strict(
+            "SUPERTABLE_RESULT_STREAM_BATCH_BYTES",
+            4 * 1024 * 1024,
+            minimum=1,
+            maximum=1024 * 1024 * 1024,
+        ),
+        SUPERTABLE_RESULT_STREAM_VARIABLE_FETCH_ROWS=_env_int_strict(
+            "SUPERTABLE_RESULT_STREAM_VARIABLE_FETCH_ROWS",
+            16,
+            minimum=1,
+            maximum=4096,
         ),
         SUPERTABLE_MAX_QUERY_BYTES=_env_int(
             "SUPERTABLE_MAX_QUERY_BYTES", 64 * 1024,

@@ -66,6 +66,7 @@ from supertable.processing import (
 )
 from supertable.engine.island_resources import (
     ArrowBatchStream,
+    ByteBoundedArrowBatchIterator,
     ContainerResources,
     ExecutionAdvice,
     QueryResourceEstimate,
@@ -73,6 +74,7 @@ from supertable.engine.island_resources import (
     ResourceGovernor,
     ResourcePlanner,
     ResourcePolicy,
+    ResourceReservationCancelled,
     ResultMemoryLimitExceeded,
 )
 from supertable.engine.island_spill import (
@@ -4483,6 +4485,9 @@ class IslandDB:
         _defer_reservation_release: bool = False,
         _prepared: Optional[IslandPreparedQuery] = None,
         max_batch_rows: Optional[int] = None,
+        max_batch_bytes: Optional[int] = None,
+        deadline_monotonic: Optional[float] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> ArrowBatchStream:
         """Execute natively and yield bounded Arrow batches.
 
@@ -4490,15 +4495,50 @@ class IslandDB:
         one-shot stream is exhausted or explicitly closed.  This is the safe
         interface for a result larger than the configured collection budget.
         """
+        caller_deadline: Optional[float] = None
+        if deadline_monotonic is not None:
+            try:
+                caller_deadline = float(deadline_monotonic)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("query deadline must be finite") from exc
+            if not math.isfinite(caller_deadline):
+                raise ValueError("query deadline must be finite")
+
+        query_cancel_event = cancel_event or threading.Event()
+
+        def caller_time_remaining() -> Optional[float]:
+            if query_cancel_event.is_set():
+                raise ResourceReservationCancelled(
+                    "IslandDB query was cancelled before execution"
+                )
+            if caller_deadline is None:
+                return None
+            remaining = caller_deadline - _monotonic()
+            if remaining <= 0:
+                raise IslandExecutionTimeout(
+                    "IslandDB caller deadline expired before execution"
+                )
+            return remaining
+
+        caller_time_remaining()
         prepare_started = time.perf_counter()
         prepared = _prepared or self.prepare_execution(
             reflection, parser, streaming_result=True,
         )
+        caller_time_remaining()
         prepare_inside_call_ms = (
             time.perf_counter() - prepare_started
         ) * 1000.0
         prepared.capability.require()
         plan = prepared.resource_plan
+        planned_row_width = max(
+            1,
+            (
+                max(1, int(plan.batch_bytes))
+                + max(1, int(plan.batch_rows))
+                - 1
+            ) // max(1, int(plan.batch_rows)),
+        )
         if max_batch_rows is not None:
             if isinstance(max_batch_rows, bool) or not isinstance(
                 max_batch_rows, int
@@ -4512,6 +4552,44 @@ class IslandDB:
                 plan,
                 batch_rows=min(max(1, int(plan.batch_rows)), max_batch_rows),
             )
+        try:
+            configured_batch_bytes = int(
+                getattr(
+                    settings,
+                    "SUPERTABLE_RESULT_STREAM_BATCH_BYTES",
+                    4 * 1024 * 1024,
+                )
+            )
+        except (TypeError, ValueError, OverflowError):
+            configured_batch_bytes = 4 * 1024 * 1024
+        if configured_batch_bytes <= 0:
+            configured_batch_bytes = 4 * 1024 * 1024
+        if _defer_reservation_release and max_batch_bytes is None:
+            # The pandas facade already owns a larger result-memory
+            # reservation and never exposes its intermediate Arrow batches to
+            # a response consumer. Preserve its planner batch target; the
+            # public streaming paths pass (or default to) the response cap.
+            configured_batch_bytes = max(1, int(plan.batch_bytes))
+        if max_batch_bytes is not None:
+            if (
+                isinstance(max_batch_bytes, bool)
+                or not isinstance(max_batch_bytes, int)
+                or max_batch_bytes < 1
+            ):
+                raise ValueError("max_batch_bytes must be a positive integer")
+            resolved_batch_bytes = min(
+                configured_batch_bytes, max_batch_bytes,
+            )
+        else:
+            resolved_batch_bytes = configured_batch_bytes
+        plan = replace(
+            plan,
+            batch_bytes=min(max(1, int(plan.batch_bytes)), resolved_batch_bytes),
+            batch_rows=min(
+                max(1, int(plan.batch_rows)),
+                max(1, resolved_batch_bytes // planned_row_width),
+            ),
+        )
         if plan.advice in {ExecutionAdvice.ROUTE_DUCKDB, ExecutionAdvice.ROUTE_SPARK}:
             raise IslandUnsupportedError(
                 f"bounded IslandDB plan routes to {plan.advice.value}: {plan.reason}"
@@ -4528,11 +4606,42 @@ class IslandDB:
             pass
         admission_started = time.perf_counter()
         admission_timeout = float(max(1, settings.DEFAULT_TIMEOUT_SEC))
-        if not _ISLAND_EXECUTION_SLOT.acquire(timeout=admission_timeout):
+        caller_remaining = caller_time_remaining()
+        if caller_remaining is not None:
+            admission_timeout = min(admission_timeout, caller_remaining)
+
+        def acquire_with_cancellation(gate, timeout: float) -> bool:
+            acquire_deadline = _monotonic() + max(0.0, timeout)
+            while True:
+                caller_time_remaining()
+                remaining = acquire_deadline - _monotonic()
+                if remaining <= 0:
+                    return False
+                if gate.acquire(timeout=min(remaining, 0.1)):
+                    return True
+
+        if not acquire_with_cancellation(
+            _ISLAND_EXECUTION_SLOT, admission_timeout,
+        ):
             raise IslandUnsupportedError(
                 "timed out waiting for the process-global IslandDB scan slot"
             )
-        if not _ARROW_POOL_LOCK.acquire(timeout=admission_timeout):
+        try:
+            arrow_pool_timeout = float(max(1, settings.DEFAULT_TIMEOUT_SEC))
+            caller_remaining = caller_time_remaining()
+            if caller_remaining is not None:
+                arrow_pool_timeout = min(arrow_pool_timeout, caller_remaining)
+        except BaseException:
+            _ISLAND_EXECUTION_SLOT.release()
+            raise
+        try:
+            arrow_pool_acquired = acquire_with_cancellation(
+                _ARROW_POOL_LOCK, arrow_pool_timeout,
+            )
+        except BaseException:
+            _ISLAND_EXECUTION_SLOT.release()
+            raise
+        if not arrow_pool_acquired:
             _ISLAND_EXECUTION_SLOT.release()
             raise IslandUnsupportedError(
                 "timed out stabilizing the process-global Arrow worker pools"
@@ -4551,10 +4660,17 @@ class IslandDB:
                         _ISLAND_EXECUTION_SLOT.release()
 
         try:
+            reservation_timeout = float(max(1, settings.DEFAULT_TIMEOUT_SEC))
+            caller_remaining = caller_time_remaining()
+            if caller_remaining is not None:
+                reservation_timeout = min(
+                    reservation_timeout, caller_remaining,
+                )
             reservation = self._governor.reserve(
                 plan,
                 query_id=query_id,
-                timeout=admission_timeout,
+                timeout=reservation_timeout,
+                cancel_event=query_cancel_event,
             )
         except BaseException:
             release_execution_slot()
@@ -4578,18 +4694,30 @@ class IslandDB:
             # to the documented bound keeps a malformed environment variable
             # from silently disabling the production safety deadline.
             configured_timeout = 300.0
-        execution_timeout = (
+        configured_execution_timeout = (
             configured_timeout
             if configured_timeout > 0
             else None
         )
-        deadline_monotonic = (
-            _monotonic() + execution_timeout
-            if execution_timeout is not None else None
+        configured_deadline = (
+            _monotonic() + configured_execution_timeout
+            if configured_execution_timeout is not None else None
         )
-        query_cancel_event = threading.Event()
+        effective_deadlines = [
+            deadline for deadline in (caller_deadline, configured_deadline)
+            if deadline is not None
+        ]
+        deadline_monotonic = min(effective_deadlines) if effective_deadlines else None
+        execution_timeout = (
+            max(0.0, deadline_monotonic - _monotonic())
+            if deadline_monotonic is not None else None
+        )
 
         def check_execution_deadline() -> None:
+            if query_cancel_event.is_set():
+                raise ResourceReservationCancelled(
+                    f"IslandDB query {query_id!r} was cancelled"
+                )
             if (
                 deadline_monotonic is not None
                 and _monotonic() >= deadline_monotonic
@@ -4795,7 +4923,13 @@ class IslandDB:
 
         def measured_batches():
             nonlocal result_rows, result_batches, result_bytes
-            batch_iterator = iter(batches)
+            bounded_batches = ByteBoundedArrowBatchIterator(
+                batches,
+                schema=schema,
+                max_batch_rows=max(1, int(plan.batch_rows)),
+                max_batch_bytes=resolved_batch_bytes,
+            )
+            batch_iterator = iter(bounded_batches)
             try:
                 while True:
                     check_execution_deadline()

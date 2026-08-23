@@ -2,7 +2,9 @@
 
 from dataclasses import dataclass
 import hashlib
+import hmac
 import json
+import re
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 from supertable.config.defaults import logger
@@ -25,6 +27,22 @@ class RoleAccessContext:
     role_type: RoleType
     tables: Dict[str, dict]
     fingerprint: str
+
+
+_POLICY_FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def validate_policy_fingerprint(
+    value: Optional[str],
+    *,
+    label: str = "policy fingerprint",
+) -> Optional[str]:
+    """Validate one canonical SHA-256 authorization-policy fingerprint."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or _POLICY_FINGERPRINT_RE.fullmatch(value) is None:
+        raise ValueError(f"{label} must be 64 lowercase hexadecimal characters")
+    return value
 
 
 def _resolve_role(role_manager: RoleManager, role_name: str) -> dict:
@@ -373,6 +391,8 @@ def restrict_read_access(
         aggregate_children: Optional[
             Dict[Tuple[str, str], Iterable[str]]
         ] = None,
+        expected_role_policy_fingerprint: Optional[str] = None,
+        policy_fingerprints_out: Optional[Dict[str, str]] = None,
 ) -> Dict[str, "RbacViewDef"]:
     """Authorize every physical table and build fail-closed RBAC views.
 
@@ -383,6 +403,11 @@ def restrict_read_access(
     role contract; table and column comparisons are case-insensitive.
     """
     from supertable.data_classes import RbacViewDef
+
+    expected_role_policy_fingerprint = validate_policy_fingerprint(
+        expected_role_policy_fingerprint,
+        label="expected_role_policy_fingerprint",
+    )
 
     contexts: Dict[str, RoleAccessContext] = {}
     policies: Dict[Tuple[str, str], dict] = {}
@@ -408,6 +433,23 @@ def restrict_read_access(
             "read the table",
         )
         contexts[namespace.casefold()] = context
+
+    if policy_fingerprints_out is not None:
+        if not isinstance(policy_fingerprints_out, dict):
+            raise TypeError("policy_fingerprints_out must be a dict")
+        policy_fingerprints_out.clear()
+        policy_fingerprints_out.update({
+            namespace: context.fingerprint
+            for namespace, context in sorted(contexts.items())
+        })
+
+    if expected_role_policy_fingerprint is not None:
+        expected_context = contexts.get(str(super_name).casefold())
+        if expected_context is None or not hmac.compare_digest(
+            expected_context.fingerprint,
+            expected_role_policy_fingerprint,
+        ):
+            raise PermissionError("Role policy changed before query execution")
 
     for pt in physical_tables:
         context = contexts.get(str(pt.super_name).casefold())

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import math
 import re
 import threading
+import time
 from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Callable, Optional, Tuple, Any, List, Dict
@@ -37,11 +40,15 @@ from supertable.engine.engine_common import (
     redact_url_credentials,
     validate_rbac_binding_stability,
 )
-from supertable.rbac.access_control import restrict_read_access  # noqa: F401
+from supertable.rbac.access_control import (
+    restrict_read_access,  # noqa: F401
+    validate_policy_fingerprint,
+)
 
 from supertable.engine.data_estimator import DataEstimator
 from supertable.engine.executor import Executor
 from supertable.engine.engine_enum import Engine as engine
+from supertable.engine.island_resources import ResourceReservationCancelled
 from supertable.data_classes import (
     MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES,
     RbacViewDef,
@@ -194,6 +201,12 @@ class _MonitoredResultStream:
                 raise monitoring_exc from exc
             raise
         self._record_batch(batch)
+        if bool(getattr(self._inner, "successful_completion", False)):
+            # A bounded export reaching its exact authorized row budget is a
+            # completed query, not an abandoned stream. Finalize now so a
+            # caller that closes immediately after consuming the last batch
+            # cannot turn the read/AUTO observation into a false failure.
+            self._finish(Status.OK.value, None)
         return batch
 
     def cancel(self) -> None:
@@ -244,6 +257,139 @@ class _MonitoredResultStream:
             pass
 
 
+class _RowBudgetResultStream:
+    """Defence-in-depth row ceiling around an already SQL-bounded stream."""
+
+    def __init__(self, inner: Any, max_total_rows: int) -> None:
+        if (
+            isinstance(max_total_rows, bool)
+            or not isinstance(max_total_rows, int)
+            or max_total_rows <= 0
+        ):
+            raise ValueError("max_total_rows must be a positive integer")
+        self._inner = inner
+        self._remaining = max_total_rows
+        self._closed = False
+        self._successful_completion = False
+        self.schema = inner.schema
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed or self._remaining <= 0:
+            raise StopIteration
+        batch = next(self._inner)
+        rows = max(0, int(getattr(batch, "num_rows", 0)))
+        if rows <= self._remaining:
+            self._remaining -= rows
+            if self._remaining == 0:
+                self._inner.close()
+                self._closed = True
+                self._successful_completion = True
+            return batch
+
+        # The outer SQL LIMIT should make this unreachable.  If a backend ever
+        # violates it, expose only the authorized budget and stop the producer
+        # before another batch can be fetched.
+        bounded = batch.slice(0, self._remaining)
+        self._remaining = 0
+        cancel = getattr(self._inner, "cancel", None)
+        if callable(cancel):
+            cancel()
+        else:
+            self._inner.close()
+        self._closed = True
+        self._successful_completion = True
+        return bounded
+
+    def cancel(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        cancel = getattr(self._inner, "cancel", None)
+        if callable(cancel):
+            cancel()
+        else:
+            self._inner.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._inner.close()
+
+    @property
+    def closed(self) -> bool:
+        # ``_closed`` means this wrapper has requested termination. An
+        # ArrowBatchStream with an active next() does not become quiescent until
+        # that call unwinds, so consumers that own an external lease must observe
+        # the inner stream's stronger lifecycle signal when it is available.
+        try:
+            inner_closed = getattr(self._inner, "closed")
+        except AttributeError:
+            return self._closed
+        return bool(inner_closed)
+
+    @property
+    def successful_completion(self) -> bool:
+        return self._successful_completion
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+
+class _QueryOutResultStream:
+    """Refresh a caller-owned metadata dict whenever a stream terminates."""
+
+    def __init__(self, inner: Any, refresh: Callable[[], None]) -> None:
+        self._inner = inner
+        self._refresh = refresh
+        self.schema = inner.schema
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self._inner)
+        except BaseException:
+            self._refresh()
+            raise
+
+    def cancel(self) -> None:
+        try:
+            cancel = getattr(self._inner, "cancel", None)
+            if callable(cancel):
+                cancel()
+            else:
+                self._inner.close()
+        finally:
+            self._refresh()
+
+    def close(self) -> None:
+        try:
+            self._inner.close()
+        finally:
+            self._refresh()
+
+    @property
+    def closed(self) -> bool:
+        return bool(getattr(self._inner, "closed", False))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc is not None:
+            self.cancel()
+        else:
+            self.close()
+
+
 _SPARK_UNSAFE_PREDICATE_LANES = frozenset({
     "numeric_cast", "date", "timestamp", "timestamptz",
 })
@@ -267,12 +413,76 @@ def _positive_budget(name: str, fallback: int) -> int:
     return value if value > 0 else fallback
 
 
-def _validate_query_complexity(sql: str) -> None:
-    """Reject oversized/deep SELECT syntax before planning or execution."""
+def _configured_result_stream_batch_rows() -> int:
+    """Return the public Arrow batch cap shared by interactive/export reads."""
+    try:
+        value = int(
+            getattr(settings, "SUPERTABLE_RESULT_STREAM_BATCH_ROWS", 256)
+        )
+    except (TypeError, ValueError, OverflowError):
+        value = 256
+    return max(1, min(value, 4096))
+
+
+def _configured_result_stream_batch_bytes() -> int:
+    """Return the hard logical-byte cap for one public Arrow batch."""
+    try:
+        value = int(
+            getattr(
+                settings,
+                "SUPERTABLE_RESULT_STREAM_BATCH_BYTES",
+                4 * 1024 * 1024,
+            )
+        )
+    except (TypeError, ValueError, OverflowError):
+        value = 4 * 1024 * 1024
+    return value if value > 0 else 4 * 1024 * 1024
+
+
+def _caller_deadline(timeout_sec: Optional[float]) -> Optional[float]:
+    """Validate a caller timeout and convert it to an absolute deadline."""
+    if timeout_sec is None:
+        return None
+    if isinstance(timeout_sec, bool):
+        raise ValueError("timeout_sec must be a finite positive number")
+    try:
+        timeout = float(timeout_sec)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("timeout_sec must be a finite positive number") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout_sec must be a finite positive number")
+    return time.monotonic() + timeout
+
+
+def _validate_query_text_size(sql: str) -> None:
+    """Cheap guard that must run before SQLGlot sees attacker-sized input."""
     if len(str(sql).encode("utf-8")) > _positive_budget(
         "SUPERTABLE_MAX_QUERY_BYTES", 64 * 1024,
     ):
         raise ValueError("SQL text exceeds the configured query-size budget")
+
+
+def _ensure_request_active(
+    deadline_monotonic: Optional[float],
+    cancel_event: Optional[threading.Event],
+) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise ResourceReservationCancelled("query was cancelled")
+    if deadline_monotonic is None:
+        return
+    try:
+        deadline = float(deadline_monotonic)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("query deadline must be finite") from exc
+    if not math.isfinite(deadline):
+        raise ValueError("query deadline must be finite")
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Query deadline expired")
+
+
+def _validate_query_complexity(sql: str) -> None:
+    """Reject oversized/deep SELECT syntax before planning or execution."""
+    _validate_query_text_size(sql)
     try:
         statements = [
             statement
@@ -340,7 +550,108 @@ def _validated_share_row_filter(raw_filter: object) -> str:
     )
     if forbidden and any(isinstance(node, forbidden) for node in where.walk()):
         raise RuntimeError("Linked-share row filter must be table-local")
+    allowed_function_types = tuple(
+        node_type
+        for name in (
+            # SQLGlot models boolean conjunction/disjunction as Func nodes even
+            # though they are operators rather than callable SQL functions.
+            "And", "Or",
+            "Cast", "TryCast",
+            "Abs", "Ceil", "Floor", "Round",
+            "Lower", "Upper", "Trim", "LTrim", "RTrim", "Length",
+            "Substring", "Coalesce", "IfNull", "Nullif",
+        )
+        if isinstance((node_type := getattr(exp, name, None)), type)
+    )
+    for node in where.walk():
+        if isinstance(node, exp.Func) and not isinstance(
+            node, allowed_function_types,
+        ):
+            # Unknown/anonymous functions include DuckDB settings, filesystem,
+            # extension, sequence, and table-function surfaces. A persisted
+            # authorization predicate is not a general SQL execution context.
+            raise RuntimeError(
+                "Linked-share row filter uses an unavailable function"
+            )
     return where.this.sql(dialect="duckdb")
+
+
+def _effective_read_policy_fingerprint(
+    role_policy_fingerprints: Dict[str, str],
+    reflection: Any,
+) -> str:
+    """Seal the exact data-free authorization state used by one reflection."""
+    namespaces = []
+    for raw_namespace, raw_fingerprint in sorted(
+        role_policy_fingerprints.items(), key=lambda item: str(item[0]).casefold(),
+    ):
+        fingerprint = validate_policy_fingerprint(
+            raw_fingerprint,
+            label="resolved role policy fingerprint",
+        )
+        assert fingerprint is not None
+        namespaces.append({
+            "namespace": str(raw_namespace).casefold(),
+            "role_policy_fingerprint": fingerprint,
+        })
+
+    snapshots = []
+    for snapshot in sorted(
+        (getattr(reflection, "supers", None) or []),
+        key=lambda item: (
+            str(getattr(item, "super_name", "")).casefold(),
+            str(getattr(item, "simple_name", "")).casefold(),
+        ),
+    ):
+        share_policy_fingerprint = getattr(
+            snapshot, "share_policy_fingerprint", None,
+        )
+        if share_policy_fingerprint is not None:
+            share_policy_fingerprint = validate_policy_fingerprint(
+                share_policy_fingerprint,
+                label="linked-share policy fingerprint",
+            )
+        snapshots.append({
+            "namespace": str(getattr(snapshot, "super_name", "")).casefold(),
+            "table": str(getattr(snapshot, "simple_name", "")).casefold(),
+            "share_policy_fingerprint": share_policy_fingerprint or "",
+            "share_row_filter": str(
+                getattr(snapshot, "share_row_filter", None) or ""
+            ),
+        })
+
+    protected_views = []
+    for raw_alias, view in sorted(
+        (getattr(reflection, "rbac_views", None) or {}).items(),
+        key=lambda item: str(item[0]).casefold(),
+    ):
+        allowed = list(getattr(view, "allowed_columns", None) or [])
+        excluded = list(getattr(view, "excluded_columns", None) or [])
+        protected_views.append({
+            "alias": str(raw_alias).casefold(),
+            "allowed_columns": (
+                ["*"] if allowed == ["*"]
+                else sorted(str(column).casefold() for column in allowed)
+            ),
+            "excluded_columns": sorted(
+                str(column).casefold() for column in excluded
+            ),
+            "where_clause": str(getattr(view, "where_clause", "") or ""),
+        })
+
+    identity = {
+        "version": 1,
+        "namespaces": namespaces,
+        "snapshots": snapshots,
+        "protected_views": protected_views,
+    }
+    return hashlib.sha256(json.dumps(
+        identity,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
 
 
 def _redact_storage_credentials(message: object) -> str:
@@ -441,6 +752,8 @@ class DataReader:
         self.timer: Optional[Timer] = None
         self.plan_stats: Optional[PlanStats] = None
         self.query_plan_manager: Optional[QueryPlanManager] = None
+        self.role_policy_fingerprint = ""
+        self.effective_policy_fingerprint = ""
 
         self._log_ctx = ""
 
@@ -732,11 +1045,32 @@ class DataReader:
         *,
         _streaming: bool = False,
         _stream_batch_rows: Optional[int] = None,
+        _stream_batch_bytes: Optional[int] = None,
+        _stream_row_limit: Optional[int] = None,
+        _deadline_monotonic: Optional[float] = None,
+        _cancel_event: Optional[threading.Event] = None,
+        expected_role_policy_fingerprint: Optional[str] = None,
+        expected_effective_policy_fingerprint: Optional[str] = None,
+        _policy_fingerprint_only: bool = False,
     ) -> Tuple[Any, Status, Optional[str]]:
+        expected_role_policy_fingerprint = validate_policy_fingerprint(
+            expected_role_policy_fingerprint,
+            label="expected_role_policy_fingerprint",
+        )
+        expected_effective_policy_fingerprint = validate_policy_fingerprint(
+            expected_effective_policy_fingerprint,
+            label="expected_effective_policy_fingerprint",
+        )
+        if not isinstance(_policy_fingerprint_only, bool):
+            raise TypeError("_policy_fingerprint_only must be boolean")
+        self.role_policy_fingerprint = ""
+        self.effective_policy_fingerprint = ""
         status = Status.ERROR
         message: Optional[str] = None
+        typed_failure: Optional[BaseException] = None
         self.timer = Timer()
         self.plan_stats = PlanStats()
+        _ensure_request_active(_deadline_monotonic, _cancel_event)
 
         # Classify into an allowed read-path command. Ordinary SELECTs fall
         # through unchanged; EXPLAIN/SHOW STATS are the two diagnostic
@@ -763,15 +1097,34 @@ class DataReader:
             except ValueError as e:
                 logger.warning(self._lp(f"rejected query: {e}"))
                 return pd.DataFrame(), Status.ERROR, str(e)
+        _ensure_request_active(_deadline_monotonic, _cancel_event)
 
         bounded_sql = command.sql
         if command.kind is CommandKind.SELECT:
+            result_limit = _positive_budget("SUPERTABLE_MAX_LIMIT", 5000)
+            if _stream_row_limit is not None:
+                if not _streaming:
+                    raise ValueError(
+                        "an export row budget requires result streaming"
+                    )
+                if (
+                    isinstance(_stream_row_limit, bool)
+                    or not isinstance(_stream_row_limit, int)
+                    or _stream_row_limit <= 0
+                ):
+                    raise ValueError(
+                        "max_total_rows must be a positive integer"
+                    )
+                result_limit = _stream_row_limit
             # Enforce the server ceiling at the DataReader boundary too.  SDK
             # callers can instantiate DataReader directly and must not bypass
-            # query_sql()'s convenience LIMIT injection.
+            # query_sql()'s convenience LIMIT injection.  The separate export
+            # path supplies its own explicit positive ceiling and remains
+            # incrementally streamed rather than materialized.
             bounded_sql = _ensure_sql_limit(
                 command.sql,
-                _positive_budget("SUPERTABLE_MAX_LIMIT", 5000),
+                result_limit,
+                maximum_limit=result_limit,
             )
 
         # SHOW STATS short-circuits the engine entirely — it returns the raw
@@ -838,9 +1191,18 @@ class DataReader:
             "tables": tables,
             "physical_tables": physical_tables,
         }
+        role_policy_fingerprints: Dict[str, str] = {}
+        rbac_kwargs["policy_fingerprints_out"] = role_policy_fingerprints
+        if expected_role_policy_fingerprint is not None:
+            rbac_kwargs["expected_role_policy_fingerprint"] = (
+                expected_role_policy_fingerprint
+            )
         if aggregate_children:
             rbac_kwargs["aggregate_children"] = aggregate_children
         rbac_views = restrict_read_access(**rbac_kwargs)
+        self.role_policy_fingerprint = role_policy_fingerprints.get(
+            str(self.super_name).casefold(), "",
+        )
         validate_rbac_binding_stability(parser, rbac_views)
 
         try:
@@ -860,13 +1222,6 @@ class DataReader:
                         f"{observation_error}"
                     )
                 )
-            # Make executor aware of storage for presign retry
-            executor = Executor(
-                storage=self.storage,
-                organization=self.organization,
-                auto_history_provider=history_provider,
-            )
-
             # Initialize plan manager and query id/hash (same as before)
             self.query_plan_manager = QueryPlanManager(
                 super_name=self.super_name,
@@ -924,6 +1279,7 @@ class DataReader:
                 estimator_kwargs["aggregate_children"] = aggregate_children
             estimator = DataEstimator(**estimator_kwargs)
             reflection = estimator.estimate()
+            _ensure_request_active(_deadline_monotonic, _cancel_event)
 
             logger.info(self._lp(f"[estimate] storage={reflection.storage_type} | files={reflection.total_reflections} | bytes={reflection.reflection_bytes}"))
 
@@ -1165,11 +1521,89 @@ class DataReader:
                     )
 
                 # Linked-share policy is pinned alongside the same resources.
+                # Its provider/schema column projection is an authorization
+                # boundary of its own and must be intersected with local RBAC.
+                share_policy_fingerprint = getattr(
+                    sup, "share_policy_fingerprint", None,
+                )
+                share_allowed_columns = getattr(
+                    sup, "share_allowed_columns", None,
+                )
+                if share_policy_fingerprint is None:
+                    if share_allowed_columns is not None:
+                        raise RuntimeError(
+                            "Linked-share column policy has no authoritative seal"
+                        )
+                else:
+                    validate_policy_fingerprint(
+                        share_policy_fingerprint,
+                        label="linked-share policy fingerprint",
+                    )
+                    if not isinstance(share_allowed_columns, list) or not (
+                        share_allowed_columns
+                    ):
+                        raise RuntimeError(
+                            "Linked-share column policy is unavailable"
+                        )
+                    share_columns_by_folded: Dict[str, str] = {}
+                    for raw_column in share_allowed_columns:
+                        if not isinstance(raw_column, str) or not raw_column:
+                            raise RuntimeError(
+                                "Linked-share column policy is invalid"
+                            )
+                        folded = raw_column.casefold()
+                        if folded in share_columns_by_folded:
+                            raise RuntimeError(
+                                "Linked-share column policy is ambiguous"
+                            )
+                        share_columns_by_folded[folded] = raw_column
+
+                    existing_rbac = reflection.rbac_views.get(td.alias)
+                    if existing_rbac is None:
+                        existing_rbac = RbacViewDef(
+                            allowed_columns=sorted(
+                                share_columns_by_folded.values(),
+                                key=str.casefold,
+                            ),
+                        )
+                        reflection.rbac_views[td.alias] = existing_rbac
+                    else:
+                        role_allowed = list(
+                            getattr(existing_rbac, "allowed_columns", None) or []
+                        )
+                        if role_allowed == ["*"]:
+                            effective_columns = dict(share_columns_by_folded)
+                        else:
+                            role_allowed_folded = {
+                                str(column).casefold() for column in role_allowed
+                            }
+                            effective_columns = {
+                                folded: name
+                                for folded, name in share_columns_by_folded.items()
+                                if folded in role_allowed_folded
+                            }
+                        excluded = {
+                            str(column).casefold()
+                            for column in (
+                                getattr(existing_rbac, "excluded_columns", None)
+                                or []
+                            )
+                        }
+                        if not set(effective_columns).difference(excluded):
+                            raise PermissionError(
+                                f"You don't have permission to read any columns in "
+                                f"'{td.simple_name}'."
+                            )
+                        existing_rbac.allowed_columns = sorted(
+                            effective_columns.values(), key=str.casefold,
+                        )
+
                 share_row_filter = getattr(sup, "share_row_filter", None)
                 if share_row_filter:
                     share_row_filter = _validated_share_row_filter(
                         share_row_filter
                     )
+                    sup.share_row_filter = share_row_filter
                     existing_rbac = reflection.rbac_views.get(td.alias)
                     if existing_rbac:
                         if existing_rbac.where_clause:
@@ -1189,6 +1623,44 @@ class DataReader:
                 message = "No parquet files found"
                 return pd.DataFrame(), status, message
 
+            if not role_policy_fingerprints:
+                if (
+                    expected_role_policy_fingerprint is not None
+                    or expected_effective_policy_fingerprint is not None
+                    or _policy_fingerprint_only
+                ):
+                    raise PermissionError(
+                        "Authoritative role policy fingerprint is unavailable"
+                    )
+            else:
+                self.effective_policy_fingerprint = (
+                    _effective_read_policy_fingerprint(
+                        role_policy_fingerprints, reflection,
+                    )
+                )
+
+            if expected_effective_policy_fingerprint is not None and not (
+                self.effective_policy_fingerprint
+                and hmac.compare_digest(
+                    self.effective_policy_fingerprint,
+                    expected_effective_policy_fingerprint,
+                )
+            ):
+                raise PermissionError(
+                    "Effective read policy changed before query execution"
+                )
+
+            if _policy_fingerprint_only:
+                return pd.DataFrame(), Status.OK, None
+
+            # Construct the executor only after every submitting-policy pin has
+            # matched the exact protected reflection it will receive.
+            executor = Executor(
+                storage=self.storage,
+                organization=self.organization,
+                auto_history_provider=history_provider,
+            )
+
             # 2) EXECUTE.  EXPLAIN is pinned to DuckDB so the plan is
             # produced cheaply and uniformly (no Pro materialisation / Spark
             # round trip) and prefixed onto the final rewritten query.
@@ -1199,6 +1671,7 @@ class DataReader:
             if _streaming:
                 if command.explain:
                     raise ValueError("EXPLAIN does not support result streaming")
+                _ensure_request_active(_deadline_monotonic, _cancel_event)
                 result_value, _engine_used = executor.execute_stream(
                     engine=exec_engine,
                     reflection=reflection,
@@ -1208,7 +1681,14 @@ class DataReader:
                     plan_stats=self.plan_stats,
                     log_prefix=self._lp(""),
                     max_batch_rows=_stream_batch_rows,
+                    max_batch_bytes=_stream_batch_bytes,
+                    deadline_monotonic=_deadline_monotonic,
+                    cancel_event=_cancel_event,
                 )
+                if _stream_row_limit is not None:
+                    result_value = _RowBudgetResultStream(
+                        result_value, _stream_row_limit,
+                    )
                 result_shape = (0, len(result_value.schema))
                 self.plan_stats.add_stat({
                     "RESULT_ROWS": None,
@@ -1240,6 +1720,17 @@ class DataReader:
                     "RESULT_COLUMNS": max(0, int(result_shape[1])),
                 })
             status = Status.OK
+        except PermissionError:
+            # Authorization pins and linked-share policy validation are security
+            # decisions, not ordinary backend failures. Preserve their type for
+            # service layers and never turn them into an empty successful result.
+            raise
+        except (ResourceReservationCancelled, TimeoutError) as e:
+            typed_failure = e
+            message = _redact_storage_credentials(e)
+            logger.warning(self._lp(f"query stopped: {message}"))
+            result_value = pd.DataFrame()
+            result_shape = result_value.shape
         except Exception as e:
             message = _redact_storage_credentials(e)
             logger.error(self._lp(f"Exception: {message}"))
@@ -1338,6 +1829,8 @@ class DataReader:
             logger.error(self._lp(f"extend_execution_plan exception: {e}"))
 
         self.timer.capture_and_reset_timing(event="EXTENDING_PLAN")
+        if typed_failure is not None:
+            raise typed_failure
         return result_value, status, message
 
     def execute_stream(
@@ -1346,6 +1839,12 @@ class DataReader:
         engine: engine = engine.ISLANDDB,
         *,
         max_batch_rows: Optional[int] = None,
+        max_batch_bytes: Optional[int] = None,
+        timeout_sec: Optional[float] = None,
+        cancel_event: Optional[threading.Event] = None,
+        _deadline_monotonic: Optional[float] = None,
+        expected_role_policy_fingerprint: Optional[str] = None,
+        expected_effective_policy_fingerprint: Optional[str] = None,
     ) -> Tuple[Any, Status, Optional[str]]:
         """Execute through the normal preflight/RBAC path as an Arrow stream.
 
@@ -1354,13 +1853,81 @@ class DataReader:
         may safely select either); unsupported Spark requests return the
         ordinary ``Status.ERROR`` result without running user SQL.
         """
+        deadline = (
+            _deadline_monotonic
+            if _deadline_monotonic is not None
+            else _caller_deadline(timeout_sec)
+        )
+        _ensure_request_active(deadline, cancel_event)
         return self.execute(
             role_name=role_name,
             engine=engine,
             with_scan=False,
             _streaming=True,
             _stream_batch_rows=max_batch_rows,
+            _stream_batch_bytes=max_batch_bytes,
+            _deadline_monotonic=deadline,
+            _cancel_event=cancel_event,
+            expected_role_policy_fingerprint=(
+                expected_role_policy_fingerprint
+            ),
+            expected_effective_policy_fingerprint=(
+                expected_effective_policy_fingerprint
+            ),
         )
+
+    def execute_export_stream(
+        self,
+        role_name: str,
+        engine: engine = engine.AUTO,
+        *,
+        max_total_rows: int,
+        timeout_sec: float,
+        max_batch_rows: Optional[int] = None,
+        max_batch_bytes: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+        _deadline_monotonic: Optional[float] = None,
+        expected_role_policy_fingerprint: Optional[str] = None,
+        expected_effective_policy_fingerprint: Optional[str] = None,
+    ) -> Tuple[Any, Status, Optional[str]]:
+        """Execute a large RBAC-filtered export as a bounded Arrow stream.
+
+        This is deliberately separate from :meth:`execute_stream`, whose
+        interactive contract remains capped by ``SUPERTABLE_MAX_LIMIT``.  An
+        export cannot run without both an explicit positive total-row budget
+        and an explicit finite positive caller timeout.
+        """
+        if (
+            isinstance(max_total_rows, bool)
+            or not isinstance(max_total_rows, int)
+            or max_total_rows <= 0
+        ):
+            raise ValueError("max_total_rows must be a positive integer")
+        deadline = (
+            _deadline_monotonic
+            if _deadline_monotonic is not None
+            else _caller_deadline(timeout_sec)
+        )
+        _ensure_request_active(deadline, cancel_event)
+        assert deadline is not None
+        return self.execute(
+            role_name=role_name,
+            engine=engine,
+            with_scan=False,
+            _streaming=True,
+            _stream_batch_rows=max_batch_rows,
+            _stream_batch_bytes=max_batch_bytes,
+            _stream_row_limit=max_total_rows,
+            _deadline_monotonic=deadline,
+            _cancel_event=cancel_event,
+            expected_role_policy_fingerprint=(
+                expected_role_policy_fingerprint
+            ),
+            expected_effective_policy_fingerprint=(
+                expected_effective_policy_fingerprint
+            ),
+        )
+
 
 def _constant_limit_value(expression: exp.Expression) -> int:
     """Evaluate a deliberately small, exact integer LIMIT grammar.
@@ -1466,7 +2033,12 @@ def _is_unbounded_limit(expression: exp.Expression) -> bool:
     )
 
 
-def _ensure_sql_limit(sql: str, default_limit: int) -> str:
+def _ensure_sql_limit(
+    sql: str,
+    default_limit: int,
+    *,
+    maximum_limit: Optional[int] = None,
+) -> str:
     """
     If the outermost query has no LIMIT clause, append one.
 
@@ -1480,7 +2052,16 @@ def _ensure_sql_limit(sql: str, default_limit: int) -> str:
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError("Query limit must be an integer") from exc
     requested = max(0, requested)
-    maximum = _positive_budget("SUPERTABLE_MAX_LIMIT", 5000)
+    if maximum_limit is None:
+        maximum = _positive_budget("SUPERTABLE_MAX_LIMIT", 5000)
+    else:
+        if (
+            isinstance(maximum_limit, bool)
+            or not isinstance(maximum_limit, int)
+            or maximum_limit <= 0
+        ):
+            raise ValueError("maximum query limit must be a positive integer")
+        maximum = maximum_limit
     enforced = min(requested, maximum)
 
     # Inspect the actual outer query node. Regex-only detection mistakes nested
@@ -1639,6 +2220,125 @@ def _public_arrow_type_name(field_type: Any) -> str:
     return str(field_type)
 
 
+def _latest_plan_stat(stats: Tuple[dict, ...], key: str) -> Any:
+    for entry in reversed(stats):
+        if isinstance(entry, dict) and key in entry:
+            return entry[key]
+    return None
+
+
+def _engine_name(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw or "").strip().casefold()
+
+
+def _update_query_out(
+    reader: DataReader,
+    out: Optional[Dict[str, Any]],
+    *,
+    requested_engine: Any,
+) -> None:
+    """Expose data-free routing/cache facts to the calling service."""
+    if out is None:
+        return
+    qpm = getattr(reader, "query_plan_manager", None)
+    query_id = getattr(qpm, "query_id", "") if qpm is not None else ""
+    query_hash = getattr(qpm, "query_hash", "") if qpm is not None else ""
+    out["query_id"] = query_id if isinstance(query_id, str) else ""
+    out["query_hash"] = query_hash if isinstance(query_hash, str) else ""
+    role_policy_fingerprint = getattr(
+        reader, "role_policy_fingerprint", "",
+    )
+    effective_policy_fingerprint = getattr(
+        reader, "effective_policy_fingerprint", "",
+    )
+    if isinstance(role_policy_fingerprint, str) and role_policy_fingerprint:
+        out["role_policy_fingerprint"] = role_policy_fingerprint
+    if (
+        isinstance(effective_policy_fingerprint, str)
+        and effective_policy_fingerprint
+    ):
+        out["effective_policy_fingerprint"] = effective_policy_fingerprint
+
+    plan_stats = getattr(reader, "plan_stats", None)
+    stats = tuple(
+        entry for entry in (getattr(plan_stats, "stats", ()) or ())
+        if isinstance(entry, dict)
+    )
+    request = _latest_plan_stat(stats, "ENGINE_REQUEST")
+    routing = _latest_plan_stat(stats, "AUTO_ROUTING")
+    outcome = _latest_plan_stat(stats, "AUTO_ROUTING_OUTCOME")
+    recorded_engine = _latest_plan_stat(stats, "ENGINE")
+    presign_refresh = _latest_plan_stat(stats, "DUCKDB_PRESIGN_REFRESH")
+    engine_failure = _latest_plan_stat(stats, "ENGINE_FAILURE")
+    connection_cache = _latest_plan_stat(stats, "DUCKDB_CONNECTION_CACHE")
+    engine_attempts = [
+        dict(entry["ENGINE_ATTEMPT"])
+        for entry in stats
+        if isinstance(entry.get("ENGINE_ATTEMPT"), dict)
+    ]
+    if not any((
+        request, routing, outcome, recorded_engine, presign_refresh,
+        engine_failure, connection_cache, engine_attempts,
+    )) and not any(
+        any(str(key).startswith("FILE_CACHE_") or key == "ISLAND_CACHE" for key in entry)
+        for entry in stats
+    ):
+        # Preserve the historical identity-only out contract for custom/legacy
+        # DataReader implementations that do not publish engine plan stats.
+        return
+
+    requested = _engine_name(requested_engine)
+    selected = ""
+    if isinstance(request, dict):
+        requested = _engine_name(request.get("requested_engine")) or requested
+        selected = _engine_name(request.get("selected_engine"))
+    if not selected and isinstance(routing, dict):
+        selected = _engine_name(routing.get("selected_engine"))
+    if not selected and isinstance(outcome, dict):
+        selected = _engine_name(outcome.get("selected_engine"))
+
+    actual = ""
+    fallback = False
+    if isinstance(outcome, dict):
+        actual = _engine_name(outcome.get("actual_engine"))
+        fallback = bool(outcome.get("fallback", False))
+    actual = actual or _engine_name(recorded_engine)
+    if not actual and engine_attempts:
+        actual = _engine_name(engine_attempts[-1].get("engine"))
+    selected = selected or actual or requested
+    if actual and selected and not isinstance(outcome, dict):
+        fallback = actual != selected
+
+    cache: Dict[str, Any] = {}
+    for entry in stats:
+        for key, value in entry.items():
+            if str(key).startswith("FILE_CACHE_"):
+                cache[str(key)] = value
+    island_cache = _latest_plan_stat(stats, "ISLAND_CACHE")
+    if isinstance(island_cache, dict):
+        cache["ISLAND_CACHE"] = dict(island_cache)
+    if isinstance(connection_cache, dict):
+        cache["DUCKDB_CONNECTION_CACHE"] = dict(connection_cache)
+
+    out.update({
+        "requested_engine": requested,
+        "selected_engine": selected,
+        "actual_engine": actual,
+        "engine_fallback": fallback,
+        "engine_attempts": engine_attempts,
+        "engine_failure": (
+            dict(engine_failure) if isinstance(engine_failure, dict) else {}
+        ),
+        "routing": dict(routing) if isinstance(routing, dict) else {},
+        "cache": cache,
+        "presign_refresh": (
+            dict(presign_refresh)
+            if isinstance(presign_refresh, dict) else {}
+        ),
+    })
+
+
 def query_sql(
         organization: str,
         super_name: str,
@@ -1648,6 +2348,8 @@ def query_sql(
         role_name: str,
         source: str = "sdk",
         out: Optional[Dict[str, Any]] = None,
+        timeout_sec: Optional[float] = None,
+        cancel_event: Optional[threading.Event] = None,
 ) -> Tuple[List[str], List[List[Any]], List[Dict[str, Any]]]:
     """
     Execute SQL query and return results in the format expected by MCP server.
@@ -1655,9 +2357,13 @@ def query_sql(
 
     ``source`` tags the query origin on the read monitoring entry
     (defaults to "sdk"; the MCP server passes "mcp"). When an ``out``
-    dict is supplied it is populated with ``query_id``/``query_hash`` so
-    the caller can correlate its own audit log to this read record.
+    dict is supplied it is populated with query identity plus data-free engine
+    routing, fallback, cache, and credential-refresh metadata so the caller can
+    correlate its own audit log to this read record.
     """
+    request_deadline = _caller_deadline(timeout_sec)
+    _validate_query_text_size(sql)
+    _ensure_request_active(request_deadline, cancel_event)
     # Safety guard: ensure a LIMIT is present so unbounded queries don't
     # overwhelm the MCP response payload. Only plain SELECTs take an appended
     # LIMIT — EXPLAIN output is tiny and SHOW STATS does not accept a LIMIT.
@@ -1685,31 +2391,33 @@ def query_sql(
             "Bounded query_sql responses do not support Spark SQL streaming"
         )
     if stream_response:
-        result_value, status, message = reader.execute_stream(
-            role_name=role_name,
-            engine=engine,
-            # Serialized-byte accounting begins after a native Arrow batch is
-            # produced. One row per producer batch prevents multiple
-            # arbitrary-width cells from accumulating ahead of that guard.
-            max_batch_rows=1,
-        )
+        try:
+            result_value, status, message = reader.execute_stream(
+                role_name=role_name,
+                engine=engine,
+                max_batch_rows=_configured_result_stream_batch_rows(),
+                max_batch_bytes=_configured_result_stream_batch_bytes(),
+                timeout_sec=timeout_sec,
+                cancel_event=cancel_event,
+                _deadline_monotonic=request_deadline,
+            )
+        except BaseException:
+            _update_query_out(reader, out, requested_engine=engine)
+            raise
     else:
         # Diagnostic commands are intrinsically bounded; the non-enum branch
         # also preserves duck-typed compatibility for custom/test executors.
-        result_value, status, message = reader.execute(
-            role_name=role_name,
-            engine=engine,
-            with_scan=False,
-        )
+        try:
+            result_value, status, message = reader.execute(
+                role_name=role_name,
+                engine=engine,
+                with_scan=False,
+            )
+        except BaseException:
+            _update_query_out(reader, out, requested_engine=engine)
+            raise
 
-    # Expose the query identity so the caller (e.g. the MCP audit log) can
-    # link back to this read's monitoring entry. Populated even on error,
-    # since the QueryPlanManager is created before execution.
-    if out is not None:
-        qpm = reader.query_plan_manager
-        if qpm is not None:
-            out["query_id"] = qpm.query_id
-            out["query_hash"] = qpm.query_hash
+    _update_query_out(reader, out, requested_engine=engine)
 
     if status == Status.ERROR:
         raise RuntimeError(f"Query execution failed: {message}")
@@ -1784,6 +2492,7 @@ def query_sql(
                     rows.append(row)
         finally:
             stream.close()
+            _update_query_out(reader, out, requested_engine=engine)
         return columns, rows, columns_meta
 
     # Convert DataFrame to the expected format
@@ -1832,3 +2541,184 @@ def query_sql(
         rows.append(row)
 
     return columns, rows, columns_meta
+
+
+def query_sql_policy_fingerprint(
+    organization: str,
+    super_name: str,
+    sql: str,
+    engine: Any,
+    role_name: str,
+    *,
+    timeout_sec: float,
+    source: str = "sdk",
+    out: Optional[Dict[str, Any]] = None,
+    cancel_event: Optional[threading.Event] = None,
+    expected_role_policy_fingerprint: Optional[str] = None,
+) -> str:
+    """Resolve the exact current query policy through the normal read preflight.
+
+    This runs parser, target-existence, RBAC, and estimator/snapshot pinning, but
+    deliberately stops before constructing an executor. Services may bind the
+    returned value to an artifact and pass it back to ``query_sql_stream`` as
+    ``expected_effective_policy_fingerprint`` to close a queued-execution gap.
+    """
+    request_deadline = _caller_deadline(timeout_sec)
+    assert request_deadline is not None
+    expected_role_policy_fingerprint = validate_policy_fingerprint(
+        expected_role_policy_fingerprint,
+        label="expected_role_policy_fingerprint",
+    )
+    _validate_query_text_size(sql)
+    _ensure_request_active(request_deadline, cancel_event)
+    try:
+        command = classify_query(sql, super_name)
+    except ValueError as exc:
+        raise ValueError("policy query must be one valid SELECT statement") from exc
+    if command.kind is not CommandKind.SELECT:
+        raise ValueError("policy query must be a SELECT statement")
+
+    reader = DataReader(
+        organization=organization,
+        super_name=super_name,
+        query=command.sql,
+        source=source,
+    )
+    try:
+        _result, status, message = reader.execute(
+            role_name=role_name,
+            engine=engine,
+            with_scan=False,
+            _deadline_monotonic=request_deadline,
+            _cancel_event=cancel_event,
+            expected_role_policy_fingerprint=(
+                expected_role_policy_fingerprint
+            ),
+            _policy_fingerprint_only=True,
+        )
+    except BaseException:
+        _update_query_out(reader, out, requested_engine=engine)
+        raise
+    _update_query_out(reader, out, requested_engine=engine)
+    if status is Status.ERROR:
+        raise RuntimeError(f"Policy preflight failed: {message}")
+    fingerprint = validate_policy_fingerprint(
+        reader.effective_policy_fingerprint,
+        label="effective policy fingerprint",
+    )
+    if fingerprint is None:
+        raise PermissionError("Effective read policy fingerprint is unavailable")
+    return fingerprint
+
+
+def query_sql_stream(
+    organization: str,
+    super_name: str,
+    sql: str,
+    engine: Any,
+    role_name: str,
+    *,
+    max_total_rows: int,
+    timeout_sec: float,
+    source: str = "sdk",
+    out: Optional[Dict[str, Any]] = None,
+    max_batch_rows: Optional[int] = None,
+    max_batch_bytes: Optional[int] = None,
+    cancel_event: Optional[threading.Event] = None,
+    expected_role_policy_fingerprint: Optional[str] = None,
+    expected_effective_policy_fingerprint: Optional[str] = None,
+) -> Any:
+    """Return a bounded, RBAC-filtered Arrow export stream without Python rows.
+
+    Unlike :func:`query_sql`, this helper may exceed
+    ``SUPERTABLE_MAX_LIMIT``. It cannot be called without explicit positive
+    row and time budgets, and the ordinary DataReader path remains capped.
+    Consumers must exhaust, cancel, or close the returned stream.
+    """
+    request_deadline = _caller_deadline(timeout_sec)
+    assert request_deadline is not None
+    expected_role_policy_fingerprint = validate_policy_fingerprint(
+        expected_role_policy_fingerprint,
+        label="expected_role_policy_fingerprint",
+    )
+    expected_effective_policy_fingerprint = validate_policy_fingerprint(
+        expected_effective_policy_fingerprint,
+        label="expected_effective_policy_fingerprint",
+    )
+    _validate_query_text_size(sql)
+    _ensure_request_active(request_deadline, cancel_event)
+    if (
+        isinstance(max_total_rows, bool)
+        or not isinstance(max_total_rows, int)
+        or max_total_rows <= 0
+    ):
+        raise ValueError("max_total_rows must be a positive integer")
+    try:
+        command = classify_query(sql, super_name)
+    except ValueError as exc:
+        raise ValueError("export query must be one valid SELECT statement") from exc
+    if command.kind is not CommandKind.SELECT:
+        raise ValueError("export query must be a SELECT statement")
+
+    bounded_sql = _ensure_sql_limit(
+        command.sql,
+        max_total_rows,
+        maximum_limit=max_total_rows,
+    )
+    configured_batch_rows = _configured_result_stream_batch_rows()
+    if max_batch_rows is None:
+        resolved_batch_rows = configured_batch_rows
+    else:
+        if (
+            isinstance(max_batch_rows, bool)
+            or not isinstance(max_batch_rows, int)
+            or max_batch_rows <= 0
+        ):
+            raise ValueError("max_batch_rows must be a positive integer")
+        resolved_batch_rows = min(max_batch_rows, configured_batch_rows)
+    configured_batch_bytes = _configured_result_stream_batch_bytes()
+    if max_batch_bytes is None:
+        resolved_batch_bytes = configured_batch_bytes
+    else:
+        if (
+            isinstance(max_batch_bytes, bool)
+            or not isinstance(max_batch_bytes, int)
+            or max_batch_bytes <= 0
+        ):
+            raise ValueError("max_batch_bytes must be a positive integer")
+        resolved_batch_bytes = min(max_batch_bytes, configured_batch_bytes)
+
+    reader = DataReader(
+        organization=organization,
+        super_name=super_name,
+        query=bounded_sql,
+        source=source,
+    )
+    try:
+        stream, status, message = reader.execute_export_stream(
+            role_name=role_name,
+            engine=engine,
+            max_total_rows=max_total_rows,
+            timeout_sec=timeout_sec,
+            max_batch_rows=resolved_batch_rows,
+            max_batch_bytes=resolved_batch_bytes,
+            cancel_event=cancel_event,
+            _deadline_monotonic=request_deadline,
+            expected_role_policy_fingerprint=(
+                expected_role_policy_fingerprint
+            ),
+            expected_effective_policy_fingerprint=(
+                expected_effective_policy_fingerprint
+            ),
+        )
+    except BaseException:
+        _update_query_out(reader, out, requested_engine=engine)
+        raise
+    _update_query_out(reader, out, requested_engine=engine)
+    if status == Status.ERROR:
+        _cancel_and_close_stream(stream)
+        raise RuntimeError(f"Query execution failed: {message}")
+    return _QueryOutResultStream(
+        stream,
+        lambda: _update_query_out(reader, out, requested_engine=engine),
+    )

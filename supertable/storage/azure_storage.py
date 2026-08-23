@@ -3,6 +3,7 @@ import io
 import json
 import fnmatch
 import os
+import threading
 
 from supertable.config.settings import settings
 from typing import Any, BinaryIO, Dict, List, Optional, Tuple
@@ -60,6 +61,12 @@ class AzureBlobStorage(StorageInterface):
         self.svc = blob_service_client
         self.container = self.svc.get_container_client(container_name)
         self.base_prefix = base_prefix.strip("/")
+        # A user-delegation-key request is a remote control-plane call.  One
+        # reflection can contain thousands of blobs, so cache the key on this
+        # authorization-scoped storage instance while it covers the requested
+        # SAS lifetime.  The lock also prevents a concurrent refresh stampede.
+        self._delegation_key_lock = threading.Lock()
+        self._delegation_key_cache = None
 
     # -------------------------
     # Factory
@@ -164,9 +171,30 @@ class AzureBlobStorage(StorageInterface):
             account_key = credential
         else:
             # AAD / managed identity: use user delegation key
-            start_time = datetime.now(timezone.utc)
-            expiry_time = start_time + timedelta(seconds=expiry_seconds)
-            delegation_key = self.svc.get_user_delegation_key(start_time, expiry_time)
+            try:
+                lifetime = int(expiry_seconds)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("expiry_seconds must be a positive integer") from exc
+            if lifetime <= 0:
+                raise ValueError("expiry_seconds must be a positive integer")
+            now = datetime.now(timezone.utc)
+            expiry_time = now + timedelta(seconds=lifetime)
+            with self._delegation_key_lock:
+                cached = self._delegation_key_cache
+                delegation_key = None
+                if cached is not None:
+                    cached_key, cached_expiry = cached
+                    # Keep a small safety window for request transit and Azure
+                    # clock skew; never mint a SAS beyond the cached key.
+                    if cached_expiry >= expiry_time + timedelta(seconds=30):
+                        delegation_key = cached_key
+                if delegation_key is None:
+                    start_time = now - timedelta(minutes=5)
+                    key_expiry = expiry_time + timedelta(minutes=5)
+                    delegation_key = self.svc.get_user_delegation_key(
+                        start_time, key_expiry,
+                    )
+                    self._delegation_key_cache = (delegation_key, key_expiry)
             sas_token = generate_blob_sas(
                 account_name=account_name,
                 container_name=self.container_name,
@@ -174,7 +202,7 @@ class AzureBlobStorage(StorageInterface):
                 user_delegation_key=delegation_key,
                 permission=BlobSasPermissions(read=True),
                 expiry=expiry_time,
-                start=start_time,
+                start=now - timedelta(minutes=5),
             )
             return f"{blob_client.url}?{sas_token}"
 

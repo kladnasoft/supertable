@@ -361,7 +361,7 @@ def test_query_sql_rejects_result_over_serialized_byte_cap(monkeypatch):
             Engine.DUCKDB, "reader",
         )
     reader.execute.assert_not_called()
-    assert reader.execute_stream.call_args.kwargs["max_batch_rows"] == 1
+    assert reader.execute_stream.call_args.kwargs["max_batch_rows"] == 256
     assert stream.closed is True
 
 
@@ -612,8 +612,12 @@ def test_duckdb_arrow_stream_owns_views_and_watchdog_until_early_close(
         timeout_sec=5,
     )
 
-    assert timers[0].started is True
-    assert timers[0].cancelled is False
+    # Connection/httpfs setup now has its own absolute-deadline watchdog,
+    # which is cancelled before the result-lifetime watchdog is installed.
+    query_timer = timers[-1]
+    assert all(timer.started and timer.cancelled for timer in timers[:-1])
+    assert query_timer.started is True
+    assert query_timer.cancelled is False
     assert stream.closed is False
     assert executor._con.execute(
         "SELECT count(*) FROM duckdb_views() "
@@ -623,7 +627,7 @@ def test_duckdb_arrow_stream_owns_views_and_watchdog_until_early_close(
     stream.close()
 
     assert stream.closed is True
-    assert timers[0].cancelled is True
+    assert query_timer.cancelled is True
     assert executor._con.execute(
         "SELECT count(*) FROM duckdb_views() "
         "WHERE view_name LIKE 'st_%' OR view_name LIKE 'tomb_%'"
@@ -659,16 +663,88 @@ def test_duckdb_arrow_stream_timeout_interrupts_and_releases_views(
         timeout_sec=5,
     )
 
-    timers[0].callback()
+    query_timer = timers[-1]
+    assert all(timer.cancelled for timer in timers[:-1])
+    query_timer.callback()
 
     with pytest.raises(TimeoutError, match="timed out"):
         next(stream)
     assert stream.closed is True
-    assert timers[0].cancelled is True
+    assert query_timer.cancelled is True
     assert executor._con.execute(
         "SELECT count(*) FROM duckdb_views() "
         "WHERE view_name LIKE 'st_%' OR view_name LIKE 'tomb_%'"
     ).fetchone()[0] == 0
+
+
+def test_duckdb_arrow_stream_enforces_wide_result_byte_batches(tmp_path):
+    source = tmp_path / "wide-events.parquet"
+    pq.write_table(
+        pa.table({
+            "payload": ["x" * (1024 * 1024)] * 5,
+            "__rowid__": list(range(1, 6)),
+            "__timestamp__": [1] * 5,
+        }),
+        source,
+    )
+    snapshot = SuperSnapshot(
+        super_name="shop",
+        simple_name="events",
+        simple_version=1,
+        files=[str(source)],
+        columns={"payload", "__rowid__", "__timestamp__"},
+        resource_keys=[str(source)],
+        snapshot_resource_keys=[str(source)],
+    )
+    reflection = Reflection(
+        "local", source.stat().st_size, 1, [snapshot],
+    )
+    temp_dir = tmp_path / "duckdb-wide-tmp"
+    temp_dir.mkdir()
+    manager = SimpleNamespace(
+        temp_dir=str(temp_dir),
+        query_plan_path=str(tmp_path / "wide-plan.json"),
+    )
+    parser = SQLParser(
+        "shop",
+        "SELECT payload FROM events LIMIT 5",
+        "duckdb",
+    )
+    executor = duckdb_engine.DuckDB()
+    byte_cap = 2 * 1024 * 1024 + 32
+
+    stream = executor.execute_stream(
+        reflection,
+        parser,
+        manager,
+        lambda _event: None,
+        timeout_sec=5,
+        max_batch_rows=256,
+        max_batch_bytes=byte_cap,
+    )
+    with stream:
+        batches = list(stream)
+
+    assert [batch.num_rows for batch in batches] == [2, 2, 1]
+    assert all(batch.nbytes <= byte_cap for batch in batches)
+    assert sum(batch.num_rows for batch in batches) == 5
+
+
+def test_duckdb_variable_width_fetch_cap_keeps_narrow_batches_multirow(
+    monkeypatch,
+):
+    description = (("payload", "VARCHAR"),)
+    monkeypatch.setattr(
+        duckdb_engine,
+        "settings",
+        SimpleNamespace(SUPERTABLE_RESULT_STREAM_VARIABLE_FETCH_ROWS=16),
+    )
+
+    assert duckdb_engine._duckdb_stream_fetch_rows(
+        max_batch_rows=256,
+        max_batch_bytes=4 * 1024 * 1024,
+        description=description,
+    ) == 16
 
 
 def test_executor_auto_to_duckdb_stream_returns_incremental_arrow_batches(
@@ -737,7 +813,12 @@ def test_duckdb_deadline_interrupts_query_cursor(monkeypatch):
             timers.append(self)
 
         def start(self):
-            self.callback()
+            # Connection setup has its own watchdog phase on the same absolute
+            # deadline. Let it complete, then fire the query-cursor watchdog
+            # this regression specifically exercises (local paths need no
+            # httpfs/storage watchdog).
+            if len(timers) == 2:
+                self.callback()
 
         def cancel(self):
             self.cancelled = True
@@ -763,5 +844,6 @@ def test_duckdb_deadline_interrupts_query_cursor(monkeypatch):
         )
 
     connection.interrupt.assert_called_once_with()
-    assert timers[0].seconds == 0.01
-    assert timers[0].cancelled is True
+    assert len(timers) == 2
+    assert 0 < timers[1].seconds <= 0.01
+    assert all(timer.cancelled for timer in timers)

@@ -807,6 +807,134 @@ class ResourceGovernor:
             self._condition.notify_all()
 
 
+class ByteBoundedArrowBatchIterator(Iterator[pa.RecordBatch]):
+    """Split producer batches at an explicit row and logical-byte boundary.
+
+    Arrow cannot split an individual value without changing the result, so a
+    single row larger than ``max_batch_bytes`` is rejected.  Slices retain the
+    producer's owning buffers until that producer batch is exhausted; engines
+    must therefore also choose a conservative upstream fetch size.  This
+    iterator is the final hard boundary that prevents an oversized batch from
+    reaching a response/page consumer when width estimates are imperfect.
+    """
+
+    def __init__(
+        self,
+        batches: Iterable[pa.RecordBatch],
+        *,
+        schema: pa.Schema,
+        max_batch_rows: int,
+        max_batch_bytes: int,
+    ) -> None:
+        for name, value in (
+            ("max_batch_rows", max_batch_rows),
+            ("max_batch_bytes", max_batch_bytes),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer")
+        self.schema = schema
+        self._inner = iter(batches)
+        self._max_rows = max_batch_rows
+        self._max_bytes = max_batch_bytes
+        self._pending: pa.RecordBatch | None = None
+        self._offset = 0
+        self._closed = False
+
+    def __iter__(self):
+        return self
+
+    @staticmethod
+    def _rows_that_fit(
+        batch: pa.RecordBatch,
+        *,
+        max_rows: int,
+        max_bytes: int,
+    ) -> int:
+        candidate_rows = min(max_rows, batch.num_rows)
+        if candidate_rows <= 0:
+            return 0
+        if batch.slice(0, candidate_rows).nbytes <= max_bytes:
+            return candidate_rows
+        if batch.slice(0, 1).nbytes > max_bytes:
+            return 0
+        low, high = 1, candidate_rows
+        while low < high:
+            middle = (low + high + 1) // 2
+            if batch.slice(0, middle).nbytes <= max_bytes:
+                low = middle
+            else:
+                high = middle - 1
+        return low
+
+    def __next__(self) -> pa.RecordBatch:
+        if self._closed:
+            raise StopIteration
+        while self._pending is None or self._offset >= self._pending.num_rows:
+            self._pending = next(self._inner)
+            self._offset = 0
+            if not isinstance(self._pending, pa.RecordBatch):
+                self.close()
+                raise TypeError(
+                    "Arrow batch producer yielded "
+                    f"{type(self._pending).__name__}, not RecordBatch"
+                )
+            if not self._pending.schema.equals(
+                self.schema, check_metadata=False,
+            ):
+                self.close()
+                raise ValueError("Arrow batch producer schema changed")
+            if self._pending.num_rows == 0:
+                # Preserve a producer's explicit empty batch without risking
+                # an infinite local skip loop; it is already byte bounded.
+                if self._pending.nbytes > self._max_bytes:
+                    self.close()
+                    raise ResultMemoryLimitExceeded(
+                        "an empty Arrow result batch exceeds the configured "
+                        "stream batch-byte budget"
+                    )
+                return self._pending
+
+        remaining = self._pending.slice(self._offset)
+        rows = self._rows_that_fit(
+            remaining,
+            max_rows=self._max_rows,
+            max_bytes=self._max_bytes,
+        )
+        if rows <= 0:
+            self.close()
+            raise ResultMemoryLimitExceeded(
+                "one Arrow result row exceeds the configured stream "
+                "batch-byte budget"
+            )
+        result = remaining.slice(0, rows)
+        self._offset += rows
+        return result
+
+    def cancel(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        cancel = getattr(self._inner, "cancel", None)
+        if callable(cancel):
+            cancel()
+        else:
+            close = getattr(self._inner, "close", None)
+            if callable(close):
+                close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self._inner, "close", None)
+        if callable(close):
+            close()
+
+
 class ArrowBatchStream(Iterator[pa.RecordBatch]):
     """Single-consumer, cancellable Arrow RecordBatch result contract.
 

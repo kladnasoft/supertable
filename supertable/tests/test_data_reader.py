@@ -367,6 +367,7 @@ class TestExecuteHappyPath:
             role_name="reader_role",
             tables=["table_def_1"],
             physical_tables=mock_parser.get_physical_tables.return_value,
+            policy_fingerprints_out={},
         )
 
     @patch(_PATCH_EXTEND_PLAN)

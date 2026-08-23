@@ -27,7 +27,15 @@ setup(
     author_email="lkupas@kladnasoft.com",
     license="FSL-1.1-ALv2",
     python_requires=">=3.10",
-    packages=find_packages(include=["supertable", "supertable.*"]),
+    packages=find_packages(
+        include=["supertable", "supertable.*"],
+        exclude=[
+            "supertable.tests", "supertable.tests.*",
+            "supertable.*.tests", "supertable.*.tests.*",
+            "supertable.benchmarks", "supertable.benchmarks.*",
+            "supertable.*.benchmarks", "supertable.*.benchmarks.*",
+        ],
+    ),
     include_package_data=True,
     install_requires=read_requirements(),
     classifiers=[
@@ -39,18 +47,23 @@ setup(
     extras_require={
         "s3": ["boto3>=1.34,<2.0"],
         "minio": ["minio>=7.2,<8.0"],
-        "azure": ["azure-storage-blob>=12.26.0"],
+        "azure": [
+            "azure-storage-blob>=12.26.0",
+            "azure-identity>=1.17,<2.0",
+        ],
         "gcp": ["google-cloud-storage>=3.1.0"],
         "all-cloud": [
             "boto3>=1.34,<2.0",
             "minio>=7.2,<8.0",
             "azure-storage-blob>=12.26.0",
+            "azure-identity>=1.17,<2.0",
             "google-cloud-storage>=3.1.0",
         ],
         "all": [
             "boto3>=1.34,<2.0",
             "minio>=7.2,<8.0",
             "azure-storage-blob>=12.26.0",
+            "azure-identity>=1.17,<2.0",
             "google-cloud-storage>=3.1.0",
         ],
     },

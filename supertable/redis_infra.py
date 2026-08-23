@@ -25,7 +25,6 @@ class Settings:
 
     def __init__(self) -> None:
         self.SUPERTABLE_ORGANIZATION: str = _cfg.SUPERTABLE_ORGANIZATION
-        self.SUPERTABLE_SUPERUSER_TOKEN: str = _cfg.SUPERTABLE_SUPERUSER_TOKEN
         self.SUPERTABLE_SESSION_SECRET: str = _cfg.SUPERTABLE_SESSION_SECRET
 
         self.SUPERTABLE_REDIS_URL: Optional[str] = _cfg.SUPERTABLE_REDIS_URL or None
@@ -61,10 +60,12 @@ if settings.SUPERTABLE_LOGIN_MASK not in (1, 2, 3):
     )
 
 def _require_runtime_env() -> None:
-    """Validate the env vars needed to actually talk to Redis.
+    """Validate the deployment identity needed to talk to Redis.
 
     Called lazily by code paths that open a real Redis connection or
-    otherwise need the deployment's organization / superuser token.
+    otherwise need the deployment's organization. Redis authentication is
+    validated independently by ``RedisOptions``; the SuperTable HTTP/API
+    superuser token is neither a Redis credential nor used by this module.
     Importing the SDK no longer fails when these are unset — only
     running against Redis does. This keeps the module importable in
     test, build, and inspection contexts where the runtime
@@ -73,8 +74,6 @@ def _require_runtime_env() -> None:
     missing: List[str] = []
     if not settings.SUPERTABLE_ORGANIZATION:
         missing.append("SUPERTABLE_ORGANIZATION")
-    if not (settings.SUPERTABLE_SUPERUSER_TOKEN or "").strip():
-        missing.append("SUPERTABLE_SUPERUSER_TOKEN")
     if missing:
         raise RuntimeError(
             "Missing required environment variables: " + ", ".join(missing)

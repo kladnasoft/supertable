@@ -37,6 +37,7 @@ coverage.xml
 
 # Virtual environments
 .env/
+.env
 .venv-test
 .venv-testpypi
 .venv

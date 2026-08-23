@@ -46,6 +46,10 @@ _LAZY_EXPORTS = {
     "SimpleTable": ("supertable.simple_table", "SimpleTable"),
     "DataWriter": ("supertable.data_writer", "DataWriter"),
     "DataReader": ("supertable.data_reader", "DataReader"),
+    "query_sql_stream": ("supertable.data_reader", "query_sql_stream"),
+    "query_sql_policy_fingerprint": (
+        "supertable.data_reader", "query_sql_policy_fingerprint",
+    ),
     "MetaReader": ("supertable.meta_reader", "MetaReader"),
     "list_supers": ("supertable.meta_reader", "list_supers"),
     "list_tables": ("supertable.meta_reader", "list_tables"),
@@ -75,7 +79,11 @@ def __dir__() -> list[str]:
 
 
 if TYPE_CHECKING:
-    from supertable.data_reader import DataReader
+    from supertable.data_reader import (
+        DataReader,
+        query_sql_policy_fingerprint,
+        query_sql_stream,
+    )
     from supertable.data_writer import DataWriter
     from supertable.errors import (
         SuperTableNotFoundError,
@@ -97,6 +105,8 @@ __all__ = [
     "SimpleTable",
     "DataWriter",
     "DataReader",
+    "query_sql_stream",
+    "query_sql_policy_fingerprint",
     "engine",
     "MetaReader",
     "list_supers",

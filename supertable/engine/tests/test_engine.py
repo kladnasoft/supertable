@@ -414,9 +414,8 @@ class TestMakePresignedList:
         storage = MagicMock()
         storage.presign.side_effect = ["https://presigned/a", Exception("network error")]
         paths = ["s3://bucket/a", "s3://bucket/b"]
-        result = make_presigned_list(storage, paths)
-        assert result[0] == "https://presigned/a"
-        assert result[1] == "s3://bucket/b"
+        with pytest.raises(RuntimeError, match="credential refresh failed"):
+            make_presigned_list(storage, paths)
 
     def test_non_url_paths_pass_through(self):
         storage = MagicMock()
@@ -1966,15 +1965,15 @@ class TestCreateReflectionTableWithPresignRetry:
     @patch("supertable.engine.engine_common.configure_httpfs_and_s3")
     @patch("supertable.engine.engine_common.create_reflection_table")
     @patch("supertable.engine.engine_common.make_presigned_list")
-    def test_http_error_triggers_presign_retry(self, mock_presign, mock_create, mock_httpfs):
-        mock_create.side_effect = [Exception("HTTP Error 403 AccessDenied"), None]
+    def test_http_error_propagates_to_executor_refresh_boundary(self, mock_presign, mock_create, mock_httpfs):
+        mock_create.side_effect = Exception("HTTP Error 403 AccessDenied")
         mock_presign.return_value = ["https://presigned/f.parquet"]
-        result = create_reflection_table_with_presign_retry(
-            MagicMock(), MagicMock(), "tbl", ["/f.parquet"]
-        )
-        assert result is True
-        assert mock_create.call_count == 2
-        mock_presign.assert_called_once()
+        with pytest.raises(Exception, match="403 AccessDenied"):
+            create_reflection_table_with_presign_retry(
+                MagicMock(), MagicMock(), "tbl", ["/f.parquet"]
+            )
+        mock_create.assert_called_once()
+        mock_presign.assert_not_called()
 
     @patch("supertable.engine.engine_common.configure_httpfs_and_s3")
     @patch("supertable.engine.engine_common.create_reflection_table")
@@ -1986,13 +1985,15 @@ class TestCreateReflectionTableWithPresignRetry:
     @patch("supertable.engine.engine_common.configure_httpfs_and_s3")
     @patch("supertable.engine.engine_common.create_reflection_table")
     @patch("supertable.engine.engine_common.make_presigned_list")
-    def test_301_triggers_retry(self, mock_presign, mock_create, mock_httpfs):
-        mock_create.side_effect = [Exception("301 Moved Permanently"), None]
+    def test_301_propagates_without_partial_retry(self, mock_presign, mock_create, mock_httpfs):
+        mock_create.side_effect = Exception("301 Moved Permanently")
         mock_presign.return_value = ["https://presigned/f.parquet"]
-        result = create_reflection_table_with_presign_retry(
-            MagicMock(), MagicMock(), "tbl", ["/f.parquet"]
-        )
-        assert result is True
+        with pytest.raises(Exception, match="301 Moved Permanently"):
+            create_reflection_table_with_presign_retry(
+                MagicMock(), MagicMock(), "tbl", ["/f.parquet"]
+            )
+        mock_create.assert_called_once()
+        mock_presign.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════

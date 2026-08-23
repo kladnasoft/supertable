@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -63,6 +65,174 @@ def _safe_path_for_log(value: object) -> str:
     except Exception:
         pass
     return text
+
+
+def _linked_share_policy_state(
+    *documents: object,
+    schema: Dict[str, str],
+) -> Tuple[Optional[str], Optional[List[str]]]:
+    """Pin linked-share provenance and column policy without credentials.
+
+    The row predicate is deliberately handled separately: DataReader parses it
+    into canonical DuckDB SQL before constructing the final effective-policy
+    fingerprint. This seal covers every other share authorization component
+    that is present in the immutable/cached snapshot payload.
+    """
+    max_name_bytes = 1024
+    max_type_bytes = 64 * 1024
+    max_columns = 16 * 1024
+    max_total_text_bytes = 4 * 1024 * 1024
+    total_text_bytes = 0
+
+    def bounded_text(value: object, *, label: str, max_bytes: int) -> str:
+        nonlocal total_text_bytes
+        if not isinstance(value, str) or not value.strip() or "\x00" in value:
+            raise RuntimeError(f"{label} is invalid")
+        # Reject obviously oversized Unicode before allocating its UTF-8 form.
+        if len(value) > max_bytes:
+            raise RuntimeError(f"{label} exceeds the size limit")
+        encoded = value.encode("utf-8")
+        if len(encoded) > max_bytes:
+            raise RuntimeError(f"{label} exceeds the size limit")
+        total_text_bytes += len(encoded)
+        if total_text_bytes > max_total_text_bytes:
+            raise RuntimeError("Linked-share policy metadata exceeds the size limit")
+        return value
+
+    candidates: List[dict] = []
+    seen_candidates = set()
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        pending = [document]
+        for wrapper_name in ("payload", "data", "snapshot"):
+            wrapped = document.get(wrapper_name)
+            if isinstance(wrapped, dict):
+                pending.append(wrapped)
+                nested = wrapped.get("snapshot")
+                if isinstance(nested, dict):
+                    pending.append(nested)
+        for candidate in pending:
+            marker = id(candidate)
+            if marker not in seen_candidates:
+                seen_candidates.add(marker)
+                candidates.append(candidate)
+
+    link_values = []
+    provider_values = []
+    allowed_policies: List[Tuple[str, ...]] = []
+    policy_marker_present = False
+    for candidate in candidates:
+        if "_linked_share" in candidate:
+            policy_marker_present = True
+            raw_link = bounded_text(
+                candidate.get("_linked_share"),
+                label="Linked-share identity metadata",
+                max_bytes=max_name_bytes,
+            )
+            if raw_link not in link_values:
+                link_values.append(raw_link)
+        if "_provider_org" in candidate:
+            policy_marker_present = True
+            raw_provider = bounded_text(
+                candidate.get("_provider_org"),
+                label="Linked-share provider metadata",
+                max_bytes=max_name_bytes,
+            )
+            if raw_provider not in provider_values:
+                provider_values.append(raw_provider)
+        if "_allowed_columns" in candidate:
+            policy_marker_present = True
+            raw_allowed = candidate.get("_allowed_columns")
+            if (
+                not isinstance(raw_allowed, list)
+                or not raw_allowed
+                or len(raw_allowed) > max_columns
+            ):
+                raise RuntimeError("Linked-share column policy is invalid")
+            folded: Dict[str, str] = {}
+            for raw_column in raw_allowed:
+                raw_column = bounded_text(
+                    raw_column,
+                    label="Linked-share column policy",
+                    max_bytes=max_name_bytes,
+                )
+                key = raw_column.casefold()
+                if key in folded:
+                    raise RuntimeError("Linked-share column policy is ambiguous")
+                folded[key] = raw_column
+            normalized = tuple(sorted(folded))
+            if "*" in normalized and normalized != ("*",):
+                raise RuntimeError("Linked-share column policy is invalid")
+            if normalized not in allowed_policies:
+                allowed_policies.append(normalized)
+
+    if not link_values:
+        if policy_marker_present:
+            raise RuntimeError("Linked-share policy has no authoritative identity")
+        return None, None
+    if (
+        len(link_values) != 1
+        or len(provider_values) != 1
+        or len(allowed_policies) > 1
+    ):
+        raise RuntimeError("Conflicting linked-share policy metadata")
+
+    if len(schema) > max_columns:
+        raise RuntimeError("Linked-share schema projection exceeds the size limit")
+    schema_projection: Dict[str, str] = {}
+    for raw_name, raw_type in schema.items():
+        name = bounded_text(
+            raw_name,
+            label="Linked-share schema column",
+            max_bytes=max_name_bytes,
+        )
+        type_text = bounded_text(
+            raw_type,
+            label="Linked-share schema type",
+            max_bytes=max_type_bytes,
+        )
+        folded = name.casefold()
+        if folded in schema_projection:
+            raise RuntimeError("Linked-share schema projection is ambiguous")
+        schema_projection[folded] = type_text
+    if not schema_projection:
+        raise RuntimeError("Linked-share schema projection is empty")
+
+    # Every linked leaf must carry the publisher's explicit column policy.
+    # Treating an absent policy as ``*`` would reopen malformed/legacy payloads
+    # to every column present in their projected schema.
+    if not allowed_policies:
+        raise RuntimeError("Linked-share column policy is unavailable")
+    explicit_allowed = allowed_policies[0]
+    if explicit_allowed == ("*",):
+        effective_allowed = sorted(schema_projection)
+    else:
+        missing = set(explicit_allowed).difference(schema_projection)
+        if missing:
+            raise RuntimeError(
+                "Linked-share column policy is not represented by its schema"
+            )
+        effective_allowed = list(explicit_allowed)
+
+    identity = {
+        "version": 1,
+        "link_id": link_values[0],
+        "provider_org": provider_values[0],
+        "allowed_columns": list(explicit_allowed),
+        "schema_projection": [
+            {"name": name, "type": schema_projection[name]}
+            for name in sorted(schema_projection)
+        ],
+    }
+    fingerprint = hashlib.sha256(json.dumps(
+        identity,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+    return fingerprint, effective_allowed
 
 
 def get_missing_columns(
@@ -1318,6 +1488,16 @@ class DataEstimator:
                         current_snapshot_data,
                     )
 
+                    current_version = current_snapshot_data.get("snapshot_version", 0)
+                    current_schema = self._schema_to_dict(current_snapshot_data.get("schema", {}))
+                    (
+                        share_policy_fingerprint,
+                        share_allowed_columns,
+                    ) = _linked_share_policy_state(
+                        snapshot,
+                        current_snapshot_data,
+                        schema=current_schema,
+                    )
                     pinned_snapshot_metadata.append({
                         "path": current_snapshot_path,
                         "table_name": snapshot.get("table_name"),
@@ -1326,10 +1506,10 @@ class DataEstimator:
                         "tombstone_digest": tombstone_digest,
                         "tombstone_format": tombstone_format,
                         "share_row_filter": share_row_filter,
+                        "share_policy_fingerprint": share_policy_fingerprint,
+                        "share_allowed_columns": share_allowed_columns,
                     })
 
-                    current_version = current_snapshot_data.get("snapshot_version", 0)
-                    current_schema = self._schema_to_dict(current_snapshot_data.get("schema", {}))
                     lowered_schema = dict_keys_to_lowercase(current_schema)
                     schema.update(lowered_schema.keys())
                     # Retain name->type for the projection ratio fallback. First
@@ -2004,7 +2184,9 @@ class DataEstimator:
                     # safely represent that set (rowids are table-local), so a
                     # tombstone or share filter on any member must fail closed.
                     if any(
-                        meta.get("tombstone_key") or meta.get("share_row_filter")
+                        meta.get("tombstone_key")
+                        or meta.get("share_row_filter")
+                        or meta.get("share_policy_fingerprint")
                         for meta in pinned_metadata
                     ):
                         raise RuntimeError(
@@ -2029,6 +2211,10 @@ class DataEstimator:
                     tombstone_digest=pinned.get("tombstone_digest"),
                     tombstone_format=pinned.get("tombstone_format"),
                     share_row_filter=pinned.get("share_row_filter"),
+                    share_policy_fingerprint=pinned.get(
+                        "share_policy_fingerprint"
+                    ),
+                    share_allowed_columns=pinned.get("share_allowed_columns"),
                     row_group_selections=literal_row_groups,
                     candidate_rows=(selected_rows if selected_rows_complete else 0),
                     candidate_rows_complete=selected_rows_complete,

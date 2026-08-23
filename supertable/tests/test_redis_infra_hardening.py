@@ -44,7 +44,9 @@ def redis_infra(monkeypatch):
         replace(
             settings_module.settings,
             SUPERTABLE_ORGANIZATION="test-org",
-            SUPERTABLE_SUPERUSER_TOKEN="test-superuser-token",
+            # A Redis-only/MCP process must not receive the SuperTable API's
+            # global superuser credential merely to construct its Redis client.
+            SUPERTABLE_SUPERUSER_TOKEN="",
         ),
     )
 
@@ -85,6 +87,19 @@ def test_catalog_and_public_client_share_hardened_connection(
 
     assert exposed is client
     assert catalog.r is client
+
+
+def test_runtime_redis_env_requires_organization_not_superuser_api_token(
+    redis_infra, monkeypatch,
+):
+    redis_infra._require_runtime_env()
+
+    monkeypatch.setattr(
+        redis_infra.settings, "SUPERTABLE_ORGANIZATION", "",
+    )
+    with pytest.raises(RuntimeError, match="SUPERTABLE_ORGANIZATION") as exc_info:
+        redis_infra._require_runtime_env()
+    assert "SUPERTABLE_SUPERUSER_TOKEN" not in str(exc_info.value)
 
 
 def test_split_tls_uses_required_certificate_and_hostname_verification(

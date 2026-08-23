@@ -737,7 +737,7 @@ def test_builtin_storage_identity_reuses_local_and_seals_full_credentials(tmp_pa
     assert "session-one" not in repr(same_a)
 
 
-def test_scoped_lite_registry_releases_unreferenced_noncurrent_scope():
+def test_scoped_lite_registry_strongly_retains_warm_noncurrent_scope():
     class Storage:
         def __init__(self, bucket):
             self.bucket_name = bucket
@@ -745,12 +745,15 @@ def test_scoped_lite_registry_releases_unreferenced_noncurrent_scope():
     executor_module._duckdb_singleton = None
     executor_module._duckdb_singletons.clear()
     first = executor_module._get_duckdb(Storage("first"), "org")
+    first_id = id(first)
     second = executor_module._get_duckdb(Storage("second"), "org")
     assert len(executor_module._duckdb_singletons) == 2
     del first
     gc.collect()
-    assert list(executor_module._duckdb_singletons.values()) == [second]
-    second._reset_connection()
+    retained = list(executor_module._duckdb_singletons.values())
+    assert [id(engine) for engine in retained] == [first_id, id(second)]
+    for engine in retained:
+        engine._reset_connection()
     executor_module._duckdb_singleton = None
     executor_module._duckdb_singletons.clear()
 

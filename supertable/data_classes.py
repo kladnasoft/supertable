@@ -339,8 +339,18 @@ class SuperSnapshot:
     # active pointer names a standalone, content-sealed segment manifest;
     # explicit ``3`` is one exact-byte-sealed immutable Parquet artifact. A
     # drained v2/v3 table may retain its format with the exact empty state.
-    # Kept last to preserve every existing positional constructor.
+    # New fields remain trailing to preserve every existing positional
+    # constructor.
     tombstone_format: Optional[int] = None
+    # A data-free seal over linked-share identity, provider, explicit column
+    # policy, and the provider-published schema projection. It deliberately
+    # excludes resource URLs and credential expiry. ``None`` denotes a local
+    # (non-linked-share) snapshot.
+    share_policy_fingerprint: Optional[str] = None
+    # Exact provider-authorized output columns for a linked share, already
+    # intersected with its pinned schema projection. ``None`` denotes local
+    # data; an empty list is invalid/fail-closed at the DataReader boundary.
+    share_allowed_columns: Optional[List[str]] = None
 
 
 @dataclass

@@ -8,6 +8,7 @@ import pytest
 
 from supertable.engine.island_resources import (
     ArrowBatchStream,
+    ByteBoundedArrowBatchIterator,
     ContainerResources,
     ExecutionAdvice,
     QueryResourceEstimate,
@@ -24,6 +25,41 @@ from supertable.engine.island_resources import (
 DiskUsage = namedtuple("DiskUsage", "total used free")
 MIB = 1024 * 1024
 GIB = 1024 * MIB
+
+
+def test_byte_bounded_iterator_splits_wide_batches_without_losing_rows():
+    batch = pa.record_batch(
+        [pa.array([b"x" * MIB] * 5)], names=["payload"],
+    )
+    bounded = ByteBoundedArrowBatchIterator(
+        [batch],
+        schema=batch.schema,
+        max_batch_rows=256,
+        max_batch_bytes=2 * MIB + 32,
+    )
+
+    result = list(bounded)
+
+    assert [item.num_rows for item in result] == [2, 2, 1]
+    assert sum(item.num_rows for item in result) == 5
+    assert all(item.nbytes <= 2 * MIB + 32 for item in result)
+
+
+def test_byte_bounded_iterator_rejects_one_oversized_indivisible_row():
+    batch = pa.record_batch(
+        [pa.array([b"x" * (2 * MIB)])], names=["payload"],
+    )
+    source = ArrowBatchStream(batch.schema, [batch])
+    bounded = ByteBoundedArrowBatchIterator(
+        source,
+        schema=batch.schema,
+        max_batch_rows=256,
+        max_batch_bytes=MIB,
+    )
+
+    with pytest.raises(ResultMemoryLimitExceeded, match="one Arrow result row"):
+        next(bounded)
+    assert source.closed is True
 
 
 def _resources(cpus: int = 4, memory: int = 4 * GIB) -> ContainerResources:

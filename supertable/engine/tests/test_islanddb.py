@@ -2766,7 +2766,7 @@ def test_public_executor_arrow_stream_is_batched_and_exact(
 
 def test_public_island_stream_bounds_arbitrary_width_at_native_producer(tmp_path):
     path = tmp_path / "wide-result.parquet"
-    payload = "x" * (5 * 1024 * 1024)
+    payload = "x" * (3 * 1024 * 1024)
     pl.DataFrame({
         "payload": [payload] * 4,
         "__rowid__": [1, 2, 3, 4],
@@ -2798,7 +2798,7 @@ def test_public_island_stream_bounds_arbitrary_width_at_native_producer(tmp_path
     try:
         first = next(stream)
         assert first.num_rows == 1
-        assert 5 * 1024 * 1024 <= first.nbytes < 6 * 1024 * 1024
+        assert 3 * 1024 * 1024 <= first.nbytes < 4 * 1024 * 1024
     finally:
         stream.close()
 

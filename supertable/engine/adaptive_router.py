@@ -499,6 +499,15 @@ class AdaptiveEngineRouter:
 
         if not availability.spark_available:
             rejections[Engine.SPARK_SQL].append("no safe fitting Spark cluster")
+        if features.streaming_result:
+            # The public Arrow result contract is implemented only by DuckDB
+            # and IslandDB.  This is a capability boundary, not a cost hint:
+            # allowing Spark into the race lets AUTO select it and fail only at
+            # Executor.execute_stream(), after estimation/routing work has
+            # already completed.
+            rejections[Engine.SPARK_SQL].append(
+                "Spark does not support streaming Arrow results"
+            )
         if not availability.spark_semantics_supported:
             rejections[Engine.SPARK_SQL].append(
                 "query outside the cross-engine semantic equivalence subset"
