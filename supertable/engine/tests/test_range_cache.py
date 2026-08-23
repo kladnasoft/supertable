@@ -413,8 +413,26 @@ def test_aged_frequency_keeps_frequent_range_over_one_off_scan(tmp_path):
     cache.max_bytes = cache._scan_cache()[1] + cache._allocation_unit()
     for _ in range(8):
         assert cache.read(key, 0, 100)[0] == payload[:100]
+    hot_data, hot_access = _range_entry_for(tmp_path, 0, 100)
+    _cold_data, cold_access = _range_entry_for(tmp_path, 100, 100)
+    # Eviction deliberately combines aged frequency with measured refill cost.
+    # Runner scheduling can make one initial refill much more expensive than
+    # the other, so normalize that independent dimension before asserting the
+    # frequency policy.
+    frequencies = []
+    for access_path in (hot_access, cold_access):
+        record = cache._read_access_record(str(access_path))
+        assert record is not None
+        frequencies.append(record.frequency)
+        normalized = type(record)(
+            frequency=record.frequency,
+            decay_epoch_ns=record.decay_epoch_ns,
+            last_access_ns=record.last_access_ns,
+            refill_cost_ns=range_cache_module._MIN_REFILL_COST_NS,
+        )
+        access_path.write_bytes(cache._encode_access_record(normalized))
+    assert frequencies[0] > frequencies[1]
     _new, metrics = cache.read(key, 200, 100)
-    hot_data, _ = _range_entry_for(tmp_path, 0, 100)
     cold_name = f"{100:016x}-{100:016x}"
 
     assert metrics.evictions == 1
