@@ -136,6 +136,7 @@ class GCSStorage(StorageInterface):
     def presign(self, key: str, expiry_seconds: int = 3600) -> str:
         """Return a presigned (signed) GET URL for the object."""
         from datetime import timedelta
+        key = self._require_presign_object_key(key)
         full_key = self._with_base(key.lstrip("/"))
         blob = self.bucket.blob(full_key)
         return blob.generate_signed_url(

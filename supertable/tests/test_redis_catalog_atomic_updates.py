@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 from types import SimpleNamespace
@@ -1001,13 +1002,16 @@ def test_control_plane_reads_never_turn_transport_or_corruption_into_empty(monke
         client, "smembers", side_effect=redis.TimeoutError("index timeout"),
     ):
         with pytest.raises(redis.TimeoutError, match="index timeout"):
-            catalog.list_shares("acme")
-        with pytest.raises(redis.TimeoutError, match="index timeout"):
-            catalog.list_linked_shares("acme", "lake")
-        with pytest.raises(redis.TimeoutError, match="index timeout"):
             catalog.list_stagings("acme", "lake")
         with pytest.raises(redis.TimeoutError, match="index timeout"):
             catalog.list_pipes("acme", "lake", "uploads")
+    with patch.object(
+        client, "scard", side_effect=redis.TimeoutError("index timeout"),
+    ):
+        with pytest.raises(redis.TimeoutError, match="index timeout"):
+            catalog.list_shares("acme")
+        with pytest.raises(redis.TimeoutError, match="index timeout"):
+            catalog.list_linked_shares("acme", "lake")
 
     client.sadd(RK.share_index("acme"), "missing")
     with pytest.raises(RuntimeError, match="missing metadata"):
@@ -1022,6 +1026,37 @@ def test_control_plane_reads_never_turn_transport_or_corruption_into_empty(monke
     client.set(RK.linked_share_doc("acme", "lake", "corrupt"), "[]")
     with pytest.raises(RuntimeError, match="Corrupt linked-share metadata"):
         catalog.get_linked_share("acme", "lake", "corrupt")
+
+
+def test_linked_control_and_leaf_indexes_are_scanned_with_hard_bounds(
+    monkeypatch,
+):
+    catalog, client = _catalog()
+    provider_index = RK.share_index("acme")
+    client.sadd(provider_index, "share-a", "share-b", "share-c")
+    with pytest.raises(RuntimeError, match="safety limit"):
+        catalog.list_shares("acme", limit=2)
+
+    control_index = RK.linked_share_index("acme", "lake")
+    client.sadd(control_index, "link-a", "link-b", "link-c")
+    with pytest.raises(RuntimeError, match="safety limit"):
+        catalog.list_linked_shares("acme", "lake", limit=2)
+
+    leaf_index = catalog._linked_leaf_names_key("acme", "lake", "link-a")
+    client.sadd(leaf_index, "events")
+    original_scard = client.scard
+
+    def stalled_sscan(key, *, cursor, count):
+        assert key == leaf_index
+        assert count <= 128
+        return 1, ["events"]
+
+    monkeypatch.setattr(client, "scard", lambda key: original_scard(key))
+    monkeypatch.setattr(client, "sscan", stalled_sscan)
+    with pytest.raises(RuntimeError, match="unstable"):
+        catalog.list_linked_share_leaf_names(
+            "acme", "lake", "link-a", limit=2,
+        )
 
 
 @pytest.mark.parametrize("member", ["../escape", b"\xff"])
@@ -1379,3 +1414,1021 @@ def test_dynamic_quality_cleanup_bound_fails_closed_and_can_resume(monkeypatch):
     )
     assert not client.exists(prefix + "first")
     assert not client.exists(prefix + "second")
+
+
+_LINKED_DIGEST_A = "a" * 64
+_LINKED_DIGEST_B = "b" * 64
+
+
+def _linked_instance_nonce(link_id: str) -> str:
+    return "link-instance-v1:" + hashlib.sha256(link_id.encode()).hexdigest()
+
+
+def _linked_payload(
+    generation: int,
+    url: str,
+    *,
+    link_id: str = "link-1",
+    provider_generated_ms: int = 100,
+    manifest_digest: str = _LINKED_DIGEST_A,
+) -> dict:
+    return {
+        "simple_name": "orders",
+        "snapshot_version": generation,
+        "last_updated_ms": 1,
+        "schema": [{"name": "id", "type": "int64"}],
+        "resources": [{"file": url, "rows": 1, "file_size": 1}],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "_linked_share": link_id,
+        "_linked_generation": generation,
+        "_linked_provider_generated_ms": provider_generated_ms,
+        "_linked_provider_manifest_digest": manifest_digest,
+        "_credential_expires_ms": 9_999_999_999_999,
+    }
+
+
+def _reserve_linked(
+    catalog: RedisCatalog,
+    *,
+    link_id: str,
+    provider_generated_ms: int,
+    manifest_digest: str,
+    publication_generation: int,
+    server_ms: int,
+) -> None:
+    assert catalog.reserve_linked_provider_publication(
+        "acme",
+        "lake",
+        link_id,
+        provider_generated_ms=provider_generated_ms,
+        manifest_digest=manifest_digest,
+        publication_generation=publication_generation,
+        not_after_ms=server_ms + 10_000,
+        instance_nonce=_linked_instance_nonce(link_id),
+    )
+
+
+def _linked_control(
+    *,
+    link_id: str,
+    publication_generation: int,
+    provider_generated_ms: int,
+    manifest_digest: str,
+) -> dict:
+    return {
+        "link_id": link_id,
+        "publication_generation": publication_generation,
+        "_linked_provider_generated_ms": provider_generated_ms,
+        "_linked_provider_manifest_digest": manifest_digest,
+        "_linked_instance_nonce": _linked_instance_nonce(link_id),
+    }
+
+
+def test_share_manifest_generation_is_monotonic_and_incarnation_scoped():
+    catalog, client = _catalog()
+    frozen_time_source = catalog._LUA_ALLOCATE_SHARE_MANIFEST_GENERATION.replace(
+        "local server_time = redis.call('TIME')",
+        "local server_time = {'1700000000', '123000'}",
+    )
+    assert frozen_time_source != catalog._LUA_ALLOCATE_SHARE_MANIFEST_GENERATION
+    catalog._allocate_share_manifest_generation = client.register_script(
+        frozen_time_source,
+    )
+
+    first = catalog.allocate_share_manifest_generation(
+        "acme", "shared-orders", _LINKED_DIGEST_A,
+    )
+    second = catalog.allocate_share_manifest_generation(
+        "acme", "shared-orders", _LINKED_DIGEST_A,
+    )
+    other_incarnation = catalog.allocate_share_manifest_generation(
+        "acme", "shared-orders", _LINKED_DIGEST_B,
+    )
+
+    assert second == first + 1
+    assert other_incarnation == first
+
+
+def test_linked_leaf_scan_pages_an_index_beyond_snapshot_limit(monkeypatch):
+    catalog, client = _catalog()
+    link_id = "link-large"
+    expected = {f"table_{index:05d}" for index in range(10_001)}
+    client.sadd(
+        catalog._linked_leaf_names_key("acme", "lake", link_id),
+        *expected,
+    )
+
+    def bounded_snapshot_must_not_run(*_args, **_kwargs):
+        raise AssertionError("paged cleanup used the all-members path")
+
+    monkeypatch.setattr(
+        catalog, "_bounded_set_members", bounded_snapshot_must_not_run,
+    )
+    cursor = 0
+    pages = 0
+    observed = set()
+    while True:
+        cursor, names = catalog.scan_linked_share_leaf_names(
+            "acme", "lake", link_id, cursor=cursor, count=256,
+        )
+        pages += 1
+        observed.update(names)
+        if cursor == 0:
+            break
+        assert pages < 1_000
+
+    assert pages > 1
+    assert observed == expected
+
+
+def test_authoritative_linked_share_lookup_requires_index_and_no_tombstone():
+    catalog, client = _catalog()
+    _seed_root(client)
+    control = {"link_id": "link-1", "cached_manifest": {"tables": []}}
+    catalog.create_linked_share("acme", "lake", "link-1", control)
+
+    assert catalog.get_authoritative_linked_share(
+        "acme", "lake", "link-1",
+    ) == control
+    assert catalog.get_authoritative_linked_share(
+        "acme", "lake", "missing",
+    ) is None
+
+    client.srem(RK.linked_share_index("acme", "lake"), "link-1")
+    with pytest.raises(RuntimeError, match="Corrupt linked-share authority"):
+        catalog.get_authoritative_linked_share("acme", "lake", "link-1")
+    client.sadd(RK.linked_share_index("acme", "lake"), "link-1")
+
+    client.set(
+        RK.linked_share_doc("acme", "lake", "link-1"),
+        json.dumps({"link_id": "different"}),
+    )
+    with pytest.raises(RuntimeError, match="Corrupt linked-share authority"):
+        catalog.get_authoritative_linked_share("acme", "lake", "link-1")
+    client.set(
+        RK.linked_share_doc("acme", "lake", "link-1"), json.dumps(control),
+    )
+
+    assert catalog.begin_unlink_linked_share(
+        "acme", "lake", "link-1",
+    ) == control
+    with pytest.raises(FileNotFoundError, match="unlinked"):
+        catalog.get_authoritative_linked_share("acme", "lake", "link-1")
+
+    client.sadd(RK.linked_share_index("acme", "lake"), "indexed-only")
+    with pytest.raises(RuntimeError, match="Corrupt linked-share authority"):
+        catalog.get_authoritative_linked_share(
+            "acme", "lake", "indexed-only",
+        )
+
+
+def test_linked_leaf_upsert_refreshes_existing_same_link_atomically():
+    catalog, client = _catalog()
+    _seed_root(client)
+    generation_1, server_ms = (
+        catalog.allocate_linked_share_publication_generation(
+            "acme", "lake", "link-1",
+        )
+    )
+    _reserve_linked(
+        catalog,
+        link_id="link-1",
+        provider_generated_ms=100,
+        manifest_digest=_LINKED_DIGEST_A,
+        publication_generation=generation_1,
+        server_ms=server_ms,
+    )
+    assert catalog.upsert_linked_leaf(
+        "acme",
+        "lake",
+        "orders",
+        _linked_payload(generation_1, "https://provider.invalid/old"),
+        "__linked_share__/link-1/orders",
+        link_id="link-1",
+        generation=generation_1,
+        not_after_ms=server_ms + 10_000,
+    ) is True
+
+    generation_2, server_ms_2 = (
+        catalog.allocate_linked_share_publication_generation(
+            "acme", "lake", "link-1",
+        )
+    )
+    assert generation_2 > generation_1
+    _reserve_linked(
+        catalog,
+        link_id="link-1",
+        provider_generated_ms=200,
+        manifest_digest=_LINKED_DIGEST_B,
+        publication_generation=generation_2,
+        server_ms=server_ms_2,
+    )
+    assert catalog.upsert_linked_leaf(
+        "acme",
+        "lake",
+        "orders",
+        _linked_payload(
+            generation_2,
+            "https://provider.invalid/fresh",
+            provider_generated_ms=200,
+            manifest_digest=_LINKED_DIGEST_B,
+        ),
+        "__linked_share__/link-1/orders",
+        link_id="link-1",
+        generation=generation_2,
+        not_after_ms=server_ms_2 + 10_000,
+    ) is False
+    leaf = json.loads(client.get(RK.meta_leaf("acme", "lake", "orders")))
+    assert leaf["payload"]["resources"][0]["file"].endswith("/fresh")
+    assert leaf["payload"]["_linked_generation"] == generation_2
+    assert leaf["payload"]["_linked_provider_generated_ms"] == 200
+    assert leaf["version"] == 1
+
+
+def test_linked_leaf_upsert_rejects_local_and_other_link_owners():
+    catalog, client = _catalog()
+    _seed_root(client)
+    catalog.set_leaf_payload_cas(
+        "acme",
+        "lake",
+        "local_orders",
+        {"resources": []},
+        "snapshots/local.json",
+    )
+    generation, server_ms = (
+        catalog.allocate_linked_share_publication_generation(
+            "acme", "lake", "link-1",
+        )
+    )
+    _reserve_linked(
+        catalog,
+        link_id="link-1",
+        provider_generated_ms=100,
+        manifest_digest=_LINKED_DIGEST_A,
+        publication_generation=generation,
+        server_ms=server_ms,
+    )
+    with pytest.raises(FileExistsError, match="Local table"):
+        catalog.upsert_linked_leaf(
+            "acme",
+            "lake",
+            "local_orders",
+            {
+                **_linked_payload(generation, "https://provider.invalid/linked"),
+                "simple_name": "local_orders",
+            },
+            "__linked_share__/link-1/local_orders",
+            link_id="link-1",
+            generation=generation,
+            not_after_ms=server_ms + 10_000,
+        )
+    local = json.loads(client.get(RK.meta_leaf("acme", "lake", "local_orders")))
+    assert "_linked_share" not in local["payload"]
+
+    catalog.upsert_linked_leaf(
+        "acme",
+        "lake",
+        "orders",
+        _linked_payload(generation, "https://provider.invalid/link-1"),
+        "__linked_share__/link-1/orders",
+        link_id="link-1",
+        generation=generation,
+        not_after_ms=server_ms + 10_000,
+    )
+    generation_2, server_ms_2 = (
+        catalog.allocate_linked_share_publication_generation(
+            "acme", "lake", "link-2",
+        )
+    )
+    _reserve_linked(
+        catalog,
+        link_id="link-2",
+        provider_generated_ms=100,
+        manifest_digest=_LINKED_DIGEST_B,
+        publication_generation=generation_2,
+        server_ms=server_ms_2,
+    )
+    competing_payload = _linked_payload(
+        generation_2,
+        "https://provider.invalid/link-2",
+        link_id="link-2",
+        provider_generated_ms=100,
+        manifest_digest=_LINKED_DIGEST_B,
+    )
+    with pytest.raises(FileExistsError, match="Another linked share"):
+        catalog.upsert_linked_leaf(
+            "acme",
+            "lake",
+            "orders",
+            competing_payload,
+            "__linked_share__/link-2/orders",
+            link_id="link-2",
+            generation=generation_2,
+            not_after_ms=server_ms_2 + 10_000,
+        )
+    linked = json.loads(client.get(RK.meta_leaf("acme", "lake", "orders")))
+    assert linked["payload"]["_linked_share"] == "link-1"
+    assert linked["payload"]["resources"][0]["file"].endswith("/link-1")
+
+
+def test_stale_linked_worker_cannot_overwrite_or_delete_new_generation():
+    catalog, client = _catalog()
+    _seed_root(client)
+    old_generation, old_server_ms = (
+        catalog.allocate_linked_share_publication_generation(
+            "acme", "lake", "link-1",
+        )
+    )
+    new_generation, new_server_ms = (
+        catalog.allocate_linked_share_publication_generation(
+            "acme", "lake", "link-1",
+        )
+    )
+    _reserve_linked(
+        catalog,
+        link_id="link-1",
+        provider_generated_ms=200,
+        manifest_digest=_LINKED_DIGEST_B,
+        publication_generation=new_generation,
+        server_ms=new_server_ms,
+    )
+    catalog.upsert_linked_leaf(
+        "acme", "lake", "orders",
+        _linked_payload(
+            new_generation,
+            "https://provider.invalid/new",
+            provider_generated_ms=200,
+            manifest_digest=_LINKED_DIGEST_B,
+        ),
+        "__linked_share__/link-1/orders",
+        link_id="link-1",
+        generation=new_generation,
+        not_after_ms=new_server_ms + 10_000,
+    )
+
+    new_control = _linked_control(
+        link_id="link-1",
+        publication_generation=new_generation,
+        provider_generated_ms=200,
+        manifest_digest=_LINKED_DIGEST_B,
+    )
+    catalog.create_linked_share(
+        "acme", "lake", "link-1", new_control,
+        not_after_ms=new_server_ms + 10_000,
+    )
+
+    with pytest.raises(SnapshotCommitConflictError, match="newer provider"):
+        catalog.reserve_linked_provider_publication(
+            "acme",
+            "lake",
+            "link-1",
+            provider_generated_ms=100,
+            manifest_digest=_LINKED_DIGEST_A,
+            publication_generation=old_generation,
+            not_after_ms=old_server_ms + 10_000,
+            instance_nonce=_linked_instance_nonce("link-1"),
+        )
+    with pytest.raises(SnapshotCommitConflictError, match="reservation"):
+        catalog.upsert_linked_leaf(
+            "acme", "lake", "orders",
+            _linked_payload(old_generation, "https://provider.invalid/stale"),
+            "__linked_share__/link-1/orders",
+            link_id="link-1",
+            generation=old_generation,
+            not_after_ms=old_server_ms + 10_000,
+        )
+    assert catalog.delete_linked_leaf_if_generation(
+        "acme",
+        "lake",
+        "orders",
+        link_id="link-1",
+        expected_generation=old_generation,
+        not_after_ms=new_server_ms + 10_000,
+    ) is False
+    leaf = json.loads(client.get(RK.meta_leaf("acme", "lake", "orders")))
+    assert leaf["payload"]["_linked_generation"] == new_generation
+    assert catalog.get_linked_share("acme", "lake", "link-1") == new_control
+
+
+def test_equal_provider_generation_with_different_manifest_is_ambiguous():
+    catalog, client = _catalog()
+    _seed_root(client)
+    generation_1, server_ms = catalog.allocate_linked_share_publication_generation(
+        "acme", "lake", "link-1",
+    )
+    _reserve_linked(
+        catalog,
+        link_id="link-1",
+        provider_generated_ms=500,
+        manifest_digest=_LINKED_DIGEST_A,
+        publication_generation=generation_1,
+        server_ms=server_ms,
+    )
+    catalog.upsert_linked_leaf(
+        "acme",
+        "lake",
+        "orders",
+        _linked_payload(
+            generation_1,
+            "https://provider.invalid/first",
+            provider_generated_ms=500,
+            manifest_digest=_LINKED_DIGEST_A,
+        ),
+        "__linked_share__/link-1/orders",
+        link_id="link-1",
+        generation=generation_1,
+        not_after_ms=server_ms + 10_000,
+    )
+    before_leaf = client.get(RK.meta_leaf("acme", "lake", "orders"))
+    before_reservation = client.get(
+        catalog._linked_provider_reservation_key("acme", "lake", "link-1")
+    )
+    generation_2, server_ms_2 = catalog.allocate_linked_share_publication_generation(
+        "acme", "lake", "link-1",
+    )
+
+    with pytest.raises(SnapshotCommitConflictError, match="ambiguous"):
+        catalog.reserve_linked_provider_publication(
+            "acme",
+            "lake",
+            "link-1",
+            provider_generated_ms=500,
+            manifest_digest=_LINKED_DIGEST_B,
+            publication_generation=generation_2,
+            not_after_ms=server_ms_2 + 10_000,
+            instance_nonce=_linked_instance_nonce("link-1"),
+        )
+
+    assert client.get(RK.meta_leaf("acme", "lake", "orders")) == before_leaf
+    assert client.get(
+        catalog._linked_provider_reservation_key("acme", "lake", "link-1")
+    ) == before_reservation
+
+
+def test_newer_provider_reservation_repairs_unique_stale_partial_leaf():
+    catalog, client = _catalog()
+    _seed_root(client)
+    old_generation, old_server_ms = (
+        catalog.allocate_linked_share_publication_generation(
+            "acme", "lake", "link-1",
+        )
+    )
+    _reserve_linked(
+        catalog,
+        link_id="link-1",
+        provider_generated_ms=100,
+        manifest_digest=_LINKED_DIGEST_A,
+        publication_generation=old_generation,
+        server_ms=old_server_ms,
+    )
+    catalog.upsert_linked_leaf(
+        "acme",
+        "lake",
+        "stale_only",
+        {
+            **_linked_payload(
+                old_generation,
+                "https://provider.invalid/stale-only",
+            ),
+            "simple_name": "stale_only",
+        },
+        "__linked_share__/link-1/stale_only",
+        link_id="link-1",
+        generation=old_generation,
+        not_after_ms=old_server_ms + 10_000,
+    )
+
+    new_generation, new_server_ms = (
+        catalog.allocate_linked_share_publication_generation(
+            "acme", "lake", "link-1",
+        )
+    )
+    _reserve_linked(
+        catalog,
+        link_id="link-1",
+        provider_generated_ms=200,
+        manifest_digest=_LINKED_DIGEST_B,
+        publication_generation=new_generation,
+        server_ms=new_server_ms,
+    )
+    with pytest.raises(SnapshotCommitConflictError, match="reservation"):
+        catalog.upsert_linked_leaf(
+            "acme",
+            "lake",
+            "late_old",
+            {
+                **_linked_payload(
+                    old_generation,
+                    "https://provider.invalid/late-old",
+                ),
+                "simple_name": "late_old",
+            },
+            "__linked_share__/link-1/late_old",
+            link_id="link-1",
+            generation=old_generation,
+            not_after_ms=old_server_ms + 10_000,
+        )
+    assert catalog.list_linked_share_leaf_names(
+        "acme", "lake", "link-1",
+    ) == ["stale_only"]
+    assert catalog.delete_stale_linked_leaf(
+        "acme",
+        "lake",
+        "stale_only",
+        link_id="link-1",
+        provider_generated_ms=200,
+        manifest_digest=_LINKED_DIGEST_B,
+        publication_generation=new_generation,
+        not_after_ms=new_server_ms + 10_000,
+    )
+    assert not client.exists(RK.meta_leaf("acme", "lake", "stale_only"))
+    assert catalog.list_linked_share_leaf_names(
+        "acme", "lake", "link-1",
+    ) == []
+
+
+def test_unlink_tombstone_fences_delayed_refresh_after_cleanup():
+    catalog, client = _catalog()
+    _seed_root(client)
+    generation, server_ms = catalog.allocate_linked_share_publication_generation(
+        "acme", "lake", "link-1",
+    )
+    _reserve_linked(
+        catalog,
+        link_id="link-1",
+        provider_generated_ms=100,
+        manifest_digest=_LINKED_DIGEST_A,
+        publication_generation=generation,
+        server_ms=server_ms,
+    )
+    payload = _linked_payload(
+        generation, "https://provider.invalid/orders",
+    )
+    catalog.upsert_linked_leaf(
+        "acme", "lake", "orders", payload,
+        "__linked_share__/link-1/orders",
+        link_id="link-1",
+        generation=generation,
+        not_after_ms=server_ms + 10_000,
+    )
+    control = _linked_control(
+        link_id="link-1",
+        publication_generation=generation,
+        provider_generated_ms=100,
+        manifest_digest=_LINKED_DIGEST_A,
+    )
+    catalog.create_linked_share(
+        "acme", "lake", "link-1", control,
+        not_after_ms=server_ms + 10_000,
+    )
+
+    assert catalog.begin_unlink_linked_share(
+        "acme", "lake", "link-1",
+    ) == control
+    assert catalog.delete_unlinked_leaf(
+        "acme", "lake", "orders", link_id="link-1",
+    )
+    catalog.finish_unlink_linked_share("acme", "lake", "link-1")
+
+    with pytest.raises(FileNotFoundError, match="unlinked"):
+        catalog.upsert_linked_leaf(
+            "acme", "lake", "orders", payload,
+            "__linked_share__/link-1/orders",
+            link_id="link-1",
+            generation=generation,
+            not_after_ms=server_ms + 10_000,
+        )
+    with pytest.raises(FileNotFoundError, match="unlinked"):
+        catalog.reserve_linked_provider_publication(
+            "acme",
+            "lake",
+            "link-1",
+            provider_generated_ms=200,
+            manifest_digest=_LINKED_DIGEST_B,
+            publication_generation=generation + 1,
+            not_after_ms=server_ms + 10_000,
+            instance_nonce=_linked_instance_nonce("link-1"),
+        )
+    tombstone = json.loads(client.get(
+        catalog._linked_unlink_tombstone_key("acme", "lake", "link-1")
+    ))
+    assert tombstone == {"link_id": "link-1", "state": "deleted"}
+    assert not client.exists(RK.meta_leaf("acme", "lake", "orders"))
+    assert catalog.list_linked_shares("acme", "lake") == []
+
+
+def test_unlink_cleanup_detaches_stale_index_without_deleting_foreign_leaf():
+    catalog, client = _catalog()
+    _seed_root(client)
+    foreign_document = json.dumps({
+        "payload": {"_linked_share": "link-2"},
+        "path": "__linked_share__/link-2/orders",
+        "version": 1,
+    })
+    client.set(RK.meta_leaf("acme", "lake", "orders"), foreign_document)
+    client.sadd(RK.meta_table_names("acme", "lake"), "orders")
+    client.sadd(
+        catalog._linked_leaf_names_key("acme", "lake", "link-1"),
+        "orders",
+    )
+    client.set(
+        catalog._linked_unlink_tombstone_key("acme", "lake", "link-1"),
+        json.dumps({"link_id": "link-1", "state": "deleting"}),
+    )
+
+    assert catalog.delete_unlinked_leaf(
+        "acme", "lake", "orders", link_id="link-1",
+    ) is False
+    assert client.get(RK.meta_leaf("acme", "lake", "orders")) == foreign_document
+    assert client.sismember(RK.meta_table_names("acme", "lake"), "orders")
+    assert not client.sismember(
+        catalog._linked_leaf_names_key("acme", "lake", "link-1"),
+        "orders",
+    )
+    catalog.finish_unlink_linked_share("acme", "lake", "link-1")
+
+
+def test_failed_initial_publication_abort_removes_control_and_partial_leaves():
+    catalog, client = _catalog()
+    _seed_root(client)
+    generation, server_ms = catalog.allocate_linked_share_publication_generation(
+        "acme", "lake", "link-1",
+    )
+    _reserve_linked(
+        catalog,
+        link_id="link-1",
+        provider_generated_ms=100,
+        manifest_digest=_LINKED_DIGEST_A,
+        publication_generation=generation,
+        server_ms=server_ms,
+    )
+    catalog.upsert_linked_leaf(
+        "acme",
+        "lake",
+        "partial",
+        {
+            **_linked_payload(
+                generation, "https://provider.invalid/partial",
+            ),
+            "simple_name": "partial",
+        },
+        "__linked_share__/link-1/partial",
+        link_id="link-1",
+        generation=generation,
+        not_after_ms=server_ms + 10_000,
+    )
+    assert catalog.abort_linked_provider_publication(
+        "acme",
+        "lake",
+        "link-1",
+        instance_nonce=_linked_instance_nonce("link-1"),
+    )
+    for name in catalog.list_linked_share_leaf_names(
+        "acme", "lake", "link-1",
+    ):
+        catalog.delete_unlinked_leaf(
+            "acme", "lake", name, link_id="link-1",
+        )
+    catalog.finish_unlink_linked_share("acme", "lake", "link-1")
+
+    assert not client.exists(RK.meta_leaf("acme", "lake", "partial"))
+    assert not client.sismember(
+        RK.meta_table_names("acme", "lake"), "partial",
+    )
+    assert catalog.list_linked_share_leaf_names(
+        "acme", "lake", "link-1",
+    ) == []
+    assert catalog.list_linked_shares("acme", "lake") == []
+
+
+def test_initial_abort_fences_newer_refresh_of_the_same_link_instance():
+    catalog, client = _catalog()
+    _seed_root(client)
+    link_id = "link-1"
+    instance_nonce = _linked_instance_nonce(link_id)
+
+    generation_1, server_ms_1 = (
+        catalog.allocate_linked_share_publication_generation(
+            "acme", "lake", link_id,
+        )
+    )
+    _reserve_linked(
+        catalog,
+        link_id=link_id,
+        provider_generated_ms=100,
+        manifest_digest=_LINKED_DIGEST_A,
+        publication_generation=generation_1,
+        server_ms=server_ms_1,
+    )
+    catalog.upsert_linked_leaf(
+        "acme",
+        "lake",
+        "orders",
+        _linked_payload(generation_1, "https://provider.invalid/old"),
+        "__linked_share__/link-1/orders",
+        link_id=link_id,
+        generation=generation_1,
+        not_after_ms=server_ms_1 + 10_000,
+    )
+    catalog.create_linked_share(
+        "acme",
+        "lake",
+        link_id,
+        _linked_control(
+            link_id=link_id,
+            publication_generation=generation_1,
+            provider_generated_ms=100,
+            manifest_digest=_LINKED_DIGEST_A,
+        ),
+        not_after_ms=server_ms_1 + 10_000,
+    )
+
+    generation_2, server_ms_2 = (
+        catalog.allocate_linked_share_publication_generation(
+            "acme", "lake", link_id,
+        )
+    )
+    _reserve_linked(
+        catalog,
+        link_id=link_id,
+        provider_generated_ms=200,
+        manifest_digest=_LINKED_DIGEST_B,
+        publication_generation=generation_2,
+        server_ms=server_ms_2,
+    )
+    catalog.upsert_linked_leaf(
+        "acme",
+        "lake",
+        "orders",
+        _linked_payload(
+            generation_2,
+            "https://provider.invalid/fresh",
+            provider_generated_ms=200,
+            manifest_digest=_LINKED_DIGEST_B,
+        ),
+        "__linked_share__/link-1/orders",
+        link_id=link_id,
+        generation=generation_2,
+        not_after_ms=server_ms_2 + 10_000,
+    )
+    catalog.update_linked_share(
+        "acme",
+        "lake",
+        link_id,
+        _linked_control(
+            link_id=link_id,
+            publication_generation=generation_2,
+            provider_generated_ms=200,
+            manifest_digest=_LINKED_DIGEST_B,
+        ),
+        not_after_ms=server_ms_2 + 10_000,
+    )
+
+    assert catalog.abort_linked_provider_publication(
+        "acme", "lake", link_id, instance_nonce=instance_nonce,
+    )
+    assert catalog.get_linked_share("acme", "lake", link_id) is None
+    assert catalog.delete_unlinked_leaf(
+        "acme", "lake", "orders", link_id=link_id,
+    )
+    catalog.finish_unlink_linked_share("acme", "lake", link_id)
+
+    assert not client.exists(RK.meta_leaf("acme", "lake", "orders"))
+    assert json.loads(client.get(
+        catalog._linked_unlink_tombstone_key("acme", "lake", link_id),
+    )) == {"link_id": link_id, "state": "deleted"}
+
+
+def test_linked_leaf_and_control_publication_reject_expired_redis_deadline():
+    catalog, client = _catalog()
+    _seed_root(client)
+    generation, server_ms = (
+        catalog.allocate_linked_share_publication_generation(
+            "acme", "lake", "link-1",
+        )
+    )
+    _reserve_linked(
+        catalog,
+        link_id="link-1",
+        provider_generated_ms=100,
+        manifest_digest=_LINKED_DIGEST_A,
+        publication_generation=generation,
+        server_ms=server_ms,
+    )
+    with pytest.raises(TimeoutError, match="deadline"):
+        catalog.upsert_linked_leaf(
+            "acme", "lake", "orders",
+            _linked_payload(generation, "https://provider.invalid/late"),
+            "__linked_share__/link-1/orders",
+            link_id="link-1",
+            generation=generation,
+            not_after_ms=server_ms - 1,
+        )
+    assert not client.exists(RK.meta_leaf("acme", "lake", "orders"))
+
+    catalog.create_linked_share(
+        "acme", "lake", "link-1", {"link_id": "link-1"},
+    )
+    with pytest.raises(TimeoutError, match="deadline"):
+        catalog.update_linked_share(
+            "acme",
+            "lake",
+            "link-1",
+            {"link_id": "link-1", "publication_generation": generation},
+            not_after_ms=server_ms - 1,
+        )
+    assert catalog.get_linked_share("acme", "lake", "link-1") == {
+        "link_id": "link-1",
+    }
+
+
+def _script_with_deadline_crossing_after_entry(source: str) -> str:
+    """Make the shared deadline helper pass once, then fail deterministically."""
+    original = """local function publication_deadline_exceeded(not_after_ms)
+  if not_after_ms == nil or not_after_ms <= 0 then return false end
+  local server_time = redis.call('TIME')
+  local server_ms = tonumber(server_time[1]) * 1000
+      + math.floor(tonumber(server_time[2]) / 1000)
+  return server_ms > not_after_ms
+end"""
+    replacement = """local deadline_test_calls = 0
+local function publication_deadline_exceeded(not_after_ms)
+  deadline_test_calls = deadline_test_calls + 1
+  return deadline_test_calls > 1
+end"""
+    assert source.count(original) == 1
+    return source.replace(original, replacement, 1)
+
+
+def test_publication_deadline_crossing_before_mutation_changes_no_catalog_keys():
+    catalog, client = _catalog()
+    _seed_root(client)
+
+    generic = client.register_script(
+        _script_with_deadline_crossing_after_entry(
+            catalog._LUA_LEAF_PAYLOAD_CAS_SET,
+        )
+    )
+    generic_result = generic(
+        keys=[
+            RK.meta_leaf("acme", "lake", "generic"),
+            RK.lock_namespace("acme", "lake"),
+            RK.meta_table_names("acme", "lake"),
+            RK.meta_namespace_deletion_intent("acme", "lake"),
+            RK.meta_simple_deletion_intent("acme", "lake", "generic"),
+            RK.meta_root("acme", "lake"),
+        ],
+        args=[
+            json.dumps({"resources": []}),
+            "snapshots/generic.json",
+            1,
+            "",
+            "generic",
+            1,
+        ],
+    )
+    assert int(generic_result) == -9
+    assert not client.exists(RK.meta_leaf("acme", "lake", "generic"))
+    assert not client.sismember(RK.meta_table_names("acme", "lake"), "generic")
+
+    linked_upsert = client.register_script(
+        _script_with_deadline_crossing_after_entry(
+            catalog._LUA_UPSERT_LINKED_LEAF,
+        )
+    )
+    linked_reservation_key = catalog._linked_provider_reservation_key(
+        "acme", "lake", "link-1",
+    )
+    linked_leaf_names_key = catalog._linked_leaf_names_key(
+        "acme", "lake", "link-1",
+    )
+    linked_tombstone_key = catalog._linked_unlink_tombstone_key(
+        "acme", "lake", "link-1",
+    )
+    client.set(linked_reservation_key, json.dumps({
+        "provider_generated_ms": 100,
+        "manifest_digest": _LINKED_DIGEST_A,
+        "publication_generation": 1,
+        "instance_nonce": _linked_instance_nonce("link-1"),
+        "state": "preparing",
+    }))
+    linked_result = linked_upsert(
+        keys=[
+            RK.meta_leaf("acme", "lake", "linked"),
+            RK.lock_namespace("acme", "lake"),
+            RK.meta_table_names("acme", "lake"),
+            RK.meta_namespace_deletion_intent("acme", "lake"),
+            RK.meta_simple_deletion_intent("acme", "lake", "linked"),
+            RK.meta_root("acme", "lake"),
+            linked_reservation_key,
+            linked_leaf_names_key,
+            linked_tombstone_key,
+        ],
+        args=[
+            json.dumps({
+                **_linked_payload(1, "https://provider.invalid/linked"),
+                "simple_name": "linked",
+            }),
+            "__linked_share__/link-1/linked",
+            "linked",
+            "link-1",
+            1,
+            1,
+        ],
+    )
+    assert int(linked_result) == -13
+    assert not client.exists(RK.meta_leaf("acme", "lake", "linked"))
+    assert not client.sismember(RK.meta_table_names("acme", "lake"), "linked")
+
+    generation, server_ms = catalog.allocate_linked_share_publication_generation(
+        "acme", "lake", "link-1",
+    )
+    _reserve_linked(
+        catalog,
+        link_id="link-1",
+        provider_generated_ms=200,
+        manifest_digest=_LINKED_DIGEST_B,
+        publication_generation=generation,
+        server_ms=server_ms,
+    )
+    catalog.upsert_linked_leaf(
+        "acme",
+        "lake",
+        "orders",
+        _linked_payload(
+            generation,
+            "https://provider.invalid/orders",
+            provider_generated_ms=200,
+            manifest_digest=_LINKED_DIGEST_B,
+        ),
+        "__linked_share__/link-1/orders",
+        link_id="link-1",
+        generation=generation,
+        not_after_ms=server_ms + 10_000,
+    )
+    before_leaf = client.get(RK.meta_leaf("acme", "lake", "orders"))
+    linked_delete = client.register_script(
+        _script_with_deadline_crossing_after_entry(
+            catalog._LUA_DELETE_LINKED_LEAF,
+        )
+    )
+    delete_result = linked_delete(
+        keys=[
+            RK.meta_leaf("acme", "lake", "orders"),
+            RK.meta_table_names("acme", "lake"),
+            RK.meta_namespace_deletion_intent("acme", "lake"),
+            RK.meta_root("acme", "lake"),
+            catalog._linked_leaf_names_key("acme", "lake", "link-1"),
+        ],
+        args=["orders", "link-1", generation, 1],
+    )
+    assert int(delete_result) == -9
+    assert client.get(RK.meta_leaf("acme", "lake", "orders")) == before_leaf
+    assert client.sismember(RK.meta_table_names("acme", "lake"), "orders")
+
+    linked_control = client.register_script(
+        _script_with_deadline_crossing_after_entry(
+            catalog._LUA_UPSERT_LINKED_SHARE,
+        )
+    )
+    control_keys = [
+        RK.linked_share_doc("acme", "lake", "link-control"),
+        RK.linked_share_index("acme", "lake"),
+        RK.meta_namespace_deletion_intent("acme", "lake"),
+        RK.meta_root("acme", "lake"),
+        catalog._linked_provider_reservation_key(
+            "acme", "lake", "link-control",
+        ),
+        catalog._linked_unlink_tombstone_key(
+            "acme", "lake", "link-control",
+        ),
+    ]
+    create_result = linked_control(
+        keys=control_keys,
+        args=[json.dumps({"link_id": "link-control"}), "link-control", "create", 1],
+    )
+    assert int(create_result) == -8
+    assert not client.exists(control_keys[0])
+    assert not client.sismember(control_keys[1], "link-control")
+
+    catalog.create_linked_share(
+        "acme", "lake", "link-control", {"link_id": "link-control"},
+    )
+    before_control = client.get(control_keys[0])
+    update_result = linked_control(
+        keys=control_keys,
+        args=[
+            json.dumps({
+                "link_id": "link-control",
+                "publication_generation": generation,
+            }),
+            "link-control",
+            "update",
+            1,
+        ],
+    )
+    assert int(update_result) == -8
+    assert client.get(control_keys[0]) == before_control
+    assert client.sismember(control_keys[1], "link-control")

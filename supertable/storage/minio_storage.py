@@ -163,6 +163,7 @@ class MinioStorage(StorageInterface):
 
     def presign(self, key: str, expiry_seconds: int = 3600) -> str:
         """Return a presigned GET URL: http(s)://host/bucket/key?...X-Amz-..."""
+        key = self._require_presign_object_key(key)
         full_key = self._with_base(key.lstrip("/"))
         return self.client.presigned_get_object(
             self.bucket_name,

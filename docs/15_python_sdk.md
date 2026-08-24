@@ -183,6 +183,10 @@ mr.get_table_schema("facts", role_name="superadmin")
 mr.get_table_stats("facts", role_name="superadmin")
 ```
 
+`get_table_stats()` returns policy-scoped aggregate fields such as file, row,
+byte, visible-column, snapshot-version, and update-time counts. It never
+returns storage resource paths, signed URLs, credentials, or cached manifests.
+
 ### RoleManager / UserManager
 
 ```python

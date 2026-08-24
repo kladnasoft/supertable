@@ -159,55 +159,81 @@ def _validated_live_row_count(
     return physical_rows - deleted_rows
 
 
-def _sanitize_snapshot_stats(snapshot: Dict[str, Any], entry: dict) -> Dict[str, Any]:
-    """Remove column-policy leaks while retaining useful table/file metrics."""
-    result = _prune_dict(
-        snapshot,
-        {
-            "previous_snapshot", "schema", "schemaString", "location",
-            "_row_filter",
-        },
-    )
-    schema = _schema_to_dict(snapshot.get("schema", {}))
-    visible_schema = _visible_schema(schema, entry)
-    visible_folded = {name.casefold() for name in visible_schema}
+def _nonnegative_metadata_int(value: object) -> Optional[int]:
+    """Return an exact non-negative integer, never a coercible lookalike."""
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
 
-    resources = result.get("resources")
+
+def _complete_resource_metric(
+    resources: object,
+    field_name: str,
+) -> Optional[int]:
+    """Sum one sealed resource metric only when every entry is complete."""
+    if not isinstance(resources, list):
+        return None
+    total = 0
+    for resource in resources:
+        if not isinstance(resource, dict):
+            return None
+        value = _nonnegative_metadata_int(resource.get(field_name))
+        if value is None:
+            return None
+        total += value
+    return total
+
+
+def _sanitize_snapshot_stats(
+    snapshot: Dict[str, Any],
+    entry: dict,
+    *,
+    table_name: str,
+) -> Dict[str, Any]:
+    """Project a snapshot to safe, policy-aware aggregate metadata.
+
+    Snapshot resource dictionaries are storage control data: their ``file``
+    values may be local object keys or linked-share bearer URLs, and future
+    adapters can attach credentials or cached manifests beside them. A deny
+    list is therefore not a durable response boundary. Return only a fixed
+    set of scalar aggregates derived from the pinned snapshot.
+    """
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("Simple table snapshot is invalid")
+
+    result: Dict[str, Any] = {"simple_name": table_name}
+    for field_name in ("snapshot_version", "last_updated_ms"):
+        value = _nonnegative_metadata_int(snapshot.get(field_name))
+        if value is not None:
+            result[field_name] = value
+
+    visible_schema = _visible_schema(snapshot.get("schema", {}), entry)
+    result["cols_count"] = len(visible_schema)
+
+    resources = snapshot.get("resources")
     if isinstance(resources, list):
-        cleaned_resources = []
-        for resource in resources:
-            if not isinstance(resource, dict):
-                continue
-            cleaned = dict(resource)
-            raw_columns = cleaned.get("columns")
-            if isinstance(raw_columns, list):
-                kept = []
-                for item in raw_columns:
-                    name = item.get("name") if isinstance(item, dict) else item
-                    if isinstance(name, str) and name.casefold() in visible_folded:
-                        kept.append(item)
-                cleaned["columns"] = kept
-            elif "columns" in cleaned:
-                # A numeric count cannot be reduced without revealing the
-                # hidden-column count. Omit it instead of inventing a value.
-                cleaned.pop("columns", None)
-            for field in ("column_max_value_bytes", "integer_domain_bounds"):
-                value = cleaned.get(field)
-                if isinstance(value, dict):
-                    cleaned[field] = {
-                        name: payload for name, payload in value.items()
-                        if str(name).casefold() in visible_folded
-                    }
-            cleaned_resources.append(cleaned)
-        result["resources"] = cleaned_resources
+        result["files"] = len(resources)
 
-    for field in ("column_max_value_bytes", "integer_domain_bounds"):
-        value = result.get(field)
-        if isinstance(value, dict):
-            result[field] = {
-                name: payload for name, payload in value.items()
-                if str(name).casefold() in visible_folded
-            }
+    total_size = _complete_resource_metric(resources, "file_size")
+    if total_size is not None:
+        result["size"] = total_size
+
+    physical_rows = _complete_resource_metric(resources, "rows")
+    if physical_rows is not None:
+        try:
+            result["rows"] = _validated_live_row_count(
+                snapshot,
+                physical_rows,
+            )
+        except RuntimeError:
+            # Malformed or incomplete deletion state makes the row count
+            # unknown. Other aggregates remain useful and contain no paths.
+            logger.warning(
+                "[get_table_stats] omitting rows for table %s because "
+                "deletion metadata is invalid",
+                table_name,
+            )
+
     return result
 
 
@@ -556,7 +582,11 @@ class MetaReader:
                         table,
                     )
                     continue
-                stats.append(_sanitize_snapshot_stats(st_data, entry))
+                stats.append(_sanitize_snapshot_stats(
+                    st_data,
+                    entry,
+                    table_name=table,
+                ))
             except (FileNotFoundError, TableNotFoundError):
                 logger.debug("Simple table snapshot missing for %s", table)
                 continue

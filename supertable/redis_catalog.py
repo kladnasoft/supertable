@@ -537,6 +537,26 @@ local function root_document_state(root, target_super)
       or (source ~= nil and source ~= cjson.null) then return 0 end
   return 1
 end
+
+local function publication_deadline_exceeded(not_after_ms)
+  if not_after_ms == nil or not_after_ms <= 0 then return false end
+  local server_time = redis.call('TIME')
+  local server_ms = tonumber(server_time[1]) * 1000
+      + math.floor(tonumber(server_time[2]) / 1000)
+  return server_ms > not_after_ms
+end
+
+local function linked_manifest_digest_ok(value)
+  return type(value) == 'string'
+      and string.len(value) == 64
+      and string.match(value, '^[0-9a-f]+$') ~= nil
+end
+
+local function linked_instance_nonce_ok(value)
+  return type(value) == 'string'
+      and string.len(value) == 81
+      and string.match(value, '^link%-instance%-v1:[0-9a-f]+$') ~= nil
+end
 """
 
 
@@ -1446,9 +1466,14 @@ local new_path = ARGV[2]
 local now_ms = tonumber(ARGV[3])
 local namespace_token = ARGV[4]
 local simple_name = ARGV[5]
+local not_after_ms = tonumber(ARGV[6] or '0')
 
 if not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
     or now_ms ~= math.floor(now_ms) then return -8 end
+if not not_after_ms or not_after_ms < 0
+    or not_after_ms > ROOT_MAX_SAFE_INTEGER
+    or not_after_ms ~= math.floor(not_after_ms) then return -9 end
+if publication_deadline_exceeded(not_after_ms) then return -9 end
 
 local namespace_holder = redis.call('GET', namespace_lock)
 if namespace_holder and namespace_holder ~= namespace_token then
@@ -1482,9 +1507,538 @@ if okp and pobj then
 end
 
 local new_val = cjson.encode({version=0, ts=now_ms, path=new_path, payload=payload})
+-- Re-sample Redis TIME after all validation/decoding.  Entry admission alone
+-- cannot authorize a mutation that finishes preparing after its fence.
+if publication_deadline_exceeded(not_after_ms) then return -9 end
 redis.call('SET', key, new_val)
 redis.call('SADD', table_names, simple_name)
 return 0
+"""
+
+    _LUA_ALLOCATE_LINKED_PUBLICATION = _LUA_ROOT_DOCUMENT_GUARD + """
+local generation_key = KEYS[1]
+local server_time = redis.call('TIME')
+local seconds = tonumber(server_time[1])
+local micros = tonumber(server_time[2])
+local server_ms = seconds * 1000 + math.floor(micros / 1000)
+local clock_generation = seconds * 1000000 + micros
+if clock_generation > ROOT_MAX_SAFE_INTEGER then return {-1} end
+local current = tonumber(redis.call('GET', generation_key) or '0')
+if not current or current < 0 or current > ROOT_MAX_SAFE_INTEGER
+    or current ~= math.floor(current) then return {-2} end
+local generation = clock_generation
+if generation <= current then generation = current + 1 end
+if generation > ROOT_MAX_SAFE_INTEGER then return {-1} end
+redis.call('SET', generation_key, tostring(generation))
+return {generation, server_ms}
+"""
+
+    _LUA_ALLOCATE_SHARE_MANIFEST_GENERATION = """
+local generation_key = KEYS[1]
+local server_time = redis.call('TIME')
+local server_ms = tonumber(server_time[1]) * 1000
+    + math.floor(tonumber(server_time[2]) / 1000)
+if not server_ms or server_ms <= 0 or server_ms > 9007199254740991 then
+  return -1
+end
+local current = tonumber(redis.call('GET', generation_key) or '0')
+if not current or current < 0 or current > 9007199254740991
+    or current ~= math.floor(current) then return -2 end
+local generation = server_ms
+if generation <= current then generation = current + 1 end
+if generation > 9007199254740991 then return -1 end
+redis.call('SET', generation_key, tostring(generation))
+return generation
+"""
+
+    _LUA_RESERVE_LINKED_PROVIDER_PUBLICATION = _LUA_ROOT_DOCUMENT_GUARD + """
+local reservation_key = KEYS[1]
+local unlink_tombstone = KEYS[2]
+local namespace_delete = KEYS[3]
+local root_key = KEYS[4]
+local provider_generation = tonumber(ARGV[1])
+local manifest_digest = ARGV[2]
+local local_generation = tonumber(ARGV[3])
+local not_after_ms = tonumber(ARGV[4])
+local instance_nonce = ARGV[5]
+
+if not provider_generation or provider_generation <= 0
+    or provider_generation > ROOT_MAX_SAFE_INTEGER
+    or provider_generation ~= math.floor(provider_generation) then return -8 end
+if not linked_manifest_digest_ok(manifest_digest)
+    or not linked_instance_nonce_ok(instance_nonce) then return -8 end
+if not local_generation or local_generation <= 0
+    or local_generation > ROOT_MAX_SAFE_INTEGER
+    or local_generation ~= math.floor(local_generation) then return -8 end
+if not not_after_ms or not_after_ms <= 0
+    or not_after_ms > ROOT_MAX_SAFE_INTEGER
+    or not_after_ms ~= math.floor(not_after_ms) then return -9 end
+if publication_deadline_exceeded(not_after_ms) then return -9 end
+if redis.call('EXISTS', unlink_tombstone) == 1 then return -1 end
+if redis.call('EXISTS', namespace_delete) == 1 then return -2 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -3 end
+if root_type ~= 'string' then return -4 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -4 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -4 end
+if root_state == 0 then return -5 end
+
+local reservation_type = redis.call('TYPE', reservation_key)
+if type(reservation_type) == 'table' then reservation_type = reservation_type['ok'] end
+if reservation_type ~= 'none' and reservation_type ~= 'string' then return -6 end
+if reservation_type == 'string' then
+  local current_ok, current = pcall(
+      cjson.decode, redis.call('GET', reservation_key)
+  )
+  if not current_ok or type(current) ~= 'table' then return -6 end
+  local current_provider = tonumber(current['provider_generated_ms'])
+  local current_local = tonumber(current['publication_generation'])
+  local current_digest = current['manifest_digest']
+  local current_state = current['state']
+  local current_instance = current['instance_nonce']
+  if not current_provider or current_provider <= 0
+      or current_provider > ROOT_MAX_SAFE_INTEGER
+      or current_provider ~= math.floor(current_provider)
+      or not current_local or current_local <= 0
+      or current_local > ROOT_MAX_SAFE_INTEGER
+      or current_local ~= math.floor(current_local)
+      or not linked_manifest_digest_ok(current_digest)
+      or (current_state ~= 'preparing' and current_state ~= 'committed') then
+    return -6
+  end
+  -- Legacy reservations predate instance nonces and can be upgraded by the
+  -- first v2 refresh. Once present, the nonce is immutable for this link.
+  if current_instance ~= nil and current_instance ~= instance_nonce then
+    return -12
+  end
+  if current_provider > provider_generation then return -10 end
+  if current_provider == provider_generation then
+    if current_digest ~= manifest_digest then return -11 end
+    if current_state == 'committed' then return 0 end
+    if current_local > local_generation then return -10 end
+    if current_local == local_generation then return 1 end
+  end
+end
+
+local reservation = cjson.encode({
+  provider_generated_ms=provider_generation,
+  manifest_digest=manifest_digest,
+  publication_generation=local_generation,
+  instance_nonce=instance_nonce,
+  state='preparing',
+})
+if publication_deadline_exceeded(not_after_ms) then return -9 end
+if redis.call('EXISTS', unlink_tombstone) == 1 then return -1 end
+redis.call('SET', reservation_key, reservation)
+return 1
+"""
+
+    _LUA_ABORT_LINKED_PROVIDER_PUBLICATION = _LUA_ROOT_DOCUMENT_GUARD + """
+local document_key = KEYS[1]
+local index_key = KEYS[2]
+local reservation_key = KEYS[3]
+local unlink_tombstone = KEYS[4]
+local namespace_delete = KEYS[5]
+local root_key = KEYS[6]
+local link_id = ARGV[1]
+local instance_nonce = ARGV[2]
+
+if not linked_instance_nonce_ok(instance_nonce) then return -8 end
+if redis.call('EXISTS', namespace_delete) == 1 then return -1 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -2 end
+if root_type ~= 'string' then return -3 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -3 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -3 end
+if root_state == 0 then return -4 end
+
+local document_type = redis.call('TYPE', document_key)
+if type(document_type) == 'table' then document_type = document_type['ok'] end
+local index_type = redis.call('TYPE', index_key)
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+local reservation_type = redis.call('TYPE', reservation_key)
+if type(reservation_type) == 'table' then reservation_type = reservation_type['ok'] end
+local tombstone_type = redis.call('TYPE', unlink_tombstone)
+if type(tombstone_type) == 'table' then tombstone_type = tombstone_type['ok'] end
+if (document_type ~= 'none' and document_type ~= 'string')
+    or (index_type ~= 'none' and index_type ~= 'set')
+    or reservation_type ~= 'string'
+    or (tombstone_type ~= 'none' and tombstone_type ~= 'string') then
+  return -5
+end
+
+if tombstone_type == 'string' then
+  local tombstone_ok, tombstone = pcall(
+      cjson.decode, redis.call('GET', unlink_tombstone)
+  )
+  if not tombstone_ok or type(tombstone) ~= 'table'
+      or tombstone['link_id'] ~= link_id
+      or (tombstone['state'] ~= 'deleting'
+          and tombstone['state'] ~= 'deleted') then return -5 end
+  return 2
+end
+
+local reservation_ok, reservation = pcall(
+    cjson.decode, redis.call('GET', reservation_key)
+)
+if not reservation_ok or type(reservation) ~= 'table'
+    or (reservation['state'] ~= 'preparing'
+        and reservation['state'] ~= 'committed')
+    or reservation['instance_nonce'] ~= instance_nonce then
+  return -6
+end
+
+local indexed = redis.call('SISMEMBER', index_key, link_id)
+local link_document = nil
+if document_type == 'none' then
+  if indexed ~= 0 then return -5 end
+else
+  if indexed ~= 1 then return -5 end
+  local document_ok, document = pcall(
+      cjson.decode, redis.call('GET', document_key)
+  )
+  if not document_ok or type(document) ~= 'table'
+      or document['link_id'] ~= link_id
+      or document['_linked_instance_nonce'] ~= instance_nonce then
+    return -6
+  end
+  link_document = document
+end
+
+local tombstone = {
+  link_id=link_id,
+  state='deleting',
+  aborted_publication={
+    instance_nonce=instance_nonce,
+  },
+}
+if link_document ~= nil then tombstone['link_doc'] = link_document end
+redis.call('SET', unlink_tombstone, cjson.encode(tombstone))
+redis.call('DEL', document_key)
+redis.call('SREM', index_key, link_id)
+redis.call('SET', reservation_key, cjson.encode({
+  instance_nonce=instance_nonce,
+  state='aborted',
+}))
+return 1
+"""
+
+    _LUA_UPSERT_LINKED_LEAF = _LUA_ROOT_DOCUMENT_GUARD + """
+local leaf_key = KEYS[1]
+local namespace_lock = KEYS[2]
+local table_names = KEYS[3]
+local namespace_delete = KEYS[4]
+local simple_delete = KEYS[5]
+local root_key = KEYS[6]
+local reservation_key = KEYS[7]
+local linked_leaf_names = KEYS[8]
+local unlink_tombstone = KEYS[9]
+local payload_json = ARGV[1]
+local new_path = ARGV[2]
+local simple_name = ARGV[3]
+local link_id = ARGV[4]
+local generation = tonumber(ARGV[5])
+local not_after_ms = tonumber(ARGV[6])
+
+if not generation or generation <= 0 or generation > ROOT_MAX_SAFE_INTEGER
+    or generation ~= math.floor(generation) then return -12 end
+if not not_after_ms or not_after_ms <= 0
+    or not_after_ms > ROOT_MAX_SAFE_INTEGER
+    or not_after_ms ~= math.floor(not_after_ms) then return -13 end
+if publication_deadline_exceeded(not_after_ms) then return -13 end
+if redis.call('EXISTS', unlink_tombstone) == 1 then return -17 end
+local server_time = redis.call('TIME')
+local server_ms = tonumber(server_time[1]) * 1000
+    + math.floor(tonumber(server_time[2]) / 1000)
+if redis.call('EXISTS', namespace_lock) == 1 then return -3 end
+if redis.call('EXISTS', namespace_delete) == 1 then return -4 end
+if redis.call('EXISTS', simple_delete) == 1 then return -5 end
+
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -6 end
+if root_type ~= 'string' then return -7 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -7 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -7 end
+if root_state == 0 then return -8 end
+
+local names_type = redis.call('TYPE', table_names)
+if type(names_type) == 'table' then names_type = names_type['ok'] end
+if names_type ~= 'none' and names_type ~= 'set' then return -9 end
+local linked_names_type = redis.call('TYPE', linked_leaf_names)
+if type(linked_names_type) == 'table' then linked_names_type = linked_names_type['ok'] end
+if linked_names_type ~= 'none' and linked_names_type ~= 'set' then return -9 end
+if not string.match(payload_json, '^%s*{') then return -10 end
+local payload_ok, payload = pcall(cjson.decode, payload_json)
+if not payload_ok or type(payload) ~= 'table'
+    or payload['_linked_share'] ~= link_id
+    or tonumber(payload['_linked_generation']) ~= generation then return -10 end
+local provider_generation = tonumber(payload['_linked_provider_generated_ms'])
+local manifest_digest = payload['_linked_provider_manifest_digest']
+if not provider_generation or provider_generation <= 0
+    or provider_generation > ROOT_MAX_SAFE_INTEGER
+    or provider_generation ~= math.floor(provider_generation)
+    or not linked_manifest_digest_ok(manifest_digest) then return -10 end
+
+local reservation_type = redis.call('TYPE', reservation_key)
+if type(reservation_type) == 'table' then reservation_type = reservation_type['ok'] end
+if reservation_type ~= 'string' then return -18 end
+local reservation_ok, reservation = pcall(
+    cjson.decode, redis.call('GET', reservation_key)
+)
+if not reservation_ok or type(reservation) ~= 'table'
+    or reservation['state'] ~= 'preparing'
+    or tonumber(reservation['provider_generated_ms']) ~= provider_generation
+    or reservation['manifest_digest'] ~= manifest_digest
+    or tonumber(reservation['publication_generation']) ~= generation then
+  return -18
+end
+
+local version = 0
+local current_raw = redis.call('GET', leaf_key)
+if current_raw then
+  local current_ok, current = pcall(cjson.decode, current_raw)
+  if not current_ok or type(current) ~= 'table'
+      or type(current['payload']) ~= 'table' then return -11 end
+  local current_link = current['payload']['_linked_share']
+  if current_link == nil then return -1 end
+  if current_link ~= link_id then return -2 end
+  local current_generation = tonumber(
+      current['payload']['_linked_generation'] or '0'
+  )
+  if not current_generation or current_generation < 0
+      or current_generation > ROOT_MAX_SAFE_INTEGER
+      or current_generation ~= math.floor(current_generation) then return -11 end
+  local current_provider = tonumber(
+      current['payload']['_linked_provider_generated_ms'] or '0'
+  )
+  if not current_provider or current_provider < 0
+      or current_provider > ROOT_MAX_SAFE_INTEGER
+      or current_provider ~= math.floor(current_provider) then return -11 end
+  if current_provider > provider_generation then return -15 end
+  if current_provider == provider_generation and current_provider > 0 then
+    local current_digest = current['payload']['_linked_provider_manifest_digest']
+    if current_digest ~= manifest_digest then return -16 end
+  end
+  if current_provider == provider_generation
+      and current_generation > generation then return -14 end
+  local current_version = tonumber(current['version'])
+  if not current_version or current_version < 0
+      or current_version >= ROOT_MAX_SAFE_INTEGER
+      or current_version ~= math.floor(current_version) then return -11 end
+  version = current_version + 1
+end
+
+local new_value = cjson.encode({
+  version=version,
+  ts=server_ms,
+  path=new_path,
+  payload=payload,
+})
+if publication_deadline_exceeded(not_after_ms) then return -13 end
+if redis.call('EXISTS', unlink_tombstone) == 1 then return -17 end
+redis.call('SET', leaf_key, new_value)
+redis.call('SADD', table_names, simple_name)
+redis.call('SADD', linked_leaf_names, simple_name)
+return current_raw and 2 or 1
+"""
+
+    _LUA_DELETE_LINKED_LEAF = _LUA_ROOT_DOCUMENT_GUARD + """
+local leaf_key = KEYS[1]
+local table_names = KEYS[2]
+local namespace_delete = KEYS[3]
+local root_key = KEYS[4]
+local linked_leaf_names = KEYS[5]
+local simple_name = ARGV[1]
+local link_id = ARGV[2]
+local expected_generation = tonumber(ARGV[3])
+local not_after_ms = tonumber(ARGV[4] or '0')
+
+if not expected_generation or expected_generation < 0
+    or expected_generation > ROOT_MAX_SAFE_INTEGER
+    or expected_generation ~= math.floor(expected_generation) then return -8 end
+if not not_after_ms or not_after_ms < 0
+    or not_after_ms > ROOT_MAX_SAFE_INTEGER
+    or not_after_ms ~= math.floor(not_after_ms) then return -9 end
+if publication_deadline_exceeded(not_after_ms) then return -9 end
+if redis.call('EXISTS', namespace_delete) == 1 then return -3 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -4 end
+if root_type ~= 'string' then return -5 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -5 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -5 end
+if root_state == 0 then return -6 end
+local names_type = redis.call('TYPE', table_names)
+if type(names_type) == 'table' then names_type = names_type['ok'] end
+if names_type ~= 'none' and names_type ~= 'set' then return -7 end
+local linked_names_type = redis.call('TYPE', linked_leaf_names)
+if type(linked_names_type) == 'table' then linked_names_type = linked_names_type['ok'] end
+if linked_names_type ~= 'none' and linked_names_type ~= 'set' then return -7 end
+
+local current_raw = redis.call('GET', leaf_key)
+if not current_raw then return 0 end
+local current_ok, current = pcall(cjson.decode, current_raw)
+if not current_ok or type(current) ~= 'table'
+    or type(current['payload']) ~= 'table' then return -5 end
+if current['payload']['_linked_share'] ~= link_id then
+  redis.call('SREM', linked_leaf_names, simple_name)
+  return 0
+end
+local current_generation = tonumber(
+    current['payload']['_linked_generation'] or '0'
+)
+if not current_generation or current_generation ~= expected_generation then
+  return -2
+end
+if publication_deadline_exceeded(not_after_ms) then return -9 end
+redis.call('DEL', leaf_key)
+redis.call('SREM', table_names, simple_name)
+redis.call('SREM', linked_leaf_names, simple_name)
+return 1
+"""
+
+    _LUA_DELETE_STALE_LINKED_LEAF = _LUA_ROOT_DOCUMENT_GUARD + """
+local leaf_key = KEYS[1]
+local table_names = KEYS[2]
+local linked_leaf_names = KEYS[3]
+local namespace_delete = KEYS[4]
+local root_key = KEYS[5]
+local reservation_key = KEYS[6]
+local unlink_tombstone = KEYS[7]
+local simple_name = ARGV[1]
+local link_id = ARGV[2]
+local provider_generation = tonumber(ARGV[3])
+local manifest_digest = ARGV[4]
+local local_generation = tonumber(ARGV[5])
+local not_after_ms = tonumber(ARGV[6])
+
+if not provider_generation or provider_generation <= 0
+    or provider_generation > ROOT_MAX_SAFE_INTEGER
+    or provider_generation ~= math.floor(provider_generation)
+    or not linked_manifest_digest_ok(manifest_digest)
+    or not local_generation or local_generation <= 0
+    or local_generation > ROOT_MAX_SAFE_INTEGER
+    or local_generation ~= math.floor(local_generation) then return -8 end
+if not not_after_ms or not_after_ms <= 0
+    or not_after_ms > ROOT_MAX_SAFE_INTEGER
+    or not_after_ms ~= math.floor(not_after_ms) then return -9 end
+if publication_deadline_exceeded(not_after_ms) then return -9 end
+if redis.call('EXISTS', unlink_tombstone) == 1 then return -10 end
+if redis.call('EXISTS', namespace_delete) == 1 then return -3 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -4 end
+if root_type ~= 'string' then return -5 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table' then return -5 end
+local root_state = root_document_state(root, nil)
+if root_state == -1 then return -5 end
+if root_state == 0 then return -6 end
+local names_type = redis.call('TYPE', table_names)
+if type(names_type) == 'table' then names_type = names_type['ok'] end
+local linked_names_type = redis.call('TYPE', linked_leaf_names)
+if type(linked_names_type) == 'table' then linked_names_type = linked_names_type['ok'] end
+if (names_type ~= 'none' and names_type ~= 'set')
+    or (linked_names_type ~= 'none' and linked_names_type ~= 'set') then
+  return -7
+end
+local reservation_ok, reservation = pcall(
+    cjson.decode, redis.call('GET', reservation_key) or ''
+)
+if not reservation_ok or type(reservation) ~= 'table'
+    or reservation['state'] ~= 'preparing'
+    or tonumber(reservation['provider_generated_ms']) ~= provider_generation
+    or reservation['manifest_digest'] ~= manifest_digest
+    or tonumber(reservation['publication_generation']) ~= local_generation then
+  return -11
+end
+local current_raw = redis.call('GET', leaf_key)
+if not current_raw then
+  redis.call('SREM', linked_leaf_names, simple_name)
+  return 0
+end
+local current_ok, current = pcall(cjson.decode, current_raw)
+if not current_ok or type(current) ~= 'table'
+    or type(current['payload']) ~= 'table' then return -5 end
+if current['payload']['_linked_share'] ~= link_id then
+  redis.call('SREM', linked_leaf_names, simple_name)
+  return 0
+end
+local current_provider = tonumber(
+    current['payload']['_linked_provider_generated_ms'] or '0'
+)
+if not current_provider or current_provider < 0
+    or current_provider > ROOT_MAX_SAFE_INTEGER
+    or current_provider ~= math.floor(current_provider) then return -5 end
+if current_provider >= provider_generation then return 0 end
+if publication_deadline_exceeded(not_after_ms) then return -9 end
+if redis.call('EXISTS', unlink_tombstone) == 1 then return -10 end
+redis.call('DEL', leaf_key)
+redis.call('SREM', table_names, simple_name)
+redis.call('SREM', linked_leaf_names, simple_name)
+return 1
+"""
+
+    _LUA_DELETE_UNLINKED_LEAF = _LUA_ROOT_DOCUMENT_GUARD + """
+local leaf_key = KEYS[1]
+local table_names = KEYS[2]
+local linked_leaf_names = KEYS[3]
+local unlink_tombstone = KEYS[4]
+local root_key = KEYS[5]
+local simple_name = ARGV[1]
+local link_id = ARGV[2]
+
+local tombstone_ok, tombstone = pcall(
+    cjson.decode, redis.call('GET', unlink_tombstone) or ''
+)
+if not tombstone_ok or type(tombstone) ~= 'table'
+    or tombstone['link_id'] ~= link_id
+    or (tombstone['state'] ~= 'deleting'
+        and tombstone['state'] ~= 'deleted') then return -1 end
+local root_type = redis.call('TYPE', root_key)
+if type(root_type) == 'table' then root_type = root_type['ok'] end
+if root_type == 'none' then return -2 end
+if root_type ~= 'string' then return -3 end
+local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
+if not root_ok or type(root) ~= 'table'
+    or root_document_state(root, nil) == -1 then return -3 end
+local names_type = redis.call('TYPE', table_names)
+if type(names_type) == 'table' then names_type = names_type['ok'] end
+local linked_names_type = redis.call('TYPE', linked_leaf_names)
+if type(linked_names_type) == 'table' then linked_names_type = linked_names_type['ok'] end
+if (names_type ~= 'none' and names_type ~= 'set')
+    or (linked_names_type ~= 'none' and linked_names_type ~= 'set') then
+  return -4
+end
+local current_raw = redis.call('GET', leaf_key)
+if not current_raw then
+  redis.call('SREM', linked_leaf_names, simple_name)
+  return 0
+end
+local current_ok, current = pcall(cjson.decode, current_raw)
+if not current_ok or type(current) ~= 'table'
+    or type(current['payload']) ~= 'table' then return -3 end
+if current['payload']['_linked_share'] ~= link_id then
+  -- The indexed name is stale, but the table now belongs to a local table or
+  -- another link. Detach only this link's bookkeeping; never delete the leaf.
+  redis.call('SREM', linked_leaf_names, simple_name)
+  return 0
+end
+redis.call('DEL', leaf_key)
+redis.call('SREM', table_names, simple_name)
+redis.call('SREM', linked_leaf_names, simple_name)
+return 1
 """
 
     _LUA_GET_REPLICA_LEAF = _LUA_ROOT_DOCUMENT_GUARD + """
@@ -1813,9 +2367,17 @@ local document_key = KEYS[1]
 local index_key = KEYS[2]
 local namespace_intent = KEYS[3]
 local root_key = KEYS[4]
+local reservation_key = KEYS[5]
+local unlink_tombstone = KEYS[6]
 local document_json = ARGV[1]
 local link_id = ARGV[2]
 local mode = ARGV[3]
+local not_after_ms = tonumber(ARGV[4] or '0')
+if not not_after_ms or not_after_ms < 0
+    or not_after_ms > ROOT_MAX_SAFE_INTEGER
+    or not_after_ms ~= math.floor(not_after_ms) then return -8 end
+if publication_deadline_exceeded(not_after_ms) then return -8 end
+if redis.call('EXISTS', unlink_tombstone) == 1 then return -12 end
 if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
 local root_type = redis.call('TYPE', root_key)
 if type(root_type) == 'table' then root_type = root_type['ok'] end
@@ -1832,6 +2394,36 @@ if root_state == 0 then return -7 end
 if not string.match(document_json, '^%s*{') then return -2 end
 local ok, document = pcall(cjson.decode, document_json)
 if not ok or type(document) ~= 'table' then return -2 end
+local new_provider = document['_linked_provider_generated_ms']
+local new_digest = document['_linked_provider_manifest_digest']
+local new_generation = document['publication_generation']
+local new_instance = document['_linked_instance_nonce']
+local provider_publication = (
+    new_provider ~= nil or new_digest ~= nil
+)
+if provider_publication then
+  new_provider = tonumber(new_provider)
+  new_generation = tonumber(new_generation)
+  if not new_provider or new_provider <= 0
+      or new_provider > ROOT_MAX_SAFE_INTEGER
+      or new_provider ~= math.floor(new_provider)
+      or not linked_manifest_digest_ok(new_digest)
+      or not linked_instance_nonce_ok(new_instance)
+      or not new_generation or new_generation <= 0
+      or new_generation > ROOT_MAX_SAFE_INTEGER
+      or new_generation ~= math.floor(new_generation) then return -2 end
+  local reservation_ok, reservation = pcall(
+      cjson.decode, redis.call('GET', reservation_key) or ''
+  )
+  if not reservation_ok or type(reservation) ~= 'table'
+      or reservation['state'] ~= 'preparing'
+      or tonumber(reservation['provider_generated_ms']) ~= new_provider
+      or reservation['manifest_digest'] ~= new_digest
+      or tonumber(reservation['publication_generation']) ~= new_generation
+      or reservation['instance_nonce'] ~= new_instance then
+    return -13
+  end
+end
 local document_type = redis.call('TYPE', document_key)
 if type(document_type) == 'table' then document_type = document_type['ok'] end
 local index_type = redis.call('TYPE', index_key)
@@ -1842,15 +2434,70 @@ local indexed = redis.call('SISMEMBER', index_key, link_id)
 if mode == 'create' then
   if document_type ~= 'none' then return -6 end
   if indexed == 1 then return -5 end
+  if publication_deadline_exceeded(not_after_ms) then return -8 end
+  if redis.call('EXISTS', unlink_tombstone) == 1 then return -12 end
   redis.call('SET', document_key, document_json)
   redis.call('SADD', index_key, link_id)
+  if provider_publication then
+    redis.call('SET', reservation_key, cjson.encode({
+      provider_generated_ms=new_provider,
+      manifest_digest=new_digest,
+      publication_generation=new_generation,
+      instance_nonce=new_instance,
+      state='committed',
+    }))
+  end
 elseif mode == 'update' then
   if document_type == 'none' then
     if indexed == 1 then return -5 end
     return 0
   end
   if indexed ~= 1 then return -5 end
+  local current_ok, current = pcall(
+      cjson.decode, redis.call('GET', document_key)
+  )
+  if not current_ok or type(current) ~= 'table' then return -5 end
+  local current_instance = current['_linked_instance_nonce']
+  if current_instance ~= nil and current_instance ~= new_instance then
+    return -14
+  end
+  local current_provider = tonumber(
+      current['_linked_provider_generated_ms'] or '0'
+  )
+  local current_generation = tonumber(
+      current['publication_generation'] or '0'
+  )
+  if not current_provider or current_provider < 0
+      or current_provider > ROOT_MAX_SAFE_INTEGER
+      or current_provider ~= math.floor(current_provider)
+      or not current_generation or current_generation < 0
+      or current_generation > ROOT_MAX_SAFE_INTEGER
+      or current_generation ~= math.floor(current_generation) then return -5 end
+  if provider_publication then
+    if current_provider > new_provider then return -10 end
+    if current_provider == new_provider and current_provider > 0 then
+      if current['_linked_provider_manifest_digest'] ~= new_digest then
+        return -11
+      end
+      if current_generation > new_generation then return -9 end
+    end
+  elseif current_provider > 0 then
+    return -10
+  elseif current_generation > tonumber(new_generation or '0') then
+    return -9
+  end
+  if publication_deadline_exceeded(not_after_ms) then return -8 end
+  if redis.call('EXISTS', unlink_tombstone) == 1 then return -12 end
   redis.call('SET', document_key, document_json)
+  if provider_publication then
+    redis.call('SET', reservation_key, cjson.encode({
+      provider_generated_ms=new_provider,
+      manifest_digest=new_digest,
+      publication_generation=new_generation,
+      instance_nonce=new_instance,
+      state='committed',
+    }))
+  end
 else
   return -2
 end
@@ -1909,6 +2556,7 @@ local document_key = KEYS[1]
 local index_key = KEYS[2]
 local namespace_intent = KEYS[3]
 local root_key = KEYS[4]
+local unlink_tombstone = KEYS[5]
 local link_id = ARGV[1]
 if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
 local root_type = redis.call('TYPE', root_key)
@@ -1924,17 +2572,105 @@ local document_type = redis.call('TYPE', document_key)
 if type(document_type) == 'table' then document_type = document_type['ok'] end
 local index_type = redis.call('TYPE', index_key)
 if type(index_type) == 'table' then index_type = index_type['ok'] end
+local tombstone_type = redis.call('TYPE', unlink_tombstone)
+if type(tombstone_type) == 'table' then tombstone_type = tombstone_type['ok'] end
 if document_type ~= 'none' and document_type ~= 'string' then return -4 end
 if index_type ~= 'none' and index_type ~= 'set' then return -4 end
+if tombstone_type ~= 'none' and tombstone_type ~= 'string' then return -4 end
 local indexed = redis.call('SISMEMBER', index_key, link_id)
 if document_type == 'none' then
   if indexed == 1 then return -4 end
-  return 0
+  if tombstone_type == 'none' then return {0} end
+  local tombstone_ok, tombstone = pcall(
+      cjson.decode, redis.call('GET', unlink_tombstone)
+  )
+  if not tombstone_ok or type(tombstone) ~= 'table'
+      or tombstone['link_id'] ~= link_id
+      or (tombstone['state'] ~= 'deleting'
+          and tombstone['state'] ~= 'deleted') then return {-4} end
+  if tombstone['state'] == 'deleted' then return {0} end
+  if type(tombstone['link_doc']) ~= 'table' then return {-4} end
+  return {2, cjson.encode(tombstone['link_doc'])}
 end
 if indexed ~= 1 then return -4 end
-local removed = redis.call('DEL', document_key)
+if tombstone_type ~= 'none' then return {-4} end
+local document_raw = redis.call('GET', document_key)
+local document_ok, document = pcall(cjson.decode, document_raw)
+if not document_ok or type(document) ~= 'table' then return {-4} end
+local tombstone = cjson.encode({
+  link_id=link_id,
+  state='deleting',
+  link_doc=document,
+})
+redis.call('SET', unlink_tombstone, tombstone)
+redis.call('DEL', document_key)
 redis.call('SREM', index_key, link_id)
-return removed
+return {1, document_raw}
+"""
+
+    _LUA_FINISH_UNLINK_LINKED_SHARE = """
+local unlink_tombstone = KEYS[1]
+local linked_leaf_names = KEYS[2]
+local link_id = ARGV[1]
+local tombstone_type = redis.call('TYPE', unlink_tombstone)
+if type(tombstone_type) == 'table' then tombstone_type = tombstone_type['ok'] end
+local names_type = redis.call('TYPE', linked_leaf_names)
+if type(names_type) == 'table' then names_type = names_type['ok'] end
+if tombstone_type ~= 'string'
+    or (names_type ~= 'none' and names_type ~= 'set') then return -1 end
+if names_type == 'set' and redis.call('SCARD', linked_leaf_names) ~= 0 then
+  return -2
+end
+local tombstone_ok, tombstone = pcall(
+    cjson.decode, redis.call('GET', unlink_tombstone)
+)
+if not tombstone_ok or type(tombstone) ~= 'table'
+    or tombstone['link_id'] ~= link_id
+    or (tombstone['state'] ~= 'deleting'
+        and tombstone['state'] ~= 'deleted') then return -1 end
+redis.call('SET', unlink_tombstone, cjson.encode({
+  link_id=link_id,
+  state='deleted',
+}))
+redis.call('DEL', linked_leaf_names)
+return 1
+"""
+
+    _LUA_GET_AUTHORITATIVE_LINKED_SHARE = """
+local document_key = KEYS[1]
+local index_key = KEYS[2]
+local unlink_tombstone = KEYS[3]
+local link_id = ARGV[1]
+
+local document_type = redis.call('TYPE', document_key)
+if type(document_type) == 'table' then document_type = document_type['ok'] end
+local index_type = redis.call('TYPE', index_key)
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+local tombstone_type = redis.call('TYPE', unlink_tombstone)
+if type(tombstone_type) == 'table' then tombstone_type = tombstone_type['ok'] end
+if (document_type ~= 'none' and document_type ~= 'string')
+    or (index_type ~= 'none' and index_type ~= 'set')
+    or (tombstone_type ~= 'none' and tombstone_type ~= 'string') then
+  return {-2}
+end
+
+-- Any durable unlink marker denies authority. It is intentionally checked
+-- before the document/index pair so a partially completed unlink cannot expose
+-- a control document through an inconsistent intermediate state.
+if tombstone_type ~= 'none' then return {-3} end
+
+local indexed = redis.call('SISMEMBER', index_key, link_id)
+if document_type == 'none' then
+  if indexed ~= 0 then return {-2} end
+  return {0}
+end
+if indexed ~= 1 then return {-2} end
+
+local document_raw = redis.call('GET', document_key)
+local document_ok, document = pcall(cjson.decode, document_raw)
+if not document_ok or type(document) ~= 'table'
+    or document['link_id'] ~= link_id then return {-2} end
+return {1, document_raw}
 """
 
     _LUA_ROOT_BUMP = _LUA_ROOT_DOCUMENT_GUARD + """
@@ -5715,6 +6451,30 @@ return 1
         # Register scripts
         self._leaf_cas_set = self.r.register_script(self._LUA_LEAF_CAS_SET)
         self._leaf_payload_cas_set = self.r.register_script(self._LUA_LEAF_PAYLOAD_CAS_SET)
+        self._allocate_linked_publication = self.r.register_script(
+            self._LUA_ALLOCATE_LINKED_PUBLICATION
+        )
+        self._allocate_share_manifest_generation = self.r.register_script(
+            self._LUA_ALLOCATE_SHARE_MANIFEST_GENERATION
+        )
+        self._reserve_linked_provider_publication = self.r.register_script(
+            self._LUA_RESERVE_LINKED_PROVIDER_PUBLICATION
+        )
+        self._abort_linked_provider_publication = self.r.register_script(
+            self._LUA_ABORT_LINKED_PROVIDER_PUBLICATION
+        )
+        self._upsert_linked_leaf = self.r.register_script(
+            self._LUA_UPSERT_LINKED_LEAF
+        )
+        self._delete_linked_leaf = self.r.register_script(
+            self._LUA_DELETE_LINKED_LEAF
+        )
+        self._delete_stale_linked_leaf = self.r.register_script(
+            self._LUA_DELETE_STALE_LINKED_LEAF
+        )
+        self._delete_unlinked_leaf = self.r.register_script(
+            self._LUA_DELETE_UNLINKED_LEAF
+        )
         self._get_replica_leaf = self.r.register_script(
             self._LUA_GET_REPLICA_LEAF
         )
@@ -5741,6 +6501,12 @@ return 1
         self._mutate_share = self.r.register_script(self._LUA_MUTATE_SHARE)
         self._delete_linked_share_fenced = self.r.register_script(
             self._LUA_DELETE_LINKED_SHARE
+        )
+        self._finish_unlink_linked_share = self.r.register_script(
+            self._LUA_FINISH_UNLINK_LINKED_SHARE
+        )
+        self._get_authoritative_linked_share = self.r.register_script(
+            self._LUA_GET_AUTHORITATIVE_LINKED_SHARE
         )
         self._begin_simple_deletion = self.r.register_script(
             self._LUA_BEGIN_SIMPLE_DELETION
@@ -8583,9 +9349,13 @@ return 1
             now_ms: Optional[int] = None,
             *,
             namespace_token: str = "",
+            not_after_ms: Optional[int] = None,
     ) -> int:
         """Atomically write a leaf pointer *and* snapshot payload (so readers avoid storage reads)."""
         timestamp = _publication_timestamp(now_ms)
+        publication_deadline = (
+            0 if not_after_ms is None else _publication_timestamp(not_after_ms)
+        )
         try:
             payload_json = json.dumps(snapshot_cache_payload(payload))
         except Exception as exc:
@@ -8608,6 +9378,7 @@ return 1
                         timestamp,
                         namespace_token or "",
                         simple,
+                        publication_deadline,
                     ],
                 )
                 or 0
@@ -8632,6 +9403,8 @@ return 1
                 )
             if result == -8:
                 raise ValueError("Leaf timestamp is outside Redis Lua's exact range")
+            if result == -9:
+                raise TimeoutError("Leaf publication deadline was exceeded")
             if result < 0:
                 raise SnapshotCommitConflictError(
                     f"Cannot initialize existing table {org}/{sup}/{simple}"
@@ -8640,6 +9413,505 @@ return 1
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] leaf_payload_cas_set error: {e}")
             raise
+
+    @staticmethod
+    def _linked_publication_generation_key(
+        org: str, sup: str, link_id: str,
+    ) -> str:
+        return RK.linked_share_doc(org, sup, link_id) + ":publication_generation"
+
+    @staticmethod
+    def _linked_provider_reservation_key(
+        org: str, sup: str, link_id: str,
+    ) -> str:
+        return RK.linked_share_doc(org, sup, link_id) + ":provider_publication"
+
+    @staticmethod
+    def _linked_leaf_names_key(org: str, sup: str, link_id: str) -> str:
+        return RK.linked_share_doc(org, sup, link_id) + ":leaf_names"
+
+    @staticmethod
+    def _linked_unlink_tombstone_key(
+        org: str, sup: str, link_id: str,
+    ) -> str:
+        return RK.linked_share_doc(org, sup, link_id) + ":unlinked"
+
+    def allocate_linked_share_publication_generation(
+        self, org: str, sup: str, link_id: str,
+    ) -> tuple[int, int]:
+        """Allocate a Redis-clock-ordered generation and return server ms."""
+        try:
+            raw = self._allocate_linked_publication(
+                keys=[self._linked_publication_generation_key(org, sup, link_id)],
+                args=[],
+            )
+            if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+                raise RuntimeError("Invalid linked publication generation result")
+            generation, server_ms = int(raw[0]), int(raw[1])
+            if generation <= 0 or server_ms < 0:
+                raise RuntimeError("Invalid linked publication generation state")
+            return generation, server_ms
+        except redis.RedisError as exc:
+            logger.error(
+                "[redis-catalog] linked publication generation error: %s",
+                exc,
+            )
+            raise
+
+    def reserve_linked_provider_publication(
+        self,
+        org: str,
+        sup: str,
+        link_id: str,
+        *,
+        provider_generated_ms: int,
+        manifest_digest: str,
+        publication_generation: int,
+        not_after_ms: int,
+        instance_nonce: str,
+    ) -> bool:
+        """Reserve one provider-ordered publication before any leaf mutation.
+
+        ``False`` means the exact provider manifest is already fully committed.
+        A lower provider timestamp or equal timestamp with different bytes is a
+        conflict, independent of local response completion order.
+        """
+        provider_generation = _lua_safe_integer(
+            provider_generated_ms,
+            field="provider manifest generation",
+            minimum=1,
+        )
+        local_generation = _lua_safe_integer(
+            publication_generation,
+            field="linked publication generation",
+            minimum=1,
+        )
+        deadline = _lua_safe_integer(
+            not_after_ms,
+            field="linked publication deadline",
+            minimum=1,
+        )
+        if not isinstance(manifest_digest, str) or re.fullmatch(
+            r"[0-9a-f]{64}", manifest_digest,
+        ) is None:
+            raise ValueError("provider manifest digest is invalid")
+        if not isinstance(instance_nonce, str) or re.fullmatch(
+            r"link-instance-v1:[0-9a-f]{64}", instance_nonce,
+        ) is None:
+            raise ValueError("linked-share instance nonce is invalid")
+        result = int(self._reserve_linked_provider_publication(
+            keys=[
+                self._linked_provider_reservation_key(org, sup, link_id),
+                self._linked_unlink_tombstone_key(org, sup, link_id),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.meta_root(org, sup),
+            ],
+            args=[
+                provider_generation,
+                manifest_digest,
+                local_generation,
+                deadline,
+                instance_nonce,
+            ],
+        ) or 0)
+        if result == 0:
+            return False
+        if result == -1:
+            raise FileNotFoundError("Linked share is unlinked")
+        if result == -2:
+            raise DeletionIntentConflictError(
+                f"Catalog mutation is fenced: {org}/{sup}"
+            )
+        if result == -3:
+            raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+        if result in (-4, -6):
+            raise RuntimeError(f"Corrupt linked publication state: {org}/{sup}")
+        if result == -5:
+            raise ReadOnlyCatalogError(f"SuperTable is read-only: {org}/{sup}")
+        if result == -8:
+            raise ValueError("Linked provider publication metadata is invalid")
+        if result == -9:
+            raise TimeoutError("Linked publication deadline was exceeded")
+        if result == -10:
+            raise SnapshotCommitConflictError(
+                "A newer provider manifest publication already started"
+            )
+        if result == -11:
+            raise SnapshotCommitConflictError(
+                "Provider manifest generation is ambiguous"
+            )
+        if result == -12:
+            raise SnapshotCommitConflictError(
+                "Linked-share instance identity changed"
+            )
+        if result != 1:
+            raise RuntimeError(f"Invalid linked publication reservation: {result}")
+        return True
+
+    def abort_linked_provider_publication(
+        self,
+        org: str,
+        sup: str,
+        link_id: str,
+        *,
+        instance_nonce: str,
+    ) -> bool:
+        """Durably fence and detach one failed publication owned by the caller.
+
+        The immutable link-instance nonce lets an ambiguous initial-create
+        caller abort its own link even if a newer refresh advanced provider or
+        local generations before the error response arrived. It cannot detach
+        a different incarnation that happens to reuse the same link id.
+        """
+        if not isinstance(instance_nonce, str) or re.fullmatch(
+            r"link-instance-v1:[0-9a-f]{64}", instance_nonce,
+        ) is None:
+            raise ValueError("linked-share instance nonce is invalid")
+        result = int(self._abort_linked_provider_publication(
+            keys=[
+                RK.linked_share_doc(org, sup, link_id),
+                RK.linked_share_index(org, sup),
+                self._linked_provider_reservation_key(org, sup, link_id),
+                self._linked_unlink_tombstone_key(org, sup, link_id),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.meta_root(org, sup),
+            ],
+            args=[
+                link_id,
+                instance_nonce,
+            ],
+        ) or 0)
+        if result in (1, 2):
+            return True
+        if result == -1:
+            raise DeletionIntentConflictError(
+                f"Catalog mutation is fenced: {org}/{sup}"
+            )
+        if result == -2:
+            raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+        if result in (-3, -5):
+            raise RuntimeError(f"Corrupt linked publication state: {org}/{sup}")
+        if result == -4:
+            raise ReadOnlyCatalogError(f"SuperTable is read-only: {org}/{sup}")
+        if result == -6:
+            raise SnapshotCommitConflictError(
+                "Linked publication ownership changed before abort"
+            )
+        if result == -8:
+            raise ValueError("Linked provider publication metadata is invalid")
+        raise RuntimeError(f"Invalid linked publication abort result: {result}")
+
+    def list_linked_share_leaf_names(
+        self, org: str, sup: str, link_id: str, *, limit: int = 10_000,
+    ) -> List[str]:
+        """Return the bounded per-link leaf index used for batch repair."""
+        return self._bounded_set_members(
+            self._linked_leaf_names_key(org, sup, link_id),
+            limit=limit,
+            description=f"linked leaf index for {org}/{sup}/{link_id}",
+        )
+
+    def scan_linked_share_leaf_names(
+        self,
+        org: str,
+        sup: str,
+        link_id: str,
+        *,
+        cursor: int = 0,
+        count: int = 256,
+    ) -> tuple[int, List[str]]:
+        """Read one bounded cleanup page without materializing the full set.
+
+        Cleanup callers hold a durable unlink tombstone or provider
+        reservation and may safely restart at cursor zero after deletions.
+        This API is deliberately not an authoritative snapshot API.
+        """
+        safe_cursor = _lua_safe_integer(
+            cursor, field="linked leaf scan cursor", minimum=0,
+        )
+        safe_count = _lua_safe_integer(
+            count, field="linked leaf scan count", minimum=1,
+        )
+        if safe_count > 1024:
+            raise ValueError("linked leaf scan count exceeds its safety limit")
+        try:
+            raw_cursor, raw_members = self.r.sscan(
+                self._linked_leaf_names_key(org, sup, link_id),
+                cursor=safe_cursor,
+                count=safe_count,
+            )
+            next_cursor = int(raw_cursor)
+            if next_cursor < 0 or next_cursor > (1 << 64) - 1:
+                raise RuntimeError("Corrupt linked leaf scan cursor")
+            if not isinstance(raw_members, (list, tuple, set)):
+                raise RuntimeError("Corrupt linked leaf scan page")
+            if len(raw_members) > safe_count * 8 + 64:
+                raise RuntimeError("Linked leaf scan page exceeds its safety limit")
+            decoded = {
+                self._decode_index_member(
+                    value,
+                    description=f"linked leaf index for {org}/{sup}/{link_id}",
+                )
+                for value in raw_members
+            }
+            return next_cursor, sorted(decoded)
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] linked leaf scan failed: %s", exc)
+            raise
+
+    def upsert_linked_leaf(
+        self,
+        org: str,
+        sup: str,
+        simple: str,
+        payload: Dict[str, Any],
+        path: str,
+        *,
+        link_id: str,
+        generation: int,
+        not_after_ms: int,
+    ) -> bool:
+        """Create/update only this link's leaf, ordered and deadline-fenced."""
+        safe_generation = _publication_timestamp(generation)
+        publication_deadline = _publication_timestamp(not_after_ms)
+        if safe_generation <= 0 or publication_deadline <= 0:
+            raise ValueError("Linked publication generation/deadline is invalid")
+        try:
+            payload_json = json.dumps(snapshot_cache_payload(payload))
+        except Exception as exc:
+            raise ValueError("snapshot payload is not JSON serializable") from exc
+        try:
+            result = int(self._upsert_linked_leaf(
+                keys=[
+                    RK.meta_leaf(org, sup, simple),
+                    RK.lock_namespace(org, sup),
+                    RK.meta_table_names(org, sup),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_simple_deletion_intent(org, sup, simple),
+                    RK.meta_root(org, sup),
+                    self._linked_provider_reservation_key(org, sup, link_id),
+                    self._linked_leaf_names_key(org, sup, link_id),
+                    self._linked_unlink_tombstone_key(org, sup, link_id),
+                ],
+                args=[
+                    payload_json,
+                    path,
+                    simple,
+                    link_id,
+                    safe_generation,
+                    publication_deadline,
+                ],
+            ) or 0)
+            if result == -1:
+                raise FileExistsError(
+                    f"Local table blocks linked leaf: {org}/{sup}/{simple}"
+                )
+            if result == -2:
+                raise FileExistsError(
+                    f"Another linked share owns table: {org}/{sup}/{simple}"
+                )
+            if result in (-3, -4, -5):
+                raise DeletionIntentConflictError(
+                    f"Catalog mutation is fenced: {org}/{sup}/{simple}"
+                )
+            if result == -6:
+                raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+            if result in (-7, -9, -11):
+                raise RuntimeError(f"Corrupt linked leaf catalog state: {org}/{sup}")
+            if result == -8:
+                raise ReadOnlyCatalogError(f"SuperTable is read-only: {org}/{sup}")
+            if result in (-10, -12):
+                raise ValueError("Linked leaf publication metadata is invalid")
+            if result == -13:
+                raise TimeoutError("Linked leaf publication deadline was exceeded")
+            if result == -14:
+                raise SnapshotCommitConflictError(
+                    "A newer linked leaf publication already committed"
+                )
+            if result == -15:
+                raise SnapshotCommitConflictError(
+                    "A newer provider manifest leaf already committed"
+                )
+            if result == -16:
+                raise SnapshotCommitConflictError(
+                    "Provider manifest generation is ambiguous"
+                )
+            if result == -17:
+                raise FileNotFoundError("Linked share is unlinked")
+            if result == -18:
+                raise SnapshotCommitConflictError(
+                    "Linked provider publication reservation changed"
+                )
+            if result not in (1, 2):
+                raise RuntimeError(f"Invalid linked leaf publication result: {result}")
+            return result == 1
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] linked leaf upsert error: %s", exc)
+            raise
+
+    def delete_linked_leaf_if_generation(
+        self,
+        org: str,
+        sup: str,
+        simple: str,
+        *,
+        link_id: str,
+        expected_generation: int,
+        not_after_ms: Optional[int] = None,
+    ) -> bool:
+        """Delete exactly one observed link generation; never a replacement."""
+        generation = _publication_timestamp(expected_generation)
+        publication_deadline = (
+            0 if not_after_ms is None else _publication_timestamp(not_after_ms)
+        )
+        try:
+            result = int(self._delete_linked_leaf(
+                keys=[
+                    RK.meta_leaf(org, sup, simple),
+                    RK.meta_table_names(org, sup),
+                    RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_root(org, sup),
+                    self._linked_leaf_names_key(org, sup, link_id),
+                ],
+                args=[
+                    simple,
+                    link_id,
+                    generation,
+                    publication_deadline,
+                ],
+            ) or 0)
+            if result in (-1, -2):
+                return False
+            if result == -3:
+                raise DeletionIntentConflictError(
+                    f"Catalog mutation is fenced: {org}/{sup}/{simple}"
+                )
+            if result == -4:
+                raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+            if result in (-5, -7):
+                raise RuntimeError(f"Corrupt linked leaf catalog state: {org}/{sup}")
+            if result == -6:
+                raise ReadOnlyCatalogError(f"SuperTable is read-only: {org}/{sup}")
+            if result == -8:
+                raise ValueError("Linked leaf generation is invalid")
+            if result == -9:
+                raise TimeoutError("Linked leaf deletion deadline was exceeded")
+            if result not in (0, 1):
+                raise RuntimeError(f"Invalid linked leaf deletion result: {result}")
+            return result == 1
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] linked leaf deletion error: %s", exc)
+            raise
+
+    def delete_stale_linked_leaf(
+        self,
+        org: str,
+        sup: str,
+        simple: str,
+        *,
+        link_id: str,
+        provider_generated_ms: int,
+        manifest_digest: str,
+        publication_generation: int,
+        not_after_ms: int,
+    ) -> bool:
+        """Remove an indexed leaf older than the live publication reservation."""
+        provider_generation = _lua_safe_integer(
+            provider_generated_ms,
+            field="provider manifest generation",
+            minimum=1,
+        )
+        local_generation = _lua_safe_integer(
+            publication_generation,
+            field="linked publication generation",
+            minimum=1,
+        )
+        deadline = _lua_safe_integer(
+            not_after_ms,
+            field="linked publication deadline",
+            minimum=1,
+        )
+        if not isinstance(manifest_digest, str) or re.fullmatch(
+            r"[0-9a-f]{64}", manifest_digest,
+        ) is None:
+            raise ValueError("provider manifest digest is invalid")
+        result = int(self._delete_stale_linked_leaf(
+            keys=[
+                RK.meta_leaf(org, sup, simple),
+                RK.meta_table_names(org, sup),
+                self._linked_leaf_names_key(org, sup, link_id),
+                RK.meta_namespace_deletion_intent(org, sup),
+                RK.meta_root(org, sup),
+                self._linked_provider_reservation_key(org, sup, link_id),
+                self._linked_unlink_tombstone_key(org, sup, link_id),
+            ],
+            args=[
+                simple,
+                link_id,
+                provider_generation,
+                manifest_digest,
+                local_generation,
+                deadline,
+            ],
+        ) or 0)
+        if result in (-1, 0):
+            return False
+        if result == -3:
+            raise DeletionIntentConflictError(
+                f"Catalog mutation is fenced: {org}/{sup}/{simple}"
+            )
+        if result == -4:
+            raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+        if result in (-5, -7):
+            raise RuntimeError(f"Corrupt linked leaf catalog state: {org}/{sup}")
+        if result == -6:
+            raise ReadOnlyCatalogError(f"SuperTable is read-only: {org}/{sup}")
+        if result == -8:
+            raise ValueError("Linked provider publication metadata is invalid")
+        if result == -9:
+            raise TimeoutError("Linked leaf deletion deadline was exceeded")
+        if result == -10:
+            raise FileNotFoundError("Linked share is unlinked")
+        if result == -11:
+            raise SnapshotCommitConflictError(
+                "Linked provider publication reservation changed"
+            )
+        if result != 1:
+            raise RuntimeError(f"Invalid stale linked leaf deletion: {result}")
+        return True
+
+    def delete_unlinked_leaf(
+        self,
+        org: str,
+        sup: str,
+        simple: str,
+        *,
+        link_id: str,
+    ) -> bool:
+        """Delete one same-link leaf only after a durable unlink tombstone."""
+        result = int(self._delete_unlinked_leaf(
+            keys=[
+                RK.meta_leaf(org, sup, simple),
+                RK.meta_table_names(org, sup),
+                self._linked_leaf_names_key(org, sup, link_id),
+                self._linked_unlink_tombstone_key(org, sup, link_id),
+                RK.meta_root(org, sup),
+            ],
+            args=[simple, link_id],
+        ) or 0)
+        if result == 0:
+            return False
+        if result == -1:
+            raise RuntimeError("Linked unlink tombstone is invalid")
+        if result == -2:
+            raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+        if result in (-3, -4):
+            raise RuntimeError(f"Corrupt linked leaf catalog state: {org}/{sup}")
+        if result == -5:
+            return False
+        if result != 1:
+            raise RuntimeError(f"Invalid unlinked leaf deletion: {result}")
+        return True
 
     # ------------- Mirror formats (Redis-backed) -------------
 
@@ -12352,6 +13624,69 @@ return 1
             raise RuntimeError(f"Corrupt {description}")
         return value
 
+    def _bounded_set_members(
+        self,
+        key: str,
+        *,
+        limit: int,
+        description: str,
+    ) -> List[str]:
+        """Read a Redis set without materializing an attacker-sized index."""
+        safe_limit = _lua_safe_integer(limit, field=description, minimum=1)
+        try:
+            cardinality = int(self.r.scard(key) or 0)
+            if cardinality < 0 or cardinality > safe_limit:
+                raise RuntimeError(f"{description} exceeds its safety limit")
+            cursor = 0
+            visited_cursors: set[int] = set()
+            decoded: set[str] = set()
+            observations = 0
+            call_budget = max(
+                64,
+                min(4096, ((safe_limit + 63) // 64) * 8 + 64),
+            )
+            for _call in range(call_budget):
+                raw_cursor, raw_members = self.r.sscan(
+                    key,
+                    cursor=cursor,
+                    count=min(128, safe_limit + 1),
+                )
+                try:
+                    next_cursor = int(raw_cursor)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise RuntimeError(f"Corrupt {description}") from exc
+                if next_cursor < 0 or next_cursor > (1 << 64) - 1:
+                    raise RuntimeError(f"Corrupt {description}")
+                if not isinstance(raw_members, (list, tuple, set)):
+                    raise RuntimeError(f"Corrupt {description}")
+                observations += len(raw_members)
+                if observations > safe_limit * 8 + 1024:
+                    raise RuntimeError(f"Corrupt or unstable {description}")
+                for raw_member in raw_members:
+                    decoded.add(self._decode_index_member(
+                        raw_member, description=description,
+                    ))
+                    if len(decoded) > safe_limit:
+                        raise RuntimeError(
+                            f"{description} exceeds its safety limit"
+                        )
+                if next_cursor == 0:
+                    # Require one stable authoritative view. A concurrent
+                    # add/remove (including a same-cardinality replacement
+                    # that exposes both generations during SSCAN) must not
+                    # silently produce a partial control-plane index.
+                    if len(decoded) != cardinality:
+                        raise RuntimeError(f"Corrupt or unstable {description}")
+                    return sorted(decoded)
+                if next_cursor == cursor or next_cursor in visited_cursors:
+                    raise RuntimeError(f"Corrupt or unstable {description}")
+                visited_cursors.add(next_cursor)
+                cursor = next_cursor
+            raise RuntimeError(f"Corrupt or unstable {description}")
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] bounded set scan failed: %s", exc)
+            raise
+
     def create_share(self, org: str, share_id: str, share_doc: Dict[str, Any]) -> None:
         """Create a share definition and its index entry atomically."""
         if not isinstance(share_doc, dict):
@@ -12371,6 +13706,38 @@ return 1
                 raise RuntimeError(f"Invalid share creation result: {result}")
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] create_share error: {e}")
+            raise
+
+    def allocate_share_manifest_generation(
+        self, org: str, share_id: str, incarnation: str,
+    ) -> int:
+        """Allocate a Redis-clock monotonic issuance value for one share token.
+
+        Token-hash scoping prevents a revoked/recreated share id from
+        inheriting the prior incarnation's ordering state.
+        """
+        if not isinstance(incarnation, str) or re.fullmatch(
+            r"[0-9a-f]{64}", incarnation,
+        ) is None:
+            raise ValueError("share incarnation is invalid")
+        key = (
+            RK.share_doc(org, share_id)
+            + ":manifest_generation:"
+            + incarnation
+        )
+        try:
+            result = int(self._allocate_share_manifest_generation(
+                keys=[key], args=[],
+            ) or 0)
+            if result == -1:
+                raise OverflowError("share manifest generation overflow")
+            if result == -2:
+                raise RuntimeError("Corrupt share manifest generation state")
+            if result <= 0 or result > _REDIS_LUA_MAX_SAFE_INTEGER:
+                raise RuntimeError("Invalid share manifest generation")
+            return result
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] share manifest generation error: %s", exc)
             raise
 
     def update_share(
@@ -12424,14 +13791,17 @@ return 1
             logger.error(f"[redis-catalog] delete_share error: {e}")
             raise
 
-    def list_shares(self, org: str) -> List[Dict[str, Any]]:
+    def list_shares(
+        self, org: str, *, limit: int = 10_000,
+    ) -> List[Dict[str, Any]]:
         shares: List[Dict[str, Any]] = []
         try:
-            members = self.r.smembers(RK.share_index(org))
-            for sid_raw in (members or []):
-                sid = self._decode_index_member(
-                    sid_raw, description=f"share index for {org}",
-                )
+            members = self._bounded_set_members(
+                RK.share_index(org),
+                limit=limit,
+                description=f"share index for {org}",
+            )
+            for sid in members:
                 raw = self.r.get(RK.share_doc(org, sid))
                 if raw is None:
                     raise RuntimeError(
@@ -12449,9 +13819,20 @@ return 1
     # Data Sharing — consumer-side linked shares
     # --------------------------------------------------------------------------- #
 
-    def create_linked_share(self, org: str, sup: str, link_id: str, link_doc: Dict[str, Any]) -> None:
+    def create_linked_share(
+        self,
+        org: str,
+        sup: str,
+        link_id: str,
+        link_doc: Dict[str, Any],
+        *,
+        not_after_ms: Optional[int] = None,
+    ) -> None:
         if not isinstance(link_doc, dict):
             raise TypeError("Linked-share document must be a JSON object")
+        publication_deadline = (
+            0 if not_after_ms is None else _publication_timestamp(not_after_ms)
+        )
         try:
             result = int(self._upsert_linked_share_fenced(
                 keys=[
@@ -12459,8 +13840,12 @@ return 1
                     RK.linked_share_index(org, sup),
                     RK.meta_namespace_deletion_intent(org, sup),
                     RK.meta_root(org, sup),
+                    self._linked_provider_reservation_key(org, sup, link_id),
+                    self._linked_unlink_tombstone_key(org, sup, link_id),
                 ],
-                args=[json.dumps(link_doc), link_id, "create"],
+                args=[
+                    json.dumps(link_doc), link_id, "create", publication_deadline,
+                ],
             ) or 0)
             if result == -1:
                 raise DeletionIntentConflictError(
@@ -12486,6 +13871,20 @@ return 1
                 raise ReadOnlyCatalogError(
                     f"SuperTable is read-only: {org}/{sup}"
                 )
+            if result == -8:
+                raise TimeoutError(
+                    "Linked-share publication deadline was exceeded"
+                )
+            if result == -12:
+                raise FileNotFoundError("Linked share is unlinked")
+            if result == -13:
+                raise SnapshotCommitConflictError(
+                    "Linked provider publication reservation changed"
+                )
+            if result == -14:
+                raise SnapshotCommitConflictError(
+                    "Linked-share instance identity changed"
+                )
             if result != 1:
                 raise RuntimeError(
                     f"Invalid linked-share publication result: {result}"
@@ -12509,9 +13908,75 @@ return 1
             logger.error(f"[redis-catalog] get_linked_share error: {e}")
             raise
 
-    def update_linked_share(self, org: str, sup: str, link_id: str, doc: Dict[str, Any]) -> bool:
+    def get_authoritative_linked_share(
+        self, org: str, sup: str, link_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically read an active, indexed linked-share control document.
+
+        A bare document is not authority: the matching index membership must
+        exist in the same Redis execution, and any durable unlink tombstone
+        denies the read. Consistent absence returns ``None``; partial/corrupt
+        state raises instead of being confused with a never-created link.
+        """
+        if (
+            not isinstance(link_id, str)
+            or not link_id
+            or len(link_id.encode("utf-8")) > 1024
+            or "\x00" in link_id
+        ):
+            raise ValueError("Linked-share identity is invalid")
+        try:
+            raw = self._get_authoritative_linked_share(
+                keys=[
+                    RK.linked_share_doc(org, sup, link_id),
+                    RK.linked_share_index(org, sup),
+                    self._linked_unlink_tombstone_key(org, sup, link_id),
+                ],
+                args=[link_id],
+            )
+            if not isinstance(raw, (list, tuple)) or not raw:
+                raise RuntimeError("Invalid authoritative linked-share result")
+            result = int(raw[0])
+            if result == 0:
+                return None
+            if result == -2:
+                raise RuntimeError(
+                    f"Corrupt linked-share authority for {org}/{sup}/{link_id}"
+                )
+            if result == -3:
+                raise FileNotFoundError(
+                    f"Linked share is unlinked: {org}/{sup}/{link_id}"
+                )
+            if result != 1 or len(raw) != 2:
+                raise RuntimeError("Invalid authoritative linked-share result")
+            return self._decode_control_object(
+                raw[1],
+                description=(
+                    f"authoritative linked-share metadata for "
+                    f"{org}/{sup}/{link_id}"
+                ),
+            )
+        except redis.RedisError as exc:
+            logger.error(
+                "[redis-catalog] authoritative linked-share read error: %s",
+                exc,
+            )
+            raise
+
+    def update_linked_share(
+        self,
+        org: str,
+        sup: str,
+        link_id: str,
+        doc: Dict[str, Any],
+        *,
+        not_after_ms: Optional[int] = None,
+    ) -> bool:
         if not isinstance(doc, dict):
             raise TypeError("Linked-share document must be a JSON object")
+        publication_deadline = (
+            0 if not_after_ms is None else _publication_timestamp(not_after_ms)
+        )
         try:
             result = int(self._upsert_linked_share_fenced(
                 keys=[
@@ -12519,8 +13984,12 @@ return 1
                     RK.linked_share_index(org, sup),
                     RK.meta_namespace_deletion_intent(org, sup),
                     RK.meta_root(org, sup),
+                    self._linked_provider_reservation_key(org, sup, link_id),
+                    self._linked_unlink_tombstone_key(org, sup, link_id),
                 ],
-                args=[json.dumps(doc), link_id, "update"],
+                args=[
+                    json.dumps(doc), link_id, "update", publication_deadline,
+                ],
             ) or 0)
             if result == -1:
                 raise DeletionIntentConflictError(
@@ -12542,6 +14011,32 @@ return 1
                 raise ReadOnlyCatalogError(
                     f"SuperTable is read-only: {org}/{sup}"
                 )
+            if result == -8:
+                raise TimeoutError(
+                    "Linked-share publication deadline was exceeded"
+                )
+            if result == -9:
+                raise SnapshotCommitConflictError(
+                    "A newer linked-share publication already committed"
+                )
+            if result == -10:
+                raise SnapshotCommitConflictError(
+                    "A newer provider manifest already committed"
+                )
+            if result == -11:
+                raise SnapshotCommitConflictError(
+                    "Provider manifest generation is ambiguous"
+                )
+            if result == -12:
+                raise FileNotFoundError("Linked share is unlinked")
+            if result == -13:
+                raise SnapshotCommitConflictError(
+                    "Linked provider publication reservation changed"
+                )
+            if result == -14:
+                raise SnapshotCommitConflictError(
+                    "Linked-share instance identity changed"
+                )
             if result == 0:
                 return False
             if result != 1:
@@ -12553,17 +14048,29 @@ return 1
             logger.error(f"[redis-catalog] update_linked_share error: {e}")
             raise
 
-    def delete_linked_share(self, org: str, sup: str, link_id: str) -> bool:
+    def begin_unlink_linked_share(
+        self, org: str, sup: str, link_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Atomically tombstone a link and return cleanup-authoritative state."""
         try:
-            result = int(self._delete_linked_share_fenced(
+            raw = self._delete_linked_share_fenced(
                 keys=[
                     RK.linked_share_doc(org, sup, link_id),
                     RK.linked_share_index(org, sup),
                     RK.meta_namespace_deletion_intent(org, sup),
                     RK.meta_root(org, sup),
+                    self._linked_unlink_tombstone_key(org, sup, link_id),
                 ],
                 args=[link_id],
-            ) or 0)
+            )
+            if isinstance(raw, (list, tuple)):
+                if not raw:
+                    raise RuntimeError("Invalid linked-share unlink result")
+                result = int(raw[0])
+                document_raw = raw[1] if len(raw) > 1 else None
+            else:
+                result = int(raw or 0)
+                document_raw = None
             if result == -1:
                 raise DeletionIntentConflictError(
                     f"Durable deletion intent fences {org}/{sup}"
@@ -12586,20 +14093,60 @@ return 1
                 raise RuntimeError(
                     f"Invalid linked-share deletion result: {result}"
                 )
-            return result == 1
+            if result == 0:
+                return None
+            if result not in (1, 2) or document_raw is None:
+                raise RuntimeError("Invalid linked-share unlink result")
+            return self._decode_control_object(
+                document_raw,
+                description=f"linked-share unlink state for {org}/{sup}/{link_id}",
+            )
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] delete_linked_share error: {e}")
             raise
 
-    def list_linked_shares(self, org: str, sup: str) -> List[Dict[str, Any]]:
+    def finish_unlink_linked_share(
+        self, org: str, sup: str, link_id: str,
+    ) -> None:
+        """Compact an unlink tombstone only after its per-link leaf index drains."""
+        result = int(self._finish_unlink_linked_share(
+            keys=[
+                self._linked_unlink_tombstone_key(org, sup, link_id),
+                self._linked_leaf_names_key(org, sup, link_id),
+            ],
+            args=[link_id],
+        ) or 0)
+        if result == -1:
+            raise RuntimeError("Linked unlink tombstone is invalid")
+        if result == -2:
+            raise RuntimeError("Linked-share leaves remain during unlink")
+        if result != 1:
+            raise RuntimeError(f"Invalid linked-share unlink finish: {result}")
+
+    def delete_linked_share(self, org: str, sup: str, link_id: str) -> bool:
+        """Compatibility wrapper that begins durable unlink fencing."""
+        document = self.begin_unlink_linked_share(org, sup, link_id)
+        if document is None:
+            return False
+        if not self.list_linked_share_leaf_names(org, sup, link_id):
+            self.finish_unlink_linked_share(org, sup, link_id)
+        return True
+
+    def list_linked_shares(
+        self,
+        org: str,
+        sup: str,
+        *,
+        limit: int = 10_000,
+    ) -> List[Dict[str, Any]]:
         links: List[Dict[str, Any]] = []
         try:
-            members = self.r.smembers(RK.linked_share_index(org, sup))
-            for lid_raw in (members or []):
-                lid = self._decode_index_member(
-                    lid_raw,
-                    description=f"linked-share index for {org}/{sup}",
-                )
+            members = self._bounded_set_members(
+                RK.linked_share_index(org, sup),
+                limit=limit,
+                description=f"linked-share index for {org}/{sup}",
+            )
+            for lid in members:
                 raw = self.r.get(RK.linked_share_doc(org, sup, lid))
                 if raw is None:
                     raise RuntimeError(

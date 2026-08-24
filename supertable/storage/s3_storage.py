@@ -132,6 +132,7 @@ class S3Storage(StorageInterface):
         return f"s3://{self.bucket_name}/{full_key}"
 
     def presign(self, key: str, expiry_seconds: int = 3600) -> str:
+        key = self._require_presign_object_key(key)
         self._ensure_bucket_region()
         full_key = self._with_base(key.lstrip("/"))
         return self.client.generate_presigned_url(

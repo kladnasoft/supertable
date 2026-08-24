@@ -50,6 +50,10 @@ from supertable.engine.island_resources import (
     ResourceReservationCancelled,
     ResultMemoryLimitExceeded,
 )
+from supertable.engine.stable_http_relay import (
+    next_local_credential_generation,
+)
+from supertable.engine.remote_paths import is_remote_scan_path
 from supertable.data_classes import Reflection
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
@@ -68,6 +72,76 @@ _PRESIGN_REFRESH_MAX_IN_FLIGHT = 8
 _presign_refresh_slots = threading.BoundedSemaphore(
     _PRESIGN_REFRESH_MAX_IN_FLIGHT
 )
+
+
+class _PresignAuthorityGate:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.users = 0
+
+
+_presign_authority_gates_lock = threading.Lock()
+_presign_authority_gates: dict[tuple[type, int, str], _PresignAuthorityGate] = {}
+
+
+def _acquire_presign_authority_gate(
+    presign,
+    key: str,
+    *,
+    deadline_monotonic: Optional[float],
+    cancel_event: Optional[threading.Event],
+) -> tuple[tuple[type, int, str], _PresignAuthorityGate]:
+    """Serialize issuance for one storage authority and immutable key.
+
+    A process generation is useful only when its order matches provider
+    invocation order. Keeping generation allocation and the synchronous SDK
+    call under this keyed gate prevents a preempted older invocation from
+    receiving an ordering marker newer than a credential issued in between.
+    Unrelated storage instances and object keys remain fully concurrent.
+    """
+    authority = getattr(presign, "__self__", None)
+    if authority is None:
+        authority = presign
+    registry_key = (type(authority), id(authority), str(key))
+    with _presign_authority_gates_lock:
+        gate = _presign_authority_gates.get(registry_key)
+        if gate is None:
+            gate = _PresignAuthorityGate()
+            _presign_authority_gates[registry_key] = gate
+        gate.users += 1
+
+    acquired = False
+    try:
+        while True:
+            _raise_if_query_cancelled(cancel_event)
+            remaining = _remaining_query_timeout(deadline_monotonic)
+            wait_for = 0.05 if remaining is None else min(0.05, remaining)
+            if gate.lock.acquire(timeout=max(0.0, wait_for)):
+                acquired = True
+                return registry_key, gate
+    finally:
+        if not acquired:
+            with _presign_authority_gates_lock:
+                gate.users = max(0, gate.users - 1)
+                if (
+                    gate.users == 0
+                    and _presign_authority_gates.get(registry_key) is gate
+                ):
+                    _presign_authority_gates.pop(registry_key, None)
+
+
+def _release_presign_authority_gate(
+    registry_key: tuple[type, int, str],
+    gate: _PresignAuthorityGate,
+) -> None:
+    gate.lock.release()
+    with _presign_authority_gates_lock:
+        gate.users = max(0, gate.users - 1)
+        if (
+            gate.users == 0
+            and _presign_authority_gates.get(registry_key) is gate
+        ):
+            _presign_authority_gates.pop(registry_key, None)
 
 
 def _configured_query_timeout_sec() -> float:
@@ -174,7 +248,25 @@ def _bounded_presign_call(
     outcome: dict[str, object] = {}
 
     def invoke() -> None:
+        authority_gate = None
         try:
+            authority_gate = _acquire_presign_authority_gate(
+                presign,
+                key,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+            )
+            _raise_if_query_cancelled(cancel_event)
+            _remaining_query_timeout(deadline_monotonic)
+            # The keyed authority gate remains held from allocation through
+            # the provider call, so generation order is invocation order even
+            # if this thread is preempted on either side of allocation.
+            outcome["credential_expires_ms"] = (
+                int(time.time() * 1_000) + int(expiry_seconds) * 1_000
+            )
+            outcome["credential_generation"] = (
+                next_local_credential_generation()
+            )
             outcome["result"] = presign(
                 key, expiry_seconds=expiry_seconds,
             )
@@ -182,9 +274,13 @@ def _bounded_presign_call(
             outcome["error"] = exc
         finally:
             try:
-                done.set()
+                if authority_gate is not None:
+                    _release_presign_authority_gate(*authority_gate)
             finally:
-                slots.release()
+                try:
+                    done.set()
+                finally:
+                    slots.release()
 
     worker = threading.Thread(
         target=invoke,
@@ -210,13 +306,16 @@ def _bounded_presign_call(
     error = outcome.get("error")
     if isinstance(error, BaseException):
         raise error
-    return outcome.get("result")
+    return (
+        outcome.get("result"),
+        outcome.get("credential_generation"),
+        outcome.get("credential_expires_ms"),
+    )
 
 
 def _is_remote_scan_path(path: object) -> bool:
-    return str(path or "").strip().casefold().startswith((
-        "s3://", "s3a://", "http://", "https://",
-    ))
+    """Compatibility wrapper around the shared provider-scheme classifier."""
+    return is_remote_scan_path(path)
 
 
 def _path_has_bearer_query(path: object) -> bool:
@@ -260,6 +359,85 @@ def _reflection_has_bearer_paths(reflection: Reflection) -> bool:
         ):
             return True
     return False
+
+
+def _snapshot_is_linked(snapshot: object) -> bool:
+    return bool(getattr(snapshot, "share_policy_fingerprint", None))
+
+
+def _reflection_has_linked_snapshots(reflection: Reflection) -> bool:
+    return any(
+        _snapshot_is_linked(snapshot)
+        for snapshot in tuple(getattr(reflection, "supers", ()) or ())
+    )
+
+
+def _reflection_has_linked_remote_paths(reflection: Reflection) -> bool:
+    return any(
+        _snapshot_is_linked(snapshot)
+        and any(
+            _is_remote_scan_path(path)
+            for path in (getattr(snapshot, "files", ()) or ())
+        )
+        for snapshot in tuple(getattr(reflection, "supers", ()) or ())
+    )
+
+
+def _reflection_has_refreshable_remote_paths(reflection: Reflection) -> bool:
+    """Return whether the consumer storage authority owns any remote path."""
+    for snapshot in tuple(getattr(reflection, "supers", ()) or ()):
+        if _snapshot_is_linked(snapshot):
+            continue
+        if any(
+            _is_remote_scan_path(path)
+            for path in (getattr(snapshot, "files", ()) or ())
+        ):
+            return True
+    # Linked shares currently reject active deletion state. Every accepted
+    # tombstone path therefore belongs to the local storage authority.
+    for tombstone in (
+        getattr(reflection, "tombstone_views", None) or {}
+    ).values():
+        if _is_remote_scan_path(getattr(tombstone, "tombstone_path", "")):
+            return True
+        if any(
+            _is_remote_scan_path(getattr(segment, "tombstone_path", ""))
+            for segment in (getattr(tombstone, "segments", ()) or ())
+        ):
+            return True
+    return False
+
+
+def _validate_linked_share_credential_lifetimes(
+    reflection: Reflection,
+    deadline_monotonic: Optional[float],
+) -> None:
+    """Fail closed unless external bearer paths cover the admitted deadline."""
+    linked_remote = [
+        snapshot
+        for snapshot in tuple(getattr(reflection, "supers", ()) or ())
+        if _snapshot_is_linked(snapshot)
+        and any(
+            _is_remote_scan_path(path)
+            for path in (getattr(snapshot, "files", ()) or ())
+        )
+    ]
+    if not linked_remote:
+        return
+    required_expiry_ms = int(
+        (time.time() + _presign_expiry_seconds(deadline_monotonic)) * 1000
+    )
+    for snapshot in linked_remote:
+        expires_ms = getattr(snapshot, "share_credential_expires_ms", None)
+        if (
+            not isinstance(expires_ms, int)
+            or isinstance(expires_ms, bool)
+            or expires_ms < required_expiry_ms
+        ):
+            raise RuntimeError(
+                "Provider-issued linked-share credentials do not cover the "
+                "query deadline"
+            )
 
 
 def _presign_expiry_seconds(
@@ -318,18 +496,33 @@ def _refresh_presigned_reflection(
 
     refreshed_any = False
 
-    def refresh_path(path: object, key: object) -> str:
+    def refresh_path_with_generation(
+        path: object,
+        key: object,
+        *,
+        consumer_authority: bool = True,
+    ) -> Tuple[str, Optional[int], Optional[int]]:
         nonlocal refreshed_any
         current = str(path or "")
         if not _is_remote_scan_path(current):
-            return current
+            return current, None, None
+        if not consumer_authority:
+            # A linked-share URL is issued by the provider control plane. The
+            # consumer storage adapter must never reinterpret it as a local
+            # object key, even if that adapter returns a syntactically valid
+            # URL for arbitrary strings.
+            return current, None, None
         _raise_if_query_cancelled(cancel_event)
         _remaining_query_timeout(refresh_deadline)
         stable_key = str(key or "").strip()
         if not stable_key:
             raise RuntimeError("remote snapshot path has no stable resource key")
         try:
-            refreshed = _bounded_presign_call(
+            (
+                refreshed,
+                credential_generation,
+                credential_expires_ms,
+            ) = _bounded_presign_call(
                 presign,
                 stable_key,
                 expiry_seconds=expiry_seconds,
@@ -347,7 +540,29 @@ def _refresh_presigned_reflection(
         _raise_if_query_cancelled(cancel_event)
         _remaining_query_timeout(refresh_deadline)
         refreshed_any = True
-        return refreshed
+        if (
+            not isinstance(credential_generation, int)
+            or isinstance(credential_generation, bool)
+            or credential_generation <= 0
+        ):
+            raise RuntimeError("storage credential refresh has no issuance order")
+        if (
+            not isinstance(credential_expires_ms, int)
+            or isinstance(credential_expires_ms, bool)
+            or credential_expires_ms <= 0
+        ):
+            raise RuntimeError("storage credential refresh has no expiry bound")
+        return refreshed, credential_generation, credential_expires_ms
+
+    def refresh_path(
+        path: object,
+        key: object,
+        *,
+        consumer_authority: bool = True,
+    ) -> str:
+        return refresh_path_with_generation(
+            path, key, consumer_authority=consumer_authority,
+        )[0]
 
     snapshots = []
     for snapshot in tuple(getattr(reflection, "supers", ()) or ()):
@@ -357,11 +572,53 @@ def _refresh_presigned_reflection(
             raise RuntimeError(
                 "remote snapshot paths do not match stable resource keys"
             )
-        refreshed_files = [
-            refresh_path(path, keys[index] if index < len(keys) else "")
+        existing_generations = list(
+            getattr(snapshot, "resource_credential_generations", ()) or ()
+        )
+        existing_expiries = list(
+            getattr(snapshot, "resource_credential_expires_ms", ()) or ()
+        )
+        refreshed_pairs = [
+            refresh_path_with_generation(
+                path,
+                keys[index] if index < len(keys) else "",
+                consumer_authority=not _snapshot_is_linked(snapshot),
+            )
             for index, path in enumerate(files)
         ]
-        snapshots.append(replace(snapshot, files=refreshed_files))
+        refreshed_files = [
+            path for path, _generation, _expiry in refreshed_pairs
+        ]
+        refreshed_generations = [
+            (
+                generation
+                if generation is not None
+                else (
+                    existing_generations[index]
+                    if index < len(existing_generations)
+                    else None
+                )
+            )
+            for index, (_path, generation, _expiry) in enumerate(refreshed_pairs)
+        ]
+        refreshed_expiries = [
+            (
+                expiry
+                if expiry is not None
+                else (
+                    existing_expiries[index]
+                    if index < len(existing_expiries)
+                    else None
+                )
+            )
+            for index, (_path, _generation, expiry) in enumerate(refreshed_pairs)
+        ]
+        snapshots.append(replace(
+            snapshot,
+            files=refreshed_files,
+            resource_credential_generations=refreshed_generations,
+            resource_credential_expires_ms=refreshed_expiries,
+        ))
 
     tombstones = {}
     for alias, tombstone in (
@@ -953,7 +1210,7 @@ def _get_duckdb_with_status(
         engine = _duckdb_singletons.get(key)
         cache_hit = engine is not None
         if engine is None:
-            engine = DuckDB(storage=storage)
+            engine = DuckDB(storage=storage, organization=organization)
             _duckdb_singletons[key] = engine
         else:
             _duckdb_singletons.move_to_end(key)
@@ -1034,11 +1291,18 @@ class Executor:
         explain: bool,
         explain_options: str,
         stage: str,
+        deadline_monotonic: Optional[float] = None,
     ) -> pd.DataFrame:
         """Run DuckDB behind Executor's single atomic refresh boundary."""
         self._publish_duckdb_connection_cache(plan_stats)
-        timeout_sec = _configured_query_timeout_sec()
-        deadline = time.monotonic() + timeout_sec
+        deadline = deadline_monotonic
+        if deadline is None:
+            deadline = time.monotonic() + _configured_query_timeout_sec()
+        timeout_sec = _remaining_query_timeout(
+            deadline,
+            fallback=_configured_query_timeout_sec(),
+        )
+        assert timeout_sec is not None
         refresh_attempted = False
 
         def run(candidate: Reflection) -> pd.DataFrame:
@@ -1109,11 +1373,21 @@ class Executor:
             return refreshed
 
         try:
-            if _reflection_has_bearer_paths(reflection):
+            refreshable_remote = _reflection_has_refreshable_remote_paths(
+                reflection
+            )
+            if refreshable_remote and (
+                bool(getattr(settings, "SUPERTABLE_DUCKDB_PRESIGNED", False))
+                or _reflection_has_bearer_paths(reflection)
+            ):
                 return run(refresh("deadline_ttl"))
             try:
                 return run(reflection)
             except DuckDBPresignRefreshRequired:
+                if not _reflection_has_refreshable_remote_paths(reflection):
+                    raise RuntimeError(
+                        "DuckDB provider credential failed before result delivery"
+                    ) from None
                 return run(refresh("query_setup"))
         except BaseException as exc:
             _record_engine_failure(
@@ -1324,6 +1598,12 @@ class Executor:
         payload when a :class:`PlanStats` collector is supplied.
         """
         bytes_total = max(0, int(reflection.reflection_bytes or 0))
+        linked_share_reflection = _reflection_has_linked_snapshots(
+            reflection
+        )
+        linked_bearer_reflection = _reflection_has_linked_remote_paths(
+            reflection
+        )
         freshness_threshold_s = cfg.engine_freshness_sec
         active_clusters = self._active_spark_clusters()
         has_active_tombstone = any(
@@ -1379,6 +1659,7 @@ class Executor:
             size_is_complete
             and parser is not None
             and getattr(self, "island_exec", None) is not None
+            and not linked_share_reflection
         ):
             try:
                 native = self.island_exec.can_execute(
@@ -1574,10 +1855,16 @@ class Executor:
                 and getattr(native, "supported", False) is True
                 and island_range_available
             ),
+            island_linked_bearer_safe=(
+                not linked_share_reflection
+            ),
             spark_available=spark_available,
             spark_semantics_supported=spark_semantics_supported,
             fitting_spark_clusters=len(fitting_clusters),
             spark_min_scan_bytes=max(0, int(spark_min or 0)),
+            spark_linked_bearer_safe=(
+                not linked_bearer_reflection
+            ),
         )
         history = {}
         history_provider = getattr(self, "_auto_history_provider", None)
@@ -1651,6 +1938,31 @@ class Executor:
         explain: bool = False,
         explain_options: str = "",
     ) -> Tuple[pd.DataFrame, str]:
+        query_deadline = (
+            time.monotonic() + _configured_query_timeout_sec()
+        )
+        # Authorization-bearing provider paths must cover the entire admitted
+        # request before live config, AUTO routing, or cache state is touched.
+        _validate_linked_share_credential_lifetimes(
+            reflection, query_deadline,
+        )
+        linked_share_reflection = _reflection_has_linked_snapshots(
+            reflection
+        )
+        linked_bearer_reflection = _reflection_has_linked_remote_paths(
+            reflection
+        )
+        if engine is Engine.ISLANDDB and linked_share_reflection:
+            raise RuntimeError(
+                "IslandDB cannot consume provider-linked bearer resources safely"
+            )
+        if (
+            engine is Engine.SPARK_SQL
+            and linked_bearer_reflection
+        ):
+            raise RuntimeError(
+                "Spark cannot consume provider-linked bearer resources safely"
+            )
         # Resolve engine config live (Redis → env → default) for this query so
         # UI changes take effect immediately without restart or cache.
         cfgs, routing_policy = resolve_engine_bundle(
@@ -1669,6 +1981,19 @@ class Executor:
             )
         )
         auto_selected = chosen if engine == Engine.AUTO else None
+        if (
+            chosen is Engine.SPARK_SQL
+            and linked_bearer_reflection
+        ):
+            # Defense in depth if a custom/monkeypatched router bypasses the
+            # availability fence above.
+            raise RuntimeError(
+                "AUTO selected Spark for an ineligible linked-share resource"
+            )
+        if chosen is Engine.ISLANDDB and linked_share_reflection:
+            raise RuntimeError(
+                "AUTO selected IslandDB for an ineligible linked-share resource"
+            )
         plan_stats.add_stat({
             "ENGINE_REQUEST": {
                 "requested_engine": engine.value,
@@ -1794,6 +2119,7 @@ class Executor:
                     explain=explain,
                     explain_options=explain_options,
                     stage=attempt_stage,
+                    deadline_monotonic=query_deadline,
                 )
                 used = "duckdb"
 
@@ -1817,6 +2143,7 @@ class Executor:
                         engine_config=duckdb_cfg,
                         cache_metrics=cache_metrics,
                         _prepared=island_prepared,
+                        deadline_monotonic=query_deadline,
                     )
                     used = "islanddb"
                     self._publish_island_profile(
@@ -1868,6 +2195,7 @@ class Executor:
                         explain=explain,
                         explain_options=explain_options,
                         stage="auto_fallback",
+                        deadline_monotonic=query_deadline,
                     )
                     used = "duckdb"
                 except BaseException as exc:
@@ -1933,6 +2261,7 @@ class Executor:
         deadline_monotonic: Optional[float] = None,
         cancel_event: Optional[threading.Event] = None,
         _resolved_bundle=None,
+        _linked_credentials_validated: bool = False,
     ):
         """Return a one-shot Arrow batch stream without pandas.
 
@@ -1944,7 +2273,25 @@ class Executor:
         # deadline has already elapsed.  Engine-specific defaults remain in
         # force when no caller deadline is supplied.
         _raise_if_query_cancelled(cancel_event)
+        if deadline_monotonic is None:
+            deadline_monotonic = (
+                time.monotonic() + _configured_query_timeout_sec()
+            )
         _remaining_query_timeout(deadline_monotonic)
+        if not _linked_credentials_validated:
+            # This common admission boundary covers DuckDB and IslandDB,
+            # including AUTO, before configuration, routing, or cache I/O.
+            _validate_linked_share_credential_lifetimes(
+                reflection, deadline_monotonic,
+            )
+            _linked_credentials_validated = True
+        linked_share_reflection = _reflection_has_linked_snapshots(
+            reflection
+        )
+        if engine is Engine.ISLANDDB and linked_share_reflection:
+            raise RuntimeError(
+                "IslandDB cannot consume provider-linked bearer resources safely"
+            )
         max_batch_rows = _resolved_stream_limit(
             max_batch_rows,
             setting_name="SUPERTABLE_RESULT_STREAM_BATCH_ROWS",
@@ -1981,6 +2328,10 @@ class Executor:
                 routing_policy=routing_policy,
             )
         )
+        if chosen is Engine.ISLANDDB and linked_share_reflection:
+            raise RuntimeError(
+                "AUTO selected IslandDB for an ineligible linked-share resource"
+            )
         plan_stats.add_stat({
             "ENGINE_REQUEST": {
                 "requested_engine": engine.value,
@@ -2038,6 +2389,7 @@ class Executor:
                 # prevents a live config change from altering fallback
                 # semantics after IslandDB has already been selected.
                 _resolved_bundle=(cfgs, routing_policy),
+                _linked_credentials_validated=True,
             )
             plan_stats.add_stat({
                 "AUTO_ROUTING_OUTCOME": {
@@ -2162,11 +2514,18 @@ class Executor:
                     })
                     return refreshed_stream
 
-                if _reflection_has_bearer_paths(execution_reflection):
-                    # Existing signed paths may have been minted during
-                    # estimation with a shorter/default TTL. Replace the whole
-                    # reflection before setup so the URL covers this request's
-                    # remaining deadline and consumes the one refresh budget.
+                refreshable_remote = _reflection_has_refreshable_remote_paths(
+                    execution_reflection
+                )
+                if refreshable_remote and (
+                    bool(getattr(
+                        settings, "SUPERTABLE_DUCKDB_PRESIGNED", False,
+                    ))
+                    or _reflection_has_bearer_paths(execution_reflection)
+                ):
+                    # Mint the only consumer-owned credential at the bounded
+                    # DuckDB setup boundary. Existing bearer paths are also
+                    # replaced so their TTL covers this request's deadline.
                     initial_inner = start_refreshed_stream("deadline_ttl")
                     retry_factory = None
                 else:
@@ -2176,7 +2535,10 @@ class Executor:
                         initial_inner = start_refreshed_stream("query_setup")
                         retry_factory = None
                     else:
-                        retry_factory = lambda: start_refreshed_stream("first_batch")
+                        retry_factory = (
+                            (lambda: start_refreshed_stream("first_batch"))
+                            if refreshable_remote else None
+                        )
                 inner = _RetryBeforeFirstBatchStream(
                     initial_inner, retry_factory=retry_factory,
                 )

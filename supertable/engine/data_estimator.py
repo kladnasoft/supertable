@@ -235,6 +235,189 @@ def _linked_share_policy_state(
     return fingerprint, effective_allowed
 
 
+_SHARE_CACHE_ID_RE = re.compile(r"share-cache-v1:[0-9a-f]{64}\Z")
+_LINKED_MANIFEST_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
+_MAX_SAFE_LINKED_INTEGER = (1 << 53) - 1
+_MAX_LINKED_AUTHORITIES_PER_ESTIMATE = 256
+
+
+def _linked_share_authority_fields(
+    *documents: object,
+) -> Optional[Tuple[str, int, int, str]]:
+    """Extract one unambiguous linked publication identity from wrappers."""
+    link_ids: Set[str] = set()
+    local_generations: Set[int] = set()
+    provider_generations: Set[int] = set()
+    manifest_digests: Set[str] = set()
+    authority_marker_present = False
+    seen = set()
+    pending = [document for document in documents if isinstance(document, dict)]
+    while pending:
+        candidate = pending.pop()
+        marker = id(candidate)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if "_linked_share" in candidate:
+            authority_marker_present = True
+            value = candidate.get("_linked_share")
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value.encode("utf-8")) > 1024
+                or "\x00" in value
+            ):
+                raise RuntimeError("Linked-share identity metadata is invalid")
+            link_ids.add(value)
+        for field_name, destination in (
+            ("_linked_generation", local_generations),
+            ("_linked_provider_generated_ms", provider_generations),
+        ):
+            if field_name in candidate:
+                authority_marker_present = True
+                value = candidate.get(field_name)
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value <= 0
+                    or value > _MAX_SAFE_LINKED_INTEGER
+                ):
+                    raise RuntimeError(
+                        "Linked-share publication authority is invalid"
+                    )
+                destination.add(value)
+        if "_linked_provider_manifest_digest" in candidate:
+            authority_marker_present = True
+            value = candidate.get("_linked_provider_manifest_digest")
+            if (
+                not isinstance(value, str)
+                or _LINKED_MANIFEST_DIGEST_RE.fullmatch(value) is None
+            ):
+                raise RuntimeError(
+                    "Linked-share manifest authority is invalid"
+                )
+            manifest_digests.add(value)
+        for wrapper_name in ("payload", "data", "snapshot"):
+            wrapped = candidate.get(wrapper_name)
+            if isinstance(wrapped, dict):
+                pending.append(wrapped)
+    if not authority_marker_present:
+        return None
+    if (
+        len(link_ids) != 1
+        or len(local_generations) != 1
+        or len(provider_generations) != 1
+        or len(manifest_digests) != 1
+    ):
+        raise RuntimeError("Linked-share publication authority is ambiguous")
+    return (
+        next(iter(link_ids)),
+        next(iter(local_generations)),
+        next(iter(provider_generations)),
+        next(iter(manifest_digests)),
+    )
+
+
+def _linked_share_credential_expiry(
+    *documents: object,
+    linked: bool,
+) -> Optional[int]:
+    """Pin one unambiguous provider credential expiry from leaf wrappers."""
+    values = set()
+    marker_present = False
+    seen = set()
+    pending = [document for document in documents if isinstance(document, dict)]
+    while pending:
+        candidate = pending.pop()
+        marker = id(candidate)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if "_credential_expires_ms" in candidate:
+            marker_present = True
+            value = candidate.get("_credential_expires_ms")
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+            ):
+                raise RuntimeError("Linked-share credential expiry is invalid")
+            values.add(value)
+        for wrapper_name in ("payload", "data", "snapshot"):
+            wrapped = candidate.get(wrapper_name)
+            if isinstance(wrapped, dict):
+                pending.append(wrapped)
+    if not linked:
+        if marker_present:
+            raise RuntimeError(
+                "Credential expiry metadata has no linked-share identity"
+            )
+        return None
+    if len(values) != 1:
+        raise RuntimeError("Linked-share credential expiry is unavailable")
+    return next(iter(values))
+
+
+def _linked_share_publication_generation(
+    *documents: object,
+    linked: bool,
+) -> Optional[int]:
+    """Pin one unambiguous provider manifest order from leaf wrappers."""
+    values = set()
+    marker_present = False
+    seen = set()
+    pending = [document for document in documents if isinstance(document, dict)]
+    while pending:
+        candidate = pending.pop()
+        marker = id(candidate)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if "_linked_provider_generated_ms" in candidate:
+            marker_present = True
+            value = candidate.get("_linked_provider_generated_ms")
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value <= 0
+            ):
+                raise RuntimeError(
+                    "Linked-share publication generation is invalid"
+                )
+            values.add(value)
+        for wrapper_name in ("payload", "data", "snapshot"):
+            wrapped = candidate.get(wrapper_name)
+            if isinstance(wrapped, dict):
+                pending.append(wrapped)
+    if not linked:
+        if marker_present:
+            raise RuntimeError(
+                "Publication generation metadata has no linked-share identity"
+            )
+        return None
+    if len(values) != 1:
+        raise RuntimeError(
+            "Linked-share publication generation is unavailable"
+        )
+    return next(iter(values))
+
+
+def _linked_resource_cache_identity(resource: object, *, linked: bool) -> Optional[str]:
+    if not isinstance(resource, dict):
+        if linked:
+            raise RuntimeError("Linked-share resource metadata is invalid")
+        return None
+    value = resource.get("_cache_identity")
+    if not linked:
+        return None
+    if (
+        not isinstance(value, str)
+        or _SHARE_CACHE_ID_RE.fullmatch(value) is None
+    ):
+        raise RuntimeError("Linked-share resource cache identity is invalid")
+    return value
+
+
 def get_missing_columns(
         tables: List[TableDefinition],
         selected: List[SuperSnapshot],
@@ -452,36 +635,34 @@ class DataEstimator:
         return val in ("1", "true", "yes", "on")
 
     def _to_duckdb_path(self, key: str) -> str:
+        return self._to_duckdb_path_with_credential_generation(key)[0]
+
+    def _to_duckdb_path_with_credential_generation(
+        self, key: str,
+    ) -> Tuple[str, Optional[int]]:
         """
-        Resolve a storage key to a usable path for DuckDB.
-        If SUPERTABLE_DUCKDB_PRESIGNED=1, presign with an **object key** (never pass a URL to presign).
+        Resolve a stable storage key without minting a bearer credential.
+
+        Estimation runs before an execution engine is selected and before the
+        engine owns the request deadline.  Presigning here would therefore do
+        unnecessary work for IslandDB/Spark and could block beyond the query
+        deadline.  The selected DuckDB executor performs the sole bounded,
+        deadline-aware presign immediately before engine setup when requested.
         """
         if not key:
-            return key
+            return key, None
 
-        # 1) Presign first if requested
-        if settings.SUPERTABLE_DUCKDB_PRESIGNED:
-            presign_fn = getattr(self.storage, "presign", None)
-            if callable(presign_fn):
-                try:
-                    url = presign_fn(key)  # key, not URL
-                    if isinstance(url, str) and url:
-                        logger.debug(
-                            f"[estimate.resolve] presigned → {_safe_path_for_log(url)}"
-                        )
-                        return url
-                except Exception as e:
-                    logger.warning(
-                        "[estimate.resolve] presign failed; falling back: "
-                        f"{_safe_path_for_log(e)}"
-                    )
-
-        # 2) If already URL, return as-is.
+        # Existing URLs may be provider-issued linked-share bearer paths. A
+        # consumer storage adapter has no authority to renew them and must
+        # never receive them as object keys, even when explicit presigning is
+        # enabled for locally owned resources.
         if "://" in key:
             logger.debug(f"[estimate.resolve] already URL: {_safe_path_for_log(key)}")
-            return key
+            return key, None
 
-        # 3) storage helpers
+        # Storage helpers return canonical, non-expiring paths.  A custom
+        # helper that returns a bearer URL remains supported, but DuckDB will
+        # replace consumer-owned bearer paths at its bounded setup boundary.
         for attr in (
             "to_duckdb_path",
             "make_duckdb_url",
@@ -498,14 +679,14 @@ class DataEstimator:
                                 f"[estimate.resolve] storage.{attr} → "
                                 f"{_safe_path_for_log(url)}"
                             )
-                        return url
+                        return url, None
                 except Exception as e:
                     logger.debug(
                         f"[estimate.resolve] storage.{attr} failed: "
                         f"{_safe_path_for_log(e)}"
                     )
 
-        # 4) Construct URL from endpoint/bucket
+        # 3) Construct URL from endpoint/bucket
         fallback = getattr(self, "_fallback_url_config", None)
         if fallback is None:
             fallback = (
@@ -521,14 +702,144 @@ class DataEstimator:
 
         if endpoint_raw and bucket:
             if use_http:
-                return f"{scheme}://{endpoint_raw.rstrip('/')}/{bucket}/{key_norm}"
+                return (
+                    f"{scheme}://{endpoint_raw.rstrip('/')}/{bucket}/{key_norm}",
+                    None,
+                )
             else:
-                return f"s3://{bucket}/{key_norm}"
+                return f"s3://{bucket}/{key_norm}", None
 
-        # 5) Fallback
-        return key
+        # 4) Fallback
+        return key, None
 
     # ----------------------- snapshot discovery & filtering -----------------------
+
+    def _authoritative_linked_control(
+        self,
+        organization: str,
+        super_name: str,
+        link_id: str,
+    ) -> Dict[str, object]:
+        """Return one normalized, atomically indexed authority record.
+
+        Reflection construction may encounter thousands of leaves from a small
+        number of shares. Resolve each distinct link exactly once rather than
+        enumerating and decoding every cached manifest in the namespace.
+        """
+        cache = getattr(self, "_linked_authority_cache", None)
+        if cache is None:
+            cache = {}
+            self._linked_authority_cache = cache
+        cache_key = (
+            str(organization),
+            str(super_name),
+            link_id,
+        )
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+        if len(cache) >= _MAX_LINKED_AUTHORITIES_PER_ESTIMATE:
+            raise RuntimeError(
+                "Linked-share authority lookup exceeds its safety limit"
+            )
+        try:
+            control = self.catalog.get_authoritative_linked_share(
+                organization, super_name, link_id,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "Linked-share leaf has no authoritative control"
+            ) from exc
+        if not isinstance(control, dict):
+            raise RuntimeError("Linked-share leaf has no authoritative control")
+        if control.get("link_id") != link_id:
+            raise RuntimeError("Linked-share control metadata is invalid")
+
+        local_generation = control.get("publication_generation")
+        provider_generation = control.get("_linked_provider_generated_ms")
+        manifest_digest = control.get("_linked_provider_manifest_digest")
+        if (
+            not isinstance(local_generation, int)
+            or isinstance(local_generation, bool)
+            or local_generation <= 0
+            or local_generation > _MAX_SAFE_LINKED_INTEGER
+            or not isinstance(provider_generation, int)
+            or isinstance(provider_generation, bool)
+            or provider_generation <= 0
+            or provider_generation > _MAX_SAFE_LINKED_INTEGER
+            or not isinstance(manifest_digest, str)
+            or _LINKED_MANIFEST_DIGEST_RE.fullmatch(manifest_digest) is None
+        ):
+            raise RuntimeError("Linked-share control metadata is invalid")
+
+        alias_prefix = control.get("alias_prefix", "")
+        manifest = control.get("cached_manifest")
+        if (
+            not isinstance(alias_prefix, str)
+            or len(alias_prefix.encode("utf-8")) > 1024
+            or "\x00" in alias_prefix
+            or not isinstance(manifest, dict)
+        ):
+            raise RuntimeError("Linked-share control metadata is invalid")
+        tables = manifest.get("tables")
+        if not isinstance(tables, list) or len(tables) > 10_000:
+            raise RuntimeError("Linked-share control metadata is invalid")
+        expected_names: Set[str] = set()
+        for table in tables:
+            provider_name = table.get("table") if isinstance(table, dict) else None
+            if (
+                not isinstance(provider_name, str)
+                or not provider_name
+                or len(provider_name.encode("utf-8")) > 1024
+                or "\x00" in provider_name
+            ):
+                raise RuntimeError("Linked-share control metadata is invalid")
+            folded = f"{alias_prefix}{provider_name}".casefold()
+            if folded in expected_names:
+                raise RuntimeError("Linked-share control metadata is ambiguous")
+            expected_names.add(folded)
+
+        normalized: Dict[str, object] = {
+            "publication_generation": local_generation,
+            "provider_generated_ms": provider_generation,
+            "manifest_digest": manifest_digest,
+            "table_names": frozenset(expected_names),
+        }
+        cache[cache_key] = normalized
+        return normalized
+
+    def _validate_linked_snapshot_authority(
+        self,
+        organization: str,
+        super_name: str,
+        simple_name: str,
+        *documents: object,
+    ) -> None:
+        """Validate a linked leaf against its indexed control at acquisition.
+
+        This check deliberately lives inside Reflection construction. MCP may
+        validate the same state before database admission, but a partial share
+        refresh can race between that check and this Redis snapshot scan.
+        """
+        authority = _linked_share_authority_fields(*documents)
+        if authority is None:
+            return
+        link_id, local_generation, provider_generation, manifest_digest = authority
+        control = self._authoritative_linked_control(
+            organization, super_name, link_id,
+        )
+        if (
+            control["publication_generation"] != local_generation
+            or control["provider_generated_ms"] != provider_generation
+            or control["manifest_digest"] != manifest_digest
+        ):
+            raise RuntimeError(
+                "Linked-share leaf does not match its authoritative control"
+            )
+        if str(simple_name).casefold() not in control["table_names"]:
+            raise RuntimeError(
+                "Linked-share leaf is outside its authoritative manifest"
+            )
 
     def _collect_snapshots_from_redis(self, organization, super_name) -> List[Dict]:
         items = list(self.catalog.scan_leaf_items(organization, super_name, count=512))
@@ -1301,6 +1612,7 @@ class DataEstimator:
         Performs RBAC check and column validation.
         """
         self.timer = Timer()
+        self._linked_authority_cache = {}
         if self.plan_stats is None:
             self.plan_stats = PlanStats()
 
@@ -1389,6 +1701,7 @@ class DataEstimator:
                 resource_object_seals: Dict[
                     str, Optional[ResourceObjectSeal]
                 ] = {}
+                resource_cache_identities: Dict[str, Optional[str]] = {}
                 resource_value_bounds: Dict[
                     str, Optional[Dict[str, int]]
                 ] = {}
@@ -1415,6 +1728,13 @@ class DataEstimator:
                     )
                     if current_snapshot_data is None:
                         current_snapshot_data = super_table.read_simple_table_snapshot(current_snapshot_path)
+                    self._validate_linked_snapshot_authority(
+                        self.organization,
+                        super_name,
+                        str(snapshot.get("table_name") or simple_name),
+                        snapshot,
+                        current_snapshot_data,
+                    )
 
                     # Pin deletion metadata from the exact snapshot document
                     # whose resources are accumulated below.  In particular,
@@ -1498,6 +1818,20 @@ class DataEstimator:
                         current_snapshot_data,
                         schema=current_schema,
                     )
+                    share_credential_expires_ms = (
+                        _linked_share_credential_expiry(
+                            snapshot,
+                            current_snapshot_data,
+                            linked=share_policy_fingerprint is not None,
+                        )
+                    )
+                    share_publication_generation = (
+                        _linked_share_publication_generation(
+                            snapshot,
+                            current_snapshot_data,
+                            linked=share_policy_fingerprint is not None,
+                        )
+                    )
                     pinned_snapshot_metadata.append({
                         "path": current_snapshot_path,
                         "table_name": snapshot.get("table_name"),
@@ -1508,6 +1842,12 @@ class DataEstimator:
                         "share_row_filter": share_row_filter,
                         "share_policy_fingerprint": share_policy_fingerprint,
                         "share_allowed_columns": share_allowed_columns,
+                        "share_credential_expires_ms": (
+                            share_credential_expires_ms
+                        ),
+                        "share_publication_generation": (
+                            share_publication_generation
+                        ),
                     })
 
                     lowered_schema = dict_keys_to_lowercase(current_schema)
@@ -1603,6 +1943,22 @@ class DataEstimator:
                                 resource_object_seals[file_key] = None
                         else:
                             resource_object_seals[file_key] = parsed_object_seal
+                        parsed_cache_identity = _linked_resource_cache_identity(
+                            resource,
+                            linked=share_policy_fingerprint is not None,
+                        )
+                        if file_key in resource_cache_identities:
+                            if (
+                                resource_cache_identities[file_key]
+                                != parsed_cache_identity
+                            ):
+                                raise RuntimeError(
+                                    "Linked-share resource cache identity is ambiguous"
+                                )
+                        else:
+                            resource_cache_identities[file_key] = (
+                                parsed_cache_identity
+                            )
                         raw_bounds = resource.get("column_max_value_bytes")
                         parsed_bounds: Optional[Dict[str, int]] = None
                         if isinstance(raw_bounds, dict):
@@ -1792,6 +2148,7 @@ class DataEstimator:
                     "resource_rows": resource_rows,
                     "resource_seals": resource_seals,
                     "resource_object_seals": resource_object_seals,
+                    "resource_cache_identities": resource_cache_identities,
                     "resource_value_bounds": resource_value_bounds,
                     "current_version": current_version,
                     "has_snapshots": bool(snapshots),
@@ -2004,9 +2361,18 @@ class DataEstimator:
             )
 
             parquet_files: List[str] = []
+            resource_credential_generations: List[Optional[int]] = []
+            resource_credential_expires_ms: List[Optional[int]] = []
             table_reflection_bytes = 0
             for file_key in survivors:
-                parquet_files.append(self._to_duckdb_path(file_key))
+                # Estimation deliberately never mints credentials. Keep this
+                # compatibility seam as the canonical path resolver used by
+                # existing embedders/tests; generation is assigned only by
+                # Executor's bounded DuckDB presign boundary.
+                resolved_path = self._to_duckdb_path(file_key)
+                parquet_files.append(resolved_path)
+                resource_credential_generations.append(None)
+                resource_credential_expires_ms.append(None)
                 full = int(key_size.get(file_key, 0))
                 reflection_file_size_raw += full
                 if not need_projection:
@@ -2215,6 +2581,22 @@ class DataEstimator:
                         "share_policy_fingerprint"
                     ),
                     share_allowed_columns=pinned.get("share_allowed_columns"),
+                    share_credential_expires_ms=pinned.get(
+                        "share_credential_expires_ms"
+                    ),
+                    resource_cache_identities=[
+                        r["resource_cache_identities"].get(key)
+                        for key in survivors
+                    ],
+                    resource_credential_generations=(
+                        resource_credential_generations
+                    ),
+                    share_publication_generation=pinned.get(
+                        "share_publication_generation"
+                    ),
+                    resource_credential_expires_ms=(
+                        resource_credential_expires_ms
+                    ),
                     row_group_selections=literal_row_groups,
                     candidate_rows=(selected_rows if selected_rows_complete else 0),
                     candidate_rows_complete=selected_rows_complete,

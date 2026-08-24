@@ -146,6 +146,35 @@ def test_linked_share_policy_seal_rejects_missing_explicit_column_policy():
         )
 
 
+def test_linked_provider_generation_is_pinned_and_must_be_unambiguous():
+    wrapper = {
+        "payload": {"_linked_provider_generated_ms": 123_456},
+    }
+    snapshot = {"_linked_provider_generated_ms": 123_456}
+    assert data_estimator._linked_share_publication_generation(
+        wrapper, snapshot, linked=True,
+    ) == 123_456
+
+    with pytest.raises(RuntimeError, match="publication generation"):
+        data_estimator._linked_share_publication_generation(
+            wrapper,
+            {"_linked_provider_generated_ms": 123_457},
+            linked=True,
+        )
+    with pytest.raises(RuntimeError, match="unavailable"):
+        data_estimator._linked_share_publication_generation(
+            {}, linked=True,
+        )
+    with pytest.raises(RuntimeError, match="invalid"):
+        data_estimator._linked_share_publication_generation(
+            {"_linked_provider_generated_ms": True}, linked=True,
+        )
+    with pytest.raises(RuntimeError, match="no linked-share identity"):
+        data_estimator._linked_share_publication_generation(
+            snapshot, linked=False,
+        )
+
+
 @pytest.mark.parametrize(
     "provider",
     [None, "", "\x00provider", "p" * 1025],

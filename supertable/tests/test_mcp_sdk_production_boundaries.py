@@ -393,6 +393,7 @@ def test_idle_executor_duckdb_stream_releases_outer_cache_lease(
         "resolve_engine_bundle",
         lambda *_args, **_kwargs: ({"duckdb": MagicMock()}, ()),
     )
+    monkeypatch.setattr(executor, "_get_catalog", lambda: None)
     cancelled = threading.Event()
     deadline = time.monotonic() + (10.0 if stop_kind == "cancel" else 0.05)
 
@@ -715,6 +716,7 @@ def test_auto_materialized_stop_is_not_replayed_on_duckdb(
         "resolve_engine_bundle",
         lambda *_args, **_kwargs: ({"duckdb": MagicMock()}, ()),
     )
+    monkeypatch.setattr(executor, "_get_catalog", lambda: None)
     warm_metrics = SimpleNamespace(
         coverage_ratio=1.0,
         to_plan_stats=lambda: {},

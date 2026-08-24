@@ -221,6 +221,12 @@ class RoutingAvailability:
     spark_semantics_supported: bool = True
     fitting_spark_clusters: int = 0
     spark_min_scan_bytes: int = 0
+    # Provider-issued linked bearer resources cannot be converted to Spark's
+    # credential-less cluster URI without crossing authorization domains.
+    spark_linked_bearer_safe: bool = True
+    # IslandDB's storage/range layer must not reinterpret a provider-issued
+    # linked-share bearer URL through the consumer's storage authority.
+    island_linked_bearer_safe: bool = True
 
 
 @dataclass(frozen=True)
@@ -490,6 +496,10 @@ class AdaptiveEngineRouter:
             rejections[Engine.ISLANDDB].append("IslandDB AUTO disabled")
         if not availability.island_supported:
             rejections[Engine.ISLANDDB].append("query outside IslandDB capability subset")
+        if not availability.island_linked_bearer_safe:
+            rejections[Engine.ISLANDDB].append(
+                "IslandDB cannot consume provider-linked bearer resources safely"
+            )
         if not features.source_bytes_complete:
             rejections[Engine.ISLANDDB].append("source byte estimate incomplete")
         if features.island_advice not in {"island_in_memory", "island_spill"}:
@@ -511,6 +521,10 @@ class AdaptiveEngineRouter:
         if not availability.spark_semantics_supported:
             rejections[Engine.SPARK_SQL].append(
                 "query outside the cross-engine semantic equivalence subset"
+            )
+        if not availability.spark_linked_bearer_safe:
+            rejections[Engine.SPARK_SQL].append(
+                "Spark cannot consume provider-linked bearer resources safely"
             )
         if not features.source_bytes_complete:
             rejections[Engine.SPARK_SQL].append("source byte estimate incomplete")

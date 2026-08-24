@@ -244,6 +244,20 @@ def _check_requested_columns(
         )
 
 
+def check_requested_columns(
+    entry: dict,
+    columns: Optional[Iterable[str]],
+    table_name: str,
+) -> None:
+    """Enforce one resolved table policy against requested columns.
+
+    Callers should obtain ``entry`` through :func:`resolve_table_policy`
+    first.  This public boundary deliberately shares the same case-insensitive
+    include-minus-exclude semantics used by SDK reads and mutations.
+    """
+    _check_requested_columns(entry, columns, table_name)
+
+
 def _check_operation_access(
     super_name: str,
     organization: str,

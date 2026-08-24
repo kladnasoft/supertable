@@ -5299,6 +5299,7 @@ class IslandDB:
         engine_config=None,
         cache_metrics=None,
         _prepared: Optional[IslandPreparedQuery] = None,
+        deadline_monotonic: Optional[float] = None,
     ) -> pd.DataFrame:
         prepared = _prepared or self.prepare_execution(
             reflection, parser, streaming_result=False,
@@ -5319,6 +5320,7 @@ class IslandDB:
             cache_metrics=cache_metrics,
             _defer_reservation_release=True,
             _prepared=prepared,
+            deadline_monotonic=deadline_monotonic,
         )
         release = getattr(stream, "_island_release_reservation", lambda: None)
         finish_profile = getattr(stream, "_island_finish_profile", lambda: None)

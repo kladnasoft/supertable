@@ -157,6 +157,7 @@ class AzureBlobStorage(StorageInterface):
         from datetime import datetime, timedelta, timezone
         from azure.storage.blob import generate_blob_sas, BlobSasPermissions
 
+        key = self._require_presign_object_key(key)
         full_key = self._with_base(key)
         blob_client = self.container.get_blob_client(full_key)
 

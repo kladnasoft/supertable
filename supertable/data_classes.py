@@ -351,6 +351,34 @@ class SuperSnapshot:
     # intersected with its pinned schema projection. ``None`` denotes local
     # data; an empty list is invalid/fail-closed at the DataReader boundary.
     share_allowed_columns: Optional[List[str]] = None
+    # Provider-issued expiry for linked-share bearer paths.  This wall-clock
+    # timestamp is authorization/availability provenance, not part of the
+    # policy fingerprint; ordinary local snapshots leave it unset.
+    share_credential_expires_ms: Optional[int] = None
+    # Opaque provider-issued immutable identities corresponding one-for-one
+    # with files/resource_keys. They remain stable when only a signed URL's
+    # credential query rotates and are never derived by stripping that URL.
+    resource_cache_identities: List[Optional[str]] = field(default_factory=list)
+    # Process-local issuance order corresponding one-for-one with local
+    # presigned ``files``. Linked-share resources use provider expiry instead.
+    # The relay uses this only to prevent a late concurrent registration from
+    # restoring an older credential; it is never a persistent cache identity.
+    resource_credential_generations: List[Optional[int]] = field(
+        default_factory=list
+    )
+    # Provider-issued manifest generation pinned from a linked virtual leaf.
+    # It is distinct from the consumer Redis leaf CAS generation and from the
+    # per-resource local presign generations above: this value orders complete
+    # provider credential manifests when wall-clock expiry is equal. Local
+    # snapshots leave it unset.
+    share_publication_generation: Optional[int] = None
+    # Conservative wall-clock expiry corresponding one-for-one with local
+    # presigned ``files``. It is captured before provider invocation and keeps
+    # an active long-lived query from being downgraded to a newer but
+    # shorter-lived credential. Linked snapshots use the share-level expiry.
+    resource_credential_expires_ms: List[Optional[int]] = field(
+        default_factory=list
+    )
 
 
 @dataclass

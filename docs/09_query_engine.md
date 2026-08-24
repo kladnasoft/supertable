@@ -36,6 +36,28 @@ job's size window and the SQL is inside the cross-engine equivalence subset.
 IslandDB is eligible only for its statically proven SQL subset and an executable
 resource plan. Missing/incomplete estimates route conservatively to DuckDB.
 
+Provider-linked share resources carrying provider-issued bearer credentials
+are DuckDB-only. AUTO records IslandDB and Spark as ineligible and selects
+DuckDB; explicitly requesting either ineligible backend fails before catalog,
+cache, or provider I/O. The common credential-expiry admission check still runs
+first, so an expired linked credential never reaches routing.
+
+When `SUPERTABLE_DUCKDB_PRESIGNED=true`, estimation retains canonical object
+paths and performs no credential I/O. Only a selected DuckDB execution mints
+one deadline-bounded credential per consumer-owned resource immediately before
+setup; IslandDB and Spark never pay that cost. Sealed immutable objects are
+then exposed to DuckDB through a stable process-local path, allowing DuckDB's
+HTTP/external cache to survive signed-URL rotation without weakening object
+identity checks.
+
+Concurrent DuckDB leases for the same stable object intentionally share that
+relay route and upstream transfer. Because an inbound HTTP read cannot be
+attributed to one lease, the relay uses the longest active lease deadline: a
+short query that cancels closes its downstream request, while shared upstream
+I/O may remain alive for a concurrent longer query. The residual resource use
+is bounded by relay connection/permit limits and the longest active deadline;
+it is not exact per-query upstream cancellation.
+
 Organizations may store non-overlapping half-open `auto_policy` intervals in
 Redis to force an engine for an estimated-scan range. Manual rules remain below
 the same capability, identity, resource, and fleet gates; an unsafe rule falls

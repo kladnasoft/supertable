@@ -41,6 +41,11 @@ from supertable.engine.island_resources import (
     ByteBoundedArrowBatchIterator,
     ResourceReservationCancelled,
 )
+from supertable.engine.stable_http_relay import (
+    StableRelayLease,
+    alias_stable_remote_paths,
+)
+from supertable.engine.remote_paths import is_remote_scan_path
 
 
 def _fresh_validated_duckdb_parser(parser: SQLParser) -> SQLParser:
@@ -937,8 +942,13 @@ class DuckDB:
       runs outside the lock.
     """
 
-    def __init__(self, storage: Optional[object] = None):
+    def __init__(
+        self,
+        storage: Optional[object] = None,
+        organization: str = "",
+    ):
         self.storage = storage
+        self.organization = str(organization or "")
         self._lock = threading.Lock()
         self._con: Optional[duckdb.DuckDBPyConnection] = None
         self._httpfs_configured = False
@@ -1027,10 +1037,7 @@ class DuckDB:
         an initial HTTPS-only query cannot cause a later S3 query to skip its
         credential setup.
         """
-        if not any(
-            str(path).lower().startswith(("s3://", "s3a://", "http://", "https://"))
-            for path in paths
-        ):
+        if not any(is_remote_scan_path(path) for path in paths):
             return
         needs_s3 = any(
             str(path).lower().startswith(("s3://", "s3a://")) for path in paths
@@ -1170,9 +1177,23 @@ class DuckDB:
 
         self._begin_query_use()
         stream_owns_lease = False
+        relay_lease = StableRelayLease()
         try:
+            execution_reflection = reflection
+            # EXPLAIN retains the original credential-bearing paths so the
+            # existing fail-closed plan-redaction boundary can reject it.
+            # Ordinary execution replaces only snapshot-sealed rotating URLs;
+            # the relay lease is transferred to a streaming result below.
+            if not explain:
+                execution_reflection, relay_lease = alias_stable_remote_paths(
+                    reflection,
+                    storage=self.storage,
+                    organization=self.organization,
+                    deadline_monotonic=lifecycle_deadline,
+                    cancel_event=cancel_event,
+                )
             result = self._execute_unleased(
-                reflection=reflection,
+                reflection=execution_reflection,
                 parser=parser,
                 query_manager=query_manager,
                 timer_capture=timer_capture,
@@ -1196,7 +1217,10 @@ class DuckDB:
                 try:
                     inner.close()
                 finally:
-                    self._finish_query_use()
+                    try:
+                        relay_lease.close()
+                    finally:
+                        self._finish_query_use()
 
             wrapped = ArrowBatchStream(
                 inner.schema,
@@ -1222,7 +1246,10 @@ class DuckDB:
                 raise
         finally:
             if not stream_owns_lease:
-                self._finish_query_use()
+                try:
+                    relay_lease.close()
+                finally:
+                    self._finish_query_use()
 
     def _execute_unleased(
             self,
@@ -1497,12 +1524,7 @@ class DuckDB:
             for path in [*all_files, *tombstone_paths]
             if path
         ]
-        remote_setup = any(
-            str(path).lower().startswith(
-                ("s3://", "s3a://", "http://", "https://")
-            )
-            for path in setup_paths
-        )
+        remote_setup = any(is_remote_scan_path(path) for path in setup_paths)
         storage_setup_guard = (
             _DuckDBSetupInterruptGuard(
                 deadline_monotonic=deadline_value,

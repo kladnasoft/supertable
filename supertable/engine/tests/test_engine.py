@@ -2200,19 +2200,38 @@ class TestDataEstimator:
     def test_to_duckdb_path_already_url(self):
         assert _make_estimator([])._to_duckdb_path("s3://bucket/key") == "s3://bucket/key"
 
-    def test_to_duckdb_path_presign(self, monkeypatch):
+    def test_to_duckdb_path_defers_presign_until_engine_setup(self, monkeypatch):
         _patch_settings(monkeypatch, SUPERTABLE_DUCKDB_PRESIGNED=True)
-        storage = MagicMock()
+        storage = MagicMock(spec=["presign", "to_duckdb_path"])
         storage.presign.return_value = "https://presigned/key"
-        assert _make_estimator([], storage)._to_duckdb_path("some/key") == "https://presigned/key"
+        storage.to_duckdb_path.return_value = "s3://bucket/some/key"
 
-    def test_to_duckdb_path_presign_failure_falls_back(self, monkeypatch):
+        assert _make_estimator([], storage)._to_duckdb_path("some/key") == (
+            "s3://bucket/some/key"
+        )
+        storage.presign.assert_not_called()
+
+    def test_to_duckdb_path_estimation_has_no_credential_generation(self, monkeypatch):
         _patch_settings(monkeypatch, SUPERTABLE_DUCKDB_PRESIGNED=True)
-        storage = MagicMock()
-        storage.presign.side_effect = Exception("fail")
-        # Falls through to further resolution attempts
+        storage = MagicMock(spec=["presign", "canonical_uri"])
+        storage.canonical_uri.return_value = "s3://bucket/some/key"
+        estimator = _make_estimator([], storage)
+
+        first_path, first_generation = (
+            estimator._to_duckdb_path_with_credential_generation("some/key")
+        )
+        assert first_path == "s3://bucket/some/key"
+        assert first_generation is None
+        storage.presign.assert_not_called()
+
+    def test_to_duckdb_path_never_invokes_blocking_presigner(self, monkeypatch):
+        _patch_settings(monkeypatch, SUPERTABLE_DUCKDB_PRESIGNED=True)
+        storage = MagicMock(spec=["presign", "canonical_uri"])
+        storage.presign.side_effect = AssertionError("must stay deferred")
+        storage.canonical_uri.return_value = "s3://bucket/some/key"
         result = _make_estimator([], storage)._to_duckdb_path("some/key")
-        assert isinstance(result, str)
+        assert result == "s3://bucket/some/key"
+        storage.presign.assert_not_called()
 
     def test_to_duckdb_path_storage_helper(self):
         storage = MagicMock(spec=["to_duckdb_path"])

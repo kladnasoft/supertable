@@ -558,6 +558,18 @@ class StorageInterface(abc.ABC):
         """
         raise NotImplementedError(f"{self.__class__.__name__} does not implement presign()")
 
+    @staticmethod
+    def _require_presign_object_key(key: object) -> str:
+        """Reject external URLs at every built-in credential-issuer boundary."""
+        if (
+            not isinstance(key, str)
+            or not key
+            or "\x00" in key
+            or "://" in key
+        ):
+            raise ValueError("presign requires a non-empty storage object key")
+        return key
+
     # -------------------------
     # Optional shared-file-cache helpers
     # -------------------------

@@ -146,6 +146,50 @@ def test_spark_semantic_gate_cannot_be_overridden_by_low_cost_history():
     assert any("semantic" in reason for reason in spark.rejection_reasons)
 
 
+def test_linked_bearer_gate_keeps_auto_off_spark_with_explicit_reason():
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
+        _features(20 * GIB, island_advice="route_spark"),
+        _availability(
+            spark_available=True,
+            fitting_spark_clusters=1,
+            spark_min_scan_bytes=1,
+            spark_linked_bearer_safe=False,
+        ),
+    )
+
+    assert decision.engine is Engine.DUCKDB
+    spark = next(c for c in decision.candidates if c.engine is Engine.SPARK_SQL)
+    assert not spark.eligible
+    assert any(
+        "provider-linked bearer" in reason
+        for reason in spark.rejection_reasons
+    )
+
+
+def test_linked_bearer_gate_keeps_auto_off_island_with_explicit_reason():
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
+        _features(
+            512 * MIB,
+            island_advice="island_in_memory",
+            island_cpu_workers=4,
+            island_io_workers=4,
+        ),
+        _availability(
+            island_enabled=True,
+            island_supported=True,
+            island_linked_bearer_safe=False,
+        ),
+    )
+
+    assert decision.engine is Engine.DUCKDB
+    island = next(c for c in decision.candidates if c.engine is Engine.ISLANDDB)
+    assert not island.eligible
+    assert any(
+        "provider-linked bearer" in reason
+        for reason in island.rejection_reasons
+    )
+
+
 def test_incomplete_estimate_uses_conservative_pro_without_cost_guess():
     decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
         _features(1, source_bytes_complete=False),

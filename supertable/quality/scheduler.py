@@ -2728,7 +2728,27 @@ def _table_snapshot_metadata_with_presence(
     snapshot = records[0]
     resources = snapshot.get("resources")
     if not isinstance(resources, list):
-        return True, snapshot.get("last_updated_ms"), None, None
+        # Public MetaReader results are aggregate-only so storage paths and
+        # linked bearer URLs never cross the metadata boundary. Retain support
+        # for legacy resource-shaped test doubles and older integrations below.
+        size = snapshot.get("size")
+        rows = snapshot.get("rows")
+        safe_size = (
+            size
+            if isinstance(size, int) and not isinstance(size, bool) and size >= 0
+            else None
+        )
+        safe_rows = (
+            rows
+            if isinstance(rows, int) and not isinstance(rows, bool) and rows >= 0
+            else None
+        )
+        return (
+            True,
+            snapshot.get("last_updated_ms"),
+            safe_size,
+            safe_rows,
+        )
 
     total_size = 0
     total_rows = 0

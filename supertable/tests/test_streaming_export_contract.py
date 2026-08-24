@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import threading
 from contextlib import contextmanager
@@ -399,6 +400,17 @@ class _IslandDeliveryFailure:
 
 
 def _auto_stream_executor(monkeypatch, cache, island):
+    # These tests exercise AUTO's cache/fallback state machine, not the
+    # separately covered presigned-path mode. Keep ambient .env settings from
+    # inserting a provider refresh into the mocked storage=None fixture.
+    monkeypatch.setattr(
+        executor_module,
+        "settings",
+        dataclasses.replace(
+            executor_module.settings,
+            SUPERTABLE_DUCKDB_PRESIGNED=False,
+        ),
+    )
     executor = Executor(storage=None, organization="org")
     duck = _AutoStreamDuck()
     executor.duckdb_exec = duck
@@ -736,6 +748,14 @@ def test_executor_owns_single_deadline_aware_presign_refresh(monkeypatch):
     executor = Executor(storage=storage, organization="org")
     executor.duckdb_exec = Duck()
     executor._file_cache = False
+    monkeypatch.setattr(
+        executor_module,
+        "settings",
+        dataclasses.replace(
+            executor_module.settings,
+            SUPERTABLE_DUCKDB_PRESIGNED=False,
+        ),
+    )
     monkeypatch.setattr(executor, "_get_catalog", lambda: None)
     monkeypatch.setattr(
         executor_module,
@@ -785,6 +805,157 @@ def test_executor_owns_single_deadline_aware_presign_refresh(monkeypatch):
     )
     assert refresh["stage"] == "first_batch"
     assert refresh["succeeded"] is True
+
+
+@pytest.mark.parametrize(
+    "remote_path",
+    [
+        "s3://bucket/events.parquet",
+        "s3a://bucket/events.parquet",
+        "gcs://bucket/events.parquet",
+        "gs://bucket/events.parquet",
+        "azure://container/events.parquet",
+        "abfs://container@account/events.parquet",
+        "abfss://container@account/events.parquet",
+        "https://objects.invalid/events.parquet",
+    ],
+)
+def test_presigned_mode_mints_once_at_materialized_duckdb_setup(
+    monkeypatch, remote_path,
+):
+    class Storage:
+        def __init__(self):
+            self.calls = []
+
+        def presign(self, key, *, expiry_seconds):
+            self.calls.append((key, expiry_seconds))
+            return f"https://fresh/{key}?signature=only"
+
+    storage = Storage()
+    executor = Executor(storage=storage, organization="org")
+    duck = MagicMock()
+    duck.cache_state.return_value = {}
+    duck.execute.return_value = MagicMock()
+    executor.duckdb_exec = duck
+    executor._file_cache = False
+    monkeypatch.setattr(executor, "_get_catalog", lambda: None)
+    monkeypatch.setattr(
+        executor_module,
+        "settings",
+        dataclasses.replace(
+            executor_module.settings,
+            SUPERTABLE_DUCKDB_PRESIGNED=True,
+        ),
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "resolve_engine_bundle",
+        lambda *_args: ({"duckdb": MagicMock()}, ()),
+    )
+    reflection = Reflection(
+        "s3", 10, 1,
+        [SuperSnapshot(
+            "shop", "events", 1,
+            [remote_path],
+            {"id"},
+            resource_keys=["org/shop/events.parquet"],
+        )],
+    )
+
+    _result, used = executor.execute(
+        Engine.DUCKDB,
+        reflection,
+        MagicMock(),
+        SimpleNamespace(),
+        Timer(),
+        PlanStats(),
+        "",
+    )
+
+    assert used == "duckdb"
+    assert len(storage.calls) == 1
+    assert duck.execute.call_count == 1
+    assert duck.execute.call_args.kwargs["reflection"].supers[0].files == [
+        "https://fresh/org/shop/events.parquet?signature=only",
+    ]
+
+
+@pytest.mark.parametrize(
+    "remote_path",
+    [
+        "s3://bucket/events.parquet",
+        "s3a://bucket/events.parquet",
+        "gcs://bucket/events.parquet",
+        "gs://bucket/events.parquet",
+        "azure://container/events.parquet",
+        "abfs://container@account/events.parquet",
+        "abfss://container@account/events.parquet",
+        "https://objects.invalid/events.parquet",
+    ],
+)
+def test_presigned_mode_mints_once_at_streaming_duckdb_setup(
+    monkeypatch, remote_path,
+):
+    class Storage:
+        def __init__(self):
+            self.calls = []
+
+        def presign(self, key, *, expiry_seconds):
+            self.calls.append((key, expiry_seconds))
+            return f"https://fresh/{key}?signature=only"
+
+    storage = Storage()
+    executor = Executor(storage=storage, organization="org")
+    duck = MagicMock()
+    duck.cache_state.return_value = {}
+    duck.execute_stream.return_value = _table_stream((9,))
+    executor.duckdb_exec = duck
+    executor._file_cache = False
+    monkeypatch.setattr(executor, "_get_catalog", lambda: None)
+    monkeypatch.setattr(
+        executor_module,
+        "settings",
+        dataclasses.replace(
+            executor_module.settings,
+            SUPERTABLE_DUCKDB_PRESIGNED=True,
+        ),
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "resolve_engine_bundle",
+        lambda *_args: ({"duckdb": MagicMock()}, ()),
+    )
+    reflection = Reflection(
+        "s3", 10, 1,
+        [SuperSnapshot(
+            "shop", "events", 1,
+            [remote_path],
+            {"id"},
+            resource_keys=["org/shop/events.parquet"],
+        )],
+    )
+
+    stream, used = executor.execute_stream(
+        Engine.DUCKDB,
+        reflection,
+        MagicMock(),
+        SimpleNamespace(),
+        Timer(),
+        PlanStats(),
+        "",
+        deadline_monotonic=__import__("time").monotonic() + 4,
+    )
+    try:
+        assert next(stream).column(0).to_pylist() == [9]
+    finally:
+        stream.close()
+
+    assert used == "duckdb"
+    assert len(storage.calls) == 1
+    assert duck.execute_stream.call_count == 1
+    assert duck.execute_stream.call_args.kwargs["reflection"].supers[0].files == [
+        "https://fresh/org/shop/events.parquet?signature=only",
+    ]
 
 
 def test_duckdb_iterator_marks_only_pre_first_batch_403_as_refreshable():

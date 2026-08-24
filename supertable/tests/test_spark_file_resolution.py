@@ -1,8 +1,8 @@
 """Spark file-path resolution never exposes bearer URLs to user SQL.
 
-``sup.files`` are resolved once by the estimator using the *DuckDB* presign
-setting (``SUPERTABLE_DUCKDB_PRESIGNED``) and shared across every engine.  Spark
-must not inherit that choice.  A cluster must scan direct backend paths using
+``sup.files`` are resolved by the estimator to canonical, non-expiring paths.
+The DuckDB presign setting is applied only after DuckDB is selected, so Spark
+never inherits that choice. A cluster must scan direct backend paths using
 cluster-side workload identity or a Hadoop credential provider.
 
 ``_resolve_spark_file`` is the decoupling point, governed solely by

@@ -1489,7 +1489,78 @@ def test_metadata_resource_stats_do_not_disclose_excluded_names(monkeypatch):
 
     rendered = json.dumps(result).casefold()
     assert "cvv" not in rendered
-    assert '"id"' in rendered
+    assert "f.parquet" not in rendered
+    assert result == [{
+        "simple_name": "card",
+        "cols_count": 1,
+        "files": 1,
+        "rows": 1,
+    }]
+
+
+def test_meta_only_linked_stats_never_return_storage_control_data(monkeypatch):
+    """META without READ gets aggregates, never the provider's bearer path."""
+    tables = {
+        "card": {
+            "columns": ["id"],
+            "filters": ["*"],
+        },
+    }
+    _install_roles(monkeypatch, {SUPER: _role("meta", tables=tables)})
+    reader = _meta_reader(tables=("card",))
+    snapshot = {
+        "simple_name": "card",
+        "snapshot_version": 7,
+        "last_updated_ms": 1234,
+        "schema": {"id": "int", "private_note": "str"},
+        "resources": [{
+            "file": (
+                "https://provider.invalid/private/card.parquet"
+                "?X-Amz-Signature=bearer-secret"
+            ),
+            "rows": 17,
+            "file_size": 2048,
+            "columns": ["id", "private_note"],
+            "provider_token": "provider-secret",
+            "cached_manifest": {
+                "resources": [{"file": "/provider/private/card.parquet"}],
+            },
+        }],
+        "provider_token": "outer-provider-secret",
+        "cached_manifest": {"credential": "cached-secret"},
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+    }
+
+    with patch("supertable.meta_reader.SimpleTable") as simple:
+        instance = simple.return_value
+        instance.get_simple_table_snapshot.return_value = (snapshot, "private")
+        instance._last_snapshot_leaf = {
+            "payload": {
+                "_linked_share": "link-1",
+                "_row_filter": None,
+                "snapshot": snapshot,
+            },
+        }
+        result = reader.get_table_stats("card", ROLE)
+
+    assert result == [{
+        "simple_name": "card",
+        "snapshot_version": 7,
+        "last_updated_ms": 1234,
+        "cols_count": 1,
+        "files": 1,
+        "size": 2048,
+        "rows": 17,
+    }]
+    rendered = json.dumps(result).casefold()
+    for secret in (
+        "https://", "provider.invalid", "x-amz-signature", "bearer-secret",
+        "provider_token", "provider-secret", "cached_manifest",
+        "cached-secret", "private_note", "/provider/private",
+    ):
+        assert secret not in rendered
 
 
 def test_show_stats_removes_rows_for_excluded_columns(monkeypatch):

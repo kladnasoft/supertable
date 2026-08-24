@@ -1692,6 +1692,12 @@ class TestMinioStorage(unittest.TestCase):
         args = client.presigned_get_object.call_args
         self.assertEqual(args[0][1], "leading/slash/key")
 
+    def test_presign_rejects_external_provider_url(self):
+        s, client = self._make_storage()
+        with self.assertRaisesRegex(ValueError, "storage object key"):
+            s.presign("https://provider.invalid/object?signature=secret")
+        client.presigned_get_object.assert_not_called()
+
     # ---- _get_object_safe ----
 
     def test_get_object_safe_success(self):
@@ -2269,6 +2275,12 @@ class TestS3Storage(unittest.TestCase):
         s.presign("/leading/key")
         params = client.generate_presigned_url.call_args[1]["Params"]
         self.assertEqual(params["Key"], "leading/key")
+
+    def test_presign_rejects_external_provider_url(self):
+        s, client = self._make_storage()
+        with self.assertRaisesRegex(ValueError, "storage object key"):
+            s.presign("https://provider.invalid/object?signature=secret")
+        client.generate_presigned_url.assert_not_called()
 
     # ---- _normalize_bucket_region ----
 
