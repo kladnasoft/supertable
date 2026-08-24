@@ -140,6 +140,7 @@ All keys follow a hierarchical namespace. Below is the complete list of key patt
 | Pattern | Type | Purpose |
 |---------|------|---------|
 | `supertable:{org}:system:auth:tokens` | HASH | Mapping: token_id (sha256) -> JSON metadata. Lives under the `system` namespace; user lakes are under `lakes:` at the same level, so this never collides with a user-named supertable. |
+| `supertable:{org}:system:auth:sessions:doc:{user_id}` | STRING + TTL | One current HMAC-digested browser-session generation per org user. The platform rotates it on login/session reissue and conditionally deletes it on logout; the raw session ID is not stored. |
 
 ### Service Registry Keys (per organization)
 

@@ -1359,6 +1359,53 @@ class TestWriteNewerThan:
 
 class TestWriteLocking:
 
+    def test_authorization_callback_fences_lock_and_publication(
+        self, writer, fake_catalog,
+    ):
+        calls: list[int] = []
+
+        def authorize() -> str:
+            calls.append(len(calls) + 1)
+            return "admin"
+
+        writer.write(
+            "admin",
+            "t1",
+            _simple_arrow(1),
+            overwrite_columns=[],
+            authorization_callback=authorize,
+        )
+
+        assert calls == [1, 2, 3]
+        assert len(fake_catalog.set_leaf_payload_cas_calls) == 1
+
+    def test_authorization_revoked_before_publication_fails_closed(
+        self, writer, fake_catalog,
+    ):
+        calls = 0
+
+        def authorize() -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise PermissionError("membership revoked")
+            return "admin"
+
+        with pytest.raises(PermissionError, match="membership revoked"):
+            writer.write(
+                "admin",
+                "t1",
+                _simple_arrow(1),
+                overwrite_columns=[],
+                authorization_callback=authorize,
+            )
+
+        assert calls == 3
+        assert writer._mocks["process"].called
+        assert fake_catalog.set_leaf_payload_cas_calls == []
+        assert fake_catalog.bump_root_calls == []
+        assert len(fake_catalog.release_calls) == 1
+
     def test_lock_released_on_success(self, writer, fake_catalog):
         data = _simple_arrow(3)
         writer.write("admin", "t1", data, overwrite_columns=[])

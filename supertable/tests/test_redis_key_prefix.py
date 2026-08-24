@@ -62,6 +62,7 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         ("system_scope",                 RK.system_scope(ORG),                 f"supertable:{ORG}:system"),
         ("system_scope_pattern",         RK.system_scope_pattern(ORG),         f"supertable:{ORG}:system:*"),
         ("auth_tokens",                  RK.auth_tokens(ORG),                  f"{sys_pre}:auth:tokens"),
+        ("auth_session",                 RK.auth_session(ORG, USER_ID),        f"{sys_pre}:auth:sessions:doc:{USER_ID}"),
         ("audit_stream",                 RK.audit_stream(ORG),                 f"{sys_pre}:audit:stream"),
         ("audit_chain_head",             RK.audit_chain_head(ORG, INSTANCE),   f"{sys_pre}:audit:chain_head:doc:{INSTANCE}"),
         ("audit_config",                 RK.audit_config(ORG),                 f"{sys_pre}:audit:config"),

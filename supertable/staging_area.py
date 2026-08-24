@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import os
+import json
+import re
+import tempfile
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import pyarrow as pa
 
@@ -16,8 +19,17 @@ from supertable.rbac.access_control import (
     check_control_access,
     check_create_access,
     check_meta_access,
+    check_read_access,
     check_write_access,
 )
+
+_SAFE_STAGE_RE = re.compile(
+    r"^(__[a-z0-9][a-z0-9_-]{0,59}__|[a-z0-9][a-z0-9_-]{0,63})$"
+)
+_SAFE_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,511}$")
+_MAX_STAGE_FILES = 10_000
+_MAX_STAGE_META_BYTES = 8 * 1024 * 1024
+_MAX_STAGING_FILE_BYTES = 512 * 1024 * 1024
 
 
 def _safe_path_component(value: str, *, label: str) -> str:
@@ -30,8 +42,17 @@ def _safe_path_component(value: str, *, label: str) -> str:
         or "/" in component
         or "\\" in component
         or "\x00" in component
+        or component != component.strip()
+        or _SAFE_FILE_RE.fullmatch(component) is None
     ):
         raise ValueError(f"Invalid {label}: expected one non-empty path component")
+    return component
+
+
+def _safe_stage_name(value: str) -> str:
+    component = _safe_path_component(value, label="staging_name")
+    if _SAFE_STAGE_RE.fullmatch(component) is None:
+        raise ValueError("Invalid staging_name")
     return component
 
 
@@ -130,9 +151,7 @@ class Staging:
         if not self._is_manager:
             # Stage mode paths
             assert self.staging_name is not None
-            self.staging_name = _safe_path_component(
-                self.staging_name, label="staging_name",
-            )
+            self.staging_name = _safe_stage_name(self.staging_name)
             self._check_deletion_intent_absent(stage=self.staging_name)
             self.stage_dir = _join_contained(
                 self.base_staging_dir, self.staging_name,
@@ -174,7 +193,9 @@ class Staging:
             staging_name=staging_name,
         )
 
-    def get_directory_structure(self, role_name: str) -> Dict[str, Any]:
+    def get_directory_structure(
+        self, role_name: str, *, max_stages: int = 10_000,
+    ) -> Dict[str, Any]:
         """
         Backwards-compatible method used by examples/3.4. read_staging.py.
 
@@ -189,12 +210,16 @@ class Staging:
         self._check_deletion_intent_absent()
         # Ensure base exists (read-only; no lock)
         base_exists = self.storage.exists(self.base_staging_dir)
-        stagings = self.catalog.list_stagings(self.organization, self.super_name)
+        if type(max_stages) is not int or max_stages <= 0:
+            raise ValueError("max_stages must be a positive integer")
+        stagings = self.catalog.list_stagings(
+            self.organization, self.super_name, limit=max_stages,
+        )
 
         stages: List[Dict[str, Any]] = []
         for name in sorted(stagings):
             try:
-                safe_name = _safe_path_component(name, label="stored staging_name")
+                safe_name = _safe_stage_name(name)
                 self._check_deletion_intent_absent(stage=safe_name)
             except DeletionIntentConflictError:
                 # A deleting/deleted stage is deliberately non-live even if
@@ -250,7 +275,7 @@ class Staging:
         return self.staging_name
 
     def _with_stage_lock(self, stage_name: str, fn):
-        stage_name = _safe_path_component(stage_name, label="staging_name")
+        stage_name = _safe_stage_name(stage_name)
         # RedisLocking renews this lease at half-TTL until the ownership-checked
         # release. Cloud prefix deletion can legitimately take longer than one
         # lease period; a fixed SET NX EX lock would allow a concurrent save to
@@ -277,6 +302,19 @@ class Staging:
 
     def _with_lock(self, fn):
         return self._with_stage_lock(self._require_stage_mode(), fn)
+
+    @staticmethod
+    def _fresh_role(
+        role_name: str,
+        authorization_callback: Optional[Callable[[], str]],
+    ) -> str:
+        effective = (
+            authorization_callback()
+            if authorization_callback is not None else role_name
+        )
+        if not isinstance(effective, str) or not effective.strip():
+            raise PermissionError("A current authorized role is required")
+        return effective.strip()
 
     def _read_legacy_file_map(
             self,
@@ -329,7 +367,7 @@ class Staging:
         where the field is absent, and is then published while the stage lease
         and both deletion intents are checked by the catalog Lua boundary.
         """
-        stage_name = _safe_path_component(stage_name, label="staging_name")
+        stage_name = _safe_stage_name(stage_name)
 
         def _resolve(token: str):
             stage_meta = self.catalog.get_staging_meta(
@@ -436,10 +474,100 @@ class Staging:
             "files": {},
         }
 
-    def save_as_parquet(self, *, role_name: str, arrow_table: pa.Table, base_file_name: str,
-                        source: str = "upload", duration_ms: float = 0, pipe_name: str = "", pipe_id: str = "") -> str:
+    def create(
+        self,
+        role_name: str,
+        *,
+        authorization_callback: Optional[Callable[[], str]] = None,
+    ) -> str:
+        """Create an empty authoritative stage under the renewable stage lock."""
         stage_name = self._require_stage_mode()
+
+        def _op(lock_token: str) -> str:
+            effective_role = self._fresh_role(
+                role_name, authorization_callback,
+            )
+            self.catalog.check_stage_mutation_allowed(
+                self.organization,
+                self.super_name,
+                stage_name,
+                lock_token=lock_token,
+            )
+            existing = self.catalog.get_staging_meta(
+                self.organization, self.super_name, stage_name,
+            )
+            if existing is not None:
+                check_write_access(
+                    super_name=self.super_name,
+                    organization=self.organization,
+                    role_name=effective_role,
+                    table_name=self.super_name,
+                )
+                return stage_name
+            check_create_access(
+                super_name=self.super_name,
+                organization=self.organization,
+                role_name=effective_role,
+                table_name=self.super_name,
+            )
+            initial = self._init_stage(lock_token, existing_meta=None)
+            if not isinstance(initial, dict):
+                raise RuntimeError("Missing initial staging metadata")
+            self.catalog.upsert_staging_meta(
+                self.organization,
+                self.super_name,
+                stage_name,
+                meta=initial,
+                lock_token=lock_token,
+                create_only=True,
+            )
+            return stage_name
+
+        return self._with_lock(_op)
+
+    def save_as_parquet(self, *, role_name: str, arrow_table: pa.Table, base_file_name: str,
+                        source: str = "upload", duration_ms: float = 0, pipe_name: str = "", pipe_id: str = "",
+                        authorization_callback: Optional[Callable[[], str]] = None) -> str:
+        stage_name = self._require_stage_mode()
+        if not isinstance(arrow_table, pa.Table):
+            raise TypeError("Staging input must be a PyArrow table")
+        try:
+            schema_bytes = int(arrow_table.schema.serialize().size)
+        except Exception:
+            schema_bytes = len(str(arrow_table.schema).encode("utf-8"))
+        if (
+            arrow_table.num_rows > 5_000_000
+            or arrow_table.num_columns > 4096
+            or int(arrow_table.nbytes) > 512 * 1024 * 1024
+            or schema_bytes > 1024 * 1024
+        ):
+            raise ValueError("Staging input exceeds its row/schema/memory limit")
+        original_name = os.path.basename(str(base_file_name or ""))
+        text_fields = {
+            "original file name": original_name,
+            "source": source,
+            "pipe_name": pipe_name,
+            "pipe_id": pipe_id,
+        }
+        limits = {
+            "original file name": 1024,
+            "source": 128,
+            "pipe_name": 256,
+            "pipe_id": 256,
+        }
+        for label, value in text_fields.items():
+            if (
+                not isinstance(value, str)
+                or "\x00" in value
+                or "\r" in value
+                or "\n" in value
+                or len(value.encode("utf-8")) > limits[label]
+            ):
+                raise ValueError(f"Invalid staging {label}")
         def _op(_lock_token: str):
+            effective_role = self._fresh_role(
+                role_name, authorization_callback,
+            )
             existing_meta = self.catalog.get_staging_meta(
                 self.organization, self.super_name, stage_name,
             )
@@ -447,16 +575,19 @@ class Staging:
             access(
                 super_name=self.super_name,
                 organization=self.organization,
-                role_name=role_name,
+                role_name=effective_role,
                 table_name=self.super_name,
             )
+            existing_files: Dict[str, Dict[str, Any]] = {}
             if existing_meta is not None:
-                existing_meta, _ = self._get_authoritative_stage_files(
+                existing_meta, existing_files = self._get_authoritative_stage_files(
                     stage_name=stage_name,
                     files_index_path=self.files_index_path,
                     lock_token=_lock_token,
                     known_meta=existing_meta,
                 )
+                if len(existing_files) >= _MAX_STAGE_FILES:
+                    raise ValueError("Staging file fan-out exceeds its safety limit")
             initial_meta = self._init_stage(
                 _lock_token, existing_meta=existing_meta,
             )
@@ -467,16 +598,97 @@ class Staging:
             file_name = f"stage_{ts_ns}_{uuid.uuid4().hex}.parquet"
             file_path = _join_contained(self.stage_dir, file_name)
 
-            self.storage.write_parquet(arrow_table, file_path)
+            try:
+                # Revalidate immediately before irreversible object I/O. The
+                # first callback may have run before a slow legacy migration.
+                effective_role = self._fresh_role(
+                    effective_role, authorization_callback,
+                )
+                access(
+                    super_name=self.super_name,
+                    organization=self.organization,
+                    role_name=effective_role,
+                    table_name=self.super_name,
+                )
+                self.storage.write_parquet(arrow_table, file_path)
+                file_size = int(self.storage.size(file_path))
+                object_identity = self.storage.stat_object(
+                    file_path,
+                ).identity_token()
+                if (
+                    file_size <= 0
+                    or file_size > _MAX_STAGING_FILE_BYTES
+                    or not isinstance(object_identity, str)
+                    or not object_identity
+                    or len(object_identity.encode("utf-8")) > 4096
+                ):
+                    raise RuntimeError(
+                        "Staging storage cannot prove the uploaded object identity"
+                    )
+            except Exception:
+                try:
+                    self.storage.delete(file_path)
+                except Exception:
+                    logger.warning(
+                        "[staging] failed to clean an unindexed upload object"
+                    )
+                raise
 
             file_meta = {
                 "file": file_name, "written_at_ns": ts_ns,
                 "rows": arrow_table.num_rows, "source": source,
+                "file_size": max(0, file_size),
+                "memory_bytes": max(0, int(arrow_table.nbytes)),
+                "column_count": max(0, int(arrow_table.num_columns)),
+                "schema_bytes": max(0, schema_bytes),
+                "object_identity": object_identity,
                 "duration_ms": round(duration_ms) if duration_ms else None,
                 "pipe_name": pipe_name or None, "pipe_id": pipe_id or None,
                 "status": "ok",
-                "original_name": os.path.basename(str(base_file_name or "")) or None,
+                "original_name": original_name or None,
             }
+            try:
+                encoded_file_meta = json.dumps(
+                    file_meta,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8")
+            except (TypeError, ValueError, OverflowError) as exc:
+                try:
+                    self.storage.delete(file_path)
+                except Exception:
+                    pass
+                raise ValueError("Staging file metadata is invalid") from exc
+            if len(encoded_file_meta) > 64 * 1024:
+                try:
+                    self.storage.delete(file_path)
+                except Exception:
+                    pass
+                raise ValueError("Staging file metadata exceeds its size limit")
+
+            # A role may be revoked while the object store is writing. Refuse
+            # publication before the Redis boundary; the unique object is then
+            # safely orphaned for lifecycle cleanup.
+            try:
+                effective_role = self._fresh_role(
+                    effective_role, authorization_callback,
+                )
+                access(
+                    super_name=self.super_name,
+                    organization=self.organization,
+                    role_name=effective_role,
+                    table_name=self.super_name,
+                )
+            except Exception:
+                try:
+                    self.storage.delete(file_path)
+                except Exception:
+                    logger.warning(
+                        "[staging] failed to clean a revoked unindexed upload"
+                    )
+                raise
             # The lock, deletion intents, and metadata update are checked in one
             # Redis Lua boundary. A stale process can leave at most its unique
             # parquet object orphaned; it cannot overwrite a newer live index.
@@ -531,9 +743,409 @@ class Staging:
             if isinstance(item, dict) and item.get("file")
         })
 
-    def delete(self, role_name: str) -> str:
+    def list_file_metadata(self, role_name: str) -> List[Dict[str, Any]]:
+        """Return the bounded, Redis-authoritative stage file documents."""
+        stage_name = self._require_stage_mode()
+        check_meta_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name=self.super_name,
+        )
+        self._check_deletion_intent_absent(stage=stage_name)
+        _meta, files = self._get_authoritative_stage_files(
+            stage_name=stage_name,
+            files_index_path=self.files_index_path,
+        )
+        if len(files) > 10_000:
+            raise RuntimeError("Staging file index exceeds its safety limit")
+        result: List[Dict[str, Any]] = []
+        for key, raw in files.items():
+            if not isinstance(key, str) or not isinstance(raw, dict):
+                raise RuntimeError("Corrupt staging file metadata")
+            safe_name = _safe_path_component(key, label="staging file name")
+            if raw.get("file") != safe_name:
+                raise RuntimeError("Corrupt staging file metadata")
+            projected = dict(raw)
+            projected.pop("object_identity", None)
+            result.append(projected)
+        return sorted(
+            result,
+            key=lambda item: int(item.get("written_at_ns") or 0),
+        )
+
+    def read_parquet_files(
+        self,
+        role_name: str,
+        *,
+        file_names: Optional[List[str]] = None,
+        max_files: int = 256,
+        max_rows: int = 5_000_000,
+        max_bytes: int = 512 * 1024 * 1024,
+        max_columns: int = 4096,
+        max_schema_bytes: int = 1024 * 1024,
+        require_bounded_metadata: bool = False,
+        authorization_callback: Optional[Callable[[], str]] = None,
+    ) -> List[pa.Table]:
+        """Read a pinned stage selection under one renewable stage lease.
+
+        File names must be present in the Redis-authoritative map.  Every
+        cumulative fan-out, row, memory and schema bound is checked before the
+        caller can concatenate the tables.
+        """
+        stage_name = self._require_stage_mode()
+        check_read_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name=self.super_name,
+            require_unfiltered=True,
+        )
+        limits = (max_files, max_rows, max_bytes, max_columns, max_schema_bytes)
+        if any(type(value) is not int or value <= 0 for value in limits):
+            raise ValueError("Staging read limits must be positive integers")
+        requested = None
+        if file_names is not None:
+            if not isinstance(file_names, list) or not file_names:
+                raise ValueError("file_names must be a non-empty list")
+            requested = [
+                _safe_path_component(name, label="staging file name")
+                for name in file_names
+            ]
+            if len(set(requested)) != len(requested):
+                raise ValueError("Duplicate staging file name")
+
+        def _op(lock_token: str) -> List[pa.Table]:
+            effective_role = self._fresh_role(
+                role_name, authorization_callback,
+            )
+            check_read_access(
+                super_name=self.super_name,
+                organization=self.organization,
+                role_name=effective_role,
+                table_name=self.super_name,
+                require_unfiltered=True,
+            )
+            self.catalog.check_stage_mutation_allowed(
+                self.organization,
+                self.super_name,
+                stage_name,
+                lock_token=lock_token,
+            )
+            meta, files = self._get_authoritative_stage_files(
+                stage_name=stage_name,
+                files_index_path=self.files_index_path,
+                lock_token=lock_token,
+            )
+            if meta is None:
+                raise FileNotFoundError(f"Staging '{stage_name}' does not exist")
+            selected = requested or sorted(
+                files,
+                key=lambda name: int(
+                    (files.get(name) or {}).get("written_at_ns") or 0
+                ),
+            )
+            if not selected:
+                return []
+            if len(selected) > max_files:
+                raise ValueError("Staging file fan-out exceeds its safety limit")
+
+            tables: List[pa.Table] = []
+            total_rows = 0
+            total_bytes = 0
+            for file_name in selected:
+                raw_meta = files.get(file_name)
+                if not isinstance(raw_meta, dict) or raw_meta.get("file") != file_name:
+                    raise FileNotFoundError("Staging file is unavailable")
+                bounded_values = {
+                    "rows": raw_meta.get("rows"),
+                    "file_size": raw_meta.get("file_size"),
+                    "memory_bytes": raw_meta.get("memory_bytes"),
+                    "column_count": raw_meta.get("column_count"),
+                    "schema_bytes": raw_meta.get("schema_bytes"),
+                }
+                if require_bounded_metadata and any(
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                    for value in bounded_values.values()
+                ):
+                    raise RuntimeError(
+                        "Legacy staging metadata lacks a safe read bound"
+                    )
+                declared_rows = bounded_values["rows"]
+                declared_file_size = bounded_values["file_size"]
+                declared_memory = bounded_values["memory_bytes"]
+                declared_columns = bounded_values["column_count"]
+                declared_schema = bounded_values["schema_bytes"]
+                declared_identity = raw_meta.get("object_identity")
+                if require_bounded_metadata and (
+                    not isinstance(declared_identity, str)
+                    or not declared_identity
+                    or len(declared_identity.encode("utf-8")) > 4096
+                ):
+                    raise RuntimeError(
+                        "Staging metadata lacks a stable object identity"
+                    )
+                if require_bounded_metadata and (
+                    total_rows + declared_rows > max_rows
+                    or total_bytes + max(declared_file_size, declared_memory) > max_bytes
+                    or declared_columns > max_columns
+                    or declared_schema > max_schema_bytes
+                ):
+                    raise ValueError("Staging read exceeds its declared safety limits")
+                path = _join_contained(self.stage_dir, file_name)
+                try:
+                    stored_bytes = int(self.storage.size(path))
+                except FileNotFoundError:
+                    raise
+                except Exception:
+                    stored_bytes = 0
+                if (
+                    require_bounded_metadata
+                    and stored_bytes != declared_file_size
+                ):
+                    raise RuntimeError("Staging object size disagrees with its metadata")
+                if require_bounded_metadata:
+                    try:
+                        live_metadata = self.storage.stat_object(path)
+                        live_identity = live_metadata.identity_token()
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Staging object identity is unavailable"
+                        ) from exc
+                    if live_identity != declared_identity:
+                        raise RuntimeError(
+                            "Staging object identity disagrees with its metadata"
+                        )
+                    if int(live_metadata.size) != stored_bytes:
+                        raise RuntimeError(
+                            "Staging object stat disagrees with its byte size"
+                        )
+                if stored_bytes < 0 or total_bytes + stored_bytes > max_bytes:
+                    raise ValueError("Staging read exceeds its byte limit")
+                if require_bounded_metadata:
+                    import pyarrow.parquet as pq
+
+                    effective_role = self._fresh_role(
+                        effective_role, authorization_callback,
+                    )
+                    check_read_access(
+                        super_name=self.super_name,
+                        organization=self.organization,
+                        role_name=effective_role,
+                        table_name=self.super_name,
+                        require_unfiltered=True,
+                    )
+                    temp_path = ""
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            mode="w+b",
+                            prefix="supertable-stage-",
+                            suffix=".parquet",
+                            delete=False,
+                        ) as sink:
+                            temp_path = sink.name
+                            downloaded = self.storage.download_to_file(
+                                path,
+                                sink,
+                                expected=live_metadata,
+                                chunk_size=1024 * 1024,
+                            )
+                        if downloaded != stored_bytes:
+                            raise RuntimeError(
+                                "Staging conditional download was incomplete"
+                            )
+                        parquet = pq.ParquetFile(temp_path)
+                        metadata = parquet.metadata
+                        if (
+                            metadata.num_rows != declared_rows
+                            or metadata.num_row_groups > 100_000
+                        ):
+                            raise RuntimeError(
+                                "Staging Parquet metadata disagrees with its index"
+                            )
+                        expanded = 0
+                        for group_index in range(metadata.num_row_groups):
+                            group = metadata.row_group(group_index)
+                            for column_index in range(group.num_columns):
+                                expanded += int(
+                                    group.column(
+                                        column_index,
+                                    ).total_uncompressed_size or 0
+                                )
+                                if expanded > max_bytes:
+                                    raise ValueError(
+                                        "Staging Parquet expansion exceeds its memory limit"
+                                    )
+                        table = pq.read_table(temp_path)
+                    finally:
+                        if temp_path:
+                            try:
+                                os.unlink(temp_path)
+                            except FileNotFoundError:
+                                pass
+                else:
+                    table = self.storage.read_parquet(path)
+                if not isinstance(table, pa.Table):
+                    raise RuntimeError("Staging object is not a Parquet table")
+                if table.num_columns > max_columns:
+                    raise ValueError("Staging schema exceeds its column limit")
+                try:
+                    schema_bytes = int(table.schema.serialize().size)
+                except Exception:
+                    schema_bytes = len(str(table.schema).encode("utf-8"))
+                if schema_bytes > max_schema_bytes:
+                    raise ValueError("Staging schema exceeds its size limit")
+                if require_bounded_metadata and (
+                    int(table.num_rows) != declared_rows
+                    or int(table.num_columns) != declared_columns
+                    or int(table.nbytes) != declared_memory
+                    or schema_bytes != declared_schema
+                ):
+                    raise RuntimeError(
+                        "Staging object content disagrees with its metadata"
+                    )
+                total_rows += int(table.num_rows)
+                total_bytes += max(stored_bytes, int(table.nbytes))
+                if total_rows > max_rows:
+                    raise ValueError("Staging read exceeds its row limit")
+                if total_bytes > max_bytes:
+                    raise ValueError("Staging read exceeds its memory limit")
+                tables.append(table)
+            return tables
+
+        return self._with_lock(_op)
+
+    def delete_file(
+        self,
+        role_name: str,
+        file_name: str,
+        *,
+        authorization_callback: Optional[Callable[[], str]] = None,
+    ) -> bool:
+        """Remove one indexed file without accepting a caller-selected path."""
+        stage_name = self._require_stage_mode()
+        file_name = _safe_path_component(file_name, label="staging file name")
+        check_control_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name=self.super_name,
+        )
+
+        def _op(lock_token: str) -> bool:
+            effective_role = self._fresh_role(
+                role_name, authorization_callback,
+            )
+            check_control_access(
+                super_name=self.super_name,
+                organization=self.organization,
+                role_name=effective_role,
+                table_name=self.super_name,
+            )
+            meta, files = self._get_authoritative_stage_files(
+                stage_name=stage_name,
+                files_index_path=self.files_index_path,
+                lock_token=lock_token,
+            )
+            if meta is None:
+                raise FileNotFoundError(f"Staging '{stage_name}' does not exist")
+            if file_name not in files:
+                raise FileNotFoundError("Staging file is unavailable")
+            next_meta = dict(meta)
+            next_files = dict(files)
+            next_files.pop(file_name)
+            next_meta["files"] = next_files
+            # Remove discoverability first.  A failed physical delete can leave
+            # only an unreferenced object, never a live pointer to missing data.
+            self.catalog.upsert_staging_meta(
+                self.organization, self.super_name, stage_name,
+                meta=next_meta, lock_token=lock_token,
+            )
+            path = _join_contained(self.stage_dir, file_name)
+            try:
+                self.storage.delete(path)
+            except FileNotFoundError:
+                pass
+            return True
+
+        return self._with_lock(_op)
+
+    def purge_files(
+        self,
+        role_name: str,
+        *,
+        max_files: int = 10_000,
+        authorization_callback: Optional[Callable[[], str]] = None,
+    ) -> int:
+        """Atomically unpublish and then physically remove all staged files."""
+        stage_name = self._require_stage_mode()
+        check_control_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name=self.super_name,
+        )
+        if type(max_files) is not int or max_files <= 0:
+            raise ValueError("max_files must be a positive integer")
+
+        def _op(lock_token: str) -> int:
+            effective_role = self._fresh_role(
+                role_name, authorization_callback,
+            )
+            check_control_access(
+                super_name=self.super_name,
+                organization=self.organization,
+                role_name=effective_role,
+                table_name=self.super_name,
+            )
+            meta, files = self._get_authoritative_stage_files(
+                stage_name=stage_name,
+                files_index_path=self.files_index_path,
+                lock_token=lock_token,
+            )
+            if meta is None:
+                raise FileNotFoundError(f"Staging '{stage_name}' does not exist")
+            if len(files) > max_files:
+                raise ValueError("Staging purge exceeds its file limit")
+            names = [
+                _safe_path_component(name, label="staging file name")
+                for name in files
+            ]
+            next_meta = dict(meta)
+            next_meta["files"] = {}
+            self.catalog.upsert_staging_meta(
+                self.organization, self.super_name, stage_name,
+                meta=next_meta, lock_token=lock_token,
+            )
+            errors = 0
+            for name in names:
+                try:
+                    self.storage.delete(_join_contained(self.stage_dir, name))
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    errors += 1
+            if errors:
+                raise OSError(
+                    f"{errors} unreferenced staging object(s) could not be removed"
+                )
+            return len(names)
+
+        return self._with_lock(_op)
+
+    def delete(
+        self,
+        role_name: str,
+        *,
+        authorization_callback: Optional[Callable[[], str]] = None,
+    ) -> str:
         """Start a create-only stage deletion intent and remove the stage."""
-        return self._delete_with_intent(role_name=role_name)
+        return self._delete_with_intent(
+            role_name=role_name,
+            authorization_callback=authorization_callback,
+        )
 
     def recover_delete(
             self,
@@ -621,6 +1233,7 @@ class Staging:
             role_name: str,
             recovery_intent_id: Optional[str] = None,
             confirm_previous_owner_stopped: bool = False,
+            authorization_callback: Optional[Callable[[], str]] = None,
     ) -> str:
         stage_name = self._require_stage_mode()
         check_control_access(
@@ -631,6 +1244,15 @@ class Staging:
         )
 
         def _op(lock_token: str):
+            effective_role = self._fresh_role(
+                role_name, authorization_callback,
+            )
+            check_control_access(
+                super_name=self.super_name,
+                organization=self.organization,
+                role_name=effective_role,
+                table_name=self.super_name,
+            )
             if recovery_intent_id is None:
                 intent = self.catalog.begin_stage_deletion(
                     self.organization,

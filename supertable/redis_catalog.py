@@ -36,6 +36,7 @@ from supertable.tombstone_manifest_v2 import (
     TOMBSTONE_FORMAT_V2,
     TOMBSTONE_FORMAT_V3,
     TombstoneManifestV2Error,
+    validate_logical_storage_path,
     validate_snapshot_tombstone_state,
 )
 
@@ -44,12 +45,21 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-_ROOT_CLONE_TYPES = frozenset({"readonly", "replica"})
+_ROOT_CLONE_TYPES = frozenset({"readonly", "writable", "replica"})
 _REDIS_LUA_MAX_SAFE_INTEGER = (1 << 53) - 1
 _UNPINNED_MIRROR_CONFIG = object()
 _DV_FORMAT_CONFIG_KEY = "deletion_vector_format"
 _DV_V2_FLEET_CONFIG_KEY = "dv_v2_reader_fleet_confirmed"
 _DV_V3_FLEET_CONFIG_KEY = "dv_v3_reader_fleet_confirmed"
+_MAX_STAGING_FILES = 10_000
+_MAX_STAGING_META_BYTES = 8 * 1024 * 1024
+_MAX_STAGING_FILE_META_BYTES = 64 * 1024
+_MAX_PIPES_PER_STAGE = 10_000
+_MAX_PIPE_META_BYTES = 1024 * 1024
+_MAX_PIPE_COLUMNS = 4096
+_MAX_PIPE_COLUMN_BYTES = 1024
+_MAX_PIPE_USER_HASH_BYTES = 4096
+_MAX_CLONE_SNAPSHOT_BYTES = 8 * 1024 * 1024
 
 
 def _validate_table_config_document(
@@ -475,7 +485,7 @@ local function root_safe_segment(value)
   return false
 end
 
-local function root_valid_string_array(value)
+local function root_valid_string_array(value, maximum)
   if value == cjson.null then return true end
   if type(value) ~= 'table' then return false end
   local encoded_ok, encoded = pcall(cjson.encode, value)
@@ -487,6 +497,7 @@ local function root_valid_string_array(value)
         or not root_safe_segment(item) or seen[item] then return false end
     seen[item] = true
     count = count + 1
+    if maximum ~= nil and count > maximum then return false end
   end
   for index = 1, count do
     if value[index] == nil then return false end
@@ -508,7 +519,8 @@ local function root_document_state(root, target_super)
       and type(root['read_only']) ~= 'boolean' then return -1 end
   local clone_type = root['clone_type']
   if clone_type ~= nil and clone_type ~= cjson.null
-      and clone_type ~= 'readonly' and clone_type ~= 'replica' then return -1 end
+      and clone_type ~= 'readonly' and clone_type ~= 'writable'
+      and clone_type ~= 'replica' then return -1 end
   local source = root['cloned_from']
   if source ~= nil and source ~= cjson.null then
     if not root_safe_segment(source)
@@ -521,20 +533,39 @@ local function root_document_state(root, target_super)
           or clone_ts > ROOT_MAX_SAFE_INTEGER
           or clone_ts ~= math.floor(clone_ts)) then return -1 end
   if root['replica_tables'] ~= nil
-      and not root_valid_string_array(root['replica_tables']) then return -1 end
+      and not root_valid_string_array(root['replica_tables'], 10000) then return -1 end
+  local source_owners = root['clone_source_owners']
+  if source_owners ~= nil and source_owners ~= cjson.null then
+    if not root_valid_string_array(source_owners, 64)
+        or source == nil or source == cjson.null
+        or source_owners[1] ~= source then return -1 end
+    for _, owner in pairs(source_owners) do
+      if target_super ~= nil and target_super ~= ''
+          and owner == target_super then return -1 end
+    end
+  end
   local commit_id = root['commit_id']
   if commit_id ~= nil and commit_id ~= cjson.null
       and (type(commit_id) ~= 'string' or string.len(commit_id) < 1) then
     return -1
   end
-  if (clone_type ~= nil and clone_type ~= cjson.null)
-      or (source ~= nil and source ~= cjson.null) then
-    if root['read_only'] ~= true
-        or source == nil or source == cjson.null then return -1 end
+  if clone_type ~= nil and clone_type ~= cjson.null then
+    if source == nil or source == cjson.null then return -1 end
+    if clone_type == 'writable' then
+      if root['read_only'] ~= false then return -1 end
+    elseif root['read_only'] ~= true then
+      return -1
+    end
+  elseif source ~= nil and source ~= cjson.null
+      and root['read_only'] ~= true then
+    -- A legacy source-only clone has no explicit writable capability.  Keep
+    -- that ambiguous representation fail-closed.
+    return -1
   end
   if root['read_only'] == true
-      or (clone_type ~= nil and clone_type ~= cjson.null)
-      or (source ~= nil and source ~= cjson.null) then return 0 end
+      or clone_type == 'readonly' or clone_type == 'replica'
+      or ((source ~= nil and source ~= cjson.null)
+          and (clone_type == nil or clone_type == cjson.null)) then return 0 end
   return 1
 end
 
@@ -705,7 +736,7 @@ def _validate_root_document(
 
     replica_tables = document.get("replica_tables")
     if replica_tables is not None:
-        if not isinstance(replica_tables, list):
+        if not isinstance(replica_tables, list) or len(replica_tables) > 10_000:
             raise ValueError("invalid root replica table allowlist")
         seen: set[str] = set()
         for table in replica_tables:
@@ -717,12 +748,42 @@ def _validate_root_document(
                 raise ValueError("invalid root replica table allowlist") from exc
             seen.add(table)
 
-    # ``cloned_from`` predates the explicit clone_type marker.  It has always
-    # represented a clone boundary, so legacy roots carrying it must be just as
-    # immutable as newer readonly/replica roots.
-    if clone_type in _ROOT_CLONE_TYPES or source is not None:
-        if document.get("read_only") is not True or source is None:
-            raise ValueError("clone roots must be read-only and source-bound")
+    source_owners = document.get("clone_source_owners")
+    if source_owners is not None:
+        if (
+            not isinstance(source_owners, list)
+            or not source_owners
+            or len(source_owners) > 64
+            or source is None
+            or source_owners[0] != source
+        ):
+            raise ValueError("invalid root clone source owners")
+        seen_owners: set[str] = set()
+        for owner in source_owners:
+            if (
+                not isinstance(owner, str)
+                or not owner
+                or owner == sup
+                or owner in seen_owners
+            ):
+                raise ValueError("invalid root clone source owners")
+            try:
+                RK.meta_root(org, owner)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("invalid root clone source owners") from exc
+            seen_owners.add(owner)
+
+    if clone_type is not None:
+        if source is None:
+            raise ValueError("clone roots must be source-bound")
+        expected_read_only = clone_type != "writable"
+        if document.get("read_only") is not expected_read_only:
+            raise ValueError("clone root mutability does not match its type")
+    elif source is not None and document.get("read_only") is not True:
+        # ``cloned_from`` predates an explicit clone type.  It does not prove
+        # that the namespace was deliberately promoted, so legacy source-only
+        # roots remain fail-closed unless an operator records ``writable``.
+        raise ValueError("legacy clone roots must be read-only")
     return document
 
 
@@ -1515,6 +1576,100 @@ redis.call('SADD', table_names, simple_name)
 return 0
 """
 
+    _LUA_COMMIT_CLONE_SNAPSHOT = _LUA_ROOT_DOCUMENT_GUARD + """
+-- clone-lifecycle-snapshot-commit
+local leaf_key = KEYS[1]
+local leaf_lock = KEYS[2]
+local namespace_lock = KEYS[3]
+local root_key = KEYS[4]
+local namespace_delete = KEYS[5]
+local simple_delete = KEYS[6]
+local table_names = KEYS[7]
+local schema_key = KEYS[8]
+
+local expected_version = tonumber(ARGV[1])
+local expected_path = ARGV[2]
+local payload_json = ARGV[3]
+local new_path = ARGV[4]
+local now_ms = tonumber(ARGV[5])
+local namespace_token = ARGV[6]
+local leaf_token = ARGV[7]
+local simple_name = ARGV[8]
+local source_super = ARGV[9]
+local target_super = ARGV[10]
+local expected_root_raw = ARGV[11]
+local commit_id = ARGV[12]
+local schema_json = ARGV[13]
+
+if not expected_version or expected_version < -1
+    or expected_version > ROOT_MAX_SAFE_INTEGER
+    or expected_version ~= math.floor(expected_version)
+    or not now_ms or now_ms < 0 or now_ms > ROOT_MAX_SAFE_INTEGER
+    or now_ms ~= math.floor(now_ms)
+    or new_path == '' or simple_name == '' or source_super == ''
+    or source_super == target_super or commit_id == '' then return -12 end
+if namespace_token == ''
+    or redis.call('GET', namespace_lock) ~= namespace_token then return -1 end
+if leaf_token == '' or redis.call('GET', leaf_lock) ~= leaf_token then return -2 end
+if redis.call('EXISTS', namespace_delete) == 1 then return -3 end
+if redis.call('EXISTS', simple_delete) == 1 then return -4 end
+
+local root_raw = redis.call('GET', root_key)
+if not root_raw then return -5 end
+if root_raw ~= expected_root_raw then return -6 end
+local root_ok, root = pcall(cjson.decode, root_raw)
+if not root_ok or type(root) ~= 'table'
+    or root_document_state(root, target_super) == -1 then return -7 end
+local source_bound_clone = root['cloned_from'] == source_super
+    and (root['clone_type'] == 'readonly' or root['clone_type'] == 'replica')
+local writable_target = root_document_state(root, target_super) == 1
+if not source_bound_clone and not writable_target then return -8 end
+if root['version'] >= ROOT_MAX_SAFE_INTEGER then return -12 end
+
+local payload_ok, payload = pcall(cjson.decode, payload_json)
+local schema_ok, schema = pcall(cjson.decode, schema_json)
+if not payload_ok or type(payload) ~= 'table'
+    or not schema_ok or type(schema) ~= 'table' then return -9 end
+local payload_version = payload['snapshot_version']
+if type(payload_version) ~= 'number'
+    or payload_version < 0 or payload_version > ROOT_MAX_SAFE_INTEGER
+    or payload_version ~= math.floor(payload_version) then return -9 end
+
+local current_raw = redis.call('GET', leaf_key)
+if expected_version == -1 then
+  if current_raw then return -10 end
+  if expected_path ~= '' or (payload_version ~= 0 and payload_version ~= 1) then
+    return -9
+  end
+else
+  if not current_raw then return -10 end
+  local current_ok, current = pcall(cjson.decode, current_raw)
+  if not current_ok or type(current) ~= 'table'
+      or current['version'] ~= expected_version
+      or current['path'] ~= expected_path
+      or payload_version ~= expected_version + 1 then return -10 end
+end
+
+local names_type = redis.call('TYPE', table_names)
+if type(names_type) == 'table' then names_type = names_type['ok'] end
+local schema_type = redis.call('TYPE', schema_key)
+if type(schema_type) == 'table' then schema_type = schema_type['ok'] end
+if (names_type ~= 'none' and names_type ~= 'set')
+    or (schema_type ~= 'none' and schema_type ~= 'string') then return -11 end
+
+local leaf = cjson.encode({
+  version=payload_version, ts=now_ms, path=new_path, payload=payload
+})
+root['version'] = root['version'] + 1
+root['ts'] = now_ms
+root['commit_id'] = commit_id
+redis.call('SET', leaf_key, leaf)
+redis.call('SET', schema_key, schema_json)
+redis.call('SADD', table_names, simple_name)
+redis.call('SET', root_key, cjson.encode(root))
+return payload_version
+"""
+
     _LUA_ALLOCATE_LINKED_PUBLICATION = _LUA_ROOT_DOCUMENT_GUARD + """
 local generation_key = KEYS[1]
 local server_time = redis.call('TIME')
@@ -2189,25 +2344,18 @@ end
 return removed
 """
 
-    _LUA_ROOT_ENSURE = """
-local ROOT_MAX_SAFE_INTEGER = 9007199254740991
+    _LUA_ROOT_ENSURE = _LUA_ROOT_DOCUMENT_GUARD + """
 local root_key = KEYS[1]
 local namespace_lock = KEYS[2]
 local namespace_delete = KEYS[3]
 local initial_json = ARGV[1]
 local namespace_token = ARGV[2]
+local target_super = ARGV[3]
 local initial_ok, initial = pcall(cjson.decode, initial_json)
-if not initial_ok or type(initial) ~= 'table' then return -3 end
-if type(initial['version']) ~= 'number'
-    or initial['version'] < 0
-    or initial['version'] > ROOT_MAX_SAFE_INTEGER
-    or initial['version'] ~= math.floor(initial['version'])
-    or type(initial['ts']) ~= 'number'
-    or initial['ts'] < 0
-    or initial['ts'] > ROOT_MAX_SAFE_INTEGER
-    or initial['ts'] ~= math.floor(initial['ts']) then return -3 end
+if not initial_ok or root_document_state(initial, target_super) == -1 then return -3 end
 local namespace_holder = redis.call('GET', namespace_lock)
-if namespace_holder and namespace_holder ~= namespace_token then
+if (namespace_token ~= '' and namespace_holder ~= namespace_token)
+    or (namespace_token == '' and namespace_holder) then
   return -1
 end
 if redis.call('EXISTS', namespace_delete) == 1 then return -2 end
@@ -2216,15 +2364,7 @@ if type(root_type) == 'table' then root_type = root_type['ok'] end
 if root_type ~= 'none' and root_type ~= 'string' then return -3 end
 if root_type == 'string' then
   local root_ok, root = pcall(cjson.decode, redis.call('GET', root_key))
-  if not root_ok or type(root) ~= 'table' then return -3 end
-  if type(root['version']) ~= 'number'
-      or root['version'] < 0
-      or root['version'] > ROOT_MAX_SAFE_INTEGER
-      or root['version'] ~= math.floor(root['version'])
-      or type(root['ts']) ~= 'number'
-      or root['ts'] < 0
-      or root['ts'] > ROOT_MAX_SAFE_INTEGER
-      or root['ts'] ~= math.floor(root['ts']) then return -3 end
+  if not root_ok or root_document_state(root, target_super) == -1 then return -3 end
   return 0
 end
 redis.call('SET', root_key, initial_json)
@@ -2240,6 +2380,15 @@ local flags_json = ARGV[1]
 local now_ms = tonumber(ARGV[2])
 local target_super = ARGV[3]
 local expected_root_raw = ARGV[4]
+local namespace_token = ARGV[5]
+local namespace_lock = KEYS[5]
+
+if namespace_token ~= '' then
+  local namespace_type = redis.call('TYPE', namespace_lock)
+  if type(namespace_type) == 'table' then namespace_type = namespace_type['ok'] end
+  if namespace_type ~= 'string'
+      or redis.call('GET', namespace_lock) ~= namespace_token then return -7 end
+end
 
 if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
 local simple_index_type = redis.call('TYPE', simple_intent_index)
@@ -2373,9 +2522,13 @@ local document_json = ARGV[1]
 local link_id = ARGV[2]
 local mode = ARGV[3]
 local not_after_ms = tonumber(ARGV[4] or '0')
+local max_items = tonumber(ARGV[5] or '0')
 if not not_after_ms or not_after_ms < 0
     or not_after_ms > ROOT_MAX_SAFE_INTEGER
     or not_after_ms ~= math.floor(not_after_ms) then return -8 end
+if not max_items or max_items < 0
+    or max_items > ROOT_MAX_SAFE_INTEGER
+    or max_items ~= math.floor(max_items) then return -15 end
 if publication_deadline_exceeded(not_after_ms) then return -8 end
 if redis.call('EXISTS', unlink_tombstone) == 1 then return -12 end
 if redis.call('EXISTS', namespace_intent) == 1 then return -1 end
@@ -2434,6 +2587,9 @@ local indexed = redis.call('SISMEMBER', index_key, link_id)
 if mode == 'create' then
   if document_type ~= 'none' then return -6 end
   if indexed == 1 then return -5 end
+  if max_items > 0 and redis.call('SCARD', index_key) >= max_items then
+    return -15
+  end
   if publication_deadline_exceeded(not_after_ms) then return -8 end
   if redis.call('EXISTS', unlink_tombstone) == 1 then return -12 end
   redis.call('SET', document_key, document_json)
@@ -2510,6 +2666,10 @@ local index_key = KEYS[2]
 local document_json = ARGV[1]
 local share_id = ARGV[2]
 local mode = ARGV[3]
+local max_items = tonumber(ARGV[4] or '0')
+if not max_items or max_items < 0
+    or max_items > 9007199254740991
+    or max_items ~= math.floor(max_items) then return -5 end
 local document_type = redis.call('TYPE', document_key)
 if type(document_type) == 'table' then document_type = document_type['ok'] end
 local index_type = redis.call('TYPE', index_key)
@@ -2518,12 +2678,16 @@ if document_type ~= 'none' and document_type ~= 'string' then return -2 end
 if index_type ~= 'none' and index_type ~= 'set' then return -2 end
 local indexed = redis.call('SISMEMBER', index_key, share_id)
 
-if mode == 'delete' then
+if mode == 'delete' or mode == 'delete_expected' then
   if document_type == 'none' then
     if indexed == 1 then return -2 end
     return 0
   end
   if indexed ~= 1 then return -2 end
+  if mode == 'delete_expected'
+      and redis.call('GET', document_key) ~= document_json then
+    return -4
+  end
   redis.call('DEL', document_key)
   redis.call('SREM', index_key, share_id)
   return 1
@@ -2535,6 +2699,9 @@ if not ok or type(document) ~= 'table' then return -3 end
 if mode == 'create' then
   if document_type ~= 'none' then return -1 end
   if indexed == 1 then return -2 end
+  if max_items > 0 and redis.call('SCARD', index_key) >= max_items then
+    return -5
+  end
   redis.call('SET', document_key, document_json)
   redis.call('SADD', index_key, share_id)
   return 1
@@ -3917,6 +4084,8 @@ local lock_token = ARGV[3]
 local create_only = ARGV[4]
 local organization = ARGV[5]
 local super_name = ARGV[6]
+local max_files = tonumber(ARGV[7])
+local max_document_bytes = tonumber(ARGV[8])
 if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
   return -1
 end
@@ -3933,12 +4102,26 @@ if root_state == -1 then return -8 end
 if root_state == 0 then return -9 end
 local ok, payload = pcall(cjson.decode, payload_json)
 if not ok or type(payload) ~= 'table' then return -4 end
+if not max_files or not max_document_bytes
+    or string.len(payload_json) > max_document_bytes then return -10 end
 if type(payload['organization']) ~= 'string'
     or payload['organization'] ~= organization
     or type(payload['super_name']) ~= 'string'
     or payload['super_name'] ~= super_name
     or type(payload['staging_name']) ~= 'string'
     or payload['staging_name'] ~= stage_name then return -4 end
+local files = payload['files']
+if files ~= nil then
+  if type(files) ~= 'table' then return -4 end
+  local file_count = 0
+  for file_key, file_meta in pairs(files) do
+    file_count = file_count + 1
+    if file_count > max_files
+        or type(file_key) ~= 'string'
+        or type(file_meta) ~= 'table'
+        or file_meta['file'] ~= file_key then return -10 end
+  end
+end
 local meta_type = redis.call('TYPE', meta_key)
 if type(meta_type) == 'table' then meta_type = meta_type['ok'] end
 local index_type = redis.call('TYPE', index_key)
@@ -3966,6 +4149,11 @@ local create_only = ARGV[4]
 local organization = ARGV[5]
 local super_name = ARGV[6]
 local stage_name = ARGV[7]
+local max_document_bytes = tonumber(ARGV[8])
+local max_pipes = tonumber(ARGV[9])
+local max_columns = tonumber(ARGV[10])
+local max_column_bytes = tonumber(ARGV[11])
+local max_user_hash_bytes = tonumber(ARGV[12])
 if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
   return -1
 end
@@ -3994,6 +4182,9 @@ if root_state == -1 then return -10 end
 if root_state == 0 then return -11 end
 local ok, payload = pcall(cjson.decode, payload_json)
 if not ok or type(payload) ~= 'table' then return -4 end
+if not max_document_bytes or not max_pipes or not max_columns
+    or not max_column_bytes or not max_user_hash_bytes
+    or string.len(payload_json) > max_document_bytes then return -12 end
 if type(payload['organization']) ~= 'string'
     or payload['organization'] ~= organization
     or type(payload['super_name']) ~= 'string'
@@ -4002,6 +4193,24 @@ if type(payload['organization']) ~= 'string'
     or payload['staging_name'] ~= stage_name
     or type(payload['pipe_name']) ~= 'string'
     or payload['pipe_name'] ~= pipe_name then return -4 end
+if type(payload['simple_name']) ~= 'string' or payload['simple_name'] == ''
+    or type(payload['user_hash']) ~= 'string'
+    or string.len(payload['user_hash']) > max_user_hash_bytes
+    or type(payload['enabled']) ~= 'boolean' then return -12 end
+local columns = payload['overwrite_columns']
+if type(columns) ~= 'table' then return -12 end
+local column_count = 0
+for column_index, column_name in pairs(columns) do
+  column_count = column_count + 1
+  if type(column_index) ~= 'number'
+      or column_index < 1
+      or column_index ~= math.floor(column_index)
+      or type(column_name) ~= 'string'
+      or column_name == ''
+      or string.len(column_name) > max_column_bytes
+      or column_count > max_columns then return -12 end
+end
+if column_count ~= #columns then return -12 end
 local pipe_type = redis.call('TYPE', pipe_key)
 if type(pipe_type) == 'table' then pipe_type = pipe_type['ok'] end
 local index_type = redis.call('TYPE', pipe_index)
@@ -4009,6 +4218,9 @@ if type(index_type) == 'table' then index_type = index_type['ok'] end
 if pipe_type ~= 'none' and pipe_type ~= 'string' then return -6 end
 if index_type ~= 'none' and index_type ~= 'set' then return -6 end
 if create_only == '1' and pipe_type ~= 'none' then return -5 end
+if pipe_type == 'none' and redis.call('SCARD', pipe_index) >= max_pipes then
+  return -12
+end
 redis.call('SET', pipe_key, payload_json)
 redis.call('SADD', pipe_index, pipe_name)
 return 1
@@ -4026,6 +4238,9 @@ local lock_token = ARGV[3]
 local organization = ARGV[4]
 local super_name = ARGV[5]
 local stage_name = ARGV[6]
+local max_files = tonumber(ARGV[7])
+local max_document_bytes = tonumber(ARGV[8])
+local max_file_meta_bytes = tonumber(ARGV[9])
 if lock_token == '' or redis.call('GET', stage_lock) ~= lock_token then
   return -1
 end
@@ -4046,6 +4261,8 @@ if meta_type == 'none' then return -6 end
 if meta_type ~= 'string' then return -5 end
 local payload_ok, payload = pcall(cjson.decode, payload_json)
 if not payload_ok or type(payload) ~= 'table' then return -4 end
+if not max_files or not max_document_bytes or not max_file_meta_bytes
+    or string.len(payload_json) > max_file_meta_bytes then return -10 end
 if type(payload['file']) ~= 'string'
     or payload['file'] ~= file_name then return -4 end
 local raw_meta = redis.call('GET', meta_key)
@@ -4063,9 +4280,20 @@ if files == nil then
 elseif type(files) ~= 'table' then
   return -5
 end
+local file_count = 0
+for existing_name, existing_meta in pairs(files) do
+  file_count = file_count + 1
+  if file_count > max_files
+      or type(existing_name) ~= 'string'
+      or type(existing_meta) ~= 'table'
+      or existing_meta['file'] ~= existing_name then return -10 end
+end
+if files[file_name] == nil and file_count >= max_files then return -10 end
 files[file_name] = payload
 meta['files'] = files
-redis.call('SET', meta_key, cjson.encode(meta))
+local encoded = cjson.encode(meta)
+if string.len(encoded) > max_document_bytes then return -10 end
+redis.call('SET', meta_key, encoded)
 return 1
 """
 
@@ -6451,6 +6679,9 @@ return 1
         # Register scripts
         self._leaf_cas_set = self.r.register_script(self._LUA_LEAF_CAS_SET)
         self._leaf_payload_cas_set = self.r.register_script(self._LUA_LEAF_PAYLOAD_CAS_SET)
+        self._commit_clone_snapshot = self.r.register_script(
+            self._LUA_COMMIT_CLONE_SNAPSHOT
+        )
         self._allocate_linked_publication = self.r.register_script(
             self._LUA_ALLOCATE_LINKED_PUBLICATION
         )
@@ -8019,12 +8250,38 @@ return 1
 
 
     def ensure_root(
-            self, org: str, sup: str, *, namespace_token: str = "",
+            self,
+            org: str,
+            sup: str,
+            *,
+            namespace_token: str = "",
+            initial_flags: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Initialize meta:root if missing with version=0."""
+        """Atomically initialize a validated root, optionally lifecycle-bound."""
+        if not isinstance(namespace_token, str):
+            raise TypeError("namespace_token must be a string")
         key = RK.meta_root(org, sup)
         try:
             init = {"version": 0, "ts": _publication_timestamp(None)}
+            if initial_flags is not None:
+                if not isinstance(initial_flags, dict):
+                    raise TypeError("Initial root flags must be a JSON object")
+                if {"version", "ts", "commit_id"}.intersection(initial_flags):
+                    raise ValueError("Root publication identity fields are immutable")
+                init.update(initial_flags)
+            try:
+                _validate_root_document(init, org=org, sup=sup)
+                encoded_init = json.dumps(
+                    init,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Invalid initial root lifecycle flags") from exc
+            if len(encoded_init.encode("utf-8")) > 1024 * 1024:
+                raise ValueError("Initial root lifecycle flags are too large")
             # The namespace fence and initialize-only write share one Redis
             # transaction, so recreation cannot slip into a verified delete.
             result = int(self._root_ensure(
@@ -8033,9 +8290,13 @@ return 1
                     RK.lock_namespace(org, sup),
                     RK.meta_namespace_deletion_intent(org, sup),
                 ],
-                args=[json.dumps(init), namespace_token or ""],
+                args=[encoded_init, namespace_token or "", sup],
             ) or 0)
             if result == -1:
+                if namespace_token:
+                    raise LockLostError(
+                        f"Lost namespace initialization lock for {org}/{sup}"
+                    )
                 raise RuntimeError(
                     f"SuperTable namespace is fenced for deletion: {org}/{sup}"
                 )
@@ -8091,7 +8352,14 @@ return 1
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}") from exc
 
-    def update_root_flags(self, org: str, sup: str, flags: Dict[str, Any]) -> bool:
+    def update_root_flags(
+            self,
+            org: str,
+            sup: str,
+            flags: Dict[str, Any],
+            *,
+            namespace_token: Optional[str] = None,
+    ) -> bool:
         """Merge *flags* into the existing meta:root JSON document.
 
         Used to set read_only, cloned_from, clone_type, clone_ts without
@@ -8101,6 +8369,10 @@ return 1
             raise TypeError("Root flags must be a JSON object")
         if {"version", "ts", "commit_id"}.intersection(flags):
             raise ValueError("Root publication identity fields are immutable")
+        if namespace_token is not None and (
+            not isinstance(namespace_token, str) or not namespace_token
+        ):
+            raise ValueError("namespace_token must be a non-empty string")
         self.check_deletion_intent_absent(org, sup)
         key = RK.meta_root(org, sup)
         try:
@@ -8130,12 +8402,14 @@ return 1
                     RK.meta_namespace_deletion_intent(org, sup),
                     RK.meta_simple_deletion_intent_index(org, sup),
                     RK.meta_stage_deletion_intent_index(org, sup),
+                    RK.lock_namespace(org, sup),
                 ],
                 args=[
                     json.dumps(flags),
                     _now_ms(),
                     sup,
                     expected_raw,
+                    namespace_token or "",
                 ],
             ) or 0)
             if result == -1:
@@ -8157,6 +8431,10 @@ return 1
             if result == -6:
                 raise DeletionIntentConflictError(
                     f"A child deletion intent fences root flags for {org}/{sup}"
+                )
+            if result == -7:
+                raise LockLostError(
+                    f"Lost namespace lock before updating root flags for {org}/{sup}"
                 )
             if result != 1:
                 raise RuntimeError(f"Invalid root flag update result: {result}")
@@ -8195,6 +8473,87 @@ return 1
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] find_readonly_clones error: {e}")
         return clones
+
+    def find_clones_strict(
+            self,
+            org: str,
+            source_sup: str,
+            *,
+            namespace_token: str,
+            maximum: int = 10_000,
+    ) -> List[str]:
+        """Enumerate every source-bound clone while owning its source fence.
+
+        Namespace deletion calls this after acquiring the same renewable lease
+        that clone creation must acquire on its source.  Corrupt roots, Redis
+        failures, unbounded scans, or lease loss are hard failures: dependency
+        discovery is a destructive-operation guard and must never fail open.
+        """
+        RK.meta_root(org, source_sup)
+        if type(maximum) is not int or maximum <= 0 or maximum > 100_000:
+            raise ValueError("Clone dependency bound is invalid")
+        lock_key = RK.lock_namespace(org, source_sup)
+
+        def assert_owner() -> None:
+            if not namespace_token or self.r.get(lock_key) != namespace_token:
+                raise LockLostError("Lost source namespace lease during clone discovery")
+
+        assert_owner()
+        pattern = RK.meta_root_pattern_for_org(org)
+        cursor = 0
+        calls = 0
+        seen_keys: set[str] = set()
+        clones: set[str] = set()
+        while True:
+            calls += 1
+            if calls > 100_000:
+                raise RuntimeError("Clone dependency scan exceeded its call bound")
+            cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=256)
+            if not isinstance(keys, (list, tuple, set)):
+                raise RuntimeError("Redis returned an invalid clone dependency page")
+            for raw_key in keys:
+                key = self._redis_key_text(raw_key)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                if len(seen_keys) > maximum + 1:
+                    raise RuntimeError("Clone dependency scan exceeds its safety limit")
+                parsed = RK.parse_lake_key(key)
+                if parsed is None or parsed[0] != org:
+                    raise RuntimeError("Clone dependency scan escaped its organization")
+                target_sup = parsed[1]
+                raw = self.r.get(key)
+                if not raw:
+                    # SCAN may observe a key removed before GET.  Supported
+                    # namespace deletion/recreation is serialized by its own
+                    # lock; resample on the next complete pass by failing now.
+                    raise SnapshotCommitConflictError(
+                        "SuperTable roots changed during clone discovery"
+                    )
+                try:
+                    root = _validate_root_document(
+                        json.loads(raw), org=org, sup=target_sup,
+                    )
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"Corrupt Redis root JSON for {org}/{target_sup}"
+                    ) from exc
+                source_owners = root.get("clone_source_owners") or []
+                if target_sup != source_sup and (
+                    root.get("cloned_from") == source_sup
+                    or source_sup in source_owners
+                ):
+                    clones.add(target_sup)
+                    if len(clones) > maximum:
+                        raise RuntimeError("Clone dependency count exceeds its safety limit")
+            try:
+                cursor = int(cursor)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Redis returned an invalid clone scan cursor") from exc
+            if cursor == 0:
+                break
+        assert_owner()
+        return sorted(clones)
 
     def bump_root(self, org: str, sup: str, now_ms: Optional[int] = None) -> int:
         self.check_deletion_intent_absent(org, sup)
@@ -9413,6 +9772,178 @@ return 1
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] leaf_payload_cas_set error: {e}")
             raise
+
+    def commit_clone_snapshot(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            payload: Dict[str, Any],
+            path: str,
+            *,
+            source_super: str,
+            expected_version: int,
+            expected_path: str,
+            namespace_token: str,
+            lock_token: str,
+            now_ms: Optional[int] = None,
+            commit_id: Optional[str] = None,
+    ) -> int:
+        """Publish one clone-lifecycle snapshot under exact Redis fences.
+
+        Unlike the ordinary writer commit, this narrow primitive may publish
+        while a clone is read-only.  It therefore requires both the target
+        namespace lease and table lease, an unchanged clone root bound to the
+        expected source, and the exact prior leaf generation/path.  It is used
+        only to materialize replicas and to replace shared artifact pointers
+        during detach; ordinary data writers cannot bypass read-only policy.
+        """
+        # Exercise the canonical key constructors before serializing attacker-
+        # controlled values or entering Lua.
+        RK.meta_root(org, sup)
+        RK.meta_root(org, source_super)
+        RK.meta_leaf(org, sup, simple)
+        try:
+            logical_path = validate_logical_storage_path(
+                path, field_name="clone snapshot path", required_suffix=".json",
+            )
+        except TombstoneManifestV2Error as exc:
+            raise ValueError("Clone snapshot path is invalid") from exc
+        expected_prefix = f"{org}/{sup}/tables/{simple}/snapshots/"
+        if not logical_path.startswith(expected_prefix):
+            raise ValueError("Clone snapshot path escapes its table")
+        if not namespace_token or not lock_token:
+            raise LockLostError("Clone snapshot publication requires both leases")
+        if type(expected_version) is not int or expected_version < -1:
+            raise ValueError("Expected clone snapshot version is invalid")
+        if not isinstance(expected_path, str) or (
+            expected_version == -1 and expected_path
+        ):
+            raise ValueError("Expected clone snapshot path is invalid")
+        if not isinstance(payload, Mapping):
+            raise ValueError("Clone snapshot payload must be an object")
+
+        try:
+            normalized_payload = snapshot_cache_payload(payload)
+            tombstone_format = validate_snapshot_tombstone_state(
+                normalized_payload.get("tombstone"),
+                normalized_payload.get("tombstone_rows"),
+                normalized_payload.get("tombstone_digest"),
+                format_present="tombstone_format" in normalized_payload,
+                tombstone_format=normalized_payload.get("tombstone_format"),
+            )
+            payload_version = normalized_payload.get("snapshot_version")
+            if type(payload_version) is not int or payload_version < 0:
+                raise ValueError("Invalid clone snapshot version")
+            if expected_version == -1:
+                required_initial = (
+                    1 if tombstone_format in (TOMBSTONE_FORMAT_V2, TOMBSTONE_FORMAT_V3)
+                    and normalized_payload.get("tombstone") is not None else 0
+                )
+                if payload_version != required_initial:
+                    raise ValueError("Invalid initial clone snapshot version")
+            elif payload_version != expected_version + 1:
+                raise ValueError("Clone snapshot is not the exact successor")
+            if (
+                tombstone_format in (TOMBSTONE_FORMAT_V2, TOMBSTONE_FORMAT_V3)
+                and normalized_payload.get("tombstone") is not None
+                and not normalized_payload["tombstone"].startswith(
+                    f"{org}/{sup}/tables/{simple}/tombstone/"
+                )
+            ):
+                raise ValueError("Clone tombstone pointer escapes its target table")
+            payload_json = json.dumps(
+                normalized_payload,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            schema_json = json.dumps(
+                self._snapshot_schema_document(normalized_payload),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError, OverflowError, TombstoneManifestV2Error) as exc:
+            raise ValueError("Clone snapshot payload is invalid") from exc
+        if len(payload_json.encode("utf-8")) > _MAX_CLONE_SNAPSHOT_BYTES:
+            raise ValueError("Clone snapshot payload exceeds its size limit")
+
+        root_key = RK.meta_root(org, sup)
+        try:
+            expected_root_raw = self.r.get(root_key)
+            if not expected_root_raw:
+                raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+            try:
+                root = _validate_root_document(
+                    json.loads(expected_root_raw), org=org, sup=sup,
+                )
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise RuntimeError(f"Corrupt Redis root JSON for {org}/{sup}") from exc
+            source_bound_clone = (
+                root.get("cloned_from") == source_super
+                and root.get("clone_type") in {"readonly", "replica"}
+            )
+            writable_target = root.get("read_only") is not True and (
+                root.get("clone_type") in {None, "writable"}
+            )
+            if not (source_bound_clone or writable_target):
+                raise SnapshotCommitConflictError("Clone target binding changed")
+            timestamp = _publication_timestamp(now_ms)
+            result = int(self._commit_clone_snapshot(
+                keys=[
+                    RK.meta_leaf(org, sup, simple),
+                    RK.lock_leaf(org, sup, simple),
+                    RK.lock_namespace(org, sup),
+                    root_key,
+                    RK.meta_namespace_deletion_intent(org, sup),
+                    RK.meta_simple_deletion_intent(org, sup, simple),
+                    RK.meta_table_names(org, sup),
+                    RK.schema(org, sup, simple),
+                ],
+                args=[
+                    expected_version,
+                    expected_path,
+                    payload_json,
+                    logical_path,
+                    timestamp,
+                    namespace_token,
+                    lock_token,
+                    simple,
+                    source_super,
+                    sup,
+                    expected_root_raw,
+                    commit_id or secrets.token_hex(16),
+                    schema_json,
+                ],
+            ))
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] clone snapshot commit failed: %s", exc)
+            raise
+
+        if result == -1:
+            raise LockLostError("Lost clone namespace lease before publication")
+        if result == -2:
+            raise LockLostError("Lost clone table lease before publication")
+        if result in (-3, -4):
+            raise DeletionIntentConflictError(
+                f"Deletion intent fences clone table {org}/{sup}/{simple}"
+            )
+        if result == -5:
+            raise FileNotFoundError(f"SuperTable does not exist: {org}/{sup}")
+        if result in (-6, -8, -10):
+            raise SnapshotCommitConflictError(
+                f"Clone lifecycle changed before publishing {org}/{sup}/{simple}"
+            )
+        if result in (-7, -9, -11, -12):
+            raise RuntimeError(
+                f"Corrupt clone lifecycle state for {org}/{sup}/{simple}"
+            )
+        if result != payload_version:
+            raise RuntimeError(f"Invalid clone snapshot commit result: {result}")
+        return result
 
     @staticmethod
     def _linked_publication_generation_key(
@@ -13687,14 +14218,30 @@ return 1
             logger.error("[redis-catalog] bounded set scan failed: %s", exc)
             raise
 
-    def create_share(self, org: str, share_id: str, share_doc: Dict[str, Any]) -> None:
+    def create_share(
+            self,
+            org: str,
+            share_id: str,
+            share_doc: Dict[str, Any],
+            *,
+            max_items: Optional[int] = None,
+    ) -> None:
         """Create a share definition and its index entry atomically."""
         if not isinstance(share_doc, dict):
             raise TypeError("Share document must be a JSON object")
+        item_limit = (
+            0
+            if max_items is None
+            else _lua_safe_integer(
+                max_items, field="share count limit", minimum=1,
+            )
+        )
         try:
             result = int(self._mutate_share(
                 keys=[RK.share_doc(org, share_id), RK.share_index(org)],
-                args=[json.dumps(share_doc), share_id, "create"],
+                args=[
+                    json.dumps(share_doc), share_id, "create", item_limit,
+                ],
             ) or 0)
             if result == -1:
                 raise FileExistsError(f"Share already exists: {org}/{share_id}")
@@ -13702,6 +14249,8 @@ return 1
                 raise RuntimeError(f"Corrupt share metadata/index for {org}")
             if result == -3:
                 raise ValueError("Share document is not valid JSON")
+            if result == -5:
+                raise RuntimeError("Share count exceeds its safety limit")
             if result != 1:
                 raise RuntimeError(f"Invalid share creation result: {result}")
         except redis.RedisError as e:
@@ -13791,6 +14340,40 @@ return 1
             logger.error(f"[redis-catalog] delete_share error: {e}")
             raise
 
+    def delete_share_if_unchanged(
+            self,
+            org: str,
+            share_id: str,
+            expected_document: Dict[str, Any],
+    ) -> bool:
+        """Atomically delete one indexed share only if its bytes are unchanged.
+
+        Provider revocation authorizes an exact source/table authority. A
+        separate GET followed by unconditional delete would permit a replaced
+        control document to be removed under that stale decision. Documents
+        read through ``get_share`` preserve JSON insertion order, so the same
+        bounded SDK encoder reproduces SDK-authored bytes; non-canonical or
+        externally rewritten records safely fail the comparison.
+        """
+        if not isinstance(expected_document, dict):
+            raise TypeError("Expected share document must be a JSON object")
+        try:
+            expected_json = json.dumps(expected_document)
+            result = int(self._mutate_share(
+                keys=[RK.share_doc(org, share_id), RK.share_index(org)],
+                args=[expected_json, share_id, "delete_expected"],
+            ) or 0)
+            if result == -2:
+                raise RuntimeError(f"Corrupt share metadata/index for {org}")
+            if result == -4:
+                raise RuntimeError("Share changed during deletion")
+            if result < 0:
+                raise RuntimeError(f"Invalid conditional share deletion result: {result}")
+            return result == 1
+        except redis.RedisError as exc:
+            logger.error("[redis-catalog] conditional share deletion error: %s", exc)
+            raise
+
     def list_shares(
         self, org: str, *, limit: int = 10_000,
     ) -> List[Dict[str, Any]]:
@@ -13827,11 +14410,19 @@ return 1
         link_doc: Dict[str, Any],
         *,
         not_after_ms: Optional[int] = None,
+        max_items: Optional[int] = None,
     ) -> None:
         if not isinstance(link_doc, dict):
             raise TypeError("Linked-share document must be a JSON object")
         publication_deadline = (
             0 if not_after_ms is None else _publication_timestamp(not_after_ms)
+        )
+        item_limit = (
+            0
+            if max_items is None
+            else _lua_safe_integer(
+                max_items, field="linked-share count limit", minimum=1,
+            )
         )
         try:
             result = int(self._upsert_linked_share_fenced(
@@ -13844,7 +14435,8 @@ return 1
                     self._linked_unlink_tombstone_key(org, sup, link_id),
                 ],
                 args=[
-                    json.dumps(link_doc), link_id, "create", publication_deadline,
+                    json.dumps(link_doc), link_id, "create",
+                    publication_deadline, item_limit,
                 ],
             ) or 0)
             if result == -1:
@@ -13884,6 +14476,10 @@ return 1
             if result == -14:
                 raise SnapshotCommitConflictError(
                     "Linked-share instance identity changed"
+                )
+            if result == -15:
+                raise RuntimeError(
+                    "Linked-share count exceeds its safety limit"
                 )
             if result != 1:
                 raise RuntimeError(
@@ -14191,6 +14787,30 @@ return 1
         payload.setdefault("super_name", sup)
         payload.setdefault("staging_name", staging_name)
         payload["updated_at_ms"] = _now_ms()
+        files = payload.get("files")
+        if files is not None and (
+            not isinstance(files, dict)
+            or len(files) > _MAX_STAGING_FILES
+            or any(
+                not isinstance(name, str)
+                or not isinstance(document, dict)
+                or document.get("file") != name
+                for name, document in files.items()
+            )
+        ):
+            raise ValueError("Staging file metadata is invalid or unbounded")
+        try:
+            payload_json = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Staging metadata is not valid JSON") from exc
+        if len(payload_json.encode("utf-8")) > _MAX_STAGING_META_BYTES:
+            raise ValueError("Staging metadata exceeds its size limit")
 
         try:
             result = int(self._upsert_staging_meta(
@@ -14203,8 +14823,9 @@ return 1
                     RK.meta_root(org, sup),
                 ],
                 args=[
-                    json.dumps(payload), staging_name, lock_token or "",
+                    payload_json, staging_name, lock_token or "",
                     "1" if create_only else "0", org, sup,
+                    _MAX_STAGING_FILES, _MAX_STAGING_META_BYTES,
                 ],
             ) or 0)
             if result == -1:
@@ -14236,6 +14857,10 @@ return 1
                 raise ReadOnlyCatalogError(
                     f"SuperTable is read-only: {org}/{sup}"
                 )
+            if result == -10:
+                raise ValueError(
+                    "Staging metadata exceeds its file or byte limit"
+                )
             if result != 1:
                 raise RuntimeError(f"Invalid staging upsert result: {result}")
             return True
@@ -14254,6 +14879,11 @@ return 1
             raise
         if not raw:
             return None
+        if len(raw if isinstance(raw, bytes) else raw.encode("utf-8")) > _MAX_STAGING_META_BYTES:
+            raise RuntimeError(
+                f"Staging metadata exceeds its size limit for "
+                f"{org}/{sup}/{staging_name}"
+            )
         try:
             obj = json.loads(raw)
         except (TypeError, ValueError, json.JSONDecodeError) as e:
@@ -14290,6 +14920,18 @@ return 1
         payload = dict(meta or {})
         payload["file"] = file_name
         try:
+            payload_json = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Staging file metadata is not valid JSON") from exc
+        if len(payload_json.encode("utf-8")) > _MAX_STAGING_FILE_META_BYTES:
+            raise ValueError("Staging file metadata exceeds its size limit")
+        try:
             result = int(self._upsert_staging_file_meta(
                 keys=[
                     RK.staging_doc(org, sup, staging_name),
@@ -14299,8 +14941,9 @@ return 1
                     RK.meta_root(org, sup),
                 ],
                 args=[
-                    json.dumps(payload), file_name, lock_token or "",
-                    org, sup, staging_name,
+                    payload_json, file_name, lock_token or "",
+                    org, sup, staging_name, _MAX_STAGING_FILES,
+                    _MAX_STAGING_META_BYTES, _MAX_STAGING_FILE_META_BYTES,
                 ],
             ) or 0)
             if result == -1:
@@ -14333,6 +14976,10 @@ return 1
                 raise ReadOnlyCatalogError(
                     f"SuperTable is read-only: {org}/{sup}"
                 )
+            if result == -10:
+                raise ValueError(
+                    "Staging file index exceeds its file or byte limit"
+                )
             if result != 1:
                 raise RuntimeError(
                     f"Invalid staging file-index result: {result}"
@@ -14346,12 +14993,19 @@ return 1
             )
             raise
 
-    def list_stagings(self, org: str, sup: str, *, count: int = 1000) -> List[str]:
+    def list_stagings(
+        self, org: str, sup: str, *, count: int = 1000,
+        limit: int = 10_000,
+    ) -> List[str]:
         """List staging names from the staging index set."""
         if not (org and sup):
             return []
         try:
-            names = self.r.smembers(RK.staging_index(org, sup)) or set()
+            names = self._bounded_set_members(
+                RK.staging_index(org, sup),
+                limit=limit,
+                description=f"staging index for {org}/{sup}",
+            )
         except UnicodeDecodeError as exc:
             raise RuntimeError(
                 f"Corrupt staging index for {org}/{sup}"
@@ -14370,6 +15024,11 @@ return 1
                 raise RuntimeError(
                     f"Corrupt staging index for {org}/{sup}"
                 ) from exc
+            if self.get_staging_meta(org, sup, name) is None:
+                raise RuntimeError(
+                    f"Staging index references missing metadata for "
+                    f"{org}/{sup}/{name}"
+                )
             decoded.add(name)
         return sorted(decoded)
 
@@ -14537,7 +15196,45 @@ return 1
         payload.setdefault("super_name", sup)
         payload.setdefault("staging_name", staging_name)
         payload.setdefault("pipe_name", pipe_name)
+        payload.setdefault("user_hash", "")
+        payload.setdefault("overwrite_columns", [])
+        payload.setdefault("enabled", True)
         payload["updated_at_ms"] = _now_ms()
+        columns = payload.get("overwrite_columns")
+        user_hash = payload.get("user_hash")
+        if (
+            not isinstance(payload.get("simple_name"), str)
+            or not payload["simple_name"]
+            or not isinstance(user_hash, str)
+            or len(user_hash.encode("utf-8")) > _MAX_PIPE_USER_HASH_BYTES
+            or type(payload.get("enabled")) is not bool
+            or not isinstance(columns, list)
+            or len(columns) > _MAX_PIPE_COLUMNS
+        ):
+            raise ValueError("Pipe metadata is invalid or unbounded")
+        seen_columns: set[str] = set()
+        for column in columns:
+            if (
+                not isinstance(column, str)
+                or not column
+                or "\x00" in column
+                or len(column.encode("utf-8")) > _MAX_PIPE_COLUMN_BYTES
+                or column.casefold() in seen_columns
+            ):
+                raise ValueError("Pipe overwrite column metadata is invalid")
+            seen_columns.add(column.casefold())
+        try:
+            payload_json = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("Pipe metadata is not valid JSON") from exc
+        if len(payload_json.encode("utf-8")) > _MAX_PIPE_META_BYTES:
+            raise ValueError("Pipe metadata exceeds its size limit")
 
         try:
             result = int(self._upsert_pipe_meta(
@@ -14551,8 +15248,11 @@ return 1
                     RK.meta_root(org, sup),
                 ],
                 args=[
-                    json.dumps(payload), pipe_name, lock_token or "",
+                    payload_json, pipe_name, lock_token or "",
                     "1" if create_only else "0", org, sup, staging_name,
+                    _MAX_PIPE_META_BYTES, _MAX_PIPES_PER_STAGE,
+                    _MAX_PIPE_COLUMNS, _MAX_PIPE_COLUMN_BYTES,
+                    _MAX_PIPE_USER_HASH_BYTES,
                 ],
             ) or 0)
             if result == -1:
@@ -14593,6 +15293,10 @@ return 1
                 raise ReadOnlyCatalogError(
                     f"SuperTable is read-only: {org}/{sup}"
                 )
+            if result == -12:
+                raise ValueError(
+                    "Pipe metadata exceeds its field, fan-out, or byte limit"
+                )
             if result != 1:
                 raise RuntimeError(f"Invalid pipe upsert result: {result}")
             return True
@@ -14612,6 +15316,11 @@ return 1
             raise
         if not raw:
             return None
+        if len(raw if isinstance(raw, bytes) else raw.encode("utf-8")) > _MAX_PIPE_META_BYTES:
+            raise RuntimeError(
+                f"Pipe metadata exceeds its size limit for "
+                f"{org}/{sup}/{staging_name}/{pipe_name}"
+            )
         try:
             obj = json.loads(raw)
         except (TypeError, ValueError, json.JSONDecodeError) as e:
@@ -14631,8 +15340,7 @@ return 1
         """List pipe metadata objects for a staging (back-compat).
 
         This is primarily used by SuperPipe to check for existing pipes.
-        If a pipe has no stored dict meta (e.g. only defs list exists), a minimal
-        payload with at least "pipe_name" is returned.
+        Index/document disagreement is corruption and fails closed.
         """
         if not (org and sup and staging_name):
             return []
@@ -14642,42 +15350,111 @@ return 1
             if isinstance(meta, dict) and meta:
                 out_metas.append(meta)
             else:
-                out_metas.append(
-                    {
-                        "organization": org,
-                        "super_name": sup,
-                        "staging_name": staging_name,
-                        "pipe_name": name,
-                    }
+                raise RuntimeError(
+                    f"Pipe index references missing metadata for "
+                    f"{org}/{sup}/{staging_name}/{name}"
                 )
         return out_metas
 
-    def list_pipes(self, org: str, sup: str, staging_name: str, *, count: int = 1000) -> List[str]:
+    def list_pipes(
+        self, org: str, sup: str, staging_name: str, *, count: int = 1000,
+        limit: int = 10_000,
+    ) -> List[str]:
         """List pipe names for a staging. Prefers the pipe index set; falls back to SCAN."""
         if not (org and sup and staging_name):
             return []
         try:
-            names = list(self.r.smembers(RK.pipe_index(org, sup, staging_name)) or [])
+            names = self._bounded_set_members(
+                RK.pipe_index(org, sup, staging_name),
+                limit=limit,
+                description=f"pipe index for {org}/{sup}/{staging_name}",
+            )
             if names:
-                return sorted({(n if isinstance(n, str) else n.decode('utf-8')) for n in names if n})
+                decoded = set()
+                for raw_name in names:
+                    try:
+                        name = self._decode_index_member(
+                            raw_name,
+                            description=(
+                                f"pipe index for {org}/{sup}/{staging_name}"
+                            ),
+                        )
+                        RK.pipe_doc(org, sup, staging_name, name)
+                    except (TypeError, ValueError, UnicodeDecodeError) as exc:
+                        raise RuntimeError(
+                            f"Corrupt pipe index for "
+                            f"{org}/{sup}/{staging_name}"
+                        ) from exc
+                    if self.get_pipe_meta(
+                        org, sup, staging_name, name,
+                    ) is None:
+                        raise RuntimeError(
+                            f"Pipe index references missing metadata for "
+                            f"{org}/{sup}/{staging_name}/{name}"
+                        )
+                    decoded.add(name)
+                return sorted(decoded)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] list_pipes smembers error: {e}")
             raise
 
         # Fallback: scan pipe definition keys.
         pattern = RK.pipe_pattern(org, sup, staging_name)
+        prefix = pattern[:-1]
         seen = set()
         cursor = 0
+        seen_cursors = set()
+        scan_calls = 0
+        try:
+            batch_size = max(1, min(int(count), 1000))
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("pipe scan count must be an integer") from exc
         try:
             while True:
-                cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=max(1, int(count)))
+                cursor, keys = self.r.scan(
+                    cursor=cursor,
+                    match=pattern,
+                    count=batch_size,
+                )
+                cursor = int(cursor)
+                scan_calls += 1
+                if scan_calls > 4096 or (
+                    cursor and cursor in seen_cursors
+                ):
+                    raise RuntimeError(
+                        f"Pipe index scan is unstable for "
+                        f"{org}/{sup}/{staging_name}"
+                    )
+                if cursor:
+                    seen_cursors.add(cursor)
                 for k in keys or []:
                     kk = k if isinstance(k, str) else k.decode("utf-8")
-                    if kk.endswith(":meta"):
-                        continue
-                    name = kk.rsplit(":pipe:", 1)[-1]
-                    if name:
-                        seen.add(name)
+                    if not kk.startswith(prefix):
+                        raise RuntimeError(
+                            f"Pipe index is corrupt for "
+                            f"{org}/{sup}/{staging_name}"
+                        )
+                    name = kk[len(prefix):]
+                    try:
+                        canonical_key = RK.pipe_doc(
+                            org, sup, staging_name, name,
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError(
+                            f"Pipe index is corrupt for "
+                            f"{org}/{sup}/{staging_name}"
+                        ) from exc
+                    if canonical_key != kk:
+                        raise RuntimeError(
+                            f"Pipe index is corrupt for "
+                            f"{org}/{sup}/{staging_name}"
+                        )
+                    seen.add(name)
+                    if len(seen) > limit:
+                        raise RuntimeError(
+                            f"Pipe index exceeds its safety limit for "
+                            f"{org}/{sup}/{staging_name}"
+                        )
                 if cursor == 0:
                     break
         except redis.RedisError as e:

@@ -1097,7 +1097,19 @@ class DataWriter:
         # --- 3. Empty frame --------------------------------------
         return polars.DataFrame()
 
-    def write(self, role_name, simple_name, data, overwrite_columns, compression_level=1, newer_than=None, delete_only=False, lineage=None):
+    def write(
+        self,
+        role_name,
+        simple_name,
+        data,
+        overwrite_columns,
+        compression_level=1,
+        newer_than=None,
+        delete_only=False,
+        lineage=None,
+        authorization_callback=None,
+        reconciliation_callback=None,
+    ):
         """
         Writes an Arrow table into the target SimpleTable with overlap handling.
 
@@ -1121,6 +1133,20 @@ class DataWriter:
                     source_files    — list of upstream file paths/URIs
                     schema_version  — version tag of the incoming schema
                     tags            — free-form dict for filtering/grouping
+
+            authorization_callback: Optional zero-argument callback returning
+                the currently authorized role name. It is invoked before
+                admission, after the table lock is acquired, and immediately
+                before the fenced catalog publication. A caller that binds
+                authentication, membership and policy state should fail closed
+                from this callback when any of them changes.
+
+            reconciliation_callback: Optional zero-argument callback for an
+                idempotent durable caller to prove that its exact write was
+                already published. It is invoked once before admission and
+                again after the exact table lock/state is pinned. The callback
+                may raise a caller-owned reconciliation signal; DataWriter
+                releases any acquired locks and performs no new publication.
 
         Raises:
             MirrorPublicationError: the authoritative core snapshot committed,
@@ -1154,10 +1180,23 @@ class DataWriter:
         monitoring_error: MonitoringDurabilityError | None = None
         durability_batch = None
 
+        def current_authorized_role() -> str:
+            value = (
+                authorization_callback()
+                if authorization_callback is not None else role_name
+            )
+            if not isinstance(value, str) or not value.strip():
+                raise PermissionError("Write authorization is unavailable")
+            return value.strip()
+
         try:
             logger.debug(lp(f"➡️ Starting write(overwrite_cols={overwrite_columns}, compression={compression_level}, newer_than={newer_than}, delete_only={delete_only})"))
 
+            if reconciliation_callback is not None:
+                reconciliation_callback()
+
             # --- Access control ------------------------------------------------
+            role_name = current_authorized_role()
             policy_columns = list(getattr(data, "column_names", ()) or ())
             if isinstance(overwrite_columns, (list, tuple)):
                 policy_columns.extend(overwrite_columns)
@@ -1326,6 +1365,19 @@ class DataWriter:
                     self.super_table.super_name,
                     simple_name,
                 )
+
+            # Queueing and lock acquisition are authorization boundaries, not
+            # authority grants. Re-resolve the caller after the exact target
+            # state is pinned under the table lease, then check the permission
+            # matching that pinned create-vs-update semantic.
+            if reconciliation_callback is not None:
+                reconciliation_callback()
+            role_name = current_authorized_role()
+            access_args["role_name"] = role_name
+            if locked_target_exists:
+                check_write_access(**access_args)
+            else:
+                check_create_access(**access_args)
 
             # Pin the create-vs-update authorization decision at the table
             # lease boundary.  A concurrent creator can publish the leaf after
@@ -2770,6 +2822,16 @@ class DataWriter:
                     # immutable file and its deduplicated directory ancestry is
                     # durable. A barrier failure aborts before Redis is touched.
                     durability_batch.barrier()
+                # Immutable objects may have taken minutes to prepare. The
+                # authoritative leaf is still unchanged, so this is the last
+                # reversible point: refresh identity/RBAC and re-check the
+                # permission pinned when the table lease was acquired.
+                role_name = current_authorized_role()
+                access_args["role_name"] = role_name
+                if locked_target_exists:
+                    check_write_access(**access_args)
+                else:
+                    check_create_access(**access_args)
                 with profiler.span("redis.set_leaf"):
                     self._publish_snapshot(
                         simple_table=simple_table,

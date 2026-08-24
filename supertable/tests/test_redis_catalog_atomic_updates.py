@@ -12,7 +12,7 @@ import redis
 
 from supertable import redis_keys as RK
 from supertable.data_writer import DataWriter
-from supertable.errors import SnapshotCommitConflictError
+from supertable.errors import LockLostError, SnapshotCommitConflictError
 from supertable.redis_catalog import (
     DeletionIntentConflictError,
     ReadOnlyCatalogError,
@@ -618,6 +618,33 @@ def test_root_flag_update_cas_compares_exact_prevalidated_document(monkeypatch):
     }
 
 
+def test_root_flag_update_can_require_exact_namespace_lease():
+    catalog, client = _catalog()
+    _seed_root(client)
+    root_key = RK.meta_root("acme", "lake")
+    lock_key = RK.lock_namespace("acme", "lake")
+    client.set(lock_key, "current-owner")
+
+    assert catalog.update_root_flags(
+        "acme",
+        "lake",
+        {"read_only": True},
+        namespace_token="current-owner",
+    )
+    before = client.get(root_key)
+
+    client.set(lock_key, "replacement-owner")
+    with pytest.raises(LockLostError, match="Lost namespace lock"):
+        catalog.update_root_flags(
+            "acme",
+            "lake",
+            {"read_only": False},
+            namespace_token="current-owner",
+        )
+
+    assert client.get(root_key) == before
+
+
 @pytest.mark.parametrize(
     "flags",
     [
@@ -995,19 +1022,38 @@ def test_share_mutations_preflight_types_and_use_explicit_cas():
     assert catalog.get_share("acme", "daily")["v"] == 2
 
 
+def test_conditional_share_delete_cannot_remove_a_replaced_authority():
+    catalog, _client = _catalog()
+    catalog.create_share("acme", "daily", {"id": "daily", "v": 1})
+    authorized = catalog.get_share("acme", "daily")
+    assert authorized == {"id": "daily", "v": 1}
+
+    assert catalog.update_share(
+        "acme", "daily", {"id": "daily", "v": 2},
+    ) is True
+    with pytest.raises(RuntimeError, match="changed during deletion"):
+        catalog.delete_share_if_unchanged("acme", "daily", authorized)
+    assert catalog.get_share("acme", "daily") == {"id": "daily", "v": 2}
+
+    current = catalog.get_share("acme", "daily")
+    assert catalog.delete_share_if_unchanged(
+        "acme", "daily", current,
+    ) is True
+    assert catalog.get_share("acme", "daily") is None
+
+
 def test_control_plane_reads_never_turn_transport_or_corruption_into_empty(monkeypatch):
     catalog, client = _catalog()
 
+    # All control-plane sets are read via bounded SCARD+SSCAN rather than
+    # attacker-sized SMEMBERS materialization.
     with patch.object(
-        client, "smembers", side_effect=redis.TimeoutError("index timeout"),
+        client, "scard", side_effect=redis.TimeoutError("index timeout"),
     ):
         with pytest.raises(redis.TimeoutError, match="index timeout"):
             catalog.list_stagings("acme", "lake")
         with pytest.raises(redis.TimeoutError, match="index timeout"):
             catalog.list_pipes("acme", "lake", "uploads")
-    with patch.object(
-        client, "scard", side_effect=redis.TimeoutError("index timeout"),
-    ):
         with pytest.raises(redis.TimeoutError, match="index timeout"):
             catalog.list_shares("acme")
         with pytest.raises(redis.TimeoutError, match="index timeout"):

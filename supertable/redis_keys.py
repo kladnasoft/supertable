@@ -28,6 +28,8 @@ Hierarchy (v2)
       {org}:                                        ← organization scope
         system:                                   ← system sentinel
           auth:tokens                                HASH    org login tokens
+          auth:sessions:
+            doc:{user_id}                           STRING  current browser generation (TTL)
           audit:
             stream                                   STREAM  audit events
             chain_head:doc:{instance_id}             HASH    per-instance chain state
@@ -375,6 +377,14 @@ def system_scope_pattern(org: str) -> str:
 def auth_tokens(org: str) -> str:
     """Org-level login tokens (HASH)."""
     return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:auth:tokens"
+
+
+def auth_session(org: str, user_id: str) -> str:
+    """Current browser-session generation for one org user (STRING + TTL)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}"
+        f":auth:sessions:doc:{_safe('user_id', user_id)}"
+    )
 
 
 # --- Org-level audit ------------------------------------------------------- #

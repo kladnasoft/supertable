@@ -242,7 +242,9 @@ def test_staging_uses_create_write_and_control_gates_and_lists_fenced_file(
             arrow_table=pa.table({"id": [1]}),
             base_file_name="first.parquet",
         )
-        create_access.assert_called_once()
+        # Admission is revalidated after the stage lock, after the object
+        # write, and immediately before catalog publication.
+        assert create_access.call_count >= 2
         write_access.assert_not_called()
         assert stage.list_files("operator") == [first]
         assert storage.read_json(stage.files_index_path) == []
@@ -252,11 +254,12 @@ def test_staging_uses_create_write_and_control_gates_and_lists_fenced_file(
             arrow_table=pa.table({"id": [2]}),
             base_file_name="second.parquet",
         )
-        write_access.assert_called_once()
+        assert write_access.call_count >= 2
         assert len(stage.list_files("operator")) == 2
 
         stage.delete("operator")
-        control_access.assert_called_once()
+        # Deletion revalidates CONTROL after acquiring the fenced stage lock.
+        assert control_access.call_count >= 2
 
 
 def test_stale_staging_file_index_update_is_rejected_without_overwrite():
@@ -531,7 +534,9 @@ def test_failed_first_parquet_write_does_not_publish_stage_or_change_auth(tmp_pa
     assert saved in catalog.get_staging_meta(
         "acme", "lake", "uploads",
     )["files"]
-    assert create_access.call_count == 2
+    # Both the failed attempt and retry perform fresh authorization checks;
+    # the retry also revalidates immediately before publication.
+    assert create_access.call_count >= 4
     write_access.assert_not_called()
 
 

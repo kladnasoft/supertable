@@ -5,7 +5,12 @@ import json
 import fakeredis
 import pytest
 
-from supertable.quality.config import BUILTIN_CHECKS, DQConfig, DQConfigReadError
+from supertable.quality.config import (
+    BUILTIN_CHECKS,
+    DQConfig,
+    DQConfigConflictError,
+    DQConfigReadError,
+)
 from supertable import redis_keys as RK
 
 
@@ -453,6 +458,22 @@ def test_update_rule_concurrent_delete_never_recreates_document():
     assert not redis_client.sismember(index_key, "delete_race")
 
 
+def test_update_rule_rejects_stale_authorized_document_fingerprint():
+    _, config = _config()
+    original = config.create_rule(_valid_rule("stale-update"))
+    expected = config.rule_fingerprint(original)
+    changed = config.update_rule("stale-update", {"threshold": 7})
+
+    with pytest.raises(DQConfigConflictError, match="changed before update"):
+        config.update_rule(
+            "stale-update",
+            {"threshold": 999},
+            expected_fingerprint=expected,
+        )
+
+    assert config.get_rule("stale-update") == changed
+
+
 def test_update_rule_rejects_orphaned_document_and_dangling_index():
     redis_client, config = _config()
     config.create_rule(_valid_rule("orphan"))
@@ -741,6 +762,24 @@ def test_delete_rule_wrong_type_index_cannot_partially_delete_document():
     assert not config.delete_rule(document["rule_id"])
     assert redis_client.get(document_key) == encoded
     assert redis_client.get(index_key) == "corrupt-not-a-set"
+
+
+def test_delete_rule_rejects_stale_authorized_document_fingerprint():
+    redis_client, config = _config()
+    original = config.create_rule(_valid_rule("stale-delete"))
+    expected = config.rule_fingerprint(original)
+    changed = config.update_rule("stale-delete", {"threshold": 7})
+
+    with pytest.raises(DQConfigConflictError, match="changed before delete"):
+        config.delete_rule(
+            "stale-delete",
+            expected_fingerprint=expected,
+        )
+
+    assert config.get_rule("stale-delete") == changed
+    assert redis_client.sismember(
+        config._key("rules", "index"), "stale-delete",
+    )
 
 
 def test_create_rule_wrong_type_index_cannot_leave_orphan_document():

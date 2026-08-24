@@ -21,7 +21,9 @@ Compliance: DORA Art. 10 (detection), SOC 2 CC6.1 (access logging).
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import re
 import time
 from typing import Optional
 
@@ -30,6 +32,8 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 logger = logging.getLogger(__name__)
+
+_SAFE_ERROR_TYPE_RE = re.compile(r"[^A-Za-z0-9_.-]")
 
 # Paths excluded from audit logging (health probes are noise)
 _EXCLUDED_PATHS = frozenset({
@@ -54,8 +58,10 @@ def _extract_org(request: Request) -> str:
 
     Tries multiple sources in priority order:
     1. request.state (set by session/auth middleware)
-    2. Query parameter
-    3. Global default from settings
+    2. Global deployment default from settings
+
+    Query parameters are intentionally excluded: unauthenticated callers must
+    not be able to select an audit tenant or initialize arbitrary tenant sinks.
     """
     state = getattr(request, "state", None)
     if state:
@@ -63,15 +69,40 @@ def _extract_org(request: Request) -> str:
         if org:
             return str(org)
 
-    org = request.query_params.get("organization") or request.query_params.get("org")
-    if org:
-        return str(org).strip()
-
     try:
         from supertable.config.settings import settings
         return settings.SUPERTABLE_ORGANIZATION or ""
     except Exception:
         return ""
+
+
+def _safe_error_type(value: str) -> str:
+    """Return a bounded diagnostic class name without exception text."""
+    normalized = _SAFE_ERROR_TYPE_RE.sub("_", str(value or "ServerError"))[:128]
+    return normalized or "ServerError"
+
+
+def _error_reference(
+    request: Request,
+    status: int,
+    error_type: str,
+    start_ms: int,
+) -> str:
+    """Build a non-secret reference for correlating an error audit event."""
+    correlation_id = str(
+        getattr(getattr(request, "state", None), "correlation_id", "") or ""
+    )
+    material = "\x1f".join(
+        (
+            correlation_id,
+            request.method,
+            request.url.path,
+            str(status),
+            error_type,
+            str(start_ms),
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
 class AuditMiddleware(BaseHTTPMiddleware):
@@ -100,8 +131,9 @@ class AuditMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
         except Exception as exc:
-            # Unhandled exception — log as critical
-            self._emit_error_event(request, 500, str(exc), start_ms)
+            # Exception messages may contain credentials, SQL, or user data.  Keep
+            # only the bounded class name and a non-secret correlation reference.
+            self._emit_error_event(request, 500, type(exc).__name__, start_ms)
             raise
 
         status = response.status_code if response else 500
@@ -111,27 +143,10 @@ class AuditMiddleware(BaseHTTPMiddleware):
         elif status == 403:
             self._emit_authz_event(request, status, start_ms)
         elif status >= 500:
-            # Try to extract error detail from the response body
-            error_msg = ""
-            try:
-                body_chunks = []
-                async for chunk in response.body_iterator:
-                    body_chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode("utf-8"))
-                body_bytes = b"".join(body_chunks)
-                import json as _json
-                try:
-                    body_json = _json.loads(body_bytes)
-                    error_msg = str(body_json.get("detail", ""))[:500]
-                except (ValueError, AttributeError):
-                    error_msg = body_bytes[:500].decode("utf-8", errors="replace")
-
-                # Rebuild the response body iterator so the client still receives it
-                async def _replay():
-                    yield body_bytes
-                response.body_iterator = _replay()
-            except Exception:
-                pass
-            self._emit_error_event(request, status, error_msg, start_ms)
+            # Never inspect or buffer the response body here.  Besides leaking
+            # response details into the audit sink, doing so defeats streaming and
+            # creates an unbounded memory amplification path for large responses.
+            self._emit_error_event(request, status, "HTTPServerError", start_ms)
 
         return response
 
@@ -163,8 +178,11 @@ class AuditMiddleware(BaseHTTPMiddleware):
                 severity=Severity.WARNING,
                 server=self._server,
             )
-        except Exception as e:
-            logger.debug("[audit-middleware] auth event emit failed: %s", e)
+        except Exception as exc:
+            logger.debug(
+                "[audit-middleware] auth event emit failed: %s",
+                type(exc).__name__,
+            )
 
     def _emit_authz_event(self, request: Request, status: int, start_ms: int) -> None:
         """Emit authorization denial event."""
@@ -196,10 +214,13 @@ class AuditMiddleware(BaseHTTPMiddleware):
                 severity=Severity.WARNING,
                 server=self._server,
             )
-        except Exception as e:
-            logger.debug("[audit-middleware] authz event emit failed: %s", e)
+        except Exception as exc:
+            logger.debug(
+                "[audit-middleware] authz event emit failed: %s",
+                type(exc).__name__,
+            )
 
-    def _emit_error_event(self, request: Request, status: int, error_msg: str, start_ms: int) -> None:
+    def _emit_error_event(self, request: Request, status: int, error_type: str, start_ms: int) -> None:
         """Emit server error event."""
         try:
             from supertable.audit import emit, EventCategory, Actions, Severity, Outcome, make_detail
@@ -209,6 +230,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
                 return
 
             duration_ms = int(time.time() * 1000) - start_ms
+            safe_error_type = _safe_error_type(error_type)
 
             emit(
                 category=EventCategory.SYSTEM,
@@ -224,7 +246,13 @@ class AuditMiddleware(BaseHTTPMiddleware):
                     method=request.method,
                     path=request.url.path,
                     status=status,
-                    error=error_msg[:500] if error_msg else "",
+                    error_type=safe_error_type,
+                    error_ref=_error_reference(
+                        request,
+                        status,
+                        safe_error_type,
+                        start_ms,
+                    ),
                     duration_ms=duration_ms,
                 ),
                 outcome=Outcome.FAILURE,
@@ -232,5 +260,8 @@ class AuditMiddleware(BaseHTTPMiddleware):
                 severity=Severity.CRITICAL,
                 server=self._server,
             )
-        except Exception as e:
-            logger.debug("[audit-middleware] error event emit failed: %s", e)
+        except Exception as exc:
+            logger.debug(
+                "[audit-middleware] error event emit failed: %s",
+                type(exc).__name__,
+            )

@@ -19,6 +19,8 @@ The prefix is centralised in ``supertable.redis_keys.quality_prefix``.
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import math
 import time
@@ -36,6 +38,10 @@ logger = logging.getLogger(__name__)
 
 class DQConfigReadError(RuntimeError):
     """Persisted DQ state could not be read with execution-safe certainty."""
+
+
+class DQConfigConflictError(RuntimeError):
+    """A quality-rule mutation was based on a stale authoritative document."""
 
 
 _MISSING = object()
@@ -639,6 +645,23 @@ class DQConfig:
             label=f"quality rule {rule_id!r}",
         )
 
+    @staticmethod
+    def rule_fingerprint(rule: Dict[str, Any]) -> str:
+        """Return a deterministic fingerprint for compare-and-set mutations."""
+        if not isinstance(rule, dict):
+            raise ValueError("quality rule fingerprint input must be an object")
+        try:
+            payload = json.dumps(
+                rule,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise ValueError("quality rule cannot be fingerprinted") from exc
+        return hashlib.sha256(payload).hexdigest()
+
     def create_rule(self, rule: Dict[str, Any], created_by: str = "") -> Dict[str, Any]:
         if not isinstance(rule, dict):
             raise ValueError("quality rule must be an object")
@@ -750,7 +773,13 @@ class DQConfig:
             raise RuntimeError(f"could not persist quality rule {rule_id!r}")
         return candidate
 
-    def update_rule(self, rule_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def update_rule(
+        self,
+        rule_id: str,
+        updates: Dict[str, Any],
+        *,
+        expected_fingerprint: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         if not isinstance(updates, dict):
             raise ValueError("quality rule updates must be an object")
         requested_updates = deepcopy(updates)
@@ -797,6 +826,14 @@ class DQConfig:
                         raise DQConfigReadError(
                             f"persisted quality rule {rule_id!r} has the wrong shape"
                         )
+                    if expected_fingerprint is not None:
+                        actual_fingerprint = self.rule_fingerprint(existing)
+                        if not hmac.compare_digest(
+                            actual_fingerprint, str(expected_fingerprint),
+                        ):
+                            raise DQConfigConflictError(
+                                f"quality rule {rule_id!r} changed before update"
+                            )
 
                     candidate = deepcopy(existing)
                     candidate.update(deepcopy(requested_updates))
@@ -857,7 +894,7 @@ class DQConfig:
                     # Re-read both authorities. A completed concurrent delete
                     # becomes a normal absent result on the next iteration.
                     continue
-        except (DQConfigReadError, ValueError):
+        except (DQConfigConflictError, DQConfigReadError, ValueError):
             raise
         except Exception as e:
             logger.error(f"[dq-config] update_rule error: {e}")
@@ -886,7 +923,12 @@ class DQConfig:
             )
         return candidate
 
-    def delete_rule(self, rule_id: str) -> bool:
+    def delete_rule(
+        self,
+        rule_id: str,
+        *,
+        expected_fingerprint: Optional[str] = None,
+    ) -> bool:
         pipe = None
         try:
             document_key = self._key("rules", "doc", rule_id)
@@ -916,6 +958,36 @@ class DQConfig:
                         raise DQConfigReadError(
                             "quality rule index has the wrong Redis type"
                         )
+                    raw = pipe.get(document_key)
+                    indexed = bool(pipe.sismember(index_key, rule_id))
+                    if raw is None:
+                        if indexed:
+                            raise DQConfigReadError(
+                                f"indexed quality rule {rule_id!r} is missing"
+                            )
+                        return False
+                    if not indexed:
+                        raise DQConfigReadError(
+                            f"quality rule {rule_id!r} is not indexed"
+                        )
+                    if expected_fingerprint is not None:
+                        try:
+                            existing = json.loads(raw)
+                        except (TypeError, ValueError, UnicodeError) as exc:
+                            raise DQConfigReadError(
+                                f"persisted quality rule {rule_id!r} is malformed"
+                            ) from exc
+                        if not isinstance(existing, dict):
+                            raise DQConfigReadError(
+                                f"persisted quality rule {rule_id!r} has the wrong shape"
+                            )
+                        actual_fingerprint = self.rule_fingerprint(existing)
+                        if not hmac.compare_digest(
+                            actual_fingerprint, str(expected_fingerprint),
+                        ):
+                            raise DQConfigConflictError(
+                                f"quality rule {rule_id!r} changed before delete"
+                            )
                     pipe.multi()
                     pipe.delete(document_key)
                     pipe.srem(index_key, rule_id)
@@ -923,6 +995,8 @@ class DQConfig:
                     break
                 except redis.WatchError:
                     continue
+        except DQConfigConflictError:
+            raise
         except Exception as e:
             logger.error(f"[dq-config] delete_rule error: {e}")
             return False
@@ -938,7 +1012,7 @@ class DQConfig:
             and all(
                 isinstance(result, int)
                 and not isinstance(result, bool)
-                and result >= 0
+                and result == 1
                 for result in results
             )
         )

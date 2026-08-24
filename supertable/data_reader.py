@@ -1279,6 +1279,11 @@ class DataReader:
                 estimator_kwargs["aggregate_children"] = aggregate_children
             estimator = DataEstimator(**estimator_kwargs)
             reflection = estimator.estimate()
+            # Retain the data-free, snapshot-pinned estimate for public
+            # preflight callers. It contains executor paths internally, so the
+            # public helper below allowlists aggregate fields rather than
+            # returning this object itself.
+            self.last_reflection = reflection
             _ensure_request_active(_deadline_monotonic, _cancel_event)
 
             logger.info(self._lp(f"[estimate] storage={reflection.storage_type} | files={reflection.total_reflections} | bytes={reflection.reflection_bytes}"))
@@ -2609,6 +2614,112 @@ def query_sql_policy_fingerprint(
     if fingerprint is None:
         raise PermissionError("Effective read policy fingerprint is unavailable")
     return fingerprint
+
+
+def estimate_query_sql(
+    organization: str,
+    super_name: str,
+    sql: str,
+    engine: Any,
+    role_name: str,
+    *,
+    timeout_sec: float,
+    source: str = "sdk",
+    cancel_event: Optional[threading.Event] = None,
+    expected_role_policy_fingerprint: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a data-free, RBAC-aware query estimate without execution.
+
+    Parser validation, table existence, RBAC, linked-share policy, immutable
+    snapshot pinning, statistics seals, and pruning all run through the same
+    path as execution. Only aggregate counts/bytes and completeness flags are
+    exposed; storage paths, SQL text, predicates, credentials, and row values
+    are never returned.
+    """
+    request_deadline = _caller_deadline(timeout_sec)
+    assert request_deadline is not None
+    expected_role_policy_fingerprint = validate_policy_fingerprint(
+        expected_role_policy_fingerprint,
+        label="expected_role_policy_fingerprint",
+    )
+    _validate_query_text_size(sql)
+    _ensure_request_active(request_deadline, cancel_event)
+    try:
+        command = classify_query(sql, super_name)
+    except ValueError as exc:
+        raise ValueError("estimate query must be one valid SELECT statement") from exc
+    if command.kind is not CommandKind.SELECT:
+        raise ValueError("estimate query must be a SELECT statement")
+    reader = DataReader(
+        organization=organization,
+        super_name=super_name,
+        query=command.sql,
+        source=source,
+    )
+    _result, status, message = reader.execute(
+        role_name=role_name,
+        engine=engine,
+        with_scan=False,
+        _deadline_monotonic=request_deadline,
+        _cancel_event=cancel_event,
+        expected_role_policy_fingerprint=expected_role_policy_fingerprint,
+        _policy_fingerprint_only=True,
+    )
+    if status is Status.ERROR:
+        raise RuntimeError(f"Query estimate failed: {message}")
+    reflection = getattr(reader, "last_reflection", None)
+    if reflection is None:
+        raise RuntimeError("Query estimate did not produce a reflection")
+    supers = list(getattr(reflection, "supers", ()) or ())
+    candidate_rows_complete = bool(supers) and all(
+        bool(getattr(item, "candidate_rows_complete", False)) for item in supers
+    )
+    candidate_rows = sum(
+        max(0, int(getattr(item, "candidate_rows", 0) or 0)) for item in supers
+    )
+    candidate_row_groups_complete = bool(supers) and all(
+        bool(getattr(item, "candidate_row_groups_complete", False))
+        for item in supers
+    )
+    candidate_row_groups = sum(
+        max(0, int(getattr(item, "candidate_row_groups", 0) or 0))
+        for item in supers
+    )
+    qpm = getattr(reader, "query_plan_manager", None)
+    return {
+        "version": 1,
+        "requested_engine": _engine_name(engine),
+        "recommended_request_engine": "auto",
+        "storage_type": str(getattr(reflection, "storage_type", "") or "")[:32],
+        "table_count": len(supers),
+        "file_count": max(0, int(getattr(reflection, "total_reflections", 0) or 0)),
+        "estimated_scan_bytes": max(
+            0, int(getattr(reflection, "reflection_bytes", 0) or 0)
+        ),
+        "source_bytes": max(0, int(getattr(reflection, "source_bytes", 0) or 0)),
+        "source_bytes_complete": bool(
+            getattr(reflection, "source_bytes_complete", False)
+        ),
+        "row_group_scan_bytes": max(
+            0, int(getattr(reflection, "row_group_scan_bytes", 0) or 0)
+        ),
+        "row_group_scan_bytes_complete": bool(
+            getattr(reflection, "row_group_scan_bytes_complete", False)
+        ),
+        "decoded_bytes": max(0, int(getattr(reflection, "decoded_bytes", 0) or 0)),
+        "decoded_bytes_complete": bool(
+            getattr(reflection, "decoded_bytes_complete", False)
+        ),
+        "candidate_rows": candidate_rows,
+        "candidate_rows_complete": candidate_rows_complete,
+        "candidate_row_groups": candidate_row_groups,
+        "candidate_row_groups_complete": candidate_row_groups_complete,
+        "has_active_tombstone": bool(
+            getattr(reflection, "tombstone_views", {})
+        ),
+        "query_id": str(getattr(qpm, "query_id", "") or "")[:128],
+        "query_hash": str(getattr(qpm, "query_hash", "") or "")[:128],
+    }
 
 
 def query_sql_stream(

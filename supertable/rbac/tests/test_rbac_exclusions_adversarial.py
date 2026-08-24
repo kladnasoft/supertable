@@ -1086,6 +1086,7 @@ def test_superadmin_can_delete_super_table_namespace(monkeypatch):
     table.catalog.begin_namespace_deletion.return_value = {
         "intent_id": "delete-intent",
     }
+    table.catalog.find_clones_strict.return_value = []
     table.catalog.scan_leaf_keys.return_value = iter(())
 
     assert table.delete(ROLE) == "delete-intent"

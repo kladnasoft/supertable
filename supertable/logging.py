@@ -386,7 +386,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                     "status": 500,
                     "duration_ms": duration_ms,
                     "client_ip": _client_ip(request),
-                    "error": str(exc),
+                    "error": type(exc).__name__,
                     "proxied": proxied,
                 },
             )

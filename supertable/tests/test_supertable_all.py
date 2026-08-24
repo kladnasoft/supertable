@@ -803,7 +803,9 @@ class TestSimpleTableDelete:
         st = SimpleTable(mock_super, "del_table")
         assert st.delete(role_name="test_role") == "delete-intent"
 
-        mock_access.assert_called_once()
+        # Admission, exact-lock state and pre-publication are independent
+        # authorization boundaries.
+        assert mock_access.call_count == 3
         assert mock_super.storage.delete_prefix.call_args_list == [
             call("org/super/tables/del_table"),
             call("org/super/delta/del_table"),
@@ -1001,6 +1003,7 @@ class TestSuperTableDelete:
             "intent_id": "delete-intent",
         }
         mock_catalog.scan_leaf_keys.return_value = []
+        mock_catalog.find_clones_strict.return_value = []
         mock_catalog_cls.return_value = mock_catalog
 
         st = SuperTable("s", "o")
@@ -1036,6 +1039,7 @@ class TestSuperTableDelete:
             "intent_id": "delete-intent",
         }
         mock_catalog.scan_leaf_keys.return_value = []
+        mock_catalog.find_clones_strict.return_value = []
         mock_catalog_cls.return_value = mock_catalog
 
         st = SuperTable("s", "o")
@@ -1065,6 +1069,7 @@ class TestSuperTableDelete:
             "intent_id": "delete-intent",
         }
         mock_catalog.scan_leaf_keys.return_value = []
+        mock_catalog.find_clones_strict.return_value = []
         mock_catalog_cls.return_value = mock_catalog
 
         st = SuperTable("s", "o")
@@ -1273,7 +1278,9 @@ class TestDataWriterWrite:
 
         # (total_columns=2 logical, total_rows=3, inserted=3, deleted=0)
         assert result == (2, 3, 3, 0)
-        mock_access.assert_called_once()
+        # Admission, exact-lock state and pre-publication are independent
+        # authorization boundaries.
+        assert mock_access.call_count == 3
         mock_catalog.acquire_simple_lock.assert_called_once()
         mock_catalog.release_simple_lock.assert_called_once()
         mock_catalog.commit_snapshot_mock.assert_called_once()

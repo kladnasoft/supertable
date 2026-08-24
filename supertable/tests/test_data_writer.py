@@ -487,10 +487,11 @@ class TestWriteHappyPath:
         # --- Assert ---
         assert result == (2, 2, 2, 0)  # (total_columns, total_rows, inserted, deleted)
 
-        mock_check_write.assert_called_once_with(
+        expected_access = call(
             super_name="s1", organization="o1",
             role_name="admin", table_name="my_tbl", columns=["id", "val"],
         )
+        assert mock_check_write.call_args_list == [expected_access] * 3
         mock_cat.acquire_simple_lock.assert_called_once()
         mock_cat.release_simple_lock.assert_called_once()
         mock_cat.set_leaf_payload_cas.assert_called_once()
@@ -1313,13 +1314,14 @@ class TestWriteAccessControl:
         dw = DataWriter("my_s", "my_o")
         dw.write("writer_role", "target_tbl", _arrow_table({"id": [1]}), ["id"])
 
-        mock_check_write.assert_called_once_with(
+        expected_access = call(
             super_name="my_s",
             organization="my_o",
             role_name="writer_role",
             table_name="target_tbl",
             columns=["id"],
         )
+        assert mock_check_write.call_args_list == [expected_access] * 3
 
 
 # ====================================================================

@@ -1,5 +1,8 @@
+import json
+import os
+import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from supertable.config.defaults import logger
 from supertable.redis_catalog import RedisCatalog
@@ -7,6 +10,49 @@ from supertable.rbac.access_control import check_write_access, check_meta_access
 
 
 _GENERIC_PIPE_DENIAL = "Pipe is unavailable under the effective access policy."
+_SAFE_SEGMENT_RE = re.compile(
+    r"^(__[a-z0-9][a-z0-9_-]{0,59}__|[a-z0-9][a-z0-9_-]{0,63})$"
+)
+_MAX_PIPE_COLUMNS = 4096
+_MAX_PIPE_COLUMN_BYTES = 1024
+_MAX_PIPE_USER_HASH_BYTES = 4096
+_MAX_PIPE_DOCUMENT_BYTES = 1024 * 1024
+
+
+def _safe_segment(value: Any, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or value in {"", ".", ".."}
+        or os.path.isabs(value)
+        or _SAFE_SEGMENT_RE.fullmatch(value) is None
+    ):
+        raise ValueError(f"Invalid {label}")
+    return value
+
+
+def _bounded_pipe_columns(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > _MAX_PIPE_COLUMNS:
+        raise ValueError("Pipe overwrite column fan-out is invalid")
+    result: List[str] = []
+    seen = set()
+    for column in value:
+        if (
+            not isinstance(column, str)
+            or not column
+            or column != column.strip()
+            or "\x00" in column
+            or len(column.encode("utf-8")) > _MAX_PIPE_COLUMN_BYTES
+        ):
+            raise ValueError("Pipe overwrite column is invalid")
+        folded = column.casefold()
+        if folded in seen:
+            raise ValueError("Pipe overwrite columns contain a duplicate")
+        seen.add(folded)
+        result.append(column)
+    return result
 
 
 class SuperPipe:
@@ -18,9 +64,9 @@ class SuperPipe:
     """
 
     def __init__(self, *, organization: str, super_name: str, staging_name: str):
-        self.organization = organization
-        self.super_name = super_name
-        self.staging_name = staging_name
+        self.organization = _safe_segment(organization, label="organization")
+        self.super_name = _safe_segment(super_name, label="super_name")
+        self.staging_name = _safe_segment(staging_name, label="staging_name")
         self.catalog = RedisCatalog()
 
         deletion_guard = getattr(
@@ -58,6 +104,19 @@ class SuperPipe:
                 self.staging_name,
                 token,
             )
+
+    @staticmethod
+    def _fresh_role(
+        role_name: str,
+        authorization_callback: Optional[Callable[[], str]],
+    ) -> str:
+        effective = (
+            authorization_callback()
+            if authorization_callback is not None else role_name
+        )
+        if not isinstance(effective, str) or not effective.strip():
+            raise PermissionError("A current authorized role is required")
+        return effective.strip()
 
     def _check_target_access(
             self, *, role_name: str, target: str, mutation: bool,
@@ -166,13 +225,31 @@ class SuperPipe:
         return meta
 
     def create(self, *, role_name: str, pipe_name: str, simple_name: str, user_hash: str, overwrite_columns: List[str] = None,
-               enabled: bool = True) -> str:
+               enabled: bool = True,
+               authorization_callback: Optional[Callable[[], str]] = None) -> str:
+        pipe_name = _safe_segment(pipe_name, label="pipe_name")
+        simple_name = _safe_segment(simple_name, label="simple_name")
+        if type(enabled) is not bool:
+            raise TypeError("enabled must be a boolean")
+        if (
+            not isinstance(user_hash, str)
+            or not user_hash
+            or user_hash != user_hash.strip()
+            or "\x00" in user_hash
+            or len(user_hash.encode("utf-8")) > _MAX_PIPE_USER_HASH_BYTES
+        ):
+            raise ValueError("Pipe user identity is invalid")
+        requested_overwrite = _bounded_pipe_columns(overwrite_columns)
+
         def _op(lock_token: str):
+            effective_role = self._fresh_role(
+                role_name, authorization_callback,
+            )
             # Authorize the caller-supplied target before inspecting any stored
             # pipe name. Unauthorized creation attempts therefore cannot probe
             # the pipe namespace at all.
             self._check_target_access(
-                role_name=role_name, target=simple_name, mutation=True,
+                role_name=effective_role, target=simple_name, mutation=True,
             )
             try:
                 existing = self.catalog.get_pipe_meta(
@@ -181,7 +258,7 @@ class SuperPipe:
                 )
             except RuntimeError:
                 if self._may_disclose_pipe_state(
-                    role_name=role_name, mutation=True,
+                    role_name=effective_role, mutation=True,
                 ):
                     raise
                 raise PermissionError(_GENERIC_PIPE_DENIAL) from None
@@ -189,7 +266,7 @@ class SuperPipe:
                 existing_target = existing.get("simple_name")
                 if not isinstance(existing_target, str) or not existing_target:
                     if self._may_disclose_pipe_state(
-                        role_name=role_name, mutation=True,
+                        role_name=effective_role, mutation=True,
                     ):
                         raise RuntimeError(
                             f"Pipe '{pipe_name}' has invalid target metadata."
@@ -199,7 +276,7 @@ class SuperPipe:
                 # caller cannot mutate. Pipe creation is create-only; explicit
                 # lifecycle methods are the only supported mutations.
                 self._check_target_access(
-                    role_name=role_name,
+                    role_name=effective_role,
                     target=existing_target,
                     mutation=True,
                 )
@@ -212,11 +289,10 @@ class SuperPipe:
                 )
             except RuntimeError:
                 if self._may_disclose_pipe_state(
-                    role_name=role_name, mutation=True,
+                    role_name=effective_role, mutation=True,
                 ):
                     raise
                 raise PermissionError(_GENERIC_PIPE_DENIAL) from None
-            requested_overwrite = list(overwrite_columns or [])
             for p in existing_pipes:
                 if (
                     p.get("simple_name") == simple_name
@@ -238,9 +314,29 @@ class SuperPipe:
                 "updated_at_ns": time.time_ns(),
                 "enabled": enabled
             }
+            try:
+                document_bytes = len(json.dumps(
+                    definition,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Pipe definition is invalid") from exc
+            if document_bytes > _MAX_PIPE_DOCUMENT_BYTES:
+                raise ValueError("Pipe definition exceeds its size limit")
 
             # 4. Save to Redis only
             try:
+                effective_role = self._fresh_role(
+                    effective_role, authorization_callback,
+                )
+                self._check_target_access(
+                    role_name=effective_role,
+                    target=simple_name,
+                    mutation=True,
+                )
                 self.catalog.upsert_pipe_meta(
                     self.organization,
                     self.super_name,
@@ -260,16 +356,37 @@ class SuperPipe:
 
         return self._with_lock(_op)
 
-    def set_enabled(self, pipe_name: str, enabled: bool, role_name: str) -> None:
+    def set_enabled(
+        self,
+        pipe_name: str,
+        enabled: bool,
+        role_name: str,
+        *,
+        authorization_callback: Optional[Callable[[], str]] = None,
+    ) -> None:
         """Updates the enabled status of a pipe in Redis."""
+        pipe_name = _safe_segment(pipe_name, label="pipe_name")
+        if type(enabled) is not bool:
+            raise TypeError("enabled must be a boolean")
         def _op(lock_token: str):
+            effective_role = self._fresh_role(
+                role_name, authorization_callback,
+            )
             meta = self._load_authorized_pipe(
-                pipe_name=pipe_name, role_name=role_name, mutation=True,
+                pipe_name=pipe_name, role_name=effective_role, mutation=True,
             )
 
             meta["enabled"] = enabled
             meta["updated_at_ns"] = time.time_ns()
 
+            effective_role = self._fresh_role(
+                effective_role, authorization_callback,
+            )
+            self._check_target_access(
+                role_name=effective_role,
+                target=str(meta.get("simple_name") or ""),
+                mutation=True,
+            )
             self.catalog.upsert_pipe_meta(
                 self.organization,
                 self.super_name,
@@ -282,10 +399,29 @@ class SuperPipe:
 
         return self._with_lock(_op)
 
-    def delete(self, pipe_name: str, role_name: str) -> bool:
+    def delete(
+        self,
+        pipe_name: str,
+        role_name: str,
+        *,
+        authorization_callback: Optional[Callable[[], str]] = None,
+    ) -> bool:
+        pipe_name = _safe_segment(pipe_name, label="pipe_name")
+
         def _op(lock_token: str):
+            effective_role = self._fresh_role(
+                role_name, authorization_callback,
+            )
             self._load_authorized_pipe(
-                pipe_name=pipe_name, role_name=role_name, mutation=True,
+                pipe_name=pipe_name, role_name=effective_role, mutation=True,
+            )
+            effective_role = self._fresh_role(
+                effective_role, authorization_callback,
+            )
+            self._load_authorized_pipe(
+                pipe_name=pipe_name,
+                role_name=effective_role,
+                mutation=True,
             )
             return self.catalog.delete_pipe_meta(
                 self.organization,
@@ -298,6 +434,7 @@ class SuperPipe:
         return self._with_lock(_op)
 
     def read(self, pipe_name: str, role_name: str) -> Dict[str, Any]:
+        pipe_name = _safe_segment(pipe_name, label="pipe_name")
         return self._load_authorized_pipe(
             pipe_name=pipe_name, role_name=role_name, mutation=False,
         )

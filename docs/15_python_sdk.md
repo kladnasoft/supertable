@@ -121,7 +121,12 @@ columns, rows, inserted, deleted = dw.write(
 `write()` returns a tuple `(total_columns, total_rows, inserted, deleted)`.
 Optional kwargs: `compression_level=1`, `newer_than=None`, `delete_only=False`,
 `lineage=None` (dict with conventional keys — see the
-`DataWriter.write` docstring).
+`DataWriter.write` docstring). Long-lived service callers can also supply an
+`authorization_callback` that returns the freshly authorized role; it is
+rechecked at admission, under the exact table lock, and just before catalog
+publication. Durable idempotent callers may supply a
+`reconciliation_callback`; it runs before admission and again under that lock
+so a proven prior commit can stop a retry before new immutable data is written.
 
 #### `DataWriter.compact()` — explicit manual compaction
 

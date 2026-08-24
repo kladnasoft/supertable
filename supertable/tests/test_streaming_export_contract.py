@@ -130,6 +130,71 @@ def test_query_sql_uses_configured_batches_deadline_cancel_and_engine_metadata(
     }
 
 
+def test_estimate_query_sql_returns_only_aggregate_snapshot_facts(monkeypatch):
+    reflection = Reflection(
+        storage_type="s3",
+        reflection_bytes=123,
+        total_reflections=2,
+        supers=[
+            SuperSnapshot(
+                "shop", "events", 7,
+                candidate_rows=11,
+                candidate_rows_complete=True,
+                candidate_row_groups=3,
+                candidate_row_groups_complete=True,
+            )
+        ],
+        source_bytes=456,
+        source_bytes_complete=True,
+        row_group_scan_bytes=100,
+        row_group_scan_bytes_complete=True,
+        decoded_bytes=789,
+        decoded_bytes_complete=True,
+        tombstone_views={"events": TombstoneDef()},
+    )
+    reader = MagicMock()
+    reader.execute.return_value = (None, data_reader.Status.OK, None)
+    reader.last_reflection = reflection
+    reader.query_plan_manager = SimpleNamespace(
+        query_id="qid-estimate", query_hash="hash-estimate",
+    )
+    monkeypatch.setattr(data_reader, "DataReader", lambda **_kwargs: reader)
+
+    result = data_reader.estimate_query_sql(
+        organization="org",
+        super_name="shop",
+        sql="SELECT id FROM events",
+        engine=Engine.AUTO,
+        role_name="reader",
+        timeout_sec=5,
+        expected_role_policy_fingerprint="a" * 64,
+    )
+
+    assert result == {
+        "version": 1,
+        "requested_engine": "auto",
+        "recommended_request_engine": "auto",
+        "storage_type": "s3",
+        "table_count": 1,
+        "file_count": 2,
+        "estimated_scan_bytes": 123,
+        "source_bytes": 456,
+        "source_bytes_complete": True,
+        "row_group_scan_bytes": 100,
+        "row_group_scan_bytes_complete": True,
+        "decoded_bytes": 789,
+        "decoded_bytes_complete": True,
+        "candidate_rows": 11,
+        "candidate_rows_complete": True,
+        "candidate_row_groups": 3,
+        "candidate_row_groups_complete": True,
+        "has_active_tombstone": True,
+        "query_id": "qid-estimate",
+        "query_hash": "hash-estimate",
+    }
+    assert reader.execute.call_args.kwargs["_policy_fingerprint_only"] is True
+
+
 def test_query_sql_stream_exceeds_interactive_cap_only_with_explicit_budgets(
     monkeypatch,
 ):

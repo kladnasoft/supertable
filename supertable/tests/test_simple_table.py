@@ -475,12 +475,13 @@ class TestSimpleTableDelete:
 
         obj.delete(role_name="admin")
 
-        mock_check.assert_called_once_with(
+        expected = call(
             super_name="sup",
             organization="org",
             role_name="admin",
             table_name="events",
         )
+        assert mock_check.call_args_list == [expected, expected, expected]
 
     @patch(_P_CHECK_CONTROL)
     def test_rbac_denied_propagates(self, mock_check):

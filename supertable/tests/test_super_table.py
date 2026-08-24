@@ -70,6 +70,7 @@ def _make_super(
     st.catalog.begin_namespace_deletion.return_value = {
         "intent_id": "namespace-delete-intent",
     }
+    st.catalog.find_clones_strict.return_value = []
     st.catalog.scan_leaf_keys.return_value = iter(())
     st.super_dir = f"{organization}/{super_name}/super"
     return st

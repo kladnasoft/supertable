@@ -195,8 +195,16 @@ def emit(
     try:
         audit_logger = get_audit_logger(organization)
         audit_logger.emit(event)
-    except Exception as e:
-        logger.error("[audit] emit failed: %s — event: %s/%s", e, category, action)
+    except Exception as exc:
+        # Audit backends can surface connection strings or record contents in
+        # exception messages.  Keep diagnostics useful without copying those
+        # messages into the application log.
+        logger.error(
+            "[audit] emit failed: %s — event: %s/%s",
+            type(exc).__name__,
+            category,
+            action,
+        )
 
 
 # ---------------------------------------------------------------------------

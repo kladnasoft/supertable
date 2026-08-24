@@ -44,6 +44,8 @@ supertable:                                    ── SuperTable SDK state
     system:                                    ── org-level system namespace
       auth:tokens                              HASH    org login tokens + audit-init marker
       auth:tokens:audit_meta                   HASH    token namespace revision head
+      auth:sessions:
+        doc:{user_id}                          STRING  current HMAC session generation (TTL)
       audit:
         stream                                 STREAM  audit events
         chain_head:doc:{instance_id}           HASH    per-instance chain state

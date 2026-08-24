@@ -218,6 +218,27 @@ class SuperTable:
         stage_tokens: Dict[str, str] = {}
         try:
             if recovery_intent_id is None:
+                clones = self.catalog.find_clones_strict(
+                    self.organization,
+                    self.super_name,
+                    namespace_token=namespace_token,
+                )
+                if (
+                    not isinstance(clones, list)
+                    or len(clones) > 10_000
+                    or any(not isinstance(clone, str) or not clone for clone in clones)
+                ):
+                    raise RuntimeError(
+                        "Catalog returned an invalid dependent-clone result"
+                    )
+                if clones:
+                    preview = ", ".join(clones[:10])
+                    suffix = "" if len(clones) <= 10 else ", ..."
+                    raise PermissionError(
+                        "Cannot delete a SuperTable while clones still depend on "
+                        f"it: {preview}{suffix}"
+                    )
+            if recovery_intent_id is None:
                 intent = self.catalog.begin_namespace_deletion(
                     self.organization,
                     self.super_name,

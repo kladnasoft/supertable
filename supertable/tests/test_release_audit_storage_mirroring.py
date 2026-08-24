@@ -494,6 +494,10 @@ def test_mirror_recovery_requires_complete_leaf_payload(tmp_path, leaf_payload):
 
 def _staging_dependencies():
     storage = MagicMock()
+    storage.size.return_value = 128
+    storage.stat_object.return_value.identity_token.return_value = (
+        "etag:test-staging-object"
+    )
     catalog = MagicMock()
     catalog.root_exists.return_value = True
     catalog.acquire_stage_lock.return_value = "stage-lock-token"
@@ -875,6 +879,7 @@ def test_super_table_prefix_failure_keeps_catalog_metadata():
     lake.catalog.begin_namespace_deletion.return_value = {
         "intent_id": "namespace-delete-intent",
     }
+    lake.catalog.find_clones_strict.return_value = []
     lake.catalog.scan_leaf_keys.return_value = iter(())
     lake.storage.delete_prefix.side_effect = OSError("prefix not empty")
 
@@ -911,6 +916,9 @@ def test_super_table_delete_fences_new_child_before_any_storage_write():
 
         def scan_leaf_keys(self, *_args, **_kwargs):
             return iter(())
+
+        def find_clones_strict(self, *_args, **_kwargs):
+            return []
 
         def scan_leaf_lock_names(self, *_args):
             return []

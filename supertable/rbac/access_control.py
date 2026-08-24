@@ -396,6 +396,45 @@ def check_meta_access(
     )
 
 
+def check_read_access(
+    super_name: str,
+    organization: str,
+    role_name: str,
+    table_name: str,
+    columns: Optional[Iterable[str]] = None,
+    *,
+    require_unfiltered: bool = False,
+) -> None:
+    """Authorize a direct bounded data read without constructing SQL views.
+
+    Most SDK reads use :func:`restrict_read_access` because they need row and
+    column policy views. Control-plane objects such as staging files have no
+    SQL table of their own, but exposing their row values still requires READ,
+    never merely META. Callers must not use this helper to bypass row-filtered
+    policies for an existing physical table.
+    """
+    if type(require_unfiltered) is not bool:
+        raise TypeError("require_unfiltered must be a boolean")
+    _context, entry = _check_operation_access(
+        super_name,
+        organization,
+        role_name,
+        table_name,
+        Permission.READ,
+        "read this table",
+        columns=columns,
+    )
+    if require_unfiltered and (
+        entry.get("columns", ["*"]) != ["*"]
+        or bool(entry.get("exclude_columns"))
+        or entry.get("filters", ["*"]) != ["*"]
+    ):
+        raise PermissionError(
+            f"Scoped table policy for '{table_name}' cannot read an "
+            "unfiltered staging object."
+        )
+
+
 def restrict_read_access(
         super_name: str,
         organization: str,

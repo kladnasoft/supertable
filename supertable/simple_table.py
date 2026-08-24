@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import copy
+import time
+import uuid
 from datetime import datetime
 
 from supertable.config.defaults import logger
@@ -17,7 +20,7 @@ from supertable.utils.snapshot import (
 )
 from supertable.utils.profiler import Profiler, get_null_profiler
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 def _spark_type_from_polars_dtype(dtype: Any) -> str:
@@ -397,6 +400,25 @@ class SimpleTable:
             ],
         ]
         try:
+            # Lock acquisition may queue behind an existing writer.  Re-read
+            # CONTROL after both namespace and leaf fences are held so a role
+            # revoked during that wait cannot begin a deletion.
+            check_control_access(
+                super_name=self.super_table.super_name,
+                organization=self.super_table.organization,
+                role_name=role_name,
+                table_name=self.simple_name,
+            )
+
+            # Keep a distinct pre-publication check immediately before the
+            # durable deletion intent.  No irreversible storage mutation has
+            # happened yet, so denial here remains cleanly fail-closed.
+            check_control_access(
+                super_name=self.super_table.super_name,
+                organization=self.super_table.organization,
+                role_name=role_name,
+                table_name=self.simple_name,
+            )
             if recovery_intent_id is None:
                 intent = self.catalog.begin_simple_deletion(
                     self.super_table.organization,
@@ -556,6 +578,286 @@ class SimpleTable:
 
         data = self.storage.read_json(path)
         return data, path
+
+    def publish_restored_successor(
+        self,
+        *,
+        role_name: str,
+        source_snapshot: Dict[str, Any],
+        lineage: Optional[Dict[str, Any]] = None,
+        authorization_callback: Optional[Callable[[], str]] = None,
+    ) -> Dict[str, Any]:
+        """Publish restored content as a new immutable successor snapshot.
+
+        Restore and rollback must never repoint a live leaf directly at an old
+        generation: doing so makes versions non-monotonic and severs the
+        history chain.  This method pins the current leaf under the renewable
+        table lease, validates all restored artifacts remain inside this exact
+        table, writes a new snapshot whose predecessor is the current head,
+        and commits it through the SDK's atomic snapshot CAS.
+        """
+        check_control_access(
+            super_name=self.super_table.super_name,
+            organization=self.super_table.organization,
+            role_name=role_name,
+            table_name=self.simple_name,
+        )
+        if not isinstance(source_snapshot, dict):
+            raise ValueError("Restored snapshot must be an object")
+
+        org = self.super_table.organization
+        sup = self.super_table.super_name
+        token = self.catalog.acquire_simple_lock(
+            org, sup, self.simple_name, ttl_s=30, timeout_s=60,
+        )
+        if not token:
+            raise TimeoutError(f"Could not acquire lock for '{self.simple_name}'")
+        try:
+            # The lease acquisition may queue behind a long writer.  Re-read
+            # the authoritative role immediately before any restore I/O so a
+            # revoked CONTROL grant cannot survive the wait.
+            effective_role = (
+                authorization_callback()
+                if authorization_callback is not None else role_name
+            )
+            if not isinstance(effective_role, str) or not effective_role.strip():
+                raise PermissionError("A current authorized role is required")
+            check_control_access(
+                super_name=self.super_table.super_name,
+                organization=self.super_table.organization,
+                role_name=effective_role.strip(),
+                table_name=self.simple_name,
+            )
+            self.catalog.check_deletion_intent_absent(
+                org, sup, simple=self.simple_name,
+            )
+            leaf = self.catalog.get_leaf(org, sup, self.simple_name)
+            if not isinstance(leaf, dict) or not isinstance(
+                leaf.get("path"), str,
+            ) or not leaf["path"]:
+                raise FileNotFoundError("The live table snapshot is unavailable")
+            if type(leaf.get("version")) is not int or leaf["version"] < 0:
+                raise RuntimeError("The live table generation is invalid")
+
+            def _contained_path(
+                raw: Any, *, label: str, required_prefix: str,
+            ) -> str:
+                if (
+                    not isinstance(raw, str)
+                    or not raw
+                    or "\x00" in raw
+                    or "\\" in raw
+                    or os.path.isabs(raw)
+                    or any(
+                        component in {"", ".", ".."}
+                        for component in raw.split("/")
+                    )
+                ):
+                    raise ValueError(f"Restored {label} path is invalid")
+                normalized = os.path.normpath(raw)
+                if normalized != raw:
+                    raise ValueError(
+                        f"Restored {label} path is not canonical"
+                    )
+                absolute = os.path.abspath(normalized)
+                prefix = os.path.abspath(os.path.normpath(required_prefix))
+                if os.path.commonpath((prefix, absolute)) != prefix:
+                    raise ValueError(
+                        f"Restored {label} path escapes its immutable artifact prefix"
+                    )
+                if absolute == prefix:
+                    raise ValueError(
+                        f"Restored {label} path does not name an object"
+                    )
+                return normalized
+
+            current_path = _contained_path(
+                leaf["path"],
+                label="live snapshot",
+                required_prefix=self.snapshot_dir,
+            )
+            mirrors = self.catalog.get_mirrors(org, sup)
+            if not isinstance(mirrors, list) or any(
+                not isinstance(value, str) for value in mirrors
+            ):
+                raise RuntimeError("Mirror configuration is invalid")
+            if mirrors:
+                # A successor cannot claim success while configured mirror
+                # formats still expose the old snapshot. Until this narrow
+                # restore primitive participates in the durable mirror outbox,
+                # reject before writing an orphan snapshot object.
+                raise RuntimeError(
+                    "Restored successors for mirror-enabled tables require "
+                    "mirror reconciliation support"
+                )
+            current_payload = complete_snapshot_payload(
+                leaf.get("payload"),
+                expected_version=leaf["version"],
+                require_policy_marker=True,
+            )
+            if current_payload is None:
+                current_size = self.storage.size(current_path)
+                if (
+                    type(current_size) is not int
+                    or current_size <= 0
+                    or current_size > 8 * 1024 * 1024
+                ):
+                    raise ValueError(
+                        "The live snapshot exceeds its size limit"
+                    )
+                current_payload = self.storage.read_json(current_path)
+            if (
+                not isinstance(current_payload, dict)
+                or current_payload.get("snapshot_version") != leaf["version"]
+            ):
+                raise RuntimeError("The live snapshot and catalog generation disagree")
+
+            restored = copy.deepcopy(source_snapshot)
+            resources = restored.get("resources")
+            schema = restored.get("schema")
+            if not isinstance(resources, list) or len(resources) > 10_000:
+                raise ValueError("Restored snapshot resource fan-out is invalid")
+            if not isinstance(schema, (dict, list)):
+                raise ValueError("Restored snapshot schema is invalid")
+            try:
+                schema_size = len(json.dumps(schema, allow_nan=False).encode("utf-8"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Restored snapshot schema is invalid") from exc
+            if schema_size > 1024 * 1024:
+                raise ValueError("Restored snapshot schema exceeds its size limit")
+            seen_resources: set[str] = set()
+            total_rows = 0
+            total_bytes = 0
+            for resource in resources:
+                if not isinstance(resource, dict):
+                    raise ValueError("Restored snapshot resource is invalid")
+                path = _contained_path(
+                    resource.get("file"), label="resource",
+                    required_prefix=self.data_dir,
+                )
+                if path in seen_resources:
+                    raise ValueError("Restored snapshot repeats a resource")
+                seen_resources.add(path)
+                rows = resource.get("rows")
+                file_size = resource.get("file_size")
+                if (
+                    type(rows) is not int
+                    or rows < 0
+                    or rows > 1_000_000_000
+                    or type(file_size) is not int
+                    or file_size <= 0
+                    or file_size > 2 * 1024 * 1024 * 1024
+                ):
+                    raise ValueError(
+                        "Restored snapshot resource bounds are invalid"
+                    )
+                total_rows += rows
+                total_bytes += file_size
+                if (
+                    total_rows > 1_000_000_000
+                    or total_bytes > 2 * 1024 * 1024 * 1024 * 1024
+                ):
+                    raise ValueError(
+                        "Restored snapshot aggregate bounds are invalid"
+                    )
+                if not self.storage.exists(path):
+                    raise FileNotFoundError("A restored data artifact is unavailable")
+                resource["file"] = path
+            for field_name, subdir in (
+                ("tombstone", "tombstone"), ("stats_file", "stats"),
+            ):
+                pointer = restored.get(field_name)
+                if pointer is None:
+                    continue
+                path = _contained_path(
+                    pointer, label=field_name,
+                    required_prefix=os.path.join(self.simple_dir, subdir),
+                )
+                if not self.storage.exists(path):
+                    raise FileNotFoundError("A restored metadata artifact is unavailable")
+                restored[field_name] = path
+
+            restored["simple_name"] = self.simple_name
+            restored["location"] = self.simple_dir
+            restored["snapshot_version"] = leaf["version"] + 1
+            restored["previous_snapshot"] = current_path
+            restored["last_updated_ms"] = int(time.time() * 1000)
+            restored["lineage"] = dict(lineage or {
+                "source_type": "snapshot_restore",
+                "restored_snapshot_version": source_snapshot.get(
+                    "snapshot_version"
+                ),
+            })
+            restored = snapshot_cache_payload(restored)
+            try:
+                lineage_size = len(json.dumps(
+                    restored["lineage"],
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8"))
+                snapshot_size = len(json.dumps(
+                    restored,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ).encode("utf-8"))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Restored snapshot is not valid JSON") from exc
+            if lineage_size > 64 * 1024:
+                raise ValueError("Restored snapshot lineage exceeds its size limit")
+            if snapshot_size > 8 * 1024 * 1024:
+                raise ValueError("Restored snapshot exceeds its size limit")
+
+            effective_role = (
+                authorization_callback()
+                if authorization_callback is not None else role_name
+            )
+            if not isinstance(effective_role, str) or not effective_role.strip():
+                raise PermissionError("A current authorized role is required")
+            check_control_access(
+                super_name=sup,
+                organization=org,
+                role_name=effective_role.strip(),
+                table_name=self.simple_name,
+            )
+            snapshot_path = os.path.join(
+                self.snapshot_dir, generate_filename(alias=self.identity),
+            )
+            self.storage.write_json(snapshot_path, restored)
+            final_role = (
+                authorization_callback()
+                if authorization_callback is not None else effective_role
+            )
+            if not isinstance(final_role, str) or not final_role.strip():
+                raise PermissionError("A current authorized role is required")
+            check_control_access(
+                super_name=sup,
+                organization=org,
+                role_name=final_role.strip(),
+                table_name=self.simple_name,
+            )
+            commit_id = uuid.uuid4().hex
+            leaf_version, root_version = self.catalog.commit_snapshot(
+                org,
+                sup,
+                self.simple_name,
+                restored,
+                snapshot_path,
+                expected_version=leaf["version"],
+                expected_path=current_path,
+                lock_token=token,
+                commit_id=commit_id,
+                now_ms=restored["last_updated_ms"],
+                expected_mirrors=[],
+            )
+            return {
+                "snapshot": restored,
+                "snapshot_path": snapshot_path,
+                "leaf_version": int(leaf_version),
+                "root_version": int(root_version),
+                "from_version": int(current_payload["snapshot_version"]),
+            }
+        finally:
+            self.catalog.release_simple_lock(org, sup, self.simple_name, token)
 
     def export_to(self, target_dir: str, compression_level: int = 3, small_only: bool = False):
         """Write a standalone copy of the current data into ``target_dir``.
