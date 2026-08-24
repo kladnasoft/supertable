@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
+import time
 import uuid
 from typing import Dict, List, Optional
 
@@ -43,6 +45,16 @@ from urllib.parse import urlparse, unquote
 # at INFO level, which floods the application log.
 for _lib in ("pyhive", "pyhive.hive", "TCLIService", "thrift", "thrift_sasl"):
     logging.getLogger(_lib).setLevel(logging.WARNING)
+
+
+# A Python DB-API driver can block inside its connection constructor before a
+# connection object exists for the ordinary watchdog to close. Bound those
+# attempts separately; an attempt that outlives its caller retains its slot
+# until it actually unwinds and closes any late connection.
+_SPARK_CONNECT_MAX_IN_FLIGHT = 8
+_spark_connect_slots = threading.BoundedSemaphore(
+    _SPARK_CONNECT_MAX_IN_FLIGHT,
+)
 
 
 # Spark SQL runs inside a long-lived JVM with access to cluster classes,
@@ -1695,6 +1707,89 @@ class SparkThriftExecutor:
         logger.debug(f"[spark.thrift] connecting to {host}:{port} (auth={auth})")
         return hive.connect(**connect_kwargs)
 
+    def _get_connection_with_deadline(
+        self,
+        cluster: Dict,
+        *,
+        deadline_monotonic: float,
+        cancel_event: Optional[threading.Event],
+    ) -> object:
+        """Create a Thrift connection without abandoning an unbounded worker."""
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("Spark query was cancelled during connection")
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("Spark query deadline exceeded during connection")
+            if _spark_connect_slots.acquire(timeout=min(0.05, remaining)):
+                break
+
+        completed = threading.Event()
+        abandoned = threading.Event()
+        outcome: Dict[str, object] = {}
+        outcome_lock = threading.Lock()
+
+        def _abandon() -> None:
+            late_connection = None
+            with outcome_lock:
+                abandoned.set()
+                late_connection = outcome.pop("connection", None)
+            if late_connection is not None:
+                try:
+                    late_connection.close()
+                except Exception:
+                    pass
+
+        def _connect() -> None:
+            try:
+                connection = self._get_connection(cluster)
+                close_connection = False
+                with outcome_lock:
+                    if abandoned.is_set():
+                        close_connection = True
+                    else:
+                        outcome["connection"] = connection
+                if close_connection:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+            except BaseException as exc:
+                with outcome_lock:
+                    outcome["error"] = exc
+            finally:
+                completed.set()
+                _spark_connect_slots.release()
+
+        worker = threading.Thread(
+            target=_connect,
+            daemon=True,
+            name="spark-thrift-connect",
+        )
+        try:
+            worker.start()
+        except BaseException:
+            _spark_connect_slots.release()
+            raise
+
+        while not completed.is_set():
+            if cancel_event is not None and cancel_event.is_set():
+                _abandon()
+                raise RuntimeError("Spark query was cancelled during connection")
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                _abandon()
+                raise RuntimeError("Spark query deadline exceeded during connection")
+            completed.wait(min(0.05, remaining))
+
+        error = outcome.get("error")
+        if isinstance(error, BaseException):
+            raise error
+        connection = outcome.get("connection")
+        if connection is None:
+            raise RuntimeError("Spark connection did not return a connection")
+        return connection
+
     def _select_cluster(self, job_bytes: int, force: bool = False) -> Dict:
         """Select the best cluster from Redis, or raise if none available."""
         cluster = self.catalog.select_spark_cluster(self.organization, job_bytes, force=force)
@@ -1717,6 +1812,10 @@ class SparkThriftExecutor:
             timer_capture,
             log_prefix: str = "",
             force: bool = False,
+            deadline_monotonic: Optional[float] = None,
+            cancel_event: Optional[threading.Event] = None,
+            max_result_rows: Optional[int] = None,
+            max_result_bytes: Optional[int] = None,
     ) -> pd.DataFrame:
         """
         Execute a query against a Spark Thrift Server.
@@ -1728,12 +1827,13 @@ class SparkThriftExecutor:
         4. Register parquet files as temp views
         5. Create RBAC-filtered views if needed
         6. Rewrite and execute the user query
-        7. Fetch results as pandas DataFrame
+        7. Fetch results as pandas DataFrame (incrementally when bounded)
         8. Clean up temp views
 
-        The entire flow is guarded by SUPERTABLE_SPARK_QUERY_TIMEOUT (default 300 s).
-        If the timeout fires the connection is forcibly closed, which unblocks any
-        pending Thrift RPC and raises a RuntimeError to the caller.
+        The entire flow is guarded by the earlier of the caller deadline and
+        SUPERTABLE_SPARK_QUERY_TIMEOUT (default 300 s), plus the caller's
+        cancellation token. If either boundary fires, the connection is
+        forcibly closed to unblock pending Thrift RPCs.
         """
         for tombstone in (
             getattr(reflection, "tombstone_views", None) or {}
@@ -1771,7 +1871,37 @@ class SparkThriftExecutor:
             getattr(reflection, "rbac_views", None) or {},
         )
 
-        query_timeout = _spark_timeout_seconds()
+        for value, label in (
+            (max_result_rows, "max_result_rows"),
+            (max_result_bytes, "max_result_bytes"),
+        ):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+            ):
+                raise ValueError(f"{label} must be a positive integer")
+
+        configured_timeout = float(_spark_timeout_seconds())
+        if configured_timeout <= 0:
+            configured_timeout = 300.0
+        now = time.monotonic()
+        effective_deadline = now + configured_timeout
+        if deadline_monotonic is not None:
+            if (
+                isinstance(deadline_monotonic, bool)
+                or not isinstance(deadline_monotonic, (int, float))
+                or not math.isfinite(float(deadline_monotonic))
+            ):
+                raise ValueError("Spark query deadline must be finite")
+            effective_deadline = min(
+                effective_deadline, float(deadline_monotonic),
+            )
+        query_timeout = effective_deadline - now
+        if query_timeout <= 0:
+            raise RuntimeError("Spark query deadline exceeded before execution")
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Spark query was cancelled before execution")
         stmt_timeout = _spark_statement_timeout_seconds()
 
         # 1. Select cluster
@@ -1791,29 +1921,50 @@ class SparkThriftExecutor:
         # connection from a background thread. This causes any blocked
         # cursor.execute / fetchall to raise an exception immediately.
         _timed_out = threading.Event()
+        _cancelled = threading.Event()
+        _finished = threading.Event()
         _conn_ref: List = []  # mutable container so watchdog can see conn
 
+        def _close_connections() -> None:
+            for active_connection in list(_conn_ref):
+                try:
+                    active_connection.close()
+                except Exception:
+                    pass
+
         def _watchdog():
-            if not _timed_out.wait(query_timeout):
-                # Timeout expired and nobody cancelled us
-                _timed_out.set()
-                logger.error(
-                    f"{log_prefix}[spark.thrift] query timeout after {query_timeout}s — "
-                    f"forcibly closing connection"
-                )
-                for c in _conn_ref:
-                    try:
-                        c.close()
-                    except Exception:
-                        pass
+            while not _finished.is_set():
+                if cancel_event is not None and cancel_event.is_set():
+                    _cancelled.set()
+                    _close_connections()
+                    return
+                remaining = effective_deadline - time.monotonic()
+                if remaining <= 0:
+                    _timed_out.set()
+                    logger.error(
+                        f"{log_prefix}[spark.thrift] query deadline exceeded — "
+                        "forcibly closing connection"
+                    )
+                    _close_connections()
+                    return
+                _finished.wait(min(0.05, remaining))
 
         watchdog = threading.Thread(target=_watchdog, daemon=True, name="spark-timeout")
         watchdog.start()
 
         try:
             # 2. Connect
-            conn = self._get_connection(cluster)
+            conn = self._get_connection_with_deadline(
+                cluster,
+                deadline_monotonic=effective_deadline,
+                cancel_event=cancel_event,
+            )
             _conn_ref.append(conn)
+            if cancel_event is not None and cancel_event.is_set():
+                _cancelled.set()
+                raise RuntimeError("Spark query was cancelled")
+            if _timed_out.is_set():
+                raise RuntimeError("Spark query deadline exceeded")
             cursor = conn.cursor()
 
             # 3. Disable Spark/Hive/system/environment variable substitution
@@ -2132,7 +2283,64 @@ class SparkThriftExecutor:
 
             # 7. Fetch results as pandas
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
-            rows = cursor.fetchall()
+            if max_result_rows is None and max_result_bytes is None:
+                rows = cursor.fetchall()
+            else:
+                fetchmany = getattr(cursor, "fetchmany", None)
+                if not callable(fetchmany):
+                    raise RuntimeError(
+                        "Spark driver does not support bounded result fetching"
+                    )
+                rows = []
+                serialized_bytes = len(json.dumps(
+                    {"columns": columns, "rows": []},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8"))
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        _cancelled.set()
+                        raise RuntimeError("Spark query was cancelled")
+                    if _timed_out.is_set() or time.monotonic() >= effective_deadline:
+                        _timed_out.set()
+                        raise RuntimeError("Spark query deadline exceeded")
+                    remaining_rows = (
+                        256
+                        if max_result_rows is None
+                        else max_result_rows + 1 - len(rows)
+                    )
+                    batch = fetchmany(max(1, min(256, remaining_rows)))
+                    if not batch:
+                        break
+                    for raw_row in batch:
+                        if (
+                            max_result_rows is not None
+                            and len(rows) >= max_result_rows
+                        ):
+                            raise RuntimeError(
+                                "Spark result exceeded the materialized row limit"
+                            )
+                        row = tuple(raw_row)
+                        if max_result_bytes is not None:
+                            try:
+                                encoded = json.dumps(
+                                    row,
+                                    ensure_ascii=False,
+                                    allow_nan=True,
+                                    default=str,
+                                    separators=(",", ":"),
+                                ).encode("utf-8")
+                            except Exception:
+                                raise RuntimeError(
+                                    "Spark result could not be bounded safely"
+                                ) from None
+                            serialized_bytes += len(encoded) + (1 if rows else 0)
+                            if serialized_bytes > max_result_bytes:
+                                raise RuntimeError(
+                                    "Spark result memory exceeds the materialized "
+                                    "byte limit"
+                                )
+                        rows.append(row)
 
             result = pd.DataFrame(rows, columns=columns) if columns else pd.DataFrame()
 
@@ -2144,9 +2352,13 @@ class SparkThriftExecutor:
             return result
 
         except Exception as e:
+            if _cancelled.is_set() or (
+                cancel_event is not None and cancel_event.is_set()
+            ):
+                raise RuntimeError("Spark query was cancelled") from None
             if _timed_out.is_set():
                 raise RuntimeError(
-                    f"Spark query timed out after {query_timeout}s"
+                    "Spark query deadline exceeded"
                 ) from None
             # Direct executor callers deserve the same credential-safe error
             # boundary as DataReader/API callers.  Suppress the original cause
@@ -2155,9 +2367,6 @@ class SparkThriftExecutor:
             raise RuntimeError(safe_message or "Spark query failed") from None
 
         finally:
-            # Cancel the watchdog so it doesn't fire after we're done.
-            _timed_out.set()
-
             # 8. Cleanup: drop RBAC views and temp tables
             if cursor:
                 for view in created_views:
@@ -2180,3 +2389,11 @@ class SparkThriftExecutor:
                     conn.close()
                 except Exception:
                     pass
+            _finished.set()
+            watchdog.join(timeout=0.2)
+            if _cancelled.is_set() or (
+                cancel_event is not None and cancel_event.is_set()
+            ):
+                raise RuntimeError("Spark query was cancelled") from None
+            if _timed_out.is_set():
+                raise RuntimeError("Spark query deadline exceeded") from None

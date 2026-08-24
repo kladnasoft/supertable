@@ -26,6 +26,7 @@ from supertable.tombstone_manifest_v2 import (
     normalize_snapshot_tombstone_state,
 )
 from supertable.utils.snapshot import complete_snapshot_payload
+from supertable.row_identity import snapshot_proves_stable_rowids
 
 logger = logging.getLogger(__name__)
 
@@ -511,6 +512,53 @@ class MetaReader:
                 continue
 
         return [dict(sorted(schema_items))]
+
+    def get_odata_table_schema(
+        self, table_name: str, role_name: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Return one keyed OData-capable table schema, or fail closed.
+
+        OData entity types require a stable unique key.  Only one direct local
+        table whose exact pinned snapshot proves the modern table-global
+        ``__rowid__`` writer contract is eligible.  The raw system column is
+        never included in the returned role-visible schema.
+        """
+        if str(table_name).casefold() == str(
+            self.super_table.super_name
+        ).casefold():
+            # The aggregate relation combines independently versioned child
+            # tables and therefore has no one table-global row-id namespace.
+            return None
+        context, authorized = self._authorized_meta_targets(
+            table_name, role_name,
+        )
+        if context is None or len(authorized) != 1:
+            return None
+        target, entry = authorized[0]
+        if str(target).casefold() != str(table_name).casefold():
+            return None
+
+        try:
+            raw = self.catalog.r.get(RK.meta_leaf(
+                self.super_table.organization,
+                self.super_table.super_name,
+                target,
+            ))
+            leaf_meta = _try_parse_leaf_meta(raw)
+            if leaf_meta is None:
+                return None
+            snapshot = _complete_leaf_snapshot(leaf_meta)
+            if snapshot is None:
+                simple_table = SimpleTable(
+                    self.super_table, target, create_if_missing=False,
+                )
+                snapshot, _ = simple_table.get_simple_table_snapshot()
+            if not snapshot_proves_stable_rowids(snapshot, leaf_meta):
+                return None
+            visible = _visible_schema(snapshot.get("schema", {}), entry)
+            return [dict(sorted(visible.items()))] if visible else None
+        except (FileNotFoundError, TableNotFoundError):
+            return None
 
     def collect_simple_table_schema(self, schemas: set, table_name: str, role_name: str) -> None:
         try:

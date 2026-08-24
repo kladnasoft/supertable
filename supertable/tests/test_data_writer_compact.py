@@ -15,7 +15,7 @@ real Parquet I/O.
 from __future__ import annotations
 
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import polars as pl
 import pytest
@@ -217,10 +217,189 @@ class TestAccessAndLock:
 
         dw.compact("admin", "tbl")
 
-        mock_check_write.assert_called_once_with(
+        expected = call(
             super_name="warehouse", organization="acme",
             role_name="admin", table_name="tbl",
         )
+        assert mock_check_write.call_args_list == [expected, expected]
+
+    @patch(_P_AUDIT)
+    @patch(_P_MON_WRITER)
+    @patch(_P_MIRROR)
+    @patch(_P_COMPACT_RES)
+    @patch(_P_COMPACT_TOMB, return_value=(0, [], set()))
+    @patch(_P_SETTINGS, new_callable=_stub_settings)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
+    def test_authorization_callback_fences_lock_and_publication(
+        self, mock_check_write, MockSimple, mock_settings,
+        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+    ):
+        dw = _build_writer()
+        events: list[str] = []
+        roles = iter(("preflight", "locked", "publisher"))
+
+        def authorize() -> str:
+            role = next(roles)
+            events.append(f"auth:{role}")
+            return role
+
+        mock_check_write.side_effect = lambda **kwargs: events.append(
+            f"check:{kwargs['role_name']}"
+        )
+        dw.catalog.acquire_simple_lock.side_effect = lambda *_a, **_k: (
+            events.append("lock") or "tok"
+        )
+
+        snap = _snapshot([_resource("a"), _resource("b")])
+        mock_simple = _mk_simple_mock(snap)
+        MockSimple.side_effect = lambda *_a, **_k: (
+            events.append("simple") or mock_simple
+        )
+        mock_simple.get_simple_table_snapshot.side_effect = lambda: (
+            events.append("snapshot") or (snap, "/snap/v1.json")
+        )
+        new_resource = {
+            "file": "c.parquet", "file_size": 5_000,
+            "columns": [{"name": "id"}],
+        }
+        mock_compact_res.side_effect = lambda **_kwargs: (
+            events.append("rewrite") or
+            (2, 200, [new_resource], {"a", "b"})
+        )
+
+        def update(*_args, **kwargs):
+            events.append(f"lineage:{kwargs['lineage']['role_name']}")
+            return (
+                {**snap, "resources": [new_resource], "snapshot_version": 2},
+                "/snap/v2.json",
+            )
+
+        mock_simple.update.side_effect = update
+        dw.catalog.commit_snapshot_mock.side_effect = lambda *_a, **_k: (
+            events.append("publish") or (2, 2)
+        )
+        dw._get_table_config = MagicMock(return_value={})
+
+        result = dw.compact(
+            "stale", "tbl", authorization_callback=authorize,
+        )
+
+        assert events == [
+            "auth:preflight",
+            "check:preflight",
+            "lock",
+            "auth:locked",
+            "check:locked",
+            "simple",
+            "snapshot",
+            "rewrite",
+            "lineage:locked",
+            "auth:publisher",
+            "check:publisher",
+            "publish",
+        ]
+        assert result["role_name"] == "publisher"
+        assert dw.catalog.release_simple_lock.call_count == 1
+
+    @patch(_P_AUDIT)
+    @patch(_P_MON_WRITER)
+    @patch(_P_MIRROR)
+    @patch(_P_COMPACT_RES)
+    @patch(_P_COMPACT_TOMB, return_value=(0, [], set()))
+    @patch(_P_SETTINGS, new_callable=_stub_settings)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
+    def test_authorization_revoked_after_lock_prevents_snapshot_read(
+        self, mock_check_write, MockSimple, mock_settings,
+        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+    ):
+        dw = _build_writer()
+        calls = 0
+
+        def authorize() -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise PermissionError("membership revoked")
+            return "admin"
+
+        with pytest.raises(PermissionError, match="membership revoked"):
+            dw.compact("stale", "tbl", authorization_callback=authorize)
+
+        assert calls == 2
+        assert mock_check_write.call_count == 1
+        MockSimple.assert_not_called()
+        mock_compact_res.assert_not_called()
+        dw.catalog.commit_snapshot_mock.assert_not_called()
+        dw.catalog.release_simple_lock.assert_called_once()
+
+    @patch(_P_AUDIT)
+    @patch(_P_MON_WRITER)
+    @patch(_P_MIRROR)
+    @patch(_P_COMPACT_RES)
+    @patch(_P_COMPACT_TOMB, return_value=(0, [], set()))
+    @patch(_P_SETTINGS, new_callable=_stub_settings)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
+    def test_authorization_revoked_before_publication_fails_closed(
+        self, mock_check_write, MockSimple, mock_settings,
+        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+    ):
+        dw = _build_writer()
+        calls = 0
+
+        def authorize() -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise PermissionError("membership revoked")
+            return "admin"
+
+        snap = _snapshot([_resource("a"), _resource("b")])
+        mock_simple = _mk_simple_mock(snap)
+        MockSimple.return_value = mock_simple
+        mock_compact_res.return_value = (
+            2,
+            200,
+            [{
+                "file": "c.parquet", "file_size": 5_000,
+                "columns": [{"name": "id"}],
+            }],
+            {"a", "b"},
+        )
+        dw._get_table_config = MagicMock(return_value={})
+
+        with pytest.raises(PermissionError, match="membership revoked"):
+            dw.compact("stale", "tbl", authorization_callback=authorize)
+
+        assert calls == 3
+        assert mock_check_write.call_count == 2
+        mock_simple.update.assert_called_once()
+        dw.catalog.commit_snapshot_mock.assert_not_called()
+        dw.catalog.set_leaf_payload_cas.assert_not_called()
+        dw.catalog.bump_root.assert_not_called()
+        dw.catalog.release_simple_lock.assert_called_once()
+
+    @pytest.mark.parametrize("invalid_role", [None, "", "   ", 7])
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
+    def test_authorization_callback_rejects_invalid_role(
+        self, mock_check_write, MockSimple, invalid_role,
+    ):
+        dw = _build_writer()
+
+        with pytest.raises(
+            PermissionError, match="Compaction authorization is unavailable",
+        ):
+            dw.compact(
+                "stale", "tbl",
+                authorization_callback=lambda: invalid_role,
+            )
+
+        mock_check_write.assert_not_called()
+        dw.catalog.acquire_simple_lock.assert_not_called()
+        MockSimple.assert_not_called()
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)

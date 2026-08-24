@@ -345,6 +345,103 @@ class TestDelete:
             label="delete this SuperTable",
         )
 
+    def test_cleanup_callback_runs_after_commit_while_fence_is_held(self):
+        st = _make_super("sup", "org")
+        events = []
+        st.storage.delete_prefix.side_effect = lambda _path: events.append("storage")
+        st.catalog.delete_super_table.side_effect = (
+            lambda *_args, **_kwargs: events.append("catalog-commit")
+        )
+        st.catalog.release_namespace_lock.side_effect = (
+            lambda *_args, **_kwargs: events.append("fence-release")
+        )
+
+        result = st.delete(
+            role_name="admin",
+            post_delete_cleanup_callback=lambda: events.append("platform-cleanup"),
+        )
+
+        assert result == "namespace-delete-intent"
+        assert events == [
+            "storage",
+            "catalog-commit",
+            "platform-cleanup",
+            "fence-release",
+        ]
+
+    def test_cleanup_failure_is_explicit_post_commit_outcome(self):
+        from supertable.super_table import NamespaceCleanupPostCommitError
+
+        st = _make_super("sup", "org")
+
+        def fail_cleanup():
+            raise ConnectionError("redis://secret@internal")
+
+        with pytest.raises(NamespaceCleanupPostCommitError) as raised:
+            st.delete(
+                role_name="admin",
+                post_delete_cleanup_callback=fail_cleanup,
+            )
+
+        assert raised.value.core_committed is True
+        assert raised.value.core_result == "namespace-delete-intent"
+        assert raised.value.intent_id == "namespace-delete-intent"
+        assert "secret" not in str(raised.value)
+        st.storage.delete_prefix.assert_called_once_with("org/sup")
+        st.catalog.delete_super_table.assert_called_once()
+        st.catalog.release_namespace_lock.assert_called_once_with(
+            "org", "sup", "namespace-token",
+        )
+
+    def test_recovery_tombstone_cleanup_failure_is_post_commit(self):
+        from supertable.super_table import NamespaceCleanupPostCommitError
+
+        st = _make_super("sup", "org")
+        st.catalog.recover_namespace_deletion.return_value = {
+            "intent_id": "recovered-intent",
+        }
+        st.catalog.clear_namespace_deletion_tombstone.side_effect = (
+            ConnectionError("redis unavailable")
+        )
+
+        with pytest.raises(NamespaceCleanupPostCommitError) as raised:
+            st.recover_delete(
+                "admin",
+                intent_id="recovered-intent",
+                confirm_previous_owner_stopped=True,
+            )
+
+        assert raised.value.core_committed is True
+        assert raised.value.intent_id == "recovered-intent"
+        st.storage.delete_prefix.assert_called_once_with("org/sup")
+        st.catalog.delete_super_table.assert_called_once()
+        st.catalog.release_namespace_lock.assert_called_once_with(
+            "org", "sup", "namespace-token",
+        )
+
+    def test_authorization_is_refreshed_immediately_before_storage_delete(self):
+        st = _make_super("sup", "org")
+        refreshed = iter(("admin", "revoked"))
+
+        def authorize():
+            return next(refreshed)
+
+        self.resolve_role_context.side_effect = (
+            SimpleNamespace(role_type=RoleType.SUPERADMIN),
+            SimpleNamespace(role_type=RoleType.SUPERADMIN),
+            SimpleNamespace(role_type=RoleType.ADMIN),
+        )
+
+        with pytest.raises(PermissionError, match="Only SUPERADMIN"):
+            st.delete(role_name="admin", authorization_callback=authorize)
+
+        assert self.resolve_role_context.call_count == 3
+        st.storage.delete_prefix.assert_not_called()
+        st.catalog.delete_super_table.assert_not_called()
+        st.catalog.release_namespace_lock.assert_called_once_with(
+            "org", "sup", "namespace-token",
+        )
+
     def test_empty_prefix_still_deletes_redis(self):
         st = _make_super("sup", "org")
 

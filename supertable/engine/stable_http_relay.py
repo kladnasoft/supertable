@@ -73,6 +73,13 @@ _UPSTREAM_TIMEOUT_SECONDS = 60.0
 _MAX_RELAY_CONNECTIONS = 64
 _HEADER_READ_TIMEOUT_SECONDS = 2.0
 _CLIENT_IO_TIMEOUT_SECONDS = 60.0
+# DuckDB can issue a final loopback probe just after a statement has completed
+# and released its last route lease.  Keep only a short, bounded set of opaque
+# route hashes so that this fail-closed lifecycle event is distinguishable from
+# an invalid request.  The marker never retains or restores the upstream URL,
+# credential, object identity, or authorization boundary.
+_RETIRED_ROUTE_MARKER_TTL_SECONDS = 5.0
+_MAX_RETIRED_ROUTE_MARKERS = 4_096
 
 
 _LOCAL_CREDENTIAL_GENERATION_LOCK = threading.Lock()
@@ -381,6 +388,7 @@ class _RelayMetrics:
     upstream_requests: int = 0
     upstream_bytes: int = 0
     rejected_requests: int = 0
+    retired_route_requests: int = 0
 
 
 class _NoRedirects(HTTPRedirectHandler):
@@ -689,9 +697,12 @@ class _RelayHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             return
         route_key = match.group(1)
-        route = relay._route(route_key)
+        route, retired_route = relay._route(route_key)
         if route is None:
-            relay._record_rejection()
+            if retired_route:
+                relay._record_retired_route_request()
+            else:
+                relay._record_rejection()
             self._empty_response(404)
             return
 
@@ -983,6 +994,7 @@ class _StableHttpRelay:
         self._route_condition = threading.Condition(self._lock)
         self._process_secret = secrets.token_bytes(32)
         self._routes: Dict[str, _Route] = {}
+        self._retired_routes: Dict[str, float] = {}
         self._active_open_count = 0
         self._metrics = _RelayMetrics()
         self._closed = False
@@ -1153,6 +1165,11 @@ class _StableHttpRelay:
                         "stable relay identity has conflicting immutable metadata"
                     )
                 if existing is None:
+                    # A new lease is authoritative immediately.  Removing the
+                    # diagnostic tombstone under the route lock ensures a
+                    # request is never classified as retired while this new
+                    # registration is visible.
+                    self._retired_routes.pop(route_key, None)
                     existing = _Route(
                         identity=identity,
                         upstream_url=upstream_url,
@@ -1232,6 +1249,7 @@ class _StableHttpRelay:
     ) -> List[object]:
         if self._routes.get(route_key) is route:
             self._routes.pop(route_key, None)
+            self._mark_route_retired_locked(route_key, time.monotonic())
         route.boundaries.clear()
         route.leases = 0
         opens = list(route.active_opens.values())
@@ -1244,6 +1262,21 @@ class _StableHttpRelay:
         route.active_transfers.clear()
         return transfers
 
+    def _mark_route_retired_locked(self, route_key: str, now: float) -> None:
+        """Remember a revoked opaque route briefly, without retaining authority."""
+        cutoff = now - _RETIRED_ROUTE_MARKER_TTL_SECONDS
+        stale = [
+            key for key, retired_at in self._retired_routes.items()
+            if retired_at < cutoff
+        ]
+        for key in stale:
+            self._retired_routes.pop(key, None)
+        self._retired_routes[route_key] = now
+        overflow = len(self._retired_routes) - _MAX_RETIRED_ROUTE_MARKERS
+        if overflow > 0:
+            for key in list(self._retired_routes)[:overflow]:
+                self._retired_routes.pop(key, None)
+
     @staticmethod
     def _close_transfers(transfers: Iterable[object]) -> None:
         for transfer in transfers:
@@ -1251,9 +1284,10 @@ class _StableHttpRelay:
             if callable(close):
                 close()
 
-    def _route(self, route_key: str) -> Optional[_RouteView]:
+    def _route(self, route_key: str) -> Tuple[Optional[_RouteView], bool]:
         retired: List[object] = []
         view = None
+        known_retired = False
         with self._route_condition:
             route = self._routes.get(route_key)
             if route is not None and self._prune_inactive_boundaries_locked(
@@ -1273,8 +1307,18 @@ class _StableHttpRelay:
                     ),
                     incarnation=route.incarnation,
                 )
+            else:
+                retired_at = self._retired_routes.get(route_key)
+                now = time.monotonic()
+                if (
+                    retired_at is not None
+                    and retired_at >= now - _RETIRED_ROUTE_MARKER_TTL_SECONDS
+                ):
+                    known_retired = True
+                elif retired_at is not None:
+                    self._retired_routes.pop(route_key, None)
         self._close_transfers(retired)
-        return view
+        return view, known_retired
 
     def _remaining_transfer_timeout(
         self,
@@ -1470,6 +1514,10 @@ class _StableHttpRelay:
         with self._lock:
             self._metrics.rejected_requests += 1
 
+    def _record_retired_route_request(self) -> None:
+        with self._lock:
+            self._metrics.retired_route_requests += 1
+
     def metrics(self) -> Dict[str, int]:
         with self._lock:
             return {
@@ -1478,6 +1526,7 @@ class _StableHttpRelay:
                 "upstream_requests": self._metrics.upstream_requests,
                 "upstream_bytes": self._metrics.upstream_bytes,
                 "rejected_requests": self._metrics.rejected_requests,
+                "retired_route_requests": self._metrics.retired_route_requests,
             }
 
     def reset_metrics(self) -> None:

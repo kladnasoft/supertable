@@ -3098,6 +3098,7 @@ class DataWriter:
         small_only: bool = True,
         compression_level: int = 1,
         lineage: dict | None = None,
+        authorization_callback=None,
     ) -> dict:
         """Explicit, lock-protected compaction for one simple table.
 
@@ -3152,6 +3153,12 @@ class DataWriter:
             lineage: optional provenance dict — same conventions as
                 ``write``. If omitted a minimal compaction lineage is
                 auto-generated.
+            authorization_callback: Optional zero-argument callback returning
+                the currently authorized role name. It is invoked before the
+                initial access check, after the table lock is acquired, and
+                immediately before fenced catalog publication. A caller that
+                binds authentication, membership and policy state should fail
+                closed from this callback when any of them changes.
 
         Returns:
             ``dict`` with keys mirroring the ``write`` stats_payload
@@ -3192,6 +3199,16 @@ class DataWriter:
         monitoring_error: MonitoringDurabilityError | None = None
         durability_batch = None
         durability_batch_committed = False
+
+        def current_authorized_role() -> str:
+            value = (
+                authorization_callback()
+                if authorization_callback is not None else role_name
+            )
+            if not isinstance(value, str) or not value.strip():
+                raise PermissionError("Compaction authorization is unavailable")
+            return value.strip()
+
         result: dict = {
             "query_id": qid,
             "recorded_at": datetime.now(timezone.utc).isoformat(),
@@ -3240,12 +3257,15 @@ class DataWriter:
             # --- Access control ------------------------------------------------
             # Compaction is a mutation — same write-access check as ``write``.
             # Safe to run now that we know the target exists.
-            check_write_access(
+            role_name = current_authorized_role()
+            result["role_name"] = role_name
+            access_args = dict(
                 super_name=self.super_table.super_name,
                 organization=self.super_table.organization,
                 role_name=role_name,
                 table_name=simple_name,
             )
+            check_write_access(**access_args)
             mark("access")
 
             # --- Per-simple Redis lock ----------------------------------------
@@ -3259,6 +3279,15 @@ class DataWriter:
             if not token:
                 raise TimeoutError(f"Could not acquire lock for simple '{simple_name}'")
             mark("lock")
+
+            # Waiting for the table lease does not preserve authority. Refresh
+            # identity/RBAC immediately at the lease boundary, before reading
+            # the pinned snapshot or writing any replacement resources.
+            role_name = current_authorized_role()
+            result["role_name"] = role_name
+            access_args["role_name"] = role_name
+            check_write_access(**access_args)
+
             mutation_fence = getattr(
                 type(self.catalog), "check_table_mutation_allowed", None,
             )
@@ -3765,6 +3794,14 @@ class DataWriter:
                 payload = new_snapshot_dict
                 if durability_batch is not None:
                     durability_batch.barrier()
+
+                # Resource preparation may be long-running. The catalog leaf is
+                # still unchanged, so refresh authority at the final reversible
+                # boundary and refuse publication if the caller was revoked.
+                role_name = current_authorized_role()
+                result["role_name"] = role_name
+                access_args["role_name"] = role_name
+                check_write_access(**access_args)
                 self._publish_snapshot(
                     simple_table=simple_table,
                     simple_name=simple_name,

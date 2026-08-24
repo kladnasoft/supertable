@@ -18,6 +18,8 @@ Covers:
 from __future__ import annotations
 
 import os
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import duckdb
@@ -2411,10 +2413,22 @@ class TestExecutor:
         instance.execute.return_value = pd.DataFrame()
         MockSpark.return_value = instance
         r, p, qm, t, ps = _exec_fixtures()
-        _, used = Executor().execute(Engine.SPARK_SQL, r, p, qm, t, ps, "test")
+        cancel = threading.Event()
+        deadline = time.monotonic() + 10
+        _, used = Executor().execute(
+            Engine.SPARK_SQL, r, p, qm, t, ps, "test",
+            deadline_monotonic=deadline,
+            cancel_event=cancel,
+            materialized_row_limit=10001,
+            materialized_result_bytes=1024,
+        )
         assert used == "spark_sql"
         _, kwargs = instance.execute.call_args
         assert kwargs.get("force") is True
+        assert kwargs["cancel_event"] is cancel
+        assert kwargs["deadline_monotonic"] <= deadline
+        assert kwargs["max_result_rows"] == 10001
+        assert kwargs["max_result_bytes"] == 1024
 
     @patch.object(DuckDB, "execute", return_value=pd.DataFrame())
     def test_auto_picks_duckdb_for_small_data(self, mock_exec):
@@ -2924,6 +2938,34 @@ class TestSparkThriftExecutor:
     def test_init(self):
         assert SparkThriftExecutor(storage=MagicMock()).storage is not None
 
+    def test_connection_attempt_respects_deadline_and_closes_late_result(
+        self, monkeypatch,
+    ):
+        executor = SparkThriftExecutor(storage=MagicMock())
+        started = threading.Event()
+        release = threading.Event()
+        late_connection = MagicMock()
+
+        def blocking_connection(_cluster):
+            started.set()
+            release.wait(2)
+            return late_connection
+
+        monkeypatch.setattr(executor, "_get_connection", blocking_connection)
+        with pytest.raises(RuntimeError, match="deadline exceeded"):
+            executor._get_connection_with_deadline(
+                {"cluster_id": "c1"},
+                deadline_monotonic=time.monotonic() + 0.05,
+                cancel_event=threading.Event(),
+            )
+        assert started.is_set()
+        release.set()
+        for _ in range(100):
+            if late_connection.close.called:
+                break
+            time.sleep(0.005)
+        late_connection.close.assert_called_once()
+
     @patch.object(SparkThriftExecutor, "_select_cluster")
     @patch.object(SparkThriftExecutor, "_get_connection")
     @patch("supertable.engine.spark_thrift._configure_spark_s3")
@@ -2953,6 +2995,54 @@ class TestSparkThriftExecutor:
         assert "CREATING_REFLECTION" in captures
         fake_cursor.close.assert_called_once()
         fake_conn.close.assert_called_once()
+
+    @patch.object(SparkThriftExecutor, "_select_cluster")
+    @patch.object(SparkThriftExecutor, "_get_connection")
+    @patch("supertable.engine.spark_thrift._configure_spark_s3")
+    @patch("supertable.engine.spark_thrift._spark_create_parquet_view")
+    @patch("supertable.engine.spark_thrift._spark_rewrite_query", return_value="SELECT 1")
+    def test_bounded_result_uses_incremental_fetch(
+        self, mock_rewrite, mock_view, mock_s3, mock_conn, mock_cluster,
+    ):
+        mock_cluster.return_value = {
+            "cluster_id": "c1", "thrift_host": "h", "thrift_port": 10000,
+        }
+        fake_cursor = MagicMock()
+        fake_cursor.description = [("col1",)]
+        fake_cursor.fetchall.return_value = [("col1", "bigint")]
+        fake_cursor.fetchmany.side_effect = [[(1,), (2,)], [(3,)], []]
+        fake_conn = MagicMock()
+        fake_conn.cursor.return_value = fake_cursor
+        mock_conn.return_value = fake_conn
+
+        parser = MagicMock()
+        parser.original_query = "SELECT * FROM t"
+        parser.get_table_tuples.return_value = [
+            TableDefinition("s", "t", "t_alias"),
+        ]
+        reflection = Reflection(
+            storage_type="mock", reflection_bytes=100, total_reflections=1,
+            supers=[
+                SuperSnapshot(
+                    "s", "t", 1, ["s3://bucket/f.parquet"], {"col1"},
+                ),
+            ],
+        )
+        result = SparkThriftExecutor(storage=MagicMock()).execute(
+            reflection,
+            parser,
+            MagicMock(),
+            lambda _event: None,
+            deadline_monotonic=time.monotonic() + 10,
+            cancel_event=threading.Event(),
+            max_result_rows=3,
+            max_result_bytes=1024,
+        )
+
+        assert result.to_dict(orient="records") == [
+            {"col1": 1}, {"col1": 2}, {"col1": 3},
+        ]
+        assert fake_cursor.fetchmany.call_count == 3
 
     @patch.object(SparkThriftExecutor, "_select_cluster")
     @patch.object(SparkThriftExecutor, "_get_connection")

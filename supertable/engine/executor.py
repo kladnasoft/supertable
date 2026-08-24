@@ -1937,10 +1937,23 @@ class Executor:
         log_prefix: str,
         explain: bool = False,
         explain_options: str = "",
+        deadline_monotonic: Optional[float] = None,
+        cancel_event: Optional[threading.Event] = None,
+        materialized_row_limit: Optional[int] = None,
+        materialized_result_bytes: Optional[int] = None,
     ) -> Tuple[pd.DataFrame, str]:
-        query_deadline = (
+        _raise_if_query_cancelled(cancel_event)
+        configured_deadline = (
             time.monotonic() + _configured_query_timeout_sec()
         )
+        if deadline_monotonic is None:
+            query_deadline = configured_deadline
+        else:
+            # A caller may tighten, never extend, the engine's own ceiling.
+            _remaining_query_timeout(deadline_monotonic)
+            query_deadline = min(
+                configured_deadline, float(deadline_monotonic),
+            )
         # Authorization-bearing provider paths must cover the entire admitted
         # request before live config, AUTO routing, or cache state is touched.
         _validate_linked_share_credential_lifetimes(
@@ -2222,6 +2235,10 @@ class Executor:
                         timer_capture=timer_capture,
                         log_prefix=log_prefix,
                         force=(engine == Engine.SPARK_SQL),
+                        deadline_monotonic=query_deadline,
+                        cancel_event=cancel_event,
+                        max_result_rows=materialized_row_limit,
+                        max_result_bytes=materialized_result_bytes,
                     )
                 except BaseException as exc:
                     _record_engine_failure(

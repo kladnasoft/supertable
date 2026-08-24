@@ -11,7 +11,7 @@ import threading
 import time
 from datetime import date, datetime, timezone
 from enum import Enum
-from typing import Callable, Optional, Tuple, Any, List, Dict
+from typing import Callable, Optional, Tuple, Any, List, Dict, Mapping
 
 import pandas as pd
 import polars as pl
@@ -64,11 +64,66 @@ from supertable.tombstone_manifest_v2 import (
     TOMBSTONE_FORMAT_V3,
     validate_snapshot_tombstone_state,
 )
+from supertable.row_identity import ODATA_INTERNAL_ROWID_COLUMN
+from supertable.odata_continuation import (
+    ODataContinuationBoundary,
+    bind_odata_continuation_boundary,
+    normalized_odata_order,
+    validate_odata_continuation_boundary,
+)
 
 
 class Status(Enum):
     OK = "ok"
     ERROR = "error"
+
+
+# Process-local capability used only by ``query_odata_sql_stream``.  The raw
+# boundary is deliberately absent from ordinary SQL reader signatures; the
+# private plumbing below also refuses a boundary that did not enter through
+# that trusted wrapper.
+_ODATA_CONTINUATION_CAPABILITY = object()
+
+
+def _odata_identity_binding(parser: SQLParser) -> str:
+    """Validate the deliberately narrow trusted OData SELECT shape."""
+    parsed = getattr(parser, "_parsed", None)
+    if not isinstance(parsed, exp.Select):
+        raise ValueError("OData identity requires one direct SELECT")
+    if any(parsed.args.get(name) is not None for name in (
+        "with_", "group", "having", "qualify", "distinct",
+    )):
+        raise ValueError("OData identity does not support transformed rows")
+    if parsed.args.get("joins"):
+        raise ValueError("OData identity does not support joins")
+    if any(isinstance(node, (exp.Subquery, exp.SetOperation)) for node in parsed.walk()):
+        raise ValueError("OData identity requires one direct table")
+    if any(isinstance(node, exp.AggFunc) for node in parsed.walk()):
+        raise ValueError("OData identity does not support aggregate rows")
+    if any(isinstance(node, exp.Placeholder) for node in parsed.walk()):
+        raise ValueError("OData identity SQL cannot contain parameters")
+    projections = list(parsed.expressions or ())
+    if not projections or any(not isinstance(item, exp.Column) for item in projections):
+        raise ValueError("OData identity requires a direct column projection")
+    for column in parsed.find_all(exp.Column):
+        if str(column.name).casefold() == ODATA_INTERNAL_ROWID_COLUMN.casefold():
+            raise ValueError("OData internal identity cannot be requested in SQL")
+    # OData paging is deterministic only over direct columns.  Validate this
+    # even on the first page so a later continuation cannot reinterpret a
+    # previously accepted expression or NULLS-FIRST order.
+    normalized_odata_order(parsed)
+
+    table_defs = parser.get_table_tuples()
+    physical = parser.get_physical_tables()
+    if len(table_defs) != 1 or len(physical) != 1:
+        raise ValueError("OData identity requires exactly one physical table")
+    table_def = table_defs[0]
+    if (
+        str(table_def.super_name).casefold()
+        == str(table_def.simple_name).casefold()
+    ):
+        raise ValueError("OData identity is unavailable for aggregate relations")
+    return str(table_def.alias)
 
 
 def _cancel_and_close_stream(stream: Any) -> None:
@@ -1047,11 +1102,18 @@ class DataReader:
         _stream_batch_rows: Optional[int] = None,
         _stream_batch_bytes: Optional[int] = None,
         _stream_row_limit: Optional[int] = None,
+        _materialized_row_limit: Optional[int] = None,
+        _materialized_result_bytes: Optional[int] = None,
         _deadline_monotonic: Optional[float] = None,
         _cancel_event: Optional[threading.Event] = None,
         expected_role_policy_fingerprint: Optional[str] = None,
         expected_effective_policy_fingerprint: Optional[str] = None,
         _policy_fingerprint_only: bool = False,
+        _odata_identity: bool = False,
+        _odata_continuation_boundary: Optional[
+            ODataContinuationBoundary
+        ] = None,
+        _odata_continuation_capability: object = None,
     ) -> Tuple[Any, Status, Optional[str]]:
         expected_role_policy_fingerprint = validate_policy_fingerprint(
             expected_role_policy_fingerprint,
@@ -1063,6 +1125,75 @@ class DataReader:
         )
         if not isinstance(_policy_fingerprint_only, bool):
             raise TypeError("_policy_fingerprint_only must be boolean")
+        if not isinstance(_odata_identity, bool):
+            raise TypeError("_odata_identity must be boolean")
+        if _odata_continuation_boundary is not None:
+            if (
+                not _odata_identity
+                or _odata_continuation_capability
+                is not _ODATA_CONTINUATION_CAPABILITY
+                or not isinstance(
+                    _odata_continuation_boundary,
+                    ODataContinuationBoundary,
+                )
+            ):
+                raise ValueError(
+                    "OData continuation requires the trusted OData stream"
+                )
+        if _odata_identity:
+            from supertable.engine.engine_enum import Engine as _EngineEnum
+            if not _streaming or engine is not _EngineEnum.DUCKDB:
+                raise ValueError(
+                    "OData identity requires explicit DuckDB result streaming"
+                )
+        if _materialized_row_limit is not None:
+            if _streaming:
+                raise ValueError(
+                    "a materialized row budget cannot be used with streaming"
+                )
+            if (
+                isinstance(_materialized_row_limit, bool)
+                or not isinstance(_materialized_row_limit, int)
+                or _materialized_row_limit <= 0
+            ):
+                raise ValueError(
+                    "materialized_row_limit must be a positive integer"
+                )
+            # Interactive reads normally stop at SUPERTABLE_MAX_LIMIT.  One
+            # additional row is permitted solely so a bounded service can
+            # distinguish an exact-size result from a truncated response.
+            configured_limit = _positive_budget(
+                "SUPERTABLE_MAX_LIMIT", 10000,
+            )
+            if _materialized_row_limit > configured_limit + 1:
+                raise ValueError(
+                    "materialized_row_limit exceeds the interactive detection "
+                    "ceiling"
+                )
+            if getattr(engine, "value", None) != "spark_sql":
+                raise ValueError(
+                    "materialized result budgets are only available for Spark SQL"
+                )
+        if _materialized_result_bytes is not None:
+            if _materialized_row_limit is None:
+                raise ValueError(
+                    "materialized_result_bytes requires a materialized row budget"
+                )
+            if (
+                isinstance(_materialized_result_bytes, bool)
+                or not isinstance(_materialized_result_bytes, int)
+                or _materialized_result_bytes <= 0
+            ):
+                raise ValueError(
+                    "materialized_result_bytes must be a positive integer"
+                )
+            _materialized_result_bytes = min(
+                _materialized_result_bytes,
+                _positive_budget(
+                    "SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES",
+                    16 * 1024 * 1024,
+                ),
+            )
         self.role_policy_fingerprint = ""
         self.effective_policy_fingerprint = ""
         status = Status.ERROR
@@ -1116,6 +1247,8 @@ class DataReader:
                         "max_total_rows must be a positive integer"
                     )
                 result_limit = _stream_row_limit
+            elif _materialized_row_limit is not None:
+                result_limit = _materialized_row_limit
             # Enforce the server ceiling at the DataReader boundary too.  SDK
             # callers can instantiate DataReader directly and must not bypass
             # query_sql()'s convenience LIMIT injection.  The separate export
@@ -1149,6 +1282,13 @@ class DataReader:
             return pd.DataFrame(), Status.ERROR, str(e)
         tables = parser.get_table_tuples()
         physical_tables = parser.get_physical_tables()
+        odata_identity_alias = (
+            _odata_identity_binding(parser) if _odata_identity else None
+        )
+        odata_continuation_boundary = bind_odata_continuation_boundary(
+            parser._parsed,
+            _odata_continuation_boundary,
+        ) if _odata_identity else None
 
         try:
             aggregate_children = self._resolve_aggregate_children(
@@ -1624,6 +1764,42 @@ class DataReader:
                             where_clause=share_row_filter,
                         )
 
+            if _odata_identity:
+                if (
+                    odata_identity_alias is None
+                    or len(reflection.supers) != 1
+                ):
+                    raise RuntimeError(
+                        "OData stable identity is unavailable for this relation"
+                    )
+                identity_snapshot = reflection.supers[0]
+                if (
+                    getattr(identity_snapshot, "stable_rowid_contract", False)
+                    is not True
+                    or getattr(
+                        identity_snapshot, "share_policy_fingerprint", None,
+                    ) is not None
+                ):
+                    raise RuntimeError(
+                        "OData stable identity is unavailable for this snapshot"
+                    )
+                matching_aliases = [
+                    str(td.alias)
+                    for td in tables
+                    if str(td.alias).casefold()
+                    == str(odata_identity_alias).casefold()
+                ]
+                if len(matching_aliases) != 1:
+                    raise RuntimeError(
+                        "OData stable identity binding is ambiguous"
+                    )
+                reflection.odata_identity_aliases = {
+                    matching_aliases[0]: ODATA_INTERNAL_ROWID_COLUMN,
+                }
+                reflection.odata_continuation_boundary = (
+                    odata_continuation_boundary
+                )
+
             if not reflection.supers:
                 message = "No parquet files found"
                 return pd.DataFrame(), status, message
@@ -1711,7 +1887,12 @@ class DataReader:
                     log_prefix=self._lp(""),
                     explain=command.explain,
                     explain_options=command.explain_options,
+                    deadline_monotonic=_deadline_monotonic,
+                    cancel_event=_cancel_event,
+                    materialized_row_limit=_materialized_row_limit,
+                    materialized_result_bytes=_materialized_result_bytes,
                 )
+                _ensure_request_active(_deadline_monotonic, _cancel_event)
                 result_shape = result_value.shape
                 try:
                     result_bytes = int(
@@ -1894,6 +2075,11 @@ class DataReader:
         _deadline_monotonic: Optional[float] = None,
         expected_role_policy_fingerprint: Optional[str] = None,
         expected_effective_policy_fingerprint: Optional[str] = None,
+        _odata_identity: bool = False,
+        _odata_continuation_boundary: Optional[
+            ODataContinuationBoundary
+        ] = None,
+        _odata_continuation_capability: object = None,
     ) -> Tuple[Any, Status, Optional[str]]:
         """Execute a large RBAC-filtered export as a bounded Arrow stream.
 
@@ -1931,6 +2117,9 @@ class DataReader:
             expected_effective_policy_fingerprint=(
                 expected_effective_policy_fingerprint
             ),
+            _odata_identity=_odata_identity,
+            _odata_continuation_boundary=_odata_continuation_boundary,
+            _odata_continuation_capability=_odata_continuation_capability,
         )
 
 
@@ -2738,6 +2927,11 @@ def query_sql_stream(
     cancel_event: Optional[threading.Event] = None,
     expected_role_policy_fingerprint: Optional[str] = None,
     expected_effective_policy_fingerprint: Optional[str] = None,
+    _odata_identity: bool = False,
+    _odata_continuation_boundary: Optional[
+        ODataContinuationBoundary
+    ] = None,
+    _odata_continuation_capability: object = None,
 ) -> Any:
     """Return a bounded, RBAC-filtered Arrow export stream without Python rows.
 
@@ -2756,6 +2950,16 @@ def query_sql_stream(
         expected_effective_policy_fingerprint,
         label="expected_effective_policy_fingerprint",
     )
+    if _odata_continuation_boundary is not None and (
+        not _odata_identity
+        or _odata_continuation_capability
+        is not _ODATA_CONTINUATION_CAPABILITY
+        or not isinstance(
+            _odata_continuation_boundary,
+            ODataContinuationBoundary,
+        )
+    ):
+        raise ValueError("OData continuation requires the trusted OData stream")
     _validate_query_text_size(sql)
     _ensure_request_active(request_deadline, cancel_event)
     if (
@@ -2821,6 +3025,9 @@ def query_sql_stream(
             expected_effective_policy_fingerprint=(
                 expected_effective_policy_fingerprint
             ),
+            _odata_identity=_odata_identity,
+            _odata_continuation_boundary=_odata_continuation_boundary,
+            _odata_continuation_capability=_odata_continuation_capability,
         )
     except BaseException:
         _update_query_out(reader, out, requested_engine=engine)
@@ -2832,4 +3039,58 @@ def query_sql_stream(
     return _QueryOutResultStream(
         stream,
         lambda: _update_query_out(reader, out, requested_engine=engine),
+    )
+
+
+def query_odata_sql_stream(
+    organization: str,
+    super_name: str,
+    sql: str,
+    role_name: str,
+    *,
+    max_total_rows: int,
+    timeout_sec: float,
+    source: str = "odata",
+    out: Optional[Dict[str, Any]] = None,
+    max_batch_rows: Optional[int] = None,
+    max_batch_bytes: Optional[int] = None,
+    cancel_event: Optional[threading.Event] = None,
+    expected_role_policy_fingerprint: Optional[str] = None,
+    expected_effective_policy_fingerprint: Optional[str] = None,
+    continuation_boundary: Optional[Mapping[str, Any]] = None,
+) -> Any:
+    """Trusted keyed OData stream over one proven local table.
+
+    The returned Arrow schema contains the fixed private
+    ``__supertable_odata_rowid__`` column after deletion-vector and RBAC
+    filtering.  Core must replace it with a deployment-keyed opaque identifier
+    before returning a response.  This path is intentionally DuckDB-only and
+    never changes ordinary SDK SELECT visibility.
+    """
+    from supertable.engine.engine_enum import Engine
+
+    validated_boundary = validate_odata_continuation_boundary(
+        continuation_boundary
+    )
+
+    return query_sql_stream(
+        organization=organization,
+        super_name=super_name,
+        sql=sql,
+        engine=Engine.DUCKDB,
+        role_name=role_name,
+        max_total_rows=max_total_rows,
+        timeout_sec=timeout_sec,
+        source=source,
+        out=out,
+        max_batch_rows=max_batch_rows,
+        max_batch_bytes=max_batch_bytes,
+        cancel_event=cancel_event,
+        expected_role_policy_fingerprint=expected_role_policy_fingerprint,
+        expected_effective_policy_fingerprint=(
+            expected_effective_policy_fingerprint
+        ),
+        _odata_identity=True,
+        _odata_continuation_boundary=validated_boundary,
+        _odata_continuation_capability=_ODATA_CONTINUATION_CAPABILITY,
     )

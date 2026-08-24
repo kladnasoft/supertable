@@ -379,6 +379,10 @@ class SuperSnapshot:
     resource_credential_expires_ms: List[Optional[int]] = field(
         default_factory=list
     )
+    # True only when the exact pinned local snapshot carries the modern
+    # writer's complete table-global ``__rowid__`` contract.  Ordinary reads
+    # ignore this proof and continue to strip every system column.
+    stable_rowid_contract: bool = False
 
 
 @dataclass
@@ -526,3 +530,12 @@ class Reflection:
     # from the conservative total decoded work bound.
     proof_decoded_bytes: int = 0
     proof_decoded_bytes_complete: bool = False
+    # Trusted OData-only alias -> protected raw identity projection.  Empty for
+    # every ordinary SDK read.  Trailing to preserve Reflection's positional
+    # constructor compatibility.
+    odata_identity_aliases: Dict[str, str] = field(default_factory=dict)
+    # Immutable, already validated OData keyset state.  Only the trusted
+    # ``query_odata_sql_stream`` boundary can populate this; ordinary reads
+    # leave it ``None`` and cannot expose or predicate on the protected row id.
+    # Kept trailing for positional constructor compatibility.
+    odata_continuation_boundary: object = None

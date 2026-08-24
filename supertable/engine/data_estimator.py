@@ -51,6 +51,7 @@ from supertable.processing import (
 from supertable.tombstone_manifest_v2 import (
     normalize_snapshot_tombstone_state,
 )
+from supertable.row_identity import snapshot_proves_stable_rowids
 
 
 def _safe_path_for_log(value: object) -> str:
@@ -1832,6 +1833,10 @@ class DataEstimator:
                             linked=share_policy_fingerprint is not None,
                         )
                     )
+                    stable_rowid_contract = snapshot_proves_stable_rowids(
+                        current_snapshot_data,
+                        snapshot,
+                    )
                     pinned_snapshot_metadata.append({
                         "path": current_snapshot_path,
                         "table_name": snapshot.get("table_name"),
@@ -1848,6 +1853,7 @@ class DataEstimator:
                         "share_publication_generation": (
                             share_publication_generation
                         ),
+                        "stable_rowid_contract": stable_rowid_contract,
                     })
 
                     lowered_schema = dict_keys_to_lowercase(current_schema)
@@ -2596,6 +2602,9 @@ class DataEstimator:
                     ),
                     resource_credential_expires_ms=(
                         resource_credential_expires_ms
+                    ),
+                    stable_rowid_contract=(
+                        pinned.get("stable_rowid_contract") is True
                     ),
                     row_group_selections=literal_row_groups,
                     candidate_rows=(selected_rows if selected_rows_complete else 0),

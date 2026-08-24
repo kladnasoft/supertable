@@ -344,6 +344,9 @@ def test_unrestricted_linked_share_reuses_duckdb_bytes_after_signature_rotation(
         assert len(origin.requests) == first_request_count
         metrics = stable_http_relay_metrics()
         assert metrics["upstream_bytes"] == first_bytes
+        # A late DuckDB probe after the first lease was revoked remains an
+        # immediate 404 and is counted separately as retired_route_requests.
+        # No request against an active or never-issued route may be rejected.
         assert metrics["rejected_requests"] == 0
     finally:
         second_lease.close()
@@ -1095,6 +1098,41 @@ def test_relay_metrics_never_expose_identity_or_upstream_url(origin):
         assert "secret" not in serialized
     finally:
         lease.close()
+
+
+def test_request_after_last_lease_is_fail_closed_and_classified_as_retired(
+    origin,
+):
+    relay = _get_relay()
+    lease = relay.register(
+        "local-cache-v1:" + "7" * 64,
+        f"http://127.0.0.1:{origin.server.server_port}/data?signature=retired",
+        expected_size=len(origin.payload),
+        expected_etag=origin.etag,
+        credential_expires_ms=int(time.time() * 1_000) + 60_000,
+        credential_generation=70,
+    )
+    retired_url = lease.url
+    lease.close()
+
+    with pytest.raises(HTTPError) as caught:
+        urlopen(Request(retired_url, method="HEAD"), timeout=1.0)
+    assert caught.value.code == 404
+    metrics = stable_http_relay_metrics()
+    assert metrics["active_routes"] == 0
+    assert metrics["upstream_requests"] == 0
+    assert metrics["retired_route_requests"] == 1
+    assert metrics["rejected_requests"] == 0
+
+    # An arbitrary opaque-looking route remains an ordinary rejected request;
+    # only a route this relay actually retired receives lifecycle classification.
+    unknown_url = retired_url.rsplit("/", 1)[0] + "/" + "f" * 64
+    with pytest.raises(HTTPError) as unknown:
+        urlopen(Request(unknown_url, method="HEAD"), timeout=1.0)
+    assert unknown.value.code == 404
+    metrics = stable_http_relay_metrics()
+    assert metrics["retired_route_requests"] == 1
+    assert metrics["rejected_requests"] == 1
 
 
 def test_shutdown_erases_active_route_and_old_lease_is_idempotent(origin):

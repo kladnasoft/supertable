@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Dict, Any, Optional
+from typing import Any, Callable, Dict, Optional
 
 from supertable.config.defaults import logger
 from supertable.rbac.role_manager import RoleManager
@@ -15,6 +15,26 @@ from supertable.redis_catalog import RedisCatalog
 from supertable.redis_keys import is_reserved_super_name, RESERVED_SUPER_NAMES
 from supertable.rbac.access_control import resolve_role_access_context
 from supertable.rbac.permissions import Permission, RoleType
+
+
+class NamespaceCleanupPostCommitError(RuntimeError):
+    """The namespace deletion committed but an application cleanup failed.
+
+    ``core_committed`` and ``core_result`` deliberately mirror the SDK's
+    other post-commit exceptions so HTTP/control-plane adapters can prohibit a
+    destructive retry while directing operators to reconcile the auxiliary
+    state.  The original exception remains available only through exception
+    chaining; its potentially sensitive text is never copied into this error.
+    """
+
+    def __init__(self, intent_id: str) -> None:
+        self.intent_id = str(intent_id)
+        self.core_committed = True
+        self.core_result = self.intent_id
+        self.subsystem = "platform_cleanup"
+        super().__init__(
+            "SuperTable deletion committed, but fenced platform cleanup failed"
+        )
 
 
 class SuperTable:
@@ -154,7 +174,13 @@ class SuperTable:
 
 
     # ------------------------------------------------------------------ delete
-    def delete(self, role_name) -> str:
+    def delete(
+            self,
+            role_name: str,
+            *,
+            authorization_callback: Optional[Callable[[], str]] = None,
+            post_delete_cleanup_callback: Optional[Callable[[], Any]] = None,
+    ) -> str:
         """Delete this SuperTable's data metadata and storage folder.
 
         WARNING: This is destructive and intended for admin flows.
@@ -163,8 +189,19 @@ class SuperTable:
         control data and may only be removed through its dedicated mandatory
         audit boundary; recreating the same SuperTable therefore cannot reset
         or silently widen its prior access policy.
+
+        ``authorization_callback`` refreshes the caller's live role after the
+        namespace fence is acquired and again immediately before irreversible
+        storage deletion. ``post_delete_cleanup_callback`` is a deliberately
+        narrow integration hook: it runs only after authoritative namespace
+        deletion has committed and while the renewable namespace lock is still
+        held, so a concurrent recreation cannot be mistaken for stale state.
         """
-        return self._delete_with_intent(role_name=role_name)
+        return self._delete_with_intent(
+            role_name=role_name,
+            authorization_callback=authorization_callback,
+            post_delete_cleanup_callback=post_delete_cleanup_callback,
+        )
 
     def recover_delete(
             self,
@@ -172,12 +209,16 @@ class SuperTable:
             *,
             intent_id: str,
             confirm_previous_owner_stopped: bool = False,
+            authorization_callback: Optional[Callable[[], str]] = None,
+            post_delete_cleanup_callback: Optional[Callable[[], Any]] = None,
     ) -> str:
         """Resume an abandoned namespace deletion after liveness proof."""
         return self._delete_with_intent(
             role_name=role_name,
             recovery_intent_id=intent_id,
             confirm_previous_owner_stopped=confirm_previous_owner_stopped,
+            authorization_callback=authorization_callback,
+            post_delete_cleanup_callback=post_delete_cleanup_callback,
         )
 
     def _delete_with_intent(
@@ -186,6 +227,8 @@ class SuperTable:
             role_name: str,
             recovery_intent_id: Optional[str] = None,
             confirm_previous_owner_stopped: bool = False,
+            authorization_callback: Optional[Callable[[], str]] = None,
+            post_delete_cleanup_callback: Optional[Callable[[], Any]] = None,
     ) -> str:
         # Deleting the namespace also deletes every child table.  A scoped
         # ADMIN could otherwise authorize the parent through ``*`` and erase a
@@ -193,17 +236,25 @@ class SuperTable:
         # structural lock that can make a per-child preflight race-free, so the
         # parent destructive operation is reserved for the trusted SUPERADMIN
         # control plane.  SimpleTable.delete remains table-policy aware.
-        context = resolve_role_access_context(
-            super_name=self.super_name,
-            organization=self.organization,
-            role_name=role_name,
-            permission=Permission.CONTROL,
-            label="delete this SuperTable",
-        )
-        if context.role_type is not RoleType.SUPERADMIN:
-            raise PermissionError(
-                "Only SUPERADMIN can delete an entire SuperTable namespace."
+        def _authorize(candidate_role: str) -> str:
+            if not isinstance(candidate_role, str) or not candidate_role:
+                raise PermissionError(
+                    "Current SuperTable deletion authorization is unavailable."
+                )
+            context = resolve_role_access_context(
+                super_name=self.super_name,
+                organization=self.organization,
+                role_name=candidate_role,
+                permission=Permission.CONTROL,
+                label="delete this SuperTable",
             )
+            if context.role_type is not RoleType.SUPERADMIN:
+                raise PermissionError(
+                    "Only SUPERADMIN can delete an entire SuperTable namespace."
+                )
+            return candidate_role
+
+        role_name = _authorize(role_name)
 
         base_dir = os.path.join(self.organization, self.super_name)
         namespace_token = self.catalog.acquire_namespace_lock(
@@ -217,6 +268,8 @@ class SuperTable:
         leaf_tokens: Dict[str, str] = {}
         stage_tokens: Dict[str, str] = {}
         try:
+            if authorization_callback is not None:
+                role_name = _authorize(authorization_callback())
             if recovery_intent_id is None:
                 clones = self.catalog.find_clones_strict(
                     self.organization,
@@ -376,6 +429,12 @@ class SuperTable:
                         )
                     stage_tokens[name] = token
 
+            # This is the last authorization boundary before irreversible I/O.
+            # It runs after every in-flight writer/stager has been drained, so
+            # revocation during a long drain cannot authorize the deletion.
+            if authorization_callback is not None:
+                role_name = _authorize(authorization_callback())
+
             # Object-store prefixes normally have no exact marker object. The
             # backend operation drains and verifies the full prefix while no
             # existing or newly-created table can publish into it.
@@ -390,16 +449,24 @@ class SuperTable:
                 namespace_token=namespace_token,
                 intent_id=intent_id,
             )
-            if recovery_intent_id is not None:
-                self.catalog.clear_namespace_deletion_tombstone(
-                    self.organization,
-                    self.super_name,
-                    expected_intent_id=intent_id,
-                    namespace_token=namespace_token,
-                    confirm_previous_owner_stopped=(
-                        confirm_previous_owner_stopped
-                    ),
-                )
+            try:
+                if post_delete_cleanup_callback is not None:
+                    post_delete_cleanup_callback()
+                if recovery_intent_id is not None:
+                    self.catalog.clear_namespace_deletion_tombstone(
+                        self.organization,
+                        self.super_name,
+                        expected_intent_id=intent_id,
+                        namespace_token=namespace_token,
+                        confirm_previous_owner_stopped=(
+                            confirm_previous_owner_stopped
+                        ),
+                    )
+            except Exception as exc:
+                # The storage and authoritative catalog namespace are already
+                # gone. Preserve that exact outcome and prohibit callers from
+                # retrying either the ordinary or recovery deletion.
+                raise NamespaceCleanupPostCommitError(str(intent_id)) from exc
         finally:
             for name, token in reversed(list(stage_tokens.items())):
                 self.catalog.release_stage_lock(
@@ -423,6 +490,8 @@ class SuperTable:
             role_name: str,
             intent_id: str,
             confirm_previous_owner_stopped: bool = False,
+            authorization_callback: Optional[Callable[[], str]] = None,
+            post_delete_cleanup_callback: Optional[Callable[[], Any]] = None,
     ) -> str:
         """Recover a namespace after its root was already removed."""
         table = cls.__new__(cls)
@@ -436,4 +505,6 @@ class SuperTable:
             role_name,
             intent_id=intent_id,
             confirm_previous_owner_stopped=confirm_previous_owner_stopped,
+            authorization_callback=authorization_callback,
+            post_delete_cleanup_callback=post_delete_cleanup_callback,
         )

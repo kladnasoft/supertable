@@ -38,6 +38,7 @@ from supertable.utils.sql_parser import (
     _build_scoped_table_bindings,
     validate_read_query_ast,
 )
+from supertable.row_identity import ODATA_INTERNAL_ROWID_COLUMN
 
 
 # =========================================================
@@ -2352,6 +2353,7 @@ def create_rbac_view(
         base_table_name: str,
         view_name: str,
         rbac_view_def,
+        required_internal_columns: Optional[List[str]] = None,
 ) -> None:
     """
     Create a filtered view on top of a reflection table for RBAC enforcement.
@@ -2387,6 +2389,10 @@ def create_rbac_view(
     }
     described = None
     actual_columns = None
+    required = list(required_internal_columns or ())
+    if required not in ([], [ODATA_INTERNAL_ROWID_COLUMN]):
+        raise RuntimeError("Invalid protected RBAC projection request")
+    required_folds = {name.casefold() for name in required}
 
     def _actual_columns() -> List[str]:
         nonlocal described, actual_columns
@@ -2400,14 +2406,25 @@ def create_rbac_view(
                 )
         return actual_columns
 
+    if required:
+        actual = _actual_columns()
+        matches = [
+            name for name in actual
+            if name.casefold() in required_folds
+        ]
+        if matches != required:
+            raise RuntimeError("Protected OData identity column is unavailable")
+
     if rbac_view_def.allowed_columns == ["*"]:
-        if excluded:
+        if excluded or required:
             visible = [
                 name for name in _actual_columns()
                 if name.casefold() not in excluded
+                and name.casefold() not in required_folds
             ]
             if not visible:
                 raise PermissionError("RBAC policy excludes every visible column")
+            visible.extend(required)
             select_cols = ", ".join(_quote_policy_column(c) for c in visible)
         else:
             select_cols = "*"
@@ -2415,10 +2432,13 @@ def create_rbac_view(
         allowed = {str(c).casefold() for c in rbac_view_def.allowed_columns}
         visible = [
             name for name in _actual_columns()
-            if name.casefold() in allowed and name.casefold() not in excluded
+            if name.casefold() in allowed
+            and name.casefold() not in excluded
+            and name.casefold() not in required_folds
         ]
         if not visible:
             raise PermissionError("RBAC policy excludes every allowed column")
+        visible.extend(required)
         select_cols = ", ".join(_quote_policy_column(c) for c in visible)
 
     # Row filter
@@ -3310,6 +3330,7 @@ def create_tombstone_view(
         view_name: str,
         tombstone_def,
         dv_table: Optional[str] = None,
+        preserve_rowid_as: Optional[str] = None,
 ) -> None:
     """
     Create a view that hides the system columns and drops tombstoned rows.
@@ -3358,6 +3379,8 @@ def create_tombstone_view(
         f"COLUMNS(c -> c NOT IN ('{ROWID_COL}', '{TIMESTAMP_COL}', "
         f"'{TOMBSTONE_FILE_COL}', '{SOURCE_FILE_COL}', '{SCAN_FILENAME_COL}'))"
     )
+    if preserve_rowid_as not in (None, ODATA_INTERNAL_ROWID_COLUMN):
+        raise RuntimeError("Invalid protected row-id projection request")
 
     tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
     expected_rows = getattr(tombstone_def, "expected_rows", None) if tombstone_def else None
@@ -3410,6 +3433,16 @@ def create_tombstone_view(
                 f"Invalid reserved system column in reflection schema: {name!r}"
             )
         seen_reserved.add(folded)
+    if preserve_rowid_as is not None:
+        rowid_rows = [row for row in source_desc if str(row[0]) == ROWID_COL]
+        if len(rowid_rows) != 1 or str(rowid_rows[0][1]).upper() != "BIGINT":
+            raise RuntimeError(
+                "OData identity requires canonical __rowid__ BIGINT"
+            )
+        live_cols = (
+            f"{live_cols}, {source_table}.{rid} AS "
+            f"{quote_if_needed(preserve_rowid_as)}"
+        )
     if tomb_path:
         rowid_rows = [row for row in source_desc if str(row[0]) == ROWID_COL]
         if len(rowid_rows) != 1 or str(rowid_rows[0][1]).upper() != "BIGINT":

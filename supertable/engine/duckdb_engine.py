@@ -12,6 +12,8 @@ from urllib.parse import urlsplit
 
 import duckdb
 import pandas as pd
+import sqlglot
+from sqlglot import exp
 
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
@@ -46,6 +48,12 @@ from supertable.engine.stable_http_relay import (
     alias_stable_remote_paths,
 )
 from supertable.engine.remote_paths import is_remote_scan_path
+from supertable.row_identity import ODATA_INTERNAL_ROWID_COLUMN
+from supertable.odata_continuation import (
+    ODataContinuationBoundary,
+    bind_odata_continuation_boundary,
+    normalized_odata_order,
+)
 
 
 def _fresh_validated_duckdb_parser(parser: SQLParser) -> SQLParser:
@@ -79,6 +87,164 @@ def _fresh_validated_duckdb_parser(parser: SQLParser) -> SQLParser:
             getattr(parser, "allow_bounded_collection_aggregates", False) is True
         ),
     )
+
+
+def _append_protected_odata_identity(sql: str, column_name: str) -> str:
+    """Append the fixed raw identity projection and final ordering key."""
+    prepared, parameters = _prepare_protected_odata_query(
+        sql, column_name, None,
+    )
+    assert not parameters
+    return prepared
+
+
+def _odata_seek_predicate(
+    order_terms: list[exp.Ordered],
+    boundary: ODataContinuationBoundary,
+    identity: exp.Column,
+) -> tuple[exp.Expression, list[Any]]:
+    """Build the NULLS-LAST lexicographic predicate with bound values."""
+
+    predicate: exp.Expression = exp.GT(
+        this=identity.copy(), expression=exp.Placeholder(),
+    )
+    parameters: list[Any] = [boundary.row_identity]
+
+    for term, supplied in reversed(list(zip(order_terms, boundary.order))):
+        column = term.this.copy()
+        value = supplied.value.value
+        equal: exp.Expression
+        if value is None:
+            # NULL is the final value class for both directions.  Only another
+            # NULL can tie it and advance to a later key/row identity.
+            greater = exp.false()
+            equal = exp.Is(this=column.copy(), expression=exp.Null())
+            greater_parameters: list[Any] = []
+            equal_parameters: list[Any] = []
+        else:
+            comparison_type = exp.LT if supplied.direction == "desc" else exp.GT
+            comparison = comparison_type(
+                this=column.copy(), expression=exp.Placeholder(),
+            )
+            # NULLS LAST means every NULL sorts after every non-NULL value,
+            # independent of ASC/DESC direction.
+            greater = exp.or_(
+                comparison,
+                exp.Is(this=column.copy(), expression=exp.Null()),
+            )
+            equal = exp.NullSafeEQ(
+                this=column.copy(), expression=exp.Placeholder(),
+            )
+            greater_parameters = [value]
+            equal_parameters = [value]
+        predicate = exp.or_(greater, exp.and_(equal, predicate))
+        parameters = greater_parameters + equal_parameters + parameters
+    return predicate, parameters
+
+
+def _render_protected_odata_select(parsed: exp.Select) -> str:
+    """Render the final direct SELECT with explicit NULLS LAST ordering."""
+    order = parsed.args.get("order")
+    if not isinstance(order, exp.Order) or not order.expressions:
+        raise RuntimeError("Protected OData query has no deterministic order")
+    terms = list(order.expressions)
+    if any(
+        not isinstance(term, exp.Ordered)
+        or not isinstance(term.this, exp.Column)
+        for term in terms
+    ):
+        raise RuntimeError("Protected OData ordering is invalid")
+
+    head = parsed.copy()
+    rendered_order = head.args.get("order")
+    limit = head.args.get("limit")
+    offset = head.args.get("offset")
+    head.set("order", None)
+    head.set("limit", None)
+    head.set("offset", None)
+    sql = head.sql(dialect="duckdb")
+    assert isinstance(rendered_order, exp.Order)
+    sql += " ORDER BY " + ", ".join(
+        f"{term.this.sql(dialect='duckdb')} "
+        f"{'DESC' if term.args.get('desc') is True else 'ASC'} NULLS LAST"
+        for term in rendered_order.expressions
+    )
+    if limit is not None:
+        sql += " " + limit.sql(dialect="duckdb")
+    if offset is not None:
+        sql += " " + offset.sql(dialect="duckdb")
+    return sql
+
+
+def _prepare_protected_odata_query(
+    sql: str,
+    column_name: str,
+    continuation_boundary: Optional[ODataContinuationBoundary],
+) -> tuple[str, list[Any]]:
+    """Add identity/order and an optional parameterised keyset boundary."""
+    if column_name != ODATA_INTERNAL_ROWID_COLUMN:
+        raise RuntimeError("Invalid protected OData identity projection")
+    try:
+        parsed = sqlglot.parse_one(sql, read="duckdb")
+    except Exception as exc:
+        raise RuntimeError("Unable to prepare protected OData query") from exc
+    if (
+        not isinstance(parsed, exp.Select)
+        or parsed.args.get("joins")
+        or any(parsed.args.get(name) is not None for name in (
+            "with_", "group", "having", "qualify", "distinct",
+        ))
+        or any(
+            isinstance(node, (exp.Subquery, exp.SetOperation, exp.AggFunc))
+            for node in parsed.walk()
+        )
+        or len(list(parsed.find_all(exp.Table))) != 1
+    ):
+        raise RuntimeError("Protected OData identity requires one direct SELECT")
+    if any(
+        str(column.name).casefold() == column_name.casefold()
+        for column in parsed.find_all(exp.Column)
+    ):
+        raise RuntimeError("Protected OData identity was present in user SQL")
+    try:
+        normalized_odata_order(parsed)
+        continuation_boundary = bind_odata_continuation_boundary(
+            parsed, continuation_boundary,
+        )
+    except ValueError as exc:
+        raise RuntimeError("Protected OData continuation is invalid") from exc
+
+    identity = exp.column(column_name, quoted=True)
+    parameters: list[Any] = []
+    if continuation_boundary is not None:
+        order = parsed.args.get("order")
+        order_terms = (
+            list(order.expressions) if isinstance(order, exp.Order) else []
+        )
+        predicate, parameters = _odata_seek_predicate(
+            order_terms,
+            continuation_boundary,
+            identity,
+        )
+        current_where = parsed.args.get("where")
+        if current_where is None:
+            parsed.set("where", exp.Where(this=predicate))
+        else:
+            parsed.set(
+                "where",
+                exp.Where(this=exp.and_(current_where.this.copy(), predicate)),
+            )
+    parsed.select(identity.copy(), append=True, copy=False)
+    parsed.order_by(
+        exp.Ordered(
+            this=identity,
+            desc=False,
+            nulls_first=False,
+        ),
+        append=True,
+        copy=False,
+    )
+    return _render_protected_odata_select(parsed), parameters
 
 
 def _harden_user_query_connection(con: duckdb.DuckDBPyConnection) -> None:
@@ -1313,6 +1479,39 @@ class DuckDB:
         caller_parser = parser
         parser = _fresh_validated_duckdb_parser(caller_parser)
         validated_ast = parser._parsed
+        odata_identity_aliases = dict(
+            getattr(reflection, "odata_identity_aliases", None) or {}
+        )
+        odata_continuation_boundary = getattr(
+            reflection, "odata_continuation_boundary", None,
+        )
+        if odata_continuation_boundary is not None and not isinstance(
+            odata_continuation_boundary, ODataContinuationBoundary,
+        ):
+            raise RuntimeError("Invalid protected OData continuation request")
+        if odata_continuation_boundary is not None and not odata_identity_aliases:
+            raise RuntimeError("Invalid protected OData continuation request")
+        if odata_identity_aliases:
+            if (
+                not _streaming
+                or explain
+                or len(odata_identity_aliases) != 1
+                or list(odata_identity_aliases.values())
+                != [ODATA_INTERNAL_ROWID_COLUMN]
+            ):
+                raise RuntimeError("Invalid protected OData identity request")
+            table_aliases = {str(td.alias) for td in parser.get_table_tuples()}
+            if set(odata_identity_aliases) != table_aliases:
+                raise RuntimeError("Protected OData identity binding is invalid")
+            try:
+                odata_continuation_boundary = bind_odata_continuation_boundary(
+                    validated_ast,
+                    odata_continuation_boundary,
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Invalid protected OData continuation request"
+                ) from exc
         _assert_reflection_covers_requested_tables(parser, reflection)
         validate_rbac_binding_stability(
             parser,
@@ -1706,8 +1905,13 @@ class DuckDB:
                 if not files:
                     td = next(t for t in table_defs if t.alias == alias)
                     sup = snapshots_by_key[(td.super_name, td.simple_name)]
+                    empty_types = dict(
+                        getattr(sup, "column_types", {}) or {}
+                    )
+                    if alias in odata_identity_aliases:
+                        empty_types["__rowid__"] = "int64"
                     create_typed_empty_view(
-                        con, table_name, dict(getattr(sup, "column_types", {}) or {}), cols,
+                        con, table_name, empty_types, cols,
                     )
                     created_views.append(table_name)
                     continue
@@ -1774,7 +1978,14 @@ class DuckDB:
                     acquired_dv_keys.append(
                         getattr(dv_table, "cache_key", cache_key)
                     )
-                create_tombstone_view(con, source, view, tomb_def, dv_table=dv_table)
+                create_tombstone_view(
+                    con,
+                    source,
+                    view,
+                    tomb_def,
+                    dv_table=dv_table,
+                    preserve_rowid_as=odata_identity_aliases.get(alias),
+                )
                 created_views.append(view)
                 query_alias_to_name[alias] = view
 
@@ -1787,7 +1998,16 @@ class DuckDB:
                     if view_def:
                         source = query_alias_to_name[alias]
                         view = f"rbac_{source}_{query_suffix}"
-                        create_rbac_view(con, source, view, view_def)
+                        create_rbac_view(
+                            con,
+                            source,
+                            view,
+                            view_def,
+                            required_internal_columns=(
+                                [odata_identity_aliases[alias]]
+                                if alias in odata_identity_aliases else None
+                            ),
+                        )
                         created_views.append(view)
                         query_alias_to_name[alias] = view
 
@@ -1797,6 +2017,15 @@ class DuckDB:
                 parsed_expression=validated_ast,
                 default_super_name=parser.default_super_name,
             )
+            executing_parameters: list[Any] = []
+            if odata_identity_aliases:
+                executing_query, executing_parameters = (
+                    _prepare_protected_odata_query(
+                    executing_query,
+                    next(iter(odata_identity_aliases.values())),
+                    odata_continuation_boundary,
+                    )
+                )
             # EXPLAIN [ANALYZE] wrapper: ask DuckDB for the plan of the rewritten
             # query (over the reflection/tombstone/RBAC view chain) instead of
             # the rows. The prefix is applied to the final SQL so the plan
@@ -1840,7 +2069,11 @@ class DuckDB:
             logger.debug(f"{log_prefix}[duckdb] executing: {executing_query}")
             check_deadline()
             backend_phase = "query execution"
-            query_result = con.execute(executing_query)
+            query_result = (
+                con.execute(executing_query, executing_parameters)
+                if executing_parameters
+                else con.execute(executing_query)
+            )
             check_deadline()
 
             if _streaming:

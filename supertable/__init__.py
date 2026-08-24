@@ -47,6 +47,9 @@ _LAZY_EXPORTS = {
     "DataWriter": ("supertable.data_writer", "DataWriter"),
     "DataReader": ("supertable.data_reader", "DataReader"),
     "query_sql_stream": ("supertable.data_reader", "query_sql_stream"),
+    "query_odata_sql_stream": (
+        "supertable.data_reader", "query_odata_sql_stream",
+    ),
     "query_sql_policy_fingerprint": (
         "supertable.data_reader", "query_sql_policy_fingerprint",
     ),
@@ -81,6 +84,7 @@ def __dir__() -> list[str]:
 if TYPE_CHECKING:
     from supertable.data_reader import (
         DataReader,
+        query_odata_sql_stream,
         query_sql_policy_fingerprint,
         query_sql_stream,
     )
@@ -106,6 +110,7 @@ __all__ = [
     "DataWriter",
     "DataReader",
     "query_sql_stream",
+    "query_odata_sql_stream",
     "query_sql_policy_fingerprint",
     "engine",
     "MetaReader",
