@@ -140,6 +140,14 @@ def bootstrap_hermetic_env(home: Optional[str] = None) -> str:
     except Exception:
         pass
 
+    # Processing also retains a process-global storage handle. Clear it so a
+    # test rooted at one temporary directory cannot leak into the next test.
+    try:
+        import supertable.processing as processing
+        processing._storage = None
+    except Exception:
+        pass
+
     if _ENV_BOOTSTRAPPED:
         return os.environ["SUPERTABLE_HOME"]
 
