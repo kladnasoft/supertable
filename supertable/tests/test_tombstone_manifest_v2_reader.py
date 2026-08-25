@@ -1427,7 +1427,7 @@ def test_simple_table_export_v2_matches_logical_live_rows(
         tmp_path, monkeypatch,
 ) -> None:
     table, storage = _local_export_table(tmp_path)
-    monkeypatch.setattr(processing, "_storage", storage)
+    monkeypatch.setattr(processing, "_get_storage", lambda: storage)
 
     result = table.export_to("exports/good")
 
@@ -1455,7 +1455,7 @@ def test_simple_table_export_v3_matches_logical_live_rows(
         "tombstone_format": TOMBSTONE_FORMAT_V3,
     })
     table.get_simple_table_snapshot = lambda: (snapshot, snapshot_path)
-    monkeypatch.setattr(processing, "_storage", storage)
+    monkeypatch.setattr(processing, "_get_storage", lambda: storage)
 
     result = table.export_to("exports/good-v3")
 
@@ -1484,7 +1484,7 @@ def test_simple_table_export_rejects_v3_artifact_outside_tombstone_prefix(
         "tombstone_format": TOMBSTONE_FORMAT_V3,
     })
     table.get_simple_table_snapshot = lambda: (snapshot, snapshot_path)
-    monkeypatch.setattr(processing, "_storage", storage)
+    monkeypatch.setattr(processing, "_get_storage", lambda: storage)
 
     with pytest.raises(ValueError, match="escapes the pinned simple table"):
         table.export_to("exports/foreign-v3")
