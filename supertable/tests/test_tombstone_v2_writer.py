@@ -97,11 +97,31 @@ def test_pinned_snapshot_validation_normalizes_pre_dv_document():
     assert "tombstone_format" not in snapshot
 
 
+def test_pinned_snapshot_validation_normalizes_v2_4_empty_document():
+    snapshot = {
+        "snapshot_version": 1,
+        "schema": {},
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+    }
+
+    DataWriter._validate_pinned_tombstone_state(snapshot)
+
+    assert snapshot["tombstone"] is None
+    assert snapshot["tombstone_rows"] == 0
+    assert snapshot["tombstone_digest"] is None
+    assert "tombstone_format" not in snapshot
+
+
 @pytest.mark.parametrize(
     "partial_state",
     [
         {"tombstone_rows": 0},
-        {"tombstone": None, "tombstone_rows": 0},
+        {
+            "tombstone": "table/tombstone/deleted.parquet",
+            "tombstone_rows": 1,
+        },
         {"tombstone_format": TOMBSTONE_FORMAT_V1},
     ],
 )

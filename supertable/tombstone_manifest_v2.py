@@ -64,6 +64,10 @@ _SNAPSHOT_TOMBSTONE_FIELDS = frozenset({
     "tombstone_rows",
     "tombstone_digest",
 })
+_V2_4_EMPTY_SNAPSHOT_TOMBSTONE_FIELDS = frozenset({
+    "tombstone",
+    "tombstone_rows",
+})
 _RawManifest = Union[Mapping[str, Any], str, bytes, bytearray, memoryview]
 
 
@@ -293,11 +297,11 @@ def normalize_snapshot_tombstone_state(
     """Validate an authoritative snapshot, including its historical shape.
 
     Snapshots written before deletion-vector metadata existed omitted all
-    three state fields and the format discriminator.  That exact document
-    shape is unambiguously the legacy empty state.  Once any state field or
-    the discriminator is present, all three state fields are required and the
-    scalar validator remains strict.  In particular, explicit nulls and
-    partial mappings are never confused with historical omission.
+    three state fields and the format discriminator.  Version 2.4 snapshots
+    used a second unambiguous empty shape: an explicit null ``tombstone`` and
+    exact-zero ``tombstone_rows``, with no digest or format discriminator.
+    Only those two historical empty shapes are normalized.  Every other
+    partial state remains invalid, and the scalar validator stays strict.
 
     This helper is intentionally for immutable authoritative documents.  A
     cached snapshot payload must still require explicit deletion-vector state
@@ -309,6 +313,16 @@ def normalize_snapshot_tombstone_state(
     present_fields = _SNAPSHOT_TOMBSTONE_FIELDS.intersection(snapshot)
     format_present = "tombstone_format" in snapshot
     if not present_fields and not format_present:
+        pointer = None
+        rows = 0
+        digest = None
+    elif (
+        not format_present
+        and present_fields == _V2_4_EMPTY_SNAPSHOT_TOMBSTONE_FIELDS
+        and snapshot.get("tombstone") is None
+        and type(snapshot.get("tombstone_rows")) is int
+        and snapshot["tombstone_rows"] == 0
+    ):
         pointer = None
         rows = 0
         digest = None

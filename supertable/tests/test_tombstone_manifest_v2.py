@@ -299,7 +299,7 @@ def _snapshot_state(
     return payload
 
 
-def test_authoritative_snapshot_normalizer_accepts_only_pre_dv_omission() -> None:
+def test_authoritative_snapshot_normalizer_accepts_pre_dv_omission() -> None:
     snapshot = {
         "snapshot_version": 1,
         "schema": [],
@@ -321,18 +321,41 @@ def test_authoritative_snapshot_normalizer_accepts_only_pre_dv_omission() -> Non
     assert complete_snapshot_payload(snapshot, expected_version=1) is None
 
 
+def test_authoritative_snapshot_normalizer_accepts_v2_4_empty_state() -> None:
+    snapshot = {
+        "snapshot_version": 1,
+        "schema": [],
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+    }
+
+    state = normalize_snapshot_tombstone_state(snapshot)
+
+    assert (
+        state.pointer,
+        state.rows,
+        state.digest,
+        state.tombstone_format,
+        state.format_present,
+    ) == (None, 0, None, 1, False)
+    assert "tombstone_digest" not in snapshot
+    # The compatibility lane is for an authoritative immutable document only.
+    # A partial Redis payload must still fall back to that heavy snapshot.
+    assert complete_snapshot_payload(snapshot, expected_version=1) is None
+
+
 @pytest.mark.parametrize(
     "present_fields",
     [
         ("tombstone",),
         ("tombstone_rows",),
         ("tombstone_digest",),
-        ("tombstone", "tombstone_rows"),
         ("tombstone", "tombstone_digest"),
         ("tombstone_rows", "tombstone_digest"),
     ],
 )
-def test_authoritative_snapshot_normalizer_rejects_every_partial_empty_state(
+def test_authoritative_snapshot_normalizer_rejects_other_partial_empty_states(
     present_fields,
 ) -> None:
     empty_state = {
@@ -342,6 +365,25 @@ def test_authoritative_snapshot_normalizer_rejects_every_partial_empty_state(
     }
     snapshot = {field: empty_state[field] for field in present_fields}
 
+    with pytest.raises(TombstoneManifestV2Error, match="all present"):
+        normalize_snapshot_tombstone_state(snapshot)
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        {"tombstone": None, "tombstone_rows": False},
+        {"tombstone": None, "tombstone_rows": 0.0},
+        {"tombstone": None, "tombstone_rows": "0"},
+        {"tombstone": None, "tombstone_rows": 1},
+        {"tombstone": "", "tombstone_rows": 0},
+        {"tombstone": "table/tombstone/deleted.parquet", "tombstone_rows": 1},
+        {"tombstone": None, "tombstone_rows": 0, "tombstone_format": 1},
+    ],
+)
+def test_authoritative_snapshot_normalizer_rejects_v2_4_near_misses(
+    snapshot,
+) -> None:
     with pytest.raises(TombstoneManifestV2Error, match="all present"):
         normalize_snapshot_tombstone_state(snapshot)
 
