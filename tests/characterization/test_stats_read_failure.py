@@ -10,39 +10,17 @@ Mechanism under test
     else:
         combined = new_df            # prev unreadable -> rebuilt from THIS write only
 
-On the LENIENT default path a failed read returns ``None``, so the new stats artifact is
-rebuilt from only the current write's rows -- every carried-forward per-file stat is
-dropped.  The sole consumer is stats-driven candidate pruning for overwrite/delete
-(data_writer.py:392-425 -> ``prune_overlapping_files_by_stats``), whose contract is
-one-directional (processing.py:1761-1770): every uncertainty, including a *missing* per-file
-stat, resolves to RETAIN, never to DROP.  A snapshot whose ``stats_file`` is empty simply
-retains all candidates (data_writer.py:417-420).
-
-So a stats-read failure can only cause MORE files to be scanned, never fewer -- query and
-delete results stay identical, only slower.
+The hardened path must never publish a replacement stats artifact built from only the
+current write when the prior artifact cannot be read.  It either preserves the previous
+stats generation or aborts before publishing a partial replacement.  This retains both
+correctness and pruning performance across a transient stats-store failure.
 
 What this test does
 -------------------
-Lands four keys in four separate data files (so there are carried-forward stats to lose),
-then overwrites one key while a read failure is injected *scoped to the stats object only*.
-That truncates the stats artifact down to just the newly-written file -- the other three
-files are now statless.  It then deletes a key that lives in one of those statless files
-(no injection) and asserts the delete actually took effect: ``deleted == 1`` and the key is
-gone.  Had the pruner treated "no stat entry" as prunable, that file would be dropped from
-the candidate set, the delete would tombstone nothing (``deleted == 0``), and the row would
-survive.
-
-Decision: ACCEPTED, not fixed
------------------------------
-Unlike the deletion-vector reads (Findings #1 and #2), this carry-forward read is left
-LENIENT on purpose.  Making it ``required=True`` would abort a user *data write* on a transient
-stats-read failure -- trading a mere scan slowdown for an availability hit, when the written
-data lands correctly either way and the only cost is reduced pruning.  So Finding #3 is a
-documented, accepted degradation; this test seals that behavior.
-
-Expected to PASS, documenting Finding #3 as an accepted pruning/perf degradation.  (A failure
-would instead mean missing stats can DROP live files from the delete candidate set -- a real
-correctness defect that WOULD force this read to be made required, like the DV reads.)
+Lands four keys in separate files, injects a failure scoped to the stats object during an
+overwrite, and permits either safe policy: complete the write while preserving carried
+stats, or abort the write.  It then verifies that stats were not truncated and that a later
+delete remains correct.
 """
 
 from __future__ import annotations
@@ -109,7 +87,7 @@ def test_stats_read_failure_does_not_drop_live_files_from_delete():
     stats_rows_before = _stats_rows()
     assert stats_rows_before > 0  # four files' worth of carried-forward stats
 
-    # --- overwrite "c" while the stats read fails -> truncates carried stats
+    # --- overwrite "c" while the stats read fails -------------------------
     # Clear the in-process stats cache so both the pruning load AND the build
     # carry-forward read actually hit storage (cold cache == realistic).
     st_processing._STATS_CACHE.clear()
@@ -135,22 +113,17 @@ def test_stats_read_failure_does_not_drop_live_files_from_delete():
     # "c" updated to 30, every other key untouched.
     assert _live_map() == {"a": 1, "b": 2, "c": 30, "d": 4}
 
-    # Prove the injection actually bit: with the carry-forward read failing,
-    # build_stats_file rebuilt the artifact from only the just-written "c" file
-    # (combined = new_df), dropping a/b/d's carried stats -- so the snapshot's
-    # stats_rows is now strictly smaller.  Without this, the delete assertions
-    # below could pass trivially (files still had stats) instead of exercising the
-    # retain-statless-files pruning path that is the whole point of the test.
+    # A failed carry-forward read must not publish a truncated replacement.
+    # The safe implementation preserves at least the prior generation's rows
+    # (and may add rows if it completed the overwrite).
     stats_rows_after = _stats_rows()
-    assert stats_rows_after < stats_rows_before, (
-        f"expected the injected stats-read failure to TRUNCATE the carried-forward "
-        f"stats, but stats_rows went {stats_rows_before} -> {stats_rows_after}; the "
-        f"delete assertions below would then pass trivially without ever exercising "
-        f"the missing-stat pruning path"
+    assert stats_rows_after >= stats_rows_before, (
+        f"the injected stats-read failure truncated carried stats: "
+        f"stats_rows went {stats_rows_before} -> {stats_rows_after}"
     )
 
-    # --- delete "a" (its file's stats were just truncated away) ------------
-    # Force the pruner to read the truncated stats artifact from storage.
+    # --- delete "a" after the failed stats read ---------------------------
+    # Force the pruner to read the preserved/current artifact from storage.
     st_processing._STATS_CACHE.clear()
     *_, deleted_a = dw.write(role_name=ROLE, simple_name=SIMPLE, data=_rows(["a"], [0]),
                              overwrite_columns=[KEY], delete_only=True)
@@ -158,11 +131,10 @@ def test_stats_read_failure_does_not_drop_live_files_from_delete():
     live = _live_map()
     assert deleted_a == 1, (
         f"delete of 'a' tombstoned {deleted_a} row(s), expected 1: the candidate file was "
-        f"wrongly PRUNED because its stats entry was dropped by the failed carry-forward "
-        f"read. The pruner must RETAIN files with no stat entry. live={live}"
+        f"wrongly PRUNED after the failed carry-forward read. live={live}"
     )
     assert "a" not in live, (
-        f"key 'a' survived a delete after its file's stats were truncated -- stats-driven "
+        f"key 'a' survived a delete after the failed stats read -- stats-driven "
         f"pruning dropped a live candidate file. live={live}"
     )
     assert live == {"b": 2, "c": 30, "d": 4}

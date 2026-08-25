@@ -18,6 +18,7 @@ QueryPlanManager, extend_execution_plan, restrict_read_access.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 from enum import Enum
@@ -237,7 +238,7 @@ class TestDataReaderInit:
         frame, status, message = dr.execute("admin", engine=engine.AUTO)
         assert frame.empty
         assert status.value == "error"
-        assert message == "bad sql"
+        assert message == "Query is invalid or unsupported"
 
 
 # ====================================================================
@@ -367,6 +368,8 @@ class TestExecuteHappyPath:
             role_name="reader_role",
             tables=["table_def_1"],
             physical_tables=mock_parser.get_physical_tables.return_value,
+            aggregate_children=None,
+            expected_role_policy_fingerprint=None,
             policy_fingerprints_out={},
         )
 
@@ -722,7 +725,7 @@ class TestExecuteEstimationError:
         df, status, message = dr.execute("admin", engine=engine.AUTO)
 
         assert status == Status.ERROR
-        assert "Missing required column(s)" in message
+        assert message == "Query execution failed"
         assert df.empty
 
 
@@ -767,7 +770,7 @@ class TestExecuteExecutorError:
         df, status, message = dr.execute("admin", engine=engine.AUTO)
 
         assert status == Status.ERROR
-        assert "DuckDB out of memory" in message
+        assert message == "Query execution failed"
         assert df.empty
 
     @patch(_PATCH_EXTEND_PLAN)
@@ -809,7 +812,7 @@ class TestExecuteExecutorError:
         # Verify status passed to extend_plan is "error"
         call_kwargs = mock_extend.call_args[1]
         assert call_kwargs["status"] == "error"
-        assert "boom" in (call_kwargs["message"] or "")
+        assert call_kwargs["message"] == "Query execution failed"
 
 
 # ====================================================================
@@ -1179,7 +1182,7 @@ class TestExecuteExtendPlanArgs:
 
         call_kwargs = mock_extend.call_args[1]
         assert call_kwargs["status"] == "error"
-        assert "estimation failed" in call_kwargs["message"]
+        assert call_kwargs["message"] == "Query execution failed"
         assert call_kwargs["result_shape"] == (0, 0)
 
 
@@ -1524,8 +1527,9 @@ class TestQuerySqlError:
         MockDR.return_value = mock_reader
 
         from supertable.data_reader import query_sql
-        with pytest.raises(RuntimeError, match="Query execution failed: something broke"):
+        with pytest.raises(RuntimeError, match=r"^Query execution failed$") as exc_info:
             query_sql("org", "sup", "Q", 10, MagicMock(), "admin")
+        assert "something broke" not in str(exc_info.value)
 
     @patch(f"{_MOD}.DataReader")
     @patch(f"{_MOD}._ensure_sql_limit")
@@ -1538,7 +1542,7 @@ class TestQuerySqlError:
         MockDR.return_value = mock_reader
 
         from supertable.data_reader import query_sql
-        with pytest.raises(RuntimeError, match="Query execution failed: None"):
+        with pytest.raises(RuntimeError, match=r"^Query execution failed$"):
             query_sql("org", "sup", "Q", 10, MagicMock(), "admin")
 
 
@@ -1855,8 +1859,9 @@ class TestExecuteExecutorArgs:
             tables=physical_tables,
             predicate_constraints={},
             join_edges=[],
-            join_pruning_lanes={"numeric"},
+            join_pruning_lanes=frozenset({"numeric"}),
             plan_stats=MockPlanStats.return_value,
+            require_odata_identity=False,
         )
 
 
@@ -2111,7 +2116,7 @@ class TestExecuteRejectedCommands:
         df, status, msg = dr.execute("admin")
 
         assert status == Status.ERROR
-        assert "table reference" in msg
+        assert msg == "Query is invalid or unsupported"
         assert df.empty
         # Rejected before any pipeline work.
         MockParser.assert_not_called()
@@ -2131,7 +2136,7 @@ class TestExecuteRejectedCommands:
         df, status, msg = dr.execute("admin")
 
         assert status == Status.ERROR
-        assert "only supported for SELECT" in msg
+        assert msg == "Query is invalid or unsupported"
         MockExecutor.assert_not_called()
         MockEstimator.assert_not_called()
 
@@ -2275,9 +2280,9 @@ class TestExecuteShowStats:
         import polars as pl
         from supertable.processing import STATS_SCHEMA
 
-        # In-memory stats frame with the canonical schema. load_stats reads
-        # through the storage backend, so we stub it here and exercise the
-        # handler's resolve -> load -> to_pandas path directly.
+        # In-memory stats frame with the canonical schema. The bounded
+        # diagnostic loader is covered separately, so stub it here and
+        # exercise the handler's resolve -> project -> to_pandas path directly.
         rows = [{
             "file_path": "data/f1.parquet", "row_group_id": 0,
             "column_name": "id", "physical_type": "INT64", "logical_type": "",
@@ -2295,8 +2300,11 @@ class TestExecuteShowStats:
 
         with patch.object(
             DataReader, "_resolve_latest_stats_context",
-            return_value=("redis://stats/v1", False),
-        ), patch("supertable.processing.load_stats", return_value=stats_df):
+            return_value=("redis://stats/v1", 1, False),
+        ), patch(
+            "supertable.processing.load_bounded_stats_diagnostic",
+            return_value=stats_df,
+        ):
             dr = DataReader("mysuper", "o", "SHOW STATS mysuper.mytable")
             df, status, msg = dr.execute("admin")
 
@@ -2326,7 +2334,9 @@ class TestExecuteShowStats:
 
         # No stats pointer -> empty frame carrying the schema columns, OK status.
         with patch.object(
-            DataReader, "_resolve_latest_stats_context", return_value=(None, False),
+            DataReader,
+            "_resolve_latest_stats_context",
+            return_value=(None, None, False),
         ):
             dr = DataReader("mysuper", "o", "SHOW STATS mytable")
             df, status, msg = dr.execute("admin")
@@ -2335,6 +2345,115 @@ class TestExecuteShowStats:
         assert msg is None
         assert df.empty
         assert list(df.columns) == list(STATS_SCHEMA.keys())
+
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_SQL_PARSER)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_GET_STORAGE)
+    def test_show_stats_rejects_oversized_row_seal_before_storage_or_pandas(
+        self, mock_get_storage, mock_restrict, MockParser, MockEstimator,
+        MockExecutor,
+    ):
+        import polars as pl
+        from supertable.data_reader import DataReader, Status
+        from supertable.processing import MAX_SHOW_STATS_ROWS
+
+        storage = MagicMock()
+        mock_get_storage.return_value = storage
+        with patch.object(
+            DataReader,
+            "_resolve_latest_stats_context",
+            return_value=(
+                "private/stats/v1.parquet",
+                MAX_SHOW_STATS_ROWS + 1,
+                False,
+            ),
+        ), patch.object(pl.DataFrame, "to_pandas") as to_pandas:
+            dr = DataReader("mysuper", "o", "SHOW STATS mytable")
+            result, status, message = dr.execute("admin")
+
+        assert status is Status.ERROR
+        assert result.empty
+        assert message == "SHOW STATS artifact is unavailable"
+        storage.stat_object.assert_not_called()
+        storage.download_to_file.assert_not_called()
+        storage.read_parquet.assert_not_called()
+        to_pandas.assert_not_called()
+
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_SQL_PARSER)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_GET_STORAGE)
+    def test_show_stats_rejects_oversized_object_before_read_or_pandas(
+        self, mock_get_storage, mock_restrict, MockParser, MockEstimator,
+        MockExecutor,
+    ):
+        import polars as pl
+        from supertable.data_reader import DataReader, Status
+        from supertable.processing import MAX_SHOW_STATS_OBJECT_BYTES
+        from supertable.storage.storage_interface import ObjectMetadata
+
+        storage = MagicMock()
+        storage.stat_object.return_value = ObjectMetadata(
+            size=MAX_SHOW_STATS_OBJECT_BYTES + 1,
+            version="immutable-v1",
+        )
+        mock_get_storage.return_value = storage
+        with patch.object(
+            DataReader,
+            "_resolve_latest_stats_context",
+            return_value=("private/stats/v1.parquet", 1, False),
+        ), patch.object(pl.DataFrame, "to_pandas") as to_pandas:
+            dr = DataReader("mysuper", "o", "SHOW STATS mytable")
+            result, status, message = dr.execute("admin")
+
+        assert status is Status.ERROR
+        assert result.empty
+        assert message == "SHOW STATS artifact is unavailable"
+        storage.stat_object.assert_called_once_with(
+            "private/stats/v1.parquet",
+        )
+        storage.download_to_file.assert_not_called()
+        storage.read_parquet.assert_not_called()
+        to_pandas.assert_not_called()
+
+    @patch(_PATCH_EXECUTOR)
+    @patch(_PATCH_DATA_ESTIMATOR)
+    @patch(_PATCH_SQL_PARSER)
+    @patch(_PATCH_RESTRICT_READ)
+    @patch(_PATCH_GET_STORAGE)
+    def test_show_stats_artifact_failure_redacts_physical_url(
+        self, mock_get_storage, mock_restrict, MockParser, MockEstimator,
+        MockExecutor, caplog,
+    ):
+        from supertable.data_reader import DataReader, Status
+
+        secret_url = (
+            "https://objects.invalid/private/stats.parquet?signature=secret"
+        )
+        mock_get_storage.return_value = MagicMock()
+        with caplog.at_level(
+            logging.ERROR, logger="supertable.config.defaults",
+        ):
+            with patch.object(
+                DataReader,
+                "_resolve_latest_stats_context",
+                return_value=(secret_url, 1, False),
+            ), patch(
+                "supertable.processing.load_bounded_stats_diagnostic",
+                side_effect=RuntimeError(f"download failed for {secret_url}"),
+            ):
+                dr = DataReader("mysuper", "o", "SHOW STATS mytable")
+                result, status, message = dr.execute("admin")
+
+        assert status is Status.ERROR
+        assert result.empty
+        assert message == "SHOW STATS artifact is unavailable"
+        assert secret_url not in caplog.text + str(message)
+        assert "signature=secret" not in caplog.text
+        assert "error_type=RuntimeError" in caplog.text
 
     @patch(_PATCH_EXECUTOR)
     @patch(_PATCH_DATA_ESTIMATOR)
@@ -2374,7 +2493,9 @@ class TestExecuteShowStats:
         }
         with patch.object(
             DataReader, "_resolve_latest_stats_context",
-        ) as resolve_stats, patch("supertable.processing.load_stats") as load_stats:
+        ) as resolve_stats, patch(
+            "supertable.processing.load_bounded_stats_diagnostic",
+        ) as load_stats:
             dr = DataReader("mysuper", "o", "SHOW STATS mytable")
             with pytest.raises(
                 PermissionError,
@@ -2402,8 +2523,10 @@ class TestExecuteShowStats:
         secret_path = "private/tenant/full-snapshot-stats.parquet"
         with patch.object(
             DataReader, "_resolve_latest_stats_context",
-            return_value=(secret_path, True),
-        ), patch("supertable.processing.load_stats") as load_stats:
+            return_value=(secret_path, 1, True),
+        ), patch(
+            "supertable.processing.load_bounded_stats_diagnostic",
+        ) as load_stats:
             dr = DataReader("mysuper", "o", "SHOW STATS mytable")
             with pytest.raises(
                 PermissionError,
@@ -2421,25 +2544,32 @@ class TestExecuteShowStats:
     @patch(_PATCH_GET_STORAGE)
     def test_show_stats_policy_resolution_failure_is_generic_and_fails_closed(
         self, mock_get_storage, mock_restrict, MockParser, MockEstimator,
-        MockExecutor,
+        MockExecutor, caplog,
     ):
         from supertable.data_reader import DataReader
 
         mock_get_storage.return_value = MagicMock()
         mock_restrict.return_value = {}
         secret_path = "s3://private-bucket/share/snapshot-v7.json?token=secret"
-        with patch.object(
-            DataReader, "_resolve_latest_stats_context",
-            side_effect=RuntimeError(f"unable to read {secret_path}"),
-        ), patch("supertable.processing.load_stats") as load_stats:
-            dr = DataReader("mysuper", "o", "SHOW STATS mytable")
-            with pytest.raises(
-                PermissionError,
-                match="unavailable under the effective access policy",
-            ) as denied:
-                dr.execute("share_reader")
+        with caplog.at_level(
+            logging.ERROR, logger="supertable.config.defaults",
+        ):
+            with patch.object(
+                DataReader, "_resolve_latest_stats_context",
+                side_effect=RuntimeError(f"unable to read {secret_path}"),
+            ), patch(
+                "supertable.processing.load_bounded_stats_diagnostic",
+            ) as load_stats:
+                dr = DataReader("mysuper", "o", "SHOW STATS mytable")
+                with pytest.raises(
+                    PermissionError,
+                    match="unavailable under the effective access policy",
+                ) as denied:
+                    dr.execute("share_reader")
 
-        assert secret_path not in str(denied.value)
+        assert secret_path not in caplog.text + str(denied.value)
+        assert "token=secret" not in caplog.text
+        assert "error_type=RuntimeError" in caplog.text
         load_stats.assert_not_called()
 
     @patch(_PATCH_EXECUTOR)

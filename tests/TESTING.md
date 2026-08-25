@@ -8,8 +8,9 @@ normal runs **compare** against them and never regenerate them.
 deletion-vector lakehouse state: every physical row carries a stable internal
 `__rowid__` (plus the internal `__timestamp__`), and a per-table tombstone
 deletion-vector parquet (`__file__` + `__rowid__`) lists the rows removed at
-**write** time. A read removes a row **solely** by anti-joining its `__rowid__`
-against that deletion vector — there is **no read-time key-collapse dedup**.
+**write** time. A read removes a row **solely** by matching the protected source
+identity `(__supertable_source_file__, __rowid__)` to the persisted vector
+identity `(__file__, __rowid__)` — there is **no read-time key-collapse dedup**.
 Consequences the goldens lock in:
 
 * Multiple rows sharing a primary key are **all kept** unless explicitly
@@ -48,7 +49,7 @@ cd /home/kladnasoft/dev/dataisland/supertable
 | `tests/characterization/test_golden.py` | `golden` | result scenarios vs sealed `result.json` |
 | `tests/characterization/test_errors.py` | `golden` | error scenarios vs sealed `error.json` |
 | `tests/characterization/test_compatibility.py` | `golden` | every `TableReader` vs the same goldens |
-| `tests/characterization/test_cross_engine.py` | `spark` | Spark SQL vs the same goldens (integration) |
+| `tests/characterization/test_cross_engine.py` | `spark` | supported Spark results vs the same goldens + active-DV fail-closed contract (integration) |
 | `tests/characterization/test_perf.py` | `perf` | non-blocking benchmarks → `tests/perf_results/` |
 | `tests/generate_current_behavior_golden.py` | — | the **only** deliberate reseal entry point |
 
@@ -106,11 +107,28 @@ export SUPERTABLE_SPARK_THRIFT_PORT=10000                   # optional (default 
 python -m pytest tests/characterization -m spark --run-spark
 ```
 
-The suite registers a cluster from those env vars into the catalog, reads each
-scenario via `engine="spark"`, and compares against the **same** goldens. If the
-fleet is unreachable it **skips** (it does not fail) so CI without Spark stays
-green. The goldens are engine-independent logical output; no engine is forced to
-imitate the other.
+Without `--run-spark` the integration matrix skips. Once the flag is supplied,
+a missing host, failed `SELECT 1` smoke probe, lost connection, or scenario
+failure is a **hard failure**, not a skip.
+
+The 56 sealed result scenarios have one explicit, fixture-verified capability
+partition:
+
+* The 32 catalogs without an active deletion vector execute through the real
+  `SPARK_SQL` backend and must match DuckDB's unchanged sealed result exactly.
+* The fixed 24 catalogs with an active deletion vector exercise the same public
+  `query_sql` facade and must fail before Spark cluster selection or connection.
+  Each case asserts the exact internal composite source-file + row-id limitation
+  and the exact public `Query execution failed` error. They are assertions, not
+  skips or expected failures.
+
+The 24 IDs are allowlisted in `test_cross_engine.py`, and a session assertion
+proves that the list exactly equals the active-DV IDs derived from the sealed
+catalogs. A new or changed fixture therefore cannot move into the unsupported
+partition silently. Spark's AUTO route independently excludes active deletion
+vectors; explicit Spark requests fail closed until the backend can carry a
+stable logical source-file identity into its reflection and perform the full
+composite anti-join safely.
 
 ## 5. Validate fixture checksums
 

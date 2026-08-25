@@ -298,7 +298,7 @@ immutable once created.
 | **Resource** | `resource_type`, `resource_id` | What was acted upon. |
 | **Operation** | `detail`, `outcome`, `reason` | Action-specific JSON payload, result, and failure reason. |
 | **Integrity** | `chain_hash` | Set by the writer (not the emitter) for tamper detection. |
-| **Instance** | `instance_id` | `hostname-PID`, stable per process. |
+| **Instance** | `instance_id` | Redis-safe per-boot identity: hashed host + PID + cryptographic nonce. |
 
 ### 12.1.2  Event ID Generation (`_uuid7`)
 
@@ -314,7 +314,7 @@ Event IDs are time-ordered for lexicographic = chronological sorting:
 |--------|--------|----------|
 | `to_dict()` | Flat dict | Redis XADD, Parquet row. |
 | `to_json()` | Compact JSON string | Log lines, export. |
-| `event_hash()` | SHA-256 hex | Chain input (excludes `chain_hash` and `instance_id`). |
+| `event_hash()` | SHA-256 hex | Chain input (excludes only writer-owned `chain_hash`; instance identity remains bound). |
 | `from_dict(d)` | `AuditEvent` | Reconstruct from storage. |
 
 ---
@@ -492,14 +492,20 @@ detail = make_detail(sql_hash="abc", row_count=42, duration_ms=123)
 
 ### 12.5.1  Architecture
 
-The `AuditLogger` follows a producer-consumer pattern identical to
-`monitoring_writer.py`:
+The `AuditLogger` uses two explicitly different durability modes:
 
-1. `emit(event)` enqueues to a bounded `queue.Queue` (max 10,000 entries)
-   and returns immediately (< 50us).
-2. A background daemon thread drains the queue in batches.
-3. Batches are written to Redis Streams (hot tier) and Parquet (warm tier).
-4. One `AuditLogger` instance per organization (singleton cache via
+1. With `SUPERTABLE_AUDIT_HASH_CHAIN=true`, `emit(event)` synchronously admits
+   the protected event to the durable Redis journal. Redis `TIME` owns its UTC
+   day and timestamp. The call succeeds only after durable admission is
+   acknowledged (an ambiguous response is reconciled by the same writer-owned
+   event ID).
+2. The background worker reserves exact journal membership, publishes an
+   immutable Parquet object, verifies a sealed exact readback, and atomically
+   commits its archive receipt and chain checkpoint.
+3. With hash chaining disabled, the compatible best-effort mode enqueues to a
+   bounded `queue.Queue` and does not claim complete daily proofs.
+4. Redis Streams receive a bounded best-effort hot copy only after durable
+   archive publication. One logger exists per organization (singleton cache via
    `get_audit_logger(org)`).
 
 ### 12.5.2  `AuditConfig`
@@ -508,12 +514,13 @@ Configuration is loaded lazily from settings:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `SUPERTABLE_AUDIT_ENABLED` | `True` | Master switch. |
+| `SUPERTABLE_AUDIT_ENABLED` | `False` | Master switch. |
 | `SUPERTABLE_AUDIT_BATCH_SIZE` | `1000` | Events per write batch. |
 | `SUPERTABLE_AUDIT_FLUSH_INTERVAL_SEC` | `60` | Max seconds between flushes. |
 | `SUPERTABLE_AUDIT_REDIS_STREAM_TTL_HOURS` | `24` | Hot-tier TTL. |
 | `SUPERTABLE_AUDIT_REDIS_STREAM_MAXLEN` | `100,000` | Max stream entries (approximate trimming). |
 | `SUPERTABLE_AUDIT_HASH_CHAIN` | `True` | Enable SHA-256 chain. |
+| `SUPERTABLE_AUDIT_PROOF_CLOSE_GRACE_SEC` | `300` | Seconds after UTC midnight before a journal day may close (0-86,400). |
 | `SUPERTABLE_AUDIT_LOG_QUERIES` | `True` | Log query executions. |
 | `SUPERTABLE_AUDIT_LOG_READS` | `True` | Log read operations. |
 | `SUPERTABLE_AUDIT_ALERT_WEBHOOK` | `""` | Webhook URL for critical alerts. |
@@ -528,9 +535,28 @@ When auditing is disabled, a `NullAuditLogger` is returned -- all methods
 
 ### 12.5.4  Queue Backpressure
 
-If the queue reaches 10,000 entries, `emit()` drops the event and logs a
-warning.  The `_stats` dict tracks `total_emitted`, `total_written`,
-`total_dropped`, and `batches_written`.
+The queue retains its 10,000-entry ceiling and also enforces a 16 MiB aggregate
+pending-byte ceiling. A complete canonical event may not exceed 96 KiB, and no
+individual event field may exceed 64 KiB. Events that exceed the item, event,
+or aggregate-byte budget are dropped before enqueue and counted without
+logging their contents. Pending-byte accounting is released only after durable
+archive completion. The `_stats` dict tracks `total_emitted`, `total_written`,
+`total_dropped`, `batches_written`, current/peak pending bytes, backend
+failures, and saturated webhook drops.
+
+The durable journal additionally caps each UTC day at 250,000 events, 512 MiB
+of admitted payload, 512 MiB of archived objects, 4,096 process identities,
+and 8,192 immutable receipts; at most 31 days may remain active. Reservations
+are limited to 1,000 events/8 MiB. Admission applies conservative receipt
+backpressure before accepting work that could exceed the sealed close-time file
+budget. Closed journal records are deleted in bounded chunks only after the
+immutable proof and close manifest are confirmed and Redis close finalization
+has succeeded.
+
+Critical-alert delivery is also bounded: at most four webhook requests may be
+in flight process-wide. Saturated alerts are counted and dropped without
+creating another thread. HTTP responses are streamed for status inspection;
+their bodies and credential-bearing webhook URLs are never buffered or logged.
 
 ---
 
@@ -545,11 +571,14 @@ verification will fail.
 ### 12.6.1  Chain Computation
 
 ```
-batch_hash  = SHA-256(sorted(event_ids) + "\n" + parquet_file_hash)
+batch_hash  = SHA-256(length-framed canonical complete event records)
 chain_hash  = SHA-256(previous_chain_hash + batch_hash)
 ```
 
-* Event IDs are sorted to ensure deterministic ordering.
+* Events are sorted by their unique writer-owned IDs for deterministic ordering.
+* Every event field, including `instance_id`, is bound; only `chain_hash` is
+  omitted because it is the output being computed.
+* Duplicate or empty event IDs and non-canonical JSON are rejected.
 * The chain starts from `GENESIS_HASH = "0" * 64`.
 
 ### 12.6.2  `InstanceChain`
@@ -563,11 +592,14 @@ class InstanceChain:
     head: str = GENESIS_HASH    # Current chain head
     batch_count: int = 0
 
-    def advance(self, event_ids: List[str], file_hash: str = "") -> str: ...
+    def next_for_events(self, events: Sequence[Mapping[str, Any]]) -> str: ...
+    def commit(self, expected_previous: str, new_head: str) -> None: ...
 ```
 
-`advance()` appends a batch and returns the new head.  The `AuditLogger`
-holds a lock when calling `advance()` for thread safety.
+The logger computes a tentative next head, publishes the exact Parquet object
+under a stable idempotency key, and commits the head only after archive
+durability is confirmed. Redis is a secondary hot copy/checkpoint and cannot
+advance the authoritative chain by itself.
 
 ### 12.6.3  Daily Merkle Proof
 
@@ -586,6 +618,37 @@ class MerkleProof:
 `compute_root()` sorts instance heads by `instance_id` and computes a
 SHA-256 over the concatenation -- deterministic regardless of insertion
 order.
+
+Hash mode has a production day-close coordinator. Admission is atomic in a
+durable Redis journal and Redis `TIME` assigns membership, so an accepted event
+cannot remain only in process memory or be backdated into a prior day. Workers
+reserve/recover exact per-instance batches, publish immutable Parquet objects,
+and atomically commit archive receipts and chain checkpoints. A day enters
+`closing` only after UTC rollover plus the configured grace and only when
+`admitted == archived` with no in-flight reservation.
+
+The closer scans every receipt-bound sealed archive batch, resumes from the
+previous immutable closed proof, and conditionally creates both
+`chain_YYYYMMDD.json` and `closed_YYYYMMDD.json`. The close manifest binds the
+format/cutover marker, exact batch IDs, receipt root, counters, and proof hash.
+Create collisions, ambiguous writes, missing predecessors, and corrupt
+readbacks fail closed; publication is safely idempotent across instances.
+
+`verify_chain_integrity()` reports current membership as `open`, a durable
+publication in progress as `closing`, a historical pre-close gap as
+`unverifiable_unclosed`, and missing/corrupt evidence for a journal day already
+marked closed as `invalid`. It never treats missing, corrupt, partially read,
+or empty input as a valid closed day. Non-hash best-effort mode cannot publish
+or claim these proofs.
+
+The durable scripts require one standalone Redis primary or Redis Sentinel.
+Redis Cluster is rejected during hash-mode logger initialization before any
+journal command can produce `CROSSSLOT`. Deployments upgrading from a version
+without the durable journal must use a coordinated/quiescent cutover: stop all
+older writers, deploy 2.5.1 to every writer, then enable hash mode. The journal
+persists immutable `format_version`, `cutover_day`, and `cutover_ms` metadata;
+closed proofs cover only journal-admitted events from that cutover. Do not run
+older writers after activation.
 
 ### 12.6.4  Verification Functions
 
@@ -638,20 +701,31 @@ deterministic verified format in Section 12.0.
 
 ```
 {storage_root}/{org}/__audit__/year=YYYY/month=MM/day=DD/
-    audit_{date}_{time}_{instance_id}_{uuid8}.parquet
+    audit_{timestamp}_{instance_id}_{publication_sha256}.parquet
 ```
 
 **Chain proofs:**
 
 ```
 {storage_root}/{org}/__audit__/_chain/chain_{date}.json
+{storage_root}/{org}/__audit__/_chain/closed_{date}.json
 ```
 
-The Parquet schema mirrors `AuditEvent` exactly -- 21 columns, all string
+The Parquet schema mirrors `AuditEvent` exactly -- 22 columns, all string
 or int64 types, built as a PyArrow schema.
 
 `compute_file_hash(data: bytes)` produces a SHA-256 of the raw Parquet file
-content, which feeds into the chain as `file_hash`.
+content for sealed read-back and collision reconciliation. The chain itself is
+bound directly to canonical event content rather than to a storage filename or
+row order.
+
+`query_audit_log(source="auto")` uses Parquet as the complete system of record;
+the Redis source remains an explicitly requested best-effort hot view. Queries
+scan newest partitions/pages under hard ceilings (31 day partitions, 250,000
+events, and 256 MiB retained scan data), apply every time/field filter, sort
+newest-first, and only then consume the caller's result limit. Exceeding a scan
+or 64 MiB result ceiling fails the whole query instead of returning a partial
+answer. The public inline result ceiling remains 10,000 rows.
 
 ---
 
@@ -694,13 +768,17 @@ internal archival worker.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `create_consumer` | `(organization, group_name, start_from="$")` | Create an external consumer group. `start_from="$"` = new events only; `"0"` = replay from beginning. |
+| `create_consumer` | `(organization, group_name, start_from="$")` | Create an external consumer group. `start_from="$"` = new events only; `"0-0"` = replay from beginning. |
 | `delete_consumer` | `(organization, group_name)` | Remove a consumer group. |
 | `list_consumers` | `(organization)` | List all consumer groups with lag info. |
 
 Each function instantiates a `RedisAuditWriter` and delegates to its
 consumer group management methods.  The maximum number of external consumers
-is governed by `SUPERTABLE_AUDIT_SIEM_MAX_CONSUMERS` (default: 10).
+is governed by `SUPERTABLE_AUDIT_SIEM_MAX_CONSUMERS` (default: 10). Creation
+first requires the effective per-organization `siem_enabled` policy, validates
+the group/start identifiers, and atomically enforces the configured group cap.
+Consumer metadata responses also have hard group, field, counter, and byte
+bounds before they are returned.
 
 ---
 
@@ -750,8 +828,19 @@ When `SUPERTABLE_AUDIT_FERNET_KEY` is configured, sensitive fields within the
 `detail` payload can be encrypted at rest using the Python `cryptography`
 library's Fernet symmetric encryption (AES-128-CBC with HMAC-SHA256).
 
-This protects PII and other sensitive data in the audit trail while still
-allowing authorised tooling to decrypt and inspect events.
+Raw `sql`, `sql_text`, `query_text`, and `statement` fields are removed before
+an event reaches a queue or backend. Configured deployments retain only a
+SHA-256 digest and Fernet ciphertext; without a key, the reversible text is
+redacted and only its digest remains. Missing dependencies, invalid keys, and
+runtime encryption failures fail closed instead of storing plaintext. This
+protects sensitive query data in the audit trail while still allowing
+authorised tooling with the configured key to decrypt and inspect events.
+
+Sensitive output names (`*_encrypted`, `*_redacted`, and `*_sha256`) are
+reserved and rejected recursively when supplied by a caller. Detail
+transformation is bounded to 16 levels, 1,024 nodes, 256 items per container,
+32 KiB per input string, and 64 KiB of canonical serialized output. These
+limits are enforced before the event enters the bounded logger queue.
 
 ---
 
@@ -784,6 +873,10 @@ def export_dora_incident_report(
 Exports audit events for a specific time window aligned to DORA RTS/ITS
 incident reporting templates (Regulation 2024/1772).
 
+`incident_id` is required; results are filtered by that identifier at either
+the event top level or inside `detail`. Export queries use the audit reader's
+10,000-event maximum.
+
 ### 12.12.3  SOC 2 Evidence Packages
 
 ```python
@@ -798,6 +891,9 @@ def export_soc2_evidence(
 
 Maps each SOC 2 Trust Services Criterion to specific event categories and
 actions.  Supported criteria:
+
+Unsupported criteria are rejected, and evidence queries use the same
+10,000-event reader maximum.
 
 | Criterion | Category Mapped |
 |-----------|-----------------|

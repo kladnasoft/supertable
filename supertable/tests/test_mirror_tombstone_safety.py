@@ -3,9 +3,31 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from supertable.mirroring.mirror_formats import MirrorFormats, MirrorSyncError
-from supertable.mirroring.mirror_parquet import write_parquet_table
-from supertable.mirroring.mirror_delta import write_delta_table
-from supertable.mirroring.mirror_iceberg import write_iceberg_table
+from supertable.mirroring.mirror_parquet import (
+    _binary_copy_if_possible as parquet_binary_copy,
+    write_parquet_table,
+)
+from supertable.mirroring.mirror_delta import (
+    _binary_copy_if_possible as delta_binary_copy,
+    write_delta_table,
+)
+from supertable.mirroring.mirror_iceberg import (
+    _binary_copy_if_possible as iceberg_binary_copy,
+    write_iceberg_table,
+)
+from supertable.storage.local_storage import LocalStorage
+
+
+def _mirror_snapshot(*, commit_id: str = "commit-41") -> dict:
+    return {
+        "snapshot_version": 41,
+        "schema": [{"name": "id", "type": "Int64"}],
+        "resources": [],
+        "tombstone": None,
+        "tombstone_rows": 0,
+        "tombstone_digest": None,
+        "_mirror_commit_id": commit_id,
+    }
 
 
 @pytest.mark.parametrize(
@@ -150,6 +172,10 @@ def test_mirror_never_coerces_malformed_deletion_state_to_empty(snapshot):
 
 
 def test_dispatch_reports_exact_failed_and_completed_formats():
+    secret = (
+        "MIRROR_SYNC_SECRET_31cc "
+        "https://bucket.invalid/object?X-Amz-Signature=BEARER_TOKEN"
+    )
     super_table = MagicMock()
     snapshot = {
         "resources": [],
@@ -162,7 +188,7 @@ def test_dispatch_reports_exact_failed_and_completed_formats():
         patch("supertable.mirroring.mirror_formats.verify_delta_table") as verify_delta,
         patch(
             "supertable.mirroring.mirror_formats.write_parquet_table",
-            side_effect=OSError("PUT failed"),
+            side_effect=OSError(secret),
         ) as parquet,
     ):
         with pytest.raises(MirrorSyncError) as raised:
@@ -176,10 +202,60 @@ def test_dispatch_reports_exact_failed_and_completed_formats():
     assert raised.value.failed_format == "PARQUET"
     assert raised.value.completed_formats == ("DELTA",)
     assert isinstance(raised.value.cause, OSError)
-    assert "PUT failed" in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert "error_type=OSError" in str(raised.value)
+    assert secret not in str(raised.value)
+    assert secret in str(raised.value.cause)
     delta.assert_called_once()
     verify_delta.assert_called_once()
     parquet.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "copy_impl",
+    [parquet_binary_copy, delta_binary_copy, iceberg_binary_copy],
+)
+def test_mirror_copy_fallback_logs_never_expose_backend_text(copy_impl, caplog):
+    secret = (
+        "MIRROR_COPY_SECRET_bfb3 "
+        "https://bucket.invalid/object?X-Goog-Signature=BEARER_TOKEN"
+    )
+    storage = MagicMock()
+    storage.copy.side_effect = OSError(secret)
+    storage.read_bytes.side_effect = OSError(secret)
+
+    assert copy_impl(storage, "source.parquet", "dest.parquet") is False
+
+    assert secret not in caplog.text
+    assert "BEARER_TOKEN" not in caplog.text
+    assert "error_type=OSError" in caplog.text
+
+
+def test_iceberg_same_commit_rebuild_log_never_exposes_backend_text(
+    tmp_path, caplog,
+):
+    secret = (
+        "ICEBERG_VERIFY_SECRET_3a91 "
+        "https://bucket.invalid/object?X-Amz-Signature=BEARER_TOKEN"
+    )
+    storage = LocalStorage(root=tmp_path)
+    table = MagicMock(
+        organization="org",
+        super_name="lake",
+        storage=storage,
+    )
+    snapshot = _mirror_snapshot()
+    write_iceberg_table(table, "events", snapshot)
+
+    with patch(
+        "supertable.mirroring.mirror_iceberg.verify_iceberg_table",
+        side_effect=OSError(secret),
+    ):
+        write_iceberg_table(table, "events", snapshot)
+
+    assert secret not in caplog.text
+    assert "BEARER_TOKEN" not in caplog.text
+    assert "error_type=OSError" in caplog.text
 
 
 def test_dispatch_verifies_normal_publication_before_reporting_success():

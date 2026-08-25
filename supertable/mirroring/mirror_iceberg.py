@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Set
 from datetime import datetime, timezone
 
 from supertable.config.defaults import logger
+from supertable.mirroring.failure_safety import mirror_error_type
 
 
 def _now_ms() -> int:
@@ -117,7 +118,10 @@ def write_iceberg_table(super_table, table_name: str, simple_snapshot: Dict[str,
         {"version": version, "metadata": metadata_path, "manifest_list": manifest_list_path},
     )
 
-    logger.debug(f"[mirror][iceberg] wrote {metadata_path} with {len(resources)} files")
+    logger.debug(
+        "[mirror][iceberg] wrote legacy metadata with %s files",
+        len(resources),
+    )
 
 
 
@@ -346,9 +350,15 @@ def _storage_path_to_uri(storage: Any, object_path: str) -> str:
         raise RuntimeError(
             "Iceberg mirroring requires storage.canonical_uri(logical_path)"
         )
-    uri = str(canonical(object_path) or "")
+    try:
+        uri = str(canonical(object_path) or "")
+    except Exception as exc:
+        raise RuntimeError(
+            "Storage canonical URI resolution failed; "
+            f"error_type={mirror_error_type(exc)}"
+        ) from None
     if "://" not in uri:
-        raise RuntimeError(f"Storage returned an invalid canonical URI: {uri!r}")
+        raise RuntimeError("Storage returned an invalid canonical URI")
     return uri
 
 
@@ -364,7 +374,10 @@ def _binary_copy_if_possible(storage: Any, src_path: str, dst_path: str) -> bool
             storage.copy(src_path, dst_path)
             return True
         except Exception as e:
-            logger.warning(f"[mirror][iceberg] storage.copy failed ({src_path} -> {dst_path}): {e}")
+            logger.warning(
+                "[mirror][iceberg] storage.copy failed; error_type=%s",
+                mirror_error_type(e),
+            )
 
     read_bytes = getattr(storage, "read_bytes", None)
     write_bytes = getattr(storage, "write_bytes", None)
@@ -373,7 +386,10 @@ def _binary_copy_if_possible(storage: Any, src_path: str, dst_path: str) -> bool
             storage.write_bytes(dst_path, read_bytes(src_path))
             return True
         except Exception as e:
-            logger.warning(f"[mirror][iceberg] byte copy failed ({src_path} -> {dst_path}): {e}")
+            logger.warning(
+                "[mirror][iceberg] byte copy failed; error_type=%s",
+                mirror_error_type(e),
+            )
 
     return False
 
@@ -491,11 +507,27 @@ def _load_prior_schema_ids(storage: Any, metadata_dir: str) -> Tuple[Dict[str, i
     # Prefer v2 schemas list, fall back to deprecated schema
     schemas = meta.get("schemas") or []
     schema0 = schemas[0] if isinstance(schemas, list) and schemas else meta.get("schema") or {}
-    for f in schema0.get("fields", []) if isinstance(schema0, dict) else []:
-        try:
-            name_to_id[str(f["name"])] = int(f["id"])
-        except Exception:
-            continue
+    fields = schema0.get("fields", []) if isinstance(schema0, dict) else None
+    if not isinstance(fields, list):
+        raise RuntimeError("Invalid prior Iceberg schema field identity")
+    field_ids: Set[int] = set()
+    for field in fields:
+        if not isinstance(field, dict):
+            raise RuntimeError("Invalid prior Iceberg schema field identity")
+        name = field.get("name")
+        field_id = field.get("id")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name.strip() != name
+            or name in name_to_id
+            or type(field_id) is not int
+            or field_id <= 0
+            or field_id in field_ids
+        ):
+            raise RuntimeError("Invalid prior Iceberg schema field identity")
+        name_to_id[name] = field_id
+        field_ids.add(field_id)
     return name_to_id, table_uuid, base_location, last_seq
 
 
@@ -509,8 +541,8 @@ def _load_current_metadata(
         return None, None
     try:
         version = int(hint.strip())
-    except Exception as exc:
-        raise RuntimeError("Invalid Iceberg version-hint.text") from exc
+    except Exception:
+        raise RuntimeError("Invalid Iceberg version-hint.text") from None
     metadata = _read_json_if_exists(
         storage, os.path.join(metadata_dir, f"v{version}.metadata.json"),
     )
@@ -660,13 +692,11 @@ def _write_iceberg_standard(super_table, table_name: str, simple_snapshot: Dict[
             # for the same stable commit instead of leaving the durable outbox
             # permanently fenced on an unverifiable publication.
             logger.warning(
-                f"[mirror][iceberg] rebuilding invalid commit "
-                f"{mirror_commit_id}: {exc}"
+                "[mirror][iceberg] rebuilding invalid commit; "
+                f"error_type={mirror_error_type(exc)}"
             )
         else:
-            logger.info(
-                f"[mirror][iceberg] commit {mirror_commit_id} already published"
-            )
+            logger.info("[mirror][iceberg] requested commit already published")
             return
 
     # Metadata generations are owned by this mirror.  Source snapshots may be
@@ -676,7 +706,8 @@ def _write_iceberg_standard(super_table, table_name: str, simple_snapshot: Dict[
         if prior_metadata_version is not None else 1
     )
 
-    # Load prior schema IDs (best-effort for stable Iceberg ids)
+    # Validate and load prior schema IDs before any successor artifacts are
+    # written so stable Iceberg identities cannot be silently reassigned.
     prior_ids, prior_uuid, _prior_location, prior_last_seq = _load_prior_schema_ids(storage, metadata_dir)
     table_uuid = prior_uuid or _stable_table_uuid(super_table.organization, super_table.super_name, table_name)
 
@@ -711,24 +742,21 @@ def _write_iceberg_standard(super_table, table_name: str, simple_snapshot: Dict[
             # Fail before writing the new manifest/pointer so reconciliation
             # can retry the exact committed snapshot safely.
             raise RuntimeError(
-                f"Failed to copy data file into Iceberg table dir: {src}"
+                "Failed to copy data file into Iceberg table dir"
             )
         try:
             source_size, source_digest = storage.content_sha256(src)
             mirror_size, mirror_digest = storage.content_sha256(dst)
         except Exception as exc:
             raise RuntimeError(
-                f"Iceberg copy could not be content-sealed: {src}"
-            ) from exc
+                "Iceberg copy could not be content-sealed; "
+                f"error_type={mirror_error_type(exc)}"
+            ) from None
         declared_size = int(r.get("file_size", r.get("size", 0)) or 0)
         if declared_size and source_size != declared_size:
-            raise RuntimeError(
-                f"Iceberg source size changed before mirroring: {src!r}"
-            )
+            raise RuntimeError("Iceberg source size changed before mirroring")
         if mirror_size != source_size or mirror_digest != source_digest:
-            raise RuntimeError(
-                f"Iceberg copy failed its content seal: {src!r}"
-            )
+            raise RuntimeError("Iceberg copy failed its content seal")
         sealed_resource = dict(r)
         sealed_resource["file_size"] = source_size
         copied_files.append((src, dst, sealed_resource, source_digest))
@@ -792,8 +820,7 @@ def _write_iceberg_standard(super_table, table_name: str, simple_snapshot: Dict[
     write_bytes(manifest_path_obj, manifest_bytes)
     if storage.read_bytes(manifest_path_obj) != manifest_bytes:
         raise RuntimeError(
-            f"Iceberg manifest failed read-after-write verification: "
-            f"{manifest_path_obj!r}"
+            "Iceberg manifest failed read-after-write verification"
         )
     manifest_sha256 = _hashlib.sha256(manifest_bytes).hexdigest()
     manifest_length = len(manifest_bytes)
@@ -833,8 +860,7 @@ def _write_iceberg_standard(super_table, table_name: str, simple_snapshot: Dict[
     write_bytes(manifest_list_obj, manifest_list_bytes)
     if storage.read_bytes(manifest_list_obj) != manifest_list_bytes:
         raise RuntimeError(
-            f"Iceberg manifest list failed read-after-write verification: "
-            f"{manifest_list_obj!r}"
+            "Iceberg manifest list failed read-after-write verification"
         )
     manifest_list_sha256 = _hashlib.sha256(manifest_list_bytes).hexdigest()
 
@@ -911,15 +937,14 @@ def _write_iceberg_standard(super_table, table_name: str, simple_snapshot: Dict[
     storage.write_json(meta_path, metadata_payload)
     if storage.read_json(meta_path) != metadata_payload:
         raise RuntimeError(
-            f"Iceberg metadata failed read-after-write verification: {meta_path!r}"
+            "Iceberg metadata failed read-after-write verification"
         )
     hint_path = os.path.join(metadata_dir, "version-hint.text")
     hint_bytes = str(metadata_version).encode("utf-8")
     write_bytes(hint_path, hint_bytes)
     if storage.read_bytes(hint_path) != hint_bytes:
         raise RuntimeError(
-            f"Iceberg version hint failed read-after-write verification: "
-            f"{hint_path!r}"
+            "Iceberg version hint failed read-after-write verification"
         )
 
     # Convenience pointer (keep previous behavior, but point to the standard metadata)
@@ -934,8 +959,7 @@ def _write_iceberg_standard(super_table, table_name: str, simple_snapshot: Dict[
     storage.write_json(latest_path, latest_payload)
     if storage.read_json(latest_path) != latest_payload:
         raise RuntimeError(
-            f"Iceberg latest pointer failed read-after-write verification: "
-            f"{latest_path!r}"
+            "Iceberg latest pointer failed read-after-write verification"
         )
 
     logger.info(
@@ -965,11 +989,13 @@ def verify_iceberg_table(
     expected_location = _storage_path_to_uri(super_table.storage, base)
     if location != expected_location or "://" not in location:
         raise RuntimeError(
-            f"Iceberg location is not the backend canonical URI: {location!r}"
+            "Iceberg location is not the backend canonical URI"
         )
     properties = metadata.get("properties") or {}
     if commit_id and str(properties.get("supertable.commit-id") or "") != commit_id:
-        raise RuntimeError(f"Iceberg mirror does not contain commit {commit_id!r}")
+        raise RuntimeError(
+            "Iceberg mirror does not contain the requested commit"
+        )
 
     snapshots = metadata.get("snapshots") or []
     if not snapshots or "://" not in str(snapshots[-1].get("manifest-list") or ""):
@@ -1006,8 +1032,8 @@ def verify_iceberg_table(
         data_seals = _json.loads(
             str(properties.get("supertable.data-seals") or "")
         )
-    except Exception as exc:
-        raise RuntimeError("Iceberg metadata has invalid data seals") from exc
+    except Exception:
+        raise RuntimeError("Iceberg metadata has invalid data seals") from None
     if not isinstance(data_seals, dict):
         raise RuntimeError("Iceberg metadata has invalid data seals")
 
@@ -1029,14 +1055,15 @@ def verify_iceberg_table(
     missing = expected_files - visible
     if missing:
         raise RuntimeError(
-            f"Iceberg mirror is missing committed data files: {sorted(missing)!r}"
+            "Iceberg mirror is missing committed data files; "
+            f"file_count={len(missing)}"
         )
     if set(data_seals) != expected_files:
         raise RuntimeError("Iceberg data seals do not match the committed snapshot")
     for path in sorted(expected_files):
         seal = data_seals.get(path)
         if not isinstance(seal, dict):
-            raise RuntimeError(f"Iceberg data seal is invalid: {path!r}")
+            raise RuntimeError("Iceberg data seal is invalid")
         recorded_size = int(seal.get("size") or 0)
         recorded_digest = str(seal.get("sha256") or "")
         actual_size, actual_digest = super_table.storage.content_sha256(path)
@@ -1047,7 +1074,7 @@ def verify_iceberg_table(
             or actual_digest != recorded_digest
         ):
             raise RuntimeError(
-                f"Iceberg mirrored artifact failed its content seal: {path!r}"
+                "Iceberg mirrored artifact failed its content seal"
             )
 
 

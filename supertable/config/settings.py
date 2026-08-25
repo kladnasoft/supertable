@@ -36,10 +36,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv, find_dotenv
+from dotenv import load_dotenv
 
 # ── .env loading (runs exactly once) ─────────────────────────────────
-_dotenv_path = find_dotenv(usecwd=True)
+# Never walk parent directories looking for a dotenv file: an unrelated
+# checkout (or attacker-controlled working directory) must not inject config.
+# Loading is opt-in through an explicit absolute/relative path.
+_dotenv_path = (os.getenv("SUPERTABLE_DOTENV_PATH") or "").strip()
 if _dotenv_path and os.path.isfile(_dotenv_path):
     load_dotenv(_dotenv_path, override=False)
 
@@ -93,8 +96,8 @@ def _env_int_strict(
         return default
     try:
         value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer") from exc
+    except ValueError:
+        raise ValueError(f"{name} must be an integer") from None
     if not minimum <= value <= maximum:
         raise ValueError(
             f"{name} must be between {minimum} and {maximum}"
@@ -458,6 +461,7 @@ class Settings:
     SUPERTABLE_AUDIT_REDIS_STREAM_TTL_HOURS: int = 24        # SUPERTABLE_AUDIT_REDIS_STREAM_TTL_HOURS
     SUPERTABLE_AUDIT_REDIS_STREAM_MAXLEN: int = 100000       # SUPERTABLE_AUDIT_REDIS_STREAM_MAXLEN
     SUPERTABLE_AUDIT_HASH_CHAIN: bool = True                 # SUPERTABLE_AUDIT_HASH_CHAIN
+    SUPERTABLE_AUDIT_PROOF_CLOSE_GRACE_SEC: int = 300        # SUPERTABLE_AUDIT_PROOF_CLOSE_GRACE_SEC
     SUPERTABLE_AUDIT_LOG_QUERIES: bool = True                # SUPERTABLE_AUDIT_LOG_QUERIES
     SUPERTABLE_AUDIT_LOG_READS: bool = True                  # SUPERTABLE_AUDIT_LOG_READS
     SUPERTABLE_AUDIT_ALERT_WEBHOOK: str = ""                 # SUPERTABLE_AUDIT_ALERT_WEBHOOK
@@ -872,6 +876,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_AUDIT_REDIS_STREAM_TTL_HOURS=_env_int("SUPERTABLE_AUDIT_REDIS_STREAM_TTL_HOURS", 24),
         SUPERTABLE_AUDIT_REDIS_STREAM_MAXLEN=_env_int("SUPERTABLE_AUDIT_REDIS_STREAM_MAXLEN", 100000),
         SUPERTABLE_AUDIT_HASH_CHAIN=_env_bool("SUPERTABLE_AUDIT_HASH_CHAIN", True),
+        SUPERTABLE_AUDIT_PROOF_CLOSE_GRACE_SEC=_env_int("SUPERTABLE_AUDIT_PROOF_CLOSE_GRACE_SEC", 300),
         SUPERTABLE_AUDIT_LOG_QUERIES=_env_bool("SUPERTABLE_AUDIT_LOG_QUERIES", True),
         SUPERTABLE_AUDIT_LOG_READS=_env_bool("SUPERTABLE_AUDIT_LOG_READS", True),
         SUPERTABLE_AUDIT_ALERT_WEBHOOK=_env_str("SUPERTABLE_AUDIT_ALERT_WEBHOOK"),

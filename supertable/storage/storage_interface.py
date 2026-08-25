@@ -12,6 +12,8 @@ from typing import Any, BinaryIO, Dict, List, Optional
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from supertable.utils.diagnostic_redaction import safe_exception_type
+
 
 # Decoding one physical row at a time is necessary to make the byte budget
 # skew-safe, but retaining one Python ``RecordBatch`` wrapper per very narrow
@@ -20,6 +22,12 @@ import pyarrow.parquet as pq
 # if the decoder batch size is increased in the future.
 PARQUET_DECODE_MAX_PENDING_BATCHES = 4_096
 PARQUET_DECODE_MAX_PENDING_ROWS = 65_536
+
+
+def storage_error_type(error: BaseException) -> str:
+    """Return bounded exception-class metadata without rendering its message."""
+
+    return safe_exception_type(error)
 
 
 def _iter_bounded_parquet_batch_groups(
@@ -154,8 +162,8 @@ def validate_range_request(
     try:
         offset = int(offset)
         length = int(length)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("range offset and length must be integers") from exc
+    except (TypeError, ValueError):
+        raise ValueError("range offset and length must be integers") from None
     if offset < 0 or length < 0:
         raise ValueError("range offset and length must be non-negative")
     if expected is not None:
@@ -221,9 +229,7 @@ class StorageInterface(abc.ABC):
             return ""
         prefix = f"{base}/"
         if not physical.startswith(prefix):
-            raise ValueError(
-                f"Provider key {path!r} is outside configured base prefix {base!r}"
-            )
+            raise ValueError("Provider key is outside configured base prefix")
         return physical[len(prefix):]
 
 
@@ -310,9 +316,7 @@ class StorageInterface(abc.ABC):
             pass
         remaining = self.list_files(path, "*")
         if remaining:
-            raise OSError(
-                f"Storage prefix is not empty after deletion: {path!r}"
-            )
+            raise OSError("Storage prefix is not empty after deletion")
 
     @staticmethod
     def _require_nonempty_delete_prefix(path: str) -> str:
@@ -404,6 +408,24 @@ class StorageInterface(abc.ABC):
         """
         pass
 
+    def create_bytes_if_absent(self, path: str, data: bytes) -> bool:
+        """Atomically create one immutable byte object without overwriting.
+
+        Return ``True`` only when this call created *path* and durably
+        acknowledged both the exact bytes and their namespace entry.  Return
+        ``False`` only when the target already existed.  Authentication,
+        transport, timeout, and otherwise ambiguous failures must be raised so
+        the caller can reconcile them with a sealed read.
+
+        The method is deliberately non-abstract for compatibility with
+        third-party storage adapters, but there is no check-then-write fallback:
+        adapters used for immutable publication must implement a provider-side
+        create precondition.
+        """
+        raise NotImplementedError(
+            "Storage adapter does not implement create_bytes_if_absent()"
+        )
+
     @abc.abstractmethod
     def read_bytes(self, path: str) -> bytes:
         """
@@ -448,7 +470,7 @@ class StorageInterface(abc.ABC):
         if callable(is_local) and bool(is_local()):
             return Path(os.path.abspath(value)).as_uri()
         raise NotImplementedError(
-            f"{self.__class__.__name__} does not implement canonical_uri()"
+            "Storage adapter does not implement canonical_uri()"
         )
 
     def content_sha256(self, path: str) -> tuple[int, str]:
@@ -468,10 +490,7 @@ class StorageInterface(abc.ABC):
                     path, spill, expected=metadata,
                 )
                 if int(written) != int(metadata.size):
-                    raise OSError(
-                        f"Short sealed read for {path!r}: expected "
-                        f"{metadata.size}, got {written}"
-                    )
+                    raise OSError("Short sealed read: object size mismatch")
                 spill.seek(0)
                 while True:
                     chunk = spill.read(8 * 1024 * 1024)
@@ -484,9 +503,8 @@ class StorageInterface(abc.ABC):
             payload = self.read_bytes(path)
             if len(payload) != int(metadata.size):
                 raise OSError(
-                    f"Short sealed read for {path!r}: expected "
-                    f"{metadata.size}, got {len(payload)}"
-                )
+                    "Short sealed read: object size mismatch"
+                ) from None
             digest.update(payload)
         return int(metadata.size), digest.hexdigest()
 
@@ -550,13 +568,17 @@ class StorageInterface(abc.ABC):
         - s3://bucket/key
         - http(s)://... URLs (when prefer_httpfs=True)
         """
-        raise NotImplementedError(f"{self.__class__.__name__} does not implement to_duckdb_path()")
+        raise NotImplementedError(
+            "Storage adapter does not implement to_duckdb_path()"
+        )
 
     def presign(self, key: str, expiry_seconds: int = 3600) -> str:
         """
         Return a presigned GET URL for the object.
         """
-        raise NotImplementedError(f"{self.__class__.__name__} does not implement presign()")
+        raise NotImplementedError(
+            "Storage adapter does not implement presign()"
+        )
 
     @staticmethod
     def _require_presign_object_key(key: object) -> str:
@@ -599,7 +621,7 @@ class StorageInterface(abc.ABC):
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
         raise NotImplementedError(
-            f"{self.__class__.__name__} does not implement streaming download_to_file()"
+            "Storage adapter does not implement streaming download_to_file()"
         )
 
     def read_range(
@@ -619,7 +641,7 @@ class StorageInterface(abc.ABC):
         """
         validate_range_request(offset, length, expected)
         raise NotImplementedError(
-            f"{self.__class__.__name__} does not implement bounded read_range()"
+            "Storage adapter does not implement bounded read_range()"
         )
 
     def cache_namespace(self) -> Dict[str, str]:

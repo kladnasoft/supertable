@@ -14,6 +14,7 @@ import redis
 from redis.sentinel import MasterNotFoundError, Sentinel
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 
 
@@ -295,7 +296,7 @@ def _decode_url_credential(value: Optional[str], *, field_name: str) -> Optional
     except UnicodeDecodeError as exc:
         raise ValueError(
             f"SUPERTABLE_REDIS_URL {field_name} is not valid UTF-8"
-        ) from exc
+        ) from None
     return decoded or None
 
 
@@ -306,8 +307,8 @@ def _parse_direct_redis_url(
 
     try:
         parsed = urlsplit(value)
-    except ValueError as exc:
-        raise ValueError(f"Invalid SUPERTABLE_REDIS_URL: {exc}") from exc
+    except ValueError:
+        raise ValueError("Invalid SUPERTABLE_REDIS_URL") from None
     scheme = parsed.scheme.lower()
     if scheme not in {"redis", "rediss"}:
         raise ValueError(
@@ -320,8 +321,8 @@ def _parse_direct_redis_url(
     try:
         host = parsed.hostname
         port = parsed.port
-    except ValueError as exc:
-        raise ValueError(f"Invalid SUPERTABLE_REDIS_URL: {exc}") from exc
+    except ValueError:
+        raise ValueError("Invalid SUPERTABLE_REDIS_URL") from None
     host = _validate_redis_host(
         host, field_name="SUPERTABLE_REDIS_URL host",
     )
@@ -420,8 +421,10 @@ def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Red
             field_name="Redis Sentinel master",
         )
         logger.debug(
-            f"[redis-catalog] Using Redis Sentinel mode. master={opts.sentinel_master}, "
-            f"sentinels={sentinel_hosts}"
+            "[redis-catalog] Using Redis Sentinel mode. "
+            "endpoint_count=%s tls=%s",
+            len(sentinel_hosts),
+            opts.use_ssl,
         )
         sentinel = Sentinel(
             sentinel_hosts,
@@ -464,13 +467,19 @@ def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Red
 
         if sentinel_err is None:
             return sentinel_client
+        error_type = safe_exception_type(sentinel_err)
         logger.error(
-            f"[redis-catalog] Sentinel unavailable (strict mode): {sentinel_err}"
+            "[redis-catalog] Sentinel unavailable (strict mode); error_type=%s",
+            error_type,
         )
-        raise sentinel_err
+        raise redis.ConnectionError(
+            f"Redis Sentinel unavailable; error_type={error_type}"
+        ) from None
 
     logger.info(
-        f"[redis-catalog] Using standard Redis mode. host={opts.host}, port={opts.port}, db={opts.db}"
+        "[redis-catalog] Using standard Redis mode. tls=%s db=%s",
+        opts.use_ssl,
+        opts.db,
     )
     return redis.Redis(
         host=opts.host,
@@ -479,6 +488,8 @@ def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Red
         username=opts.username,
         password=opts.password,
         decode_responses=decode_responses,
+        socket_timeout=0.5,
+        socket_connect_timeout=0.5,
         **tls_kwargs,
     )
 
@@ -499,13 +510,19 @@ def close_all_redis_clients() -> None:
             if pool is not None:
                 pool.disconnect()
         except Exception as e:
-            logger.debug(f"[redis-connector] pool disconnect failed: {e}")
+            logger.debug(
+                "[redis-connector] pool disconnect failed; error_type=%s",
+                safe_exception_type(e),
+            )
         try:
             close = getattr(client, "close", None)
             if callable(close):
                 close()
         except Exception as e:
-            logger.debug(f"[redis-connector] client close failed: {e}")
+            logger.debug(
+                "[redis-connector] client close failed; error_type=%s",
+                safe_exception_type(e),
+            )
 
 
 class RedisConnector:

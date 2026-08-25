@@ -10,10 +10,14 @@ import pytest
 
 from supertable.data_classes import Reflection, SuperSnapshot
 from supertable.engine import executor as executor_module
-from supertable.engine.data_estimator import DataEstimator
+from supertable.engine.data_estimator import (
+    DataEstimator,
+    _linked_table_names_digest,
+)
 from supertable.engine.engine_enum import Engine
 from supertable.engine.executor import Executor, _refresh_presigned_reflection
 from supertable.engine.plan_stats import PlanStats
+from supertable.errors import SnapshotCommitConflictError
 from supertable.storage.storage_interface import StorageInterface
 from supertable.utils.timer import Timer
 
@@ -149,6 +153,199 @@ def test_sdk_linked_authority_cache_has_unique_link_budget(monkeypatch):
             _linked_leaf_payload(table="events", link_id="link-3"),
         )
     assert len(estimator._authority_lookup_calls) == 2
+
+
+def _collection_leaf(
+    table: str,
+    *,
+    link_id: str = "link-1",
+    local_generation: int = 11,
+    provider_generation: int = 22,
+    manifest_digest: str = "c" * 64,
+) -> dict:
+    return {
+        "simple": table,
+        "version": 0,
+        "ts": 1,
+        "path": f"__linked_share__/{link_id}/{table}",
+        "payload": {
+            **_linked_leaf_payload(
+                table=table,
+                local_generation=local_generation,
+                link_id=link_id,
+            ),
+            "_linked_provider_generated_ms": provider_generation,
+            "_linked_provider_manifest_digest": manifest_digest,
+        },
+    }
+
+
+class _CollectionCatalog:
+    def __init__(self, *, items, indexes, controls=None, conflict=False):
+        self.items = list(items)
+        self.indexes = dict(indexes)
+        self.controls = dict(controls or {})
+        self.control_calls = []
+        self.conflict = conflict
+
+    def pin_leaf_authority_snapshot(self, organization, super_name):
+        return {"organization": organization, "super_name": super_name}
+
+    def scan_leaf_items(self, organization, super_name, count):
+        return iter(self.items)
+
+    def list_linked_share_table_indexes(
+        self, organization, super_name, *, limit,
+    ):
+        return dict(self.indexes)
+
+    def get_authoritative_linked_share(
+        self, organization, super_name, link_id,
+    ):
+        self.control_calls.append(link_id)
+        return self.controls.get(link_id)
+
+    def verify_leaf_authority_snapshot(
+        self, organization, super_name, pin,
+    ):
+        if self.conflict:
+            raise SnapshotCommitConflictError(
+                "linked catalog generation changed",
+            )
+
+
+def _collection_estimator(catalog) -> DataEstimator:
+    estimator = object.__new__(DataEstimator)
+    estimator.catalog = catalog
+    estimator._linked_authority_cache = {}
+    return estimator
+
+
+@pytest.mark.parametrize("items", [[], [_collection_leaf("events")]])
+def test_sdk_collection_rejects_missing_linked_manifest_tables(items):
+    control = _linked_control(tables=("events", "users"))
+    catalog = _CollectionCatalog(
+        items=items,
+        indexes={"link-1": None},
+        controls={"link-1": control},
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete or non-authoritative"):
+        _collection_estimator(catalog)._collect_snapshots_from_redis(
+            "consumer", "lake",
+        )
+
+    assert catalog.control_calls == ["link-1"]
+
+
+def test_sdk_collection_uses_compact_indexes_for_legal_33_link_namespace():
+    items = []
+    indexes = {}
+    for index in range(33):
+        link_id = f"link-{index}"
+        table = f"table-{index}"
+        local_generation = index + 1
+        provider_generation = index + 101
+        manifest_digest = f"{index + 1:064x}"
+        items.append(_collection_leaf(
+            table,
+            link_id=link_id,
+            local_generation=local_generation,
+            provider_generation=provider_generation,
+            manifest_digest=manifest_digest,
+        ))
+        indexes[link_id] = {
+            "version": 1,
+            "link_id": link_id,
+            "publication_generation": local_generation,
+            "provider_generated_ms": provider_generation,
+            "manifest_digest": manifest_digest,
+            "table_count": 1,
+            "table_names_digest": _linked_table_names_digest({table}),
+        }
+    catalog = _CollectionCatalog(items=items, indexes=indexes)
+
+    snapshots = _collection_estimator(catalog)._collect_snapshots_from_redis(
+        "consumer", "lake",
+    )
+
+    assert len(snapshots) == 33
+    assert catalog.control_calls == []
+
+
+def test_sdk_collection_rejects_generation_change_after_authority_validation():
+    table = "events"
+    catalog = _CollectionCatalog(
+        items=[_collection_leaf(table)],
+        indexes={
+            "link-1": {
+                "version": 1,
+                "link_id": "link-1",
+                "publication_generation": 11,
+                "provider_generated_ms": 22,
+                "manifest_digest": "c" * 64,
+                "table_count": 1,
+                "table_names_digest": _linked_table_names_digest({table}),
+            },
+        },
+        conflict=True,
+    )
+
+    with pytest.raises(SnapshotCommitConflictError, match="generation changed"):
+        _collection_estimator(catalog)._collect_snapshots_from_redis(
+            "consumer", "lake",
+        )
+
+
+def test_linked_missing_resource_size_never_uses_consumer_storage(
+    monkeypatch,
+):
+    from supertable.tests.test_data_estimator_join_pruning import (
+        SUPER,
+        _make_estimator,
+    )
+
+    estimator = _make_estimator(
+        monkeypatch, join_edges=[], predicate_constraints={},
+    )
+    snapshots = estimator._collect_snapshots_from_redis("org", SUPER)
+    linked = next(
+        snapshot for snapshot in snapshots
+        if snapshot["table_name"] == "category"
+    )
+    payload = linked["payload"]
+    payload.update({
+        "_linked_share": "link-1",
+        "_linked_generation": 11,
+        "_linked_provider_generated_ms": 22,
+        "_linked_provider_manifest_digest": "c" * 64,
+        "_provider_org": "provider",
+        "_allowed_columns": ["*"],
+        "_credential_expires_ms": int((time.time() + 600) * 1000),
+    })
+    payload["resources"][0].pop("file_size")
+    for index, resource in enumerate(payload["resources"]):
+        resource["_cache_identity"] = (
+            "share-cache-v1:" + f"{index + 1:064x}"
+        )
+    estimator._collect_snapshots_from_redis = (
+        lambda organization, super_name: list(snapshots)
+    )
+    estimator.catalog = SimpleNamespace(
+        get_authoritative_linked_share=lambda *_args: _linked_control(
+            tables=("category",),
+        ),
+    )
+    consumer_storage = MagicMock()
+    consumer_storage.size.side_effect = AssertionError(
+        "provider resource reached consumer size lookup",
+    )
+    estimator.storage = consumer_storage
+
+    with pytest.raises(RuntimeError, match="resource size is unavailable"):
+        estimator.estimate()
+
+    consumer_storage.size.assert_not_called()
 
 
 class _OneBatchStream:
@@ -432,7 +629,9 @@ def test_auto_linked_bearer_routes_to_duckdb_and_records_island_reason(
     executor.duckdb_exec.execute_stream.return_value = _OneBatchStream()
     executor.island_exec = MagicMock()
     monkeypatch.setattr(executor, "_get_catalog", lambda: None)
-    monkeypatch.setattr(executor, "_active_spark_clusters", lambda: [])
+    monkeypatch.setattr(
+        executor, "_active_spark_clusters", lambda **_kwargs: [],
+    )
     config = SimpleNamespace(
         engine_freshness_sec=300,
         engine_spark_min_bytes=0,

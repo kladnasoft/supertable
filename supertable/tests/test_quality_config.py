@@ -35,6 +35,14 @@ def _config():
     return redis_client, DQConfig(redis_client, "org", "lake")
 
 
+def test_quality_documents_have_a_bounded_serialized_size():
+    _, config = _config()
+    oversized = {"table_name": "facts", "rule_type": "row_count_min", "extra": "x" * (1024 * 1024)}
+    with pytest.raises(ValueError, match="size limit"):
+        config.create_rule(oversized)
+    assert config.set_global_config({"extra": "x" * (1024 * 1024)}) is False
+
+
 def test_old_partial_global_config_is_forward_merged_with_all_builtins():
     redis_client, config = _config()
     redis_client.set(

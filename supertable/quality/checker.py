@@ -308,14 +308,14 @@ def validate_incremental_column(
         return ValidationResult(
             False,
             "hidden_column",
-            f"incremental column {column!r} is not part of the public read schema",
+            "incremental column is not part of the public read schema",
         )
     visible = _column_type_map(columns)
     if column not in visible:
         return ValidationResult(
             False,
             "missing_column",
-            f"incremental column {column!r} does not exist in the public read schema",
+            "incremental column does not exist in the public read schema",
         )
     if _col_category(visible[column]) != "date":
         return ValidationResult(
@@ -484,8 +484,8 @@ def _count_value(value: Any, field: str) -> int:
         raise ValueError(f"{field} must be a non-negative integer")
     try:
         exact = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError) as exc:
-        raise ValueError(f"{field} must be a non-negative integer") from exc
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError(f"{field} must be a non-negative integer") from None
     if not exact.is_finite() or exact < 0 or exact != exact.to_integral_value():
         raise ValueError(f"{field} must be a non-negative integer")
     return int(exact)
@@ -816,8 +816,8 @@ def _distinct_in_literals(expected: Sequence[Any]) -> List[str]:
         literal = _literal_sql(value)
         try:
             literal_bytes = len(literal.encode("utf-8"))
-        except UnicodeEncodeError as exc:
-            raise ValueError("expected values must be valid UTF-8") from exc
+        except UnicodeEncodeError:
+            raise ValueError("expected values must be valid UTF-8") from None
         encoded_bytes += literal_bytes + (2 if literals else 0)
         if encoded_bytes > DISTINCT_IN_MAX_LITERAL_BYTES:
             raise _ExpectedValuesLimitError(
@@ -1071,7 +1071,7 @@ def _custom_sql_scope_issue(
             if actual_parts != expected_parts:
                 return (
                     "table_scope",
-                    f"custom_sql may only read its attached table {table_fqn!r}",
+                    "custom_sql may only read its attached table",
                 )
 
         projections = statement.expressions
@@ -1299,7 +1299,7 @@ def validate_custom_rule(
         return ValidationResult(False, "invalid_rule", "rule must be an object")
     rule_type = rule.get("rule_type")
     if rule_type not in _CUSTOM_RULE_TYPES:
-        return ValidationResult(False, "unknown_rule_type", f"unknown rule type {rule_type!r}")
+        return ValidationResult(False, "unknown_rule_type", "unknown quality rule type")
 
     if rule_type == "custom_sql":
         sql = rule.get("sql")
@@ -1326,7 +1326,7 @@ def validate_custom_rule(
             return ValidationResult(
                 False,
                 "hidden_column",
-                f"custom_sql references private column {hidden!r}",
+                "custom_sql references a private column",
             )
         scope_issue = _custom_sql_scope_issue(sql, table_fqn)
         if scope_issue is not None:
@@ -1360,7 +1360,7 @@ def validate_custom_rule(
                         return ValidationResult(
                             False,
                             "missing_column",
-                            f"custom_sql column {reference.name!r} does not exist "
+                            "custom_sql references a column that does not exist "
                             "in the public read schema",
                         )
                     reference_table = str(reference.table or "").casefold()
@@ -1375,8 +1375,7 @@ def validate_custom_rule(
                         return ValidationResult(
                             False,
                             "column_scope",
-                            f"custom_sql column {reference.sql()!r} is not qualified "
-                            "by its attached table",
+                            "custom_sql column is not qualified by its attached table",
                         )
                 # COUNT always returns a bounded integer.  SUM/AVG/MIN/MAX are
                 # allowed only over numeric logical columns: in particular,
@@ -1395,8 +1394,7 @@ def validate_custom_rule(
                         return ValidationResult(
                             False,
                             "non_numeric_aggregate",
-                            "custom_sql SUM/AVG/MIN/MAX require a numeric "
-                            f"column; {argument.name!r} is not numeric",
+                            "custom_sql SUM/AVG/MIN/MAX require a numeric column",
                         )
             except Exception:
                 return ValidationResult(
@@ -1411,12 +1409,12 @@ def validate_custom_rule(
     elif rule_type in _COLUMN_RULE_TYPES:
         column = rule.get("column_name")
         if not isinstance(column, str) or not column:
-            return ValidationResult(False, "missing_column", f"{rule_type} requires column_name")
+            return ValidationResult(False, "missing_column", "quality rule requires column_name")
         if not is_profilable_column(column):
             return ValidationResult(
                 False,
                 "hidden_column",
-                f"custom rule column {column!r} is not part of the public read schema",
+                "quality rule column is not part of the public read schema",
             )
         if columns is not None:
             visible_types = _column_type_map(columns)
@@ -1424,20 +1422,20 @@ def validate_custom_rule(
                 return ValidationResult(
                     False,
                     "missing_column",
-                    f"custom rule column {column!r} does not exist in the public read schema",
+                    "quality rule column does not exist in the public read schema",
                 )
             category = _col_category(visible_types[column])
             if category == "other":
                 return ValidationResult(
                     False,
                     "unsupported_column_type",
-                    f"custom rule {rule_type} does not support nested/opaque column {column!r}",
+                    "quality rule does not support a nested or opaque column",
                 )
             if rule_type in {"column_min", "column_max"} and category != "numeric":
                 return ValidationResult(
                     False,
                     "unsupported_column_type",
-                    f"custom rule {rule_type} requires a numeric column",
+                    "quality rule requires a numeric column",
                 )
             if rule_type == "distinct_in":
                 expected = rule.get("expected_values")
@@ -1461,7 +1459,7 @@ def validate_custom_rule(
                                 False,
                                 "expected_value_type",
                                 "distinct_in expected_values must match the "
-                                f"logical type of column {column!r}",
+                                "logical column type",
                             )
 
     threshold = rule.get("threshold")
@@ -1505,7 +1503,10 @@ def build_custom_rule_sql(
     """
     validation = validate_custom_rule(rule, columns, table_fqn=table_fqn)
     if not validation.valid:
-        logger.warning("[dq-checker] custom rule rejected: %s", validation.message)
+        logger.warning(
+            "[dq-checker] custom rule rejected; validation_code=%s",
+            validation.code,
+        )
         return None
     rt = rule.get("rule_type", "")
     col = rule.get("column_name")

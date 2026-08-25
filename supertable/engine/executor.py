@@ -10,7 +10,7 @@ import threading
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import replace
-from typing import Callable, Mapping, Optional, Tuple
+from typing import Any, Callable, Mapping, Optional, Tuple
 from urllib.parse import parse_qsl, urlsplit
 
 import pandas as pd
@@ -58,6 +58,7 @@ from supertable.data_classes import Reflection
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.storage.storage_interface import StorageInterface
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 
 _duckdb_singleton: Optional[DuckDB] = None
@@ -72,6 +73,35 @@ _PRESIGN_REFRESH_MAX_IN_FLIGHT = 8
 _presign_refresh_slots = threading.BoundedSemaphore(
     _PRESIGN_REFRESH_MAX_IN_FLIGHT
 )
+
+# Redis-backed engine configuration is a synchronous control-plane read.  A
+# caller deadline must cover it just as it covers the selected engine.  Calls
+# that outlive their request retain a slot until the Redis client really
+# returns, preventing a failing backend from creating an unbounded daemon
+# thread population.
+_CONTROL_PLANE_MAX_IN_FLIGHT = 8
+_control_plane_slots = threading.BoundedSemaphore(
+    _CONTROL_PLANE_MAX_IN_FLIGHT
+)
+
+
+def _safe_island_failure_message(
+    exc: BaseException,
+    *,
+    phase: str,
+) -> str:
+    """Return correlation metadata without retaining Island/backend prose."""
+
+    error_type = safe_exception_type(exc)
+    try:
+        encoded = str(exc).encode("utf-8", errors="surrogatepass")
+    except Exception:
+        encoded = error_type.encode("ascii")
+    return (
+        f"IslandDB {phase} failed; error_type={error_type}; "
+        f"diagnostic_id={hashlib.sha256(encoded).hexdigest()[:16]}; "
+        f"diagnostic_bytes={len(encoded)}"
+    )
 
 
 class _PresignAuthorityGate:
@@ -196,8 +226,8 @@ def _remaining_query_timeout(
         return fallback
     try:
         deadline = float(deadline_monotonic)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("query deadline must be finite") from exc
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("query deadline must be finite") from None
     if not math.isfinite(deadline):
         raise ValueError("query deadline must be finite")
     remaining = deadline - time.monotonic()
@@ -213,6 +243,81 @@ def _raise_if_query_cancelled(
         raise ResourceReservationCancelled("query was cancelled before execution")
 
 
+def _bounded_query_control_call(
+    call: Callable[[], object],
+    *,
+    deadline_monotonic: Optional[float],
+    cancel_event: Optional[threading.Event],
+    operation: str,
+) -> object:
+    """Run one blocking read-only control-plane call within the query boundary."""
+    while True:
+        _raise_if_query_cancelled(cancel_event)
+        remaining = _remaining_query_timeout(deadline_monotonic)
+        wait_for = 0.05 if remaining is None else min(0.05, remaining)
+        if _control_plane_slots.acquire(timeout=max(0.0, wait_for)):
+            break
+
+    completed = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def invoke() -> None:
+        try:
+            outcome["result"] = call()
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            completed.set()
+            _control_plane_slots.release()
+
+    worker = threading.Thread(
+        target=invoke,
+        daemon=True,
+        name=f"supertable-{operation}",
+    )
+    try:
+        worker.start()
+    except BaseException:
+        _control_plane_slots.release()
+        raise
+
+    while not completed.is_set():
+        _raise_if_query_cancelled(cancel_event)
+        remaining = _remaining_query_timeout(deadline_monotonic)
+        wait_for = 0.05 if remaining is None else min(0.05, remaining)
+        completed.wait(max(0.0, wait_for))
+
+    _raise_if_query_cancelled(cancel_event)
+    _remaining_query_timeout(deadline_monotonic)
+    error = outcome.get("error")
+    if isinstance(error, BaseException):
+        raise error
+    return outcome.get("result")
+
+
+def _resolve_engine_bundle_with_boundary(
+    organization: str,
+    catalog_provider: Callable[[], object],
+    *,
+    deadline_monotonic: Optional[float],
+    cancel_event: Optional[threading.Event],
+) -> tuple[dict[str, EngineRuntimeConfig], tuple[AutoRoutingRule, ...]]:
+    result = _bounded_query_control_call(
+        lambda: resolve_engine_bundle(organization, catalog_provider()),
+        deadline_monotonic=deadline_monotonic,
+        cancel_event=cancel_event,
+        operation="engine-config",
+    )
+    if (
+        not isinstance(result, tuple)
+        or len(result) != 2
+        or not isinstance(result[0], dict)
+        or not isinstance(result[1], tuple)
+    ):
+        raise RuntimeError("Engine configuration resolver returned invalid state")
+    return result
+
+
 def _bounded_presign_call(
     presign,
     key: str,
@@ -220,7 +325,7 @@ def _bounded_presign_call(
     expiry_seconds: int,
     deadline_monotonic: Optional[float],
     cancel_event: Optional[threading.Event],
-) -> object:
+) -> Tuple[object, Optional[int], Optional[int]]:
     """Run one blocking provider call behind a deadline-aware bounded gate.
 
     Python cannot safely kill a thread inside a provider SDK.  The caller may
@@ -306,10 +411,20 @@ def _bounded_presign_call(
     error = outcome.get("error")
     if isinstance(error, BaseException):
         raise error
+    generation = outcome.get("credential_generation")
+    expires_ms = outcome.get("credential_expires_ms")
     return (
         outcome.get("result"),
-        outcome.get("credential_generation"),
-        outcome.get("credential_expires_ms"),
+        (
+            generation
+            if isinstance(generation, int) and not isinstance(generation, bool)
+            else None
+        ),
+        (
+            expires_ms
+            if isinstance(expires_ms, int) and not isinstance(expires_ms, bool)
+            else None
+        ),
     )
 
 
@@ -751,7 +866,7 @@ def _record_engine_failure(
         "ENGINE_FAILURE": {
             "engine": engine.value,
             "stage": stage,
-            "reason_code": type(exc).__name__,
+            "reason_code": safe_exception_type(exc),
         },
     })
 
@@ -902,7 +1017,7 @@ class _AutoIslandFallbackStream:
         self._inner.close()
 
 
-class _FallbackPlanStats:
+class _FallbackPlanStats(PlanStats):
     """Forward Duck fallback telemetry without replacing AUTO request facts."""
 
     def __init__(self, target: PlanStats) -> None:
@@ -1020,7 +1135,7 @@ def _storage_identity_details(storage: Optional[object]) -> tuple[tuple, str]:
         return ("none",), "none"
     module = storage.__class__.__module__
     qualname = storage.__class__.__qualname__
-    parts = [module, qualname]
+    parts: list[object] = [module, qualname]
     for name in (
         "bucket_name", "container_name", "base_prefix", "endpoint_url",
         "region", "url_style", "secure", "project_id", "account_name",
@@ -1101,9 +1216,15 @@ def _storage_identity_details(storage: Optional[object]) -> tuple[tuple, str]:
             getattr(client, "_request_signer", None),
             "_credentials", None,
         )
-        try:
-            frozen = credentials.get_frozen_credentials()
-        except Exception:
+        get_frozen_credentials = getattr(
+            credentials, "get_frozen_credentials", None,
+        )
+        if callable(get_frozen_credentials):
+            try:
+                frozen = get_frozen_credentials()
+            except Exception:
+                frozen = credentials
+        else:
             frozen = credentials
         hidden_values = [
             getattr(frozen, "access_key", None),
@@ -1251,12 +1372,12 @@ class Executor:
         ) = _get_duckdb_with_status(
             storage=storage, organization=organization,
         )
-        self.spark_exec = None
+        self.spark_exec: Any = None
         self.island_exec = IslandDB(
             storage=storage, organization=organization,
         )
-        self._file_cache = None
-        self._catalog = None  # lazily created RedisCatalog for live config reads
+        self._file_cache: Any = None
+        self._catalog: Any = None  # lazily created RedisCatalog for live config reads
         # Optional, read-only profile feedback.  The callable receives the
         # fully bucketed aggregate feature record and returns comparable
         # histories keyed by Engine. It is best-effort: Redis/provider failure
@@ -1292,12 +1413,14 @@ class Executor:
         explain_options: str,
         stage: str,
         deadline_monotonic: Optional[float] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> pd.DataFrame:
         """Run DuckDB behind Executor's single atomic refresh boundary."""
         self._publish_duckdb_connection_cache(plan_stats)
         deadline = deadline_monotonic
         if deadline is None:
             deadline = time.monotonic() + _configured_query_timeout_sec()
+        _raise_if_query_cancelled(cancel_event)
         timeout_sec = _remaining_query_timeout(
             deadline,
             fallback=_configured_query_timeout_sec(),
@@ -1306,6 +1429,8 @@ class Executor:
         refresh_attempted = False
 
         def run(candidate: Reflection) -> pd.DataFrame:
+            _raise_if_query_cancelled(cancel_event)
+            _remaining_query_timeout(deadline)
             return self.duckdb_exec.execute(
                 reflection=candidate,
                 parser=parser,
@@ -1317,6 +1442,7 @@ class Executor:
                 explain_options=explain_options,
                 timeout_sec=timeout_sec,
                 deadline_monotonic=deadline,
+                cancel_event=cancel_event,
             )
 
         def refresh(refresh_stage: str) -> Reflection:
@@ -1334,6 +1460,7 @@ class Executor:
                     reflection,
                     expiry_seconds=expiry_seconds,
                     deadline_monotonic=deadline,
+                    cancel_event=cancel_event,
                 )
             except (ResourceReservationCancelled, TimeoutError) as exc:
                 plan_stats.add_stat({
@@ -1342,7 +1469,7 @@ class Executor:
                         "succeeded": False,
                         "before_rows": True,
                         "stage": refresh_stage,
-                        "reason_code": type(exc).__name__,
+                        "reason_code": safe_exception_type(exc),
                     },
                 })
                 raise
@@ -1355,7 +1482,7 @@ class Executor:
                         "succeeded": False,
                         "before_rows": True,
                         "stage": refresh_stage,
-                        "reason_code": type(exc).__name__,
+                        "reason_code": safe_exception_type(exc),
                     },
                 })
                 raise RuntimeError(
@@ -1436,9 +1563,9 @@ class Executor:
             plan_stats.add_stat({"ISLAND_TELEMETRY": profile_doc})
         except Exception as telemetry_error:
             logger.debug(
-                "%s[islanddb] plan telemetry unavailable: %s",
+                "%s[islanddb] plan telemetry unavailable; error_type=%s",
                 log_prefix,
-                telemetry_error,
+                safe_exception_type(telemetry_error),
             )
 
     @staticmethod
@@ -1474,7 +1601,7 @@ class Executor:
                 # unsupported SQL retains its exact, data-free reasons above.
                 reasons = [
                     "IslandDB capability analysis failed: "
-                    f"{type(analysis_error).__name__}"
+                    f"{safe_exception_type(analysis_error)}"
                 ]
             plan_stats.add_stat({
                 "ENGINE_CAPABILITY": {
@@ -1511,7 +1638,10 @@ class Executor:
                     workers=settings.SUPERTABLE_ISLAND_CACHE_WORKERS,
                 )
             except Exception as exc:
-                logger.warning("[file-cache] disabled for this executor: %s", exc)
+                logger.warning(
+                    "[file-cache] disabled for this executor; error_type=%s",
+                    safe_exception_type(exc),
+                )
                 self._file_cache = False
                 return None
         return self._file_cache
@@ -1528,7 +1658,12 @@ class Executor:
             self._catalog = RedisCatalog()
         return self._catalog or None
 
-    def _active_spark_clusters(self) -> list:
+    def _active_spark_clusters(
+        self,
+        *,
+        deadline_monotonic: Optional[float] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> list:
         """Active Spark Thrift clusters registered for this org (best-effort).
 
         Returns ``[]`` when no catalog is reachable or none are active, which
@@ -1536,17 +1671,30 @@ class Executor:
         the job.
         """
         try:
-            catalog = self._get_catalog()
+            def discover() -> object:
+                catalog = self._get_catalog()
+                if catalog is None:
+                    return []
+                return catalog.list_spark_clusters(self.organization) or []
+
+            clusters = (
+                _bounded_query_control_call(
+                    discover,
+                    deadline_monotonic=deadline_monotonic,
+                    cancel_event=cancel_event,
+                    operation="spark-fleet-discovery",
+                )
+                if deadline_monotonic is not None or cancel_event is not None
+                else discover()
+            )
+        except (ResourceReservationCancelled, TimeoutError):
+            raise
         except Exception:
             # Fleet discovery is merely an AUTO availability hint. Required
             # engine-policy acquisition has already happened at execute(); a
-            # transient discovery failure keeps AUTO off Spark.
+            # transient backend failure keeps AUTO off Spark.
             return []
-        if catalog is None:
-            return []
-        try:
-            clusters = catalog.list_spark_clusters(self.organization) or []
-        except Exception:
+        if not isinstance(clusters, (list, tuple)):
             return []
         return [
             c for c in clusters
@@ -1588,6 +1736,8 @@ class Executor:
         streaming_result: bool = False,
         plan_stats: Optional[PlanStats] = None,
         routing_policy: Tuple[AutoRoutingRule, ...] = (),
+        deadline_monotonic: Optional[float] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Engine:
         """Choose the lowest predicted-cost engine after hard safety gates.
 
@@ -1605,7 +1755,16 @@ class Executor:
             reflection
         )
         freshness_threshold_s = cfg.engine_freshness_sec
-        active_clusters = self._active_spark_clusters()
+        if deadline_monotonic is None and cancel_event is None:
+            # Preserve the historical override/test-double call contract for
+            # direct, unbounded routing probes. Production query admission
+            # always supplies the boundary and takes the branch below.
+            active_clusters = self._active_spark_clusters()
+        else:
+            active_clusters = self._active_spark_clusters(
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
+            )
         has_active_tombstone = any(
             getattr(tombstone, "tombstone_path", None)
             for tombstone in (
@@ -1690,7 +1849,9 @@ class Executor:
                         plan_stats, None, analysis_error=exc,
                     )
                 logger.debug(
-                    "[engine.auto] IslandDB resource probe skipped: %s", exc,
+                    "[engine.auto] IslandDB resource probe skipped; "
+                    "error_type=%s",
+                    safe_exception_type(exc),
                 )
 
         rg_size_complete = bool(
@@ -1870,12 +2031,25 @@ class Executor:
         history_provider = getattr(self, "_auto_history_provider", None)
         if history_provider is not None:
             try:
-                supplied = history_provider(features)
-                if supplied:
+                supplied = (
+                    _bounded_query_control_call(
+                        lambda: history_provider(features),
+                        deadline_monotonic=deadline_monotonic,
+                        cancel_event=cancel_event,
+                        operation="engine-history",
+                    )
+                    if deadline_monotonic is not None or cancel_event is not None
+                    else history_provider(features)
+                )
+                if isinstance(supplied, Mapping):
                     history = dict(supplied)
+            except (ResourceReservationCancelled, TimeoutError):
+                raise
             except Exception as exc:
                 logger.debug(
-                    "[engine.auto] historical profile lookup skipped: %s", exc,
+                    "[engine.auto] historical profile lookup skipped; "
+                    "error_type=%s",
+                    safe_exception_type(exc),
                 )
         matched_rule = match_auto_routing_policy(
             routing_policy, features.effective_scan_bytes,
@@ -1978,9 +2152,14 @@ class Executor:
             )
         # Resolve engine config live (Redis → env → default) for this query so
         # UI changes take effect immediately without restart or cache.
-        cfgs, routing_policy = resolve_engine_bundle(
-            self.organization, self._get_catalog()
+        cfgs, routing_policy = _resolve_engine_bundle_with_boundary(
+            self.organization,
+            self._get_catalog,
+            deadline_monotonic=query_deadline,
+            cancel_event=cancel_event,
         )
+        _raise_if_query_cancelled(cancel_event)
+        _remaining_query_timeout(query_deadline)
         duckdb_cfg = cfgs["duckdb"]
 
         chosen = (
@@ -1991,6 +2170,8 @@ class Executor:
                 parser=parser,
                 plan_stats=plan_stats,
                 routing_policy=routing_policy,
+                deadline_monotonic=query_deadline,
+                cancel_event=cancel_event,
             )
         )
         auto_selected = chosen if engine == Engine.AUTO else None
@@ -2026,10 +2207,13 @@ class Executor:
                     reflection, parser, streaming_result=False,
                 )
             except IslandUnsupportedError as exc:
-                self._publish_engine_capability(
-                    plan_stats, IslandCapability(False, (str(exc),)),
+                safe_failure = _safe_island_failure_message(
+                    exc, phase="materialized preparation",
                 )
-                raise
+                self._publish_engine_capability(
+                    plan_stats, IslandCapability(False, (safe_failure,)),
+                )
+                raise IslandUnsupportedError(safe_failure) from None
             self._publish_engine_capability(
                 plan_stats, island_prepared.capability,
             )
@@ -2094,6 +2278,8 @@ class Executor:
         )
 
         with cache_context as (execution_reflection, cache_metrics):
+            _raise_if_query_cancelled(cancel_event)
+            _remaining_query_timeout(query_deadline)
             if cache_metrics is not None:
                 plan_stats.add_stat(cache_metrics.to_plan_stats())
 
@@ -2133,6 +2319,7 @@ class Executor:
                     explain_options=explain_options,
                     stage=attempt_stage,
                     deadline_monotonic=query_deadline,
+                    cancel_event=cancel_event,
                 )
                 used = "duckdb"
 
@@ -2157,6 +2344,7 @@ class Executor:
                         cache_metrics=cache_metrics,
                         _prepared=island_prepared,
                         deadline_monotonic=query_deadline,
+                        cancel_event=cancel_event,
                     )
                     used = "islanddb"
                     self._publish_island_profile(
@@ -2194,7 +2382,7 @@ class Executor:
                         "ENGINE_ATTEMPT": {
                             "engine": Engine.DUCKDB.value,
                             "stage": "auto_fallback",
-                            "reason_code": type(exc).__name__,
+                            "reason_code": safe_exception_type(exc),
                         },
                     })
                     df = self._execute_duckdb_materialized(
@@ -2209,6 +2397,7 @@ class Executor:
                         explain_options=explain_options,
                         stage="auto_fallback",
                         deadline_monotonic=query_deadline,
+                        cancel_event=cancel_event,
                     )
                     used = "duckdb"
                 except BaseException as exc:
@@ -2329,10 +2518,15 @@ class Executor:
         cfgs, routing_policy = (
             _resolved_bundle
             if _resolved_bundle is not None
-            else resolve_engine_bundle(
-                self.organization, self._get_catalog()
+            else _resolve_engine_bundle_with_boundary(
+                self.organization,
+                self._get_catalog,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
             )
         )
+        _raise_if_query_cancelled(cancel_event)
+        _remaining_query_timeout(deadline_monotonic)
         chosen = (
             engine
             if engine != Engine.AUTO
@@ -2343,6 +2537,8 @@ class Executor:
                 streaming_result=True,
                 plan_stats=plan_stats,
                 routing_policy=routing_policy,
+                deadline_monotonic=deadline_monotonic,
+                cancel_event=cancel_event,
             )
         )
         if chosen is Engine.ISLANDDB and linked_share_reflection:
@@ -2385,7 +2581,7 @@ class Executor:
                 "ENGINE_ATTEMPT": {
                     "engine": Engine.DUCKDB.value,
                     "stage": f"auto_stream_fallback_{stage}",
-                    "reason_code": type(exc).__name__,
+                    "reason_code": safe_exception_type(exc),
                 },
             })
             fallback_stats = _FallbackPlanStats(plan_stats)
@@ -2413,7 +2609,7 @@ class Executor:
                     "selected_engine": Engine.ISLANDDB.value,
                     "actual_engine": Engine.DUCKDB.value,
                     "fallback": True,
-                    "reason_code": type(exc).__name__,
+                    "reason_code": safe_exception_type(exc),
                     "stage": stage,
                 },
             })
@@ -2501,7 +2697,7 @@ class Executor:
                                 "succeeded": False,
                                 "before_rows": True,
                                 "stage": stage,
-                                "reason_code": type(exc).__name__,
+                                "reason_code": safe_exception_type(exc),
                             },
                         })
                         raise
@@ -2514,7 +2710,7 @@ class Executor:
                                 "succeeded": False,
                                 "before_rows": True,
                                 "stage": stage,
-                                "reason_code": type(exc).__name__,
+                                "reason_code": safe_exception_type(exc),
                             },
                         })
                         raise RuntimeError(
@@ -2556,7 +2752,7 @@ class Executor:
                             (lambda: start_refreshed_stream("first_batch"))
                             if refreshable_remote else None
                         )
-                inner = _RetryBeforeFirstBatchStream(
+                duckdb_inner = _RetryBeforeFirstBatchStream(
                     initial_inner, retry_factory=retry_factory,
                 )
             except BaseException as exc:
@@ -2570,8 +2766,8 @@ class Executor:
                 )
                 raise
 
-            inner = _FailureTelemetryIterator(
-                inner,
+            delivery_inner = _FailureTelemetryIterator(
+                duckdb_inner,
                 plan_stats=plan_stats,
                 engine=Engine.DUCKDB,
                 stage="stream_delivery",
@@ -2579,13 +2775,13 @@ class Executor:
 
             def close_duckdb_stream() -> None:
                 try:
-                    inner.close()
+                    delivery_inner.close()
                 finally:
                     cache_context.__exit__(None, None, None)
 
-            stream = ArrowBatchStream(
-                inner.schema,
-                inner,
+            duckdb_stream = ArrowBatchStream(
+                delivery_inner.schema,
+                delivery_inner,
                 close_callback=close_duckdb_stream,
                 cancel_event=cancel_event,
             )
@@ -2593,8 +2789,8 @@ class Executor:
             # additionally owns the whole-object cache context. Drive the same
             # cooperative close state machine here so an idle deadline/cancel
             # cannot release the cursor while leaving its cache lease stranded.
-            stream = _DuckDBResultLifecycleStream(
-                stream,
+            lifecycle_stream = _DuckDBResultLifecycleStream(
+                duckdb_stream,
                 deadline_monotonic=duckdb_deadline,
                 timeout_value=duckdb_timeout_value,
                 cancel_event=cancel_event,
@@ -2609,15 +2805,18 @@ class Executor:
                 })
             plan_stats.add_stat({"ENGINE": "duckdb"})
             plan_stats.add_stat({"RESULT_MODE": "arrow_stream"})
-            return stream, "duckdb"
+            return lifecycle_stream, "duckdb"
 
         try:
             island_prepared = self.island_exec.prepare_execution(
                 reflection, parser, streaming_result=True,
             )
         except IslandUnsupportedError as exc:
+            safe_failure = _safe_island_failure_message(
+                exc, phase="stream preparation",
+            )
             self._publish_engine_capability(
-                plan_stats, IslandCapability(False, (str(exc),)),
+                plan_stats, IslandCapability(False, (safe_failure,)),
             )
             _record_engine_failure(
                 plan_stats,
@@ -2627,7 +2826,7 @@ class Executor:
             )
             if engine is Engine.AUTO:
                 return start_auto_island_fallback(exc, "prepare"), "duckdb"
-            raise
+            raise IslandUnsupportedError(safe_failure) from None
         except (IslandResourceError, ResultMemoryLimitExceeded) as exc:
             _record_engine_failure(
                 plan_stats,
@@ -2707,7 +2906,7 @@ class Executor:
                 )
             if cache_metrics is not None:
                 plan_stats.add_stat(cache_metrics.to_plan_stats())
-            inner = self.island_exec.execute_stream(
+            island_inner = self.island_exec.execute_stream(
                 reflection=execution_reflection,
                 parser=parser,
                 query_manager=query_manager,
@@ -2737,8 +2936,8 @@ class Executor:
                 return start_auto_island_fallback(exc, "setup"), "duckdb"
             raise
 
-        inner = _FailureTelemetryIterator(
-            inner,
+        delivery_inner = _FailureTelemetryIterator(
+            island_inner,
             plan_stats=plan_stats,
             engine=Engine.ISLANDDB,
             stage="stream_delivery",
@@ -2746,7 +2945,7 @@ class Executor:
 
         def close_stream() -> None:
             try:
-                inner.close()
+                delivery_inner.close()
             finally:
                 try:
                     self._publish_island_profile(
@@ -2756,8 +2955,8 @@ class Executor:
                     cache_context.__exit__(None, None, None)
 
         island_stream = ArrowBatchStream(
-            inner.schema,
-            inner,
+            delivery_inner.schema,
+            delivery_inner,
             close_callback=close_stream,
             cancel_event=cancel_event,
         )
@@ -2777,13 +2976,13 @@ class Executor:
                 fallback_factory=start_auto_island_fallback,
                 island_success=commit_island_success,
             )
-            stream = ArrowBatchStream(
+            result_stream = ArrowBatchStream(
                 auto_inner.schema,
                 auto_inner,
                 cancel_event=cancel_event,
             )
         else:
             plan_stats.add_stat({"ENGINE": "islanddb"})
-            stream = island_stream
+            result_stream = island_stream
         plan_stats.add_stat({"RESULT_MODE": "arrow_stream"})
-        return stream, "islanddb"
+        return result_stream, "islanddb"

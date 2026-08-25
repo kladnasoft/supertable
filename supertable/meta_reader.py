@@ -26,6 +26,7 @@ from supertable.tombstone_manifest_v2 import (
     normalize_snapshot_tombstone_state,
 )
 from supertable.utils.snapshot import complete_snapshot_payload
+from supertable.utils.diagnostic_redaction import safe_exception_type
 from supertable.row_identity import snapshot_proves_stable_rowids
 
 logger = logging.getLogger(__name__)
@@ -35,7 +36,6 @@ logger = logging.getLogger(__name__)
 _SUPER_META_CACHE: Dict[str, Tuple[int, float, Dict[str, Any]]] = {}
 _SUPER_META_CACHE_LOCK = threading.Lock()
 _SUPER_META_CACHE_MAX_ENTRIES = 256
-
 _HIDDEN_COLUMNS = frozenset({
     "__rowid__",
     "__timestamp__",
@@ -43,6 +43,12 @@ _HIDDEN_COLUMNS = frozenset({
     "__supertable_source_file__",
     "__supertable_scan_filename__",
 })
+
+
+def _safe_error_type(error: BaseException) -> str:
+    """Return bounded exception metadata without formatting backend text."""
+
+    return safe_exception_type(error)
 
 def _super_meta_cache_ttl_s() -> float:
     val = settings.SUPERTABLE_SUPER_META_CACHE_TTL_S
@@ -145,10 +151,13 @@ def _validated_live_row_count(
     physical_rows: int,
 ) -> int:
     """Return exact live rows without coercing malformed DV state to zero."""
+    tombstone_state_error = False
     try:
         state = normalize_snapshot_tombstone_state(snapshot)
-    except (TypeError, TombstoneManifestV2Error) as exc:
-        raise RuntimeError("Snapshot has an invalid deletion-vector state") from exc
+    except (TypeError, TombstoneManifestV2Error):
+        tombstone_state_error = True
+    if tombstone_state_error:
+        raise RuntimeError("Snapshot has an invalid deletion-vector state")
 
     if state.pointer is None:
         return physical_rows
@@ -196,8 +205,9 @@ def _sanitize_snapshot_stats(
     Snapshot resource dictionaries are storage control data: their ``file``
     values may be local object keys or linked-share bearer URLs, and future
     adapters can attach credentials or cached manifests beside them. A deny
-    list is therefore not a durable response boundary. Return only a fixed
-    set of scalar aggregates derived from the pinned snapshot.
+    list is therefore not a durable response boundary. Return fixed aggregate
+    fields plus an allow-listed, path-free resource metric projection that
+    preserves the useful 2.5.0 response shape.
     """
     if not isinstance(snapshot, dict):
         raise RuntimeError("Simple table snapshot is invalid")
@@ -214,6 +224,50 @@ def _sanitize_snapshot_stats(
     resources = snapshot.get("resources")
     if isinstance(resources, list):
         result["files"] = len(resources)
+        # Preserve the 2.5.0 response's resource-level shape for callers that
+        # consume per-file metrics, while making storage paths, bearer URLs,
+        # provider seals, and cache identities impossible to return. This is a
+        # positive allow-list rather than a deny-list so future control fields
+        # cannot accidentally become public API data.
+        visible_schema = _visible_schema(snapshot.get("schema", {}), entry)
+        visible_folded = {name.casefold() for name in visible_schema}
+        safe_resources: List[Dict[str, Any]] = []
+        for resource in resources:
+            if not isinstance(resource, dict):
+                continue
+            projected: Dict[str, Any] = {}
+            for field_name in ("rows", "file_size", "stats_rows"):
+                value = _nonnegative_metadata_int(resource.get(field_name))
+                if value is not None:
+                    projected[field_name] = value
+            value = resource.get("column_max_value_bytes")
+            if isinstance(value, dict):
+                # Nested values need their own positive schema. Merely
+                # allow-listing the outer field would still let a corrupt
+                # snapshot smuggle arbitrary objects/paths as a column value.
+                bounds: Dict[str, int] = {}
+                bound_names: set[str] = set()
+                ambiguous = False
+                for name, payload in value.items():
+                    if (
+                        not isinstance(name, str)
+                        or name.casefold() not in visible_folded
+                    ):
+                        continue
+                    folded = name.casefold()
+                    if (
+                        folded in bound_names
+                        or type(payload) is not int
+                        or payload < 0
+                    ):
+                        ambiguous = True
+                        break
+                    bounds[name] = payload
+                    bound_names.add(folded)
+                if not ambiguous:
+                    projected["column_max_value_bytes"] = bounds
+            safe_resources.append(projected)
+        result["resources"] = safe_resources
 
     total_size = _complete_resource_metric(resources, "file_size")
     if total_size is not None:
@@ -230,9 +284,7 @@ def _sanitize_snapshot_stats(
             # Malformed or incomplete deletion state makes the row count
             # unknown. Other aggregates remain useful and contain no paths.
             logger.warning(
-                "[get_table_stats] omitting rows for table %s because "
-                "deletion metadata is invalid",
-                table_name,
+                "[get_table_stats] rows_omitted_invalid_deletion_metadata",
             )
 
     return result
@@ -309,10 +361,13 @@ def _try_parse_leaf_meta(raw: Any) -> Optional[Dict[str, Any]]:
     raw_s = raw_s.strip()
     if not raw_s:
         raise RuntimeError("Redis leaf value is empty")
+    decode_failed = False
     try:
         parsed = json.loads(raw_s)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("Redis leaf value is not valid JSON") from exc
+    except (TypeError, ValueError):
+        decode_failed = True
+    if decode_failed:
+        raise RuntimeError("Redis leaf value is not valid JSON")
     if not isinstance(parsed, dict):
         raise RuntimeError("Redis leaf value is not a JSON object")
     return parsed
@@ -373,16 +428,19 @@ class MetaReader:
             table_name = item.get("simple")
             if not isinstance(table_name, str) or not table_name:
                 raise RuntimeError("Catalog leaf scan returned an invalid table name")
+            invalid_table_name = False
             try:
                 RK.meta_leaf(
                     self.super_table.organization,
                     self.super_table.super_name,
                     table_name,
                 )
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError):
+                invalid_table_name = True
+            if invalid_table_name:
                 raise RuntimeError(
                     "Catalog leaf scan returned an invalid table name"
-                ) from exc
+                )
             self.catalog.check_deletion_intent_absent(
                 self.super_table.organization,
                 self.super_table.super_name,
@@ -455,7 +513,7 @@ class MetaReader:
                               role_name=role_name, table_name=table)
                 result.append(table)
             except PermissionError:
-                logger.warning(f"No permission for the user: {role_name} to table: {table}")
+                logger.warning("[get_tables] metadata_access_denied")
 
         return result
 
@@ -465,8 +523,7 @@ class MetaReader:
         )
         if context is None or not authorized:
             logger.warning(
-                "[get_table_schema] No visible metadata for user '%s' on table '%s'",
-                role_name, table_name,
+                "[get_table_schema] no_visible_metadata",
             )
             return None
 
@@ -508,7 +565,10 @@ class MetaReader:
                 schema = _visible_schema((st_data or {}).get("schema", {}), entry)
                 schema_items.update(schema.items())
             except (FileNotFoundError, TableNotFoundError) as e:
-                logger.debug("Failed to read schema for table %s: %s", target, e)
+                logger.debug(
+                    "[get_table_schema] snapshot_missing; error_type=%s",
+                    _safe_error_type(e),
+                )
                 continue
 
         return [dict(sorted(schema_items))]
@@ -570,8 +630,9 @@ class MetaReader:
             )
         except PermissionError as e:
             logger.warning(
-                "[collect_simple_table_schema] Access denied for user '%s' on table '%s': %s",
-                role_name, table_name, str(e)
+                "[collect_simple_table_schema] metadata_access_denied; "
+                "error_type=%s",
+                _safe_error_type(e),
             )
             return
 
@@ -580,8 +641,11 @@ class MetaReader:
                 self.super_table, table_name, create_if_missing=False,
             )
             simple_table_data, _ = simple_table.get_simple_table_snapshot()
-        except (FileNotFoundError, TableNotFoundError):
-            logger.debug("Simple table snapshot missing for %s", table_name)
+        except (FileNotFoundError, TableNotFoundError) as e:
+            logger.debug(
+                "[collect_simple_table_schema] snapshot_missing; error_type=%s",
+                _safe_error_type(e),
+            )
             return
 
         schema = _visible_schema(simple_table_data.get("schema", {}) or {}, entry)
@@ -594,8 +658,7 @@ class MetaReader:
         )
         if context is None or not authorized:
             logger.warning(
-                "[get_table_stats] No visible metadata for user '%s' on table '%s'",
-                role_name, table_name,
+                "[get_table_stats] no_visible_metadata",
             )
             return []
 
@@ -603,9 +666,7 @@ class MetaReader:
         for table, entry in authorized:
             if _has_row_filter(entry):
                 logger.info(
-                    "[get_table_stats] omitting unscoped counters for "
-                    "row-filtered table %s",
-                    table,
+                    "[get_table_stats] row_filtered_counters_omitted",
                 )
                 continue
             try:
@@ -625,9 +686,7 @@ class MetaReader:
                     or _metadata_has_share_row_filter(st_data)
                 ):
                     logger.info(
-                        "[get_table_stats] omitting unscoped counters for "
-                        "linked-share-filtered table %s",
-                        table,
+                        "[get_table_stats] linked_share_counters_omitted",
                     )
                     continue
                 stats.append(_sanitize_snapshot_stats(
@@ -635,8 +694,11 @@ class MetaReader:
                     entry,
                     table_name=table,
                 ))
-            except (FileNotFoundError, TableNotFoundError):
-                logger.debug("Simple table snapshot missing for %s", table)
+            except (FileNotFoundError, TableNotFoundError) as e:
+                logger.debug(
+                    "[get_table_stats] snapshot_missing; error_type=%s",
+                    _safe_error_type(e),
+                )
                 continue
 
         return stats
@@ -660,8 +722,7 @@ class MetaReader:
         )
         if context is None or (not authorized and not empty_superadmin):
             logger.warning(
-                "[get_super_meta] No visible metadata for user '%s' on super '%s'",
-                role_name, self.super_table.super_name,
+                "[get_super_meta] no_visible_metadata",
             )
             return None
 
@@ -680,8 +741,7 @@ class MetaReader:
         ]
         if authorized and not metric_authorized:
             logger.info(
-                "[get_super_meta] no unfiltered metadata targets for role '%s'",
-                role_name,
+                "[get_super_meta] no_unfiltered_metadata_targets",
             )
             return None
 
@@ -735,8 +795,7 @@ class MetaReader:
             elif _metadata_has_share_row_filter(leaf_meta):
                 linked_filter_omitted = True
                 logger.info(
-                    "[get_super_meta] omitting linked-share-filtered table %s",
-                    table,
+                    "[get_super_meta] linked_share_counters_omitted",
                 )
                 continue
             elif (
@@ -754,8 +813,7 @@ class MetaReader:
 
         if candidate_tables and not tables:
             logger.info(
-                "[get_super_meta] no unfiltered metadata targets for role '%s'",
-                role_name,
+                "[get_super_meta] no_unfiltered_metadata_targets",
             )
             return None
 
@@ -781,7 +839,11 @@ class MetaReader:
                     t_end = time.perf_counter()
                     if debug_timings:
                         logger.info(
-                            "[timing][get_super_meta] total_ms=%.2f access_ms=%.2f root_ms=%.2f scan_ms=%.2f mget_ms=%.2f tables=%d snapshots=%d snapshots_ms=%.2f max_snapshot_ms=%.2f max_snapshot_table=%s org=%s super=%s role_name=%s cache_hit=1",
+                            "[timing][get_super_meta] total_ms=%.2f "
+                            "access_ms=%.2f root_ms=%.2f scan_ms=%.2f "
+                            "mget_ms=%.2f tables=%d snapshots=%d "
+                            "snapshots_ms=%.2f max_snapshot_ms=%.2f "
+                            "cache_hit=1",
                             (t_end - t0) * 1000.0,
                             (t_access - t0) * 1000.0,
                             (t_root - t_access) * 1000.0,
@@ -791,10 +853,6 @@ class MetaReader:
                             0,
                             0.0,
                             0.0,
-                            "",
-                            self.super_table.organization,
-                            self.super_table.super_name,
-                            role_name[:12],
                         )
                     return copy.deepcopy(cached_result)
 
@@ -806,7 +864,6 @@ class MetaReader:
         snapshot_calls = 0
         snapshot_ms_total = 0.0
         max_snapshot_ms = 0.0
-        max_snapshot_table = ""
 
         for idx, table in enumerate(tables):
             try:
@@ -834,7 +891,6 @@ class MetaReader:
                     snapshot_ms_total += dt_ms
                     if dt_ms > max_snapshot_ms:
                         max_snapshot_ms = dt_ms
-                        max_snapshot_table = table
 
                 if not isinstance(st_data, dict):
                     raise RuntimeError("Simple table snapshot is invalid")
@@ -845,8 +901,7 @@ class MetaReader:
                 ):
                     linked_filter_omitted = True
                     logger.info(
-                        "[get_super_meta] omitting linked-share-filtered table %s",
-                        table,
+                        "[get_super_meta] linked_share_counters_omitted",
                     )
                     continue
 
@@ -893,7 +948,10 @@ class MetaReader:
                 total_size += table_size
 
             except (FileNotFoundError, TableNotFoundError) as e:
-                logger.debug("Failed to get stats for table %s: %s", table, e)
+                logger.debug(
+                    "[get_super_meta] snapshot_missing; error_type=%s",
+                    _safe_error_type(e),
+                )
                 continue
 
         if candidate_tables and not simple_table_info and linked_filter_omitted:
@@ -932,7 +990,10 @@ class MetaReader:
         t_end = time.perf_counter()
         if debug_timings:
             logger.info(
-                "[timing][get_super_meta] total_ms=%.2f access_ms=%.2f root_ms=%.2f scan_ms=%.2f mget_ms=%.2f tables=%d snapshots=%d snapshots_ms=%.2f max_snapshot_ms=%.2f max_snapshot_table=%s org=%s super=%s role_name=%s cache_hit=0",
+                "[timing][get_super_meta] total_ms=%.2f access_ms=%.2f "
+                "root_ms=%.2f scan_ms=%.2f mget_ms=%.2f tables=%d "
+                "snapshots=%d snapshots_ms=%.2f max_snapshot_ms=%.2f "
+                "cache_hit=0",
                 (t_end - t0) * 1000.0,
                 (t_access - t0) * 1000.0,
                 (t_root - t_access) * 1000.0,
@@ -942,10 +1003,6 @@ class MetaReader:
                 snapshot_calls,
                 snapshot_ms_total,
                 max_snapshot_ms,
-                max_snapshot_table,
-                self.super_table.organization,
-                self.super_table.super_name,
-                role_name[:12],
             )
 
         return result

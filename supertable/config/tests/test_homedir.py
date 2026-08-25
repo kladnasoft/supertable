@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -221,6 +222,62 @@ class TestResolveAppHome:
             raising=True,
         )
         assert homedir_mod.get_app_home() == homedir_mod._resolve_app_home()
+
+    def test_unwritable_home_uses_private_owned_runtime_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        configured_file = tmp_path / "not-a-directory"
+        configured_file.write_text("occupied", encoding="utf-8")
+        runtime_root = tmp_path / "runtime"
+        runtime_root.mkdir(mode=0o700)
+        monkeypatch.setattr(
+            homedir_mod, "settings",
+            SimpleNamespace(SUPERTABLE_HOME=str(configured_file)),
+            raising=True,
+        )
+        monkeypatch.setattr(homedir_mod.tempfile, "gettempdir", lambda: str(runtime_root))
+
+        resolved = Path(homedir_mod._resolve_app_home())
+
+        assert resolved == runtime_root / f"supertable-{os.geteuid()}"
+        info = resolved.lstat()
+        assert stat.S_ISDIR(info.st_mode)
+        assert info.st_uid == os.geteuid()
+        assert stat.S_IMODE(info.st_mode) == 0o700
+
+    def test_runtime_fallback_rejects_precreated_symlink(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        configured_file = tmp_path / "not-a-directory"
+        configured_file.write_text("occupied", encoding="utf-8")
+        runtime_root = tmp_path / "runtime"
+        attacker_target = tmp_path / "attacker-target"
+        runtime_root.mkdir(mode=0o700)
+        attacker_target.mkdir()
+        fallback = runtime_root / f"supertable-{os.geteuid()}"
+        fallback.symlink_to(attacker_target, target_is_directory=True)
+        monkeypatch.setattr(
+            homedir_mod, "settings",
+            SimpleNamespace(SUPERTABLE_HOME=str(configured_file)),
+            raising=True,
+        )
+        monkeypatch.setattr(homedir_mod.tempfile, "gettempdir", lambda: str(runtime_root))
+
+        with pytest.raises(RuntimeError, match="No writable application home"):
+            homedir_mod._resolve_app_home()
+
+        assert fallback.is_symlink()
+        assert list(attacker_target.iterdir()) == []
+
+    def test_runtime_fallback_rejects_non_sticky_shared_parent(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        runtime_root = tmp_path / "shared-runtime"
+        runtime_root.mkdir(mode=0o777)
+        runtime_root.chmod(0o777)
+        monkeypatch.setattr(homedir_mod.tempfile, "gettempdir", lambda: str(runtime_root))
+
+        assert homedir_mod._private_runtime_fallback() is None
 
 
 class TestChangeToAppHome:

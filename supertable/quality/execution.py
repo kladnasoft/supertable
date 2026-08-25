@@ -17,6 +17,9 @@ import pandas as pd
 
 from supertable.data_reader import DataReader, Status
 from supertable.engine.engine_enum import Engine
+from supertable.utils.diagnostic_redaction import (
+    safe_exception_type as _safe_error_type,
+)
 
 
 class QualitySQLExecutionError(RuntimeError):
@@ -107,20 +110,39 @@ def execute_quality_sql(
             # templates. Public/custom quality SQL never receives it.
             reader_kwargs["_allow_bounded_collection_aggregates"] = True
         reader = factory(**reader_kwargs)
-        frame, raw_status, message = reader.execute(
+        frame, raw_status, _raw_message = reader.execute(
             role_name=role_name,
             engine=requested,
         )
+        error_type: Optional[str] = None
     except Exception as exc:
         # RBAC and construction failures intentionally propagate out of
         # DataReader.  Quality scheduling needs the same structured failure as
         # an engine exception, never an implicit pass.
         frame = pd.DataFrame()
         raw_status = Status.ERROR
-        message = str(exc)
+        error_type = _safe_error_type(exc)
 
-    status = getattr(raw_status, "value", str(raw_status)).casefold()
-    ok = raw_status is Status.OK or status == Status.OK.value
+    raw_status_value = (
+        raw_status.value if isinstance(raw_status, Status) else raw_status
+    )
+    ok = (
+        raw_status is Status.OK
+        or (
+            isinstance(raw_status_value, str)
+            and raw_status_value.casefold() == Status.OK.value
+        )
+    )
+    status = Status.OK.value if ok else Status.ERROR.value
+    message: Optional[str]
+    if ok:
+        # A successful quality query has no failure diagnostic.  Discard a
+        # non-conforming reader's arbitrary message instead of propagating it.
+        message = None
+    else:
+        message = "Quality SQL execution failed"
+        if error_type is not None:
+            message += f"; error_type={error_type}"
     if not isinstance(frame, pd.DataFrame):
         frame = pd.DataFrame() if frame is None else pd.DataFrame(frame)
 
@@ -176,7 +198,7 @@ def execute_quality_sql(
         and not ok
     ):
         island_supported = False
-        island_reasons = (message or "IslandDB execution rejected",)
+        island_reasons = ("IslandDB execution rejected",)
 
     return QualitySQLResult(
         frame=frame,

@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import time
-import traceback
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -38,6 +37,7 @@ import pyarrow as pa
 from supertable.config.homedir import initialize_app_home
 from supertable.data_reader import DataReader, Status
 from supertable.data_writer import DataWriter
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 from supertable.demo.webshop.core import GenerationConfig, WebshopDataGenerator
 from supertable.demo.webshop.defaults import (
@@ -551,8 +551,10 @@ def run(config: TopUpConfig) -> None:
                   f"write={_fmt(write_elapsed)}")
 
         except Exception as exc:
-            print(f"  [ERROR] {exc}")
-            traceback.print_exc()
+            print(
+                "  [ERROR] top-up cycle failed; "
+                f"error_type={safe_exception_type(exc)}"
+            )
 
         sleep_secs = config.sleep_minutes * 60
         next_run   = pd.Timestamp.now() + pd.Timedelta(seconds=sleep_secs)

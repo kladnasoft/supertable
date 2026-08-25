@@ -5,6 +5,7 @@ import time
 from dataclasses import replace
 
 import fakeredis
+import pytest
 
 from supertable import redis_keys as RK
 from supertable.engine.engine_enum import Engine
@@ -141,10 +142,14 @@ def test_profile_sanitizer_removes_presign_userinfo_and_secret_keys():
 
     rendered = json.dumps(sanitize_profile(profile), sort_keys=True)
 
-    for secret in ("password", "admin", "topsecret", "Bearer private"):
+    for secret in (
+        "password", "bucket", "data.parquet", "admin", "topsecret",
+        "Bearer private",
+    ):
         assert secret not in rendered
-    assert "https://minio:9000/bucket/data.parquet?<redacted>" in rendered
-    assert '"authorization": "<redacted>"' in rendered
+    assert "minio" not in rendered
+    assert "authorization" not in rendered
+    assert '"_redacted_fields"' in rendered
 
 
 def test_profile_sanitizer_is_depth_item_and_byte_bounded():
@@ -172,8 +177,54 @@ def test_redact_text_scrubs_url_and_loose_secret_assignments():
         "open https://u:p@host/x?sig=hello&x=1 token=world password=hunter2"
     )
     assert clean == (
-        "open https://host/x?<redacted> token=<redacted> password=<redacted>"
+        "open https://host/<redacted-path> token=<redacted> password=<redacted>"
     )
+
+
+@pytest.mark.parametrize(
+    "diagnostic, secret",
+    [
+        ("Authorization: Bearer PROFILE_AUTH_SECRET", "PROFILE_AUTH_SECRET"),
+        ("Cookie: session=PROFILE_COOKIE_SECRET", "PROFILE_COOKIE_SECRET"),
+        ("X-Api-Key: PROFILE_API_SECRET", "PROFILE_API_SECRET"),
+        ('{"access_token":"PROFILE_BODY_SECRET"}', "PROFILE_BODY_SECRET"),
+    ],
+)
+def test_redact_text_scrubs_header_and_json_body_credentials(
+    diagnostic, secret,
+) -> None:
+    rendered = redact_text(diagnostic)
+
+    assert secret not in rendered
+    assert "<redacted>" in rendered
+
+
+def test_profile_sanitizer_redacts_unsigned_non_http_object_paths() -> None:
+    clean = sanitize_profile({
+        "source": "s3a://u:p@bucket.invalid/TENANT_PATH_TOKEN/data.parquet",
+        "nested": [
+            "abfss://container@account.invalid/OTHER_PATH_TOKEN/file.parquet"
+            "?QUERY_TOKEN=1#FRAGMENT_TOKEN"
+        ],
+    })
+    rendered = json.dumps(clean, sort_keys=True)
+
+    assert "bucket.invalid" not in rendered
+    assert "account.invalid" not in rendered
+    for secret in (
+        "TENANT_PATH_TOKEN", "OTHER_PATH_TOKEN", "data.parquet",
+        "file.parquet", "QUERY_TOKEN", "FRAGMENT_TOKEN",
+    ):
+        assert secret not in rendered
+
+
+def test_redact_text_handles_non_http_object_urls() -> None:
+    rendered = redact_text(
+        "failed s3a://u:p@bucket.invalid/PATH_TOKEN/file.parquet"
+        "?QUERY_TOKEN=yes#FRAGMENT_TOKEN"
+    )
+
+    assert rendered == "failed s3a://bucket.invalid/<redacted-path>"
 
 
 def test_normalization_prefers_engine_latency_and_tracks_provenance():

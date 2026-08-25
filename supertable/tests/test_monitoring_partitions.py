@@ -147,6 +147,20 @@ class TestHelpers:
         out = _parse_entries(raw)
         assert out == [{"a": 1}, {"b": 2}]
 
+    def test_parse_entries_never_logs_poisoned_scalar_content(self, caplog):
+        secret = "https://host/capability/TOP-SECRET?sig=sentinel"
+        caplog.set_level("DEBUG", logger=pmod.__name__)
+
+        assert _parse_entries([
+            json.dumps(secret),
+            json.dumps([secret]),
+            f"not-json-{secret}",
+        ]) == []
+
+        rendered = "\n".join(record.getMessage() for record in caplog.records)
+        assert secret not in rendered
+        assert rendered.count("value_type=unexpected_value") == 2
+
     def test_parse_entries_empty(self):
         assert _parse_entries([]) == []
         assert _parse_entries(None) == []  # type: ignore[arg-type]
@@ -206,12 +220,16 @@ class TestListDrainable:
         args, kwargs = cat.r.scan_iter.call_args
         assert kwargs.get("match") == RK.monitor_partition_pattern_for_org(ORG)
 
-    def test_scan_failure_returns_empty(self):
+    def test_scan_failure_returns_empty(self, caplog):
         cat = _mock_catalog()
-        cat.r.scan_iter.side_effect = RuntimeError("redis down")
+        secret = "redis://user:TOP-SECRET@host/0"
+        cat.r.scan_iter.side_effect = RuntimeError(secret)
         # Must not raise — orchestrator's loop should never crash on
         # a transient redis hiccup.
         assert list_drainable_partitions(cat, organization=ORG) == []
+        assert secret not in "\n".join(
+            record.getMessage() for record in caplog.records
+        )
 
     def test_malformed_keys_ignored(self):
         cat = _mock_catalog()

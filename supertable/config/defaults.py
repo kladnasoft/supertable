@@ -46,13 +46,13 @@ class Default:
 
     def _update_log_level(self):
         logging.getLogger().setLevel(self.LOG_LEVEL)
-        logger.debug(f"Log level changed to {self.LOG_LEVEL}")
+        logger.debug("Log level changed")
 
 
 def load_defaults_from_env(env_file: str | None = None, prefer_system: bool = True) -> Default:
     log_level = settings.SUPERTABLE_LOG_LEVEL
     if log_level not in _VALID_LOG_LEVELS:
-        logger.warning(f"Invalid LOG_LEVEL={log_level!r}. Falling back to INFO.")
+        logger.warning("Invalid LOG_LEVEL. Falling back to INFO.")
         log_level = "INFO"
     logging.getLogger().setLevel(log_level)
 

@@ -82,7 +82,7 @@ class SuperPipe:
         # Check if staging exists in Redis before allowing pipe operations
         staging_meta = self.catalog.get_staging_meta(organization, super_name, staging_name)
         if not staging_meta:
-            raise FileNotFoundError(f"Staging '{staging_name}' does not exist in Redis for {organization}/{super_name}")
+            raise FileNotFoundError("Staging does not exist in Redis")
 
     def _with_lock(self, fn):
         # Lock against the staging area to prevent concurrent pipe/stage mutations
@@ -94,7 +94,7 @@ class SuperPipe:
             timeout_s=30,
         )
         if not token:
-            raise RuntimeError(f"Cannot modify pipes: Stage {self.staging_name} is currently locked.")
+            raise RuntimeError("Cannot modify pipes: the stage is currently locked.")
         try:
             return fn(token)
         finally:
@@ -193,7 +193,7 @@ class SuperPipe:
                 role_name=role_name, mutation=mutation,
             ):
                 raise RuntimeError(
-                    f"Pipe '{pipe_name}' has invalid target metadata."
+                    "Pipe has invalid target metadata."
                 )
             raise PermissionError(_GENERIC_PIPE_DENIAL)
 
@@ -224,7 +224,7 @@ class SuperPipe:
                 raise PermissionError(_GENERIC_PIPE_DENIAL) from None
         return meta
 
-    def create(self, *, role_name: str, pipe_name: str, simple_name: str, user_hash: str, overwrite_columns: List[str] = None,
+    def create(self, *, role_name: str, pipe_name: str, simple_name: str, user_hash: str, overwrite_columns: Optional[List[str]] = None,
                enabled: bool = True,
                authorization_callback: Optional[Callable[[], str]] = None) -> str:
         pipe_name = _safe_segment(pipe_name, label="pipe_name")
@@ -269,7 +269,7 @@ class SuperPipe:
                         role_name=effective_role, mutation=True,
                     ):
                         raise RuntimeError(
-                            f"Pipe '{pipe_name}' has invalid target metadata."
+                            "Pipe has invalid target metadata."
                         )
                     raise PermissionError(_GENERIC_PIPE_DENIAL)
                 # Do not disclose or replace a pipe belonging to a table the
@@ -300,7 +300,7 @@ class SuperPipe:
                 ):
                     raise ValueError(
                         "A pipe with this simple_name and column configuration "
-                        f"already exists: {p.get('pipe_name')}"
+                        "already exists"
                     )
 
             # 3. Define the payload
@@ -322,8 +322,8 @@ class SuperPipe:
                     ensure_ascii=False,
                     allow_nan=False,
                 ).encode("utf-8"))
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError("Pipe definition is invalid") from exc
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("Pipe definition is invalid") from None
             if document_bytes > _MAX_PIPE_DOCUMENT_BYTES:
                 raise ValueError("Pipe definition exceeds its size limit")
 
@@ -351,7 +351,7 @@ class SuperPipe:
                 # different protected target after our read. Do not disclose
                 # that race winner without re-authorizing its exact metadata.
                 raise PermissionError(_GENERIC_PIPE_DENIAL) from None
-            logger.info(f"[pipe] created in redis: {pipe_name}")
+            logger.info("[pipe] created in redis")
             return f"redis://{self.organization}/{self.super_name}/{self.staging_name}/{pipe_name}"
 
         return self._with_lock(_op)
@@ -395,7 +395,7 @@ class SuperPipe:
                 meta=meta,
                 lock_token=lock_token,
             )
-            logger.info(f"[pipe] updated enabled={enabled} for {pipe_name}")
+            logger.info("[pipe] updated enabled=%s", enabled)
 
         return self._with_lock(_op)
 
@@ -412,15 +412,15 @@ class SuperPipe:
             effective_role = self._fresh_role(
                 role_name, authorization_callback,
             )
-            self._load_authorized_pipe(
+            meta = self._load_authorized_pipe(
                 pipe_name=pipe_name, role_name=effective_role, mutation=True,
             )
             effective_role = self._fresh_role(
                 effective_role, authorization_callback,
             )
-            self._load_authorized_pipe(
-                pipe_name=pipe_name,
+            self._check_target_access(
                 role_name=effective_role,
+                target=str(meta.get("simple_name") or ""),
                 mutation=True,
             )
             return self.catalog.delete_pipe_meta(

@@ -17,9 +17,11 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import duckdb
@@ -52,6 +54,7 @@ from supertable.engine.plan_stats import PlanStats
 from supertable.engine.engine_common import (
     quote_if_needed,
     sanitize_sql_string,
+    safe_sql_diagnostic,
     escape_parquet_path,
     hashed_table_name,
     pro_table_name,
@@ -77,6 +80,7 @@ from supertable.engine.engine_common import (
     dv_table_name,
     dv_table_id,
     validate_rbac_binding_stability,
+    run_engine_diagnostics,
 )
 from supertable.engine.data_estimator import DataEstimator, get_missing_columns
 from supertable.engine.engine_enum import Engine
@@ -85,6 +89,8 @@ from supertable.engine.duckdb_engine import DuckDB
 
 from supertable.engine.islanddb import IslandUnsupportedError
 from supertable.engine.spark_thrift import (
+    SPARK_RESULT_TYPE_CODES_ATTR,
+    SPARK_UTC_TIMESTAMP_INDEXES_ATTR,
     _spark_quote_identifier,
     _spark_table_name,
     _spark_create_parquet_view,
@@ -95,6 +101,7 @@ from supertable.engine.spark_thrift import (
     _parquet_timestamp_units,
     _ts_to_timestamp_expr,
     _build_tscast_select,
+    _spark_result_dataframe,
     SparkThriftExecutor,
 )
 
@@ -182,6 +189,15 @@ class TestSanitizeSqlString:
         # Bare numeric literals must pass through unchanged.
         assert sanitize_sql_string("42") == "42"
 
+    def test_sql_diagnostic_is_stable_and_never_contains_query_text(self):
+        query = "SELECT * FROM t WHERE bearer = 'SQL_BEARER_SECRET'"
+        digest, byte_count = safe_sql_diagnostic(query)
+
+        assert len(digest) == 16
+        assert digest == safe_sql_diagnostic(query)[0]
+        assert byte_count == len(query.encode("utf-8"))
+        assert "SQL_BEARER_SECRET" not in digest
+
 
 class TestEscapeParquetPath:
 
@@ -193,6 +209,112 @@ class TestEscapeParquetPath:
 
     def test_multiple_quotes(self):
         assert escape_parquet_path("a'b'c") == "a''b''c"
+
+
+class TestEngineDiagnosticsConfidentiality:
+
+    @staticmethod
+    def _secret_error() -> RuntimeError:
+        return RuntimeError(
+            "backend failed at "
+            "https://URL_USER:URL_PASSWORD@storage.invalid/REMOTE_PATH_TOKEN/"
+            "data.parquet?QUERY_TOKEN=yes#FRAGMENT_TOKEN "
+            "while opening /srv/private/LOCAL_PATH_TOKEN/spill.tmp"
+        )
+
+    def test_initialization_failure_returns_only_safe_type(
+        self, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            _engine_common.duckdb,
+            "connect",
+            MagicMock(side_effect=self._secret_error()),
+        )
+
+        report = run_engine_diagnostics(
+            engine="https://engine.invalid/ENGINE_PATH_TOKEN?token=secret",
+        )
+        rendered = json.dumps(report, sort_keys=True)
+
+        assert report["engine"] == "unknown"
+        assert report["overall"] == "fail"
+        assert "error_type=RuntimeError" in rendered
+        for secret in (
+            "URL_USER", "URL_PASSWORD", "REMOTE_PATH_TOKEN", "data.parquet",
+            "QUERY_TOKEN", "FRAGMENT_TOKEN", "LOCAL_PATH_TOKEN",
+            "ENGINE_PATH_TOKEN", "/srv/private",
+        ):
+            assert secret not in rendered
+
+    def test_all_diagnostic_checks_exclude_backend_errors_and_spill_path(
+        self, monkeypatch,
+    ):
+        local_path = "/srv/private/LOCAL_PATH_TOKEN/spill.tmp"
+        secret_error = self._secret_error()
+
+        class PrimaryConnection:
+            def __init__(self):
+                self.statement = ""
+
+            def execute(self, statement, *_args):
+                self.statement = statement
+                if "temp_directory')" in statement:
+                    return self
+                if "max_temp_directory_size')" in statement:
+                    return self
+                raise secret_error
+
+            def fetchone(self):
+                if "temp_directory')" in self.statement:
+                    return (local_path,)
+                if "max_temp_directory_size')" in self.statement:
+                    return ("1 GiB",)
+                raise AssertionError("unexpected fetch")
+
+            def close(self):
+                return None
+
+        class SpillConnection:
+            def execute(self, _statement, *_args):
+                raise secret_error
+
+            def close(self):
+                return None
+
+        connections = iter((PrimaryConnection(), SpillConnection()))
+        monkeypatch.setattr(
+            _engine_common.duckdb,
+            "connect",
+            lambda: next(connections),
+        )
+        monkeypatch.setattr(
+            _engine_common,
+            "init_connection",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(_engine_common, "_filesystem_type", lambda _path: "")
+
+        def fail_makedirs(*_args, **_kwargs):
+            raise secret_error
+
+        monkeypatch.setattr(_engine_common.os, "makedirs", fail_makedirs)
+
+        report = run_engine_diagnostics(engine="lite")
+        rendered = json.dumps(report, sort_keys=True)
+
+        assert {check["id"] for check in report["checks"]} == {
+            "connect", "version", "memory", "threads", "temp_dir", "spill",
+            "cache",
+        }
+        assert "path_bytes=" in rendered
+        assert "path_sha256=" in rendered
+        assert "error_type=RuntimeError" in rendered
+        for secret in (
+            "URL_USER", "URL_PASSWORD", "REMOTE_PATH_TOKEN", "data.parquet",
+            "QUERY_TOKEN", "FRAGMENT_TOKEN", "LOCAL_PATH_TOKEN",
+            "/srv/private", local_path,
+        ):
+            assert secret not in rendered
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1403,7 +1525,8 @@ class TestReadWriteDuckDBParity:
         import polars
         from supertable import processing as _processing
 
-        monkeypatch.setattr(_processing, "_get_storage", lambda: object())
+        selected_storage = object()
+        monkeypatch.setattr(_processing, "_get_storage", lambda: selected_storage)
 
         f1 = str(tmp_path / "f1.parquet")
         polars.DataFrame({"__rowid__": [10, 20], "id": [1, 2]}).write_parquet(f1)
@@ -1427,6 +1550,7 @@ class TestReadWriteDuckDBParity:
         assert len(calls) == 1
         # for_paths forwarded so httpfs is loaded for remote scans.
         assert "for_paths" in calls[0][1]
+        assert calls[0][1]["storage"] is selected_storage
 
     def test_probe_reuses_pooled_connection(self, tmp_path, monkeypatch):
         # A second probe on the same thread must REUSE the pooled connection,
@@ -2614,8 +2738,11 @@ class TestDuckDB:
     @patch("supertable.engine.duckdb_engine._harden_user_query_connection")
     def test_execute_flow(
         self, mock_harden, mock_rewrite, mock_create, mock_hash, mock_init,
-        mock_duckdb,
+        mock_duckdb, caplog,
     ):
+        secret = "https://user:DUCK_SQL_SECRET@example.invalid/object?token=bearer"
+        mock_rewrite.return_value = f"SELECT '{secret}' AS value"
+        caplog.set_level("DEBUG", logger="supertable.config.defaults")
         fake_con = MagicMock()
         fake_con.execute.return_value.fetchdf.return_value = pd.DataFrame({"x": [1]})
         mock_duckdb.connect.return_value = fake_con
@@ -2641,6 +2768,8 @@ class TestDuckDB:
         assert "CREATING_REFLECTION" in captures
         mock_init.assert_called_once()
         mock_create.assert_called_once()
+        assert secret not in caplog.text
+        assert "[duckdb] executing sql_sha256=" in caplog.text
         # The lite executor reuses a persistent connection; it is NOT closed per query.
 
     @patch("supertable.engine.duckdb_engine.duckdb")
@@ -2938,6 +3067,74 @@ class TestSparkThriftExecutor:
     def test_init(self):
         assert SparkThriftExecutor(storage=MagicMock()).storage is not None
 
+    def test_result_frame_preserves_nullable_bigints_and_datetime_range(self):
+        ancient = datetime(1, 1, 1, 0, 0, 0, 1)
+        future = datetime(9999, 12, 31, 23, 59, 59, 999999)
+        description = [
+            ("id", "BIGINT_TYPE", None, None, None, None, True),
+            ("id", "BIGINT_TYPE", None, None, None, None, True),
+            ("instant", "TIMESTAMP_TYPE", None, None, None, None, True),
+        ]
+
+        result = _spark_result_dataframe(
+            [
+                (None, 9_007_199_254_740_993, ancient),
+                (1, None, future),
+            ],
+            description,
+            preserve_scalar_identity=True,
+        )
+
+        assert list(result.columns) == ["id", "id", "instant"]
+        assert [str(dtype) for dtype in result.dtypes] == [
+            "object", "object", "object",
+        ]
+        raw_rows = list(result.itertuples(index=False, name=None))
+        assert raw_rows == [
+            (None, 9_007_199_254_740_993, ancient),
+            (1, None, future),
+        ]
+        assert type(raw_rows[0][1]) is int
+        assert result.attrs[SPARK_RESULT_TYPE_CODES_ATTR] == (
+            "BIGINT_TYPE", "BIGINT_TYPE", "TIMESTAMP_TYPE",
+        )
+        assert result.attrs[SPARK_UTC_TIMESTAMP_INDEXES_ATTR] == (2,)
+
+        with pytest.raises(RuntimeError, match="invalid result metadata"):
+            _spark_result_dataframe(
+                [(1,)], [], preserve_scalar_identity=True,
+            )
+
+    @pytest.mark.parametrize(
+        "description",
+        [
+            [],
+            [()],
+            [("id",)],
+            [("id", "BIGINT_TYPE", None, None, None, None)],
+            [("id", "BIGINT_TYPE", None, None, None, None, True, None)],
+            [("id", None, None, None, None, None, True)],
+            [("id", "", None, None, None, None, True)],
+            [("id", "UNKNOWN_TYPE", None, None, None, None, True)],
+            [(1, "BIGINT_TYPE", None, None, None, None, True)],
+        ],
+    )
+    def test_result_frame_rejects_malformed_metadata(self, description):
+        with pytest.raises(RuntimeError, match="invalid result metadata"):
+            _spark_result_dataframe(
+                [], description, preserve_scalar_identity=True,
+            )
+
+    @pytest.mark.parametrize("row", [1, (), (1, 2), [1, 2]])
+    def test_result_frame_rejects_malformed_row_arity(self, row):
+        description = [
+            ("id", "BIGINT_TYPE", None, None, None, None, True),
+        ]
+        with pytest.raises(RuntimeError, match="invalid result row"):
+            _spark_result_dataframe(
+                [row], description, preserve_scalar_identity=True,
+            )
+
     def test_connection_attempt_respects_deadline_and_closes_late_result(
         self, monkeypatch,
     ):
@@ -2966,6 +3163,62 @@ class TestSparkThriftExecutor:
             time.sleep(0.005)
         late_connection.close.assert_called_once()
 
+    def test_cluster_selection_respects_deadline(self, monkeypatch):
+        executor = SparkThriftExecutor(storage=MagicMock())
+        started = threading.Event()
+
+        def blocking_selection(_job_bytes, force=False):
+            started.set()
+            time.sleep(0.3)
+            return {
+                "cluster_id": "late",
+                "thrift_host": "late.invalid",
+            }
+
+        monkeypatch.setattr(executor, "_select_cluster", blocking_selection)
+        before = time.monotonic()
+        with pytest.raises(RuntimeError, match="deadline exceeded"):
+            executor._select_cluster_with_deadline(
+                1024,
+                force=False,
+                deadline_monotonic=before + 0.05,
+                cancel_event=threading.Event(),
+            )
+        assert started.is_set()
+        assert time.monotonic() - before < 0.2
+
+    def test_cluster_selection_respects_cancellation(self, monkeypatch):
+        executor = SparkThriftExecutor(storage=MagicMock())
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocking_selection(_job_bytes, force=False):
+            started.set()
+            release.wait(1)
+            return {
+                "cluster_id": "late",
+                "thrift_host": "late.invalid",
+            }
+
+        monkeypatch.setattr(executor, "_select_cluster", blocking_selection)
+        cancelled = threading.Event()
+        timer = threading.Timer(0.05, cancelled.set)
+        timer.start()
+        before = time.monotonic()
+        try:
+            with pytest.raises(RuntimeError, match="cancelled"):
+                executor._select_cluster_with_deadline(
+                    1024,
+                    force=False,
+                    deadline_monotonic=before + 10,
+                    cancel_event=cancelled,
+                )
+        finally:
+            release.set()
+            timer.cancel()
+        assert started.is_set()
+        assert time.monotonic() - before < 0.2
+
     @patch.object(SparkThriftExecutor, "_select_cluster")
     @patch.object(SparkThriftExecutor, "_get_connection")
     @patch("supertable.engine.spark_thrift._configure_spark_s3")
@@ -2974,7 +3227,9 @@ class TestSparkThriftExecutor:
     def test_execute_flow(self, mock_rewrite, mock_view, mock_s3, mock_conn, mock_cluster):
         mock_cluster.return_value = {"cluster_id": "c1", "thrift_host": "h", "thrift_port": 10000}
         fake_cursor = MagicMock()
-        fake_cursor.description = [("col1",)]
+        fake_cursor.description = [
+            ("col1", "BIGINT_TYPE", None, None, None, None, True),
+        ]
         fake_cursor.fetchall.return_value = [(42,)]
         fake_conn = MagicMock()
         fake_conn.cursor.return_value = fake_cursor
@@ -3008,8 +3263,15 @@ class TestSparkThriftExecutor:
             "cluster_id": "c1", "thrift_host": "h", "thrift_port": 10000,
         }
         fake_cursor = MagicMock()
-        fake_cursor.description = [("col1",)]
-        fake_cursor.fetchall.return_value = [("col1", "bigint")]
+        fake_cursor.description = [
+            ("col1", "BIGINT_TYPE", None, None, None, None, True),
+        ]
+        fake_cursor.fetchall.side_effect = [
+            [("col1", "bigint")],
+            [("col1", "bigint")],
+            [("col1", "bigint")],
+            AssertionError("bounded query result used fetchall"),
+        ]
         fake_cursor.fetchmany.side_effect = [[(1,), (2,)], [(3,)], []]
         fake_conn = MagicMock()
         fake_conn.cursor.return_value = fake_cursor
@@ -3043,6 +3305,8 @@ class TestSparkThriftExecutor:
             {"col1": 1}, {"col1": 2}, {"col1": 3},
         ]
         assert fake_cursor.fetchmany.call_count == 3
+        assert fake_cursor.arraysize == 4
+        assert fake_cursor.fetchall.call_count == 3
 
     @patch.object(SparkThriftExecutor, "_select_cluster")
     @patch.object(SparkThriftExecutor, "_get_connection")
@@ -3052,9 +3316,16 @@ class TestSparkThriftExecutor:
     def test_s3_to_s3a_conversion(self, mock_rewrite, mock_view, mock_s3, mock_conn, mock_cluster):
         mock_cluster.return_value = {"cluster_id": "c1", "thrift_host": "h"}
         fake_cursor = MagicMock()
-        fake_cursor.description = []
+        fake_cursor.description = [
+            ("id", "BIGINT_TYPE", None, None, None, None, True),
+        ]
         # Protected projection requires an authoritative DESCRIBE result.
-        fake_cursor.fetchall.return_value = [("id", "bigint")]
+        fake_cursor.fetchall.side_effect = [
+            [("id", "bigint")],
+            [("id", "bigint")],
+            [("== Physical Plan ==",)],
+            [],
+        ]
         fake_conn = MagicMock()
         fake_conn.cursor.return_value = fake_cursor
         mock_conn.return_value = fake_conn
@@ -3210,9 +3481,11 @@ class TestSparkTimestampCast:
 
         class _FakeStorage:
             base_prefix = "org/warehouse"
-            def read_bytes(self, key):
+            def size(self, key):
+                return len(raw)
+            def read_range(self, key, start, length):
                 seen["key"] = key
-                return raw
+                return raw[start:start + length]
 
         units = _parquet_timestamp_units(
             _FakeStorage(), "s3://bucket/org/warehouse/t/data.parquet")
@@ -3229,9 +3502,11 @@ class TestSparkTimestampCast:
 
         class _FakeStorage:
             base_prefix = ""
-            def read_bytes(self, key):
+            def size(self, key):
+                return len(raw)
+            def read_range(self, key, start, length):
                 seen["key"] = key
-                return raw
+                return raw[start:start + length]
 
         url = ("https://minio:9000/bucket/t/data.parquet"
                "?X-Amz-Signature=abc&X-Amz-Expires=3600")
@@ -3264,7 +3539,10 @@ class TestSparkTimestampCast:
 
         mock_cluster.return_value = {"cluster_id": "c1", "thrift_host": "h", "thrift_port": 10000}
         fake_cursor = MagicMock()
-        fake_cursor.description = [("col_name",), ("data_type",)]
+        fake_cursor.description = [
+            ("col_name", "STRING_TYPE", None, None, None, None, True),
+            ("data_type", "STRING_TYPE", None, None, None, None, True),
+        ]
         fake_cursor.fetchall.return_value = [
             ("__timestamp__", "bigint"), ("__rowid__", "bigint"),
             ("created_at", "bigint"), ("user_id", "bigint"), ("name", "string"),
@@ -3308,7 +3586,10 @@ class TestSparkTimestampCast:
 
         mock_cluster.return_value = {"cluster_id": "c1", "thrift_host": "h"}
         fake_cursor = MagicMock()
-        fake_cursor.description = [("col_name",), ("data_type",)]
+        fake_cursor.description = [
+            ("col_name", "STRING_TYPE", None, None, None, None, True),
+            ("data_type", "STRING_TYPE", None, None, None, None, True),
+        ]
         fake_cursor.fetchall.return_value = [
             ("__timestamp__", "timestamp"), ("created_at", "bigint"),
             ("user_id", "bigint"), ("name", "string"),

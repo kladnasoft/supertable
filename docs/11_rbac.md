@@ -271,7 +271,11 @@ class FilterBuilder:
 ```
 
 `FilterBuilder` produces a complete `SELECT ... FROM ... WHERE ...` statement
-that the query engine wraps as a filtered view.
+that the query engine wraps as a filtered view.  `table_name` must be one bare
+SimpleTable identifier (1--128 characters matching
+`^[A-Za-z_][A-Za-z0-9_]*$`).  It is stripped and canonically quoted using the
+builder's configured identifier quote.  Qualified, pre-quoted, aliased, and
+other raw SQL table expressions are rejected.
 
 **Filter JSON grammar:**
 
@@ -292,13 +296,16 @@ BETWEEN, NOT BETWEEN
 
 ### 11.5.3  SQL Injection Prevention
 
-The filter builder applies three layers of sanitisation:
+The filter builder applies four layers of sanitisation:
 
-1. **`_sanitize_column(col)`** -- validates against `^[A-Za-z_][A-Za-z0-9_]*$`
-   and wraps in double quotes.
-2. **`_sanitize_value(val)`** -- escapes single quotes (SQL standard doubling)
+1. **`_sanitize_table_identifier(table_name)`** -- accepts one bare SimpleTable
+   identifier and canonically quotes it; SQL fragments and qualified names are
+   rejected.
+2. **`_sanitize_column(col)`** -- validates against `^[A-Za-z_][A-Za-z0-9_]*$`
+   and wraps in the builder's configured identifier quote.
+3. **`_sanitize_value(val)`** -- escapes single quotes (SQL standard doubling)
    and blocks `;`, `--`, `/*`, `*/`.
-3. **`_sanitize_operation(op)`** -- whitelist-only; rejects anything not in
+4. **`_sanitize_operation(op)`** -- whitelist-only; rejects anything not in
    `_ALLOWED_OPS`.
 
 ---
@@ -341,14 +348,14 @@ The `format_column_list()` helper in `filter_builder.py` produces the SELECT
 projection:
 
 ```python
-def format_column_list(columns):
+def format_column_list(columns, quote_char='"'):
     if not isinstance(columns, list):
         raise ValueError("RBAC columns must be a list")
     if columns == ["*"]:
         return "*"
     if not columns or "*" in columns:
         raise ValueError("RBAC wildcard must be the only selected column")
-    quoted = [_sanitize_column(column) for column in columns]
+    quoted = [_sanitize_column(column, quote_char) for column in columns]
     return ",".join(f'{column} as {column}' for column in quoted)
 ```
 

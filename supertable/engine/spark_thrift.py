@@ -11,7 +11,7 @@ import re
 import threading
 import time
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import sqlglot
@@ -22,13 +22,17 @@ from supertable.config.settings import settings
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser, validate_read_query_ast
 from supertable.utils.spark_security import validate_spark_storage_config
+from supertable.utils.diagnostic_redaction import (
+    local_path_metadata,
+    safe_exception_type,
+)
 from supertable.data_classes import Reflection, RbacViewDef
 from supertable.redis_catalog import RedisCatalog
 
 from supertable.engine.engine_common import (
     quote_if_needed,
     rewrite_query_with_hashed_tables,
-    redact_url_credentials,
+    safe_sql_diagnostic,
     snapshot_spark_type,
     tombstone_data_paths,
     validate_rbac_binding_stability,
@@ -54,6 +58,14 @@ for _lib in ("pyhive", "pyhive.hive", "TCLIService", "thrift", "thrift_sasl"):
 _SPARK_CONNECT_MAX_IN_FLIGHT = 8
 _spark_connect_slots = threading.BoundedSemaphore(
     _SPARK_CONNECT_MAX_IN_FLIGHT,
+)
+
+# Cluster discovery is a synchronous Redis read and occurs before a Thrift
+# connection exists for the ordinary watchdog to close.  Bound abandoned
+# discovery workers independently from connection workers.
+_SPARK_SELECTION_MAX_IN_FLIGHT = 8
+_spark_selection_slots = threading.BoundedSemaphore(
+    _SPARK_SELECTION_MAX_IN_FLIGHT,
 )
 
 
@@ -110,16 +122,13 @@ _SPARK_SAFE_USER_FUNCTIONS = frozenset(
 )
 
 
-_SPARK_SENSITIVE_ASSIGNMENT_RE = re.compile(
-    r"(?i)("
-    r"(?:spark\.hadoop\.)?(?:fs\.)?(?:s3a\.)?"
-    r"(?:access\.key|secret\.key|session\.token|credentials?)"
-    r"|s3_(?:access_key|secret_key|session_token)"
-    r"|aws_(?:access_key_id|secret_access_key|session_token)"
-    r"|password|token|signature"
-    r")(\s*(?:=|:)\s*)(?:'[^']*'|\"[^\"]*\"|[^\s,;]+)"
-)
 _SPARK_VARIABLE_SUBSTITUTION_RE = re.compile(r"\$\{")
+
+# Snapshot versions originate in Redis/Lua catalog documents, whose integer
+# contract is limited to values exactly representable by both runtimes.  Keep
+# the same bound at the final SQL-identifier derivation boundary so malformed
+# direct executor input cannot append arbitrary text to a temporary-view name.
+_MAX_SAFE_SPARK_SNAPSHOT_VERSION = (1 << 53) - 1
 
 # Several Spark SQL identity expressions are accepted without parentheses.
 # In the sqlglot versions supported by SuperTable those tokens parse as plain,
@@ -143,40 +152,78 @@ _SPARK_DUCKDB_ONLY_BOUNDED_COLLECTION_AGGREGATES = frozenset({
     "list",
 })
 
+# HiveServer2's result metadata maps both Spark ``TimestampType`` (an instant)
+# and ``TimestampNTZType`` (a wall-clock value) to the same TIMESTAMP_TYPE.
+# PyHive therefore cannot preserve that semantic distinction at the public
+# JSON boundary. SuperTable pins Spark sessions to UTC/TIMESTAMP_LTZ below and
+# rejects the explicit NTZ-producing surface before cluster selection. Under
+# that closed contract, a TIMESTAMP_TYPE result can be marked as a UTC instant
+# without mislabelling a wall-clock value.
+_SPARK_UNREPRESENTABLE_NTZ_FUNCTIONS = frozenset({
+    "localtimestamp",
+    "make_timestamp_ntz",
+    "to_timestamp_ntz",
+    "try_make_timestamp_ntz",
+})
+_SPARK_BARE_UNREPRESENTABLE_NTZ_IDENTIFIERS = frozenset({"localtimestamp"})
 
-def _redact_spark_sensitive_text(value: object) -> str:
-    """Return a bounded, credential-safe Spark error/log message."""
-    text = redact_url_credentials(value)
-    # The shared URL redactor historically targeted signed query strings.
-    # Strip authority userinfo here as well, including URLs without a query.
-    def _strip_userinfo(match: re.Match[str]) -> str:
-        raw = match.group(0)
-        try:
-            parsed = urlparse(raw)
-            if parsed.username is None and parsed.password is None:
-                return raw
-            host = parsed.hostname or ""
-            if ":" in host and not host.startswith("["):
-                host = f"[{host}]"
-            if parsed.port is not None:
-                host = f"{host}:{parsed.port}"
-            suffix = f"?{parsed.query}" if parsed.query else ""
-            return f"{parsed.scheme}://{host}{parsed.path}{suffix}"
-        except Exception:
-            return "<redacted-url>"
+# Private pandas attrs carried from the Thrift boundary to query_sql(). Type
+# codes retain authoritative DB-API metadata even though dtype=object is used
+# to prevent pandas from coercing nullable BIGINT values to float. Column
+# indexes, rather than names, preserve duplicate result-column names.
+SPARK_RESULT_TYPE_CODES_ATTR = "_supertable_spark_result_type_codes"
+SPARK_UTC_TIMESTAMP_INDEXES_ATTR = (
+    "_supertable_spark_utc_timestamp_indexes"
+)
 
-    text = re.sub(
-        r"(?i)https?://[^\s'\"<>]+",
-        _strip_userinfo,
-        text,
+# PyHive 0.7 exposes HiveServer2's closed TTypeId vocabulary as the DB-API
+# ``type_code`` strings below.  Reject missing or unknown metadata instead of
+# silently guessing how a public scalar should be represented.
+SPARK_THRIFT_TYPE_CODES = frozenset({
+    "BOOLEAN_TYPE",
+    "TINYINT_TYPE",
+    "SMALLINT_TYPE",
+    "INT_TYPE",
+    "BIGINT_TYPE",
+    "FLOAT_TYPE",
+    "DOUBLE_TYPE",
+    "STRING_TYPE",
+    "TIMESTAMP_TYPE",
+    "BINARY_TYPE",
+    "ARRAY_TYPE",
+    "MAP_TYPE",
+    "STRUCT_TYPE",
+    "UNION_TYPE",
+    "USER_DEFINED_TYPE",
+    "DECIMAL_TYPE",
+    "NULL_TYPE",
+    "DATE_TYPE",
+    "VARCHAR_TYPE",
+    "CHAR_TYPE",
+    "INTERVAL_YEAR_MONTH_TYPE",
+    "INTERVAL_DAY_TIME_TYPE",
+})
+
+
+def _redact_spark_sensitive_text(
+    value: object, *, phase: str = "query",
+) -> str:
+    """Return phase/type/digest metadata without arbitrary backend prose."""
+
+    error_type = (
+        safe_exception_type(value)
+        if isinstance(value, BaseException)
+        else "str" if type(value) is str else "Exception"
     )
-    text = _SPARK_SENSITIVE_ASSIGNMENT_RE.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}<redacted>",
-        text,
+    try:
+        raw = str(value)
+    except Exception:
+        raw = error_type
+    diagnostic_id, diagnostic_bytes = safe_sql_diagnostic(raw)
+    return (
+        f"Spark {phase} failed; error_type={error_type}; "
+        f"diagnostic_id={diagnostic_id}; diagnostic_bytes={diagnostic_bytes}"
     )
-    if len(text) > 4_096:
-        text = text[:4_096] + "<truncated>"
-    return text
 
 
 def _redact_spark_plan_text(value: object) -> str:
@@ -219,20 +266,49 @@ def _validate_spark_expression_capabilities(parsed: exp.Expression) -> None:
 
     for column in parsed.find_all(exp.Column):
         identifier = column.this
+        bare_name = (
+            str(identifier.this or "").casefold()
+            if isinstance(identifier, exp.Identifier)
+            else ""
+        )
         if (
             not column.table
             and isinstance(identifier, exp.Identifier)
             and not identifier.args.get("quoted")
-            and str(identifier.this or "").casefold()
-            in _SPARK_BARE_SESSION_IDENTIFIERS
+            and bare_name in _SPARK_BARE_SESSION_IDENTIFIERS
         ):
             raise ValueError(
                 "Spark SQL session identity expression is not allowed in "
                 "SuperTable queries"
             )
+        if (
+            not column.table
+            and isinstance(identifier, exp.Identifier)
+            and not identifier.args.get("quoted")
+            and bare_name in _SPARK_BARE_UNREPRESENTABLE_NTZ_IDENTIFIERS
+        ):
+            raise ValueError(
+                "Spark TIMESTAMP_NTZ results are not supported by the "
+                "HiveServer2 result protocol"
+            )
+
+    timestamp_ntz_type = getattr(exp.DataType.Type, "TIMESTAMPNTZ", None)
+    if timestamp_ntz_type is not None and any(
+        data_type.this == timestamp_ntz_type
+        for data_type in parsed.find_all(exp.DataType)
+    ):
+        raise ValueError(
+            "Spark TIMESTAMP_NTZ results are not supported by the "
+            "HiveServer2 result protocol"
+        )
 
     for function in parsed.find_all(exp.Func):
         name = _spark_function_name(function)
+        if name in _SPARK_UNREPRESENTABLE_NTZ_FUNCTIONS:
+            raise ValueError(
+                "Spark TIMESTAMP_NTZ results are not supported by the "
+                "HiveServer2 result protocol"
+            )
         qualified = (
             isinstance(function.parent, exp.Dot)
             and function.parent.expression is function
@@ -271,8 +347,10 @@ def _validate_spark_user_functions(parser: SQLParser) -> None:
             dialect = "spark"
         try:
             parsed = sqlglot.parse_one(query, read=dialect)
-        except Exception as exc:
-            raise RuntimeError("Spark query could not be validated safely") from exc
+        except Exception:
+            raise RuntimeError(
+                "Spark query could not be validated safely"
+            ) from None
 
     # Built-in deep-quality SQL can opt into a narrowly bounded DuckDB LIST
     # aggregate. Spark SQL does not preserve that aggregate's ordered semantics
@@ -316,6 +394,15 @@ def _revalidate_spark_parser(
         dialect = "spark"
     elif dialect not in {"duckdb", "spark"}:
         raise ValueError("Spark execution received an unsupported SQL dialect")
+    try:
+        original_expression = sqlglot.parse_one(query, read=dialect)
+    except Exception:
+        # SQLParser below owns the complete syntax/read-policy error contract.
+        # This early pass exists only to reject Spark-specific capabilities
+        # from the original text before a shared parser can normalize them.
+        pass
+    else:
+        _validate_spark_expression_capabilities(original_expression)
     super_name = getattr(parser, "default_super_name", None)
     if not isinstance(super_name, str) or not super_name:
         reflected_supers = {
@@ -589,6 +676,11 @@ def _execute_spark_setup_sql(cursor, sql: str, phase: str) -> None:
 
 def _spark_table_name(super_name: str, simple_name: str, version: int) -> str:
     """Generate a deterministic Spark temp table name."""
+    if (
+        type(version) is not int
+        or not 0 <= version <= _MAX_SAFE_SPARK_SNAPSHOT_VERSION
+    ):
+        raise RuntimeError("Spark snapshot version is invalid")
     key = f"{super_name}_{simple_name}"
     digest = hashlib.sha1(
         key.encode("utf-8"), usedforsecurity=False
@@ -725,6 +817,7 @@ def _spark_create_parquet_view_impl(
 
         part_batches.append(part_views)
 
+    target_columns: List[tuple[str, str, Optional[str]]]
     if snapshot_by_fold:
         target_columns = [
             (
@@ -1012,8 +1105,10 @@ def _validate_spark_tombstone_definition(tombstone_def) -> tuple[bool, int]:
             format_present=tombstone_format is not None,
             tombstone_format=tombstone_format,
         )
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("Invalid Spark deletion-vector snapshot state") from exc
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            "Invalid Spark deletion-vector snapshot state"
+        ) from None
 
     if pointer is None:
         if cache_key is not None or segments != ():
@@ -1023,10 +1118,10 @@ def _validate_spark_tombstone_definition(tombstone_def) -> tuple[bool, int]:
         return False, normalized_format
     try:
         tombstone_data_paths(tombstone_def)
-    except Exception as exc:
+    except Exception:
         raise RuntimeError(
             "Invalid Spark deletion-vector representation"
-        ) from exc
+        ) from None
     return True, normalized_format
 
 
@@ -1262,7 +1357,7 @@ def _spark_create_tombstone_view(
 
 def _read_parquet_schema(
     storage,
-    original_path: str,
+    original_path: Optional[str],
     raw_key: Optional[str] = None,
 ):
     """Read one parquet file's schema (footer only); return a ``pyarrow.Schema``.
@@ -1288,8 +1383,8 @@ def _read_parquet_schema(
     # a custom endpoint URL nor reapplies the backend's base prefix.
     if storage is not None and isinstance(raw_key, str) and raw_key:
         try:
-            data = storage.read_bytes(raw_key)
-            return pq.read_schema(pa.BufferReader(data))
+            reader = _StorageRangeReader(storage, raw_key)
+            return pq.read_schema(reader)
         except Exception:
             return None
 
@@ -1317,15 +1412,62 @@ def _read_parquet_schema(
     if base and full_key.startswith(base + "/"):
         rel_key = full_key[len(base) + 1:]
     try:
-        data = storage.read_bytes(rel_key)
-        return pq.read_schema(pa.BufferReader(data))
+        reader = _StorageRangeReader(storage, rel_key)
+        return pq.read_schema(reader)
     except Exception:
         return None
 
 
+class _StorageRangeReader:
+    """Small seekable file-like adapter backed only by bounded range reads."""
+
+    def __init__(self, storage, path: str) -> None:
+        self.storage = storage
+        self.path = path
+        self.position = 0
+        self.length = int(storage.size(path))
+        self.closed = False
+
+    def tell(self) -> int:
+        return self.position
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            target = offset
+        elif whence == 1:
+            target = self.position + offset
+        elif whence == 2:
+            target = self.length + offset
+        else:
+            raise ValueError("invalid seek mode")
+        if target < 0:
+            raise ValueError("negative seek position")
+        self.position = target
+        return target
+
+    def read(self, size: int = -1) -> bytes:
+        if self.position >= self.length:
+            return b""
+        if size is None or size < 0:
+            size = self.length - self.position
+        size = min(size, self.length - self.position)
+        data = self.storage.read_range(self.path, self.position, size)
+        self.position += len(data)
+        return data
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _parquet_timestamp_units(
     storage,
-    original_path: str,
+    original_path: Optional[str],
     raw_key: Optional[str] = None,
 ) -> Optional[Dict[str, str]]:
     """Map ``column -> parquet timestamp unit`` ('s'/'ms'/'us'/'ns') for every
@@ -1449,8 +1591,10 @@ def _spark_rewrite_query(
         )
         if transpiled and transpiled[0]:
             return transpiled[0]
-    except Exception as exc:
-        raise RuntimeError("Unable to transpile protected query for Spark") from exc
+    except Exception:
+        raise RuntimeError(
+            "Unable to transpile protected query for Spark"
+        ) from None
     raise RuntimeError("Unable to transpile protected query for Spark")
 
 
@@ -1509,11 +1653,25 @@ def _double_quotes_to_backticks(sql: str) -> str:
 # =========================================================
 
 def _configure_spark_session_security(cursor) -> None:
-    """Install mandatory fail-closed guards before metadata or user SQL."""
-    try:
-        cursor.execute("SET spark.sql.variable.substitute=false")
-    except Exception:
-        raise RuntimeError("Spark session security configuration failed") from None
+    """Install mandatory fail-closed guards before metadata or user SQL.
+
+    HiveServer2 erases Spark's LTZ/NTZ distinction in result metadata. Pinning
+    the session and Parquet inference to UTC/LTZ is therefore part of the
+    correctness boundary, not an optional compatibility workaround.
+    """
+    mandatory_settings = (
+        ("spark.sql.variable.substitute", "false"),
+        ("spark.sql.session.timeZone", "UTC"),
+        ("spark.sql.timestampType", "TIMESTAMP_LTZ"),
+        ("spark.sql.parquet.inferTimestampNTZ.enabled", "false"),
+    )
+    for key, value in mandatory_settings:
+        try:
+            cursor.execute(f"SET {key}={value}")
+        except Exception:
+            raise RuntimeError(
+                "Spark session security configuration failed"
+            ) from None
 
 
 def _configure_spark_s3(cursor, cluster: Optional[Dict] = None) -> None:
@@ -1595,7 +1753,7 @@ def _configure_spark_s3(cursor, cluster: Optional[Dict] = None) -> None:
             logger.debug(
                 "[spark.thrift] session setting %s failed (%s)",
                 key,
-                type(exc).__name__,
+                safe_exception_type(exc),
             )
             if required:
                 raise RuntimeError(
@@ -1645,6 +1803,81 @@ def _execute_with_stmt_timeout(
         timer.cancel()
 
 
+def _validated_spark_result_metadata(
+    description: Any,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[int, ...]]:
+    """Return positional PyHive metadata or fail closed on contract drift."""
+    fields = tuple(description or ())
+    if not fields:
+        raise RuntimeError("Spark returned invalid result metadata")
+
+    columns: List[str] = []
+    type_codes: List[str] = []
+    utc_timestamp_indexes: List[int] = []
+    for index, field in enumerate(fields):
+        if type(field) not in (list, tuple) or len(field) != 7:
+            raise RuntimeError("Spark returned invalid result metadata")
+        raw_name = field[0]
+        raw_type_code = field[1]
+        if type(raw_name) is not str or (
+            type(raw_type_code) is not str
+            or raw_type_code not in SPARK_THRIFT_TYPE_CODES
+        ):
+            raise RuntimeError("Spark returned invalid result metadata")
+        columns.append(raw_name)
+        type_codes.append(raw_type_code)
+        if raw_type_code == "TIMESTAMP_TYPE":
+            utc_timestamp_indexes.append(index)
+
+    return (
+        tuple(columns),
+        tuple(type_codes),
+        tuple(utc_timestamp_indexes),
+    )
+
+
+def _validated_spark_result_row(
+    raw_row: Any,
+    column_count: int,
+) -> tuple[Any, ...]:
+    """Return one exact DB-API row after validating its positional arity."""
+    if type(raw_row) not in (list, tuple) or len(raw_row) != column_count:
+        raise RuntimeError("Spark returned invalid result row")
+    return raw_row if type(raw_row) is tuple else tuple(raw_row)
+
+
+def _spark_result_dataframe(
+    rows: List[Any],
+    description: Any,
+    *,
+    preserve_scalar_identity: bool,
+) -> pd.DataFrame:
+    """Build a result frame without allowing pandas scalar coercion.
+
+    In particular, pandas' ordinary constructor promotes ``BIGINT + NULL`` to
+    float64, which both changes the public logical type and can lose integers
+    above 2**53. DB-API rows already contain the correct Python scalars, so an
+    object frame is the bounded public facade's lossless compatibility
+    container. Unbounded direct executor callers retain pandas' historical
+    inferred dtypes. Authoritative Thrift type codes and UTC-instant column
+    indexes travel in positional attrs; positions also work with duplicate
+    names.
+    """
+    columns, type_codes, utc_timestamp_indexes = (
+        _validated_spark_result_metadata(description)
+    )
+    for row in rows:
+        _validated_spark_result_row(row, len(columns))
+    result = pd.DataFrame(
+        rows,
+        columns=columns,
+        dtype=object if preserve_scalar_identity else None,
+    )
+    result.attrs[SPARK_RESULT_TYPE_CODES_ATTR] = type_codes
+    result.attrs[SPARK_UTC_TIMESTAMP_INDEXES_ATTR] = utc_timestamp_indexes
+    return result
+
+
 # =========================================================
 # SparkThrift executor
 # =========================================================
@@ -1664,17 +1897,29 @@ class SparkThriftExecutor:
     def __init__(self, storage: Optional[object] = None, organization: str = ""):
         self.storage = storage
         self.organization = organization
-        self.catalog = RedisCatalog()
+        # Redis construction can itself perform Sentinel discovery. Defer it
+        # into the deadline-aware cluster-selection worker below.
+        self.catalog: Optional[RedisCatalog] = None
+        self._catalog_lock = threading.Lock()
 
-    def _get_connection(self, cluster: Dict) -> object:
+    def _get_catalog(self) -> RedisCatalog:
+        catalog = self.catalog
+        if catalog is not None:
+            return catalog
+        with self._catalog_lock:
+            if self.catalog is None:
+                self.catalog = RedisCatalog()
+            return self.catalog
+
+    def _get_connection(self, cluster: Dict) -> Any:
         """Create a PyHive connection to the Thrift Server."""
         try:
             from pyhive import hive
-        except ImportError as e:
+        except ImportError:
             raise RuntimeError(
                 "PyHive is required for SPARK engine. "
                 "Install it with: pip install pyhive[hive]"
-            ) from e
+            ) from None
 
         host = cluster["thrift_host"]
         port = int(cluster.get("thrift_port", 10000))
@@ -1713,7 +1958,7 @@ class SparkThriftExecutor:
         *,
         deadline_monotonic: float,
         cancel_event: Optional[threading.Event],
-    ) -> object:
+    ) -> Any:
         """Create a Thrift connection without abandoning an unbounded worker."""
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -1726,7 +1971,7 @@ class SparkThriftExecutor:
 
         completed = threading.Event()
         abandoned = threading.Event()
-        outcome: Dict[str, object] = {}
+        outcome: Dict[str, Any] = {}
         outcome_lock = threading.Lock()
 
         def _abandon() -> None:
@@ -1792,7 +2037,9 @@ class SparkThriftExecutor:
 
     def _select_cluster(self, job_bytes: int, force: bool = False) -> Dict:
         """Select the best cluster from Redis, or raise if none available."""
-        cluster = self.catalog.select_spark_cluster(self.organization, job_bytes, force=force)
+        cluster = self._get_catalog().select_spark_cluster(
+            self.organization, job_bytes, force=force,
+        )
         if not cluster:
             raise RuntimeError(
                 f"No active Spark cluster available for job size {job_bytes} bytes. "
@@ -1802,6 +2049,79 @@ class SparkThriftExecutor:
             f"[spark.thrift] selected cluster: {cluster.get('name', cluster['cluster_id'])} "
             f"(host={cluster['thrift_host']}:{cluster.get('thrift_port', 10000)})"
         )
+        return cluster
+
+    def _select_cluster_with_deadline(
+        self,
+        job_bytes: int,
+        *,
+        force: bool,
+        deadline_monotonic: float,
+        cancel_event: Optional[threading.Event],
+    ) -> Dict:
+        """Select through Redis without extending the caller's query boundary."""
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError(
+                    "Spark query was cancelled during cluster selection"
+                )
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "Spark query deadline exceeded during cluster selection"
+                )
+            if _spark_selection_slots.acquire(timeout=min(0.05, remaining)):
+                break
+
+        completed = threading.Event()
+        outcome: Dict[str, object] = {}
+
+        def select() -> None:
+            try:
+                outcome["cluster"] = self._select_cluster(
+                    job_bytes, force=force,
+                )
+            except BaseException as exc:
+                outcome["error"] = exc
+            finally:
+                completed.set()
+                _spark_selection_slots.release()
+
+        worker = threading.Thread(
+            target=select,
+            daemon=True,
+            name="spark-cluster-selection",
+        )
+        try:
+            worker.start()
+        except BaseException:
+            _spark_selection_slots.release()
+            raise
+
+        while not completed.is_set():
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError(
+                    "Spark query was cancelled during cluster selection"
+                )
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "Spark query deadline exceeded during cluster selection"
+                )
+            completed.wait(min(0.05, remaining))
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Spark query was cancelled during cluster selection")
+        if time.monotonic() >= deadline_monotonic:
+            raise RuntimeError(
+                "Spark query deadline exceeded during cluster selection"
+            )
+        error = outcome.get("error")
+        if isinstance(error, BaseException):
+            raise error
+        cluster = outcome.get("cluster")
+        if not isinstance(cluster, dict):
+            raise RuntimeError("Spark cluster selection returned invalid state")
         return cluster
 
     def execute(
@@ -1835,6 +2155,17 @@ class SparkThriftExecutor:
         cancellation token. If either boundary fires, the connection is
         forcibly closed to unblock pending Thrift RPCs.
         """
+        # SuperSnapshot is a compatibility dataclass and direct executor
+        # callers can construct it without the catalog validators.  Derive
+        # every metadata-backed name now so an invalid version fails before
+        # cluster lookup, a Thrift connection, or any cursor SQL statement.
+        for snapshot in getattr(reflection, "supers", ()) or ():
+            _spark_table_name(
+                snapshot.super_name,
+                snapshot.simple_name,
+                snapshot.simple_version,
+            )
+
         for tombstone in (
             getattr(reflection, "tombstone_views", None) or {}
         ).values():
@@ -1905,7 +2236,18 @@ class SparkThriftExecutor:
         stmt_timeout = _spark_statement_timeout_seconds()
 
         # 1. Select cluster
-        cluster = self._select_cluster(reflection.reflection_bytes, force=force)
+        cluster = self._select_cluster_with_deadline(
+            reflection.reflection_bytes,
+            force=force,
+            deadline_monotonic=effective_deadline,
+            cancel_event=cancel_event,
+        )
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("Spark query was cancelled during cluster selection")
+        if time.monotonic() >= effective_deadline:
+            raise RuntimeError(
+                "Spark query deadline exceeded during cluster selection"
+            )
         try:
             validate_spark_storage_config(cluster)
         except ValueError as exc:
@@ -1986,14 +2328,12 @@ class SparkThriftExecutor:
             #
             #     spark.sql.legacy.parquet.nanosAsLong=true  (Spark 3.4+)
             #       → reads nanos INT64 as LongType instead of crashing.
-            #     spark.sql.parquet.inferTimestampNTZ.enabled=false
-            #       → disables NTZ timestamp inference, falls back to
-            #         treating all timestamps as UTC-adjusted.
+            #     inferTimestampNTZ=false is installed as a mandatory session
+            #     correctness guard above, alongside UTC/TIMESTAMP_LTZ.
             #     spark.sql.parquet.outputTimestampType=TIMESTAMP_MICROS
             #       → if Spark writes parquet, use micros (harmless if read-only).
             _timestamp_workarounds = [
                 ("spark.sql.legacy.parquet.nanosAsLong", "true"),
-                ("spark.sql.parquet.inferTimestampNTZ.enabled", "false"),
                 ("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS"),
             ]
             for _tw_key, _tw_val in _timestamp_workarounds:
@@ -2002,7 +2342,7 @@ class SparkThriftExecutor:
                 except Exception as _tw_err:
                     logger.debug(
                         f"{log_prefix}[spark.thrift] SET {_tw_key} failed "
-                        f"(non-fatal, {type(_tw_err).__name__})"
+                        f"(non-fatal, {safe_exception_type(_tw_err)})"
                     )
 
             # 4. Register reflection tables
@@ -2114,6 +2454,13 @@ class SparkThriftExecutor:
                             representative[0] if representative else None,
                             raw_key=(representative[1] if representative else None),
                         )
+                        if (
+                            representative is not None
+                            and _ts_units_cache[table_name] is None
+                        ):
+                            raise RuntimeError(
+                                "Spark timestamp metadata could not be verified"
+                            )
                     ts_units = _ts_units_cache[table_name]
 
                     select_parts, cast_cols = _build_tscast_select(desc_rows, ts_units)
@@ -2134,14 +2481,15 @@ class SparkThriftExecutor:
                             f"{cast_cols} back to TIMESTAMP"
                         )
                 except Exception as cast_err:
-                    # Non-fatal: if DESCRIBE or the wrapper fails, the original
-                    # view stays in place.  The query may still fail with a type
-                    # mismatch, but at least we don't break the happy path.
                     logger.debug(
                         f"{log_prefix}[spark.thrift] timestamp wrapper "
                         f"failed for {table_name} "
-                        f"(non-fatal, {type(cast_err).__name__})"
+                        f"({safe_exception_type(cast_err)})"
                     )
+                    if _ts_units_cache.get(table_name):
+                        raise RuntimeError(
+                            "Spark timestamp normalization failed"
+                        ) from None
 
             logger.info(
                 f"{log_prefix}[spark.thrift] registered {len(alias_to_table_name)} table(s), "
@@ -2192,7 +2540,7 @@ class SparkThriftExecutor:
                 parsed_expression=getattr(parser, "_parsed", None),
                 default_super_name=parser.default_super_name,
             )
-            parser.executing_query = executing_query
+            setattr(parser, "executing_query", executing_query)
             if caller_parser is not parser:
                 setattr(caller_parser, "executing_query", executing_query)
 
@@ -2219,7 +2567,7 @@ class SparkThriftExecutor:
                 # "== <Section Name> ==" headers.
                 plan_sections = {}
                 current_section = "raw"
-                current_lines = []
+                current_lines: List[str] = []
                 for line in explain_text.split("\n"):
                     stripped = line.strip()
                     if stripped.startswith("== ") and stripped.endswith(" =="):
@@ -2256,18 +2604,18 @@ class SparkThriftExecutor:
                             json.dump(spark_plan, fh, ensure_ascii=False)
                         logger.debug(
                             f"{log_prefix}[spark.thrift] query plan saved to "
-                            f"{query_manager.query_plan_path}"
+                            f"{local_path_metadata(query_manager.query_plan_path)}"
                         )
                     except Exception as plan_write_err:
                         logger.debug(
                             f"{log_prefix}[spark.thrift] failed to write plan "
-                            f"JSON ({type(plan_write_err).__name__})"
+                            f"JSON ({safe_exception_type(plan_write_err)})"
                         )
             except Exception as explain_err:
                 # EXPLAIN failure must never block the actual query.
                 logger.debug(
                     f"{log_prefix}[spark.thrift] EXPLAIN EXTENDED failed "
-                    f"(non-fatal, {type(explain_err).__name__})"
+                    f"(non-fatal, {safe_exception_type(explain_err)})"
                 )
 
             _execute_with_stmt_timeout(
@@ -2282,7 +2630,10 @@ class SparkThriftExecutor:
                 )
 
             # 7. Fetch results as pandas
-            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            result_description = tuple(cursor.description or ())
+            columns, _result_type_codes, _utc_timestamp_indexes = (
+                _validated_spark_result_metadata(result_description)
+            )
             if max_result_rows is None and max_result_bytes is None:
                 rows = cursor.fetchall()
             else:
@@ -2291,6 +2642,24 @@ class SparkThriftExecutor:
                     raise RuntimeError(
                         "Spark driver does not support bounded result fetching"
                     )
+                upstream_fetch_rows = (
+                    256
+                    if max_result_rows is None
+                    else max(1, min(256, max_result_rows + 1))
+                )
+                # PyHive's fetchmany(n) delegates to fetchone(), while
+                # fetchone() fills its private buffer using cursor.arraysize
+                # (1,000 by default).  Reduce that upstream Thrift request too,
+                # otherwise a nominal 256-row fetch can silently prefetch 1,000
+                # variable-width rows before the byte budget sees any of them.
+                try:
+                    cursor.arraysize = upstream_fetch_rows
+                    if int(cursor.arraysize) != upstream_fetch_rows:
+                        raise ValueError("cursor rejected bounded arraysize")
+                except Exception:
+                    raise RuntimeError(
+                        "Spark driver does not support bounded result fetching"
+                    ) from None
                 rows = []
                 serialized_bytes = len(json.dumps(
                     {"columns": columns, "rows": []},
@@ -2320,7 +2689,10 @@ class SparkThriftExecutor:
                             raise RuntimeError(
                                 "Spark result exceeded the materialized row limit"
                             )
-                        row = tuple(raw_row)
+                        row = _validated_spark_result_row(
+                            raw_row,
+                            len(columns),
+                        )
                         if max_result_bytes is not None:
                             try:
                                 encoded = json.dumps(
@@ -2342,7 +2714,14 @@ class SparkThriftExecutor:
                                 )
                         rows.append(row)
 
-            result = pd.DataFrame(rows, columns=columns) if columns else pd.DataFrame()
+            result = _spark_result_dataframe(
+                rows,
+                result_description,
+                preserve_scalar_identity=(
+                    max_result_rows is not None
+                    or max_result_bytes is not None
+                ),
+            )
 
             logger.info(
                 f"{log_prefix}[spark.thrift] query complete: "

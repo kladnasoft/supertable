@@ -38,13 +38,13 @@ import logging
 import math
 import multiprocessing
 import os
+import re
 import signal
 import threading
 import time
-import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -53,8 +53,17 @@ from supertable.tombstone_manifest_v2 import (
     TombstoneManifestV2Error,
     normalize_snapshot_tombstone_state,
 )
+from supertable.utils.diagnostic_redaction import (
+    safe_exception_type as _safe_error_type,
+)
 
 logger = logging.getLogger(__name__)
+
+_ERROR_TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z", re.ASCII)
+
+
+def _safe_failure_message(context: str, error: BaseException) -> str:
+    return f"{context}; error_type={_safe_error_type(error)}"
 
 # ──────────────────────────────────────────────────────────────────────
 # Constants
@@ -71,6 +80,7 @@ DEFAULT_MAX_WORKERS = max(
 DEFAULT_JOB_DEADLINE_SECONDS = max(
     1, int(os.environ.get("SUPERTABLE_DQ_JOB_DEADLINE_SECONDS", "300"))
 )
+_MAX_SCHEDULER_JOBS_PER_TICK = 10_000
 DEFAULT_PREPARED_HISTORY_TTL_SECONDS = max(
     86_400,
     DEFAULT_JOB_DEADLINE_SECONDS + DEFAULT_RUNNING_TTL_SECONDS,
@@ -194,6 +204,10 @@ class CheckRunOutcome:
     errors: int = 0
     skipped: int = 0
     message: str = ""
+    # Only scheduler constructors may mark a diagnostic as safe for transport
+    # and persistence.  A forged/corrupt child payload is reduced to a fixed
+    # message before it can enter Redis or a parent-process result.
+    diagnostic_safe: bool = field(default=False, repr=False, compare=False)
     details: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
     # Scheduler-owned runners defer their Redis-visible latest/column bundle
     # until the outer lease owner can commit it together with cooldown,
@@ -260,15 +274,36 @@ def _success(
         details=tuple(details or ()),
         publication=tuple(publication or ()),
         prepared_history=prepared_history,
+        diagnostic_safe=True,
     )
 
 
 def _failed(mode: str, message: str, *, errors: int = 1) -> CheckRunOutcome:
-    return CheckRunOutcome(mode=mode, state="failed", errors=errors, message=message)
+    return CheckRunOutcome(
+        mode=mode,
+        state="failed",
+        errors=errors,
+        message=message,
+        diagnostic_safe=True,
+    )
 
 
 def _skipped(mode: str, message: str) -> CheckRunOutcome:
-    return CheckRunOutcome(mode=mode, state="skipped", message=message)
+    return CheckRunOutcome(
+        mode=mode,
+        state="skipped",
+        message=message,
+        diagnostic_safe=True,
+    )
+
+
+def _persistable_outcome_message(outcome: CheckRunOutcome) -> str:
+    """Return only diagnostics produced by trusted scheduler constructors."""
+
+    if outcome.diagnostic_safe and isinstance(outcome.message, str):
+        return outcome.message[:4096]
+    mode = outcome.mode if outcome.mode in QUALITY_MODES else "unknown"
+    return f"{mode} quality outcome diagnostics unavailable"
 
 # Singleton state
 _scheduler_thread: Optional[threading.Thread] = None
@@ -540,7 +575,10 @@ def notify_ingest(r, org: str, sup: str, table_name: str) -> None:
     except Exception as e:
         # Never fail ingest itself. The persistent unresolved marker remains
         # for the scheduler to resolve after configuration/backend recovery.
-        logger.warning(f"[dq-ingest] Deferred pending-mode resolution: {e}")
+        logger.warning(
+            "[dq-ingest] Deferred pending-mode resolution; error_type=%s",
+            _safe_error_type(e),
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -589,8 +627,9 @@ def _job_done(job_key: str, future: Any, slots: threading.BoundedSemaphore) -> N
     if error is not None:
         _stats_increment("jobs_failed")
         logger.error(
-            "[dq-scheduler] table job %s failed: %s", job_key, error,
-            exc_info=(type(error), error, error.__traceback__),
+            "[dq-scheduler] table job %s failed; error_type=%s",
+            job_key,
+            _safe_error_type(error),
         )
     _stats_update(active_jobs=active)
 
@@ -648,7 +687,7 @@ def _isolated_process_bootstrap(send_connection, target, target_args) -> None:
         target(send_connection, *target_args)
     except BaseException as exc:
         try:
-            send_connection.send(("error", f"{type(exc).__name__}: {exc}"))
+            send_connection.send(("error", _safe_error_type(exc)))
         except Exception:
             pass
     finally:
@@ -731,7 +770,7 @@ def _run_killable_subprocess(
         target=_isolated_process_bootstrap,
         args=(send_connection, target, target_args),
         name=process_name[:120],
-        daemon=False,
+        daemon=True,
     )
     try:
         process.start()
@@ -744,7 +783,9 @@ def _run_killable_subprocess(
             pass
         return _IsolatedProcessResult(
             state="start_failed",
-            message=f"could not start isolated quality process: {exc}",
+            message=_safe_failure_message(
+                "could not start isolated quality process", exc,
+            ),
         )
     finally:
         # Once started, the parent must not retain the writer end or EOF would
@@ -781,7 +822,13 @@ def _run_killable_subprocess(
                     and len(message) == 2
                     and message[0] == "error"
                 ):
-                    child_error = str(message[1])
+                    raw_type = message[1]
+                    child_error = (
+                        raw_type
+                        if isinstance(raw_type, str)
+                        and _ERROR_TYPE_RE.fullmatch(raw_type)
+                        else "Exception"
+                    )
                 else:
                     child_error = "isolated quality process returned an invalid envelope"
         except (EOFError, OSError):
@@ -846,7 +893,10 @@ def _run_killable_subprocess(
         if child_error:
             return _IsolatedProcessResult(
                 state="crashed",
-                message=child_error,
+                message=(
+                    "isolated quality process failed; "
+                    f"error_type={child_error}"
+                ),
                 pid=pid,
                 exitcode=exitcode,
                 force_terminated=force_terminated,
@@ -933,7 +983,7 @@ def _quality_mode_process_entry(
     except BaseException as exc:
         outcome = _failed(
             mode,
-            f"isolated quality execution failed: {type(exc).__name__}: {exc}",
+            _safe_failure_message("isolated quality execution failed", exc),
         )
     finally:
         if guard is not None and not outcome.successful:
@@ -978,6 +1028,12 @@ def _run_isolated_mode_check(
     if result.force_terminated:
         _stats_increment("jobs_force_terminated")
     if result.state == "completed" and isinstance(result.payload, CheckRunOutcome):
+        if not result.payload.diagnostic_safe:
+            return replace(
+                result.payload,
+                message=_persistable_outcome_message(result.payload),
+                diagnostic_safe=True,
+            )
         return result.payload
     messages = {
         "deadline": "quality job deadline exceeded",
@@ -985,7 +1041,10 @@ def _run_isolated_mode_check(
         "lease_lost": "quality execution lease was lost during execution",
         "termination_failed": "quality subprocess could not be terminated safely",
     }
-    return _failed(mode, messages.get(result.state, result.message or result.state))
+    return _failed(
+        mode,
+        messages.get(result.state, "isolated quality subprocess failed"),
+    )
 
 
 def _scheduler_loop() -> None:
@@ -1018,10 +1077,11 @@ def _scheduler_loop() -> None:
                     executor=executor,
                     slots=slots,
                 )
-            except Exception:
+            except Exception as exc:
                 _stats_increment("tick_failures")
                 logger.error(
-                    f"[dq-scheduler] Error in tick:\n{traceback.format_exc()}"
+                    "[dq-scheduler] tick failed; error_type=%s",
+                    _safe_error_type(exc),
                 )
             _stats_update(
                 last_tick_completed_at=datetime.now(timezone.utc).isoformat(),
@@ -1142,7 +1202,10 @@ def _scheduler_tick(
     try:
         r = create_redis_client()
     except Exception as e:
-        logger.warning(f"[dq-scheduler] Cannot connect to Redis: {e}")
+        logger.warning(
+            "[dq-scheduler] Cannot connect to Redis; error_type=%s",
+            _safe_error_type(e),
+        )
         return
 
     pairs = _discover_dq_pairs(r)
@@ -1162,7 +1225,9 @@ def _scheduler_tick(
                 allow_zero=True,
             )
         except (DQConfigReadError, TypeError, ValueError, OverflowError) as exc:
-            message = f"Global quality schedule could not be read safely: {exc}"
+            message = _safe_failure_message(
+                "Global quality schedule could not be read safely", exc,
+            )
             for table_name in _list_tables(r, org, sup):
                 _record_tick_config_failure(
                     r,
@@ -1197,6 +1262,12 @@ def _scheduler_tick(
                     )
             continue
         for table_name in tables:
+            if len(jobs) >= _MAX_SCHEDULER_JOBS_PER_TICK:
+                logger.warning(
+                    "[dq-scheduler] job materialization cap reached; "
+                    "remaining tables deferred to the next tick"
+                )
+                break
             jobs.append((
                 r, org, sup, table_name, dqc, schedule, cooldown_sec,
                 quick_cron, deep_cron, custom_cron, now,
@@ -1258,11 +1329,12 @@ def _snapshot_table_lease_admission(
         leaf_payload = r.get(RK.meta_leaf(org, sup, table))
     except Exception as exc:
         logger.warning(
-            "[dq-scheduler] Could not read table incarnation for %s/%s/%s: %s",
+            "[dq-scheduler] Could not read table incarnation for %s/%s/%s; "
+            "error_type=%s",
             org,
             sup,
             table,
-            exc,
+            _safe_error_type(exc),
         )
         return None
     if leaf_payload is None:
@@ -1325,11 +1397,12 @@ def _snapshot_pending_lifecycle_admission(
         )
     except Exception as exc:
         logger.warning(
-            "[dq-scheduler] Could not pin pending lifecycle for %s/%s/%s: %s",
+            "[dq-scheduler] Could not pin pending lifecycle for %s/%s/%s; "
+            "error_type=%s",
             org,
             sup,
             table,
-            exc,
+            _safe_error_type(exc),
         )
         return None
     if not isinstance(captured, (list, tuple)) or len(captured) != 2:
@@ -1389,7 +1462,9 @@ def _process_table_job(
     except (DQConfigReadError, TypeError, ValueError, OverflowError) as exc:
         _record_tick_config_failure(
             r, org, sup, table_name, dqc, QUALITY_MODES, cooldown_sec,
-            f"Table quality schedule could not be read safely: {exc}",
+            _safe_failure_message(
+                "Table quality schedule could not be read safely", exc,
+            ),
             table_admission=table_admission,
         )
         return
@@ -1495,7 +1570,9 @@ def _process_table_job(
             _record_tick_config_failure(
                 r, org, sup, table_name, dqc, ("deep",),
                 table_cooldown_sec,
-                f"Deep quality config could not be read safely: {exc}",
+                _safe_failure_message(
+                    "Deep quality config could not be read safely", exc,
+                ),
                 table_admission=table_admission,
             )
             has_deep = stale_deep = False
@@ -1529,7 +1606,9 @@ def _process_table_job(
             _record_tick_config_failure(
                 r, org, sup, table_name, dqc, ("custom",),
                 table_cooldown_sec,
-                f"Custom quality rules could not be read safely: {exc}",
+                _safe_failure_message(
+                    "Custom quality rules could not be read safely", exc,
+                ),
                 table_admission=table_admission,
             )
             has_rules = stale_custom = False
@@ -1588,10 +1667,11 @@ def _record_tick_config_failure(
             )
         except Exception as exc:
             logger.error(
-                "[dq-scheduler] Could not record %s config failure for %s: %s",
+                "[dq-scheduler] Could not record %s config failure for %s; "
+                "error_type=%s",
                 mode,
                 table_name,
-                exc,
+                _safe_error_type(exc),
             )
 
 
@@ -1657,9 +1737,9 @@ def _publish_failure_and_retry(
         # document; the retry key remains safe and does not touch that state.
         logger.error(
             "[dq-scheduler] Could not safely publish failed-attempt telemetry "
-            "for %s: %s",
+            "for %s; error_type=%s",
             table_name,
-            exc,
+            _safe_error_type(exc),
         )
     _set_retry_if_owned(
         r,
@@ -1778,7 +1858,10 @@ def _try_run_check(
             allow_zero=True,
         )
     except ValueError as exc:
-        return _failed(mode, str(exc))
+        return _failed(
+            mode,
+            _safe_failure_message("quality cooldown is invalid", exc),
+        )
     if deadline_monotonic is not None:
         if (
             isinstance(deadline_monotonic, bool)
@@ -1801,7 +1884,10 @@ def _try_run_check(
                 org, sup, table_name, mode, cron_state,
             )
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
-            return _failed(mode, f"quality cron state is invalid: {exc}")
+            return _failed(
+                mode,
+                _safe_failure_message("quality cron state is invalid", exc),
+            )
         if expected_admission != lease_admission:
             return _failed(mode, "quality cron admission does not match its state")
 
@@ -1921,9 +2007,10 @@ def _try_run_check(
         ))
     except Exception as exc:
         logger.error(
-            "[dq-scheduler] Could not verify execution admission for %s: %s",
+            "[dq-scheduler] Could not verify execution admission for %s; "
+            "error_type=%s",
             table_name,
-            exc,
+            _safe_error_type(exc),
         )
         return _failed(mode, "quality execution admission could not be verified")
     if admission_result == -1:
@@ -2079,7 +2166,10 @@ def _try_run_check(
         lease_join = getattr(lease_thread, "join", None)
         if callable(lease_join):
             lease_join(timeout=1.0)
-        outcome = _failed(mode, f"could not start lease renewer: {exc}")
+        outcome = _failed(
+            mode,
+            _safe_failure_message("could not start lease renewer", exc),
+        )
         try:
             _publish_failure_and_retry(
                 r,
@@ -2097,9 +2187,10 @@ def _try_run_check(
             pass
         except Exception as callback_exc:
             logger.error(
-                "[dq-scheduler] terminal state publication failed for %s: %s",
+                "[dq-scheduler] terminal state publication failed for %s; "
+                "error_type=%s",
                 table_name,
-                callback_exc,
+                _safe_error_type(callback_exc),
             )
         finally:
             _delete_if_value(r, running_key, lock_token)
@@ -2247,30 +2338,38 @@ def _try_run_check(
             )
             publish_cron_completion(outcome)
             logger.error(
-                "[dq-scheduler] %s check failed for %s: %s",
+                "[dq-scheduler] %s check failed for %s; state=%s",
                 mode,
                 table_name,
-                outcome.message,
+                outcome.state,
             )
         publish_owned_completion(outcome)
         return outcome
 
     except _LeaseLostError as exc:
         logger.error(
-            "[dq-scheduler] %s check lost its lease for %s: %s",
+            "[dq-scheduler] %s check lost its lease for %s; error_type=%s",
             mode,
             table_name,
-            exc,
+            _safe_error_type(exc),
         )
         # Fail closed: a worker with ambiguous ownership may not publish an
         # attempt, set cooldown/backoff, or consume pending work.
-        return _failed(mode, str(exc))
+        return _failed(
+            mode,
+            _safe_failure_message("quality execution lease was lost", exc),
+        )
     except Exception as exc:
         logger.error(
-            f"[dq-scheduler] {mode} check failed for {table_name}:\n"
-            f"{traceback.format_exc()}"
+            "[dq-scheduler] %s check failed for %s; error_type=%s",
+            mode,
+            table_name,
+            _safe_error_type(exc),
         )
-        outcome = _failed(mode, str(exc))
+        outcome = _failed(
+            mode,
+            _safe_failure_message("quality check failed", exc),
+        )
         try:
             lease_guard.assert_owned()
             _publish_failure_and_retry(
@@ -2949,7 +3048,7 @@ def _attempt_record(outcome: CheckRunOutcome) -> Dict[str, Any]:
         "critical": int(outcome.critical or 0),
         "errors": int(outcome.errors or 0),
         "skipped": int(outcome.skipped or 0),
-        "message": str(outcome.message or ""),
+        "message": _persistable_outcome_message(outcome),
     }
 
 
@@ -3035,6 +3134,7 @@ def _publish_dqc_documents(
         """
         with lease_guard.fence_lock:
             lease_guard.assert_owned()
+            publication_failure: Optional[str] = None
             try:
                 published = int(redis_client.eval(
                     script,
@@ -3047,9 +3147,11 @@ def _publish_dqc_documents(
                 )) == 1
             except Exception as exc:
                 lease_guard.lost.set()
-                raise _LeaseLostError(
-                    f"quality publication fence could not be verified: {exc}"
-                ) from exc
+                publication_failure = _safe_failure_message(
+                    "quality publication fence could not be verified", exc,
+                )
+            if publication_failure is not None:
+                raise _LeaseLostError(publication_failure)
             if not published:
                 lease_guard.lost.set()
                 raise _LeaseLostError(
@@ -3211,10 +3313,11 @@ def _write_mode_history(
         raise
     except Exception as exc:
         logger.error(
-            "[dq-scheduler] History durability failed for %s %s: %s",
+            "[dq-scheduler] History durability failed for %s %s; "
+            "error_type=%s",
             mode,
             table_name,
-            exc,
+            _safe_error_type(exc),
         )
         return False
 
@@ -3420,7 +3523,10 @@ def _run_quick_check(
     try:
         from supertable.meta_reader import MetaReader
     except ImportError as exc:
-        return _failed("quick", f"MetaReader not available: {exc}")
+        return _failed(
+            "quick",
+            _safe_failure_message("MetaReader is unavailable", exc),
+        )
 
     eff = dqc.get_effective_config(table_name)
     checks = eff.get("checks", {})
@@ -3444,13 +3550,19 @@ def _run_quick_check(
         if not schema_dict and not snapshot_exists:
             return _failed("quick", f"No schema for {table_name}")
     except Exception as e:
-        return _failed("quick", f"Schema read failed for {table_name}: {e}")
+        return _failed(
+            "quick",
+            _safe_failure_message("quality schema read failed", e),
+        )
 
     # Build and execute quick SQL
     try:
         table_fqn = quality_table_fqn(sup, table_name)
     except ValueError as exc:
-        return _failed("quick", str(exc))
+        return _failed(
+            "quick",
+            _safe_failure_message("quality table identity is invalid", exc),
+        )
     # Row-level incremental quality is deliberately disabled.  A timestamp
     # alone is not a lossless cursor: ``>`` loses equal/late rows and ``>=``
     # double-counts the boundary. DQConfig sanitizes legacy configuration, and
@@ -3465,8 +3577,7 @@ def _run_quick_check(
             if not execution.ok:
                 return _failed(
                     "quick",
-                    f"Quick SQL failed with status={execution.status}: "
-                    f"{execution.message or 'no error message'}",
+                    f"Quick SQL failed with status={execution.status}",
                 )
             result_df = execution.require_success()
             if result_df.empty:
@@ -3476,7 +3587,10 @@ def _run_quick_check(
                 )
             row = result_df.to_dict(orient="records")[0]
         except Exception as e:
-            return _failed("quick", f"Quick SQL execution failed for {table_name}: {e}")
+            return _failed(
+                "quick",
+                _safe_failure_message("Quick SQL execution failed", e),
+            )
     else:
         # Constructing the public read relation for a zero-column table makes
         # both DuckDB and IslandDB reject an empty COLUMNS projection.  The
@@ -3493,7 +3607,10 @@ def _run_quick_check(
     try:
         parsed = parse_quick_result(row, columns)
     except Exception as exc:
-        return _failed("quick", f"Quick result parsing failed for {table_name}: {exc}")
+        return _failed(
+            "quick",
+            _safe_failure_message("Quick result parsing failed", exc),
+        )
 
     # Anomaly detection
     prev_parsed = previous.get("parsed") if previous else None
@@ -3668,7 +3785,10 @@ def _run_deep_check(
     try:
         from supertable.meta_reader import MetaReader
     except ImportError as exc:
-        return _failed("deep", f"MetaReader not available: {exc}")
+        return _failed(
+            "deep",
+            _safe_failure_message("MetaReader is unavailable", exc),
+        )
 
     eff = dqc.get_effective_config(table_name)
     checks = eff.get("checks", {})
@@ -3687,7 +3807,10 @@ def _run_deep_check(
             return _failed("deep", f"No schema for {table_name}")
         columns = filter_visible_columns(list(schema_dict.items()))
     except Exception as e:
-        return _failed("deep", f"Deep schema read failed for {table_name}: {e}")
+        return _failed(
+            "deep",
+            _safe_failure_message("Deep schema read failed", e),
+        )
 
     if not deep_enabled:
         checked_at = _now_iso()
@@ -3760,7 +3883,10 @@ def _run_deep_check(
     try:
         table_fqn = quality_table_fqn(sup, table_name)
     except ValueError as exc:
-        return _failed("deep", str(exc))
+        return _failed(
+            "deep",
+            _safe_failure_message("quality table identity is invalid", exc),
+        )
     pending_columns: Dict[str, Dict[str, Any]] = {}
     outcomes: List[Dict[str, Any]] = []
     applicable_by_category = {
@@ -3812,8 +3938,7 @@ def _run_deep_check(
             if not execution.ok:
                 return _failed(
                     "deep",
-                    f"Deep SQL failed for {table_name}.{col_name} with "
-                    f"status={execution.status}: {execution.message or 'no error message'}",
+                    f"Deep SQL failed with status={execution.status}",
                 )
             result_df = execution.require_success()
             if result_df.empty:
@@ -3847,19 +3972,14 @@ def _run_deep_check(
         except Exception as e:
             return _failed(
                 "deep",
-                f"Deep check failed for {table_name}.{col_name}: {e}",
+                _safe_failure_message("Deep check failed", e),
             )
 
     summary = _summary_from_outcomes(outcomes)
     if summary["errors"]:
-        messages = [
-            str(outcome.get("message") or outcome.get("check_id"))
-            for outcome in outcomes
-            if outcome.get("status") == "error"
-        ]
         return _failed(
             "deep",
-            "Deep check evaluation failed: " + "; ".join(messages),
+            "Deep check evaluation failed",
             errors=summary["errors"],
         )
 
@@ -3976,7 +4096,10 @@ def _run_custom_check(
     try:
         from supertable.meta_reader import MetaReader
     except ImportError as exc:
-        return _failed("custom", f"MetaReader not available: {exc}")
+        return _failed(
+            "custom",
+            _safe_failure_message("MetaReader is unavailable", exc),
+        )
 
     custom_rules = dqc.list_rules_for_table(table_name)
 
@@ -3996,12 +4119,18 @@ def _run_custom_check(
         if not schema_dict and not snapshot_exists:
             return _failed("custom", f"No schema for {table_name}")
     except Exception as exc:
-        return _failed("custom", f"Custom-rule schema read failed for {table_name}: {exc}")
+        return _failed(
+            "custom",
+            _safe_failure_message("Custom-rule schema read failed", exc),
+        )
 
     try:
         table_fqn = quality_table_fqn(sup, table_name)
     except ValueError as exc:
-        return _failed("custom", str(exc))
+        return _failed(
+            "custom",
+            _safe_failure_message("quality table identity is invalid", exc),
+        )
 
     if not custom_rules:
         checked_at = _now_iso()
@@ -4131,8 +4260,7 @@ def _run_custom_check(
                     return _failed(
                         "custom",
                         f"Custom rule {rule['rule_id']} SQL failed with "
-                        f"status={execution.status}: "
-                        f"{execution.message or 'no error message'}",
+                        f"status={execution.status}",
                     )
                 r_df = execution.require_success()
                 r_result = (
@@ -4168,7 +4296,10 @@ def _run_custom_check(
                     "detected_at": _now_iso(),
                 })
         except Exception as e:
-            return _failed("custom", f"Custom rule {rule['rule_id']} failed: {e}")
+            return _failed(
+                "custom",
+                _safe_failure_message("Custom rule execution failed", e),
+            )
 
     summary = _summary_from_outcomes(rule_results)
     checked_at = _now_iso()
@@ -4350,6 +4481,7 @@ def _prepare_history_if_owned(
     redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[3])
     return 1
     """
+    preparation_failed = False
     try:
         result = int(lease_guard.redis.eval(
             script,
@@ -4365,11 +4497,13 @@ def _prepare_history_if_owned(
             "1" if table_admission is not None else "0",
             leaf_payload if table_admission is not None else "",
         ))
-    except Exception as exc:
+    except Exception:
         lease_guard.mark_lost()
+        preparation_failed = True
+    if preparation_failed:
         raise _LeaseLostError(
             "quality history preparation could not be verified"
-        ) from exc
+        )
     if result in (0, -1):
         lease_guard.mark_lost()
         raise _LeaseLostError(
@@ -4421,9 +4555,10 @@ def _deliver_committed_history(r, prepared: Optional[_PreparedHistory]) -> bool:
         )
     except Exception as exc:
         logger.warning(
-            "[dq-scheduler] Committed history delivery failed for %s: %s",
+            "[dq-scheduler] Committed history delivery failed for %s; "
+            "error_type=%s",
             prepared.history_id,
-            exc,
+            _safe_error_type(exc),
         )
         return False
 
@@ -4455,6 +4590,7 @@ def _queue_history_outbox_if_owned(
     end
     return -1
     """
+    enqueue_failed = False
     try:
         result = int(lease_guard.redis.eval(
             script,
@@ -4465,13 +4601,15 @@ def _queue_history_outbox_if_owned(
             history_id,
             payload,
         ))
-    except Exception as exc:
+    except Exception:
         # The script may have committed before an ambiguous transport error.
         # Fence this worker locally so no cooldown/pending transition follows.
         lease_guard.mark_lost()
+        enqueue_failed = True
+    if enqueue_failed:
         raise _LeaseLostError(
             "quality history outbox ownership could not be verified"
-        ) from exc
+        )
     if result == 0:
         lease_guard.mark_lost()
         raise _LeaseLostError(
@@ -4483,13 +4621,16 @@ def _queue_history_outbox_if_owned(
             history_id,
         )
         return False
+    readback_failed = False
     try:
         persisted = lease_guard.redis.hget(key, history_id)
-    except Exception as exc:
+    except Exception:
         lease_guard.mark_lost()
+        readback_failed = True
+    if readback_failed:
         raise _LeaseLostError(
             "quality history outbox read-back could not be verified"
-        ) from exc
+        )
     if persisted is None or not _redis_values_equal(persisted, payload):
         lease_guard.mark_lost()
         raise _LeaseLostError(
@@ -4528,7 +4669,10 @@ def _drain_history_outbox(r, org: str, sup: str, *, limit: int = 100) -> int:
     try:
         raw_cursor = r.get(cursor_key)
     except Exception as exc:
-        logger.warning("[dq-scheduler] history outbox cursor read failed: %s", exc)
+        logger.warning(
+            "[dq-scheduler] history outbox cursor read failed; error_type=%s",
+            _safe_error_type(exc),
+        )
         return 0
     try:
         cursor = int(raw_cursor) if raw_cursor is not None else 0
@@ -4537,7 +4681,11 @@ def _drain_history_outbox(r, org: str, sup: str, *, limit: int = 100) -> int:
     except (TypeError, ValueError, OverflowError) as exc:
         # Cursor state is only a fairness hint.  A malformed hint must not
         # strand durable history; restart the scan from the beginning.
-        logger.warning("[dq-scheduler] resetting invalid history outbox cursor: %s", exc)
+        logger.warning(
+            "[dq-scheduler] resetting invalid history outbox cursor; "
+            "error_type=%s",
+            _safe_error_type(exc),
+        )
         cursor = 0
     try:
         next_cursor, raw_items = r.hscan(
@@ -4546,7 +4694,10 @@ def _drain_history_outbox(r, org: str, sup: str, *, limit: int = 100) -> int:
             count=max(1, min(int(limit), 1000)),
         )
     except Exception as exc:
-        logger.warning("[dq-scheduler] history outbox scan failed: %s", exc)
+        logger.warning(
+            "[dq-scheduler] history outbox scan failed; error_type=%s",
+            _safe_error_type(exc),
+        )
         return 0
     delivered = 0
     for raw_id, raw_payload in (raw_items or {}).items():
@@ -4568,9 +4719,10 @@ def _drain_history_outbox(r, org: str, sup: str, *, limit: int = 100) -> int:
                 delivered += 1
         except Exception as exc:
             logger.error(
-                "[dq-scheduler] history outbox delivery failed for %s: %s",
+                "[dq-scheduler] history outbox delivery failed for %s; "
+                "error_type=%s",
                 history_id,
-                exc,
+                _safe_error_type(exc),
             )
     # Multiple scheduler hosts may drain the same outbox.  Advance only from
     # the exact cursor this worker scanned: a delayed page-zero worker must not
@@ -4604,7 +4756,10 @@ def _drain_history_outbox(r, org: str, sup: str, *, limit: int = 100) -> int:
             str(int(next_cursor)),
         )
     except Exception as exc:
-        logger.warning("[dq-scheduler] history outbox cursor CAS failed: %s", exc)
+        logger.warning(
+            "[dq-scheduler] history outbox cursor CAS failed; error_type=%s",
+            _safe_error_type(exc),
+        )
     return delivered
 
 
@@ -4725,10 +4880,13 @@ def _cron_schedule_state(
         else:
             return now_ms >= first_due_ms, state
     if raw is not None:
+        malformed_state = False
         try:
             state = json.loads(raw)
-        except (TypeError, ValueError, UnicodeError) as exc:
-            raise RuntimeError("persisted quality cron state is malformed") from exc
+        except (TypeError, ValueError, UnicodeError):
+            malformed_state = True
+        if malformed_state:
+            raise RuntimeError("persisted quality cron state is malformed")
         schema_version = state.get("schema_version") if isinstance(state, dict) else None
         if (
             not isinstance(state, dict)
@@ -4775,6 +4933,7 @@ def _cron_schedule_state(
         redis.call('set', KEYS[1], ARGV[2])
         return 1
         """
+        replace_failed = False
         try:
             if table_admission is not None:
                 leaf_key, leaf_payload, simple_delete_key, namespace_delete_key = (
@@ -4796,10 +4955,12 @@ def _cron_schedule_state(
                 replace_result = int(r.eval(
                     script, 1, key, raw, encoded, "0", "",
                 ))
-        except Exception as exc:
+        except Exception:
+            replace_failed = True
+        if replace_failed:
             raise RuntimeError(
                 "updated quality cron state could not be CAS-persisted"
-            ) from exc
+            )
         if replace_result == -1:
             raise RuntimeError(
                 "table incarnation changed before cron schedule reset"
@@ -4810,12 +4971,15 @@ def _cron_schedule_state(
             # its phase only when it installed the exact schedule requested by
             # this caller; never overwrite a different, potentially newer one.
             fresh_raw = r.get(key)
+            malformed_fresh_state = False
             try:
                 fresh = json.loads(fresh_raw) if fresh_raw is not None else None
-            except (TypeError, ValueError, UnicodeError) as exc:
+            except (TypeError, ValueError, UnicodeError):
+                malformed_fresh_state = True
+            if malformed_fresh_state:
                 raise RuntimeError(
                     "quality cron state changed to malformed data during reset"
-                ) from exc
+                )
             fresh_version = (
                 fresh.get("schema_version") if isinstance(fresh, dict) else None
             )
@@ -4912,6 +5076,7 @@ def _record_cron_outcome(
         """
         with lease_guard.fence_lock:
             lease_guard.assert_owned()
+            outcome_commit_failed = False
             try:
                 result = int(r.eval(
                     script,
@@ -4930,11 +5095,13 @@ def _record_cron_outcome(
                     "1" if table_admission is not None else "0",
                     leaf_payload if table_admission is not None else "",
                 ))
-            except Exception as exc:
+            except Exception:
                 lease_guard.lost.set()
+                outcome_commit_failed = True
+            if outcome_commit_failed:
                 raise _LeaseLostError(
                     "quality cron outcome ownership could not be verified"
-                ) from exc
+                )
             if result == 0:
                 lease_guard.lost.set()
                 raise _LeaseLostError(
@@ -4983,7 +5150,7 @@ def _cron_outcome_document(
         "last_started_ms": updated.get("last_started_ms") or now_ms,
         "last_completed_ms": now_ms,
         "last_outcome": outcome.state,
-        "last_message": outcome.message[:4096],
+        "last_message": _persistable_outcome_message(outcome),
     })
     return updated
 
@@ -5154,6 +5321,7 @@ def _set_retry_if_owned(
     """
     with lease_guard.fence_lock:
         lease_guard.assert_owned()
+        retry_commit_failure: Optional[str] = None
         try:
             result = int(r.eval(
                 script,
@@ -5171,9 +5339,11 @@ def _set_retry_if_owned(
             ))
         except Exception as exc:
             lease_guard.lost.set()
-            raise _LeaseLostError(
-                f"retry ownership fence could not be verified: {exc}"
-            ) from exc
+            retry_commit_failure = _safe_failure_message(
+                "retry ownership fence could not be verified", exc,
+            )
+        if retry_commit_failure is not None:
+            raise _LeaseLostError(retry_commit_failure)
         if result != 1:
             lease_guard.lost.set()
             raise _LeaseLostError(
@@ -5650,8 +5820,9 @@ def _commit_success_if_owned(
         except Exception as exc:
             lease_guard.lost.set()
             logger.error(
-                "[dq-scheduler] Atomic quality success commit was ambiguous: %s",
-                exc,
+                "[dq-scheduler] Atomic quality success commit was ambiguous; "
+                "error_type=%s",
+                _safe_error_type(exc),
             )
             return False
         if result != 1:
@@ -5898,7 +6069,10 @@ def _discover_dq_pairs(r) -> List[Tuple[str, str]]:
             if cursor == 0:
                 break
     except Exception as e:
-        logger.warning(f"[dq-scheduler] discover pairs failed: {e}")
+        logger.warning(
+            "[dq-scheduler] discover pairs failed; error_type=%s",
+            _safe_error_type(e),
+        )
     return list(set(pairs))
 
 
@@ -5919,5 +6093,8 @@ def _list_tables(r, org: str, sup: str) -> List[str]:
             if cursor == 0:
                 break
     except Exception as e:
-        logger.warning(f"[dq-scheduler] list_tables failed: {e}")
+        logger.warning(
+            "[dq-scheduler] list_tables failed; error_type=%s",
+            _safe_error_type(e),
+        )
     return sorted(set(tables))

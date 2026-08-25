@@ -94,4 +94,4 @@ def get_storage(kind: Optional[str] = None, **kwargs: Any) -> StorageInterface:
             return GCSStorage(**kwargs)
         return GCSStorage.from_env()
 
-    raise ValueError(f"Unknown storage type: {storage_type}")
+    raise ValueError("Unknown storage type")

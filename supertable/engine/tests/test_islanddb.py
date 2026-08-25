@@ -4,6 +4,8 @@ import dataclasses
 import gc
 import json
 import os
+import re
+import threading
 import time
 import types
 from contextlib import contextmanager
@@ -44,6 +46,7 @@ from supertable.engine.island_resources import (
     QueryResourcePlan,
     ResourcePlanner,
     ResourcePolicy,
+    ResourceReservationCancelled,
 )
 from supertable.processing import (
     TOMBSTONE_FILE_COL,
@@ -524,6 +527,38 @@ def test_arrow_dataset_applies_validated_row_group_hint_and_exact_filter(tmp_pat
     assert engine.last_profile.estimated_candidate_row_groups_complete is True
 
 
+def test_native_debug_log_hashes_sql_instead_of_logging_literals(
+    tmp_path, caplog,
+):
+    secret = "731234567890123456"
+    path = tmp_path / "sql-log-confidentiality.parquet"
+    pl.DataFrame({
+        "id": [1],
+        "v": [int(secret)],
+        "__rowid__": [1],
+        "__timestamp__": [1],
+    }).write_parquet(path)
+    snapshot = _snapshot(
+        "t",
+        [path],
+        ["raw/sql-log-confidentiality.parquet"],
+        types={
+            "id": "Int64",
+            "v": "Int64",
+            "__rowid__": "Int64",
+            "__timestamp__": "Int64",
+        },
+    )
+    query = f"SELECT id FROM s.t WHERE v = {secret}"
+    caplog.set_level("DEBUG", logger="supertable.config.defaults")
+
+    actual, _engine = _run_island(tmp_path, _reflection(snapshot), query)
+
+    assert actual["id"].tolist() == [1]
+    assert secret not in caplog.text
+    assert "[islanddb] executing sql_sha256=" in caplog.text
+
+
 def test_stale_row_group_footer_count_scans_all_and_keeps_result(tmp_path):
     path = tmp_path / "groups.parquet"
     pl.DataFrame({
@@ -976,8 +1011,120 @@ def test_materialized_facade_failure_is_profiled_separately(
     assert persisted["result_complete"] is False
 
 
-def test_profile_writer_failure_never_fails_materialized_query(
+@pytest.mark.parametrize(
+    "cancel_stage",
+    ["arrow", "polars", "pandas", "pre-return"],
+)
+def test_materialized_cancel_is_checked_after_every_conversion_boundary(
+    tmp_path, numeric_reflection, monkeypatch, cancel_stage,
+):
+    query = "SELECT id FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(
+        tmp_path / f"cancel-{cancel_stage}-materialized-plan.json"
+    )
+    engine = IslandDB()
+    cancel_event = threading.Event()
+
+    if cancel_stage == "arrow":
+        original_collect = islanddb_module.ArrowBatchStream.collect_table
+
+        def cancel_after_collect(stream, *, max_bytes):
+            table = original_collect(stream, max_bytes=max_bytes)
+            cancel_event.set()
+            return table
+
+        monkeypatch.setattr(
+            islanddb_module.ArrowBatchStream,
+            "collect_table",
+            cancel_after_collect,
+        )
+    elif cancel_stage == "polars":
+        original_from_arrow = islanddb_module.pl.from_arrow
+
+        def cancel_after_polars(table):
+            frame = original_from_arrow(table)
+            cancel_event.set()
+            return frame
+
+        monkeypatch.setattr(
+            islanddb_module.pl, "from_arrow", cancel_after_polars,
+        )
+    elif cancel_stage == "pandas":
+        original_to_pandas = engine._to_duckdb_pandas
+
+        def cancel_after_pandas(frame):
+            result = original_to_pandas(frame)
+            cancel_event.set()
+            return result
+
+        monkeypatch.setattr(engine, "_to_duckdb_pandas", cancel_after_pandas)
+    else:
+        original_add_phase = islanddb_module._QueryExecutionMetrics.add_phase
+
+        def cancel_after_pandas_telemetry(metrics, name, elapsed_ms):
+            original_add_phase(metrics, name, elapsed_ms)
+            if name == "facade_polars_to_pandas_ms":
+                cancel_event.set()
+
+        monkeypatch.setattr(
+            islanddb_module._QueryExecutionMetrics,
+            "add_phase",
+            cancel_after_pandas_telemetry,
+        )
+
+    with pytest.raises(ResourceReservationCancelled, match="cancelled"):
+        engine.execute(
+            numeric_reflection,
+            parser,
+            manager,
+            lambda _: None,
+            cancel_event=cancel_event,
+        )
+
+    assert engine.last_profile.execution_outcome == "cancelled"
+    assert engine.last_profile.result_complete is False
+
+
+def test_materialized_deadline_is_rechecked_immediately_before_return(
     tmp_path, numeric_reflection, monkeypatch,
+):
+    query = "SELECT id FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "deadline-materialized-plan.json")
+    engine = IslandDB()
+    clock = [0.0]
+    monkeypatch.setattr(islanddb_module, "_monotonic", lambda: clock[0])
+    original_add_phase = islanddb_module._QueryExecutionMetrics.add_phase
+
+    def expire_after_pandas_telemetry(metrics, name, elapsed_ms):
+        original_add_phase(metrics, name, elapsed_ms)
+        if name == "facade_polars_to_pandas_ms":
+            clock[0] = 101.0
+
+    monkeypatch.setattr(
+        islanddb_module._QueryExecutionMetrics,
+        "add_phase",
+        expire_after_pandas_telemetry,
+    )
+
+    with pytest.raises(IslandExecutionTimeout, match="before returning"):
+        engine.execute(
+            numeric_reflection,
+            parser,
+            manager,
+            lambda _: None,
+            deadline_monotonic=100.0,
+        )
+
+    assert engine.last_profile.execution_outcome == "cancelled"
+    assert engine.last_profile.result_complete is False
+
+
+def test_profile_writer_failure_never_fails_materialized_query(
+    tmp_path, numeric_reflection, monkeypatch, caplog,
 ):
     query = "SELECT count(*) AS n FROM s.t"
     parser = SQLParser("s", query, "duckdb")
@@ -985,10 +1132,16 @@ def test_profile_writer_failure_never_fails_materialized_query(
     manager.query_plan_path = str(tmp_path / "unwritable-plan.json")
     engine = IslandDB()
 
+    secret = (
+        "profile sink unavailable at /srv/private/PROFILE_PATH_TOKEN; "
+        "https://storage.invalid/REMOTE_PATH_TOKEN?token=QUERY_TOKEN"
+    )
+
     def fail_profile(*_args, **_kwargs):
-        raise OSError("profile sink unavailable")
+        raise OSError(secret)
 
     monkeypatch.setattr(engine, "_write_profile", fail_profile)
+    caplog.set_level("DEBUG", logger="supertable.config.defaults")
     result = engine.execute(
         numeric_reflection, parser, manager, lambda _: None,
     )
@@ -1001,6 +1154,11 @@ def test_profile_writer_failure_never_fails_materialized_query(
     assert manager._island_profile is engine.last_profile
     assert manager._island_profile_token == engine.last_profile.telemetry_query_id
     assert not (tmp_path / "unwritable-plan.json").exists()
+    assert "PROFILE_PATH_TOKEN" not in caplog.text
+    assert "REMOTE_PATH_TOKEN" not in caplog.text
+    assert "QUERY_TOKEN" not in caplog.text
+    assert "/srv/private" not in caplog.text
+    assert "error_type=OSError" in caplog.text
 
 
 def test_telemetry_failure_never_masks_pre_stream_error_or_leaks_slot(
@@ -2962,7 +3120,8 @@ def test_forced_external_group_and_sort_spill_matches_duckdb(
     parser = SQLParser("s", query, "duckdb")
     manager = QueryPlanManager("s", "island-tests", "", query)
     engine = IslandDB()
-    engine._spill_root = tmp_path / "spill"
+    engine._spill_root = tmp_path / "LOCAL_SPILL_PATH_TOKEN" / "spill"
+    manager.query_plan_path = str(tmp_path / "island-profile.json")
     forced = QueryResourcePlan(
         advice=ExecutionAdvice.ISLAND_SPILL,
         cpu_workers=2,
@@ -2990,7 +3149,19 @@ def test_forced_external_group_and_sort_spill_matches_duckdb(
 
     pd.testing.assert_frame_equal(result, expected)
     assert engine.last_profile.spill["triggered"] is True
-    assert not list((tmp_path / "spill").glob("island-*"))
+    profile_doc = engine.last_profile.as_dict()
+    rendered_profile = json.dumps(profile_doc, sort_keys=True)
+    assert "LOCAL_SPILL_PATH_TOKEN" not in rendered_profile
+    assert str(engine._spill_root) not in rendered_profile
+    assert "directory" not in engine.last_profile.spill
+    assert "directory_metadata" in engine.last_profile.spill
+    assert "path_sha256=" in engine.last_profile.spill["directory_metadata"]
+    persisted = (tmp_path / "island-profile.json").read_text(encoding="utf-8")
+    assert "LOCAL_SPILL_PATH_TOKEN" not in persisted
+    stats = PlanStats()
+    Executor._publish_island_profile(stats, manager, "")
+    assert "LOCAL_SPILL_PATH_TOKEN" not in repr(stats.stats)
+    assert not list(engine._spill_root.glob("island-*"))
 
 
 def test_spill_direct_arrow_projection_uses_sealed_schema_and_full_hints(
@@ -3034,7 +3205,7 @@ def test_spill_direct_arrow_projection_uses_sealed_schema_and_full_hints(
 
 
 def test_order_only_spill_uses_direct_scan_and_normalizes_rich_stream(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, caplog,
 ):
     import supertable.engine.islanddb as island_module
 
@@ -3107,6 +3278,7 @@ def test_order_only_spill_uses_direct_scan_and_normalizes_rich_stream(
         engine, "resource_plan",
         lambda reflection, parser, streaming_result: forced,
     )
+    caplog.set_level("DEBUG", logger="supertable.config.defaults")
 
     with engine.execute_stream(
         reflection, parser, manager, lambda _: None,
@@ -3128,6 +3300,8 @@ def test_order_only_spill_uses_direct_scan_and_normalizes_rich_stream(
     assert fixed_binary_casts == []
     assert "ARROW NATIVE DIRECT PROJECTION" in engine.last_profile.optimized_plan
     assert "ARROW NATIVE RANGE PARTITION SORT" in engine.last_profile.optimized_plan
+    assert query not in caplog.text
+    assert "executing direct Arrow projection sql_sha256=" in caplog.text
     assert engine.last_profile.spill["triggered"] is True
     assert engine.last_profile.spill_bytes > 0
     assert not list((tmp_path / "direct-rich-spill").glob("island-*"))
@@ -3286,12 +3460,19 @@ def test_explicit_unsupported_query_rejects_before_cache_io(
     cache = _CachePreflightSpy()
     executor._file_cache = cache
 
-    with pytest.raises(IslandUnsupportedError, match="NOCASE"):
+    with pytest.raises(IslandUnsupportedError) as caught:
         executor.execute(
             Engine.ISLANDDB, numeric_reflection, parser, manager, Timer(),
             PlanStats(), "",
         )
 
+    assert re.fullmatch(
+        r"IslandDB materialized preparation failed; "
+        r"error_type=IslandUnsupportedError; "
+        r"diagnostic_id=[0-9a-f]{16}; diagnostic_bytes=[0-9]+",
+        str(caught.value),
+    )
+    assert "NOCASE" not in str(caught.value)
     assert cache.entered == 0
 
 

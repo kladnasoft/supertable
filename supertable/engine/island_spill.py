@@ -29,6 +29,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from supertable.engine.island_resources import ArrowBatchStream
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 
 class IslandSpillError(RuntimeError):
@@ -289,8 +290,10 @@ class SpillSession:
             return
         try:
             path.resolve().relative_to(self._directory.resolve())
-        except ValueError as exc:
-            raise ValueError("refusing to remove a path outside this spill session") from exc
+        except ValueError:
+            raise ValueError(
+                "refusing to remove a path outside this spill session"
+            ) from None
         try:
             size = path.stat().st_size
         except FileNotFoundError:
@@ -1528,6 +1531,26 @@ def _aggregate_output_type(spec: AggregateSpec, schema: pa.Schema) -> pa.DataTyp
     raise UnsupportedSpillOperation(f"aggregate {function!r} has no bounded implementation")
 
 
+def _native_group_aggregate(
+    table: pa.Table,
+    group_keys: Sequence[str],
+    aggregate_functions: Sequence[tuple[object, str]],
+    *,
+    operation: str,
+) -> pa.Table:
+    """Invoke Arrow grouping without retaining its attacker-shaped prose."""
+
+    try:
+        return table.group_by(
+            list(group_keys), use_threads=True,
+        ).aggregate(aggregate_functions)
+    except (pa.ArrowNotImplementedError, pa.ArrowTypeError) as exc:
+        raise UnsupportedSpillOperation(
+            f"native {operation} is not available; "
+            f"error_type={safe_exception_type(exc)}"
+        ) from None
+
+
 def external_group_aggregate(
     batches: Iterable[pa.RecordBatch],
     *,
@@ -1762,14 +1785,12 @@ def external_group_aggregate(
                 if spec.function.lower() == "sum"
             ],
         )
-        try:
-            result = working.group_by(
-                list(group_keys), use_threads=True,
-            ).aggregate(aggregate_functions)
-        except (pa.ArrowNotImplementedError, pa.ArrowTypeError) as exc:
-            raise UnsupportedSpillOperation(
-                f"native bounded aggregation is not available: {exc}"
-            ) from exc
+        result = _native_group_aggregate(
+            working,
+            group_keys,
+            aggregate_functions,
+            operation="bounded aggregation",
+        )
         session._check_cancelled()
         return table_from_result(result, count_results_are_int64=True)
 
@@ -1791,14 +1812,12 @@ def external_group_aggregate(
                 if spec.function.lower() in {"count", "count_star", "sum"}
             ],
         )
-        try:
-            result = table.group_by(
-                list(group_keys), use_threads=True,
-            ).aggregate(aggregate_functions)
-        except (pa.ArrowNotImplementedError, pa.ArrowTypeError) as exc:
-            raise UnsupportedSpillOperation(
-                f"native compact-state aggregation is not available: {exc}"
-            ) from exc
+        result = _native_group_aggregate(
+            table,
+            group_keys,
+            aggregate_functions,
+            operation="compact-state aggregation",
+        )
         session._check_cancelled()
         return table_from_result(result, count_results_are_int64=False)
 

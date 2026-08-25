@@ -32,6 +32,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from supertable.mirroring.failure_safety import mirror_error_type
+
 
 # ---------------------------------------------------------------------------
 # Fixtures & helpers
@@ -143,7 +145,7 @@ def _install_writer_catalog_contract(
             "status": "failed",
             "commit_id": kwargs["commit_id"],
             "failure_stage": kwargs["failure_stage"],
-            "error": str(kwargs["error"]),
+            "error": {"type": mirror_error_type(kwargs["error"])},
         }
 
     catalog_type = type(catalog)
@@ -803,9 +805,9 @@ class TestSimpleTableDelete:
         st = SimpleTable(mock_super, "del_table")
         assert st.delete(role_name="test_role") == "delete-intent"
 
-        # Admission, exact-lock state and pre-publication are independent
-        # authorization boundaries.
-        assert mock_access.call_count == 3
+        # Admission and one post-lock/pre-publication revalidation are the two
+        # authorization boundaries; duplicate consecutive checks add no fence.
+        assert mock_access.call_count == 2
         assert mock_super.storage.delete_prefix.call_args_list == [
             call("org/super/tables/del_table"),
             call("org/super/delta/del_table"),
@@ -1814,7 +1816,8 @@ class TestDataReaderExecute:
         df, status, msg = dr.execute("user_hash")
 
         assert status == Status.ERROR
-        assert "estimation failed" in msg
+        assert msg == "Query execution failed"
+        assert "estimation failed" not in msg
 
 
 class TestQuerySql:
@@ -1853,7 +1856,7 @@ class TestQuerySql:
         mock_reader.execute.return_value = (pd.DataFrame(), Status.ERROR, "bad query")
         mock_reader_cls.return_value = mock_reader
 
-        with pytest.raises(RuntimeError, match="bad query"):
+        with pytest.raises(RuntimeError) as raised:
             query_sql(
                 organization="org",
                 super_name="super",
@@ -1862,6 +1865,11 @@ class TestQuerySql:
                 engine=MagicMock(),
                 role_name="admin",
             )
+
+        assert str(raised.value) == "Query execution failed"
+        assert "bad query" not in str(raised.value)
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
 
 
 class TestDataReaderLogPrefix:

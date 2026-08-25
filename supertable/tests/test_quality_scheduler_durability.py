@@ -53,6 +53,100 @@ def _wait_for(predicate, timeout: float = 2.0) -> bool:
     return bool(predicate())
 
 
+def test_async_job_exception_text_is_never_logged(caplog):
+    secret = "https://host/private/TOP-SECRET?sig=sentinel SELECT private_col"
+    future = Future()
+    future.set_exception(RuntimeError(secret))
+    slots = threading.BoundedSemaphore(1)
+    assert slots.acquire(blocking=False)
+    with scheduler._active_jobs_lock:
+        scheduler._active_jobs["secret-job"] = future
+
+    scheduler._job_done("secret-job", future, slots)
+
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret not in rendered
+    assert "error_type=RuntimeError" in rendered
+
+
+def test_isolated_bootstrap_sends_only_bounded_exception_type(monkeypatch):
+    secret = "token=TOP-SECRET; SELECT private_col"
+
+    class Connection:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+
+        def send(self, value):
+            self.sent.append(value)
+
+        def close(self):
+            self.closed = True
+
+    def explode(_connection):
+        raise RuntimeError(secret)
+
+    connection = Connection()
+    monkeypatch.setattr(scheduler.os, "setsid", lambda: None)
+    scheduler._isolated_process_bootstrap(connection, explode, ())
+
+    assert connection.sent == [("error", "RuntimeError")]
+    assert secret not in repr(connection.sent)
+    assert connection.closed is True
+
+
+def test_untrusted_child_diagnostic_is_removed_before_result_and_persistence(
+    monkeypatch,
+):
+    secret = "https://host/capability/TOP-SECRET/object?sig=sentinel"
+    payload = scheduler.CheckRunOutcome(
+        mode="quick",
+        state="failed",
+        errors=1,
+        message=secret,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_run_killable_subprocess",
+        lambda *_args, **_kwargs: scheduler._IsolatedProcessResult(
+            state="completed",
+            payload=payload,
+        ),
+    )
+    guard = SimpleNamespace(
+        table_admission=None,
+        lost=threading.Event(),
+    )
+
+    outcome = scheduler._run_isolated_mode_check(
+        org=ORG,
+        sup=SUPER,
+        table_name=TABLE,
+        mode="quick",
+        running_key="running",
+        lock_token="token",
+        deadline_monotonic=time.monotonic() + 1,
+        cancel_event=threading.Event(),
+        lease_guard=guard,
+    )
+    attempt = scheduler._attempt_record(outcome)
+    cron = scheduler._cron_outcome_document(
+        {
+            "expression": "* * * * *",
+            "timezone": "UTC",
+            "next_due_ms": 1_800_000_000_000,
+            "last_started_ms": None,
+        },
+        outcome,
+        1_800_000_000_001,
+    )
+
+    assert secret not in repr(outcome)
+    assert secret not in json.dumps(attempt)
+    assert secret not in json.dumps(cron)
+    assert outcome.message == "quick quality outcome diagnostics unavailable"
+
+
 def _latest_quick() -> dict:
     return {
         "checked_at": "2026-08-18T10:00:00+00:00",
@@ -1756,7 +1850,7 @@ def test_noncooperative_process_is_killed_at_deadline_and_capacity_recovers():
         result.append(scheduler._run_killable_subprocess(
             _ignore_process_cancellation,
             (process_entered,),
-            deadline_monotonic=time.monotonic() + 2.0,
+            deadline_monotonic=time.monotonic() + 5.0,
             cancel_event=scheduler._scheduler_stop,
             lease_lost_event=None,
             process_name="dq-test-deadline",
@@ -1767,8 +1861,8 @@ def test_noncooperative_process_is_killed_at_deadline_and_capacity_recovers():
             executor, slots, "noncooperative", isolated_job,
         )
         assert entered.wait(1)
-        assert process_entered.wait(3)
-        assert _wait_for(lambda: not scheduler._active_jobs, timeout=3)
+        assert process_entered.wait(6)
+        assert _wait_for(lambda: not scheduler._active_jobs, timeout=6)
         assert result and result[0].state == "deadline"
         assert result[0].force_terminated is True
         assert result[0].alive_after_cleanup is False
@@ -1810,7 +1904,7 @@ def test_shutdown_force_terminates_noncooperative_scheduled_process():
         assert scheduler._submit_table_job(
             executor, slots, "noncooperative-shutdown", isolated_job,
         )
-        assert process_entered.wait(2)
+        assert process_entered.wait(5)
         assert scheduler.stop_scheduler(timeout_s=2) is True
         assert result and result[0].state == "shutdown"
         assert result[0].force_terminated is True

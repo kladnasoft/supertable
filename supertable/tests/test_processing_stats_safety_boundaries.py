@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import logging
 from datetime import datetime, timezone
 
 import polars
@@ -12,6 +13,7 @@ import pytest
 from supertable import processing as processing_mod
 from supertable.data_classes import PredInterval
 from supertable.processing import (
+    MAX_SHOW_STATS_STRING_BYTES,
     STATS_SCHEMA,
     _STATS_CACHE,
     _conform_stats_schema,
@@ -19,11 +21,13 @@ from supertable.processing import (
     _stats_rows_for_metadata,
     _stored_select_lane,
     _stored_select_lane_values,
+    load_bounded_stats_diagnostic,
     load_stats,
     probe_ranges_from_df,
     prune_files_by_predicates,
     prune_overlapping_files_by_stats,
 )
+from supertable.storage.local_storage import LocalStorage
 
 
 @pytest.fixture(autouse=True)
@@ -393,3 +397,257 @@ def test_load_stats_conforms_legacy_schema_before_caching(monkeypatch):
     assert loaded["stats_available"].item() is True
     # The second load is the same conformed cached object, not the unsafe input.
     assert load_stats("legacy/stats/v1.parquet") is loaded
+
+
+def test_bounded_stats_diagnostic_seals_and_projects_canonical_columns(tmp_path):
+    frame = polars.DataFrame([_row("data/f.parquet", 1, 9)], schema=STATS_SCHEMA)
+    artifact = frame.to_arrow().append_column(
+        "untrusted_extra",
+        pa.array(["must-not-escape"]),
+    )
+    storage = LocalStorage(root=str(tmp_path))
+    path = "lake/table/stats/stats-v1.parquet"
+    storage.write_parquet(artifact, path)
+
+    loaded = load_bounded_stats_diagnostic(
+        path,
+        expected_rows=1,
+        storage=storage,
+    )
+
+    assert loaded.schema == STATS_SCHEMA
+    assert loaded.height == 1
+    assert loaded["file_path"].item() == "data/f.parquet"
+    assert "untrusted_extra" not in loaded.columns
+
+
+def test_bounded_stats_diagnostic_rejects_footer_size_before_decode(
+    tmp_path, monkeypatch,
+):
+    frame = polars.DataFrame([_row("data/f.parquet", 1, 9)], schema=STATS_SCHEMA)
+    storage = LocalStorage(root=str(tmp_path))
+    path = "lake/table/stats/stats-v1.parquet"
+    storage.write_parquet(frame.to_arrow(), path)
+    parsed = pq.ParquetFile(tmp_path / path)
+
+    class FooterOnlyParquet:
+        metadata = parsed.metadata
+        schema_arrow = parsed.schema_arrow
+
+        @staticmethod
+        def iter_batches(**_kwargs):
+            raise AssertionError("oversized footer chunks reached the decoder")
+
+    monkeypatch.setattr(
+        processing_mod.pq,
+        "ParquetFile",
+        lambda _source, **_kwargs: FooterOnlyParquet(),
+    )
+
+    with pytest.raises(ValueError, match="decoded data exceeds"):
+        load_bounded_stats_diagnostic(
+            path,
+            expected_rows=1,
+            storage=storage,
+            max_decoded_bytes=1,
+        )
+
+
+def test_bounded_stats_diagnostic_rejects_dictionary_amplification_before_cast(
+    tmp_path, monkeypatch,
+):
+    repeated = "x" * MAX_SHOW_STATS_STRING_BYTES
+    rows = []
+    for index in range(256):
+        row = _row(f"data/f-{index}.parquet", 1, 9)
+        row["min_string"] = repeated
+        rows.append(row)
+    frame = polars.DataFrame(rows, schema=STATS_SCHEMA)
+    storage = LocalStorage(root=str(tmp_path))
+    path = "lake/table/stats/dictionary-amplification.parquet"
+    storage.write_parquet(frame.to_arrow(), path)
+
+    artifact_path = tmp_path / path
+    metadata = pq.read_metadata(artifact_path)
+    encoded_string_bytes = sum(
+        metadata.row_group(row_group).column(column).total_uncompressed_size
+        for row_group in range(metadata.num_row_groups)
+        for column in range(metadata.num_columns)
+        if metadata.row_group(row_group).column(column).path_in_schema
+        == "min_string"
+    )
+    assert artifact_path.stat().st_size < 256 * 1024
+    assert encoded_string_bytes < 1024 * 1024
+
+    def expansion_must_not_run(*_args, **_kwargs):
+        raise AssertionError("dictionary string was expanded before admission")
+
+    monkeypatch.setattr(processing_mod.pc, "cast", expansion_must_not_run)
+    with pytest.raises(ValueError, match="decoded data exceeds"):
+        load_bounded_stats_diagnostic(
+            path,
+            expected_rows=256,
+            storage=storage,
+            max_decoded_bytes=1024 * 1024,
+        )
+
+
+def test_bounded_stats_diagnostic_rejects_oversized_dictionary_scalar(
+    tmp_path, monkeypatch,
+):
+    row = _row("data/f.parquet", 1, 9)
+    row["min_string"] = "x" * (MAX_SHOW_STATS_STRING_BYTES + 1)
+    frame = polars.DataFrame([row], schema=STATS_SCHEMA)
+    storage = LocalStorage(root=str(tmp_path))
+    path = "lake/table/stats/oversized-string.parquet"
+    storage.write_parquet(frame.to_arrow(), path)
+
+    def expansion_must_not_run(*_args, **_kwargs):
+        raise AssertionError("oversized dictionary scalar reached a cast")
+
+    monkeypatch.setattr(processing_mod.pc, "cast", expansion_must_not_run)
+    with pytest.raises(ValueError, match="string scalar exceeds"):
+        load_bounded_stats_diagnostic(
+            path,
+            expected_rows=1,
+            storage=storage,
+        )
+
+
+def test_bounded_stats_diagnostic_rejects_noncanonical_scalar_type(tmp_path):
+    frame = polars.DataFrame([_row("data/f.parquet", 1, 9)], schema=STATS_SCHEMA)
+    artifact = frame.to_arrow()
+    file_path_index = artifact.schema.get_field_index("file_path")
+    artifact = artifact.set_column(
+        file_path_index,
+        pa.field("file_path", pa.binary()),
+        pa.array([b"data/f.parquet"]),
+    )
+    storage = LocalStorage(root=str(tmp_path))
+    path = "lake/table/stats/noncanonical-scalar.parquet"
+    storage.write_parquet(artifact, path)
+
+    with pytest.raises(RuntimeError, match="unsafe scalar type"):
+        load_bounded_stats_diagnostic(
+            path,
+            expected_rows=1,
+            storage=storage,
+        )
+
+
+def test_load_stats_uses_explicitly_pinned_storage_for_probe_and_read(
+    monkeypatch,
+):
+    expected = polars.DataFrame(schema=STATS_SCHEMA)
+
+    class PinnedStorage:
+        def __init__(self):
+            self.calls = []
+
+        def exists(self, path):
+            self.calls.append(("exists", path))
+            return True
+
+        def read_parquet(self, path):
+            self.calls.append(("read_parquet", path))
+            return expected.to_arrow()
+
+    pinned = PinnedStorage()
+
+    def sticky_global_must_not_run():
+        raise AssertionError("load_stats switched to sticky global storage")
+
+    monkeypatch.setattr(processing_mod, "_get_storage", sticky_global_must_not_run)
+    loaded = load_stats(
+        "provider/stats/v1.parquet",
+        storage=pinned,
+        cache_identity="pinned-provider-stats-v1",
+        allow_cache=False,
+    )
+
+    assert loaded is not None
+    assert loaded.schema == STATS_SCHEMA
+    assert pinned.calls == [
+        ("exists", "provider/stats/v1.parquet"),
+        ("read_parquet", "provider/stats/v1.parquet"),
+    ]
+
+
+def test_build_stats_uses_one_pinned_storage_for_directory_and_write(
+    monkeypatch,
+):
+    class PinnedStorage:
+        def __init__(self):
+            self.directories = []
+            self.objects = {}
+
+        def makedirs(self, path):
+            self.directories.append(path)
+
+        def write_bytes(self, path, data):
+            self.objects[path] = data
+
+    pinned = PinnedStorage()
+
+    def sticky_global_must_not_run():
+        raise AssertionError("build_stats switched to sticky global storage")
+
+    monkeypatch.setattr(processing_mod, "_get_storage", sticky_global_must_not_run)
+    new_rows = polars.DataFrame(
+        [_row("provider/data/part.parquet", 1, 1)],
+        schema=STATS_SCHEMA,
+    )
+
+    path, combined = processing_mod.build_stats_file(
+        stats_dir="provider/stats",
+        prev_stats_path=None,
+        new_rows=new_rows,
+        removed_files=None,
+        compression_level=1,
+        storage=pinned,
+    )
+
+    assert path is not None
+    assert combined is not None and combined.height == 1
+    assert len(pinned.directories) == 1
+    assert path in pinned.objects
+
+
+def test_parquet_read_logs_and_required_errors_redact_storage_credentials(
+    caplog,
+):
+    url = (
+        "https://alice:password@example.invalid/private/data.parquet"
+        "?X-Amz-Credential=credential-secret&X-Amz-Signature=signed-secret"
+        "#fragment-secret"
+    )
+
+    class ExplodingStorage:
+        def exists(self, path):
+            return True
+
+        def read_parquet(self, path):
+            raise RuntimeError("backend-secret-from-exception")
+
+    with caplog.at_level(logging.WARNING):
+        assert processing_mod._read_parquet_safe(
+            url, storage=ExplodingStorage(),
+        ) is None
+        with pytest.raises(RuntimeError) as raised:
+            processing_mod._read_parquet_safe(
+                url, storage=ExplodingStorage(), required=True,
+            )
+
+    observed = caplog.text + str(raised.value)
+    assert "https://example.invalid/<redacted-path>" in observed
+    for secret in (
+        "alice",
+        "password",
+        "private",
+        "data.parquet",
+        "credential-secret",
+        "signed-secret",
+        "fragment-secret",
+        "backend-secret-from-exception",
+    ):
+        assert secret not in observed

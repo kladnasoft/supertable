@@ -15,6 +15,7 @@ remain ordered; tuples and ndarrays become JSON arrays.
 from __future__ import annotations
 
 import math
+import sys
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Set
@@ -38,6 +39,23 @@ DEFAULT_MAX_TOTAL_BYTES = 16 * 1024 * 1024
 
 class JSONNormalizationError(ValueError):
     """A value cannot be represented within the quality JSON contract."""
+
+
+def _is_pandas_null_sentinel(value: object) -> bool:
+    """Match exact pandas sentinel classes without trusting writable names."""
+
+    value_type = type(value)
+    for module_name, class_name in (
+        ("pandas._libs.missing", "NAType"),
+        ("pandas._libs.tslibs.nattype", "NaTType"),
+    ):
+        module = sys.modules.get(module_name)
+        published_type = (
+            vars(module).get(class_name) if module is not None else None
+        )
+        if value_type is published_type:
+            return True
+    return False
 
 
 def normalize_json_value(
@@ -169,7 +187,7 @@ def normalize_json_value(
 
         # pandas missing-value sentinels cannot safely participate in boolean
         # checks.  Detect them without taking a hard pandas dependency here.
-        if type(current).__name__ in {"NAType", "NaTType"}:
+        if _is_pandas_null_sentinel(current):
             charge(4)
             return None
 
@@ -295,12 +313,12 @@ def normalize_json_value(
             converted = current.item()
             if converted is current:
                 raise JSONNormalizationError(
-                    f"unsupported quality JSON scalar {type(current).__name__}"
+                    "unsupported quality JSON scalar value"
                 )
             return walk(converted, depth)
 
         raise JSONNormalizationError(
-            f"unsupported quality JSON value {type(current).__name__}"
+            "unsupported quality JSON value"
         )
 
     return walk(value, 0)

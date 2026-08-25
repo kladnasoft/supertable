@@ -32,7 +32,11 @@ bytes, file/row-group fanout, result size, freshness, spill advice, and scoped
 historical observations also participate.
 
 Spark is eligible only when an active registered Thrift cluster accepts the
-job's size window and the SQL is inside the cross-engine equivalence subset.
+job's size window, the SQL is inside the cross-engine equivalence subset, and
+none of the pinned snapshots has an active deletion vector. Explicit Spark
+requests against active deletion vectors fail closed before cluster selection
+or connection; AUTO keeps Spark out of the candidate set and routes to an
+eligible single-node engine.
 IslandDB is eligible only for its statically proven SQL subset and an executable
 resource plan. Missing/incomplete estimates route conservatively to DuckDB.
 
@@ -136,7 +140,9 @@ DuckDB is the lightweight, transient execution path optimized for small datasets
 
 - **Single persistent connection**: created lazily and reused across all queries to preserve DuckDB's HTTP metadata cache and external file cache between requests.
 - **No materialized state**: VIEWs are created with unique (hashed) names and dropped in the `finally` block after each query. No TABLE state is retained between queries.
-- **Thread-safe**: a lock guards connection creation and httpfs initialization only. DuckDB allows concurrent reads on the same connection, so query execution runs outside the lock.
+- **Thread-safe**: runtime PRAGMA/configuration changes and non-streaming query
+  execution are serialized by a reentrant runtime lock. Streaming queries keep
+  setup and execution protected while their result lifecycle remains isolated.
 - **Closed SQL capability surface**: the backend reparses the original SQL,
   requires one read-only statement, rebuilds its table bindings, verifies that
   every requested relation exists in the authorized reflection, and rejects
@@ -167,7 +173,8 @@ DuckDB is the lightweight, transient execution path optimized for small datasets
 3. For each table referenced in the query:
    - Generate a hashed table name via `hashed_table_name()`.
    - Create a reflection table or view from the resolved parquet files using `create_reflection_table_with_presign_retry()`.
-   - Optionally layer dedup, tombstone, and RBAC views on top.
+   - Create the protected projection (including the composite deletion-vector
+     anti-join when active), then layer RBAC on top.
 4. Rewrite the user's SQL to reference the hashed table names via `rewrite_query_with_hashed_tables()`.
 5. Disable raw backend profiling, disable secret unredaction/extension
    autoloading, and execute the rewritten SQL.
@@ -191,6 +198,10 @@ If the connection encounters an unrecoverable error, `_reset_connection()` close
 
 Spark Thrift is the distributed execution path for datasets too large for a single-node DuckDB instance.
 
+Nanosecond timestamp normalization verifies parquet footer metadata first. If a
+representative footer cannot be verified, the read fails closed instead of
+guessing a timestamp unit.
+
 ### Characteristics
 
 - Connects to a Spark Thrift Server via PyHive's HiveServer2 interface.
@@ -203,6 +214,13 @@ Spark Thrift is the distributed execution path for datasets too large for a sing
   closed.
 - Persists only credential-safe plans: raw Catalyst plan sections are replaced
   by a fixed marker before the plan file is written.
+- Rejects snapshots with an active deletion vector before parser work, fleet
+  selection, or connection. Spark's resolved `s3a://`, `gs://`, `abfss://`, or
+  signed source paths cannot yet be bound safely to the stable logical
+  `__file__` keys stored in the vector. A row-id-only anti-join could hide a
+  live row in a different file, so explicit Spark fails closed and AUTO selects
+  another eligible engine until composite source-file + row-id identity is
+  implemented end to end.
 - Creates temporary parquet views using `CREATE OR REPLACE TEMPORARY VIEW ... USING parquet OPTIONS (path ...)`.
 - Batches large file lists: individual file views are created per batch, unioned into batch views, then all batch views are unioned into the final view. Batch size is controlled by `SUPERTABLE_SPARK_BATCH_SIZE`.
 - Intermediate views are kept alive until the final query completes (Spark's lazy view resolution requires this).
@@ -256,7 +274,6 @@ class Reflection:
     supers: List[SuperSnapshot]    # per-table file lists and metadata
     freshness_ms: int = 0          # max last_updated_ms across snapshots
     rbac_views: Dict[str, RbacViewDef] = {}
-    dedup_views: Dict[str, DedupViewDef] = {}
     tombstone_views: Dict[str, TombstoneDef] = {}
 ```
 
@@ -266,7 +283,10 @@ The `get_missing_columns()` function validates that columns requested by the que
 
 ## View Chain Construction
 
-Each engine constructs a layered view chain on top of the raw parquet data. The chain is built bottom-up, with each layer wrapping the previous one:
+Successful engine executions construct a protected view chain on top of the raw
+parquet data. DuckDB and IslandDB can apply active deletion vectors. Spark uses
+the same public projection and RBAC contract only when no deletion vector is
+active; otherwise it rejects the request before touching the fleet.
 
 ```
 parquet files
@@ -275,13 +295,11 @@ parquet files
 [1] Base reflection table/view  (parquet_scan of all files)
     |
     v
-[2] RBAC view                   (column + row filtering)
+[2] Protected projection       (composite deletion-vector anti-join,
+                                then strip internal columns)
     |
     v
-[3] Tombstone view              (exclude soft-deleted rows)
-    |
-    v
-[4] Dedup view                  (ROW_NUMBER to keep latest per PK)
+[3] RBAC view                   (column + row filtering)
     |
     v
   User query executes against the top-most view
@@ -318,41 +336,35 @@ The `RbacViewDef` dataclass carries:
 
 View naming uses `rbac_view_name()`: `f"rbac_{base_table_name}"`.
 
-### Tombstone View
+### Protected Deletion-Vector View
 
-Created by `create_tombstone_view()` when the snapshot's metadata includes a tombstones block:
-
-```sql
-CREATE OR REPLACE VIEW <view_name> AS
-SELECT * FROM <source_table>
-WHERE NOT EXISTS (
-  SELECT 1 FROM (VALUES (k1, k2), ...) AS __tombstones__(pk1, pk2)
-  WHERE <source_table>.pk1 = __tombstones__.pk1
-    AND <source_table>.pk2 = __tombstones__.pk2
-);
-```
-
-This anti-join pattern handles NULLs correctly and avoids column name collisions. Tombstone lists are bounded by the compaction threshold (typically <= 1000 keys).
-
-### Dedup View
-
-Created by `create_dedup_view()` when the table has `dedup_on_read` enabled in its config:
+The writer records obsolete/deleted physical rows in an immutable deletion
+vector with the exact pair `(__file__, __rowid__)`. `create_tombstone_view()`
+validates the vector's schema, pinned row count/digest, referenced snapshot
+files, and source row-id integrity before exposing a protected view. Its logical
+shape is:
 
 ```sql
 CREATE OR REPLACE VIEW <view_name> AS
-SELECT <visible_columns> FROM (
-  SELECT *, ROW_NUMBER() OVER (
-    PARTITION BY <primary_keys>
-    ORDER BY <order_column> DESC
-  ) AS __rn__
-  FROM <source_table>
-) sub WHERE __rn__ = 1;
+SELECT <public columns>
+FROM <source_table> AS src
+ANTI JOIN <validated_deletion_vector> AS dv
+  ON src.__supertable_source_file__ = dv.__file__
+ AND src.__rowid__ = dv.__rowid__;
 ```
 
-The `DedupViewDef` dataclass controls:
-- `primary_keys`: columns forming the composite dedup key.
-- `order_column`: column for ordering (default `__timestamp__`).
-- `visible_columns`: columns exposed to the user query. When empty or `["*"]`, all source columns except `__rn__` are exposed using DuckDB's `EXCLUDE` syntax.
+`__supertable_source_file__` is the executor's protected canonical logical
+identity for the scanned data object; it is not a user-visible column. The
+composite join is required even when row IDs are normally table-global: using
+`__rowid__` alone would turn a metadata or legacy collision into live-row loss.
+The view strips `__rowid__`, `__timestamp__`, and all protected source-file
+columns before RBAC or user SQL can observe them.
+
+Spark does not currently create this view for an active vector. Its explicit
+executor raises `Spark deletion-vector reads require composite source-file +
+row-id identity and are not supported safely`; the public `query_sql` facade
+returns the stable sanitized `Query execution failed` message. This is a
+fail-closed capability boundary, not a fallback or an ignored tombstone.
 
 ## Query Rewriting
 
@@ -445,8 +457,15 @@ The multi-engine architecture addresses a fundamental tradeoff in data analytics
 - **DuckDB** handles the majority of interactive queries (dashboards, ad-hoc exploration) with sub-second latency and zero infrastructure overhead. It is the default path for datasets under 100 MB.
 - **IslandDB** handles supported selective Parquet workloads with conservative
   memory admission, range reads, bounded results, and optional hard-quota spill.
-- **Spark SQL** enables queries over datasets that exceed single-node memory limits. It requires a Spark Thrift Server but handles arbitrarily large data volumes.
+- **Spark SQL** enables supported queries over datasets that exceed single-node
+  memory limits. It requires a Spark Thrift Server; snapshots with active
+  deletion vectors remain on DuckDB/IslandDB through AUTO and explicit Spark
+  rejects them.
 
 The freshness-aware routing prevents a common failure mode: caching data that is still being actively ingested. Without this, a dashboard querying a table mid-ingestion would populate the IslandDB cache, only to invalidate it seconds later when the next batch lands.
 
-The view chain (base, RBAC, tombstone, dedup) ensures that security filtering and data consistency are enforced at the engine level, not the application level. This means every query path -- SQL editor, API, OData, MCP -- gets identical security and consistency guarantees without duplicating logic.
+The protected projection and RBAC chain keeps security filtering and data
+consistency in the engine layer rather than duplicating it in each API. Every
+successful query path therefore receives the same policy and deletion-vector
+guarantees. An engine that cannot establish those guarantees fails closed or is
+excluded by AUTO; it never returns an unfiltered approximation.

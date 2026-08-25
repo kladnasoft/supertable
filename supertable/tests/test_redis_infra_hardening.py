@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import importlib
+import logging
 import sys
+import traceback
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -152,13 +154,14 @@ def test_malformed_sentinel_never_degrades_to_direct_redis(
 
 
 def test_unavailable_sentinel_never_falls_back_to_direct_redis(
-    redis_infra, monkeypatch,
+    redis_infra, monkeypatch, caplog,
 ):
     direct_calls = []
+    backend_secret = "redis://admin:REDIS_SECRET_DO_NOT_LOG@private.invalid/0"
 
     class UnavailableMaster:
         def ping(self):
-            raise redis.ConnectionError("sentinel unavailable")
+            raise redis.ConnectionError(backend_secret)
 
     class Sentinel:
         def __init__(self, *_args, **_kwargs):
@@ -193,6 +196,52 @@ def test_unavailable_sentinel_never_falls_back_to_direct_redis(
     monkeypatch.setattr(redis_infra, "_require_runtime_env", lambda: None)
     redis_connector._CLIENT_CACHE.clear()
 
-    with pytest.raises(redis.ConnectionError, match="sentinel unavailable"):
+    with pytest.raises(
+        redis.ConnectionError,
+        match=r"^Redis Sentinel unavailable; error_type=ConnectionError$",
+    ) as caught:
         redis_infra._build_redis_client()
     assert direct_calls == []
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value), caught.value, caught.value.__traceback__,
+        )
+    )
+    assert backend_secret not in rendered
+    assert backend_secret not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("method_name", "arguments", "empty_result"),
+    [
+        ("get_users", ("org", "sup"), []),
+        ("get_roles", ("org", "sup"), []),
+        ("get_user_details", ("org", "sup", "user"), None),
+        ("get_role_details", ("org", "sup", "role"), None),
+        (
+            "rbac_get_user_id_by_username",
+            ("org", "sup", "username"),
+            None,
+        ),
+    ],
+)
+def test_fallback_catalog_logs_only_backend_error_type(
+    redis_infra, caplog, method_name, arguments, empty_result,
+):
+    backend_secret = "redis://admin:REDIS_BACKEND_SUPERSECRET@private.invalid/0"
+
+    class FailingRedis:
+        def __getattr__(self, _name):
+            def fail(*_args, **_kwargs):
+                raise RuntimeError(backend_secret)
+
+            return fail
+
+    catalog = redis_infra._FallbackCatalog(FailingRedis())
+    caplog.set_level(logging.WARNING, logger="supertable.redis_infra")
+
+    assert getattr(catalog, method_name)(*arguments) == empty_result
+
+    assert backend_secret not in caplog.text
+    assert "REDIS_BACKEND_SUPERSECRET" not in caplog.text
+    assert "error_type=RuntimeError" in caplog.text

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import traceback
 from types import SimpleNamespace
 
 import fakeredis
@@ -174,7 +175,8 @@ def test_redis_time_refuses_delivery_at_partition_expiry_and_retains_wal(
 
 
 def test_post_commit_error_is_explicit_and_preserves_core_result():
-    cause = mw.MonitoringBackpressureError("spool full")
+    secret = "https://host/private/TOP-SECRET?sig=sentinel"
+    cause = mw.MonitoringBackpressureError(secret)
     error = mw.MonitoringPostCommitError(
         organization="acme",
         super_name="sales",
@@ -185,7 +187,10 @@ def test_post_commit_error_is_explicit_and_preserves_core_result():
     )
     assert error.core_committed is True
     assert error.core_result == (3, 10, 2, 0)
-    assert error.cause is cause
+    assert error.cause is not cause
+    assert error.cause_type == "MonitoringBackpressureError"
+    assert secret not in str(error)
+    assert secret not in str(error.cause)
 
 
 def test_noncanonical_payload_is_a_durability_error_not_generic_type_error(
@@ -262,12 +267,46 @@ def test_stream_monitoring_records_close_failure_as_error():
         ),
     )
 
-    with pytest.raises(RuntimeError, match="backend close failed"):
+    with pytest.raises(RuntimeError, match="Query result stream failed"):
         next(stream)
 
     assert outcomes == [(
-        Status.ERROR.value, "backend close failed", 0, 0,
+        Status.ERROR.value, "Query result stream failed", 0, 0,
     )]
+
+
+@pytest.mark.parametrize("terminal", ["cancel", "close", "context"])
+def test_stream_terminal_backend_failures_never_expose_backend_text(terminal):
+    from supertable.data_reader import _MonitoredResultStream, Status
+
+    secret = "https://host/capability/TOP-SECRET?sig=sentinel"
+
+    class Inner:
+        schema = pa.schema([("id", pa.int64())])
+
+        def cancel(self):
+            raise RuntimeError(secret)
+
+        def close(self):
+            raise RuntimeError(secret)
+
+    outcomes = []
+    stream = _MonitoredResultStream(Inner(), lambda *args: outcomes.append(args))
+
+    with pytest.raises(RuntimeError, match="Query result stream failed") as raised:
+        if terminal == "cancel":
+            stream.cancel()
+        elif terminal == "close":
+            stream.close()
+        else:
+            with stream:
+                pass
+
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert secret not in rendered
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert outcomes == [(Status.ERROR.value, "Query result stream failed", 0, 0)]
 
 
 def test_stream_monitoring_backpressure_closes_and_surfaces_completed_outcome():

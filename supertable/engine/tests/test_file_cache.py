@@ -14,6 +14,7 @@ from supertable.data_classes import Reflection, SuperSnapshot, TombstoneDef
 from supertable.engine.file_cache import (
     FileCache,
     FileCacheIntegrityError,
+    FileCacheUnavailable,
 )
 from supertable.storage.local_storage import LocalStorage
 from supertable.storage.storage_interface import (
@@ -706,6 +707,25 @@ def test_idle_ttl_prune_removes_unleased_entry(tmp_path):
     metrics = cache.prune()
     assert metrics.evictions == 1
     assert not os.path.exists(path)
+
+
+def test_malformed_published_reservation_blocks_new_admission(tmp_path):
+    storage = FakeRemote({"table/data.parquet": _parquet_bytes()})
+    cache = FileCache(
+        storage, "org", root=str(tmp_path), workers=1, max_bytes=1024,
+    )
+    reservation_dir = os.path.join(cache.cache_root, ".reservations")
+    cache._ensure_private_dir(reservation_dir)
+    reservation = os.path.join(reservation_dir, "torn.json")
+    with open(reservation, "wb") as target:
+        target.write(b'{"size":')
+
+    assert cache._reservation_bytes() == cache.max_bytes
+    with pytest.raises(FileCacheUnavailable, match="cache byte cap"):
+        cache._reserve(
+            1,
+            exclude_directory=os.path.join(cache.cache_root, "unused"),
+        )
 
 
 def test_mismatched_resource_keys_never_reverse_parse_url(tmp_path):

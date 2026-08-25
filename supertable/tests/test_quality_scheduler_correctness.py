@@ -403,7 +403,8 @@ def test_quick_sql_error_status_is_failure_and_never_published(
     )
 
     assert outcome.state == "failed"
-    assert "binder error" in outcome.message
+    assert outcome.message == "Quick SQL failed with status=error"
+    assert "binder error" not in repr(outcome)
     assert dqc.latest is None
 
 
@@ -561,7 +562,8 @@ def test_custom_sql_error_cannot_be_evaluated_as_zero_violations(
     )
 
     assert outcome.state == "failed"
-    assert "scan failed" in outcome.message
+    assert outcome.message == "Custom rule limit SQL failed with status=error"
+    assert "scan failed" not in repr(outcome)
     assert dqc.latest is None
 
 
@@ -1997,7 +1999,10 @@ def test_lease_thread_start_failure_releases_lock_and_records_attempt(
     )
 
     assert outcome.state == "failed"
-    assert "thread quota" in outcome.message
+    assert outcome.message == (
+        "could not start lease renewer; error_type=RuntimeError"
+    )
+    assert "thread quota" not in repr(outcome)
     assert not redis_client.exists(scheduler._running_key(ORG, SUPER, TABLE))
     assert redis_client.exists(scheduler._retry_key(ORG, SUPER, TABLE, "quick"))
     assert dqc.latest["mode_attempts"]["quick"]["state"] == "failed"

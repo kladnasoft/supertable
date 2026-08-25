@@ -15,6 +15,7 @@ This file pins both guards.
 from __future__ import annotations
 
 import os
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -145,6 +146,88 @@ class TestPlanExtenderSinkGuard:
         )
         MockMW.assert_called_once_with(organization="org", monitor_type="plans")
         mock_mw.log_metric.assert_called_once()
+
+    @patch("supertable.plan_extender.MonitoringWriter")
+    def test_remote_path_tokens_never_reach_monitoring_payload(
+        self, MockMW, tmp_path,
+    ):
+        from supertable.engine.plan_stats import PlanStats
+        from supertable.plan_extender import extend_execution_plan
+
+        remote = (
+            "https://URL_USER:URL_PASSWORD@storage.invalid/REMOTE_PATH_TOKEN/"
+            "data.parquet?QUERY_TOKEN=yes#FRAGMENT_TOKEN"
+        )
+        local_path = "/srv/private/LOCAL_PATH_TOKEN/profile.json"
+        sql_literal = "SQL_SSN_LITERAL"
+        rbac_literal = "RBAC_TENANT_LITERAL"
+        auth_secret = "MONITOR_AUTH_SECRET"
+        cookie_secret = "MONITOR_COOKIE_SECRET"
+        api_secret = "MONITOR_API_SECRET"
+        body_secret = "MONITOR_BODY_SECRET"
+        plan_path = tmp_path / "query-profile.json"
+        plan_path.write_text(
+            json.dumps({
+                "query_name": (
+                    f"SELECT ssn FROM orders WHERE ssn='{sql_literal}'"
+                ),
+                "operator": {
+                    "extra_info": {
+                        "Filename": remote,
+                        "Filters": f"tenant = '{rbac_literal}'",
+                        "local_path": local_path,
+                        "headers": (
+                            f"Authorization: Bearer {auth_secret}\n"
+                            f"Cookie: session={cookie_secret}\n"
+                            f"X-Api-Key: {api_secret}"
+                        ),
+                        "response": (
+                            f'{{"access_token":"{body_secret}"}}'
+                        ),
+                    },
+                    "operator_timing": 0.125,
+                },
+            }),
+            encoding="utf-8",
+        )
+        mock_mw = MagicMock()
+        MockMW.return_value.__enter__.return_value = mock_mw
+        MockMW.return_value.__exit__.return_value = False
+        qpm = self._build_qpm("orders")
+        qpm.query_plan_path = str(plan_path)
+        qpm.source_type = "api"
+        qpm.query = (
+            f"SELECT ssn FROM orders WHERE ssn='{sql_literal}'"
+        )
+        plan_stats = PlanStats()
+        plan_stats.add_stat({"REMOTE_SOURCE": remote})
+
+        extend_execution_plan(
+            query_plan_manager=qpm,
+            role_name="r",
+            timing={"REMOTE_PHASE": remote},
+            plan_stats=plan_stats,
+            status="error",
+            message=(
+                f"backend failed at {remote}; tenant='{rbac_literal}'; "
+                f"Authorization: Bearer {auth_secret}"
+            ),
+            result_shape=(0, 0),
+        )
+
+        payload = mock_mw.log_metric.call_args.args[0]
+        persisted = json.dumps(payload, sort_keys=True)
+        assert "_redacted_fields" in persisted
+        assert "<redacted-diagnostic" in persisted
+        assert "operator_timing" in persisted
+        for secret in (
+            "URL_USER", "URL_PASSWORD", "REMOTE_PATH_TOKEN", "data.parquet",
+            "QUERY_TOKEN", "FRAGMENT_TOKEN",
+            "LOCAL_PATH_TOKEN", local_path, sql_literal, rbac_literal,
+            auth_secret, cookie_secret, api_secret, body_secret,
+        ):
+            assert secret not in persisted
+        assert not plan_path.exists()
 
     @patch("supertable.plan_extender.MonitoringWriter")
     def test_monitoring_backpressure_still_deletes_raw_plan(self, MockMW, tmp_path):

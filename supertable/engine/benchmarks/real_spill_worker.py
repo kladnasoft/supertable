@@ -23,7 +23,6 @@ import os
 import platform
 import struct
 import time
-import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -43,6 +42,7 @@ from .runner import (
     _proc_io_counters,
     _profile_metrics,
 )
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 
 DIGEST_FORMAT_VERSION = 1
@@ -85,10 +85,10 @@ def _arrow_type(name: str) -> pa.DataType:
     }
     try:
         return types[normalized]
-    except KeyError as exc:
+    except KeyError:
         raise RealSpillWorkerError(
-            f"unsupported result contract Arrow type {name!r}"
-        ) from exc
+            "unsupported result contract Arrow type"
+        ) from None
 
 
 def parse_result_contract(plan: Mapping[str, Any]) -> tuple[ResultColumn, ...]:
@@ -217,11 +217,10 @@ class StreamingResultDigest:
             try:
                 if not array.type.equals(column.arrow_type):
                     array = pc.cast(array, column.arrow_type, safe=True)
-            except (pa.ArrowException, TypeError, ValueError) as exc:
+            except (pa.ArrowException, TypeError, ValueError):
                 raise RealSpillWorkerError(
-                    f"cannot normalize result column {column.name!r} from "
-                    f"{array.type} to {column.arrow_type}: {exc}"
-                ) from exc
+                    "cannot normalize benchmark result column"
+                ) from None
             normalized.append(array)
         return normalized
 
@@ -253,9 +252,9 @@ class StreamingResultDigest:
 
     def update(self, batch: pa.RecordBatch) -> None:
         if not isinstance(batch, pa.RecordBatch):
-            raise RealSpillWorkerError(
-                f"result yielded {type(batch).__name__}, expected RecordBatch"
-            )
+                raise RealSpillWorkerError(
+                    "result yielded an unexpected value, expected RecordBatch"
+                )
         arrays = self._normalize(batch)
         self._validate_order(arrays)
         for column, array in zip(self.columns, arrays):
@@ -590,8 +589,11 @@ def worker_main(request_path: str | Path, response_path: str | Path) -> int:
     except Exception as exc:  # noqa: BLE001 - preserve benchmark forensics
         response = {
             "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "traceback": traceback.format_exc(),
+            "error": (
+                "real-spill worker failed; "
+                f"error_type={safe_exception_type(exc)}"
+            ),
+            "traceback": "redacted",
         }
         code = 1
     response_file.write_text(

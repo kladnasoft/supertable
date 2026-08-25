@@ -18,6 +18,7 @@ from supertable.storage.storage_interface import (
     ObjectIdentityMismatch,
     ObjectMetadata,
     StorageInterface,
+    storage_error_type,
     validate_range_request,
     write_all,
 )
@@ -104,7 +105,11 @@ class GCSStorage(StorageInterface):
         sa_json = settings.GCP_SA_JSON
         project = settings.GCP_PROJECT or None
 
-        if creds_path and Path(creds_path).is_file():
+        if creds_path:
+            if not Path(creds_path).is_file():
+                raise FileNotFoundError(
+                    "configured GOOGLE_APPLICATION_CREDENTIALS file is unavailable"
+                )
             client = storage.Client.from_service_account_json(creds_path, project=project)
         elif sa_json:
             import json as _json
@@ -166,7 +171,7 @@ class GCSStorage(StorageInterface):
     def _get_blob_raise(self, path: str):
         blob = self.bucket.get_blob(path)
         if blob is None:
-            raise FileNotFoundError(f"File not found: {path}")
+            raise FileNotFoundError("File not found")
         return blob
 
     # -------------------------
@@ -181,16 +186,16 @@ class GCSStorage(StorageInterface):
         try:
             blob = self._get_blob_raise(path)
             data = blob.download_as_bytes()
-        except NotFound as e:
-            raise FileNotFoundError(f"File not found: {path}") from e
+        except NotFound:
+            raise FileNotFoundError("File not found") from None
 
         if len(data) == 0:
-            raise ValueError(f"File is empty: {path}")
+            raise ValueError("File is empty")
 
         try:
             return json.loads(data)
-        except json.JSONDecodeError as je:
-            raise ValueError(f"Invalid JSON in {path}") from je
+        except json.JSONDecodeError:
+            raise ValueError("Invalid JSON") from None
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
         path = self._with_base(path)
@@ -208,7 +213,7 @@ class GCSStorage(StorageInterface):
         path = self._with_base(path)
         blob = self.bucket.get_blob(path)
         if blob is None:
-            raise FileNotFoundError(f"File not found: {path}")
+            raise FileNotFoundError("File not found")
         # size is populated on the Blob returned by get_blob
         return int(blob.size or 0)
 
@@ -227,10 +232,10 @@ class GCSStorage(StorageInterface):
         path = self._with_base(path)
         try:
             blob = self.bucket.get_blob(path)
-        except NotFound as e:
-            raise FileNotFoundError(f"File not found: {path}") from e
+        except NotFound:
+            raise FileNotFoundError("File not found") from None
         if blob is None:
-            raise FileNotFoundError(f"File not found: {path}")
+            raise FileNotFoundError("File not found")
         return self._metadata_from_blob(blob)
 
     def download_to_file(
@@ -258,11 +263,11 @@ class GCSStorage(StorageInterface):
         sink = _CountingSink(file_obj)
         try:
             blob.download_to_file(sink, **request)
-        except NotFound as e:
-            raise FileNotFoundError(f"File not found: {path}") from e
+        except NotFound:
+            raise FileNotFoundError("File not found") from None
         if expected is not None and sink.written != expected.size:
             raise OSError(
-                f"Short download for {path}: expected {expected.size} bytes, wrote {sink.written}"
+                f"Short download: expected {expected.size} bytes, wrote {sink.written}"
             )
         return sink.written
 
@@ -292,14 +297,12 @@ class GCSStorage(StorageInterface):
                 request["if_etag_match"] = expected.etag
         try:
             payload = blob.download_as_bytes(**request)
-        except PreconditionFailed as exc:
-            raise ObjectIdentityMismatch(f"Object version changed: {path}") from exc
-        except NotFound as exc:
-            raise FileNotFoundError(f"File not found: {path}") from exc
+        except PreconditionFailed:
+            raise ObjectIdentityMismatch("Object version changed") from None
+        except NotFound:
+            raise FileNotFoundError("File not found") from None
         if len(payload) != length:
-            raise ObjectIdentityMismatch(
-                f"Short or oversized conditional range read for {path}"
-            )
+            raise ObjectIdentityMismatch("Short or oversized conditional range read")
         return payload
 
     def cache_namespace(self) -> Dict[str, str]:
@@ -384,7 +387,7 @@ class GCSStorage(StorageInterface):
         logical = self._without_base(path)
         prefix = self._normalize_dir_prefix(path)
         if next(iter(self.client.list_blobs(self.bucket_name, prefix=prefix)), None) is None:
-            raise FileNotFoundError(f"File or folder not found: {path}")
+            raise FileNotFoundError("File or folder not found")
         self.delete_prefix(logical)
 
     def delete_prefix(self, path: str) -> None:
@@ -400,16 +403,20 @@ class GCSStorage(StorageInterface):
         previous_batch = None
         stagnant = 0
         prior_errors: List[Exception] = []
+        attempts = 0
         while True:
+            attempts += 1
+            if attempts > 32:
+                raise OSError("GCS prefix deletion exceeded retry bound")
             blobs = list(itertools.islice(
                 self.client.list_blobs(self.bucket_name, prefix=prefix), 1000,
             ))
             if not blobs:
                 if prior_errors:
                     raise OSError(
-                        f"GCS reported {len(prior_errors)} failed deletion(s) "
-                        f"under {path!r}"
-                    ) from prior_errors[0]
+                        "GCS prefix deletion failed; "
+                        f"failures={len(prior_errors)}"
+                    ) from None
                 return
             names = tuple(str(getattr(blob, "name", "")) for blob in blobs)
             errors: List[Exception] = []
@@ -424,13 +431,10 @@ class GCSStorage(StorageInterface):
             if stagnant >= 3:
                 if prior_errors:
                     raise OSError(
-                        f"GCS reported {len(prior_errors)} failed deletion(s) "
-                        f"under {path!r}"
-                    ) from prior_errors[0]
-                raise OSError(
-                    f"GCS prefix made no deletion progress: {path!r}; "
-                    f"remaining={names[0]!r}"
-                )
+                        "GCS prefix deletion failed; "
+                        f"failures={len(prior_errors)}"
+                    ) from None
+                raise OSError("GCS prefix deletion made no progress")
 
     # -------------------------
     # Directory structure (recursive)
@@ -480,16 +484,26 @@ class GCSStorage(StorageInterface):
         path = self._with_base(path)
         blob = self.bucket.get_blob(path)
         if blob is None:
-            raise FileNotFoundError(f"File not found: {path}")
-        data = blob.download_as_bytes()
+            raise FileNotFoundError("Parquet file not found")
+        try:
+            data = blob.download_as_bytes()
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to read Parquet; error_type={storage_error_type(e)}"
+            ) from None
         if not data:
-            raise ValueError(f"File is empty: {path}")
-        buf = io.BytesIO(data)
-        proj = None
-        if columns is not None:
-            proj = self._project_columns(pq.read_schema(buf).names, columns)
-            buf.seek(0)
-        return pq.read_table(buf, columns=proj)
+            raise ValueError("Parquet file is empty")
+        try:
+            buf = io.BytesIO(data)
+            proj = None
+            if columns is not None:
+                proj = self._project_columns(pq.read_schema(buf).names, columns)
+                buf.seek(0)
+            return pq.read_table(buf, columns=proj)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to read Parquet; error_type={storage_error_type(e)}"
+            ) from None
 
     # -------------------------
     # Raw bytes / text
@@ -499,11 +513,20 @@ class GCSStorage(StorageInterface):
         blob = self.bucket.blob(path)
         blob.upload_from_string(data)
 
+    def create_bytes_if_absent(self, path: str, data: bytes) -> bool:
+        path = self._with_base(path)
+        blob = self.bucket.blob(path)
+        try:
+            blob.upload_from_string(data, if_generation_match=0)
+        except PreconditionFailed:
+            return False
+        return True
+
     def read_bytes(self, path: str) -> bytes:
         path = self._with_base(path)
         blob = self.bucket.get_blob(path)
         if blob is None:
-            raise FileNotFoundError(f"File not found: {path}")
+            raise FileNotFoundError("File not found")
         return blob.download_as_bytes()
 
     def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None:

@@ -2,7 +2,7 @@
 
 ## Overview
 
-SuperTable uses a centralized, immutable configuration system. All settings are loaded once at startup from environment variables (with optional `.env` file support) into a frozen Python dataclass. Values never change at runtime — restart the process to pick up new values.
+SuperTable uses a centralized, immutable configuration system. All settings are loaded once at startup from environment variables. Dotenv loading is opt-in through `SUPERTABLE_DOTENV_PATH`; the process never searches parent or working directories for an implicit `.env` file. Values never change at runtime — restart the process to pick up new values.
 
 **Source of truth**: `supertable/config/settings.py`
 

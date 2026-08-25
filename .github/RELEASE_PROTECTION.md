@@ -22,6 +22,12 @@ annotated tag. CI then tests, builds, installs, attests, and uploads artifacts
 from that exact tag. PyPI upload is the final job and cannot run if any gate
 fails.
 
+`pyproject.toml` is the single package-metadata authority. Its `[project]`
+version must exactly match `supertable.__version__`; `setup.py` is intentionally
+a metadata-free compatibility shim. Dependency audits accept no advisory
+exceptions and cover the supported core ranges, exact runtime/cloud lower
+bounds, the installed cloud matrix environments, and pinned release tooling.
+
 ## Compatibility token upload
 
 Trusted Publishing remains the preferred production path. Existing maintainers

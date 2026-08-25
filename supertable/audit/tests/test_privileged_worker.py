@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import signal
+import traceback
 from types import SimpleNamespace
 
 import fakeredis
@@ -321,6 +323,25 @@ def test_integrity_failure_exits_immediately_without_retry(failure):
     assert waits == []
 
 
+def test_poisoned_delivery_metadata_is_not_written_to_worker_logs(caplog):
+    secret = "https://admin:never-log@example.test/?access_token=never-log"
+    poisoned = SimpleNamespace(
+        batch_id=secret,
+        stream_ids=(secret,),
+        acknowledged=1,
+        reused=False,
+    )
+    outbox = FakeOutbox(drains=[poisoned])
+    worker = PrivilegedArchiveWorker(outbox, _config())
+    caplog.set_level(
+        logging.INFO,
+        logger="supertable.audit.privileged_worker",
+    )
+
+    assert worker.run() == WorkerExitCode.INTEGRITY
+    assert secret not in "\n".join(record.getMessage() for record in caplog.records)
+
+
 def test_health_check_is_read_only():
     outbox = FakeOutbox(drains=[AssertionError("must not drain")])
     worker = PrivilegedArchiveWorker(
@@ -465,6 +486,27 @@ def test_strict_redis_preflight_reports_config_acl_failure_precisely():
         verify_redis_durability(outbox)
 
 
+def test_strict_redis_preflight_redacts_hostile_backend_failure():
+    secret = "redis://admin:never-log@example.test/0?access_token=never-log"
+    outbox = FakeOutbox(
+        redis=FakeRedis(),
+        health=RuntimeError(secret),
+    )
+
+    with pytest.raises(RedisDurabilityError) as caught:
+        verify_redis_durability(outbox)
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value), caught.value, caught.value.__traceback__,
+        )
+    )
+    assert "error_type=RuntimeError" in str(caught.value)
+    assert caught.value.__suppress_context__ is True
+    assert secret not in str(caught.value)
+    assert secret not in rendered
+
+
 def test_everysec_requires_explicit_weaker_durability_opt_in():
     outbox = FakeOutbox(redis=FakeRedis(config={"appendfsync": "everysec"}))
 
@@ -480,7 +522,7 @@ def test_wrong_redis_key_type_fails_before_outbox_health_commands():
     outbox = FakeOutbox(redis=redis)
     redis.types[outbox.delivery_ledger_key] = "string"
 
-    with pytest.raises(RedisDurabilityError, match="expected 'hash' or 'none'"):
+    with pytest.raises(RedisDurabilityError, match="unexpected Redis type"):
         verify_redis_durability(outbox)
 
     assert outbox.health_calls == 0
@@ -722,6 +764,23 @@ def test_cli_bounds_batch_size_and_keeps_trim_opt_in():
             outbox_factory=lambda _organization: FakeOutbox(),
         )
     assert raised.value.code == WorkerExitCode.CONFIG
+
+
+def test_cli_configuration_failure_never_echoes_exception_message(
+    monkeypatch,
+    capsys,
+):
+    secret = "https://admin:never-log@example.test/?access_token=never-log"
+
+    def fail_config(_args):
+        raise ValueError(secret)
+
+    monkeypatch.setattr(worker_module, "_config_from_args", fail_config)
+    with pytest.raises(SystemExit) as raised:
+        main(["--organization", "org", "--consumer", "worker"])
+
+    assert raised.value.code == WorkerExitCode.CONFIG
+    assert secret not in capsys.readouterr().err
 
 
 def test_verify_chain_cli_mode_is_exclusive_and_rejects_trim():

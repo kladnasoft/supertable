@@ -14,17 +14,90 @@ Compliance: DORA Art. 12 (record keeping), SOC 2 CC7.3 (forensic integrity).
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from hashlib import sha256
+from typing import Any, Dict, List, Optional, TypedDict
 
 from supertable.audit.chain import (
-    compute_batch_hash,
+    GENESIS_HASH,
     compute_chain_hash,
+    compute_event_batch_hash,
     verify_merkle_proof,
 )
+from supertable.audit.diagnostics import safe_audit_error_type
 
 logger = logging.getLogger(__name__)
+
+_MAX_AUDIT_QUERY_LIMIT = 10_000
+_MAX_AUDIT_QUERY_DAY_PARTITIONS = 31
+_MAX_TIMESTAMP_MS = 253_402_300_799_999  # 9999-12-31T23:59:59.999Z
+_MAX_AUDIT_QUERY_SCAN_EVENTS = 250_000
+_MAX_AUDIT_QUERY_SCAN_BYTES = 256 * 1024 * 1024
+_MAX_AUDIT_QUERY_RESULT_BYTES = 64 * 1024 * 1024
+_AUDIT_QUERY_RETAINED_OVERHEAD = 2 * 1024
+_REDIS_QUERY_PAGE = 256
+
+
+class AuditQueryError(RuntimeError):
+    """An admitted audit query could not be completed without partial data."""
+
+
+class _FilterKwargs(TypedDict):
+    category: Optional[str]
+    action: Optional[str]
+    actor_id: Optional[str]
+    resource_type: Optional[str]
+    resource_id: Optional[str]
+    outcome: Optional[str]
+    severity: Optional[str]
+    correlation_id: Optional[str]
+    start_ms: Optional[int]
+    end_ms: Optional[int]
+    limit: int
+
+
+def _opaque_file_ref(value: Any) -> str:
+    """Return a non-reversible reference without exposing a backend path."""
+    if isinstance(value, bytes):
+        raw = value
+    elif isinstance(value, str):
+        raw = value.encode("utf-8", errors="replace")
+    else:
+        raw = b"<unavailable>"
+    return f"sha256:{sha256(raw).hexdigest()[:16]}"
+
+
+def _query_event_size(event: Dict[str, Any]) -> int:
+    """Bound retained query records using their canonical JSON footprint."""
+    try:
+        size = len(json.dumps(
+            event,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8"))
+    except (TypeError, ValueError, UnicodeEncodeError):
+        raise AuditQueryError("audit query returned an invalid event") from None
+    if size > 96 * 1024:
+        raise AuditQueryError("audit query event exceeds its byte limit")
+    return size + _AUDIT_QUERY_RETAINED_OVERHEAD
+
+
+def _canonical_proof_bytes(proof: Any) -> bytes:
+    """Serialize a proof without retaining poisoned decode failures."""
+    try:
+        return json.dumps(
+            proof.to_dict(),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except Exception:
+        raise AuditQueryError("audit proof is not canonical") from None
 
 
 # ---------------------------------------------------------------------------
@@ -71,13 +144,20 @@ def _apply_filters(
             ts = int(event.get("timestamp_ms", 0))
         except (TypeError, ValueError):
             pass
-        if start_ms and ts and ts < start_ms:
+        if start_ms is not None and ts < start_ms:
             continue
-        if end_ms and ts and ts > end_ms:
+        if end_ms is not None and ts > end_ms:
             continue
         filtered.append(event)
     # Sort by timestamp descending (newest first) then apply limit
-    filtered.sort(key=lambda e: int(e.get("timestamp_ms", 0) or 0), reverse=True)
+    def _timestamp(event: Dict[str, Any]) -> int:
+        try:
+            value = int(event.get("timestamp_ms", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return value
+
+    filtered.sort(key=_timestamp, reverse=True)
     return filtered[:limit]
 
 
@@ -96,10 +176,48 @@ def _query_redis(
         from supertable.redis_infra import redis_client
         from supertable.audit.writer_redis import RedisAuditWriter
         writer = RedisAuditWriter(redis_client, organization, "", maxlen=0)
-        return writer.query(start_ms=start_ms, end_ms=end_ms, count=limit)
-    except Exception as e:
-        logger.warning("[audit-reader] Redis query failed: %s", e)
-        return []
+        results: List[Dict[str, Any]] = []
+        scanned_bytes = 0
+        cursor = "+"
+        while True:
+            remaining = _MAX_AUDIT_QUERY_SCAN_EVENTS - len(results)
+            if remaining <= 0:
+                probe = writer.query(
+                    count=1,
+                    min_stream_id="-",
+                    max_stream_id=cursor,
+                )
+                if probe:
+                    raise AuditQueryError(
+                        "audit hot-tier query exceeds its scan ceiling"
+                    )
+                break
+            page_size = min(_REDIS_QUERY_PAGE, remaining)
+            page = writer.query(
+                count=page_size,
+                min_stream_id="-",
+                max_stream_id=cursor,
+            )
+            for event in page:
+                scanned_bytes += _query_event_size(event)
+                if scanned_bytes > _MAX_AUDIT_QUERY_SCAN_BYTES:
+                    raise AuditQueryError(
+                        "audit hot-tier query exceeds its byte scan ceiling"
+                    )
+                results.append(event)
+            if len(page) < page_size:
+                break
+            last_id = page[-1].get("_stream_id")
+            if not isinstance(last_id, str):
+                raise AuditQueryError("audit hot-tier cursor is invalid")
+            cursor = f"({last_id}"
+        return results
+    except Exception as exc:
+        logger.error(
+            "[audit-reader] Redis query failed; error_type=%s",
+            safe_audit_error_type(exc),
+        )
+        raise AuditQueryError("audit hot-tier query failed") from None
 
 
 # ---------------------------------------------------------------------------
@@ -119,50 +237,79 @@ def _query_parquet(
     """
     from datetime import datetime, timezone
 
-    try:
-        from supertable.audit.writer_parquet import ParquetAuditWriter
-        writer = ParquetAuditWriter()
-    except Exception as e:
-        logger.warning("[audit-reader] Parquet writer init failed: %s", e)
-        return []
-
     # Determine the day range to scan
     now_ms = int(time.time() * 1000)
-    eff_start_ms = start_ms if start_ms else 0
-    eff_end_ms = end_ms if end_ms else now_ms
+    # A warm-tier request without an explicit start is bounded to the most
+    # recent admitted window instead of scanning from the Unix epoch.
+    eff_end_ms = end_ms if end_ms is not None else now_ms
+    eff_start_ms = (
+        start_ms
+        if start_ms is not None
+        else max(0, eff_end_ms - (30 * 24 * 3600 * 1000))
+    )
 
-    start_dt = datetime.fromtimestamp(eff_start_ms / 1000, tz=timezone.utc)
-    end_dt = datetime.fromtimestamp(eff_end_ms / 1000, tz=timezone.utc)
+    try:
+        start_dt = datetime.fromtimestamp(eff_start_ms / 1000, tz=timezone.utc)
+        end_dt = datetime.fromtimestamp(eff_end_ms / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        raise ValueError(
+            "audit query timestamp is outside the supported range"
+        ) from None
 
     events: List[Dict[str, Any]] = []
+    scanned_bytes = 0
     current_date = start_dt.date()
     end_date = end_dt.date()
 
-    # Cap at 366 days to prevent unbounded scans on wide-open queries
     from datetime import timedelta
-    max_end = current_date + timedelta(days=366)
-    if end_date > max_end:
-        end_date = max_end
+    if (end_date - current_date).days >= _MAX_AUDIT_QUERY_DAY_PARTITIONS:
+        raise ValueError("audit archive query exceeds the day-partition limit")
 
-    while current_date <= end_date:
-        if len(events) >= limit:
-            break
-
-        batches = writer.read_batch_events(
-            organization,
-            year=current_date.year,
-            month=current_date.month,
-            day=current_date.day,
+    try:
+        from supertable.audit.writer_parquet import ParquetAuditWriter
+        writer = ParquetAuditWriter()
+    except Exception as exc:
+        logger.error(
+            "[audit-reader] Parquet writer init failed; error_type=%s",
+            safe_audit_error_type(exc),
         )
+        raise AuditQueryError("audit archive query failed") from None
+
+    # Results are newest-first, so scan complete newer partitions before older
+    # ones.  No result limit is consumed until public filters are applied.
+    current_date = end_date
+    while current_date >= start_dt.date():
+        remaining = _MAX_AUDIT_QUERY_SCAN_EVENTS - len(events)
+        if remaining <= 0:
+            raise AuditQueryError(
+                "audit archive query exceeds its event scan ceiling"
+            )
+
+        try:
+            batches = writer.read_batch_events(
+                organization,
+                year=current_date.year,
+                month=current_date.month,
+                day=current_date.day,
+                limit=remaining,
+                strict=True,
+            )
+        except Exception as exc:
+            logger.error(
+                "[audit-reader] archive partition read failed; error_type=%s",
+                safe_audit_error_type(exc),
+            )
+            raise AuditQueryError("audit archive query failed") from None
         for batch in batches:
             for event in batch.get("events", []):
+                scanned_bytes += _query_event_size(event)
+                if scanned_bytes > _MAX_AUDIT_QUERY_SCAN_BYTES:
+                    raise AuditQueryError(
+                        "audit archive query exceeds its byte scan ceiling"
+                    )
                 events.append(event)
-                if len(events) >= limit:
-                    break
-            if len(events) >= limit:
-                break
 
-        current_date += timedelta(days=1)
+        current_date -= timedelta(days=1)
 
     return events
 
@@ -198,72 +345,81 @@ def query_audit_log(
     source="redis": queries Redis only (hot tier).
     source="parquet": queries Parquet only (warm tier).
     """
-    if not organization:
-        return []
+    from supertable import redis_keys as RK
 
-    now_ms = int(time.time() * 1000)
-    cutoff_24h = now_ms - (24 * 3600 * 1000)
+    RK.audit_stream(organization)
+    if source not in {"auto", "redis", "parquet"}:
+        raise ValueError("audit query source is invalid")
+    if type(limit) is not int or limit <= 0 or limit > _MAX_AUDIT_QUERY_LIMIT:
+        raise ValueError("audit query limit must be between 1 and 10000")
+    for label, timestamp_value in (("start", start_ms), ("end", end_ms)):
+        if timestamp_value is None:
+            continue
+        if (
+            type(timestamp_value) is not int
+            or timestamp_value < 0
+            or timestamp_value > _MAX_TIMESTAMP_MS
+        ):
+            raise ValueError(f"audit query {label} timestamp is invalid")
+    if start_ms is not None and end_ms is not None and start_ms > end_ms:
+        raise ValueError("audit query start must not exceed end")
+    for label, filter_value in (
+        ("category", category),
+        ("action", action),
+        ("actor_id", actor_id),
+        ("resource_type", resource_type),
+        ("resource_id", resource_id),
+        ("outcome", outcome),
+        ("severity", severity),
+        ("correlation_id", correlation_id),
+    ):
+        if filter_value is None:
+            continue
+        try:
+            valid = (
+                isinstance(filter_value, str)
+                and len(filter_value.encode("utf-8")) <= 1_024
+            )
+        except UnicodeEncodeError:
+            valid = False
+        if not valid:
+            raise ValueError(f"audit query {label} filter is invalid")
 
-    filter_kwargs = dict(
-        category=category,
-        action=action,
-        actor_id=actor_id,
-        resource_type=resource_type,
-        resource_id=resource_id,
-        outcome=outcome,
-        severity=severity,
-        correlation_id=correlation_id,
-        start_ms=start_ms,
-        end_ms=end_ms,
-        limit=limit,
-    )
-
-    results: List[Dict[str, Any]] = []
+    filter_kwargs: _FilterKwargs = {
+        "category": category,
+        "action": action,
+        "actor_id": actor_id,
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+        "outcome": outcome,
+        "severity": severity,
+        "correlation_id": correlation_id,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "limit": limit,
+    }
 
     if source == "redis":
         results = _query_redis(organization, start_ms, end_ms, limit)
-        return _apply_filters(results, **filter_kwargs)
+        filtered = _apply_filters(results, **filter_kwargs)
+        if sum(_query_event_size(event) for event in filtered) > _MAX_AUDIT_QUERY_RESULT_BYTES:
+            raise AuditQueryError("audit query result exceeds its byte ceiling")
+        return filtered
 
     if source == "parquet":
         results = _query_parquet(organization, start_ms, end_ms, limit)
-        return _apply_filters(results, **filter_kwargs)
+        filtered = _apply_filters(results, **filter_kwargs)
+        if sum(_query_event_size(event) for event in filtered) > _MAX_AUDIT_QUERY_RESULT_BYTES:
+            raise AuditQueryError("audit query result exceeds its byte ceiling")
+        return filtered
 
-    # source == "auto"
-    query_is_recent = (start_ms is None or start_ms >= cutoff_24h)
-
-    if query_is_recent:
-        # Everything falls within the Redis hot tier
-        results = _query_redis(organization, start_ms, end_ms, limit)
-        return _apply_filters(results, **filter_kwargs)
-
-    # Historical query — need both tiers
-    # 1) Parquet for the historical portion (start_ms → cutoff_24h)
-    parquet_events = _query_parquet(organization, start_ms, cutoff_24h, limit)
-
-    # 2) Redis for the recent portion (cutoff_24h → end_ms)
-    remaining = limit - len(parquet_events)
-    redis_events: List[Dict[str, Any]] = []
-    if remaining > 0:
-        eff_end = end_ms if end_ms else now_ms
-        if eff_end > cutoff_24h:
-            redis_events = _query_redis(organization, cutoff_24h, end_ms, remaining)
-
-    # Merge — Parquet events first (older), then Redis (newer)
-    combined = parquet_events + redis_events
-
-    # Deduplicate by event_id (a batch may appear in both tiers
-    # if it was written right around the 24h boundary)
-    seen_ids: set = set()
-    deduped: List[Dict[str, Any]] = []
-    for event in combined:
-        eid = event.get("event_id", "")
-        if eid and eid in seen_ids:
-            continue
-        if eid:
-            seen_ids.add(eid)
-        deduped.append(event)
-
-    return _apply_filters(deduped, **filter_kwargs)
+    # ``auto`` is complete by construction: Parquet is the durable system of
+    # record, while Redis is a best-effort acceleration that may have gaps.
+    results = _query_parquet(organization, start_ms, end_ms, limit)
+    filtered = _apply_filters(results, **filter_kwargs)
+    if sum(_query_event_size(event) for event in filtered) > _MAX_AUDIT_QUERY_RESULT_BYTES:
+        raise AuditQueryError("audit query result exceeds its byte ceiling")
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -274,39 +430,15 @@ def verify_chain_integrity(
     organization: str,
     date: str,
 ) -> Dict[str, Any]:
-    """Verify hash chain integrity for a specific day.
+    """Verify one complete, content-bound day against its stored proof.
 
-    Reads all Parquet batch files for the given date, groups them by
-    server instance, replays the SHA-256 chain for each instance, and
-    cross-references against the stored daily Merkle proof.
-
-    Args:
-        organization: tenant organization name
-        date: date string in ``YYYY-MM-DD`` or ``YYYYMMDD`` format
-
-    Returns:
-        {
-            "valid": bool,                # overall verdict
-            "date": str,
-            "organization": str,
-            "instances": {
-                "<instance_id>": {
-                    "batches": int,
-                    "events": int,
-                    "chain_valid": bool,
-                    "gaps": [...],
-                }
-            },
-            "merkle_proof": {             # null if no proof file
-                "valid": bool,
-                "computed_root": str,
-                "recorded_root": str,
-            },
-            "total_batches": int,
-            "total_events": int,
-        }
+    A day is never declared valid merely because no rows were returned.  The
+    current proof is mandatory, all decoded rows are bound into the chain, and
+    the starting head comes from the previous proof (or a provable genesis).
+    Storage/decode limits and missing anchors fail closed.
     """
-    from datetime import datetime as _dt
+    from datetime import datetime as _dt, timedelta, timezone as _timezone
+    from supertable import redis_keys as RK
 
     result: Dict[str, Any] = {
         "valid": False,
@@ -318,120 +450,356 @@ def verify_chain_integrity(
         "total_events": 0,
     }
 
-    if not organization or not date:
+    if not isinstance(organization, str) or not isinstance(date, str):
+        result["error"] = "Invalid audit verification request"
         return result
 
-    # Parse date
-    clean_date = date.replace("-", "")
     try:
+        # Validate the tenant before any read or proof path is constructed.
+        RK.audit_stream(organization)
+        if date != date.strip():
+            raise ValueError("non-canonical date")
+        clean_date = date.replace("-", "")
         dt = _dt.strptime(clean_date, "%Y%m%d")
+        if date not in {dt.strftime("%Y%m%d"), dt.strftime("%Y-%m-%d")}:
+            raise ValueError("non-canonical date")
         year, month, day = dt.year, dt.month, dt.day
-    except ValueError:
-        result["error"] = f"Invalid date format: {date}"
+    except (TypeError, ValueError):
+        result["error"] = "Invalid audit verification request"
         return result
 
-    # ── Read all Parquet batch files for this day ──
     try:
         from supertable.audit.writer_parquet import ParquetAuditWriter
         writer = ParquetAuditWriter()
-        batches = writer.read_batch_events(organization, year, month, day)
-    except Exception as e:
-        logger.error("[audit-reader] Failed to read batch events for %s: %s", date, e)
-        result["error"] = f"Failed to read Parquet files: {e}"
+        close_manifest = writer.load_day_close_manifest(
+            organization, clean_date, strict=True,
+        )
+        if close_manifest is None:
+            target_day = int(dt.replace(tzinfo=_timezone.utc).timestamp()) // 86_400
+            current_day = int(time.time() * 1000) // 86_400_000
+            journal_status = ""
+            try:
+                from supertable.audit.durable_journal import RedisAuditJournal
+                from supertable.redis_infra import redis_client
+
+                journal_status = RedisAuditJournal.inspect_day_state(
+                    redis_client, organization, target_day,
+                ).get("status", "")
+            except Exception:
+                journal_status = ""
+            if journal_status == "closed":
+                result["status"] = "invalid"
+                result["error"] = (
+                    "Closed audit day is missing its immutable manifest"
+                )
+            elif journal_status == "closing":
+                result["status"] = "closing"
+                result["error"] = "Audit day proof publication is still pending"
+            elif target_day >= current_day or journal_status == "open":
+                result["status"] = "open"
+                result["error"] = "Audit day membership is still open"
+            else:
+                result["status"] = "unverifiable_unclosed"
+                result["error"] = "Audit day has no immutable close manifest"
+            return result
+        close_day = close_manifest.get("day")
+        cutover_day = close_manifest.get("cutover_day")
+        if type(close_day) is not int or type(cutover_day) is not int:
+            raise AuditQueryError("audit close manifest counters are invalid")
+        batches = writer.read_batch_events(
+            organization, year, month, day, strict=True,
+        )
+        proof = writer.load_chain_proof(
+            organization, clean_date, strict=True,
+        )
+        previous_date = (dt - timedelta(days=1)).strftime("%Y%m%d")
+        previous_proof = (
+            writer.load_chain_proof(
+                organization, previous_date, strict=True,
+            )
+            if close_day > cutover_day
+            else None
+        )
+        previous_close_manifest = (
+            writer.load_day_close_manifest(
+                organization, previous_date, strict=True,
+            )
+            if previous_proof is not None
+            else None
+        )
+    except Exception as exc:
+        error_type = safe_audit_error_type(exc)
+        logger.error(
+            "[audit-reader] integrity input read failed; error_type=%s",
+            error_type,
+        )
+        result["error"] = "Audit integrity inputs could not be read"
+        result["error_type"] = error_type
         return result
 
-    if not batches:
-        # No data for this day — technically valid (nothing to tamper with)
-        result["valid"] = True
-        result["info"] = "No audit data found for this date"
+    if proof is None:
+        result["error"] = "Closed audit day proof is unavailable"
+        result["status"] = "invalid"
         return result
 
-    # ── Group batches by instance_id and sort by timestamp ──
-    instance_batches: Dict[str, List[Dict[str, Any]]] = {}
-    for batch in batches:
-        inst = batch.get("instance_id", "unknown")
-        instance_batches.setdefault(inst, []).append(batch)
-
-    # Sort each instance's batches by min_timestamp_ms (chronological order)
-    for inst in instance_batches:
-        instance_batches[inst].sort(key=lambda b: b.get("min_timestamp_ms", 0))
-
-    # ── Replay chain for each instance ──
-    all_valid = True
-    total_batches = 0
-    total_events = 0
-
-    for inst_id, inst_batch_list in instance_batches.items():
-        inst_result: Dict[str, Any] = {
-            "batches": len(inst_batch_list),
-            "events": 0,
-            "chain_valid": True,
-            "gaps": [],
-        }
-
-        prev_chain_hash = ""
-
-        for i, batch in enumerate(inst_batch_list):
-            event_ids = batch.get("event_ids", [])
-            recorded_chain_hash = batch.get("chain_hash", "")
-            event_count = batch.get("event_count", 0)
-
-            inst_result["events"] += event_count
-
-            if not recorded_chain_hash:
-                # Hash chaining was disabled for this batch — skip verification
-                continue
-
-            # ── Bug fix 1: the logger calls chain.advance(event_ids) without
-            # passing a file_hash, so batch_hash is computed with file_hash="".
-            # We must match that here — NOT use the Parquet file hash.
-            expected_batch_hash = compute_batch_hash(event_ids, "")
-
-            # ── Bug fix 2: the chain is continuous across days (restored from
-            # Redis on startup).  We do NOT know what the chain head was at the
-            # start of this day.  For the first batch of each instance we accept
-            # the recorded chain_hash as the baseline.  For subsequent batches
-            # we verify that chain_hash = SHA-256(prev_recorded_chain_hash + batch_hash).
-            if i == 0 or not prev_chain_hash:
-                # First batch: we cannot verify the absolute starting point,
-                # but we record it as the baseline for verifying subsequent batches.
-                prev_chain_hash = recorded_chain_hash
-                continue
-
-            expected_chain_hash = compute_chain_hash(prev_chain_hash, expected_batch_hash)
-
-            if expected_chain_hash != recorded_chain_hash:
-                inst_result["chain_valid"] = False
-                inst_result["gaps"].append({
-                    "batch_index": i,
-                    "file_path": batch.get("file_path", ""),
-                    "expected_chain_hash": expected_chain_hash,
-                    "recorded_chain_hash": recorded_chain_hash,
-                    "event_count": event_count,
-                })
-                all_valid = False
-
-            prev_chain_hash = recorded_chain_hash
-
-        total_batches += inst_result["batches"]
-        total_events += inst_result["events"]
-        result["instances"][inst_id] = inst_result
-
-    result["total_batches"] = total_batches
-    result["total_events"] = total_events
-
-    # ── Cross-reference with stored Merkle proof ──
     try:
-        from supertable.audit.writer_parquet import ParquetAuditWriter
-        proof_writer = ParquetAuditWriter()
-        proof = proof_writer.load_chain_proof(organization, clean_date)
-        if proof:
-            merkle_result = verify_merkle_proof(proof)
-            result["merkle_proof"] = merkle_result
-            if not merkle_result.get("valid", False):
-                all_valid = False
-    except Exception as e:
-        logger.warning("[audit-reader] Merkle proof check failed: %s", e)
+        proof_raw = _canonical_proof_bytes(proof)
+    except AuditQueryError:
+        result["error"] = "Audit proof document is invalid"
+        result["error_type"] = "AuditQueryError"
+        result["status"] = "invalid"
+        return result
+    if sha256(proof_raw).hexdigest() != close_manifest.get("proof_hash"):
+        result["error"] = "Audit proof differs from its closed-day manifest"
+        result["status"] = "invalid"
+        return result
+    if previous_proof is not None:
+        if previous_close_manifest is None:
+            result["error"] = "Previous audit proof has no closed-day manifest"
+            result["status"] = "invalid"
+            return result
+        try:
+            previous_raw = _canonical_proof_bytes(previous_proof)
+        except AuditQueryError:
+            result["error"] = "Previous audit proof document is invalid"
+            result["error_type"] = "AuditQueryError"
+            result["status"] = "invalid"
+            return result
+        if sha256(previous_raw).hexdigest() != previous_close_manifest.get(
+            "proof_hash"
+        ):
+            result["error"] = (
+                "Previous audit proof differs from its closed-day manifest"
+            )
+            result["status"] = "invalid"
+            return result
 
-    result["valid"] = all_valid
-    return result
+    expected_batch_ids = close_manifest.get("batch_ids")
+    if not isinstance(expected_batch_ids, list):
+        result["error"] = "Audit close manifest membership is unavailable"
+        result["status"] = "invalid"
+        return result
+    selected_batches: List[Dict[str, Any]] = []
+    observed_batch_ids: set[str] = set()
+    expected_batch_id_set = set(expected_batch_ids)
+    for batch in batches:
+        path = batch.get("file_path") if isinstance(batch, dict) else None
+        if not isinstance(path, str):
+            result["error"] = "Audit archive membership is invalid"
+            result["status"] = "invalid"
+            return result
+        filename = path.rsplit("/", 1)[-1]
+        batch_id = filename.removesuffix(".parquet").rsplit("_", 1)[-1]
+        if batch_id in expected_batch_id_set:
+            if batch_id in observed_batch_ids:
+                result["error"] = "Audit archive membership is duplicated"
+                result["status"] = "invalid"
+                return result
+            observed_batch_ids.add(batch_id)
+            selected_batches.append(batch)
+    if observed_batch_ids != expected_batch_id_set:
+        result["error"] = "Audit archive membership is incomplete"
+        result["status"] = "invalid"
+        return result
+    batches = selected_batches
+
+    try:
+        def _canonical_hash(value: Any) -> bool:
+            return (
+                isinstance(value, str)
+                and len(value) == 64
+                and all(ch in "0123456789abcdef" for ch in value)
+            )
+
+        def _proof_date(value: Any) -> str:
+            if not isinstance(value, str):
+                raise ValueError("proof date is invalid")
+            candidate = value.replace("-", "")
+            parsed = _dt.strptime(candidate, "%Y%m%d")
+            if value not in {
+                parsed.strftime("%Y%m%d"), parsed.strftime("%Y-%m-%d"),
+            }:
+                raise ValueError("proof date is invalid")
+            return parsed.strftime("%Y%m%d")
+
+        def _proof_entries(value: Any, expected_date: str) -> Dict[str, Dict[str, Any]]:
+            if _proof_date(value.date) != expected_date:
+                raise ValueError("proof date does not match its partition")
+            if not isinstance(value.instances, dict) or len(value.instances) > 4_096:
+                raise ValueError("proof instances are invalid")
+            if type(value.total_events) is not int or value.total_events < 0:
+                raise ValueError("proof event total is invalid")
+            if not _canonical_hash(value.merkle_root):
+                raise ValueError("proof root is invalid")
+            merkle = verify_merkle_proof(value)
+            if not merkle.get("valid", False):
+                raise ValueError("proof root does not match instance heads")
+            entries: Dict[str, Dict[str, Any]] = {}
+            event_total = 0
+            for instance_id, entry in value.instances.items():
+                RK.audit_chain_head(organization, instance_id)
+                if not isinstance(entry, dict) or set(entry) != {
+                    "head", "batches", "events",
+                }:
+                    raise ValueError("proof instance entry is invalid")
+                head = entry.get("head")
+                batches_count = entry.get("batches")
+                events_count = entry.get("events")
+                if not _canonical_hash(head):
+                    raise ValueError("proof instance head is invalid")
+                if type(batches_count) is not int or batches_count < 0:
+                    raise ValueError("proof batch count is invalid")
+                if type(events_count) is not int or events_count < 0:
+                    raise ValueError("proof instance event count is invalid")
+                if batches_count == 0 and head != GENESIS_HASH:
+                    raise ValueError("empty proof chain has a non-genesis head")
+                entries[instance_id] = {
+                    "head": head,
+                    "batches": batches_count,
+                    "events": events_count,
+                }
+                event_total += events_count
+            if event_total != value.total_events:
+                raise ValueError("proof event total does not match its instances")
+            return entries
+
+        current_entries = _proof_entries(proof, clean_date)
+        previous_entries = (
+            _proof_entries(previous_proof, previous_date)
+            if previous_proof is not None else {}
+        )
+        result["merkle_proof"] = verify_merkle_proof(proof)
+
+        instance_batches: Dict[str, List[Dict[str, Any]]] = {}
+        seen_event_ids: set[str] = set()
+        total_events = 0
+        for batch in batches:
+            if not isinstance(batch, dict):
+                raise ValueError("batch record is invalid")
+            events = batch.get("events")
+            if not isinstance(events, list) or not events:
+                raise ValueError("batch events are missing")
+            event_count = batch.get("event_count")
+            if type(event_count) is not int or event_count != len(events):
+                raise ValueError("batch event count is inconsistent")
+            instance_id = batch.get("instance_id")
+            chain_hash = batch.get("chain_hash")
+            if not isinstance(instance_id, str):
+                raise ValueError("batch instance identity is invalid")
+            if not isinstance(chain_hash, str):
+                raise ValueError("batch chain head is invalid")
+            RK.audit_chain_head(organization, instance_id)
+            if not _canonical_hash(chain_hash):
+                raise ValueError("batch chain head is invalid")
+
+            actual_ids: List[str] = []
+            timestamps: List[int] = []
+            for event in events:
+                if not isinstance(event, dict):
+                    raise ValueError("event record is invalid")
+                event_id = event.get("event_id")
+                if not isinstance(event_id, str) or not event_id:
+                    raise ValueError("event ID is invalid")
+                if event_id in seen_event_ids:
+                    raise ValueError("event ID is duplicated")
+                seen_event_ids.add(event_id)
+                if (
+                    event.get("organization") != organization
+                    or event.get("instance_id") != instance_id
+                    or event.get("chain_hash") != chain_hash
+                ):
+                    raise ValueError("event batch identity is inconsistent")
+                timestamp_ms = event.get("timestamp_ms")
+                if type(timestamp_ms) is not int or timestamp_ms < 0:
+                    raise ValueError("event timestamp is invalid")
+                actual_ids.append(event_id)
+                timestamps.append(timestamp_ms)
+
+            declared_ids = batch.get("event_ids")
+            if (
+                not isinstance(declared_ids, list)
+                or declared_ids != sorted(actual_ids)
+                or len(set(declared_ids)) != len(declared_ids)
+            ):
+                raise ValueError("batch event IDs are inconsistent")
+            if batch.get("min_timestamp_ms") != min(timestamps):
+                raise ValueError("batch timestamp metadata is inconsistent")
+            batch["_content_hash"] = compute_event_batch_hash(events)
+            instance_batches.setdefault(instance_id, []).append(batch)
+            total_events += event_count
+
+        if set(instance_batches) - set(current_entries):
+            raise ValueError("observed instance is absent from proof")
+
+        all_instances = set(current_entries) | set(previous_entries)
+        for instance_id in sorted(all_instances):
+            current_entry = current_entries.get(instance_id)
+            previous_entry = previous_entries.get(instance_id)
+            observed = list(instance_batches.get(instance_id, []))
+            if current_entry is None:
+                raise ValueError("prior instance is absent from current proof")
+
+            prior_batches = previous_entry["batches"] if previous_entry else 0
+            prior_head = previous_entry["head"] if previous_entry else GENESIS_HASH
+            if previous_entry is None and current_entry["batches"] != len(observed):
+                raise ValueError("instance predecessor anchor is unavailable")
+            if current_entry["batches"] - prior_batches != len(observed):
+                raise ValueError("proof batch count does not match observed batches")
+            observed_events = sum(batch["event_count"] for batch in observed)
+            if current_entry["events"] != observed_events:
+                raise ValueError("proof event count does not match observed events")
+
+            current_head = prior_head
+            remaining = observed
+            ordered: List[Dict[str, Any]] = []
+            while remaining:
+                candidates = [
+                    batch for batch in remaining
+                    if compute_chain_hash(
+                        current_head, batch["_content_hash"],
+                    ) == batch["chain_hash"]
+                ]
+                if len(candidates) != 1:
+                    raise ValueError("batch chain order is missing or ambiguous")
+                candidate = candidates[0]
+                ordered.append(candidate)
+                current_head = candidate["chain_hash"]
+                remaining = [batch for batch in remaining if batch is not candidate]
+            if current_head != current_entry["head"]:
+                raise ValueError("proof terminal head does not match observed chain")
+
+            result["instances"][instance_id] = {
+                "batches": len(ordered),
+                "events": observed_events,
+                "chain_valid": True,
+                "gaps": [],
+                "starting_head": prior_head,
+                "terminal_head": current_head,
+                "file_refs": [
+                    _opaque_file_ref(batch.get("file_path")) for batch in ordered
+                ],
+            }
+
+        if total_events != proof.total_events:
+            raise ValueError("proof total does not match observed events")
+        if (
+            close_manifest.get("admitted") != total_events
+            or close_manifest.get("receipt_count") != len(batches)
+        ):
+            raise ValueError(
+                "closed-day manifest does not match observed archive membership"
+            )
+        result["total_batches"] = len(batches)
+        result["total_events"] = total_events
+        result["valid"] = True
+        result["status"] = "verified"
+        return result
+    except Exception as exc:
+        logger.warning(
+            "[audit-reader] integrity verification failed; error_type=%s",
+            safe_audit_error_type(exc),
+        )
+        result["error"] = "Audit integrity verification failed"
+        result["error_type"] = safe_audit_error_type(exc)
+        result["status"] = "invalid"
+        return result

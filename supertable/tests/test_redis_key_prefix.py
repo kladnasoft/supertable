@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import re
+import traceback
 from pathlib import Path
 
 import pytest
@@ -407,6 +408,24 @@ def test_registry_rejects_bad_pid():
         RK.registry("acme", "api", "host1", -1)
     with pytest.raises(ValueError):
         RK.registry("acme", "api", "host1", "not_a_pid")  # type: ignore[arg-type]
+
+
+def test_registry_bad_pid_traceback_does_not_render_hostile_value():
+    secret = "api_token=REGISTRY_PID_SENTINEL"
+
+    class HostilePid:
+        def __int__(self):
+            raise ValueError(secret)
+
+        def __repr__(self):
+            return secret
+
+    with pytest.raises(ValueError) as raised:
+        RK.registry("acme", "api", "host1", HostilePid())  # type: ignore[arg-type]
+
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert str(raised.value) == "Invalid pid"
+    assert secret not in rendered
 
 
 # ---------------------------------------------------------------------------

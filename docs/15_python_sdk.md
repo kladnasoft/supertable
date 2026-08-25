@@ -65,7 +65,7 @@ pip install "supertable[all]"    # everything
 
 | Extra | Packages | Description |
 |-------|----------|-------------|
-| `s3` | `boto3>=1.34,<2.0` | AWS S3 storage backend |
+| `s3` | `boto3>=1.35.2,<2.0` | AWS S3 storage backend |
 | `minio` | `minio>=7.2,<8.0` | MinIO storage backend |
 | `azure` | `azure-storage-blob>=12.26.0` | Azure Blob Storage backend |
 | `gcp` | `google-cloud-storage>=3.1.0` | Google Cloud Storage backend |

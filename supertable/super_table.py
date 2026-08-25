@@ -23,8 +23,8 @@ class NamespaceCleanupPostCommitError(RuntimeError):
     ``core_committed`` and ``core_result`` deliberately mirror the SDK's
     other post-commit exceptions so HTTP/control-plane adapters can prohibit a
     destructive retry while directing operators to reconcile the auxiliary
-    state.  The original exception remains available only through exception
-    chaining; its potentially sensitive text is never copied into this error.
+    state.  Backend exception chaining is deliberately suppressed because
+    formatted tracebacks are an externally visible diagnostic surface.
     """
 
     def __init__(self, intent_id: str) -> None:
@@ -128,10 +128,7 @@ class SuperTable:
             self.organization, self.super_name, ttl_s=30, timeout_s=60,
         )
         if not token:
-            raise TimeoutError(
-                f"Could not acquire namespace creation lock for "
-                f"{self.organization}/{self.super_name}"
-            )
+            raise TimeoutError("Could not acquire the namespace creation lock")
         try:
             # Check before either fast-path return: stale root metadata behind
             # a terminal tombstone must never reopen a deleted namespace.
@@ -167,9 +164,9 @@ class SuperTable:
         Read the **heavy** simple-table snapshot JSON from storage (MinIO/local).
         """
         if not simple_table_path or not self.storage.exists(simple_table_path):
-            raise FileNotFoundError(f"Simple table snapshot not found: {simple_table_path}")
+            raise FileNotFoundError("Simple table snapshot was not found")
         if self.storage.size(simple_table_path) == 0:
-            raise ValueError(f"Simple table snapshot is empty: {simple_table_path}")
+            raise ValueError("Simple table snapshot is empty")
         return self.storage.read_json(simple_table_path)
 
 
@@ -261,10 +258,7 @@ class SuperTable:
             self.organization, self.super_name, ttl_s=30, timeout_s=60,
         )
         if not namespace_token:
-            raise TimeoutError(
-                f"Could not acquire deletion fence for "
-                f"{self.organization}/{self.super_name}"
-            )
+            raise TimeoutError("Could not acquire the namespace deletion fence")
         leaf_tokens: Dict[str, str] = {}
         stage_tokens: Dict[str, str] = {}
         try:
@@ -285,11 +279,8 @@ class SuperTable:
                         "Catalog returned an invalid dependent-clone result"
                     )
                 if clones:
-                    preview = ", ".join(clones[:10])
-                    suffix = "" if len(clones) <= 10 else ", ..."
                     raise PermissionError(
-                        "Cannot delete a SuperTable while clones still depend on "
-                        f"it: {preview}{suffix}"
+                        "Cannot delete a SuperTable while clones still depend on it"
                     )
             if recovery_intent_id is None:
                 intent = self.catalog.begin_namespace_deletion(
@@ -311,11 +302,7 @@ class SuperTable:
             if not intent_id:
                 raise RuntimeError("Catalog returned an invalid deletion intent")
             logger.info(
-                "[deletion] SuperTable cleanup started for %s/%s; "
-                "deletion_intent_id=%s; recovery=%s",
-                self.organization,
-                self.super_name,
-                intent_id,
+                "[deletion] SuperTable cleanup started; recovery=%s",
                 recovery_intent_id is not None,
             )
 
@@ -341,10 +328,7 @@ class SuperTable:
                     timeout_s=60,
                 )
                 if not token:
-                    raise TimeoutError(
-                        f"Could not drain writer for "
-                        f"{self.organization}/{self.super_name}/{name}"
-                    )
+                    raise TimeoutError("Could not drain a table writer")
                 leaf_tokens[name] = token
 
             # A first-time writer owns a leaf lock before it has any leaf to
@@ -381,10 +365,7 @@ class SuperTable:
                         timeout_s=60,
                     )
                     if not token:
-                        raise TimeoutError(
-                            f"Could not drain writer for "
-                            f"{self.organization}/{self.super_name}/{name}"
-                        )
+                        raise TimeoutError("Could not drain a table writer")
                     leaf_tokens[name] = token
 
             # Stage uploads also perform object-store I/O while holding their
@@ -423,10 +404,7 @@ class SuperTable:
                         timeout_s=60,
                     )
                     if not token:
-                        raise TimeoutError(
-                            f"Could not drain staging writer for "
-                            f"{self.organization}/{self.super_name}/{name}"
-                        )
+                        raise TimeoutError("Could not drain a staging writer")
                     stage_tokens[name] = token
 
             # This is the last authorization boundary before irreversible I/O.
@@ -449,6 +427,7 @@ class SuperTable:
                 namespace_token=namespace_token,
                 intent_id=intent_id,
             )
+            cleanup_failed = False
             try:
                 if post_delete_cleanup_callback is not None:
                     post_delete_cleanup_callback()
@@ -462,11 +441,13 @@ class SuperTable:
                             confirm_previous_owner_stopped
                         ),
                     )
-            except Exception as exc:
+            except Exception:
                 # The storage and authoritative catalog namespace are already
                 # gone. Preserve that exact outcome and prohibit callers from
                 # retrying either the ordinary or recovery deletion.
-                raise NamespaceCleanupPostCommitError(str(intent_id)) from exc
+                cleanup_failed = True
+            if cleanup_failed:
+                raise NamespaceCleanupPostCommitError(str(intent_id)) from None
         finally:
             for name, token in reversed(list(stage_tokens.items())):
                 self.catalog.release_stage_lock(

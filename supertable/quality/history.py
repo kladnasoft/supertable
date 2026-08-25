@@ -42,6 +42,9 @@ from supertable.quality.serialization import (
     DEFAULT_MAX_TOTAL_BYTES,
     normalize_json_value,
 )
+from supertable.utils.diagnostic_redaction import (
+    safe_exception_type as _safe_error_type,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -153,8 +156,11 @@ def write_history(
     try:
         import polars as pl
         from supertable.data_writer import DataWriter
-    except ImportError as e:
-        logger.debug(f"[dq-history] DataWriter/polars not available, skipping history write: {e}")
+    except ImportError as exc:
+        logger.debug(
+            "[dq-history] parquet_dependencies_unavailable; error_type=%s",
+            _safe_error_type(exc),
+        )
         return False
 
     try:
@@ -217,8 +223,11 @@ def write_history(
         )
         return True
 
-    except Exception as e:
-        logger.warning(f"[dq-history] Failed to write history for {table_name}: {e}")
+    except Exception as exc:
+        logger.warning(
+            "[dq-history] parquet_write_failed; error_type=%s",
+            _safe_error_type(exc),
+        )
         return False
 
 
@@ -254,8 +263,11 @@ def write_history_via_sql(
     try:
         from supertable.redis_connector import create_redis_client
         r = create_redis_client()
-    except Exception:
-        logger.debug("[dq-history] Cannot connect to Redis for history fallback")
+    except Exception as exc:
+        logger.debug(
+            "[dq-history] redis_connect_failed; error_type=%s",
+            _safe_error_type(exc),
+        )
         return False
 
     try:
@@ -283,8 +295,11 @@ def write_history_via_sql(
         logger.debug(f"[dq-history] Wrote history row to Redis fallback: {table_name}")
         return True
 
-    except Exception as e:
-        logger.warning(f"[dq-history] Redis history fallback failed for {table_name}: {e}")
+    except Exception as exc:
+        logger.warning(
+            "[dq-history] redis_write_failed; error_type=%s",
+            _safe_error_type(exc),
+        )
         return False
 
 

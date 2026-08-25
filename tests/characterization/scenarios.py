@@ -692,7 +692,7 @@ def _query() -> List[Scenario]:
         primary_keys=["id"],
         sql="SELECT id, __timestamp__ FROM t ORDER BY id", ordered=True,
         expect_error=ErrorExpectation(
-            "RuntimeError", "DuckDB query execution failed", "execution"
+            "RuntimeError", "Query execution failed", "execution"
         ),
     ))
 
@@ -956,7 +956,7 @@ def _errors() -> List[Scenario]:
         primary_keys=["id"],
         sql="SELECT id, val FROM t",
         expect_error=ErrorExpectation(
-            "RuntimeError", "DuckDB managed query setup failed", "execution"
+            "RuntimeError", "Query execution failed", "execution"
         ),
         corrupt_inputs=_delete_first_parquet,
     ))
@@ -968,7 +968,7 @@ def _errors() -> List[Scenario]:
         primary_keys=["id"],
         sql="SELECT id, val FROM t",
         expect_error=ErrorExpectation(
-            "RuntimeError", "DuckDB managed query setup failed", "execution"
+            "RuntimeError", "Query execution failed", "execution"
         ),
         corrupt_inputs=_scramble_first_parquet,
     ))

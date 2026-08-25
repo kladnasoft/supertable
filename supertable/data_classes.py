@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple
 
+from supertable.row_identity import ResourceRowIdIntegritySeal
+
 
 MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES = 4096
 
@@ -233,10 +235,12 @@ class IntegerDomainBound:
 
     @property
     def cardinality_upper_bound(self) -> int:
+        minimum = self.minimum
+        maximum = self.maximum
         non_null = (
             0
-            if self.minimum is None
-            else int(self.maximum) - int(self.minimum) + 1
+            if minimum is None or maximum is None
+            else maximum - minimum + 1
         )
         return non_null + int(self.has_null)
 
@@ -383,6 +387,26 @@ class SuperSnapshot:
     # writer's complete table-global ``__rowid__`` contract.  Ordinary reads
     # ignore this proof and continue to strip every system column.
     stable_rowid_contract: bool = False
+    # Exact table-global allocation ceiling pinned from the same immutable
+    # snapshot as the selected resources. It is consumed only by the trusted
+    # OData identity path.
+    rowid_high_watermark: Optional[int] = None
+    # Stable raw resource key -> writer-attested row-ID facts tied to that
+    # resource's footer seal. Ordinary reads never parse or consume this map.
+    resource_rowid_integrity_seals: Dict[
+        str, ResourceRowIdIntegritySeal
+    ] = field(default_factory=dict)
+    # Stable raw resource key -> exact manifest row count. Historical row-ID
+    # snapshots without a writer seal use this only to verify the protected
+    # backend's one-time/full physical aggregate.
+    resource_row_counts: Dict[str, int] = field(default_factory=dict)
+    # Execution-only raw resource key -> stable relay identity. The relay
+    # clears caller-supplied values and populates an entry only after it has
+    # replaced that resource's scan path with a leased route whose reads enforce
+    # the snapshot ETag through If-Match and verify immutable size. Catalog and
+    # estimator objects leave this empty; it must never be treated as declared
+    # provider metadata.
+    resource_relay_cache_identities: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -450,9 +474,10 @@ class TombstoneDef:
     """Tombstone (deletion-vector) definition for a single table alias.
 
     Produced by DataReader from the snapshot's ``tombstone`` pointer,
-    consumed by executors to create a view that anti-joins the data on
-    ``__rowid__`` against the deletion-vector parquet, hiding rows that
-    have been logically deleted but not yet physically compacted.
+    consumed by executors to create a view that anti-joins the data on the
+    protected composite source identity ``(__file__, __rowid__)`` against the
+    deletion-vector parquet, hiding rows that have been logically deleted but
+    not yet physically compacted.
 
     - tombstone_path: executor-facing path of the deletion-vector parquet
       (columns ``__file__`` + ``__rowid__``).  ``None`` means no

@@ -156,10 +156,8 @@ class MedcenterDataGenerator:
             self.year = int(year_str)
             self.month = int(month_str)
             self.days_in_month = calendar.monthrange(self.year, self.month)[1]
-        except (ValueError, IndexError) as exc:
-            raise ValueError(
-                f"Invalid month {config.month!r}; expected YYYY-MM"
-            ) from exc
+        except (ValueError, IndexError):
+            raise ValueError("Invalid month; expected YYYY-MM") from None
 
     # ------------------------------------------------------------------
     # Invoices
@@ -325,4 +323,3 @@ class MedcenterDataGenerator:
             raw_invoices_table: invoices[INVOICE_COLUMNS],
             raw_payments_table: payments[PAYMENT_COLUMNS],
         }
-

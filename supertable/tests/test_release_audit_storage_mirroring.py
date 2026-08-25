@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import fakeredis
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from supertable import redis_keys as RK
@@ -20,6 +21,7 @@ from supertable.mirroring.mirror_delta import (
 from supertable.mirroring.mirror_formats import (
     MirrorFormats,
     MirrorRecoveryConfirmationRequired,
+    MirrorRecoveryError,
 )
 from supertable.mirroring.mirror_iceberg import (
     verify_iceberg_table,
@@ -34,6 +36,7 @@ from supertable.redis_catalog import RedisCatalog
 from supertable.simple_table import SimpleTable
 from supertable.staging_area import Staging
 from supertable.storage.local_storage import LocalStorage
+from supertable.storage.storage_interface import ObjectMetadata
 from supertable.super_table import SuperTable
 
 
@@ -85,6 +88,17 @@ class CorruptIcebergAvroStorage(LocalStorage):
         if path.endswith(".avro"):
             return super().write_bytes(path, b"BROKEN")
         return super().write_bytes(path, data)
+
+
+class ToggleSchemaReadStorage(LocalStorage):
+    def __init__(self, root) -> None:
+        super().__init__(root=root)
+        self.schema_reads_fail = True
+
+    def read_parquet(self, path: str):
+        if self.schema_reads_fail:
+            raise OSError("transient parquet schema read failure")
+        return super().read_parquet(path)
 
 
 def _table(storage):
@@ -160,6 +174,37 @@ def test_delta_silent_log_corruption_is_rejected_and_retry_repairs_v0(tmp_path):
     ) == ["acme/lake/delta/events/_delta_log/00000000000000000000.json"]
 
 
+def test_delta_schema_inference_failure_publishes_nothing_and_retry_repairs(
+    tmp_path,
+):
+    storage = ToggleSchemaReadStorage(tmp_path)
+    source = "acme/lake/simple/events/data/part.parquet"
+    storage.write_parquet(
+        pa.table({"id": pa.array([1], type=pa.int64())}), source,
+    )
+    snapshot = _snapshot()
+    snapshot["schema"] = []
+    snapshot["resources"][0]["file_size"] = storage.size(source)
+    table = _table(storage)
+    commit_path = (
+        "acme/lake/delta/events/_delta_log/00000000000000000000.json"
+    )
+
+    with pytest.raises(RuntimeError, match="valid non-empty schema"):
+        write_delta_table(table, "events", snapshot)
+
+    assert not storage.exists(commit_path)
+
+    storage.schema_reads_fail = False
+    write_delta_table(table, "events", snapshot)
+    actions = [
+        json.loads(line)
+        for line in storage.read_text(commit_path).splitlines()
+    ]
+    metadata = next(action["metaData"] for action in actions if "metaData" in action)
+    assert json.loads(metadata["schemaString"])["fields"][0]["name"] == "id"
+
+
 @pytest.mark.integration
 def test_delta_output_opens_with_delta_rs_when_installed(tmp_path):
     deltalake = pytest.importorskip("deltalake")
@@ -203,6 +248,60 @@ def test_iceberg_uses_backend_canonical_uri_with_full_base_prefix(tmp_path):
     verify_iceberg_table(
         _table(storage), "events", snapshot, commit_id="commit-41",
     )
+
+
+@pytest.mark.parametrize(
+    "bad_fields",
+    [
+        [{"id": 1, "name": "", "required": False, "type": "long"}],
+        [{"id": 1, "name": 7, "required": False, "type": "long"}],
+        [
+            {"id": 1, "name": "id", "required": False, "type": "long"},
+            {"id": 2, "name": "id", "required": False, "type": "long"},
+        ],
+        [{"id": "1", "name": "id", "required": False, "type": "long"}],
+        [{"id": True, "name": "id", "required": False, "type": "long"}],
+        [{"id": 0, "name": "id", "required": False, "type": "long"}],
+        [
+            {"id": 1, "name": "id", "required": False, "type": "long"},
+            {"id": 1, "name": "other", "required": False, "type": "long"},
+        ],
+    ],
+    ids=[
+        "empty-name",
+        "non-string-name",
+        "duplicate-name",
+        "string-id",
+        "boolean-id",
+        "non-positive-id",
+        "duplicate-id",
+    ],
+)
+def test_iceberg_invalid_prior_field_identity_blocks_successor_publication(
+    tmp_path, bad_fields,
+):
+    storage = LocalStorage(root=tmp_path)
+    source = "acme/lake/simple/events/data/part.parquet"
+    storage.write_bytes(source, b"PAR1")
+    table = _table(storage)
+    write_iceberg_table(table, "events", _snapshot())
+
+    metadata_dir = "acme/lake/iceberg/events/metadata"
+    metadata_path = f"{metadata_dir}/v1.metadata.json"
+    metadata = storage.read_json(metadata_path)
+    metadata["schemas"][0]["fields"] = bad_fields
+    storage.write_json(metadata_path, metadata)
+    before_avro = storage.list_files(metadata_dir, "*.avro")
+
+    with pytest.raises(RuntimeError, match="prior Iceberg schema field identity"):
+        write_iceberg_table(
+            table, "events", _snapshot(commit_id="commit-42"),
+        )
+
+    assert storage.read_text(f"{metadata_dir}/version-hint.text") == "1"
+    assert not storage.exists(f"{metadata_dir}/v2.metadata.json")
+    assert storage.read_json("acme/lake/iceberg/events/latest.json")["version"] == 1
+    assert storage.list_files(metadata_dir, "*.avro") == before_avro
 
 
 @pytest.mark.integration
@@ -395,9 +494,11 @@ def test_mirror_recovery_never_takes_over_on_lease_expiry_alone(tmp_path):
         with pytest.raises(
             MirrorRecoveryConfirmationRequired,
             match="previous publisher has stopped",
-        ):
+        ) as raised:
             MirrorFormats.reconcile_publication(table, "events")
 
+    assert raised.value.publication_owner == "stale-owner-a"
+    assert "stale-owner-a" not in str(raised.value)
     catalog.claim_mirror_publication.assert_not_called()
     mirror.assert_not_called()
     catalog.complete_mirror_publication.assert_not_called()
@@ -442,6 +543,50 @@ def test_mirror_recovery_rejects_same_path_snapshot_replacement(tmp_path):
     catalog.release_simple_lock.assert_called_once_with(
         "acme", "lake", "events", "lease-token",
     )
+
+
+def test_mirror_recovery_snapshot_read_failure_has_safe_public_text():
+    secret = (
+        "MIRROR_RECOVERY_SECRET_e6d1 "
+        "https://bucket.invalid/object?X-Amz-Signature=BEARER_TOKEN"
+    )
+    snapshot_path = "acme/lake/simple/events/snapshots/41.json"
+    snapshot = _snapshot()
+    storage = MagicMock()
+    cause = OSError(secret)
+    storage.read_json.side_effect = cause
+    table = _table(storage)
+    state = {
+        "status": "failed",
+        "commit_id": "commit-41",
+        "snapshot_path": snapshot_path,
+        "core_committed": True,
+        "mirrors": ["PARQUET"],
+        "publication_owner": "lease-token",
+        "publisher_quiesced": False,
+    }
+    catalog = MagicMock(spec=RedisCatalog)
+    catalog.acquire_simple_lock.return_value = "lease-token"
+    catalog.get_mirror_publication.return_value = state
+    catalog.get_leaf.return_value = {
+        "commit_id": "commit-41",
+        "path": snapshot_path,
+        "version": 41,
+        "payload": snapshot,
+    }
+
+    with patch.object(MirrorFormats, "_catalog", return_value=catalog):
+        with pytest.raises(MirrorRecoveryError) as raised:
+            MirrorFormats.reconcile_publication(table, "events")
+
+    assert raised.value.stage == "snapshot_read"
+    assert raised.value.error_type == "OSError"
+    assert raised.value.cause is cause
+    assert raised.value.__cause__ is None
+    assert secret not in str(raised.value)
+    assert "error_type=OSError" in str(raised.value)
+    catalog.fail_mirror_publication.assert_not_called()
+    catalog.complete_mirror_publication.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -494,10 +639,28 @@ def test_mirror_recovery_requires_complete_leaf_payload(tmp_path, leaf_payload):
 
 def _staging_dependencies():
     storage = MagicMock()
-    storage.size.return_value = 128
-    storage.stat_object.return_value.identity_token.return_value = (
-        "etag:test-staging-object"
-    )
+    objects: dict[str, bytes] = {}
+
+    def write_parquet(table, path):
+        sink = pa.BufferOutputStream()
+        pq.write_table(table, sink)
+        objects[path] = sink.getvalue().to_pybytes()
+
+    def stat_object(path):
+        data = objects.get(path, b"")
+        return ObjectMetadata(
+            size=len(data),
+            etag=f"test-staging-object-{len(data)}",
+        )
+
+    def read_range(path, offset, length, **_kwargs):
+        return objects[path][offset:offset + length]
+
+    storage.write_parquet.side_effect = write_parquet
+    storage.size.side_effect = lambda path: len(objects.get(path, b""))
+    storage.stat_object.side_effect = stat_object
+    storage.read_range.side_effect = read_range
+    storage.delete.side_effect = lambda path: objects.pop(path, None)
     catalog = MagicMock()
     catalog.root_exists.return_value = True
     catalog.acquire_stage_lock.return_value = "stage-lock-token"

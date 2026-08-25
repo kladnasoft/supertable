@@ -1258,7 +1258,7 @@ def test_data_reader_rejects_manifest_root_outside_pinned_table() -> None:
         _frame_result, status, message = reader.execute("admin")
 
     assert status is reader_module.Status.ERROR
-    assert "manifest pointer escapes the pinned table" in str(message)
+    assert message == "Query execution failed"
     estimator._to_duckdb_path.assert_not_called()
     executor.execute.assert_not_called()
 

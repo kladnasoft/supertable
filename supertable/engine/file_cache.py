@@ -224,8 +224,8 @@ def _canonical_json(value: Any) -> str:
 def _metadata_size(metadata: object) -> int:
     try:
         size = int(getattr(metadata, "size"))
-    except Exception as exc:
-        raise FileCacheUnavailable("storage metadata has no valid object size") from exc
+    except Exception:
+        raise FileCacheUnavailable("storage metadata has no valid object size") from None
     if size < 0:
         raise FileCacheUnavailable("storage metadata reported a negative object size")
     return size
@@ -632,43 +632,46 @@ class FileCache:
         if clone_reflection and any(
             resolution.path for resolution in resolutions.values()
         ):
-            target = copy.deepcopy(reflection)
-            for sup in getattr(target, "supers", ()) or ():
-                files = list(getattr(sup, "files", ()) or ())
-                keys = list(getattr(sup, "resource_keys", ()) or ())
-                if len(files) != len(keys):
-                    continue
-                sup.files = [
-                    resolutions.get(str(key), _Resolution(None, None, CacheMetrics())).path
-                    or original
-                    for original, key in zip(files, keys)
-                ]
+            try:
+                target = copy.deepcopy(reflection)
+                for sup in getattr(target, "supers", ()) or ():
+                    files = list(getattr(sup, "files", ()) or ())
+                    keys = list(getattr(sup, "resource_keys", ()) or ())
+                    if len(files) != len(keys):
+                        continue
+                    sup.files = [
+                        resolutions.get(str(key), _Resolution(None, None, CacheMetrics())).path
+                        or original
+                        for original, key in zip(files, keys)
+                    ]
 
-            for tombstone in (getattr(target, "tombstone_views", {}) or {}).values():
-                if (
-                    getattr(tombstone, "tombstone_format", None)
-                    == TOMBSTONE_FORMAT_V2
-                ):
-                    localized_segments = []
-                    for segment in getattr(tombstone, "segments", ()) or ():
-                        resolution = resolutions.get(str(segment.cache_key))
-                        localized_segments.append(
-                            replace(
-                                segment,
-                                tombstone_path=(
-                                    resolution.path
-                                    if resolution and resolution.path
-                                    else segment.tombstone_path
-                                ),
+                for tombstone in (getattr(target, "tombstone_views", {}) or {}).values():
+                    if getattr(tombstone, "tombstone_format", None) == TOMBSTONE_FORMAT_V2:
+                        localized_segments = []
+                        for segment in getattr(tombstone, "segments", ()) or ():
+                            resolution = resolutions.get(str(segment.cache_key))
+                            localized_segments.append(
+                                replace(
+                                    segment,
+                                    tombstone_path=(
+                                        resolution.path
+                                        if resolution and resolution.path
+                                        else segment.tombstone_path
+                                    ),
+                                )
                             )
-                        )
-                    tombstone.segments = tuple(localized_segments)
-                    continue
-                key = getattr(tombstone, "cache_key", None)
-                if key:
-                    resolution = resolutions.get(str(key))
-                    if resolution and resolution.path:
-                        tombstone.tombstone_path = resolution.path
+                        tombstone.segments = tuple(localized_segments)
+                        continue
+                    key = getattr(tombstone, "cache_key", None)
+                    if key:
+                        resolution = resolutions.get(str(key))
+                        if resolution and resolution.path:
+                            tombstone.tombstone_path = resolution.path
+            except Exception:
+                for lease in leases:
+                    lease.close()
+                leases.clear()
+                raise
 
         self._merge_cumulative(metrics)
         return target, metrics, leases
@@ -844,7 +847,7 @@ class FileCache:
                     os.fsync(raw.fileno())
             except FileCacheIntegrityError:
                 raise
-            except Exception as exc:
+            except Exception:
                 # Conditional GETs commonly report an SDK-specific exception.
                 # Re-stat after any failed transfer: a changed/disappeared
                 # version is a snapshot-integrity failure, while a transient
@@ -852,14 +855,14 @@ class FileCache:
                 # unavailability and may safely use the original engine path.
                 try:
                     current = self.storage.stat_object(raw_key)
-                except FileNotFoundError as missing:
+                except FileNotFoundError:
                     raise FileCacheIntegrityError(
                         "remote object disappeared during cache download"
-                    ) from missing
+                    ) from None
                 except Exception:
                     raise FileCacheUnavailable(
                         "streaming cache download failed"
-                    ) from exc
+                    ) from None
                 if (
                     _metadata_size(current) != size
                     or _metadata_identity_token(current)
@@ -867,10 +870,10 @@ class FileCache:
                 ):
                     raise FileCacheIntegrityError(
                         "remote object version changed during cache download"
-                    ) from exc
+                    ) from None
                 raise FileCacheUnavailable(
                     "streaming cache download failed"
-                ) from exc
+                ) from None
 
             assert hashing is not None
             actual_size = hashing.bytes_written
@@ -889,10 +892,10 @@ class FileCache:
 
             try:
                 pq.read_metadata(temp_path)
-            except Exception as exc:
+            except Exception:
                 raise FileCacheIntegrityError(
                     "downloaded object has an invalid Parquet footer"
-                ) from exc
+                ) from None
 
             # Fence providers that do not support a conditional streaming GET,
             # and defend against implementations that silently ignored it.
@@ -1174,8 +1177,8 @@ class FileCache:
         root = Path(self.cache_root)
         try:
             relative = Path(directory).relative_to(root)
-        except ValueError as exc:
-            raise FileCacheUnavailable("cache entry escaped its configured root") from exc
+        except ValueError:
+            raise FileCacheUnavailable("cache entry escaped its configured root") from None
 
         current = root
         for component in ("", *relative.parts):
@@ -1229,8 +1232,8 @@ class FileCache:
             pq.read_metadata(paths.data)
         except FileCacheIntegrityError:
             raise
-        except Exception as exc:
-            raise FileCacheIntegrityError("committed cache entry is corrupt") from exc
+        except Exception:
+            raise FileCacheIntegrityError("committed cache entry is corrupt") from None
 
     # ------------------------------------------------------------------
     # Capacity, TTL, and LRU
@@ -1444,7 +1447,11 @@ class FileCache:
                     value = json.load(source)
                 total += max(0, int(value.get("size", 0)))
             except Exception:
-                continue
+                # A published reservation belongs to a concurrent admission
+                # until stale cleanup can prove otherwise. Its future size is
+                # unknowable when the record is torn or malformed, so charge
+                # the full cap instead of silently admitting another object.
+                total += self.max_bytes
         return total
 
     def _clean_stale_reservations(self) -> None:
@@ -1485,8 +1492,8 @@ class FileCache:
         current = Path(self.cache_root)
         try:
             relative = Path(directory).relative_to(current)
-        except ValueError as exc:
-            raise FileCacheUnavailable("cache entry escaped its configured root") from exc
+        except ValueError:
+            raise FileCacheUnavailable("cache entry escaped its configured root") from None
         for component in relative.parts:
             current = current / component
             if os.path.lexists(current) and os.path.islink(current):
@@ -1508,17 +1515,17 @@ class FileCache:
         os.makedirs(directory, mode=0o700, exist_ok=True)
         try:
             os.chmod(directory, 0o700)
-        except OSError as exc:
+        except OSError:
             try:
                 info = os.stat(directory, follow_symlinks=False)
             except OSError:
                 raise FileCacheUnavailable(
                     "cache directory permissions could not be secured"
-                ) from exc
+                ) from None
             if stat.S_IMODE(info.st_mode) & 0o077:
                 raise FileCacheUnavailable(
                     "cache directory permissions could not be secured"
-                ) from exc
+                ) from None
         info = os.stat(directory, follow_symlinks=False)
         if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
             raise FileCacheUnavailable("cache directory is not private")

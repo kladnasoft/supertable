@@ -35,6 +35,7 @@ from supertable.demo.medcenter.defaults import (
     stg_invoices_table,
 )
 from supertable.demo.medcenter.helpers import run_query
+from supertable.demo.medcenter.validation import require_canonical_month
 
 EXPORT_COLUMNS = [
     "satzart", "konto", "gkonto", "belegnr", "belegdatum", "buchsymbol",
@@ -92,6 +93,7 @@ def _empty_series() -> pd.Series:
 
 
 def _chargebee_frame(month: str) -> pd.DataFrame:
+    month = require_canonical_month(month)
     invoices = run_query(
         f"SELECT invoice_number, MIN(date_issued) AS date_issued, "
         f"MIN(customer_name) AS customer_name, MIN(status) AS status, "
@@ -138,6 +140,7 @@ def _chargebee_frame(month: str) -> pd.DataFrame:
 
 
 def _stripe_weight_frame(month: str) -> pd.DataFrame:
+    month = require_canonical_month(month)
     invoices = run_query(
         f"SELECT invoice_number, date, customer_name, status, amount "
         f"FROM {raw_stripe_invoices} "
@@ -163,6 +166,7 @@ def _stripe_weight_frame(month: str) -> pd.DataFrame:
 
 
 def _eigenprodukte_frame(month: str) -> pd.DataFrame:
+    month = require_canonical_month(month)
     stg = run_query(
         f"SELECT invoice_number, invoice_date, patient_name, positions, "
         f"gross_total, net_vat0, net_vat10, net_vat20, "
@@ -175,7 +179,7 @@ def _eigenprodukte_frame(month: str) -> pd.DataFrame:
     def dominant_rate(row: pd.Series) -> int:
         nets = {0: row["net_vat0"], 10: row["net_vat10"],
                 20: row["net_vat20"]}
-        return max(nets, key=nets.get)
+        return max(nets, key=lambda rate: nets[rate])
 
     rates = (
         stg.apply(dominant_rate, axis=1) if len(stg) else _empty_series()
@@ -202,6 +206,10 @@ EXPORT_BUILDERS = {
 def export_accounting_import(
     month: str = demo_month, output_dir: str = export_dir
 ) -> list[str]:
+    # Validate before creating the output directory, executing a query, or
+    # deriving a filename.  The private builders repeat this check so a
+    # direct internal call cannot bypass the SQL-literal boundary.
+    month = require_canonical_month(month)
     os.makedirs(output_dir, exist_ok=True)
     written = []
     for export_key, builder in EXPORT_BUILDERS.items():
@@ -219,11 +227,20 @@ def export_accounting_import(
     return written
 
 
+def _month_argument(value: str) -> str:
+    try:
+        return require_canonical_month(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Write the 12-column accounting-import CSVs"
     )
-    ap.add_argument("--month", default=demo_month, help="YYYY-MM")
+    ap.add_argument(
+        "--month", type=_month_argument, default=demo_month, help="YYYY-MM"
+    )
     ap.add_argument("--output-dir", default=export_dir)
     return ap.parse_args()
 

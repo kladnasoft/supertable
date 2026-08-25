@@ -34,6 +34,10 @@ _VALID_ACTOR_TYPES = frozenset(
 _VALID_OUTCOMES = frozenset({"success", "failure", "denied", "no_change"})
 _VALID_SEVERITIES = frozenset({"info", "warning", "critical"})
 
+
+class _DuplicatePrivilegedJSONField(ValueError):
+    """Internal marker for a duplicate decoded object member."""
+
 _CONTEXT_LIMITS = {
     "actor_type": 32,
     "actor_id": 256,
@@ -127,8 +131,8 @@ def _canonical_json_bytes(value: Any) -> bytes:
             ensure_ascii=False,
             allow_nan=False,
         )
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("value is not canonical JSON data") from exc
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("value is not canonical JSON data") from None
     return rendered.encode("utf-8")
 
 
@@ -211,7 +215,7 @@ class PrivilegedActionContext:
                 ),
             )
         if self.actor_type not in _VALID_ACTOR_TYPES:
-            raise ValueError(f"unsupported actor_type: {self.actor_type!r}")
+            raise ValueError("privileged actor_type is unsupported")
         if not isinstance(self.context_missing, bool):
             raise TypeError("context_missing must be a boolean")
         if self.context_missing and self.actor_type != "system":
@@ -255,9 +259,9 @@ class PrivilegedActionContext:
                 raise TypeError("context field names must be strings")
             key = aliases.get(raw_key, raw_key)
             if key not in allowed:
-                raise ValueError(f"unknown privileged context field: {raw_key!r}")
+                raise ValueError("privileged context contains an unknown field")
             if key in normalized:
-                raise ValueError(f"duplicate privileged context field: {key!r}")
+                raise ValueError("privileged context contains a duplicate field")
             normalized[key] = item
 
         missing_marker = normalized.get("context_missing", False)
@@ -340,7 +344,7 @@ def _canonical_string_tuple(
             required=True,
         )
         if field_names_only and not _SAFE_FIELD_RE.fullmatch(item):
-            raise ValueError(f"invalid changed field name: {item!r}")
+            raise ValueError("changed field name is invalid")
         checked.append(item)
         if len(checked) > max_items:
             raise ValueError(f"{field_name} exceeds the {max_items}-item limit")
@@ -459,13 +463,13 @@ class PrivilegedAuditRecord:
             )
 
         if self.actor_type not in _VALID_ACTOR_TYPES:
-            raise ValueError(f"unsupported actor_type: {self.actor_type!r}")
+            raise ValueError("privileged actor_type is unsupported")
         outcome = _enum_text(self.outcome)
         severity = _enum_text(self.severity)
         if not isinstance(outcome, str) or outcome not in _VALID_OUTCOMES:
-            raise ValueError(f"unsupported outcome: {outcome!r}")
+            raise ValueError("privileged outcome is unsupported")
         if not isinstance(severity, str) or severity not in _VALID_SEVERITIES:
-            raise ValueError(f"unsupported severity: {severity!r}")
+            raise ValueError("privileged severity is unsupported")
         object.__setattr__(self, "outcome", outcome)
         object.__setattr__(self, "severity", severity)
 
@@ -628,9 +632,7 @@ class PrivilegedAuditRecord:
         unknown = supplied - known
         missing = known - supplied
         if unknown:
-            raise ValueError(
-                f"unknown privileged audit fields: {sorted(str(x) for x in unknown)}"
-            )
+            raise ValueError("privileged audit record contains unknown fields")
         if missing:
             raise ValueError(
                 f"missing privileged audit fields: {sorted(missing)}"
@@ -667,7 +669,12 @@ class PrivilegedAuditRecord:
     @classmethod
     def from_json(cls, value: Union[str, bytes, bytearray]) -> "PrivilegedAuditRecord":
         if isinstance(value, str):
-            encoded = value.encode("utf-8")
+            try:
+                encoded = value.encode("utf-8")
+            except UnicodeEncodeError:
+                raise ValueError(
+                    "privileged audit JSON is not valid UTF-8"
+                ) from None
         elif isinstance(value, (bytes, bytearray)):
             encoded = bytes(value)
         else:
@@ -676,14 +683,14 @@ class PrivilegedAuditRecord:
             raise ValueError("privileged audit record exceeds the 64-KiB limit")
         try:
             text = encoded.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ValueError("privileged audit JSON is not valid UTF-8") from exc
+        except UnicodeDecodeError:
+            raise ValueError("privileged audit JSON is not valid UTF-8") from None
 
         def no_duplicate_keys(pairs: Iterable[Tuple[str, Any]]) -> Dict[str, Any]:
             result: Dict[str, Any] = {}
             for key, item in pairs:
                 if key in result:
-                    raise ValueError(f"duplicate JSON field: {key!r}")
+                    raise _DuplicatePrivilegedJSONField
                 result[key] = item
             return result
 
@@ -692,11 +699,13 @@ class PrivilegedAuditRecord:
                 text,
                 object_pairs_hook=no_duplicate_keys,
                 parse_constant=lambda token: (_ for _ in ()).throw(
-                    ValueError(f"invalid JSON number: {token}")
+                    ValueError("invalid privileged audit JSON number")
                 ),
             )
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise ValueError("invalid privileged audit JSON") from exc
+        except _DuplicatePrivilegedJSONField:
+            raise ValueError("duplicate privileged audit JSON field") from None
+        except (json.JSONDecodeError, TypeError, ValueError):
+            raise ValueError("invalid privileged audit JSON") from None
         if not isinstance(parsed, dict):
             raise ValueError("privileged audit JSON must contain an object")
         return cls.from_dict(parsed)
@@ -829,6 +838,13 @@ def build_record(
         max_items=32_768,
         item_limit=256,
     )
+    changed_full = _canonical_string_tuple(
+        changed_fields,
+        field_name="changed_fields",
+        max_items=128,
+        item_limit=128,
+        field_names_only=True,
+    )
     return PrivilegedAuditRecord(
         schema_version=PRIVILEGED_AUDIT_SCHEMA_VERSION,
         event_id=event_id or _new_id(),
@@ -862,7 +878,7 @@ def build_record(
             "" if after_document is None
             else canonical_security_sha256(after_document)
         ),
-        changed_fields=changed_fields,
+        changed_fields=changed_full,
         role_ids_added=added_full[:MAX_ROLE_DELTA_PREVIEW],
         role_ids_removed=removed_full[:MAX_ROLE_DELTA_PREVIEW],
         role_ids_added_count=len(added_full),
@@ -946,7 +962,7 @@ def verify_records(
             ):
                 return False
             previous = record.ledger_sequence
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return False
     return True
 

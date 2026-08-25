@@ -51,24 +51,31 @@ def _resolve_role(role_manager: RoleManager, role_name: str) -> dict:
     Raises ``PermissionError`` if the role does not exist or is disabled.
     """
     role_info = role_manager.get_role_by_name(role_name)
-    if not role_info:
-        logger.error(f"Role not found: {role_name}")
-        raise PermissionError(f"Invalid or nonexistent role: {role_name}")
+    if not isinstance(role_info, dict) or not role_info:
+        logger.error("Role resolution failed")
+        raise PermissionError("Invalid or nonexistent role")
     # Check if role is disabled (enabled field missing = enabled for backward compat)
     enabled_val = role_info.get("enabled")
     if isinstance(enabled_val, bytes):
-        enabled_val = enabled_val.decode("utf-8")
+        try:
+            enabled_val = enabled_val.decode("utf-8")
+        except UnicodeDecodeError:
+            logger.error("Persisted role enabled state is invalid")
+            raise PermissionError("Invalid role policy") from None
     if enabled_val is not None:
-        enabled = (
-            enabled_val
-            if isinstance(enabled_val, bool)
-            else str(enabled_val).strip().lower() in ("true", "1")
-        )
+        if isinstance(enabled_val, bool):
+            enabled = enabled_val
+        elif isinstance(enabled_val, str):
+            enabled = enabled_val.strip().lower() in ("true", "1")
+        elif type(enabled_val) is int:
+            enabled = enabled_val == 1
+        else:
+            enabled = False
     else:
         enabled = True
     if not enabled:
-        logger.warning(f"Role '{role_name}' is disabled")
-        raise PermissionError(f"Role '{role_name}' is disabled.")
+        logger.warning("Role is disabled or has invalid enabled state")
+        raise PermissionError("Role is disabled.")
     return role_info
 
 
@@ -84,15 +91,22 @@ def _normalize_tables(role_tables) -> dict:
     New    ``{"t1": {…}}``        → returned as-is
     Missing / ``None`` / ``{}``   → ``{}``
     """
+    policy_invalid = False
     try:
         return canonicalize_role_tables(
             role_tables,
             default_if_empty=False,
             allow_legacy_list=True,
         )
-    except (TypeError, ValueError) as exc:
-        logger.error("Invalid persisted RBAC table policy: %s", exc)
-        raise PermissionError("Invalid role policy") from exc
+    except (TypeError, ValueError):
+        policy_invalid = True
+    assert policy_invalid
+    logger.error(
+        "Invalid persisted RBAC table policy; error_type=ValueError",
+    )
+    # Raise outside the handler so even direct inspection of ``__context__``
+    # cannot recover the rejected persisted policy.
+    raise PermissionError("Invalid role policy")
 
 
 def _resolve_table_entry(role_tables: dict, table_name: str) -> Optional[dict]:
@@ -143,10 +157,14 @@ def _role_context(
     role_manager = RoleManager(super_name=super_name, organization=organization)
     role_info = _resolve_role(role_manager, role_name)
     raw_type = role_info.get("role")
-    try:
-        role_type = RoleType(raw_type)
-    except (TypeError, ValueError):
-        logger.error("Role '%s' has invalid role type: %r", role_name, raw_type)
+    role_type: Optional[RoleType] = None
+    if isinstance(raw_type, str):
+        try:
+            role_type = RoleType(raw_type)
+        except (TypeError, ValueError):
+            pass
+    if role_type is None:
+        logger.error("Persisted role type is invalid")
         raise PermissionError(f"You don't have permission to {label}.")
     if not has_permission(role_type, permission):
         raise PermissionError(f"You don't have permission to {label}.")
@@ -197,6 +215,7 @@ def resolve_table_policy(
         raise PermissionError(
             f"You don't have permission to {permission_label} table '{table_name}'."
         )
+    assert entry is not None
     return entry
 
 
@@ -505,8 +524,8 @@ def restrict_read_access(
             raise PermissionError("Role policy changed before query execution")
 
     for pt in physical_tables:
-        context = contexts.get(str(pt.super_name).casefold())
-        if context is None:
+        physical_context = contexts.get(str(pt.super_name).casefold())
+        if physical_context is None:
             raise PermissionError("No role policy for referenced SuperTable")
 
         physical_key = (
@@ -516,7 +535,7 @@ def restrict_read_access(
         target_names = child_names if child_names is not None else (pt.simple_name,)
         target_entries = []
         for target_name in target_names:
-            entry = resolve_table_policy(context, target_name, "read")
+            entry = resolve_table_policy(physical_context, target_name, "read")
             _check_requested_columns(entry, pt.columns or None, target_name)
 
             allowed = entry.get("columns", ["*"])
@@ -600,8 +619,8 @@ def restrict_read_access(
     rbac_views: Dict[str, RbacViewDef] = {}
     for td in tables:
         key = (str(td.super_name).casefold(), str(td.simple_name).casefold())
-        entry = policies.get(key)
-        if entry is None:
+        view_entry = policies.get(key)
+        if view_entry is None:
             # CTE aliases are not physical relations and are secured through
             # their transitive source views.
             continue
@@ -609,19 +628,22 @@ def restrict_read_access(
         if context.role_type is RoleType.SUPERADMIN:
             continue
 
-        allowed_columns = list(entry.get("columns", ["*"]))
-        excluded_columns = list(entry.get("exclude_columns", []))
-        filters = entry.get("filters", ["*"])
+        allowed_columns = list(view_entry.get("columns", ["*"]))
+        excluded_columns = list(view_entry.get("exclude_columns", []))
+        filters = view_entry.get("filters", ["*"])
         where_clause = ""
         if filters != ["*"]:
+            invalid_filter = False
             try:
                 generated = FilterBuilder(
                     table_name="__PLACEHOLDER__",
                     columns=["*"],
                     role_info={"filters": filters},
                 ).filter_query
-            except (KeyError, TypeError, ValueError) as exc:
-                raise PermissionError("Invalid role row-filter policy") from exc
+            except (KeyError, TypeError, ValueError):
+                invalid_filter = True
+            if invalid_filter:
+                raise PermissionError("Invalid role row-filter policy")
             where_idx = generated.upper().find("WHERE ")
             if where_idx < 0:
                 raise PermissionError("Invalid role row-filter policy")

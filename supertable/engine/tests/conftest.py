@@ -39,7 +39,7 @@ import supertable.super_table  # noqa: F401  (ensure in sys.modules)
 sys.modules["supertable"].engine = sys.modules["supertable.engine"]
 
 
-@pytest.fixture(autouse=True, scope="session")
+@pytest.fixture(autouse=True)
 def _suppress_test_log_noise():
     """
     Suppress INFO/WARNING log output during tests.
@@ -48,11 +48,18 @@ def _suppress_test_log_noise():
     fallback, missing columns, connection reset, etc.).  These are
     correct behaviour — but noisy in test output.
     """
-    for name in ("supertable", "supertable.engine"):
-        logging.getLogger(name).setLevel(logging.CRITICAL)
-    yield
-    for name in ("supertable", "supertable.engine"):
-        logging.getLogger(name).setLevel(logging.NOTSET)
+    names = ("supertable", "supertable.engine")
+    original_levels = {
+        name: logging.getLogger(name).level
+        for name in names
+    }
+    try:
+        for name in names:
+            logging.getLogger(name).setLevel(logging.CRITICAL)
+        yield
+    finally:
+        for name, level in original_levels.items():
+            logging.getLogger(name).setLevel(level)
 
 
 @pytest.fixture(autouse=True)

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import threading
+import traceback
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -9,10 +10,12 @@ import pytest
 import redis
 
 from supertable import redis_keys as RK
+from supertable import redis_catalog as redis_catalog_module
 from supertable.data_writer import DataWriter
 from supertable.errors import LockLostError, SnapshotCommitConflictError
 from supertable.redis_catalog import (
     DeletionIntentConflictError,
+    MirrorPublicationStateError,
     ReadOnlyCatalogError,
     RedisCatalog,
 )
@@ -120,6 +123,388 @@ def test_snapshot_commit_atomically_updates_leaf_and_root():
     assert root["version"] == 10
     assert root["commit_id"] == "commit-5"
     assert root["read_only"] is False
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_snapshot_commit_rejects_payload_over_8_mib_without_mutation(
+    pinned_no_mirrors,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    with pytest.raises(ValueError, match="8 MiB size limit"):
+        catalog.commit_snapshot(
+            "org",
+            "lake",
+            "table",
+            _snapshot_payload(padding="x" * (8 * 1024 * 1024)),
+            "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            **kwargs,
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+    assert not fake.exists(RK.schema("org", "lake", "table"))
+
+
+def test_snapshot_commit_rejects_oversized_schema_without_mutation():
+    catalog, fake = _catalog()
+    _seed(fake)
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+
+    with pytest.raises(ValueError, match="schema exceeds its 1 MiB size limit"):
+        catalog.commit_snapshot(
+            "org",
+            "lake",
+            "table",
+            _snapshot_payload(schema={"wide": "x" * (1024 * 1024)}),
+            "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            expected_mirrors=[],
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+    assert not fake.exists(RK.schema("org", "lake", "table"))
+
+
+def test_snapshot_commit_rejects_excessive_resource_count_without_mutation():
+    catalog, fake = _catalog()
+    _seed(fake)
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+
+    with pytest.raises(ValueError, match="resource count limit"):
+        catalog.commit_snapshot(
+            "org",
+            "lake",
+            "table",
+            _snapshot_payload(resources=[{}] * 100_001),
+            "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            expected_mirrors=[],
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+    assert not fake.exists(RK.schema("org", "lake", "table"))
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_snapshot_schema_and_resource_exact_boundaries_are_accepted(
+    pinned_no_mirrors,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    empty_schema = json.dumps({"wide": ""})
+    schema = {"wide": "x" * (1024 * 1024 - len(empty_schema))}
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    assert catalog.commit_snapshot(
+        "org",
+        "lake",
+        "table",
+        _snapshot_payload(resources=[{}] * 100_000, schema=schema),
+        "snap/5.json",
+        expected_version=4,
+        expected_path="snap/4.json",
+        lock_token="token",
+        **kwargs,
+    ) == (5, 10)
+    assert len(fake.get(RK.schema("org", "lake", "table"))) == 1024 * 1024
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), -float("inf")])
+def test_snapshot_commit_rejects_nonfinite_json_without_mutation(
+    pinned_no_mirrors,
+    nonfinite,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    with pytest.raises(ValueError, match="not JSON serializable"):
+        catalog.commit_snapshot(
+            "org", "lake", "table",
+            _snapshot_payload(extra=nonfinite),
+            "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            **kwargs,
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+    assert not fake.exists(RK.schema("org", "lake", "table"))
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_snapshot_commit_lua_rejects_nonfinite_json_without_mutation(
+    pinned_no_mirrors,
+    monkeypatch,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+    script_name = (
+        "_snapshot_commit_no_mirrors"
+        if pinned_no_mirrors else "_snapshot_commit"
+    )
+    script = getattr(catalog, script_name)
+
+    def inject_nonfinite(*, keys, args):
+        forwarded = list(args)
+        forwarded[0] = json.dumps(
+            {**_snapshot_payload(), "injected": float("nan")},
+            allow_nan=True,
+        )
+        return script(keys=keys, args=forwarded)
+
+    monkeypatch.setattr(catalog, script_name, inject_nonfinite)
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    with pytest.raises(ValueError, match="byte/count safety limits"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            **kwargs,
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_snapshot_identity_byte_boundaries_and_signed_url_rejection(
+    pinned_no_mirrors,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+    exact_path = "p/" + "x" * (4096 - len("p/") - len(".json")) + ".json"
+    exact_commit = "c" * 4096
+
+    assert catalog.commit_snapshot(
+        "org", "lake", "table", _snapshot_payload(), exact_path,
+        expected_version=4,
+        expected_path="snap/4.json",
+        lock_token="token",
+        commit_id=exact_commit,
+        **kwargs,
+    ) == (5, 10)
+
+    _seed(fake)
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+    signed = (
+        "https://bucket.invalid/snap.json?"
+        "X-Amz-Signature=SNAPSHOT_BEARER_MARKER"
+    )
+    with pytest.raises(ValueError, match="snapshot path is invalid"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(), signed,
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            **kwargs,
+        )
+    with pytest.raises(ValueError, match="4096-byte limit"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            commit_id="c" * 4097,
+            **kwargs,
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+    assert "SNAPSHOT_BEARER_MARKER" not in " ".join(fake.keys("*"))
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_snapshot_lua_rejects_injected_signed_url_without_mutation(
+    pinned_no_mirrors,
+    monkeypatch,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+    script_name = (
+        "_snapshot_commit_no_mirrors"
+        if pinned_no_mirrors else "_snapshot_commit"
+    )
+    script = getattr(catalog, script_name)
+    signed = (
+        "https://bucket.invalid/snap.json?"
+        "X-Amz-Signature=LUA_PATH_BEARER_MARKER"
+    )
+
+    def inject_signed_path(*, keys, args):
+        forwarded = list(args)
+        forwarded[1] = signed
+        return script(keys=keys, args=forwarded)
+
+    monkeypatch.setattr(catalog, script_name, inject_signed_path)
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    with pytest.raises(ValueError, match="byte/count safety limits"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            **kwargs,
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+@pytest.mark.parametrize(
+    ("path", "commit_id"),
+    [
+        ("snap/\u0085.json", "commit-5"),
+        ("snap/5.json", "commit\u0085id"),
+        ("snap/\ud800.json", "commit-5"),
+    ],
+)
+def test_snapshot_identity_rejects_control_and_invalid_unicode_without_mutation(
+    pinned_no_mirrors,
+    path,
+    commit_id,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    with pytest.raises(ValueError):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(), path,
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            commit_id=commit_id,
+            **kwargs,
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_snapshot_commit_rejects_root_growth_over_one_mib_without_mutation(
+    pinned_no_mirrors,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    base = {"version": 9, "ts": 1, "read_only": False, "padding": ""}
+    compact = json.dumps(base, separators=(",", ":"))
+    base["padding"] = "x" * (1024 * 1024 - len(compact))
+    raw_root = json.dumps(base, separators=(",", ":"))
+    assert len(raw_root.encode("utf-8")) == 1024 * 1024
+    fake.set(RK.meta_root("org", "lake"), raw_root)
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    with pytest.raises(ValueError, match="byte/count safety limits"):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            commit_id="root-growth",
+            **kwargs,
+        )
+
+    assert fake.get(RK.meta_root("org", "lake")) == raw_root
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_snapshot_commit_lua_repeats_payload_limit_without_mutation(
+    pinned_no_mirrors,
+    monkeypatch,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+    script_name = (
+        "_snapshot_commit_no_mirrors"
+        if pinned_no_mirrors
+        else "_snapshot_commit"
+    )
+    script = getattr(catalog, script_name)
+
+    def substitute_oversized_payload(*, keys, args):
+        forwarded = list(args)
+        forwarded[0] = json.dumps({
+            **_snapshot_payload(),
+            "padding": "x" * (8 * 1024 * 1024),
+        })
+        return script(keys=keys, args=forwarded)
+
+    monkeypatch.setattr(catalog, script_name, substitute_oversized_payload)
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    with pytest.raises(ValueError, match="byte/count safety limits"):
+        catalog.commit_snapshot(
+            "org",
+            "lake",
+            "table",
+            _snapshot_payload(),
+            "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            **kwargs,
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+    assert not fake.exists(RK.schema("org", "lake", "table"))
 
 
 def test_normal_snapshot_commit_does_not_hash_or_persist_payload_digest(
@@ -371,7 +756,7 @@ def test_both_snapshot_lua_paths_reject_invalid_one_shot_wire_state(
 
     def corrupt_wire_flag(*args, **kwargs):
         script_args = list(kwargs["args"])
-        script_args[-1] = wire_flag
+        script_args[14] = wire_flag
         return real_script(keys=kwargs["keys"], args=script_args)
 
     monkeypatch.setattr(catalog, script_name, corrupt_wire_flag)
@@ -1052,6 +1437,108 @@ def test_expected_absent_commit_loses_to_concurrent_creator_without_overwrite():
     assert fake.get(RK.meta_root("org", "lake")) == before_root
 
 
+def test_snapshot_conflict_never_exposes_expected_storage_path():
+    secret_path = "snap/customer-private-path-sentinel.json"
+    catalog, fake = _catalog()
+    _seed(fake, version=4, path="snap/current.json")
+
+    with pytest.raises(SnapshotCommitConflictError) as raised:
+        catalog.commit_snapshot(
+            "org",
+            "lake",
+            "table",
+            _snapshot_payload(snapshot_version=5),
+            "snap/new.json",
+            expected_version=4,
+            expected_path=secret_path,
+            lock_token="token",
+            commit_id="commit-5",
+        )
+
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert secret_path not in rendered
+    assert str(raised.value) == (
+        "Snapshot base changed; expected_version=4; current_version=4"
+    )
+
+
+def test_snapshot_commit_never_renders_poisoned_redis_response(monkeypatch):
+    secret = "access_token=SNAPSHOT_RESULT_SENTINEL"
+
+    class _PoisonedInteger:
+        def __int__(self):
+            raise RuntimeError(secret)
+
+    catalog, fake = _catalog()
+    _seed(fake)
+    poisoned = [_PoisonedInteger(), secret, secret]
+    monkeypatch.setattr(
+        catalog,
+        "_snapshot_commit",
+        MagicMock(return_value=poisoned),
+    )
+    monkeypatch.setattr(
+        catalog,
+        "_snapshot_commit_no_mirrors",
+        MagicMock(return_value=poisoned),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        catalog.commit_snapshot(
+            "org",
+            "lake",
+            "table",
+            _snapshot_payload(snapshot_version=5),
+            "snap/new.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            commit_id="commit-5",
+        )
+
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert secret not in rendered
+    assert str(raised.value) == (
+        "Invalid snapshot commit result; error_type=RuntimeError"
+    )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_rowid_reservation_never_renders_poisoned_redis_response(monkeypatch):
+    secret = "signature=ROWID_RESULT_SENTINEL"
+
+    class _PoisonedInteger:
+        def __int__(self):
+            raise RuntimeError(secret)
+
+    catalog, fake = _catalog()
+    _seed_current_snapshot(fake)
+    monkeypatch.setattr(
+        catalog,
+        "_reserve_rowids_at_least",
+        MagicMock(return_value=[_PoisonedInteger(), secret]),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        catalog.reserve_rowids_at_least(
+            "org",
+            "lake",
+            "table",
+            1,
+            100,
+            lock_token="token",
+        )
+
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert secret not in rendered
+    assert str(raised.value) == (
+        "Invalid rowid reservation result; error_type=RuntimeError"
+    )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
 def test_expected_absent_commit_is_blocked_by_durable_namespace_deletion():
     catalog, fake = _catalog()
     fake.set(
@@ -1699,7 +2186,7 @@ def test_failed_mirror_record_retains_exact_core_commit_and_blocks_overwrite():
     assert failed["status"] == "failed"
     assert failed["core_committed"] is True
     assert failed["failure_stage"] == "mirror:PARQUET"
-    assert failed["error"] == {"type": "OSError", "message": "delete denied"}
+    assert failed["error"] == {"type": "OSError"}
 
     with pytest.raises(SnapshotCommitConflictError, match="Unresolved mirror"):
         catalog.prepare_mirror_publication(
@@ -1707,6 +2194,360 @@ def test_failed_mirror_record_retains_exact_core_commit_and_blocks_overwrite():
             snapshot_path="snap/6.json", mirrors=["PARQUET"],
             lock_token="token",
         )
+
+
+def test_mirror_failure_durable_state_never_persists_backend_secret_text():
+    secret = (
+        "MIRROR_SECRET_MARKER_7f96 "
+        "https://bucket.invalid/object?X-Amz-Signature=BEARER_TOKEN"
+    )
+    catalog, fake = _catalog()
+    _seed(fake)
+    catalog.prepare_mirror_publication(
+        "org", "lake", "table", commit_id="commit-5",
+        snapshot_path="snap/5.json", mirrors=["PARQUET"],
+        lock_token="token", now_ms=120,
+    )
+    catalog.commit_snapshot(
+        "org", "lake", "table", _snapshot_payload(), "snap/5.json",
+        expected_version=4, expected_path="snap/4.json", lock_token="token",
+        commit_id="commit-5", mirror_publication=True, now_ms=123,
+    )
+
+    failed = catalog.fail_mirror_publication(
+        "org", "lake", "table", commit_id="commit-5", lock_token="token",
+        failure_stage="mirror:PARQUET", error=OSError(secret), now_ms=130,
+    )
+
+    raw = fake.get(RK.meta_mirror_publication("org", "lake", "table"))
+    assert secret not in raw
+    assert "BEARER_TOKEN" not in raw
+    assert failed["error"] == {"type": "OSError"}
+    assert failed["failure_stage"] == "mirror:PARQUET"
+    assert failed["commit_id"] == "commit-5"
+
+
+def test_mirror_state_read_redacts_legacy_backend_message():
+    secret = "MIRROR_LEGACY_SECRET https://host.invalid/x?sig=BEARER"
+    catalog, fake = _catalog()
+    _seed(fake)
+    key = RK.meta_mirror_publication("org", "lake", "table")
+    fake.set(
+        key,
+        json.dumps({
+            "status": "failed",
+            "failure_stage": "outbox_complete",
+            "commit_id": "commit-5",
+            "error": {
+                "type": "TimeoutError",
+                "message": secret,
+                "provider_response": secret,
+            },
+        }),
+    )
+
+    state = catalog.get_mirror_publication("org", "lake", "table")
+
+    assert state["error"] == {"type": "TimeoutError"}
+    assert secret not in json.dumps(state)
+    migrated = fake.get(key)
+    assert secret not in migrated
+    assert "provider_response" not in migrated
+    assert json.loads(migrated)["error"] == {"type": "TimeoutError"}
+
+
+@pytest.mark.parametrize(
+    "legacy_error",
+    [
+        {"type": "TimeoutError"},
+        {
+            "type": "TimeoutError",
+            "message": "INVALID_STAGE_SECRET https://host.invalid/x?sig=BEARER",
+        },
+    ],
+)
+def test_mirror_legacy_sanitization_precedes_invalid_stage_failure(
+    legacy_error,
+):
+    secret = "INVALID_STAGE_SECRET https://host.invalid/x?sig=BEARER"
+    catalog, fake = _catalog()
+    key = RK.meta_mirror_publication("org", "lake", "table")
+    fake.set(
+        key,
+        json.dumps({
+            "status": "failed",
+            "commit_id": "commit-5",
+            "failure_stage": secret,
+            "error": legacy_error,
+            "provider_response": secret,
+            "error_message": secret,
+        }),
+    )
+
+    with pytest.raises(
+        RuntimeError, match="Corrupt mirror publication state",
+    ) as raised:
+        catalog.get_mirror_publication("org", "lake", "table")
+
+    migrated = fake.get(key)
+    assert "provider_response" not in migrated
+    assert "error_message" not in migrated
+    assert '"message"' not in migrated
+    assert secret not in migrated
+    assert "failure_stage" not in migrated
+    assert json.loads(migrated)["status"] == "corrupt"
+    assert json.loads(migrated)["error"] == {"type": "TimeoutError"}
+    assert secret not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
+def test_mirror_legacy_signed_snapshot_path_is_purged_before_failure():
+    secret = (
+        "https://bucket.invalid/snap.json?"
+        "X-Amz-Signature=LEGACY_PATH_BEARER_MARKER"
+    )
+    catalog, fake = _catalog()
+    key = RK.meta_mirror_publication("org", "lake", "table")
+    fake.set(
+        key,
+        json.dumps({
+            "status": "failed",
+            "commit_id": "commit-5",
+            "snapshot_path": secret,
+            "failure_stage": "outbox_complete",
+            "error": {"type": "TimeoutError"},
+        }),
+    )
+
+    with pytest.raises(
+        RuntimeError, match="Corrupt mirror publication state",
+    ) as raised:
+        catalog.get_mirror_publication("org", "lake", "table")
+
+    migrated = fake.get(key)
+    assert secret not in migrated
+    assert "snapshot_path" not in migrated
+    assert json.loads(migrated)["status"] == "corrupt"
+    assert secret not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
+def test_mirror_legacy_top_level_diagnostics_are_removed_by_allowlist():
+    secret = "TOP_LEVEL_SECRET https://host.invalid/x?sig=BEARER"
+    catalog, fake = _catalog()
+    key = RK.meta_mirror_publication("org", "lake", "table")
+    fake.set(
+        key,
+        json.dumps({
+            "schema_version": 2,
+            "status": "failed",
+            "commit_id": "commit-5",
+            "snapshot_path": "snap/5.json",
+            "mirrors": ["PARQUET"],
+            "failure_stage": "outbox_complete",
+            "error": {"type": "OSError"},
+            "provider_response": secret,
+            "error_message": secret,
+            "diagnostic_context": {"url": secret},
+        }),
+    )
+
+    state = catalog.get_mirror_publication("org", "lake", "table")
+
+    assert state["commit_id"] == "commit-5"
+    assert state["snapshot_path"] == "snap/5.json"
+    assert state["mirrors"] == ["PARQUET"]
+    assert secret not in json.dumps(state)
+    assert secret not in fake.get(key)
+
+
+def test_mirror_legacy_sanitization_never_overwrites_concurrent_transition(
+    monkeypatch,
+):
+    secret = "RACE_SECRET https://host.invalid/x?sig=BEARER"
+    catalog, fake = _catalog()
+    key = RK.meta_mirror_publication("org", "lake", "table")
+    fake.set(
+        key,
+        json.dumps({
+            "status": "failed",
+            "commit_id": "old-commit",
+            "snapshot_path": "snap/old.json",
+            "failure_stage": "outbox_complete",
+            "error": {"type": "OSError", "message": secret},
+        }),
+    )
+    script = catalog._sanitize_mirror_publication
+    concurrent = {
+        "schema_version": 2,
+        "status": "complete",
+        "commit_id": "new-commit",
+        "snapshot_path": "snap/new.json",
+        "mirrors": ["PARQUET"],
+        "core_committed": True,
+        "publication_owner": "new-owner",
+        "owner_generation": 2,
+        "publisher_quiesced": True,
+        "error": None,
+    }
+    raced = False
+
+    def transition_before_cas(*, keys, args):
+        nonlocal raced
+        if not raced:
+            raced = True
+            fake.set(key, json.dumps(concurrent))
+        return script(keys=keys, args=args)
+
+    monkeypatch.setattr(
+        catalog, "_sanitize_mirror_publication", transition_before_cas,
+    )
+
+    state = catalog.get_mirror_publication("org", "lake", "table")
+
+    assert state["commit_id"] == "new-commit"
+    assert state["status"] == "complete"
+    assert json.loads(fake.get(key))["publication_owner"] == "new-owner"
+
+
+def test_prepare_mirror_publication_rejects_signed_snapshot_url_without_state():
+    catalog, fake = _catalog()
+    _seed(fake)
+    signed = (
+        "https://bucket.invalid/snap.json?"
+        "X-Amz-Signature=MIRROR_PATH_BEARER_MARKER"
+    )
+
+    with pytest.raises(ValueError, match="mirror snapshot path is invalid"):
+        catalog.prepare_mirror_publication(
+            "org", "lake", "table",
+            commit_id="commit-5",
+            snapshot_path=signed,
+            mirrors=["PARQUET"],
+            lock_token="token",
+        )
+
+    assert not fake.exists(
+        RK.meta_mirror_publication("org", "lake", "table")
+    )
+
+
+def test_prepare_mirror_lua_rejects_injected_signed_url_without_state(
+    monkeypatch,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    script = catalog._mirror_publication_prepare
+    signed = (
+        "https://bucket.invalid/snap.json?"
+        "X-Amz-Signature=LUA_MIRROR_PATH_BEARER_MARKER"
+    )
+
+    def inject_signed_path(*, keys, args):
+        forwarded = list(args)
+        record = json.loads(forwarded[0])
+        record["snapshot_path"] = signed
+        forwarded[0] = json.dumps(record)
+        return script(keys=keys, args=forwarded)
+
+    monkeypatch.setattr(
+        catalog, "_mirror_publication_prepare", inject_signed_path,
+    )
+
+    with pytest.raises(RuntimeError, match="prepare status -4"):
+        catalog.prepare_mirror_publication(
+            "org", "lake", "table",
+            commit_id="commit-5",
+            snapshot_path="snap/5.json",
+            mirrors=["PARQUET"],
+            lock_token="token",
+        )
+
+    assert not fake.exists(
+        RK.meta_mirror_publication("org", "lake", "table")
+    )
+
+
+def test_mirror_core_commit_transport_error_is_safe_and_preserves_cause(
+    monkeypatch,
+):
+    secret = "CORE_COMMIT_SECRET https://redis.invalid/x?password=BEARER"
+    catalog, fake = _catalog()
+    _seed(fake)
+    cause = redis.TimeoutError(secret)
+    monkeypatch.setattr(
+        catalog, "_snapshot_commit", MagicMock(side_effect=cause),
+    )
+
+    with pytest.raises(MirrorPublicationStateError) as raised:
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(), "snap/5.json",
+            expected_version=4,
+            expected_path="snap/4.json",
+            lock_token="token",
+            commit_id="commit-5",
+            mirror_publication=True,
+            expected_mirrors=["PARQUET"],
+        )
+
+    assert raised.value.operation == "core commit"
+    assert raised.value.cause is cause
+    assert raised.value.__cause__ is None
+    assert secret not in str(raised.value)
+
+
+def test_redis_catalog_transport_log_is_type_only(monkeypatch):
+    secret = "REDIS_LOG_SECRET https://redis.invalid/x?password=BEARER"
+    catalog, _fake = _catalog()
+    recorded = MagicMock()
+    monkeypatch.setattr(redis_catalog_module.logger, "error", recorded)
+    monkeypatch.setattr(
+        catalog.r, "get", MagicMock(side_effect=redis.TimeoutError(secret)),
+    )
+
+    with pytest.raises(redis.TimeoutError):
+        catalog.get_root("org", "lake")
+
+    rendered = " ".join(str(value) for call in recorded.call_args_list for value in call)
+    assert secret not in rendered
+    assert "TimeoutError" in rendered
+
+
+def test_ambiguous_mirror_completion_has_safe_public_text_and_original_cause(
+    monkeypatch,
+):
+    secret = "MIRROR_COMPLETION_SECRET https://host.invalid/x?sig=BEARER"
+    catalog, fake = _catalog()
+    _seed(fake)
+    catalog.prepare_mirror_publication(
+        "org", "lake", "table", commit_id="commit-5",
+        snapshot_path="snap/5.json", mirrors=["PARQUET"],
+        lock_token="token",
+    )
+    catalog.commit_snapshot(
+        "org", "lake", "table", _snapshot_payload(), "snap/5.json",
+        expected_version=4, expected_path="snap/4.json", lock_token="token",
+        commit_id="commit-5", mirror_publication=True,
+    )
+    cause = redis.TimeoutError(secret)
+
+    def ambiguous_completion(*_args, **_kwargs):
+        raise cause
+
+    monkeypatch.setattr(
+        catalog, "_mirror_publication_transition", ambiguous_completion,
+    )
+    with pytest.raises(MirrorPublicationStateError) as raised:
+        catalog.complete_mirror_publication(
+            "org", "lake", "table", commit_id="commit-5",
+            lock_token="token",
+        )
+
+    assert raised.value.cause is cause
+    assert raised.value.__cause__ is None
+    assert raised.value.error_type == "TimeoutError"
+    assert "error_type=TimeoutError" in str(raised.value)
+    assert secret not in str(raised.value)
 
 
 def test_completed_mirror_record_allows_next_publication():
@@ -2020,6 +2861,21 @@ def test_root_transport_error_is_unknown_not_absent(monkeypatch):
     )
     with pytest.raises(redis.TimeoutError, match="redis timeout"):
         catalog.get_root("org", "lake")
+
+
+def test_ping_transport_log_never_contains_redis_credentials(monkeypatch):
+    secret = "PING_SECRET redis://user:password@host.invalid:6379/0"
+    catalog, _fake = _catalog()
+    recorded = MagicMock()
+    monkeypatch.setattr(redis_catalog_module.logger, "debug", recorded)
+    monkeypatch.setattr(
+        catalog.r, "ping", MagicMock(side_effect=redis.ConnectionError(secret)),
+    )
+
+    assert catalog.ping() is False
+    rendered = " ".join(str(value) for call in recorded.call_args_list for value in call)
+    assert secret not in rendered
+    assert "ConnectionError" in rendered
 
 
 def test_replica_resolution_transport_error_cannot_fall_back_to_local(monkeypatch):
@@ -2608,6 +3464,39 @@ def test_legacy_catalog_adapter_uses_lightweight_quality_fallback():
         "org", "lake", "pending_unresolved", "table",
     )
     assert fake.get(unresolved) == "commit-5"
+
+
+def test_legacy_quality_notification_log_never_exposes_backend_text(caplog):
+    secret = "redis://user:QUALITY_BEARER@internal:6379/0"
+
+    class LegacyAtomicCatalog:
+        def commit_snapshot(self, *_args, **_kwargs):
+            return 5, 10
+
+        def persist_quality_generation(self, *_args, **_kwargs):
+            raise RuntimeError(secret)
+
+    writer = DataWriter.__new__(DataWriter)
+    writer.super_table = SimpleNamespace(organization="org", super_name="lake")
+    writer.catalog = LegacyAtomicCatalog()
+    table = SimpleNamespace(
+        _last_snapshot_leaf={"version": 4, "path": "snap/4.json"},
+    )
+
+    writer._publish_snapshot(
+        simple_table=table,
+        simple_name="table",
+        payload=_snapshot_payload(schema={}),
+        path="snap/5.json",
+        base_path="snap/4.json",
+        lock_token="token",
+        commit_id="commit-5",
+        now_ms=123,
+        notify_quality=True,
+    )
+
+    assert secret not in caplog.text
+    assert "error_type=RuntimeError" in caplog.text
 
 
 def test_catalog_without_atomic_fenced_commit_is_rejected():

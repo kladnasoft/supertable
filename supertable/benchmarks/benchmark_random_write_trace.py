@@ -32,7 +32,6 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -647,10 +646,10 @@ def _install_runtime(package_root: Path | None, home: Path) -> dict[str, Any]:
     try:
         import fakeredis
         import lupa  # noqa: F401 - proves fakeredis can execute catalog Lua
-    except Exception as exc:
+    except Exception:
         raise RuntimeError(
             "fakeredis and lupa are required for the hermetic write benchmark"
-        ) from exc
+        ) from None
 
     import supertable
     import supertable.data_reader as reader_module
@@ -1197,9 +1196,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "blockers": comparison["blockers"],
         }, sort_keys=True))
         return 0 if comparison["gate_passed"] else 3
-    except Exception as exc:
-        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
-        traceback.print_exc()
+    except Exception:
+        print("benchmark execution failed", file=sys.stderr)
         return 1
 
 

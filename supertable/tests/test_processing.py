@@ -41,6 +41,16 @@ def _df(**cols) -> pl.DataFrame:
     return pl.DataFrame(cols)
 
 
+def test_compaction_duplicate_rowid_diagnostic_has_no_source_cause() -> None:
+    from supertable.processing import _prove_safe_compacted_rowids
+
+    frame = pl.DataFrame({"__rowid__": [7, 7], "value": ["a", "b"]})
+    with pytest.raises(ValueError, match="future tombstones over-delete") as caught:
+        _prove_safe_compacted_rowids(frame)
+
+    assert caught.value.__cause__ is None
+
+
 # ===========================================================================
 # 1. _resolve_unified_dtype
 # ===========================================================================

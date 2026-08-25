@@ -36,6 +36,7 @@ from .runner import (
     assert_exact_parity,
     result_digest,
 )
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 
 GIB = 1024**3
@@ -79,12 +80,14 @@ def _read_json(path: str | Path) -> dict[str, Any]:
     source = Path(path).expanduser().resolve()
     try:
         value = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError):
         raise SpillGateConfigurationError(
-            f"cannot read JSON from {source}: {type(exc).__name__}: {exc}"
-        ) from exc
+            "cannot read benchmark JSON"
+        ) from None
     if not isinstance(value, dict):
-        raise SpillGateConfigurationError(f"{source} must contain a JSON object")
+        raise SpillGateConfigurationError(
+            "benchmark JSON must contain an object"
+        )
     return value
 
 
@@ -154,8 +157,10 @@ def _validate_expected_result(canonical: Mapping[str, Any], *, label: str) -> No
         )
     try:
         count_index = columns.index("id_count")
-    except ValueError as exc:
-        raise SpillGateConfigurationError(f"{label} has no id_count column") from exc
+    except ValueError:
+        raise SpillGateConfigurationError(
+            f"{label} has no id_count column"
+        ) from None
     counts: list[int] = []
     for row in rows:
         if not isinstance(row, list) or count_index >= len(row):
@@ -190,10 +195,10 @@ def _sealed_oracle_group_domain(canonical: Mapping[str, Any]) -> dict[str, Any]:
         raise SpillGateConfigurationError("DuckDB oracle is not a canonical table")
     try:
         dimension_index = columns.index("dimension")
-    except ValueError as exc:
+    except ValueError:
         raise SpillGateConfigurationError(
             "DuckDB spill oracle has no dimension group column"
-        ) from exc
+        ) from None
     dimensions = []
     for row in rows:
         if not isinstance(row, list) or dimension_index >= len(row):
@@ -508,7 +513,12 @@ def _cleanup_spill_root(spill_root: Path, *, attempt_root: Path) -> dict[str, An
         if relative != Path("island-spill"):
             raise ValueError("spill root is not the attempt's island-spill directory")
     except (OSError, ValueError) as exc:
-        return {"attempted": False, "errors": [f"unsafe_path:{type(exc).__name__}:{exc}"]}
+        return {
+            "attempted": False,
+            "errors": [
+                "unsafe_path; error_type=" + safe_exception_type(exc)
+            ],
+        }
 
     for child in list(resolved_spill.iterdir()):
         try:
@@ -517,7 +527,10 @@ def _cleanup_spill_root(spill_root: Path, *, attempt_root: Path) -> dict[str, An
             else:
                 child.unlink()
         except OSError as exc:
-            errors.append(f"{child.name}:{type(exc).__name__}:{exc}")
+            errors.append(
+                "spill cleanup failed; "
+                f"error_type={safe_exception_type(exc)}"
+            )
     return {"attempted": True, "errors": errors}
 
 
@@ -824,7 +837,10 @@ def run_attempt(
                 stdout, stderr = process.communicate()
         returncode = process.returncode
     except OSError as exc:
-        launch_error = f"{type(exc).__name__}: {exc}"
+        launch_error = (
+            "spill-gate launch failed; "
+            f"error_type={safe_exception_type(exc)}"
+        )
     finally:
         sampler.stop()
         docker_state = _docker_state(docker, container_name)
@@ -840,7 +856,10 @@ def run_attempt(
         try:
             response = _read_json(response_path)
         except SpillGateConfigurationError as exc:
-            response_error = str(exc)
+            response_error = (
+                "worker response unavailable; "
+                f"error_type={safe_exception_type(exc)}"
+            )
 
     status = "worker_failed"
     exit_code = EXIT_WORKER_FAILURE
@@ -876,9 +895,15 @@ def run_attempt(
         except BenchmarkParityError as exc:
             status = "parity_failed"
             exit_code = EXIT_PARITY_FAILURE
-            validation_error = str(exc)
+            validation_error = (
+                "benchmark parity failed; "
+                f"error_type={safe_exception_type(exc)}"
+            )
         except SpillGateError as exc:
-            validation_error = str(exc)
+            validation_error = (
+                "spill-gate validation failed; "
+                f"error_type={safe_exception_type(exc)}"
+            )
 
     spill_after_worker = _tree_footprint(attempt_root / "island-spill")
     if exit_code == EXIT_SUCCESS and spill_after_worker["files"]:
@@ -1039,8 +1064,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             oracle_request=args.oracle_request,
             oracle_response=args.oracle_response,
         )
-    except SpillGateConfigurationError as exc:
-        parser.error(str(exc))
+    except SpillGateConfigurationError:
+        parser.error("spill-gate benchmark configuration is invalid")
 
     output_root.mkdir(parents=True, exist_ok=True)
     final_code = EXIT_SUCCESS

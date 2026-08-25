@@ -3,16 +3,20 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
+import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from datetime import datetime, timezone
 import re
-from typing import Any
+from typing import Any, Sequence
 
 import polars
+import pyarrow as pa
+import pyarrow.compute as pc
 from polars import DataFrame
 
 from supertable.config.defaults import logger
@@ -83,6 +87,7 @@ from supertable.mirroring.mirror_formats import (
     MirrorFormats,
     MirrorPublicationError,
 )
+from supertable.mirroring.failure_safety import mirror_error_type
 from supertable.tombstone_manifest_v2 import (
     MAX_JSON_EXACT_INTEGER,
     TOMBSTONE_FORMAT_V2,
@@ -91,7 +96,14 @@ from supertable.tombstone_manifest_v2 import (
     validate_logical_storage_path,
     validate_snapshot_tombstone_state,
 )
-from supertable.audit import emit as _audit_emit, EventCategory, Actions, Severity, make_detail
+from supertable.audit import (
+    Actions,
+    AuditEncryptionError,
+    EventCategory,
+    Severity,
+    emit as _audit_emit,
+    make_detail,
+)
 
 
 def _safe_json(obj):
@@ -106,8 +118,17 @@ def _safe_json(obj):
 
 
 class DataWriter:
-    def __init__(self, super_name: str, organization: str):
+    def __init__(
+        self,
+        super_name: str,
+        organization: str,
+        *,
+        audit_actor_id: str = "",
+        audit_actor_username: str = "",
+    ):
         self.super_table = SuperTable(super_name, organization)
+        self.audit_actor_id = str(audit_actor_id or "")
+        self.audit_actor_username = str(audit_actor_username or "")
         self.catalog = RedisCatalog()
         self._table_config_cache: dict = {}
         self._artifact_cache_identities = _WriterArtifactCacheIdentities()
@@ -303,10 +324,10 @@ class DataWriter:
                 self.super_table.organization,
                 self.super_table.super_name,
             )
-        except Exception as exc:
+        except Exception:
             raise RuntimeError(
                 f"Cannot safely determine enabled mirrors for {operation}"
-            ) from exc
+            ) from None
         if not isinstance(configured, (list, tuple, set)):
             raise RuntimeError("Catalog returned an invalid mirror configuration")
         return list(configured)
@@ -325,41 +346,108 @@ class DataWriter:
         non-null and table-global unique, and the current deletion-vector must be
         readable/valid.  A partial scan cannot safely establish a recovery floor.
         """
-        seen: set[int] = set()
         high = 0
-        for resource in snapshot.get("resources") or []:
-            file_path = resource.get("file") if isinstance(resource, dict) else None
-            if not file_path:
-                raise ValueError("Cannot derive rowid high-watermark from an invalid resource")
-            frame = _read_parquet_safe(
-                file_path,
-                file_size=int(resource.get("file_size") or 0),
-                columns=[ROWID_COL],
-                required=True,
-                profiler=profiler,
+        resources = snapshot.get("resources") or []
+        storage = getattr(self.super_table, "storage", None)
+        iter_batches = getattr(storage, "iter_parquet_batches", None)
+        if resources and not callable(iter_batches):
+            raise RuntimeError(
+                "Cannot derive rowid high-watermark without bounded Parquet batches"
             )
-            if frame is None or ROWID_COL not in frame.columns:
-                raise ValueError(
-                    f"Cannot derive rowid high-watermark: {file_path!r} lacks {ROWID_COL!r}"
+        # A disk-backed uniqueness index makes the one-time legacy/restore
+        # proof independent of table cardinality in Python memory.  Every
+        # built-in storage backend feeds bounded Arrow batches under its object
+        # identity seal; SQLite's exact signed-Int64 primary key proves both
+        # within-file and cross-file uniqueness without a process-wide set.
+        with tempfile.TemporaryDirectory(prefix="supertable-rowid-proof-") as temp_dir:
+            database_path = os.path.join(temp_dir, "rowids.sqlite3")
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.execute("PRAGMA journal_mode=OFF")
+                connection.execute("PRAGMA synchronous=OFF")
+                connection.execute("PRAGMA temp_store=FILE")
+                connection.execute(
+                    "CREATE TABLE rowids (value INTEGER PRIMARY KEY) WITHOUT ROWID"
                 )
-            rowids = frame.get_column(ROWID_COL)
-            if rowids.dtype != polars.Int64 or rowids.null_count() > 0:
-                raise ValueError(
-                    f"Cannot derive rowid high-watermark: {file_path!r} has invalid rowids"
-                )
-            values = rowids.to_list()
-            if (
-                (values and min(values) <= 0)
-                or len(values) != len(set(values))
-                or seen.intersection(values)
-            ):
-                raise ValueError(
-                    "Cannot derive rowid high-watermark: physical rowids must "
-                    "be positive and table-global unique"
-                )
-            seen.update(values)
-            if values:
-                high = max(high, max(values))
+                for resource in resources:
+                    # A non-empty resource list passed the callable check above.
+                    # Keep that relationship explicit for static analysis too.
+                    assert callable(iter_batches)
+                    file_path = (
+                        resource.get("file")
+                        if isinstance(resource, dict) else None
+                    )
+                    declared_rows = (
+                        resource.get("rows")
+                        if isinstance(resource, dict) else None
+                    )
+                    if (
+                        not file_path
+                        or type(declared_rows) is not int
+                        or declared_rows < 0
+                    ):
+                        raise ValueError(
+                            "Cannot derive rowid high-watermark from an invalid resource"
+                        )
+                    scanned_rows = 0
+                    for raw_batch in iter_batches(
+                        file_path,
+                        max_decoded_bytes=8 * 1024 * 1024,
+                        columns=[ROWID_COL],
+                    ):
+                        if isinstance(raw_batch, pa.RecordBatch):
+                            batch = pa.Table.from_batches([raw_batch])
+                        elif isinstance(raw_batch, pa.Table):
+                            batch = raw_batch
+                        else:
+                            raise RuntimeError(
+                                "Bounded rowid scan returned an invalid Arrow batch"
+                            )
+                        if (
+                            batch.column_names != [ROWID_COL]
+                            or batch.schema.field(ROWID_COL).type != pa.int64()
+                            or batch.column(ROWID_COL).null_count > 0
+                        ):
+                            raise ValueError(
+                                "Cannot derive rowid high-watermark: physical "
+                                "rowids must be non-null Int64 values"
+                            )
+                        row_count = int(batch.num_rows)
+                        scanned_rows += row_count
+                        column = batch.column(ROWID_COL)
+                        minimum = pc.min(column).as_py() if row_count else None
+                        maximum = pc.max(column).as_py() if row_count else None
+                        if minimum is not None and int(minimum) <= 0:
+                            raise ValueError(
+                                "Cannot derive rowid high-watermark: physical "
+                                "rowids must be positive and table-global unique"
+                            )
+                        changes_before = connection.total_changes
+
+                        def row_values():
+                            for chunk in column.chunks:
+                                for scalar in chunk:
+                                    yield (int(scalar.as_py()),)
+
+                        connection.executemany(
+                            "INSERT OR IGNORE INTO rowids(value) VALUES (?)",
+                            row_values(),
+                        )
+                        connection.commit()
+                        if connection.total_changes - changes_before != row_count:
+                            raise ValueError(
+                                "Cannot derive rowid high-watermark: physical "
+                                "rowids must be positive and table-global unique"
+                            )
+                        if maximum is not None:
+                            high = max(high, int(maximum))
+                    if scanned_rows != declared_rows:
+                        raise ValueError(
+                            "Cannot derive rowid high-watermark: physical row "
+                            "count disagrees with the snapshot"
+                        )
+            finally:
+                connection.close()
 
         tombstone_path = snapshot.get("tombstone")
         if tombstone_path:
@@ -560,6 +648,7 @@ class DataWriter:
         notify_quality: bool = False,
         durability_batch: Any | None = None,
         one_shot_initial: bool = False,
+        authority_generation: Sequence[int] | None = None,
     ) -> None:
         """Publish a snapshot through the fenced atomic catalog primitive.
 
@@ -582,8 +671,8 @@ class DataWriter:
                 )
             try:
                 expected_version = int(leaf.get("version", -1))
-            except (TypeError, ValueError) as exc:
-                raise RuntimeError("Current leaf has an invalid version") from exc
+            except (TypeError, ValueError):
+                raise RuntimeError("Current leaf has an invalid version") from None
             if (
                 type(leaf.get("version")) is not int
                 or expected_version < -1
@@ -653,6 +742,10 @@ class DataWriter:
                 commit_kwargs["quality_generation"] = commit_id
             if one_shot_initial:
                 commit_kwargs["one_shot_initial"] = True
+            if authority_generation is not None:
+                commit_kwargs["expected_write_authority_generation"] = (
+                    authority_generation
+                )
             try:
                 if durability_batch is not None:
                     # The directory barrier is complete at this point.  Mark
@@ -678,6 +771,7 @@ class DataWriter:
                         LockLostError,
                         DeletionIntentConflictError,
                         ReadOnlyCatalogError,
+                        PermissionError,
                     ),
                 ):
                     # These typed responses prove the fenced Lua transaction
@@ -698,7 +792,8 @@ class DataWriter:
                     except Exception as state_exc:
                         logger.error(
                             "Failed to persist mirror core-commit failure for "
-                            f"{simple_name}: {state_exc}"
+                            f"{simple_name}; "
+                            f"error_type={mirror_error_type(state_exc)}"
                         )
                 raise
             if notify_quality and not atomic_quality:
@@ -732,8 +827,9 @@ class DataWriter:
                         )
                 except Exception as exc:
                     logger.warning(
-                        "Post-commit data-quality notification was deferred: %s",
-                        exc,
+                        "Post-commit data-quality notification was deferred; "
+                        "error_type=%s",
+                        mirror_error_type(exc),
                     )
             return
 
@@ -1057,7 +1153,8 @@ class DataWriter:
                     sample = polars.from_arrow(arrow_tbl).limit(0)
                 except Exception as e:
                     logger.debug(
-                        f"[compact] could not read schema from {first_path}: {e}"
+                        "[compact] could not read output schema; "
+                        f"error_type={mirror_error_type(e)}"
                     )
                     continue
                 success_count += 1
@@ -1212,6 +1309,47 @@ class DataWriter:
                 table_name=simple_name,
                 columns=policy_columns,
             )
+            sample_authority_generation = getattr(
+                type(self.catalog), "sample_write_authority_generation", None,
+            )
+            validate_authority_generation = getattr(
+                type(self.catalog), "validate_write_authority_generation", None,
+            )
+
+            def stable_full_access_check(target_exists: bool):
+                """Authorize inside one unchanged catalog-generation window."""
+                def check_once() -> None:
+                    if target_exists:
+                        check_write_access(**access_args)
+                    else:
+                        check_create_access(**access_args)
+
+                if not (
+                    callable(sample_authority_generation)
+                    and callable(validate_authority_generation)
+                ):
+                    check_once()
+                    return None
+                # Sampling only after a full check could bless a decision made
+                # just before a concurrent revocation. Bracket the full policy
+                # read and retry a bounded number of times until one complete
+                # decision occurred under an unchanged generation.
+                for _attempt in range(3):
+                    generation = self.catalog.sample_write_authority_generation(
+                        self.super_table.organization,
+                        self.super_table.super_name,
+                    )
+                    check_once()
+                    if self.catalog.validate_write_authority_generation(
+                        self.super_table.organization,
+                        self.super_table.super_name,
+                        generation,
+                    ) is True:
+                        return generation
+                raise PermissionError(
+                    "Write authorization changed continuously during validation"
+                )
+
             prepared_mutation_leaf = None
             prepare_mutation_leaf = getattr(
                 type(self.catalog), "prepare_table_mutation_leaf", None,
@@ -1229,10 +1367,17 @@ class DataWriter:
                     self.super_table.super_name,
                     simple_name,
                 )
-            if target_existed:
-                check_write_access(**access_args)
-            else:
-                check_create_access(**access_args)
+            authority_generation = stable_full_access_check(target_existed)
+            # Retain a fail-closed catalog generation only *after* the full
+            # table/column authorization decision.  The two later security
+            # boundaries still refresh caller identity, but an unchanged role,
+            # create-vs-write semantic, RBAC generation, and writable root can
+            # then be proved with one atomic Redis round trip instead of
+            # rebuilding the complete RoleManager view each time.  Catalog
+            # adapters without this optional primitive keep the established
+            # full-check behaviour.
+            authority_role_name = role_name
+            authority_target_exists = target_existed
             mark("access")
 
             # --- Convert input -------------------------------------------------
@@ -1374,18 +1519,26 @@ class DataWriter:
                 reconciliation_callback()
             role_name = current_authorized_role()
             access_args["role_name"] = role_name
-            if locked_target_exists:
-                check_write_access(**access_args)
-            else:
-                check_create_access(**access_args)
-
-            # Pin the create-vs-update authorization decision at the table
-            # lease boundary.  A concurrent creator can publish the leaf after
-            # our optimistic preflight but before this writer acquires the
-            # lease; CREATE permission must never authorize mutation of that
-            # newly-existing table.
-            if not target_existed and locked_target_exists:
-                check_write_access(**access_args)
+            authority_unchanged = False
+            if (
+                authority_generation is not None
+                and role_name == authority_role_name
+                and locked_target_exists == authority_target_exists
+            ):
+                authority_unchanged = (
+                    self.catalog.validate_write_authority_generation(
+                        self.super_table.organization,
+                        self.super_table.super_name,
+                        authority_generation,
+                    )
+                    is True
+                )
+            if not authority_unchanged:
+                authority_generation = stable_full_access_check(
+                    locked_target_exists,
+                )
+                authority_role_name = role_name
+                authority_target_exists = locked_target_exists
 
             # WRITE authority cannot recreate a table that disappeared before
             # its table lease was acquired.  The caller must retry through the
@@ -1625,6 +1778,7 @@ class DataWriter:
                         allow_cache=True,
                         cache_identity=current_stats_cache_identity,
                         profiler=profiler,
+                        storage=self.super_table.storage,
                     )
                     if stored_stats_df is not None and "stats_rows" in last_simple_table:
                         expected_stats_rows = int(last_simple_table.get("stats_rows") or 0)
@@ -2751,6 +2905,7 @@ class DataWriter:
                             if previous_stats_path else None
                         ),
                         validation_out=stats_validation_out,
+                        storage=self.super_table.storage,
                     )
                     stats_rows = (
                         combined_stats_df.height
@@ -2828,10 +2983,26 @@ class DataWriter:
                 # permission pinned when the table lease was acquired.
                 role_name = current_authorized_role()
                 access_args["role_name"] = role_name
-                if locked_target_exists:
-                    check_write_access(**access_args)
-                else:
-                    check_create_access(**access_args)
+                authority_unchanged = False
+                if (
+                    authority_generation is not None
+                    and role_name == authority_role_name
+                    and locked_target_exists == authority_target_exists
+                ):
+                    authority_unchanged = (
+                        self.catalog.validate_write_authority_generation(
+                            self.super_table.organization,
+                            self.super_table.super_name,
+                            authority_generation,
+                        )
+                        is True
+                    )
+                if not authority_unchanged:
+                    authority_generation = stable_full_access_check(
+                        locked_target_exists,
+                    )
+                    authority_role_name = role_name
+                    authority_target_exists = locked_target_exists
                 with profiler.span("redis.set_leaf"):
                     self._publish_snapshot(
                         simple_table=simple_table,
@@ -2854,6 +3025,7 @@ class DataWriter:
                         ),
                         durability_batch=durability_batch,
                         one_shot_initial=initial_creation,
+                        authority_generation=authority_generation,
                     )
                 if prev_tombstone_path and prev_tombstone_path != tombstone_path:
                     evict_tombstone(
@@ -2897,9 +3069,12 @@ class DataWriter:
                         except Exception as state_exc:
                             logger.error(lp(
                                 "failed to persist mirror failure state: "
-                                f"{state_exc}"
+                                f"error_type={mirror_error_type(state_exc)}"
                             ))
-                        logger.error(lp(f"mirroring failed after core commit: {e}"))
+                        logger.error(lp(
+                            "mirroring failed after core commit; "
+                            f"stage={stage}, error_type={mirror_error_type(e)}"
+                        ))
                     else:
                         try:
                             self._complete_mirror_publication(
@@ -2920,11 +3095,12 @@ class DataWriter:
                             except Exception as state_exc:
                                 logger.error(lp(
                                     "failed to persist mirror completion error: "
-                                    f"{state_exc}"
+                                    f"error_type={mirror_error_type(state_exc)}"
                                 ))
                             logger.error(lp(
                                 "mirror data published but durable completion "
-                                f"state failed: {e}"
+                                "state failed; "
+                                f"error_type={mirror_error_type(e)}"
                             ))
                 mark("mirror")
 
@@ -2974,7 +3150,9 @@ class DataWriter:
                 result_tuple = (total_columns, total_rows, inserted, deleted)
 
         except Exception as e:
-            logger.error(lp(f"write() failed: {e!s}"))
+            logger.error(lp(
+                f"write() failed; error_type={mirror_error_type(e)}"
+            ))
             raise
         finally:
             try:
@@ -3042,9 +3220,14 @@ class DataWriter:
                     monitor.log_metric(stats_payload)
         except MonitoringDurabilityError as me:
             monitoring_error = me
-            logger.error(lp(f"monitoring durability/backpressure failure: {me}"))
+            logger.error(lp(
+                "monitoring durability/backpressure failure; "
+                f"error_type={mirror_error_type(me)}"
+            ))
         except Exception as me:
-            logger.error(lp(f"monitoring enqueue failed: {me}"))
+            logger.error(lp(
+                f"monitoring enqueue failed; error_type={mirror_error_type(me)}"
+            ))
 
         # ---------- AUDIT LOG ----------
         try:
@@ -3053,6 +3236,8 @@ class DataWriter:
                 _audit_emit(
                     category=EventCategory.DATA_MUTATION, action=Actions.DATA_WRITE,
                     organization=self.super_table.organization,
+                    actor_id=getattr(self, "audit_actor_id", ""),
+                    actor_username=getattr(self, "audit_actor_username", ""),
                     super_name=self.super_table.super_name,
                     resource_type="table", resource_id=simple_name,
                     detail=make_detail(
@@ -3061,11 +3246,13 @@ class DataWriter:
                         role_name=role_name, delete_only=delete_only,
                     ),
                 )
+        except AuditEncryptionError:
+            raise
         except Exception:
-            pass  # Never fail a write due to audit
+            pass  # Ordinary audit delivery remains best-effort post-commit.
 
         if monitoring_error is not None:
-            failure = MonitoringPostCommitError(
+            monitoring_failure = MonitoringPostCommitError(
                 organization=self.super_table.organization,
                 super_name=self.super_table.super_name,
                 table_name=simple_name,
@@ -3074,10 +3261,13 @@ class DataWriter:
                 cause=monitoring_error,
             )
             if mirror_error is not None:
-                failure.mirror_error = mirror_error
-            raise failure from monitoring_error
+                monitoring_failure.mirror_error = RuntimeError(
+                    "mirror publication also failed; "
+                    f"error_type={mirror_error_type(mirror_error)}"
+                )
+            raise monitoring_failure from None
         if mirror_error is not None:
-            failure = MirrorPublicationError(
+            mirror_failure = MirrorPublicationError(
                 organization=self.super_table.organization,
                 super_name=self.super_table.super_name,
                 table_name=simple_name,
@@ -3087,7 +3277,7 @@ class DataWriter:
                 core_result=result_tuple,
                 cause=mirror_error,
             )
-            raise failure from mirror_error
+            raise mirror_failure from None
         return result_tuple
 
     def compact(
@@ -3265,7 +3455,39 @@ class DataWriter:
                 role_name=role_name,
                 table_name=simple_name,
             )
-            check_write_access(**access_args)
+            sample_authority_generation = getattr(
+                type(self.catalog), "sample_write_authority_generation", None,
+            )
+            validate_authority_generation = getattr(
+                type(self.catalog), "validate_write_authority_generation", None,
+            )
+
+            def stable_full_access_check():
+                """Authorize inside one unchanged catalog-generation window."""
+                if not (
+                    callable(sample_authority_generation)
+                    and callable(validate_authority_generation)
+                ):
+                    check_write_access(**access_args)
+                    return None
+                for _attempt in range(3):
+                    generation = self.catalog.sample_write_authority_generation(
+                        self.super_table.organization,
+                        self.super_table.super_name,
+                    )
+                    check_write_access(**access_args)
+                    if self.catalog.validate_write_authority_generation(
+                        self.super_table.organization,
+                        self.super_table.super_name,
+                        generation,
+                    ) is True:
+                        return generation
+                raise PermissionError(
+                    "Compaction authorization changed continuously during validation"
+                )
+
+            authority_generation = stable_full_access_check()
+            authority_role_name = role_name
             mark("access")
 
             # --- Per-simple Redis lock ----------------------------------------
@@ -3286,7 +3508,19 @@ class DataWriter:
             role_name = current_authorized_role()
             result["role_name"] = role_name
             access_args["role_name"] = role_name
-            check_write_access(**access_args)
+            authority_unchanged = False
+            if authority_generation is not None and role_name == authority_role_name:
+                authority_unchanged = (
+                    self.catalog.validate_write_authority_generation(
+                        self.super_table.organization,
+                        self.super_table.super_name,
+                        authority_generation,
+                    )
+                    is True
+                )
+            if not authority_unchanged:
+                authority_generation = stable_full_access_check()
+                authority_role_name = role_name
 
             mutation_fence = getattr(
                 type(self.catalog), "check_table_mutation_allowed", None,
@@ -3756,6 +3990,7 @@ class DataWriter:
                         if last_simple_table.get("stats_file") else None
                     ),
                     validation_out=stats_validation_out,
+                    storage=self.super_table.storage,
                 )
                 last_simple_table["stats_file"] = stats_path
                 last_simple_table["stats_rows"] = (
@@ -3801,7 +4036,22 @@ class DataWriter:
                 role_name = current_authorized_role()
                 result["role_name"] = role_name
                 access_args["role_name"] = role_name
-                check_write_access(**access_args)
+                authority_unchanged = False
+                if (
+                    authority_generation is not None
+                    and role_name == authority_role_name
+                ):
+                    authority_unchanged = (
+                        self.catalog.validate_write_authority_generation(
+                            self.super_table.organization,
+                            self.super_table.super_name,
+                            authority_generation,
+                        )
+                        is True
+                    )
+                if not authority_unchanged:
+                    authority_generation = stable_full_access_check()
+                    authority_role_name = role_name
                 self._publish_snapshot(
                     simple_table=simple_table,
                     simple_name=simple_name,
@@ -3813,6 +4063,7 @@ class DataWriter:
                     now_ms=now_ms,
                     mirrors=enabled_mirrors,
                     durability_batch=durability_batch,
+                    authority_generation=authority_generation,
                 )
                 durability_batch_committed = True
                 if (
@@ -3856,9 +4107,12 @@ class DataWriter:
                         except Exception as state_exc:
                             logger.error(lp(
                                 "failed to persist mirror failure state: "
-                                f"{state_exc}"
+                                f"error_type={mirror_error_type(state_exc)}"
                             ))
-                        logger.error(lp(f"mirroring failed after core commit: {e}"))
+                        logger.error(lp(
+                            "mirroring failed after core commit; "
+                            f"stage={stage}, error_type={mirror_error_type(e)}"
+                        ))
                     else:
                         try:
                             self._complete_mirror_publication(
@@ -3879,11 +4133,12 @@ class DataWriter:
                             except Exception as state_exc:
                                 logger.error(lp(
                                     "failed to persist mirror completion error: "
-                                    f"{state_exc}"
+                                    f"error_type={mirror_error_type(state_exc)}"
                                 ))
                             logger.error(lp(
                                 "mirror data published but durable completion "
-                                f"state failed: {e}"
+                                "state failed; "
+                                f"error_type={mirror_error_type(e)}"
                             ))
                 mark("mirror")
 
@@ -3902,7 +4157,9 @@ class DataWriter:
                 ))
 
         except Exception as e:
-            logger.error(lp(f"compact() failed: {e!s}"))
+            logger.error(lp(
+                f"compact() failed; error_type={mirror_error_type(e)}"
+            ))
             raise
         finally:
             try:
@@ -3956,9 +4213,14 @@ class DataWriter:
                     monitor.log_metric(stats_payload)
         except MonitoringDurabilityError as me:
             monitoring_error = me
-            logger.error(lp(f"monitoring durability/backpressure failure: {me}"))
+            logger.error(lp(
+                "monitoring durability/backpressure failure; "
+                f"error_type={mirror_error_type(me)}"
+            ))
         except Exception as me:
-            logger.error(lp(f"monitoring enqueue failed: {me}"))
+            logger.error(lp(
+                f"monitoring enqueue failed; error_type={mirror_error_type(me)}"
+            ))
 
         # ---------- AUDIT LOG ----------
         try:
@@ -3966,6 +4228,8 @@ class DataWriter:
                 category=EventCategory.DATA_MUTATION,
                 action=Actions.DATA_WRITE,
                 organization=self.super_table.organization,
+                actor_id=getattr(self, "audit_actor_id", ""),
+                actor_username=getattr(self, "audit_actor_username", ""),
                 super_name=self.super_table.super_name,
                 resource_type="table",
                 resource_id=simple_name,
@@ -3980,11 +4244,13 @@ class DataWriter:
                     role_name=role_name,
                 ),
             )
+        except AuditEncryptionError:
+            raise
         except Exception:
             pass
 
         if monitoring_error is not None:
-            failure = MonitoringPostCommitError(
+            monitoring_failure = MonitoringPostCommitError(
                 organization=self.super_table.organization,
                 super_name=self.super_table.super_name,
                 table_name=simple_name,
@@ -3993,10 +4259,13 @@ class DataWriter:
                 cause=monitoring_error,
             )
             if mirror_error is not None:
-                failure.mirror_error = mirror_error
-            raise failure from monitoring_error
+                monitoring_failure.mirror_error = RuntimeError(
+                    "mirror publication also failed; "
+                    f"error_type={mirror_error_type(mirror_error)}"
+                )
+            raise monitoring_failure from None
         if mirror_error is not None:
-            failure = MirrorPublicationError(
+            mirror_failure = MirrorPublicationError(
                 organization=self.super_table.organization,
                 super_name=self.super_table.super_name,
                 table_name=simple_name,
@@ -4006,7 +4275,7 @@ class DataWriter:
                 core_result=result,
                 cause=mirror_error,
             )
-            raise failure from mirror_error
+            raise mirror_failure from None
         return result
 
     def validation(self, dataframe: DataFrame, simple_name: str, overwrite_columns: list, newer_than: str = None, delete_only: bool = False):

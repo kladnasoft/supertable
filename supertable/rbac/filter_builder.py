@@ -18,10 +18,27 @@ def _sanitize_column(col: str, quote_char: str = '"') -> str:
     """Validate and quote a column name used in RBAC filters."""
     if quote_char not in ('"', '`'):
         raise ValueError("Unsupported RBAC identifier quote")
+    if not isinstance(col, str):
+        raise ValueError("Invalid column name in RBAC filter")
     col = col.strip()
     if not col or not _SAFE_COLUMN_RE.fullmatch(col):
-        raise ValueError(f"Invalid column name in RBAC filter: {col!r}")
+        raise ValueError("Invalid column name in RBAC filter")
     return f"{quote_char}{col}{quote_char}"
+
+
+def _sanitize_table_identifier(table_name: str, quote_char: str = '"') -> str:
+    """Validate and quote a bare SimpleTable name used in an RBAC query."""
+    if quote_char not in ('"', '`'):
+        raise ValueError("Unsupported RBAC identifier quote")
+    if not isinstance(table_name, str):
+        raise ValueError("Invalid table name in RBAC filter")
+    table_name = table_name.strip()
+    if (
+        not 1 <= len(table_name) <= 128
+        or not _SAFE_COLUMN_RE.fullmatch(table_name)
+    ):
+        raise ValueError("Invalid table name in RBAC filter")
+    return f"{quote_char}{table_name}{quote_char}"
 
 
 def _sanitize_value(val: str) -> str:
@@ -30,7 +47,7 @@ def _sanitize_value(val: str) -> str:
     escaped = str(val).replace("'", "''")
     # Block semicolons, comment markers, and other injection vectors
     if any(c in escaped for c in (";", "--", "/*", "*/")):
-        raise ValueError(f"Disallowed characters in RBAC filter value: {val!r}")
+        raise ValueError("Disallowed characters in RBAC filter value")
     return escaped
 
 
@@ -40,18 +57,20 @@ def _sanitize_operation(op: str) -> str:
         raise ValueError("RBAC filter operation must be a string")
     normalized = op.strip().upper()
     if normalized not in _ALLOWED_OPS:
-        raise ValueError(f"Invalid operation in RBAC filter: {op!r}")
+        raise ValueError("Invalid operation in RBAC filter")
     return normalized
 
 
-def format_column_list(columns):
+def format_column_list(columns, quote_char='"'):
+    if quote_char not in ('"', '`'):
+        raise ValueError("Unsupported RBAC identifier quote")
     if not isinstance(columns, list):
         raise ValueError("RBAC columns must be a list")
     if columns == ["*"]:
         return "*"
     if not columns or "*" in columns:
         raise ValueError("RBAC wildcard must be the only selected column")
-    quoted = [_sanitize_column(column) for column in columns]
+    quoted = [_sanitize_column(column, quote_char) for column in columns]
     return ",".join(f'{column} as {column}' for column in quoted)
 
 
@@ -98,7 +117,7 @@ class FilterBuilder():
                         f"NOT ({self.json_to_sql_clause(val, _depth + 1)})"
                     )
                 elif not isinstance(val, dict):
-                    raise ValueError(f"Invalid RBAC predicate for column {key!r}")
+                    raise ValueError("Invalid RBAC predicate for column")
                 elif "range" in val:
                     if set(val) != {"range"}:
                         raise ValueError("RBAC range cannot contain extra fields")
@@ -126,7 +145,7 @@ class FilterBuilder():
                             safe_val = _sanitize_value(cond["value"])
                             range_parts.append(f"{safe_col} {safe_op} '{safe_val}'")
                         elif val_type == "reference":
-                            safe_ref = self._column(str(cond["value"]))
+                            safe_ref = self._column(cond["value"])
                             range_parts.append(f"{safe_col} {safe_op} {safe_ref}")
                         else:
                             raise ValueError(
@@ -136,7 +155,7 @@ class FilterBuilder():
                 else:
                     safe_col = self._column(key)
                     if not {"operation", "type"}.issubset(val):
-                        raise ValueError(f"Incomplete RBAC predicate for {key!r}")
+                        raise ValueError("Incomplete RBAC predicate")
                     operation = _sanitize_operation(val["operation"])
                     val_type = val["type"]
                     if val_type == "null":
@@ -156,7 +175,7 @@ class FilterBuilder():
                         value = "NULL"
                     elif val_type == "value":
                         if "value" not in val:
-                            raise ValueError(f"RBAC predicate for {key!r} has no value")
+                            raise ValueError("RBAC predicate has no value")
                         allowed_fields = {"operation", "type", "value"}
                         if operation in _LIKE_OPS:
                             allowed_fields.add("escape")
@@ -206,21 +225,24 @@ class FilterBuilder():
                                 "type, and value"
                             )
                         if "value" not in val:
-                            raise ValueError(f"RBAC predicate for {key!r} has no reference")
+                            raise ValueError("RBAC predicate has no reference")
                         if operation not in (_COMPARISON_OPS | _LIKE_OPS):
                             raise ValueError(
                                 f"RBAC {operation} does not accept a column reference"
                             )
-                        value = self._column(str(val["value"]))
+                        value = self._column(val["value"])
                     else:
-                        raise ValueError(f"Invalid RBAC value type: {val_type!r}")
+                        raise ValueError("Invalid RBAC value type")
                     clauses.append(f"{safe_col} {operation} {value}")
             return " AND ".join(clauses)
         else:
             raise ValueError("RBAC filter must be an object or list")
 
     def build_filter_query(self, table_name, columns, filters):
-        column_list = format_column_list(columns)
+        safe_table = _sanitize_table_identifier(
+            table_name, self.identifier_quote,
+        )
+        column_list = format_column_list(columns, self.identifier_quote)
 
         if filters == ["*"]:
             where_clause = ""
@@ -230,4 +252,4 @@ class FilterBuilder():
                 raise ValueError("RBAC filter produced no predicate")
             where_clause = f"\nWHERE {predicates}"
 
-        return f"SELECT {column_list}\nFROM {table_name}{where_clause}"
+        return f"SELECT {column_list}\nFROM {safe_table}{where_clause}"

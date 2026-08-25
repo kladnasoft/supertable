@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import traceback
 
 import pytest
 
@@ -177,6 +178,27 @@ def test_malformed_or_unsupported_direct_redis_url_fails_closed(
         redis_connector.RedisOptions()
 
 
+@pytest.mark.parametrize(
+    "redis_url",
+    [
+        "redis://user:REDIS_PASSWORD_DO_NOT_LOG@[broken/0",
+        "redis://user:REDIS_PASSWORD_DO_NOT_LOG@redis.example:not-a-port/0",
+        "redis://user:%FF@redis.example/0",
+    ],
+)
+def test_malformed_direct_redis_url_never_reflects_credentials(redis_url):
+    with pytest.raises(ValueError) as caught:
+        redis_connector._parse_direct_redis_url(redis_url)
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value), caught.value, caught.value.__traceback__,
+        )
+    )
+    assert "REDIS_PASSWORD_DO_NOT_LOG" not in rendered
+    assert "%FF" not in rendered
+
+
 def test_sentinel_mode_retains_split_connection_contract(monkeypatch):
     monkeypatch.setattr(
         redis_connector,
@@ -287,3 +309,15 @@ def test_client_cache_identity_reflects_url_derived_endpoint(monkeypatch):
     assert redis_connector._options_cache_key(first) != redis_connector._options_cache_key(
         second
     )
+
+
+def test_direct_client_has_bounded_connect_and_command_timeouts(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        redis_connector.redis,
+        "Redis",
+        lambda **kwargs: captured.update(kwargs) or object(),
+    )
+    redis_connector._build_redis_client(_options(), True)
+    assert captured["socket_timeout"] == 0.5
+    assert captured["socket_connect_timeout"] == 0.5

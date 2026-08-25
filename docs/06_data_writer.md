@@ -2,13 +2,13 @@
 
 ## Business Context
 
-The Data Writer is the core write-path component of SuperTable. Every row that enters the data lake -- whether from an API upload, a staging area commit, or a pipe transformation -- flows through the `DataWriter` class. It is responsible for turning raw Arrow tables into versioned, deduplicated, compressed Parquet files while maintaining snapshot isolation, catalog consistency, and optional mirroring to downstream formats.
+The Data Writer is the core write-path component of SuperTable. Every row that enters the data lake -- whether from an API upload, a staging area commit, or a pipe transformation -- flows through the `DataWriter` class. It turns raw Arrow tables into versioned, compressed, immutable Parquet files and publishes snapshot-pinned deletion vectors while maintaining snapshot isolation, catalog consistency, and optional mirroring to downstream formats.
 
 The write pipeline is designed around three principles:
 
 1. **Atomicity** -- a write either succeeds completely (new snapshot, updated catalog, optional mirror) or fails without side-effects. A Redis-backed per-table lock serialises concurrent writers.
 2. **Idempotency** -- the `newer_than` parameter lets callers replay the same data safely; stale or duplicate rows are silently dropped.
-3. **Incremental merge** -- only files whose key ranges overlap with incoming data are rewritten. Non-overlapping small files accumulate until a compaction threshold is reached, at which point they are merged toward a compressed-byte output target. Compaction spills each source object, decodes one physical row at a time, and separately caps decoded bytes, Arrow batches/rows, and pending Polars frames/rows.
+3. **Merge on read** -- ordinary deletes and upserts append immutable data and record the exact replaced physical rows in a deletion vector. Physical rewrites happen at explicit or threshold compaction, where bounded packing separately caps decoded bytes, Arrow batches/rows, and pending Polars frames/rows.
 
 ---
 
@@ -32,7 +32,7 @@ Creates a writer bound to a specific SuperTable within an organization. Internal
 
 - `self.super_table` -- a `SuperTable(super_name, organization)` instance representing the logical dataset.
 - `self.catalog` -- a `RedisCatalog()` for metadata operations (lock acquisition, leaf pointer updates, root bumps).
-- `self._table_config_cache` -- an in-process dict that caches per-table dedup configuration to avoid repeated Redis round-trips.
+- `self._table_config_cache` -- an in-process copy of per-table write and deletion-vector configuration used for observability; writes refresh the authoritative configuration under the table lease.
 
 ---
 
@@ -59,7 +59,7 @@ def write(
 ### Pipeline Steps
 
 ```
-access_check --> convert --> dedup_ts --> validate --> lock --> snapshot
+access_check --> convert --> validate --> system_ts --> lock --> snapshot
     --> overlap --> newer_than --> process --> update_simple
     --> bump_root --> mirror --> unlock --> monitoring
     --> audit
@@ -73,11 +73,7 @@ Calls `check_write_access()` from the RBAC module to verify the role has write p
 
 Converts the incoming PyArrow table to a Polars `DataFrame` using `polars.from_arrow(data)`. Captures `incoming_rows` and `incoming_columns` for monitoring.
 
-#### 3. Dedup Timestamp Injection (`dedup_ts`)
-
-If the table is configured with `dedup_on_read=True`, a `__timestamp__` column is injected (set to `datetime.now(timezone.utc)`) unless one already exists. The read side uses this column in a `ROW_NUMBER` window to return only the latest row per primary key.
-
-#### 4. Validation (`validate`)
+#### 3. Validation (`validate`)
 
 The `validation()` method enforces structural invariants:
 
@@ -88,8 +84,16 @@ The `validation()` method enforces structural invariants:
 | Name pattern | `^[A-Za-z_][A-Za-z0-9_]*$` |
 | Overwrite columns type | Must be a list, not a string |
 | Overwrite columns presence | All columns must exist in the DataFrame |
-| Delete-only guard | `delete_only=True` requires `overwrite_columns` |
+| Delete-only mode | With `overwrite_columns`, deletes matching rows; without them, deletes the whole table |
 | Newer-than guard | `newer_than` must be a valid column name string and `overwrite_columns` must be set |
+
+#### 4. System Timestamp Injection (`dedup_ts`)
+
+Every non-delete write injects the system-owned `__timestamp__` using the
+current UTC time. A caller-supplied value is deliberately overwritten. The
+column drives date partitioning and internal layout; `newer_than` is the
+supported caller-controlled conflict-resolution column. Readers do not run a
+key-based `ROW_NUMBER()` collapse.
 
 #### 5. Lock Acquisition (`lock`)
 
@@ -118,37 +122,48 @@ The function then applies `prune_not_overlapping_files_by_threshold()` which gat
 
 #### 8. Newer-Than Filtering (`newer_than`)
 
-When `newer_than` is specified, `filter_stale_incoming_rows()` joins incoming data against existing overlapping files on `overwrite_columns`, comparing the `newer_than` column. Rows where the existing value is >= the incoming value are dropped as stale/replayed. If all rows are stale, the write short-circuits (no file I/O), but still releases the lock and emits monitoring.
+`resolve_overwrite_writes()` probes the overlapping candidates once. It first
+applies the predecessor deletion vector, then compares live existing rows with
+the incoming rows on `overwrite_columns`. When `newer_than` is specified, an
+incoming row whose existing value is greater than or equal to its value is
+dropped as stale/replayed. If all rows are stale, the write short-circuits (no
+new data or deletion-vector artifact) but still releases the lock and emits
+monitoring. The same probe returns the exact live physical rows replaced by the
+surviving input.
 
-A `file_cache` dict is populated during this step so that Parquet files read here are not re-read during the processing step.
+#### 9. Deletion-Vector Resolution
 
-#### 9. Tombstone / Soft-Delete Logic
+Deletes are physical-row decisions, not persistent business-key markers.
+`resolve_overwrite_writes()` returns the live `(file, __rowid__)` pairs matched
+by each targeted delete or surviving upsert, after excluding rows already in
+the predecessor vector. A pure append creates no deletion-vector entries.
 
-When `dedup_on_read` is enabled and `primary_keys` are configured:
+- A targeted delete publishes the matched pairs and writes no data row.
+- An upsert publishes those pairs and writes each surviving incoming row with a
+  fresh `__rowid__` in a new immutable data file.
+- A reinsertion never removes the predecessor entry: the old physical row stays
+  deleted while the fresh physical identity remains visible.
+- A whole-table delete sunsets every current data resource and clears the
+  vector rather than constructing an O(rows) intermediate artifact.
 
-**Delete-only with tombstones** (`delete_only=True` and `use_tombstones=True`):
-- Extracts key tuples from the incoming DataFrame via `extract_key_tuples()`.
-- Appends them to the existing tombstone list (deduplicated).
-- No Parquet files are read or written (purely metadata).
-- If the tombstone count reaches the compaction threshold (default 1000, configurable via `tombstone_compact_total`), `compact_tombstones()` physically removes the tombstoned rows from all affected Parquet files and clears the tombstone list.
+The vector is sealed with its row count and digest. Its logical rows contain
+`__file__` and `__rowid__`; readers anti-join on both values, so equal row IDs
+from different files cannot hide each other.
 
-**Reconciliation on insert/overwrite**:
-- When incoming data has keys matching existing tombstones, those tombstone entries are removed via `reconcile_tombstones()` so the newly-written rows become visible.
+#### 10. Immutable Publication and Compaction (`process`)
 
-**Physical delete fallback** (`delete_only=True` without `dedup_on_read`):
-- Falls back to `process_delete_only()`, which rewrites each overlapping file independently with the matching rows removed.
+The data-file write and deletion-vector publication use disjoint locations and
+may run concurrently. With no new deleted pairs, the snapshot reuses the
+predecessor vector. Otherwise the writer publishes an immutable successor:
+formats 1 and 3 use a direct Parquet artifact, while format 2 uses a sealed JSON
+manifest plus immutable Parquet segments.
 
-#### 10. Processing -- Merge and Rewrite (`process`)
-
-For non-delete writes, `process_overlapping_files()` executes a three-phase merge:
-
-**Phase 1 -- Compaction**: Sends selected `has_overlap=False` files through the fused compactor. Each source is version-sealed into a disk spill and decoded one physical row at a time. The packer concatenates each slice once and flushes on the compressed-output target, decoded-byte budget, 128-frame cap, or 1,048,576-row cap. A single unusually wide row is the only decoded-byte exception.
-
-**Phase 2 -- Overlap merge** (`process_files_with_overlap`): For each `has_overlap=True` file, performs an anti-join on the composite overwrite key to drop rows being overwritten, then concatenates the survivors with the merged buffer. Uses `2x MAX_MEMORY_CHUNK_SIZE` as the spill threshold. Files where no rows are actually deleted (false positive from stats) are skipped and tracked separately.
-
-**Phase 3 -- Skipped-file compaction**: When the number of skipped files (overlap=True but zero actual matches) exceeds `MAX_OVERLAPPING_FILES`, they are all merged into the output buffer to prevent small-file accumulation.
-
-A final flush writes any remaining rows.
+Ordinary writes do not rewrite every overlapping source file. When the vector
+reaches `max_tombstone_rows` (default 1,000,000), targeted compaction physically
+anti-joins its recorded row IDs from the named data files, writes survivor
+files, sunsets only the successfully replaced resources, and publishes any
+residual vector entries. Explicit compaction drains an active vector regardless
+of that lazy write threshold.
 
 #### 11. Update Snapshot (`update_simple`)
 
@@ -256,13 +271,11 @@ print(stats["files_before"], "→", stats["files_after"])
 3. **Snapshot read** — uses `SimpleTable(..., create_if_missing=False)`
    so a missing table raises `TableNotFoundError` instead of being
    bootstrapped. Compaction never creates a table.
-4. **Tombstone compaction** — runs `compact_tombstones()` to physically
-   remove soft-deleted rows from affected parquet files.
-   - `force_tombstones=True` (default) bypasses
-     `tombstone_compact_total`: clean *now* regardless of count.
-   - `force_tombstones=False` honors the natural threshold (same gate
-     as the delete-only path in `write()`).
-   - Skipped entirely when no primary keys / no tombstones.
+4. **Deletion-vector compaction** — drains every active deletion vector before
+   small-file compaction, physically removing the identified rows from affected
+   Parquet files. `force_tombstones` is retained for API and lineage
+   compatibility, but explicit `compact()` drains regardless of that flag or
+   `max_tombstone_rows`. It is skipped only when no active vector exists.
 5. **Small-file compaction** — calls `processing.compact_resources()`:
    - `small_only=True` (default): only files strictly smaller than
      `max_memory_chunk_size` are considered. Large files are
@@ -291,8 +304,8 @@ sequence is identical.
 
 ### Short-circuit
 
-When `compact_resources` finds nothing to merge **and** tombstones
-either don't run or don't produce work, the method returns early
+When `compact_resources` finds nothing to merge **and** the deletion-vector
+drain produces no work, the method returns early
 without writing a new snapshot. `files_before == files_after` and
 no leaf-CAS / root-bump / mirror calls are made.
 
@@ -481,43 +494,68 @@ All Parquet files are written with:
 
 ---
 
-## Tombstone System
+## Deletion-Vector System
 
-Tombstones provide soft-delete semantics for tables with `dedup_on_read` enabled.
+The code retains `tombstone` in metadata and helper names for compatibility,
+but the stored object is a physical deletion vector. Each row identifies an
+exact immutable source row by `(__file__, __rowid__)`; no primary-key tuple is
+persisted as a future delete rule.
 
 ### Key Functions
 
 | Function | Purpose |
 |---|---|
-| `extract_key_tuples(df, primary_keys)` | Extracts unique composite-key tuples from a DataFrame for tombstone storage |
-| `reconcile_tombstones(tombstone_keys, incoming_keys)` | Removes tombstone entries that match newly-written keys (resurrection) |
-| `compact_tombstones(snapshot, primary_keys, data_dir, compression_level, table_config)` | Physically removes tombstoned rows from Parquet files when the threshold is breached |
-| `_tombstone_threshold(table_config)` | Returns the compaction threshold (default: `_DEFAULT_TOMBSTONE_COMPACT_TOTAL = 1000`) |
-| `_tombstone_overlaps_stats(tombstone_df, primary_keys, stats)` | Uses column stats to skip files that provably cannot contain tombstoned keys |
+| `resolve_overwrite_writes(...)` | Applies the predecessor vector, filters stale input, and returns the exact live `(file, __rowid__)` pairs replaced by surviving keys |
+| `identify_deleted_rowids(...)` | Conservative projected fallback that derives matching physical pairs from candidate files |
+| `build_tombstone_file(...)` | Builds the legacy format-1 immutable Parquet successor |
+| `build_tombstone_v2(...)` | Appends a sealed Parquet delta segment and publishes an immutable JSON manifest |
+| `build_tombstone_v3(...)` | Builds one immutable single-Parquet successor from the pinned predecessor and proved delta |
+| `compact_tombstones(...)` | Physically removes recorded rows from their named files and returns any entries that could not be safely consumed |
 
 ### Lifecycle
 
-1. **Soft delete**: Key tuples are appended to the `tombstones.deleted_keys` list in the snapshot metadata. No Parquet files are touched.
-2. **Read filtering**: The read side excludes tombstoned keys when building query results.
-3. **Reconciliation**: When new data arrives for a previously-deleted key, the tombstone entry is removed so the new row becomes visible.
-4. **Compaction**: When `len(deleted_keys) >= tombstone_compact_total`, all affected Parquet files are rewritten with the tombstoned rows physically removed, and the tombstone list is cleared.
+1. **Resolve**: A targeted delete or upsert maps its surviving business-key
+   matches to live physical `(file, __rowid__)` pairs after applying the
+   predecessor vector.
+2. **Publish**: Those pairs extend an immutable deletion-vector artifact. A
+   changed vector therefore performs Parquet and/or manifest storage I/O; it is
+   not an inline metadata key list.
+3. **Read**: The reader validates the snapshot-pinned path, row count, digest,
+   format, and resource membership, then anti-joins on the composite physical
+   identity.
+4. **Reinsert**: New data receives a fresh row ID. The old entry remains in the
+   vector and cannot hide the new physical row, even when the business key is
+   identical.
+5. **Compact**: `write()` drains when the vector reaches
+   `max_tombstone_rows` (default 1,000,000); explicit `compact()` always drains
+   an active vector. Only successfully rewritten source groups are removed
+   from the vector, so failures cannot resurrect rows.
+6. **Delete all**: A whole-table delete sunsets every data resource and clears
+   the vector without constructing an O(rows) artifact.
 
 ### Tombstone Storage Format
 
-Tombstones are stored in the snapshot JSON:
+The snapshot stores an immutable artifact pointer and its seals at top level:
 
 ```json
 {
-  "tombstones": {
-    "primary_keys": ["customer_id", "order_id"],
-    "deleted_keys": [
-      ["CUST-001", "ORD-100"],
-      ["CUST-002", "ORD-200"]
-    ],
-    "total_tombstones": 2
-  }
+  "tombstone": "acme/warehouse/orders/tombstone/deleted_abcd.parquet",
+  "tombstone_rows": 2,
+  "tombstone_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "tombstone_format": 1
 }
 ```
+
+For formats 1 and 3, `tombstone` names a direct Parquet object whose logical
+schema is:
+
+```json
+{"__file__": "acme/warehouse/orders/data/part-0001.parquet", "__rowid__": 123}
+```
+
+Format 2 instead points to a sealed JSON manifest containing bounded immutable
+Parquet segment descriptors. Every snapshot pins the exact root and segment
+identities it reads; artifacts are never mutated in place.
 
 ---
 

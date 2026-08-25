@@ -56,6 +56,7 @@ from supertable.engine.engine_common import (
     TIMESTAMP_COL,
     _load_v3_tombstone_frame,
     rewrite_query_with_hashed_tables,
+    safe_sql_diagnostic,
     tombstone_data_paths,
 )
 from supertable.processing import (
@@ -86,6 +87,10 @@ from supertable.engine.island_spill import (
     external_sort,
 )
 from supertable.storage.storage_interface import ObjectMetadata
+from supertable.utils.diagnostic_redaction import (
+    local_path_metadata,
+    safe_exception_type,
+)
 from supertable.tombstone_manifest_v2 import (
     TOMBSTONE_FORMAT_V2,
     TOMBSTONE_FORMAT_V3,
@@ -136,10 +141,10 @@ def _validate_island_tombstone_definition(tomb_def) -> bool:
             format_present=tombstone_format is not None,
             tombstone_format=tombstone_format,
         )
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError):
         raise IslandIntegrityError(
             "invalid deletion-vector snapshot state"
-        ) from exc
+        ) from None
 
     if pointer is None:
         if cache_key is not None or segments != ():
@@ -164,10 +169,10 @@ def _validate_island_tombstone_definition(tomb_def) -> bool:
             )
     try:
         tombstone_data_paths(tomb_def)
-    except Exception as exc:
+    except Exception:
         raise IslandIntegrityError(
             "invalid deletion-vector representation"
-        ) from exc
+        ) from None
     return True
 
 
@@ -1825,7 +1830,10 @@ class IslandDB:
         try:
             root = self._query_root(parser)
         except Exception as exc:
-            return IslandCapability(False, (f"SQL parse failed: {exc}",))
+            return IslandCapability(
+                False,
+                (f"SQL parse failed; error_type={safe_exception_type(exc)}",),
+            )
         if not isinstance(root, exp.Select):
             reasons.append("only one top-level SELECT is native")
 
@@ -3395,10 +3403,10 @@ class IslandDB:
                     expected_rows=rows,
                     allowed_files=set(allowed),
                 )
-            except Exception as exc:
+            except Exception:
                 raise IslandIntegrityError(
                     "required v2 deletion vector failed validation"
-                ) from exc
+                ) from None
         if tombstone_format == TOMBSTONE_FORMAT_V3:
             # _validate_island_tombstone_definition() proves that active v3
             # snapshot resource keys are a non-empty sequence of strings.
@@ -3414,10 +3422,10 @@ class IslandDB:
                     ),
                 )
                 return frame
-            except Exception as exc:
+            except Exception:
                 raise IslandIntegrityError(
                     "required v3 deletion vector failed exact-byte validation"
-                ) from exc
+                ) from None
         identity_source = cache_key or os.path.realpath(path)
         cache_identity = (
             f"islanddb-dv-v1:{self._artifact_cache_namespace}:{identity_source}:"
@@ -3784,7 +3792,10 @@ class IslandDB:
             os.replace(tmp, target)
             succeeded = True
         except Exception as exc:  # profiling must never break a read
-            logger.debug("[islanddb] profile write skipped: %s", exc)
+            logger.debug(
+                "[islanddb] profile write skipped; error_type=%s",
+                safe_exception_type(exc),
+            )
             if tmp is not None:
                 try:
                     tmp.unlink(missing_ok=True)
@@ -3896,7 +3907,14 @@ class IslandDB:
         if casts:
             lazy_result = lazy_result.with_columns(casts)
         optimized_plan = lazy_result.explain(optimized=True)
-        logger.debug("%s[islanddb] executing native query: %s", log_prefix, query)
+        if logger.isEnabledFor(10):
+            sql_digest, sql_bytes = safe_sql_diagnostic(query)
+            logger.debug(
+                "%s[islanddb] executing sql_sha256=%s sql_bytes=%d",
+                log_prefix,
+                sql_digest,
+                sql_bytes,
+            )
         return lazy_result, original_root, query, optimized_plan
 
     @staticmethod
@@ -4267,11 +4285,15 @@ class IslandDB:
             input_schema, input_batches, input_plan = direct_input
             parser.executing_query = pre_sql
             timer_capture("CREATING_REFLECTION")
-            logger.debug(
-                "%s[islanddb] executing direct Arrow projection: %s",
-                log_prefix,
-                pre_sql,
-            )
+            if logger.isEnabledFor(10):
+                sql_digest, sql_bytes = safe_sql_diagnostic(pre_sql)
+                logger.debug(
+                    "%s[islanddb] executing direct Arrow projection "
+                    "sql_sha256=%s sql_bytes=%d",
+                    log_prefix,
+                    sql_digest,
+                    sql_bytes,
+                )
         else:
             lazy_input, _, _, input_plan = self._prepare_lazy_query(
                 reflection,
@@ -4499,8 +4521,8 @@ class IslandDB:
         if deadline_monotonic is not None:
             try:
                 caller_deadline = float(deadline_monotonic)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError("query deadline must be finite") from exc
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("query deadline must be finite") from None
             if not math.isfinite(caller_deadline):
                 raise ValueError("query deadline must be finite")
 
@@ -4746,7 +4768,9 @@ class IslandDB:
             # sampler construction must never escape this boundary.
             try:
                 logger.debug(
-                    "[islanddb] process telemetry could not start: %s", exc,
+                    "[islanddb] process telemetry could not start; "
+                    "error_type=%s",
+                    safe_exception_type(exc),
                 )
             except BaseException:
                 pass
@@ -4791,7 +4815,9 @@ class IslandDB:
                         pass
                     try:
                         logger.debug(
-                            "[islanddb] process telemetry unavailable: %s", exc,
+                            "[islanddb] process telemetry unavailable; "
+                            "error_type=%s",
+                            safe_exception_type(exc),
                         )
                     except BaseException:
                         pass
@@ -4900,10 +4926,11 @@ class IslandDB:
                 reservation.release()
                 release_execution_slot()
             if isinstance(exc, SpillDeadlineExceeded):
-                raise execution_timeout_from(exc) from exc
+                raise execution_timeout_from(exc) from None
             raise IslandUnsupportedError(
-                f"bounded spill could not be honored: {exc}"
-            ) from exc
+                "bounded spill could not be honored; "
+                f"error_type={safe_exception_type(exc)}"
+            ) from None
         except BaseException:
             finish_telemetry_no_throw()
             try:
@@ -4939,7 +4966,7 @@ class IslandDB:
                     except StopIteration:
                         break
                     except SpillDeadlineExceeded as exc:
-                        raise execution_timeout_from(exc) from exc
+                        raise execution_timeout_from(exc) from None
                     finally:
                         query_execution_metrics.add_phase(
                             "producer_active_ms",
@@ -4996,7 +5023,10 @@ class IslandDB:
                     if cache_metrics is not None else {}
                 )
             except Exception as exc:
-                logger.debug("[islanddb] cache telemetry skipped: %s", exc)
+                logger.debug(
+                    "[islanddb] cache telemetry skipped; error_type=%s",
+                    safe_exception_type(exc),
+                )
                 combined_cache = {}
             combined_cache.update(range_metrics)
             finished_at = time.perf_counter()
@@ -5082,7 +5112,9 @@ class IslandDB:
                         "triggered": True,
                         "budget_bytes": plan.spill_budget_bytes,
                         "estimated_bytes": plan.estimated_spill_bytes,
-                        "directory": str(self._spill_root),
+                        "directory_metadata": local_path_metadata(
+                            self._spill_root,
+                        ),
                     }
                     if plan.advice == ExecutionAdvice.ISLAND_SPILL else
                     {"triggered": False}
@@ -5204,7 +5236,10 @@ class IslandDB:
             except Exception as exc:
                 # Accommodate instrumentation monkeypatches as defensively as
                 # the production writer: telemetry can never fail a query.
-                logger.debug("[islanddb] profile persistence failed: %s", exc)
+                logger.debug(
+                    "[islanddb] profile persistence failed; error_type=%s",
+                    safe_exception_type(exc),
+                )
                 persist_succeeded = False
             persist_ms = (time.perf_counter() - persist_started) * 1000.0
             profile.profile_persist_ms = persist_ms
@@ -5235,7 +5270,10 @@ class IslandDB:
                     # Observability must not turn a successfully produced query
                     # into an application error or mask the original producer
                     # failure during ArrowBatchStream finalization.
-                    logger.debug("[islanddb] profile finalization skipped: %s", exc)
+                    logger.debug(
+                        "[islanddb] profile finalization skipped; error_type=%s",
+                        safe_exception_type(exc),
+                    )
             finally:
                 try:
                     # Ensure a profile-construction failure cannot strand the
@@ -5287,6 +5325,11 @@ class IslandDB:
             stream._island_release_reservation = release_deferred_resources
             stream._island_finish_profile = finish
             stream._island_execution_metrics = query_execution_metrics
+            # Keep the exact effective (caller/configured) execution boundary
+            # alive through Arrow -> Polars -> pandas materialization. The
+            # producer has already stopped by then, so its iterator checks
+            # cannot cover these potentially blocking facade conversions.
+            setattr(stream, "_island_deadline_monotonic", deadline_monotonic)
         return stream
 
     def execute(
@@ -5300,6 +5343,7 @@ class IslandDB:
         cache_metrics=None,
         _prepared: Optional[IslandPreparedQuery] = None,
         deadline_monotonic: Optional[float] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> pd.DataFrame:
         prepared = _prepared or self.prepare_execution(
             reflection, parser, streaming_result=False,
@@ -5321,16 +5365,38 @@ class IslandDB:
             _defer_reservation_release=True,
             _prepared=prepared,
             deadline_monotonic=deadline_monotonic,
+            cancel_event=cancel_event,
         )
         release = getattr(stream, "_island_release_reservation", lambda: None)
         finish_profile = getattr(stream, "_island_finish_profile", lambda: None)
         execution_metrics = getattr(stream, "_island_execution_metrics", None)
+        materialized_cancel_event = stream.cancel_event
+        materialized_deadline = getattr(
+            stream, "_island_deadline_monotonic", deadline_monotonic,
+        )
+
+        def check_materialized_boundary(stage: str) -> None:
+            if materialized_cancel_event.is_set():
+                raise ResourceReservationCancelled(
+                    f"IslandDB query was cancelled {stage}"
+                )
+            if (
+                materialized_deadline is not None
+                and _monotonic() >= materialized_deadline
+            ):
+                materialized_cancel_event.set()
+                raise IslandExecutionTimeout(
+                    f"IslandDB query deadline expired {stage}"
+                )
+
         facade_started = time.perf_counter()
         try:
+            check_materialized_boundary("before Arrow collection")
             collect_started = time.perf_counter()
             try:
                 with stream:
                     table = stream.collect_table(max_bytes=plan.result_memory_bytes)
+                check_materialized_boundary("after Arrow collection")
             finally:
                 if execution_metrics is not None:
                     execution_metrics.add_phase(
@@ -5340,6 +5406,7 @@ class IslandDB:
             convert_started = time.perf_counter()
             try:
                 result = pl.from_arrow(table)
+                check_materialized_boundary("after Arrow-to-Polars conversion")
             finally:
                 if execution_metrics is not None:
                     execution_metrics.add_phase(
@@ -5350,6 +5417,7 @@ class IslandDB:
             normalize_started = time.perf_counter()
             if isinstance(root, exp.Select):
                 result = self._normalize_aggregate_dtypes(result, root)
+            check_materialized_boundary("after Polars normalization")
             if execution_metrics is not None:
                 execution_metrics.add_phase(
                     "facade_dtype_normalize_ms",
@@ -5358,12 +5426,17 @@ class IslandDB:
             pandas_started = time.perf_counter()
             try:
                 pandas_result = self._to_duckdb_pandas(result)
+                check_materialized_boundary("after Polars-to-pandas conversion")
             finally:
                 if execution_metrics is not None:
                     execution_metrics.add_phase(
                         "facade_polars_to_pandas_ms",
                         (time.perf_counter() - pandas_started) * 1000.0,
                     )
+            # Instrumentation above is deliberately outside the pandas
+            # conversion timer and can run user-supplied telemetry hooks.
+            # Recheck at the last possible boundary before publishing a result.
+            check_materialized_boundary("before returning the pandas result")
             return pandas_result
         except BaseException:
             if execution_metrics is not None:

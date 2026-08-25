@@ -199,6 +199,40 @@ def test_external_sort_rejects_unsealed_float_order(tmp_path):
             )
 
 
+def test_native_group_failure_never_retains_backend_diagnostic() -> None:
+    secret = (
+        "Authorization: Bearer HEADER_TOKEN; "
+        "s3://URL_USER:URL_PASSWORD@bucket/REMOTE_PATH_TOKEN/data.parquet"
+        "?X-Amz-Signature=QUERY_TOKEN"
+    )
+
+    class FailingGroup:
+        def aggregate(self, _functions):
+            raise pa.ArrowNotImplementedError(secret)
+
+    class FailingTable:
+        def group_by(self, _keys, *, use_threads):
+            assert use_threads is True
+            return FailingGroup()
+
+    with pytest.raises(UnsupportedSpillOperation) as caught:
+        spill_module._native_group_aggregate(
+            FailingTable(),
+            ["tenant"],
+            [("value", "sum")],
+            operation="bounded aggregation",
+        )
+
+    rendered = str(caught.value)
+    assert "ArrowNotImplementedError" in rendered
+    assert "HEADER_TOKEN" not in rendered
+    assert "URL_USER" not in rendered
+    assert "URL_PASSWORD" not in rendered
+    assert "REMOTE_PATH_TOKEN" not in rendered
+    assert "QUERY_TOKEN" not in rendered
+    assert caught.value.__cause__ is None
+
+
 def test_external_sort_rejects_single_oversized_input_batch(tmp_path):
     table = pa.table({"payload": ["x" * 1024] * 400, "key": list(range(400))})
     assert table.nbytes > 256 * 1024

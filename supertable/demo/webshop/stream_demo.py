@@ -48,6 +48,7 @@ import pyarrow as pa
 from supertable.config.homedir import initialize_app_home
 from supertable.data_reader import DataReader, Status
 from supertable.data_writer import DataWriter
+from supertable.utils.diagnostic_redaction import safe_exception_type
 from supertable.demo.webshop.core import GenerationConfig, WebshopDataGenerator
 from supertable.demo.webshop.defaults import (
     generated_data_dir,
@@ -178,7 +179,13 @@ def _producer_loop(q, stop, dim_dir: str, seed: int,
                     continue
     except Exception as exc:  # surface fatal generator errors to the consumer
         try:
-            q.put({"error": f"{type(exc).__name__}: {exc}"}, timeout=1.0)
+            q.put(
+                {
+                    "error": "generator failed; "
+                    f"error_type={safe_exception_type(exc)}"
+                },
+                timeout=1.0,
+            )
         except Exception:
             pass
 
@@ -255,8 +262,11 @@ class Streamer:
                           f"(live from SuperTable)")
                     return int(val) + 1
         except Exception as exc:
-            print(f"  bootstrap  : table read failed ({type(exc).__name__}: {exc}); "
-                  f"falling back to local snapshot")
+            print(
+                "  bootstrap  : table read failed; "
+                f"error_type={safe_exception_type(exc)}; "
+                "falling back to local snapshot"
+            )
 
         # 2) Local snapshot fallback (first cold run / offline).
         path = dim_dir / "sessions" / "sessions.parquet"
@@ -313,7 +323,10 @@ class Streamer:
                     overwrite_columns=overwrite_columns,
                 )
             except Exception as exc:  # keep the stream alive, surface the error
-                error = f"{type(exc).__name__}: {exc}"
+                error = (
+                    "stream update failed; "
+                    f"error_type={safe_exception_type(exc)}"
+                )
             write_ms = (time.perf_counter() - t1) * 1000.0
 
             with self._lock:
@@ -438,7 +451,14 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self._json(STREAMER.tick())
             except Exception as exc:
-                self._json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, 500)
+                self._json(
+                    {
+                        "ok": False,
+                        "error": "stream request failed; "
+                        f"error_type={safe_exception_type(exc)}",
+                    },
+                    500,
+                )
         elif path == "/favicon.ico":
             self._send(204, b"", "image/x-icon")
         else:
@@ -654,7 +674,7 @@ async function tick(){
     render(await r.json());
   }catch(e){
     setStatus('err');
-    render({error:'network: '+e.message});
+    render({error:'network request failed'});
   }finally{
     if(running){
       // Aim for a fixed period measured from tick START, so cadence stays ~1/s

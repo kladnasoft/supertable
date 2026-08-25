@@ -10,9 +10,10 @@ import stat
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
+from typing import Any, Callable, cast, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlparse, urlsplit
 
 import duckdb
 import sqlglot
@@ -24,7 +25,10 @@ from sqlglot.optimizer.scope import traverse_scope
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.config.homedir import get_app_home
-from supertable.data_classes import MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES
+from supertable.data_classes import (
+    MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES,
+    ResourceObjectSeal,
+)
 from supertable.engine.engine_config import normalize_memory_size
 from supertable.tombstone_manifest_v2 import (
     MAX_JSON_EXACT_INTEGER,
@@ -38,7 +42,84 @@ from supertable.utils.sql_parser import (
     _build_scoped_table_bindings,
     validate_read_query_ast,
 )
-from supertable.row_identity import ODATA_INTERNAL_ROWID_COLUMN
+from supertable.utils.diagnostic_redaction import (
+    local_path_metadata,
+    redact_remote_urls,
+    redact_sensitive_diagnostic_text,
+    safe_exception_type,
+)
+from supertable.row_identity import (
+    ODATA_INTERNAL_ROWID_COLUMN,
+    MAX_TABLE_ROWID,
+    ResourceRowIdIntegritySeal,
+)
+
+
+_ODATA_ROWID_PROOF_CACHE_MAX_ENTRIES = 4096
+_ODATA_ROWID_MAX_RESOURCES = 10_000
+_ODATA_ROWID_MAX_RESOURCE_KEY_BYTES = 4096
+_ODATA_ROWID_MAX_NAMESPACE_TEXT_BYTES = 4096
+_odata_rowid_proof_cache_lock = threading.Lock()
+_odata_rowid_proof_cache: "OrderedDict[tuple[str, str], None]" = OrderedDict()
+
+
+def safe_sql_diagnostic(sql: str) -> tuple[str, int]:
+    """Return a correlation-safe digest/size pair without exposing SQL text."""
+
+    encoded = str(sql).encode("utf-8", errors="surrogatepass")
+    return hashlib.sha256(encoded).hexdigest()[:16], len(encoded)
+
+
+def _odata_hash_frame(
+    digest: Any,
+    tag: bytes,
+    payload: bytes,
+) -> None:
+    """Add one unambiguous bounded field to an OData proof digest."""
+    digest.update(len(tag).to_bytes(2, "big"))
+    digest.update(tag)
+    digest.update(len(payload).to_bytes(8, "big"))
+    digest.update(payload)
+
+
+def _odata_cache_namespace_digest(
+    cache_namespace: object,
+) -> tuple[bytes, bool]:
+    """Return a fixed-size authority digest and whether it is cache-capable.
+
+    Production callers bind proofs to one organization and exact storage
+    instance. ``None`` remains valid for direct/internal compatibility calls,
+    but can never authorize a cross-request cache entry.
+    """
+    if cache_namespace is None:
+        return hashlib.sha256(b"supertable-odata-cache-namespace-none\0").digest(), False
+    if not isinstance(cache_namespace, tuple) or len(cache_namespace) != 4:
+        raise RuntimeError("OData row-id cache authority is invalid")
+    organization, module, qualname, storage_nonce = cache_namespace
+    if any(type(value) is not str for value in (organization, module, qualname)):
+        raise RuntimeError("OData row-id cache authority is invalid")
+    if (
+        type(storage_nonce) is not str
+        or len(storage_nonce) != 32
+        or any(character not in "0123456789abcdef" for character in storage_nonce)
+    ):
+        raise RuntimeError("OData row-id cache authority is invalid")
+
+    digest = hashlib.sha256(b"supertable-odata-cache-namespace-v1\0")
+    for tag, value in (
+        (b"organization", organization),
+        (b"module", module),
+        (b"qualname", qualname),
+    ):
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise RuntimeError("OData row-id cache authority is invalid") from None
+        if len(encoded) > _ODATA_ROWID_MAX_NAMESPACE_TEXT_BYTES:
+            raise RuntimeError("OData row-id cache authority is invalid")
+        _odata_hash_frame(digest, tag, encoded)
+    _odata_hash_frame(digest, b"storage-nonce", storage_nonce.encode("ascii"))
+    return digest.digest(), True
 
 
 # =========================================================
@@ -143,49 +224,9 @@ def escape_parquet_path(path: str) -> str:
     return path.replace(chr(39), chr(39) + chr(39))
 
 
-_URL_IN_TEXT_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
-
-
 def redact_url_credentials(value: object) -> str:
-    """Remove presign/SAS query strings before a value reaches a log."""
-    text = str(value or "")
-
-    def replace(match: re.Match) -> str:
-        raw = match.group(0)
-        url = raw.rstrip(").,;]}")
-        suffix = raw[len(url):]
-        try:
-            parsed = urlsplit(url)
-            netloc = parsed.netloc
-            if parsed.username is not None or parsed.password is not None:
-                host = parsed.hostname or ""
-                if ":" in host and not host.startswith("["):
-                    host = f"[{host}]"
-                try:
-                    port = parsed.port
-                except ValueError:
-                    port = None
-                netloc = host + (f":{port}" if port is not None else "")
-            if (
-                parsed.query
-                or parsed.fragment
-                or netloc != parsed.netloc
-            ):
-                url = urlunsplit(
-                    (
-                        parsed.scheme,
-                        netloc,
-                        parsed.path,
-                        "<redacted>" if parsed.query else "",
-                        "",
-                    )
-                )
-        except Exception:
-            if "?" in url:
-                url = url.split("?", 1)[0] + "?<redacted>"
-        return url + suffix
-
-    return _URL_IN_TEXT_RE.sub(replace, text)
+    """Remove remote paths and common rendered credential forms from text."""
+    return redact_sensitive_diagnostic_text(value)
 
 
 _SNAPSHOT_TO_DUCKDB_TYPE = {
@@ -417,8 +458,8 @@ def _validate_enum_args(args: str) -> None:
         raise ValueError("invalid Enum parameters")
     try:
         categories = ast.literal_eval(match.group(1))
-    except (SyntaxError, ValueError) as exc:
-        raise ValueError("invalid Enum category list") from exc
+    except (SyntaxError, ValueError):
+        raise ValueError("invalid Enum category list") from None
     if (
         not isinstance(categories, list)
         or any(not isinstance(category, str) for category in categories)
@@ -505,20 +546,20 @@ def snapshot_duckdb_type(type_name: str) -> str:
         return direct
     try:
         return _render_dtype(_dtype_ast(type_name), "duckdb")
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError):
         raise RuntimeError(
             f"Unsupported snapshot column type for empty table: {type_name!r}"
-        ) from exc
+        ) from None
 
 
 def snapshot_spark_type(type_name: str) -> str:
     """Map persisted Spark/Polars types to a closed, safe Spark SQL type."""
     try:
         return _render_dtype(_dtype_ast(type_name), "spark")
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError):
         raise RuntimeError(
             f"Unsupported snapshot column type for empty Spark table: {type_name!r}"
-        ) from exc
+        ) from None
 
 
 def create_typed_empty_view(
@@ -861,11 +902,13 @@ def configure_httpfs_and_s3(
     try:
         con.execute("SET autoinstall_known_extensions=false;")
     except Exception:
-        pass
+        raise RuntimeError(
+            "DuckDB extension auto-download policy could not be disabled"
+        ) from None
 
     try:
         con.execute("LOAD httpfs;")
-    except Exception as load_err:
+    except Exception:
         if settings.SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD:
             # Operator explicitly allowed reaching the network for a one-off
             # install (e.g. an online dev box without a baked extension).
@@ -876,11 +919,11 @@ def configure_httpfs_and_s3(
                 "DuckDB 'httpfs' extension is not available locally and network "
                 "auto-download is disabled, so this query cannot run. Bake/seed "
                 "httpfs into "
-                f"'{get_app_home()}/.duckdb/extensions/v<duckdb_version>/<platform>/' "
+                "the configured DuckDB extension directory "
                 "(the container entrypoint restores it from /opt/duckdb-extensions), "
                 "or set SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=true to permit a "
-                f"one-time online install. Underlying DuckDB error: {load_err}"
-            ) from load_err
+                "one-time online install."
+            ) from None
 
     try:
         supported = {
@@ -1365,10 +1408,10 @@ def rewrite_query_with_hashed_tables(
     else:
         try:
             parsed = sqlglot.parse_one(original_sql)
-        except Exception as e:
+        except Exception:
             raise RuntimeError(
                 "Unable to rewrite protected query table references"
-            ) from e
+            ) from None
 
     folded_targets: Dict[str, tuple[str, str]] = {}
     for alias, physical in alias_to_table.items():
@@ -1383,10 +1426,10 @@ def rewrite_query_with_hashed_tables(
             default_super_name or "__supertable_default__",
             scopes=scopes,
         )
-    except Exception as exc:
+    except Exception:
         raise RuntimeError(
             "Unable to prove protected query table bindings"
-        ) from exc
+        ) from None
     rewritten: set[str] = set()
 
     # Replacing ``schema.table`` with a request-private unqualified view also
@@ -1410,10 +1453,10 @@ def rewrite_query_with_hashed_tables(
         direct_sources: list[exp.Table] = []
         try:
             selected_sources = scope.selected_sources.items()
-        except Exception as exc:
+        except Exception:
             raise RuntimeError(
                 "Unable to prove protected query column bindings"
-            ) from exc
+            ) from None
         for source_alias, selected in selected_sources:
             try:
                 node, source = selected
@@ -1785,7 +1828,10 @@ def init_connection(
     try:
         con.execute(f"SET home_directory='{get_app_home()}';")
     except Exception as e:
-        logger.warning(f"[duckdb.init] home_directory pin failed: {e}")
+        logger.warning(
+            "[duckdb.init] home_directory pin failed; error_type=%s",
+            _diagnostic_error_type(e),
+        )
 
     # Never let DuckDB auto-DOWNLOAD an extension.  Everything we need (httpfs)
     # is baked/seeded into the local extension dir; an implicit network install
@@ -1796,7 +1842,11 @@ def init_connection(
     try:
         con.execute("SET autoinstall_known_extensions=false;")
     except Exception as e:
-        logger.debug(f"[duckdb.init] disabling extension auto-install failed: {e}")
+        logger.debug(
+            "[duckdb.init] disabling extension auto-install failed; "
+            "error_type=%s",
+            _diagnostic_error_type(e),
+        )
 
     # Resolve memory limit.
     # Single env var SUPERTABLE_DUCKDB_MEMORY_LIMIT controls both executors.
@@ -1810,8 +1860,9 @@ def init_connection(
         con.execute(f"PRAGMA memory_limit='{effective_memory_limit}';")
     except Exception as e:
         logger.warning(
-            f"[duckdb.init] memory_limit='{effective_memory_limit}' rejected: {e}; "
-            f"keeping DuckDB default"
+            "[duckdb.init] memory_limit rejected; error_type=%s; "
+            "keeping DuckDB default",
+            _diagnostic_error_type(e),
         )
 
     # Absolute temp path is required for DuckDB to actually spill to disk.
@@ -1881,6 +1932,7 @@ def new_duckdb_connection(
         temp_dir: str,
         for_paths: Optional[List[str]] = None,
         memory_limit: str = "1GB",
+        storage: Optional[object] = None,
 ) -> duckdb.DuckDBPyConnection:
     """Create a DuckDB connection configured exactly like the read path.
 
@@ -1898,7 +1950,7 @@ def new_duckdb_connection(
     try:
         init_connection(con, temp_dir=temp_dir, memory_limit=memory_limit)
         if for_paths and any("://" in str(p) for p in for_paths):
-            configure_httpfs_and_s3(con, for_paths)
+            configure_httpfs_and_s3(con, for_paths, storage=storage)
     except Exception:
         # Don't leak the half-initialised connection if a pragma / httpfs load
         # raises; re-raise so callers still fall back exactly as before.
@@ -1918,6 +1970,7 @@ def get_pooled_duckdb_connection(
         temp_dir: str,
         for_paths: Optional[List[str]] = None,
         memory_limit: str = "1GB",
+        storage: Optional[object] = None,
 ) -> duckdb.DuckDBPyConnection:
     """Return this thread's pooled probe connection, building it on first use.
 
@@ -1931,11 +1984,12 @@ def get_pooled_duckdb_connection(
     con = getattr(_probe_pool, "con", None)
     if con is None:
         con = new_duckdb_connection(
-            temp_dir=temp_dir, for_paths=for_paths, memory_limit=memory_limit
+            temp_dir=temp_dir, for_paths=for_paths, memory_limit=memory_limit,
+            storage=storage,
         )
         _probe_pool.con = con
     elif for_paths and any("://" in str(p) for p in for_paths):
-        configure_httpfs_and_s3(con, for_paths)
+        configure_httpfs_and_s3(con, for_paths, storage=storage)
     return con
 
 
@@ -1979,7 +2033,10 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
     try:
         con.execute(f"PRAGMA memory_limit='{memory_limit}';")
     except Exception as e:
-        logger.warning(f"[duckdb.pragma] memory_limit='{memory_limit}' rejected: {e}")
+        logger.warning(
+            "[duckdb.pragma] memory_limit rejected; error_type=%s",
+            _diagnostic_error_type(e),
+        )
 
     # Explicit thread count wins; otherwise derive from the live memory limit
     # and IO multiplier (same formula as init_connection).
@@ -2013,7 +2070,11 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
                     f"SET external_file_cache_max_size='{sanitize_sql_string(cache_size)}';"
                 )
         except Exception as e:
-            logger.warning(f"[duckdb.pragma] external file cache config failed: {e}")
+            logger.warning(
+                "[duckdb.pragma] external file cache config failed; "
+                "error_type=%s",
+                _diagnostic_error_type(e),
+            )
     else:
         try:
             con.execute("SET enable_external_file_cache=false;")
@@ -2024,6 +2085,26 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
 # =========================================================
 # Engine self-diagnostics (UI "Diagnose" button)
 # =========================================================
+
+_DIAGNOSTIC_ENGINE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z", re.ASCII)
+
+
+def _diagnostic_error_type(error: BaseException) -> str:
+    """Return an inert exception class label without invoking ``str(error)``."""
+
+    return safe_exception_type(error)
+
+
+def _diagnostic_scalar(value: object, *, limit: int = 256) -> str:
+    """Bound a scalar setting and redact embedded URLs or credentials."""
+
+    try:
+        text = redact_sensitive_diagnostic_text(value)
+    except Exception:
+        return "<unavailable>"
+    text = " ".join(text.split())
+    return text[:limit] + ("<truncated>" if len(text) > limit else "")
+
 
 def _filesystem_type(path: str) -> str:
     """Best-effort filesystem type for ``path`` via /proc/mounts (Linux).
@@ -2078,13 +2159,20 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
 
     checks: List[Dict[str, Any]] = []
 
+    safe_engine = str(engine or "").casefold()
+    if not _DIAGNOSTIC_ENGINE_RE.fullmatch(safe_engine):
+        safe_engine = "unknown"
+
     def add(cid, label, status, detail="", value=""):
         checks.append({
             "id": cid,
             "label": label,
             "status": status,
-            "detail": str(detail),
-            "value": "" if value is None else str(value),
+            "detail": _diagnostic_scalar(detail, limit=4_096),
+            "value": (
+                "" if value is None
+                else _diagnostic_scalar(value, limit=512)
+            ),
         })
 
     # 1. Open + configure a connection the same way the engine does.
@@ -2097,8 +2185,19 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
         add("connect", "Engine connection", "ok",
             "Opened and configured a DuckDB connection")
     except Exception as e:
-        add("connect", "Engine connection", "fail", f"Could not initialise: {e}")
-        return {"engine": engine, "duckdb_version": "", "overall": "fail", "checks": checks}
+        add(
+            "connect",
+            "Engine connection",
+            "fail",
+            "Engine initialization failed; "
+            f"error_type={_diagnostic_error_type(e)}",
+        )
+        return {
+            "engine": safe_engine,
+            "duckdb_version": "",
+            "overall": "fail",
+            "checks": checks,
+        }
 
     # 2. DuckDB version + whether the file cache can be capped on this build.
     version = ""
@@ -2113,7 +2212,13 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
              "runs bounded by memory_limit rather than a dedicated cap"),
             version)
     except Exception as e:
-        add("version", "DuckDB version", "warn", f"version() failed: {e}")
+        add(
+            "version",
+            "DuckDB version",
+            "warn",
+            "Version query failed; "
+            f"error_type={_diagnostic_error_type(e)}",
+        )
 
     # 3. Memory limit effective?
     try:
@@ -2125,7 +2230,13 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
         else:
             add("memory", "Memory limit", "ok", "PRAGMA memory_limit is active", mem)
     except Exception as e:
-        add("memory", "Memory limit", "fail", f"Could not read memory_limit: {e}")
+        add(
+            "memory",
+            "Memory limit",
+            "fail",
+            "Memory-limit query failed; "
+            f"error_type={_diagnostic_error_type(e)}",
+        )
 
     # 4. Thread count.
     try:
@@ -2133,7 +2244,13 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
         add("threads", "Worker threads", "ok",
             "More threads add parallelism but also raise simultaneous memory use", th)
     except Exception as e:
-        add("threads", "Worker threads", "warn", f"Could not read threads: {e}")
+        add(
+            "threads",
+            "Worker threads",
+            "warn",
+            "Thread-count query failed; "
+            f"error_type={_diagnostic_error_type(e)}",
+        )
 
     # 5. Spill (temp) directory: set, exists, writable, on real disk?
     temp_dir = ""
@@ -2157,7 +2274,7 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
             mtds = ""
 
         writable = False
-        werr = ""
+        write_error_type = ""
         try:
             os.makedirs(temp_dir, exist_ok=True)
             probe = os.path.join(temp_dir, f".st_spill_probe_{uuid.uuid4().hex}")
@@ -2168,7 +2285,7 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
             os.remove(probe)
             writable = True
         except Exception as e:
-            werr = str(e)
+            write_error_type = _diagnostic_error_type(e)
 
         free_gb = None
         try:
@@ -2178,9 +2295,10 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
         fstype = _filesystem_type(temp_dir)
         ram_backed = fstype in ("tmpfs", "ramfs")
 
-        parts = [f"path={temp_dir}"]
+        path_summary = local_path_metadata(temp_dir)
+        parts = [path_summary]
         if mtds:
-            parts.append(f"cap={mtds}")
+            parts.append(f"cap={_diagnostic_scalar(mtds)}")
         if free_gb is not None:
             parts.append(f"free={free_gb:.1f} GB")
         if fstype:
@@ -2190,19 +2308,20 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
         if not writable:
             add("temp_dir", "Spill directory writable", "fail",
                 f"Cannot write to the spill directory — queries OOM instead of "
-                f"spilling. {werr} ({summary})", temp_dir)
+                f"spilling; error_type={write_error_type or 'Exception'} "
+                f"({summary})", path_summary)
         elif ram_backed:
             add("temp_dir", "Spill directory writable", "warn",
                 f"Writable but RAM-backed ({fstype}) — spilling here consumes memory "
                 f"instead of relieving it; mount a real disk volume. ({summary})",
-                temp_dir)
+                path_summary)
         elif free_gb is not None and free_gb < 1.0:
             add("temp_dir", "Spill directory writable", "warn",
                 f"Writable but low free space ({free_gb:.1f} GB) — large spills may "
-                f"fail. ({summary})", temp_dir)
+                f"fail. ({summary})", path_summary)
         else:
             add("temp_dir", "Spill directory writable", "ok",
-                f"Wrote and removed a 1 MiB probe file. {summary}", temp_dir)
+                f"Wrote and removed a 1 MiB probe file. {summary}", path_summary)
 
     # 6. Force a real disk spill under memory pressure (end-to-end proof).
     spill = None
@@ -2230,14 +2349,23 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
             f"Sorted {n:,} rows (~465 MB) under a 256 MB limit in {ms:.0f} ms — "
             "DuckDB spilled to disk instead of failing", f"{n:,} rows")
     except Exception as e:
-        msg = str(e)
+        # DuckDB puts its stable failure classification in string args. Keep
+        # the backend prose transient and out of every returned report field.
+        error_parts = tuple(
+            part for part in getattr(e, "args", ())
+            if isinstance(part, str)
+        )
+        msg = " ".join(error_parts)
+        error_type = _diagnostic_error_type(e)
         if "out of memory" in msg.lower() or "failed to pin" in msg.lower():
             add("spill", "Disk spill under pressure", "fail",
                 "A query that must spill ran out of memory instead — the spill "
-                f"directory is not usable for spilling. {msg}")
+                "directory is not usable for spilling; "
+                f"reason=out_of_memory; error_type={error_type}")
         else:
             add("spill", "Disk spill under pressure", "warn",
-                f"Spill probe did not complete: {msg}")
+                "Spill probe did not complete; reason=probe_failed; "
+                f"error_type={error_type}")
     finally:
         if spill is not None:
             try:
@@ -2271,7 +2399,13 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
                 "SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE to enable, bounded by "
                 "memory_limit)", "off")
     except Exception as e:
-        add("cache", "External file cache", "warn", f"Could not read cache state: {e}")
+        add(
+            "cache",
+            "External file cache",
+            "warn",
+            "External-cache query failed; "
+            f"error_type={_diagnostic_error_type(e)}",
+        )
 
     try:
         con.close()
@@ -2285,8 +2419,8 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
             overall = c["status"]
 
     return {
-        "engine": engine,
-        "duckdb_version": version,
+        "engine": safe_engine,
+        "duckdb_version": _diagnostic_scalar(version),
         "overall": overall,
         "checks": checks,
     }
@@ -2507,8 +2641,8 @@ def _duckdb_parquet_path_is_glob(path: str) -> bool:
     """
     try:
         parsed = urlsplit(path)
-    except ValueError as exc:
-        raise RuntimeError("Invalid resolved deletion-vector path") from exc
+    except ValueError:
+        raise RuntimeError("Invalid resolved deletion-vector path") from None
     candidate = (
         parsed.path
         if parsed.scheme.casefold() in {"http", "https"}
@@ -2554,10 +2688,10 @@ def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
                 format_present=True,
                 tombstone_format=tombstone_format,
             )
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError):
             raise RuntimeError(
                 "Invalid deletion-vector snapshot state"
-            ) from exc
+            ) from None
     if tombstone_format != TOMBSTONE_FORMAT_V2:
         if segments:
             raise RuntimeError(
@@ -2578,10 +2712,10 @@ def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
                     field_name="format-3 tombstone artifact key",
                     required_suffix=".parquet",
                 )
-            except (TypeError, ValueError) as exc:
+            except (TypeError, ValueError):
                 raise RuntimeError(
                     "Invalid format-3 deletion-vector artifact key"
-                ) from exc
+                ) from None
         return ()
     if tombstone_path is None:
         if cache_key is not None or segments:
@@ -2599,8 +2733,10 @@ def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
             field_name="tombstone manifest cache key",
             required_suffix=".json",
         )
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("Invalid v2 deletion-vector manifest cache key") from exc
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            "Invalid v2 deletion-vector manifest cache key"
+        ) from None
 
     keys: List[str] = []
     row_total = 0
@@ -2623,8 +2759,10 @@ def _v2_tombstone_segments(tombstone_def) -> Tuple[object, ...]:
                 field_name="tombstone segment cache key",
                 required_suffix=".parquet",
             )
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("Invalid deletion-vector segment cache key") from exc
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                "Invalid deletion-vector segment cache key"
+            ) from None
         if (
             not isinstance(rows, int) or isinstance(rows, bool) or rows <= 0
             or rows > MAX_JSON_EXACT_INTEGER
@@ -2738,10 +2876,10 @@ def _local_parquet_file_identity(path: str) -> Optional[tuple[int, ...]]:
 
     try:
         observed = os.stat(local_path, follow_symlinks=True)
-    except OSError as exc:
+    except OSError:
         raise RuntimeError(
             "Unable to inspect local deletion-vector segment"
-        ) from exc
+        ) from None
     if not stat.S_ISREG(observed.st_mode):
         raise RuntimeError("Local deletion-vector segment is not a regular file")
     return (
@@ -2785,10 +2923,10 @@ class _PinnedLocalTombstoneStorage:
         try:
             with open(self.local_path, "rb") as handle:
                 payload = handle.read()
-        except OSError as exc:
+        except OSError:
             raise RuntimeError(
                 "Unable to read local format-3 deletion vector"
-            ) from exc
+            ) from None
         if _local_parquet_file_identity(self.local_path) != self.identity:
             raise RuntimeError(
                 "Local format-3 tombstone changed during its sealed read"
@@ -2879,10 +3017,10 @@ def _provider_parquet_file_identity(
         size = getattr(metadata, "size", None)
         identity_fn = getattr(metadata, "identity_token", None)
         identity = identity_fn() if callable(identity_fn) else None
-    except Exception as exc:
+    except Exception:
         raise RuntimeError(
             "Unable to observe remote deletion-vector segment"
-        ) from exc
+        ) from None
     if (
         not isinstance(size, int)
         or isinstance(size, bool)
@@ -3119,7 +3257,10 @@ def _describe_relation(
     try:
         return list(con.execute(f"DESCRIBE SELECT * FROM {relation_sql}").fetchall())
     except Exception as exc:
-        raise RuntimeError(f"Unable to read deletion-vector schema: {exc}") from exc
+        raise RuntimeError(
+            "Unable to read deletion-vector schema; "
+            f"error_type={_diagnostic_error_type(exc)}"
+        ) from None
 
 
 def _validate_tombstone_relation_details(
@@ -3181,7 +3322,10 @@ def _validate_tombstone_relation_details(
             f", {digest_sql}, list(DISTINCT {file_col}) FROM {relation_sql}",
         ).fetchone()
     except Exception as exc:
-        raise RuntimeError(f"Unable to validate deletion-vector rows: {exc}") from exc
+        raise RuntimeError(
+            "Unable to validate deletion-vector rows; "
+            f"error_type={_diagnostic_error_type(exc)}"
+        ) from None
 
     total = int(total)
     if (
@@ -3201,8 +3345,10 @@ def _validate_tombstone_relation_details(
     if expected_rows is not None:
         try:
             expected = int(expected_rows)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("Invalid deletion-vector expected row count") from exc
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                "Invalid deletion-vector expected row count"
+            ) from None
         if expected < 0 or total != expected:
             raise RuntimeError(
                 f"Invalid deletion-vector row count: expected {expected}, got {total}"
@@ -3257,6 +3403,457 @@ def validate_tombstone_relation(
     return count, digest
 
 
+def _validate_odata_source_rowids(
+    con: duckdb.DuckDBPyConnection,
+    source_table: str,
+    *,
+    high_watermark: object,
+    resource_keys: object,
+    resource_rows: object,
+    integrity_seals: object,
+    object_seals: object,
+    cache_namespace: object,
+    resource_cache_identities: object,
+    enforced_read_identities: object,
+    share_policy_fingerprint: object,
+    share_publication_generation: object,
+    read_identity_enforced: object,
+) -> None:
+    """Verify the protected identity against its pinned writer attestations.
+
+    This scan runs only when the trusted OData projection is requested.  Every
+    ordinary query continues to strip ``__rowid__`` without paying for a
+    distinct/global-domain aggregate. Persisted writer and conditional object
+    seals can carry one positive result across requests; legacy/mutable paths
+    are physically reverified by this backend-boundary aggregate every time.
+    """
+    if (
+        not isinstance(high_watermark, int)
+        or isinstance(high_watermark, bool)
+        or high_watermark < 0
+        or high_watermark > MAX_TABLE_ROWID
+    ):
+        raise RuntimeError("OData row-id high-watermark proof is unavailable")
+    if (
+        not isinstance(resource_keys, (list, tuple))
+        or len(resource_keys) > _ODATA_ROWID_MAX_RESOURCES
+    ):
+        raise RuntimeError("OData row-id resource proof is unavailable")
+    keys: list[str] = []
+    for key in resource_keys:
+        if type(key) is not str or not key or "\x00" in key:
+            raise RuntimeError("OData row-id resource proof is ambiguous")
+        try:
+            encoded_key = key.encode("utf-8")
+        except UnicodeEncodeError:
+            raise RuntimeError("OData row-id resource proof is ambiguous") from None
+        if len(encoded_key) > _ODATA_ROWID_MAX_RESOURCE_KEY_BYTES:
+            raise RuntimeError("OData row-id resource proof is ambiguous")
+        keys.append(key)
+    key_set = set(keys)
+    if len(key_set) != len(keys):
+        raise RuntimeError("OData row-id resource proof is ambiguous")
+    if not isinstance(integrity_seals, dict):
+        raise RuntimeError("OData row-id integrity proof is unavailable")
+    if not isinstance(resource_rows, dict):
+        raise RuntimeError("OData row-id row-count proof is unavailable")
+    if not isinstance(object_seals, dict):
+        object_seals = {}
+    if read_identity_enforced is None:
+        read_identity_enforced = False
+    if type(read_identity_enforced) is not bool:
+        raise RuntimeError("OData row-id read identity proof is invalid")
+    if resource_cache_identities is None:
+        resource_cache_identities = {key: None for key in keys}
+    if not isinstance(resource_cache_identities, dict):
+        raise RuntimeError("OData row-id provider authority is unavailable")
+    if enforced_read_identities is None:
+        enforced_read_identities = {}
+    if not isinstance(enforced_read_identities, dict):
+        raise RuntimeError("OData row-id enforced read authority is invalid")
+    if (
+        len(resource_rows) != len(keys)
+        or set(resource_rows) != key_set
+        or len(integrity_seals) > len(keys)
+        or not set(integrity_seals).issubset(key_set)
+        or len(object_seals) > len(keys)
+        or not set(object_seals).issubset(key_set)
+        or len(resource_cache_identities) != len(keys)
+        or set(resource_cache_identities) != key_set
+        or len(enforced_read_identities) > len(keys)
+        or not set(enforced_read_identities).issubset(key_set)
+    ):
+        raise RuntimeError("OData row-id resource proof is ambiguous")
+
+    linked_authority = share_policy_fingerprint is not None
+    validated_share_policy_fingerprint: Optional[str] = None
+    validated_share_publication_generation: Optional[int] = None
+    if linked_authority:
+        if (
+            type(share_policy_fingerprint) is not str
+            or len(share_policy_fingerprint) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in share_policy_fingerprint
+            )
+            or type(share_publication_generation) is not int
+            or share_publication_generation <= 0
+            or share_publication_generation > (1 << 53) - 1
+        ):
+            raise RuntimeError("OData row-id publication authority is invalid")
+        validated_share_policy_fingerprint = cast(
+            str, share_policy_fingerprint,
+        )
+        validated_share_publication_generation = cast(
+            int, share_publication_generation,
+        )
+    elif share_publication_generation is not None:
+        raise RuntimeError("OData row-id publication authority is ambiguous")
+
+    expected_rows = 0
+    namespace_digest, namespace_cacheable = _odata_cache_namespace_digest(
+        cache_namespace,
+    )
+    # A declaration that an object has an ETag/version is not itself a read
+    # condition. Positive proofs may be retained only for a caller whose
+    # actual scanner enforces the immutable condition on every byte read.
+    # DuckDB supplies ``True`` only when every global resource was replaced by
+    # a stable-relay route that enforces ETag/If-Match and immutable size.
+    # Generic/partial direct paths rescan while ordinary queries remain
+    # entirely proof-free.
+    complete_enforced_reads = (
+        len(enforced_read_identities) == len(keys)
+        and set(enforced_read_identities) == key_set
+    )
+    cacheable = (
+        namespace_cacheable
+        and read_identity_enforced
+        and complete_enforced_reads
+    )
+    seen_enforced_read_identities: set[str] = set()
+    cache_digest = hashlib.sha256(b"supertable-odata-rowid-proof-cache-v4\0")
+    _odata_hash_frame(cache_digest, b"authority", namespace_digest)
+    _odata_hash_frame(
+        cache_digest,
+        b"read-identity-enforced",
+        b"\x01" if read_identity_enforced else b"\x00",
+    )
+    if linked_authority:
+        assert validated_share_policy_fingerprint is not None
+        assert validated_share_publication_generation is not None
+        _odata_hash_frame(cache_digest, b"linked-authority-present", b"\x01")
+        _odata_hash_frame(
+            cache_digest,
+            b"share-policy-fingerprint",
+            validated_share_policy_fingerprint.encode("ascii"),
+        )
+        _odata_hash_frame(
+            cache_digest,
+            b"share-publication-generation",
+            validated_share_publication_generation.to_bytes(8, "big"),
+        )
+    else:
+        _odata_hash_frame(cache_digest, b"linked-authority-present", b"\x00")
+    _odata_hash_frame(
+        cache_digest,
+        b"high-watermark",
+        high_watermark.to_bytes(8, "big"),
+    )
+    _odata_hash_frame(
+        cache_digest,
+        b"resource-count",
+        len(keys).to_bytes(8, "big"),
+    )
+    for index, key in enumerate(keys):
+        enforced_read_identity = enforced_read_identities.get(key)
+        if enforced_read_identity is not None:
+            if (
+                type(enforced_read_identity) is not str
+                or not enforced_read_identity
+                or "\x00" in enforced_read_identity
+            ):
+                raise RuntimeError(
+                    "OData row-id enforced read authority is invalid"
+                )
+            try:
+                encoded_enforced_read_identity = (
+                    enforced_read_identity.encode("utf-8")
+                )
+            except UnicodeEncodeError:
+                raise RuntimeError(
+                    "OData row-id enforced read authority is invalid"
+                ) from None
+            if (
+                len(encoded_enforced_read_identity)
+                > MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES
+            ):
+                raise RuntimeError(
+                    "OData row-id enforced read authority is invalid"
+                )
+            if enforced_read_identity in seen_enforced_read_identities:
+                raise RuntimeError(
+                    "OData row-id enforced read authority is ambiguous"
+                )
+            seen_enforced_read_identities.add(enforced_read_identity)
+        else:
+            encoded_enforced_read_identity = b""
+            cacheable = False
+        resource_cache_identity = resource_cache_identities.get(key)
+        if resource_cache_identity is not None:
+            if (
+                type(resource_cache_identity) is not str
+                or not resource_cache_identity
+                or "\x00" in resource_cache_identity
+            ):
+                raise RuntimeError("OData row-id provider authority is invalid")
+            try:
+                encoded_cache_identity = resource_cache_identity.encode("utf-8")
+            except UnicodeEncodeError:
+                raise RuntimeError(
+                    "OData row-id provider authority is invalid"
+                ) from None
+            if (
+                len(encoded_cache_identity)
+                > MAX_TOMBSTONE_PROVIDER_IDENTITY_BYTES
+            ):
+                raise RuntimeError("OData row-id provider authority is invalid")
+        else:
+            encoded_cache_identity = b""
+        if linked_authority:
+            if (
+                not resource_cache_identity
+                or not resource_cache_identity.startswith("share-cache-v1:")
+                or len(resource_cache_identity) != len("share-cache-v1:") + 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in resource_cache_identity[
+                        len("share-cache-v1:"):
+                    ]
+                )
+            ):
+                raise RuntimeError("OData row-id provider authority is invalid")
+        elif (
+            resource_cache_identity is not None
+            and resource_cache_identity.startswith("share-cache-v1:")
+        ):
+            raise RuntimeError("OData row-id provider authority is ambiguous")
+
+        seal = integrity_seals.get(key)
+        declared_rows = resource_rows.get(key)
+        if (
+            not isinstance(declared_rows, int)
+            or isinstance(declared_rows, bool)
+            or declared_rows < 0
+            or declared_rows > MAX_TABLE_ROWID
+        ):
+            raise RuntimeError("OData row-id row-count proof is incomplete")
+        if key in integrity_seals:
+            if not isinstance(seal, ResourceRowIdIntegritySeal):
+                raise RuntimeError("OData row-id integrity proof is invalid")
+            if (
+                seal.rows != declared_rows
+                or seal.nonnull != seal.rows
+                or seal.unique != seal.rows
+                or (
+                    seal.rows == 0
+                    and (seal.minimum is not None or seal.maximum is not None)
+                )
+                or (
+                    seal.rows > 0
+                    and (
+                        seal.minimum is None
+                        or seal.maximum is None
+                        or seal.minimum <= 0
+                        or seal.maximum > high_watermark
+                    )
+                )
+            ):
+                raise RuntimeError("OData row-id integrity proof is invalid")
+        expected_rows += declared_rows
+        if expected_rows > high_watermark:
+            raise RuntimeError("OData row-id integrity proof exceeds its allocation")
+        object_seal = object_seals.get(key)
+        if key in object_seals and not isinstance(
+            object_seal, ResourceObjectSeal,
+        ):
+            raise RuntimeError("OData row-id object proof is invalid")
+        object_identity = (
+            (
+                object_seal.size,
+                object_seal.version,
+                object_seal.etag,
+                object_seal.last_modified_ns,
+                object_seal.checksum_sha256,
+            )
+            if isinstance(object_seal, ResourceObjectSeal)
+            else None
+        )
+        if isinstance(object_seal, ResourceObjectSeal) and (
+            object_seal.size > (1 << 64) - 1
+            or object_seal.last_modified_ns > (1 << 64) - 1
+        ):
+            raise RuntimeError("OData row-id object proof is invalid")
+        if (
+            not isinstance(object_seal, ResourceObjectSeal)
+            or not object_seal.etag
+        ):
+            # Declared row-ID/footer facts do not prove that bytes at a mutable
+            # path were not replaced after this aggregate. Version/checksum/
+            # mtime-only metadata is also insufficient for the currently
+            # supported cache-capable HTTP path, whose enforceable condition is
+            # If-Match. Local, legacy and non-ETag objects are reverified on
+            # every protected OData query (ordinary queries remain scan-free).
+            cacheable = False
+        _odata_hash_frame(
+            cache_digest, b"resource-index", index.to_bytes(8, "big"),
+        )
+        _odata_hash_frame(cache_digest, b"resource-key", key.encode("utf-8"))
+        _odata_hash_frame(
+            cache_digest,
+            b"provider-cache-identity-present",
+            b"\x01" if resource_cache_identity is not None else b"\x00",
+        )
+        if resource_cache_identity is not None:
+            _odata_hash_frame(
+                cache_digest,
+                b"provider-cache-identity",
+                encoded_cache_identity,
+            )
+        _odata_hash_frame(
+            cache_digest,
+            b"enforced-read-identity-present",
+            b"\x01" if enforced_read_identity is not None else b"\x00",
+        )
+        if enforced_read_identity is not None:
+            _odata_hash_frame(
+                cache_digest,
+                b"enforced-read-identity",
+                encoded_enforced_read_identity,
+            )
+        _odata_hash_frame(
+            cache_digest, b"declared-rows", declared_rows.to_bytes(8, "big"),
+        )
+        if isinstance(seal, ResourceRowIdIntegritySeal):
+            _odata_hash_frame(cache_digest, b"rowid-seal-present", b"\x01")
+            for integer_tag, integer_value in (
+                (b"rowid-version", seal.version),
+                (b"rowid-rows", seal.rows),
+                (b"rowid-nonnull", seal.nonnull),
+                (b"rowid-unique", seal.unique),
+            ):
+                _odata_hash_frame(
+                    cache_digest,
+                    integer_tag,
+                    integer_value.to_bytes(8, "big"),
+                )
+            for extrema_tag, extrema_value in (
+                (b"rowid-minimum", seal.minimum),
+                (b"rowid-maximum", seal.maximum),
+            ):
+                _odata_hash_frame(
+                    cache_digest,
+                    extrema_tag,
+                    (
+                        b"\x00"
+                        if extrema_value is None
+                        else b"\x01" + extrema_value.to_bytes(
+                            8, "big", signed=True,
+                        )
+                    ),
+                )
+            _odata_hash_frame(
+                cache_digest, b"rowid-digest", seal.digest.encode("ascii"),
+            )
+            _odata_hash_frame(
+                cache_digest,
+                b"rowid-footer",
+                seal.footer_sha256.encode("ascii"),
+            )
+        else:
+            _odata_hash_frame(cache_digest, b"rowid-seal-present", b"\x00")
+        if isinstance(object_seal, ResourceObjectSeal):
+            _odata_hash_frame(cache_digest, b"object-seal-present", b"\x01")
+            _odata_hash_frame(
+                cache_digest, b"object-size", object_seal.size.to_bytes(8, "big"),
+            )
+            for text_tag, text_value in (
+                (b"object-version", object_seal.version),
+                (b"object-etag", object_seal.etag),
+            ):
+                try:
+                    encoded_value = text_value.encode("utf-8")
+                except UnicodeEncodeError:
+                    raise RuntimeError("OData row-id object proof is invalid") from None
+                if len(encoded_value) > _ODATA_ROWID_MAX_NAMESPACE_TEXT_BYTES:
+                    raise RuntimeError("OData row-id object proof is invalid")
+                _odata_hash_frame(cache_digest, text_tag, encoded_value)
+            _odata_hash_frame(
+                cache_digest,
+                b"object-last-modified",
+                object_seal.last_modified_ns.to_bytes(8, "big"),
+            )
+            _odata_hash_frame(
+                cache_digest,
+                b"object-checksum",
+                object_seal.checksum_sha256.encode("ascii"),
+            )
+        else:
+            _odata_hash_frame(cache_digest, b"object-seal-present", b"\x00")
+
+    cache_key = ("odata-rowid-proof-v4", cache_digest.hexdigest())
+    if cacheable:
+        with _odata_rowid_proof_cache_lock:
+            if cache_key in _odata_rowid_proof_cache:
+                _odata_rowid_proof_cache.move_to_end(cache_key)
+                return
+
+    source = quote_if_needed(source_table)
+    rowid = quote_if_needed(ROWID_COL)
+    try:
+        result = con.execute(
+            f"SELECT count(*) AS total_rows, "
+            f"count({rowid}) AS nonnull_rows, "
+            f"count(DISTINCT {rowid}) AS unique_rows, "
+            f"min({rowid}) AS minimum_rowid, "
+            f"max({rowid}) AS maximum_rowid FROM {source}"
+        ).fetchone()
+    except Exception:
+        raise RuntimeError("Unable to verify OData row-id integrity") from None
+    if result is None:
+        raise RuntimeError("Unable to verify OData row-id integrity")
+    total, nonnull, unique, minimum, maximum = result
+    if (
+        int(total) != expected_rows
+        or int(nonnull) != int(total)
+        or int(unique) != int(total)
+        or (
+            int(total) == 0
+            and (minimum is not None or maximum is not None)
+        )
+        or (
+            int(total) > 0
+            and (
+                minimum is None
+                or maximum is None
+                or int(minimum) <= 0
+                or int(maximum) > high_watermark
+            )
+        )
+    ):
+        raise RuntimeError(
+            "OData row-id integrity verification rejected the physical snapshot"
+        )
+    if cacheable:
+        with _odata_rowid_proof_cache_lock:
+            _odata_rowid_proof_cache[cache_key] = None
+            _odata_rowid_proof_cache.move_to_end(cache_key)
+            while (
+                len(_odata_rowid_proof_cache)
+                > _ODATA_ROWID_PROOF_CACHE_MAX_ENTRIES
+            ):
+                _odata_rowid_proof_cache.popitem(last=False)
+
+
 def _validate_tombstone_source_rowids(
         con: duckdb.DuckDBPyConnection,
         source_table: str,
@@ -3305,10 +3902,10 @@ def _validate_tombstone_source_rowids(
             "LIMIT 1",
             [selected_referenced],
         ).fetchone()
-    except Exception as exc:
+    except Exception:
         raise RuntimeError(
             "Unable to prove deletion-vector source row-id integrity"
-        ) from exc
+        ) from None
 
     if invalid is not None:
         total, nonnull, unique, minimum = invalid
@@ -3329,8 +3926,19 @@ def create_tombstone_view(
         source_table: str,
         view_name: str,
         tombstone_def,
-        dv_table: Optional[str] = None,
-        preserve_rowid_as: Optional[str] = None,
+    dv_table: Optional[str] = None,
+    preserve_rowid_as: Optional[str] = None,
+    odata_rowid_high_watermark: object = None,
+    odata_resource_keys: object = None,
+    odata_resource_rows: object = None,
+    odata_rowid_integrity_seals: object = None,
+    odata_resource_object_seals: object = None,
+    odata_cache_namespace: object = None,
+    odata_resource_cache_identities: object = None,
+    odata_enforced_read_identities: object = None,
+    odata_share_policy_fingerprint: object = None,
+    odata_share_publication_generation: object = None,
+    odata_read_identity_enforced: object = False,
 ) -> None:
     """
     Create a view that hides the system columns and drops tombstoned rows.
@@ -3358,9 +3966,9 @@ def create_tombstone_view(
            always use a validated private table, including when persistent
            cache capacity is zero.
 
-    This view sits directly on top of the reflection table (before RBAC),
-    so the anti-join still has ``__rowid__`` available and RBAC never sees
-    the system columns.
+    This view sits directly on top of the reflection table (before RBAC), so
+    the anti-join still has the protected canonical source-file identity and
+    ``__rowid__`` available while RBAC never sees the system columns.
 
     Args:
         con: DuckDB connection
@@ -3439,6 +4047,23 @@ def create_tombstone_view(
             raise RuntimeError(
                 "OData identity requires canonical __rowid__ BIGINT"
             )
+        _validate_odata_source_rowids(
+            con,
+            source_table,
+            high_watermark=odata_rowid_high_watermark,
+            resource_keys=odata_resource_keys,
+            resource_rows=odata_resource_rows,
+            integrity_seals=odata_rowid_integrity_seals,
+            object_seals=odata_resource_object_seals,
+            cache_namespace=odata_cache_namespace,
+            resource_cache_identities=odata_resource_cache_identities,
+            enforced_read_identities=odata_enforced_read_identities,
+            share_policy_fingerprint=odata_share_policy_fingerprint,
+            share_publication_generation=(
+                odata_share_publication_generation
+            ),
+            read_identity_enforced=odata_read_identity_enforced,
+        )
         live_cols = (
             f"{live_cols}, {source_table}.{rid} AS "
             f"{quote_if_needed(preserve_rowid_as)}"
@@ -3994,8 +4619,10 @@ class TombstoneCache:
                 table_count = getattr(entry.table_name, "row_count", -1)
                 try:
                     expected = int(expected_rows)
-                except (TypeError, ValueError) as exc:
-                    raise RuntimeError("Invalid deletion-vector expected row count") from exc
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        "Invalid deletion-vector expected row count"
+                    ) from None
                 if expected < 0 or table_count != expected:
                     raise RuntimeError(
                         f"Invalid deletion-vector row count: expected {expected}, "

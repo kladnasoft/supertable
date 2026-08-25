@@ -16,6 +16,13 @@ from supertable.redis_catalog import (
 )
 from supertable import redis_keys as RK
 from supertable.audit.privileged import PrivilegedActionContext
+from supertable.utils.diagnostic_redaction import safe_exception_type
+
+
+def _safe_error_type(error: BaseException) -> str:
+    """Return bounded exception metadata without rendering backend text."""
+
+    return safe_exception_type(error)
 
 
 class UserManager:
@@ -85,7 +92,7 @@ class UserManager:
                         cause="rbac_bootstrap_repair",
                     ),
                 )
-                logger.info(f"Added superadmin role to existing superuser: {existing_id}")
+                logger.info("Default superuser role repaired")
         else:
             try:
                 user_id = self.create_user({
@@ -95,9 +102,12 @@ class UserManager:
                     "Create the bootstrap superuser",
                     cause="rbac_bootstrap",
                 ))
-                logger.info(f"Default superuser created: {user_id}")
+                logger.info("Default superuser created")
             except Exception as e:
-                logger.error(f"Failed to create default superuser: {e}")
+                logger.error(
+                    "Default superuser creation failed; error_type=%s",
+                    _safe_error_type(e),
+                )
                 # Bootstrap is a security boundary, not best-effort setup.
                 # In particular, an unavailable mandatory audit ledger must
                 # not be hidden behind a seemingly healthy UserManager.
@@ -230,10 +240,14 @@ class UserManager:
                 self._catalog.get_user_details(org, sup, winner_id)
                 if winner_id else None
             )
-            if winner and sorted(winner.get("roles", [])) == sorted(roles):
+            if (
+                winner_id
+                and winner
+                and sorted(winner.get("roles", [])) == sorted(roles)
+            ):
                 return winner_id
             raise
-        logger.debug(f"User created: {user_id} ({username})")
+        logger.debug("User created")
         return user_id
 
     def get_user(self, user_id: str) -> Dict:
@@ -402,7 +416,7 @@ class UserManager:
             user_id,
             action_context=action_context,
         )
-        logger.debug(f"User deleted: {user_id}")
+        logger.debug("User deleted")
 
     def list_users(self) -> List[Dict]:
         """List all user documents."""

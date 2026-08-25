@@ -3,7 +3,9 @@ import duckdb
 import hashlib
 import io
 import os
+import traceback
 from dataclasses import FrozenInstanceError
+import traceback
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -64,7 +66,7 @@ def test_local_download_streams_and_honours_expected_metadata(tmp_path):
     path = tmp_path / "source.parquet"
     payload = b"0123456789" * 5
     path.write_bytes(payload)
-    storage = LocalStorage()
+    storage = LocalStorage(str(tmp_path))
     expected = storage.stat_object(str(path))
     sink = RecordingSink()
 
@@ -129,7 +131,7 @@ def test_local_relative_paths_cannot_escape_configured_root(tmp_path):
 def test_local_download_rejects_stale_metadata(tmp_path):
     path = tmp_path / "source.parquet"
     path.write_bytes(b"before")
-    storage = LocalStorage()
+    storage = LocalStorage(str(tmp_path))
     stale = storage.stat_object(str(path))
     path.write_bytes(b"after-but-different")
 
@@ -142,7 +144,7 @@ def test_local_download_rejects_invalid_chunk_size(tmp_path):
     path.write_bytes(b"data")
 
     with pytest.raises(ValueError, match="chunk_size must be positive"):
-        LocalStorage().download_to_file(str(path), io.BytesIO(), chunk_size=0)
+        LocalStorage(str(tmp_path)).download_to_file(str(path), io.BytesIO(), chunk_size=0)
 
 
 def test_parquet_stream_splits_clustered_wide_rows_to_decoded_budget(
@@ -230,7 +232,7 @@ def test_local_range_reads_only_requested_bytes_and_rejects_stale_seal(tmp_path)
     path = tmp_path / "source.parquet"
     payload = bytes(range(251)) * 10
     path.write_bytes(payload)
-    storage = LocalStorage()
+    storage = LocalStorage(str(tmp_path))
     expected = storage.stat_object(str(path))
 
     assert storage.read_range(str(path), 127, 31, expected=expected) == payload[127:158]
@@ -289,6 +291,20 @@ def test_s3_streams_with_version_and_etag_preconditions():
     client.get_object.assert_called_once_with(
         Bucket="bucket", Key="raw/key", VersionId="v7", IfMatch='"etag-7"',
     )
+
+
+def test_s3_installed_sdk_models_if_none_match_for_put_object():
+    pytest.importorskip("botocore")
+    import botocore.session
+
+    model = (
+        botocore.session.get_session()
+        .get_service_model("s3")
+        .operation_model("PutObject")
+        .input_shape
+    )
+
+    assert "IfNoneMatch" in model.members
 
 
 def test_s3_range_uses_conditional_bounded_get():
@@ -395,6 +411,36 @@ def test_minio_range_sets_offset_length_and_version_fence():
     assert response.closed and response.released
 
 
+def test_minio_conditional_create_suppresses_binary_body_trace():
+    pytest.importorskip("minio")
+    from minio import Minio
+
+    from supertable.storage.minio_storage import MinioStorage
+
+    http = MagicMock()
+    http.urlopen.return_value = SimpleNamespace(
+        data=b"",
+        headers={},
+        status=200,
+    )
+    client = Minio(
+        "localhost:9000",
+        access_key="access-key",
+        secret_key="secret-key",
+        secure=False,
+        region="us-east-1",
+    )
+    client._http = http
+    trace = io.StringIO()
+    client.trace_on(trace)
+    storage = MinioStorage("bucket", client)
+    payload = b"confidential-proof-\xff\x00"
+
+    assert storage.create_bytes_if_absent("proof.json", payload) is True
+    assert "confidential-proof" not in trace.getvalue()
+    assert http.urlopen.call_args.kwargs["body"] == payload
+
+
 def test_gcs_streams_to_sink_with_generation_precondition():
     pytest.importorskip("google.cloud.storage")
     from supertable.storage.gcp_storage import GCSStorage
@@ -432,6 +478,57 @@ def test_gcs_range_uses_inclusive_end_and_generation_fence():
     blob.download_as_bytes.assert_called_once_with(
         start=3, end=6, if_generation_match=123,
     )
+
+
+def test_gcs_create_bytes_if_absent_uses_generation_zero_and_preserves_errors():
+    pytest.importorskip("google.cloud.storage")
+    from google.api_core.exceptions import PreconditionFailed
+    from supertable.storage.gcp_storage import GCSStorage
+
+    client = MagicMock()
+    blob = client.bucket.return_value.blob.return_value
+    storage = GCSStorage("bucket", client=client, base_prefix="prefix")
+
+    assert storage.create_bytes_if_absent("proof.json", b"proof") is True
+    blob.upload_from_string.assert_called_once_with(
+        b"proof", if_generation_match=0,
+    )
+
+    blob.upload_from_string.side_effect = PreconditionFailed("exists")
+    assert storage.create_bytes_if_absent("proof.json", b"proof") is False
+    blob.upload_from_string.side_effect = OSError("ambiguous")
+    with pytest.raises(OSError, match="ambiguous"):
+        storage.create_bytes_if_absent("proof.json", b"proof")
+
+
+def test_gcs_parquet_failure_redacts_path_and_backend_message(monkeypatch):
+    pytest.importorskip("google.cloud.storage")
+    from supertable.storage import gcp_storage
+    from supertable.storage.gcp_storage import GCSStorage
+
+    secret = "signed-path-token-DO-NOT-LOG"
+    client = MagicMock()
+    blob = client.bucket.return_value.get_blob.return_value
+    blob.download_as_bytes.return_value = b"not parquet"
+    storage = GCSStorage("bucket", client=client, base_prefix="prefix")
+    monkeypatch.setattr(
+        gcp_storage.pq,
+        "read_table",
+        MagicMock(side_effect=RuntimeError(f"backend-secret-{secret}")),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^Failed to read Parquet; error_type=RuntimeError$",
+    ) as caught:
+        storage.read_parquet(f"tenant/{secret}.parquet")
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value), caught.value, caught.value.__traceback__,
+        )
+    )
+    assert secret not in rendered
 
 
 def test_azure_streams_bounded_sink_writes_with_version_and_etag():
@@ -480,6 +577,56 @@ def test_azure_range_uses_offset_length_and_version_fence():
         etag='"etag-7"',
         match_condition=MatchConditions.IfNotModified,
     )
+
+
+def test_azure_create_bytes_if_absent_never_enables_overwrite():
+    pytest.importorskip("azure.storage.blob")
+    from azure.core.exceptions import ResourceExistsError
+    from supertable.storage.azure_storage import AzureBlobStorage
+
+    service = MagicMock()
+    blob = service.get_container_client.return_value.get_blob_client.return_value
+    storage = AzureBlobStorage("container", service, base_prefix="prefix")
+
+    assert storage.create_bytes_if_absent("proof.json", b"proof") is True
+    assert blob.upload_blob.call_args.args == (b"proof",)
+    assert blob.upload_blob.call_args.kwargs["overwrite"] is False
+
+    blob.upload_blob.side_effect = ResourceExistsError("exists")
+    assert storage.create_bytes_if_absent("proof.json", b"proof") is False
+    blob.upload_blob.side_effect = OSError("ambiguous")
+    with pytest.raises(OSError, match="ambiguous"):
+        storage.create_bytes_if_absent("proof.json", b"proof")
+
+
+def test_azure_parquet_failure_redacts_path_and_backend_message(monkeypatch):
+    pytest.importorskip("azure.storage.blob")
+    from supertable.storage import azure_storage
+    from supertable.storage.azure_storage import AzureBlobStorage
+
+    secret = "signed-path-token-DO-NOT-LOG"
+    service = MagicMock()
+    blob = service.get_container_client.return_value.get_blob_client.return_value
+    blob.download_blob.return_value.readall.return_value = b"not parquet"
+    storage = AzureBlobStorage("container", service, base_prefix="prefix")
+    monkeypatch.setattr(
+        azure_storage.pq,
+        "read_table",
+        MagicMock(side_effect=RuntimeError(f"backend-secret-{secret}")),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^Failed to read Parquet; error_type=RuntimeError$",
+    ) as caught:
+        storage.read_parquet(f"tenant/{secret}.parquet")
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value), caught.value, caught.value.__traceback__,
+        )
+    )
+    assert secret not in rendered
 
 
 def test_gcs_delete_prefix_drains_all_batches_and_retries_partial_failure():
@@ -549,3 +696,58 @@ def test_azure_delete_prefix_drains_all_batches_and_retries_partial_failure():
         call.kwargs["name_starts_with"] == "base/table/"
         for call in container.list_blobs.call_args_list
     )
+
+
+def test_gcs_delete_prefix_failure_suppresses_path_and_provider_text():
+    pytest.importorskip("google.cloud.storage")
+    from supertable.storage.gcp_storage import GCSStorage
+
+    secret = "https://gcs.invalid/private?signature=DELETE_SECRET"
+
+    class Blob:
+        name = "base/table/PRIVATE_OBJECT_SECRET"
+
+        def delete(self):
+            raise OSError(secret)
+
+    listings = iter([[Blob()], []])
+    client = MagicMock()
+    bucket = client.bucket.return_value
+    bucket.get_blob.return_value = None
+    client.list_blobs.side_effect = lambda *_args, **_kwargs: next(listings)
+    storage = GCSStorage("bucket", client=client, base_prefix="base")
+    path_secret = "table/PRIVATE_PATH_SECRET"
+
+    with pytest.raises(OSError) as caught:
+        storage.delete_prefix(path_secret)
+
+    rendered = "".join(traceback.format_exception(caught.value))
+    for forbidden in (secret, "DELETE_SECRET", "PRIVATE_OBJECT_SECRET", "PRIVATE_PATH_SECRET"):
+        assert forbidden not in rendered
+    assert caught.value.__cause__ is None
+
+
+def test_azure_delete_prefix_failure_suppresses_path_and_provider_text():
+    pytest.importorskip("azure.storage.blob")
+    from supertable.storage.azure_storage import AzureBlobStorage
+
+    secret = "https://azure.invalid/private?signature=DELETE_SECRET"
+    service = MagicMock()
+    container = service.get_container_client.return_value
+    listings = iter([
+        [SimpleNamespace(name="base/table/PRIVATE_OBJECT_SECRET")],
+        [],
+    ])
+    container.list_blobs.side_effect = lambda **_kwargs: next(listings)
+    container.delete_blob.side_effect = OSError(secret)
+    storage = AzureBlobStorage("container", service, base_prefix="base")
+    storage._blob_exists = lambda _name: False
+    path_secret = "table/PRIVATE_PATH_SECRET"
+
+    with pytest.raises(OSError) as caught:
+        storage.delete_prefix(path_secret)
+
+    rendered = "".join(traceback.format_exception(caught.value))
+    for forbidden in (secret, "DELETE_SECRET", "PRIVATE_OBJECT_SECRET", "PRIVATE_PATH_SECRET"):
+        assert forbidden not in rendered
+    assert caught.value.__cause__ is None

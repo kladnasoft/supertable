@@ -40,6 +40,7 @@ from supertable.utils.snapshot import (
     referenced_snapshot_artifacts,
     snapshot_cache_payload,
 )
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 
 _CHECKPOINT_VERSION = 2
@@ -54,6 +55,43 @@ _MAX_CHECKPOINTS = 10_000
 _MAX_AUDIT_BATCHES = 10_000
 _ARCHIVE_GROUP = "__privileged_archival__"
 _REDIS_TYPES = frozenset({"string", "hash", "set", "list", "zset"})
+_TOMBSTONE_REASON_MESSAGES = {
+    "manifest JSON is not in canonical form": "manifest_noncanonical",
+    "manifest canonical SHA-256 does not match the snapshot": (
+        "manifest_digest_mismatch"
+    ),
+    "manifest organization does not match the pinned table": (
+        "manifest_identity_mismatch"
+    ),
+    "manifest super_name does not match the pinned table": (
+        "manifest_identity_mismatch"
+    ),
+    "manifest simple_name does not match the pinned table": (
+        "manifest_identity_mismatch"
+    ),
+    "snapshot_version must be the immediate successor of "
+    "base_snapshot_version": "manifest_lineage_invalid",
+    "manifest total_rows does not match the snapshot": (
+        "manifest_row_count_mismatch"
+    ),
+    "total_rows does not equal the sum of segment rows": (
+        "manifest_row_count_mismatch"
+    ),
+}
+
+
+def _safe_error_type(error: BaseException) -> str:
+    return safe_exception_type(error)
+
+
+def _tombstone_failure_reason(error: BaseException) -> str:
+    """Map detailed parser failures to a non-secret recovery reason code."""
+    detail = error.args[0] if len(error.args) == 1 else None
+    return (
+        _TOMBSTONE_REASON_MESSAGES.get(detail, "manifest_contract_invalid")
+        if isinstance(detail, str)
+        else "manifest_contract_invalid"
+    )
 
 
 class RecoveryError(RuntimeError):
@@ -149,7 +187,7 @@ def _text(value: Any, *, field: str) -> str:
         try:
             return value.decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise RecoveryError(f"{field} is not UTF-8") from exc
+            raise RecoveryError(f"{field} is not UTF-8") from None
     if isinstance(value, str):
         return value
     raise RecoveryError(f"{field} must be Redis text")
@@ -169,7 +207,7 @@ def _validate_identity(organization: str) -> None:
     try:
         RK.org_prefix(organization)
     except (TypeError, ValueError) as exc:
-        raise RecoveryError("organization is not a canonical Redis identifier") from exc
+        raise RecoveryError("organization is not a canonical Redis identifier") from None
 
 
 def _logical_path(path: Any, *, field: str) -> str:
@@ -195,7 +233,9 @@ def _read_bytes(storage: Any, path: str, *, maximum: int, label: str) -> bytes:
     except RecoveryError:
         raise
     except Exception as exc:
-        raise RecoveryError(f"cannot read {label} {path!r}: {exc}") from exc
+        raise RecoveryError(
+            f"cannot read {label}; error_type={_safe_error_type(exc)}"
+        ) from None
     if not isinstance(payload, bytes) or not 1 <= len(payload) <= maximum:
         raise RecoveryError(f"{label} bytes are outside the supported bound")
     return payload
@@ -208,7 +248,9 @@ def _scan(redis_client: Any, pattern: str) -> tuple[str, ...]:
         try:
             cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=500)
         except Exception as exc:
-            raise RecoveryError(f"Redis SCAN failed: {exc}") from exc
+            raise RecoveryError(
+                f"Redis SCAN failed; error_type={_safe_error_type(exc)}"
+            ) from None
         for raw in keys or ():
             found.add(_text(raw, field="Redis key"))
         if int(cursor) == 0:
@@ -247,7 +289,7 @@ def _validate_activation_anchor(organization: str, item: Mapping[str, Any]) -> s
     try:
         document = json.loads(value)
     except (TypeError, ValueError) as exc:
-        raise RecoveryError("privileged activation anchor is not valid JSON") from exc
+        raise RecoveryError("privileged activation anchor is not valid JSON") from None
     required = {
         "version",
         "kind",
@@ -288,7 +330,10 @@ def _redis_value(redis_client: Any, key: str) -> dict[str, Any]:
     try:
         raw_type = _text(redis_client.type(key), field=f"TYPE {key}").lower()
     except Exception as exc:
-        raise RecoveryError(f"cannot inspect Redis key {key!r}: {exc}") from exc
+        raise RecoveryError(
+            "cannot inspect Redis key; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     if raw_type == "none":
         raise RecoveryError(f"Redis key disappeared while checkpointing: {key}")
     if raw_type not in _REDIS_TYPES:
@@ -322,7 +367,10 @@ def _redis_value(redis_client: Any, key: str) -> dict[str, Any]:
     except RecoveryError:
         raise
     except Exception as exc:
-        raise RecoveryError(f"cannot read Redis key {key!r}: {exc}") from exc
+        raise RecoveryError(
+            "cannot read Redis key; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     return {"key": key, "type": raw_type, "value": value}
 
 
@@ -332,7 +380,10 @@ def _capture_state_once(redis_client: Any, organization: str) -> tuple[dict[str,
         try:
             pttl = int(redis_client.pttl(key))
         except Exception as exc:
-            raise RecoveryError(f"cannot inspect TTL for {key!r}: {exc}") from exc
+            raise RecoveryError(
+                "cannot inspect Redis TTL; "
+                f"error_type={_safe_error_type(exc)}"
+            ) from None
         if pttl == -2:
             raise RecoveryError(f"Redis key disappeared while checkpointing: {key}")
         if pttl < -2:
@@ -347,7 +398,7 @@ def _decode_json(payload: bytes, *, label: str) -> dict[str, Any]:
     try:
         value = json.loads(payload)
     except (UnicodeDecodeError, TypeError, ValueError) as exc:
-        raise RecoveryError(f"{label} is not valid JSON") from exc
+        raise RecoveryError(f"{label} is not valid JSON") from None
     if not isinstance(value, dict):
         raise RecoveryError(f"{label} must be a JSON object")
     return value
@@ -389,8 +440,18 @@ def _validate_state_items(
             not isinstance(value, list) or any(not isinstance(v, str) for v in value)
         ):
             raise RecoveryError(f"checkpoint collection {key!r} has invalid data")
-        if key_type == "set" and value != sorted(set(value)):
-            raise RecoveryError(f"checkpoint set {key!r} is not canonical")
+        if key_type == "set":
+            # The collection contract above proves this at runtime; repeat the
+            # narrowing here so static analysis does not treat ``None`` as an
+            # iterable while checking canonical set ordering.
+            if not isinstance(value, list):
+                raise RecoveryError(
+                    f"checkpoint collection {key!r} has invalid data"
+                )
+            if value != sorted(set(value)):
+                raise RecoveryError(
+                    f"checkpoint set {key!r} is not canonical"
+                )
         if key_type == "zset":
             if not isinstance(value, list):
                 raise RecoveryError(f"checkpoint zset {key!r} has invalid data")
@@ -407,7 +468,7 @@ def _validate_state_items(
                 try:
                     float(pair[1])
                 except ValueError as exc:
-                    raise RecoveryError(f"checkpoint zset {key!r} has invalid score") from exc
+                    raise RecoveryError(f"checkpoint zset {key!r} has invalid score") from None
                 seen.add(pair[0])
         if key == activation_key:
             _validate_activation_anchor(organization, item)
@@ -437,14 +498,15 @@ def _content_seal(
             size, digest = len(payload), _sha256(payload)
     except Exception as exc:
         raise RecoveryError(
-            f"cannot content-seal snapshot artifact {path!r}: {exc}"
-        ) from exc
+            "cannot content-seal snapshot artifact; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     try:
         size = int(size)
     except (TypeError, ValueError) as exc:
         raise RecoveryError(
             f"snapshot artifact {path!r} returned an invalid size"
-        ) from exc
+        ) from None
     if (
         size < 1
         or not isinstance(digest, str)
@@ -474,7 +536,7 @@ def _validate_snapshot(
     try:
         leaf = json.loads(leaf_raw)
     except (TypeError, ValueError) as exc:
-        raise RecoveryError(f"leaf {super_name}/{simple_name} is invalid JSON") from exc
+        raise RecoveryError(f"leaf {super_name}/{simple_name} is invalid JSON") from None
     if not isinstance(leaf, dict):
         raise RecoveryError(f"leaf {super_name}/{simple_name} is not an object")
     path = _logical_path(leaf.get("path"), field="snapshot path")
@@ -510,7 +572,7 @@ def _validate_snapshot(
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise RecoveryError(
             f"catalog schema for {super_name}/{simple_name} is invalid JSON"
-        ) from exc
+        ) from None
     if not isinstance(redis_schema, dict):
         raise RecoveryError(
             f"catalog schema for {super_name}/{simple_name} is not an object"
@@ -569,9 +631,14 @@ def _validate_snapshot(
             require_canonical_manifest=True,
         )
     except (TypeError, TombstoneManifestV2Error) as exc:
+        reason = (
+            _tombstone_failure_reason(exc)
+            if isinstance(exc, TombstoneManifestV2Error)
+            else "artifact_contract_invalid"
+        )
         raise RecoveryError(
-            f"snapshot {path!r} has an invalid artifact graph: {exc}"
-        ) from exc
+            f"snapshot has an invalid artifact graph; reason={reason}"
+        ) from None
 
     artifact_seals: dict[str, dict[str, Any]] = {}
     for reference in artifact_references:
@@ -590,9 +657,9 @@ def _validate_snapshot(
                 )
             except TombstoneManifestV2Error as exc:
                 raise RecoveryError(
-                    f"tombstone manifest {artifact!r} changed after root validation: "
-                    f"{exc}"
-                ) from exc
+                    "tombstone manifest changed after root validation; "
+                    f"error_type={_safe_error_type(exc)}"
+                ) from None
             size = len(sealed_manifest)
             content_sha256 = _sha256(sealed_manifest)
             if content_sha256 != reference.declared_digest:
@@ -669,7 +736,7 @@ def _state_json_object(
     try:
         document = json.loads(str(item["value"]))
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise RecoveryError(f"{label} is not valid JSON") from exc
+        raise RecoveryError(f"{label} is not valid JSON") from None
     if not isinstance(document, dict):
         raise RecoveryError(f"{label} is not a JSON object")
     return document
@@ -838,7 +905,7 @@ def _validate_rbac_catalog_state(
         except (TypeError, ValueError) as exc:
             raise RecoveryError(
                 f"catalog contains an unsafe RBAC key {key!r}"
-            ) from exc
+            ) from None
         if not key.startswith(scope):
             raise RecoveryError(f"catalog contains an unsafe RBAC key {key!r}")
         grouped.setdefault(sup, {})[key] = item
@@ -880,7 +947,7 @@ def _validate_rbac_catalog_state(
                 except (TypeError, ValueError) as exc:
                     raise RecoveryError(
                         f"catalog contains an unsafe RBAC role key {key!r}"
-                    ) from exc
+                    ) from None
                 if canonical_key != key or item.get("type") != "hash":
                     raise RecoveryError(f"RBAC role document {key!r} is invalid")
                 roles[role_id] = dict(item.get("value", {}))
@@ -894,7 +961,7 @@ def _validate_rbac_catalog_state(
                 except (TypeError, ValueError) as exc:
                     raise RecoveryError(
                         f"catalog contains an unsafe RBAC user key {key!r}"
-                    ) from exc
+                    ) from None
                 if canonical_key != key or item.get("type") != "hash":
                     raise RecoveryError(f"RBAC user document {key!r} is invalid")
                 users[user_id] = dict(item.get("value", {}))
@@ -908,7 +975,7 @@ def _validate_rbac_catalog_state(
                 except (TypeError, ValueError) as exc:
                     raise RecoveryError(
                         f"catalog contains an unsafe role-type index {key!r}"
-                    ) from exc
+                    ) from None
                 if (
                     canonical_key != key
                     or role_type not in valid_role_types
@@ -937,7 +1004,7 @@ def _validate_rbac_catalog_state(
             except (TypeError, ValueError) as exc:
                 raise RecoveryError(
                     f"RBAC role document is invalid for {sup}/{role_id}"
-                ) from exc
+                ) from None
             stored_hash = document.get("content_hash", "")
             if stored_hash and stored_hash != canonical["content_hash"]:
                 raise RecoveryError(
@@ -1001,14 +1068,14 @@ def _validate_rbac_catalog_state(
             except (TypeError, ValueError) as exc:
                 raise RecoveryError(
                     f"RBAC username is invalid for {sup}/{user_id}"
-                ) from exc
+                ) from None
             raw_roles = document.get("roles")
             try:
                 assigned = json.loads(raw_roles) if isinstance(raw_roles, str) else None
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise RecoveryError(
                     f"RBAC user roles are invalid for {sup}/{user_id}"
-                ) from exc
+                ) from None
             if not isinstance(assigned, list) or any(
                 not isinstance(role_id, str) or not role_id
                 for role_id in assigned
@@ -1022,7 +1089,7 @@ def _validate_rbac_catalog_state(
                 except (TypeError, ValueError) as exc:
                     raise RecoveryError(
                         f"RBAC user role ID is unsafe for {sup}/{user_id}"
-                    ) from exc
+                    ) from None
                 if role_id not in role_types:
                     raise RecoveryError(
                         f"RBAC user references a missing role for {sup}/{user_id}"
@@ -1084,12 +1151,12 @@ def _validate_catalog_state(
             except ValueError as exc:
                 detail = (
                     "invalid identity fields"
-                    if str(exc) == "invalid root identity fields"
-                    else str(exc)
+                    if exc.args == ("invalid root identity fields",)
+                    else "invalid root document"
                 )
                 raise RecoveryError(
                     f"catalog root {sup!r} violates the runtime contract: {detail}"
-                ) from exc
+                ) from None
 
     snapshots: list[dict[str, Any]] = []
     names_by_super: dict[str, set[str]] = {sup: set() for sup in roots}
@@ -1107,7 +1174,7 @@ def _validate_catalog_state(
             if key != RK.meta_leaf(org, sup, simple):
                 raise ValueError("non-canonical leaf key")
         except (TypeError, ValueError) as exc:
-            raise RecoveryError(f"catalog contains an unsafe leaf key {key!r}") from exc
+            raise RecoveryError(f"catalog contains an unsafe leaf key {key!r}") from None
         if sup not in roots:
             raise RecoveryError(f"leaf {sup}/{simple} has no catalog root")
         leaf = _state_json_object(item, label=f"leaf {sup}/{simple}")
@@ -1154,7 +1221,7 @@ def _validate_catalog_state(
                 except (TypeError, ValueError) as exc:
                     raise RecoveryError(
                         f"catalog contains an unsafe {family} key {key!r}"
-                    ) from exc
+                    ) from None
                 if key != canonical or simple not in names:
                     raise RecoveryError(
                         f"catalog contains an orphan/unsafe {family} key {key!r}"
@@ -1179,7 +1246,7 @@ def _validate_catalog_state(
                     except ValueError as exc:
                         raise RecoveryError(
                             f"rowid sequence for {sup}/{simple} is invalid"
-                        ) from exc
+                        ) from None
                     if parsed_rowid > 9_223_372_036_854_775_807:
                         raise RecoveryError(
                             f"rowid sequence for {sup}/{simple} exceeds signed Int64"
@@ -1195,8 +1262,9 @@ def _validate_catalog_state(
                     except ValueError as exc:
                         raise RecoveryError(
                             f"table config for {sup}/{simple} has an invalid "
-                            f"DV-v2 activation: {exc}"
-                        ) from exc
+                            "DV-v2 activation; "
+                            f"error_type={_safe_error_type(exc)}"
+                        ) from None
                     # Preserve unknown legacy/user metadata, but every field
                     # interpreted by the current writer must have the exact
                     # runtime shape.  Otherwise a checkpoint can be sealed and
@@ -1359,7 +1427,7 @@ def _validate_catalog_state(
             try:
                 canonical = RK.meta_simple_deletion_intent(org, sup, simple)
             except (TypeError, ValueError) as exc:
-                raise RecoveryError(f"unsafe simple deletion intent key {key!r}") from exc
+                raise RecoveryError(f"unsafe simple deletion intent key {key!r}") from None
             if key != canonical:
                 raise RecoveryError(f"unsafe simple deletion intent key {key!r}")
             document = _state_json_object(
@@ -1384,7 +1452,7 @@ def _validate_catalog_state(
             try:
                 canonical = RK.meta_stage_deletion_intent(org, sup, stage)
             except (TypeError, ValueError) as exc:
-                raise RecoveryError(f"unsafe stage deletion intent key {key!r}") from exc
+                raise RecoveryError(f"unsafe stage deletion intent key {key!r}") from None
             if key != canonical:
                 raise RecoveryError(f"unsafe stage deletion intent key {key!r}")
             document = _state_json_object(
@@ -1541,7 +1609,7 @@ def _redis_mapping(value: Mapping[Any, Any], *, label: str) -> dict[str, str]:
             for key, item in value.items()
         }
     except AttributeError as exc:
-        raise RecoveryError(f"{label} is not a Redis mapping") from exc
+        raise RecoveryError(f"{label} is not a Redis mapping") from None
 
 
 def _stream_id(value: Any, *, field: str) -> tuple[int, int]:
@@ -1584,7 +1652,10 @@ def _verify_live_audit_position(
     except RecoveryError:
         raise
     except Exception as exc:
-        raise RecoveryError(f"cannot inspect live privileged audit state: {exc}") from exc
+        raise RecoveryError(
+            "cannot inspect live privileged audit state; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
 
     allowed_types = {
         stream_key: {"none", "stream"},
@@ -1620,7 +1691,7 @@ def _verify_live_audit_position(
             except (TypeError, ValueError) as exc:
                 raise RecoveryError(
                     "privileged audit delivery head is invalid JSON"
-                ) from exc
+                ) from None
             if not isinstance(actual_head, dict) or not isinstance(expected_head, dict):
                 raise RecoveryError("privileged audit delivery head is invalid")
             # Delivery wall-clock time is operational metadata, not ledger
@@ -1638,7 +1709,10 @@ def _verify_live_audit_position(
         latest_rows = redis_client.xrevrange(stream_key, max="+", min="-", count=1)
         groups = redis_client.xinfo_groups(stream_key)
     except Exception as exc:
-        raise RecoveryError(f"cannot inspect privileged audit delivery state: {exc}") from exc
+        raise RecoveryError(
+            "cannot inspect privileged audit delivery state; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     if latest_rows:
         latest_id = _text(latest_rows[0][0], field="latest audit stream ID")
         latest_fields = _redis_mapping(latest_rows[0][1], label="latest audit stream")
@@ -1670,7 +1744,7 @@ def _verify_live_audit_position(
             audit.last_stream_id, field="archive tip stream ID",
         )
     except (TypeError, ValueError) as exc:
-        raise RecoveryError("privileged archive consumer group is invalid") from exc
+        raise RecoveryError("privileged archive consumer group is invalid") from None
     if pending != 0 or delivered < expected_delivered:
         raise RecoveryError(
             "privileged audit WAL is not fully acknowledged through its archive tip"
@@ -1762,7 +1836,10 @@ def create_catalog_checkpoint(
     except RecoveryError:
         raise
     except Exception as exc:
-        raise RecoveryError(f"cannot durably publish catalog checkpoint: {exc}") from exc
+        raise RecoveryError(
+            "cannot durably publish catalog checkpoint; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     return CatalogCheckpoint(
         organization, created_ms, path, manifest_hash, len(state), len(snapshots),
     )
@@ -1776,7 +1853,7 @@ def _validate_checkpoint_manifest(
     path = _logical_path(path, field="checkpoint path")
     match = _CHECKPOINT_RE.fullmatch(PurePosixPath(path).name)
     if match is None:
-        raise RecoveryError(f"unexpected file in catalog checkpoint set: {path}")
+        raise RecoveryError("unexpected file in catalog checkpoint set")
     payload = _read_bytes(
         storage, path, maximum=_MAX_CHECKPOINT_BYTES, label="catalog checkpoint",
     )
@@ -1788,7 +1865,7 @@ def _validate_checkpoint_manifest(
     try:
         created_ms = int(manifest["created_ms"])
     except (KeyError, TypeError, ValueError) as exc:
-        raise RecoveryError("catalog checkpoint timestamp is invalid") from exc
+        raise RecoveryError("catalog checkpoint timestamp is invalid") from None
     if (
         manifest.get("version") != _CHECKPOINT_VERSION
         or manifest.get("kind") != _CHECKPOINT_KIND
@@ -1798,7 +1875,7 @@ def _validate_checkpoint_manifest(
         or match.group(2) != computed
         or payload != _canonical(manifest)
     ):
-        raise RecoveryError(f"catalog checkpoint identity/hash is invalid: {path}")
+        raise RecoveryError("catalog checkpoint identity/hash is invalid")
     state = manifest.get("redis_state")
     snapshots = manifest.get("snapshots")
     if not isinstance(state, list) or not isinstance(snapshots, list):
@@ -1826,7 +1903,10 @@ def _latest_checkpoint(storage: Any, organization: str) -> tuple[str, dict[str, 
     try:
         paths = storage.list_files(_checkpoint_dir(organization), "checkpoint_*.json")
     except Exception as exc:
-        raise RecoveryError(f"cannot list catalog checkpoints: {exc}") from exc
+        raise RecoveryError(
+            "cannot list catalog checkpoints; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     if not paths:
         raise RecoveryError(
             "no sealed Redis catalog checkpoint exists; refusing to guess from loose snapshots"
@@ -1864,7 +1944,10 @@ def _audit_plan(
     try:
         paths = storage.list_files(manifest_dir, "batch_*.json")
     except Exception as exc:
-        raise RecoveryError(f"cannot list privileged audit checkpoints: {exc}") from exc
+        raise RecoveryError(
+            "cannot list privileged audit checkpoints; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     if not paths:
         if expected is not _UNBOUND_AUDIT_POSITION and expected is not None:
             raise RecoveryError("checkpoint-pinned privileged audit tip is missing")
@@ -1888,7 +1971,7 @@ def _audit_plan(
         logical = _logical_path(path, field="audit checkpoint path")
         match = _AUDIT_MANIFEST_RE.fullmatch(PurePosixPath(logical).name)
         if match is None or logical != f"{manifest_dir}/{PurePosixPath(logical).name}":
-            raise RecoveryError(f"unexpected privileged audit checkpoint path: {logical}")
+            raise RecoveryError("unexpected privileged audit checkpoint path")
         batch_id = match.group(1)
         try:
             manifest = outbox._read_checkpoint_manifest(
@@ -1896,8 +1979,9 @@ def _audit_plan(
             )
         except Exception as exc:
             raise RecoveryError(
-                f"privileged audit checkpoint verification failed: {exc}"
-            ) from exc
+                "privileged audit checkpoint verification failed; "
+                f"error_type={_safe_error_type(exc)}"
+            ) from None
         manifests[batch_id] = manifest
     referenced = {
         str(previous["batch_id"])
@@ -1962,8 +2046,9 @@ def _audit_plan(
             outbox.read_archive_batch(batch_id, organization=organization)
         except Exception as exc:
             raise RecoveryError(
-                f"privileged audit archive verification failed: {exc}"
-            ) from exc
+                "privileged audit archive verification failed; "
+                f"error_type={_safe_error_type(exc)}"
+            ) from None
     latest_manifest = manifests[tip]
     latest_entries = outbox.read_archive_batch(tip, organization=organization)
     if not latest_entries:
@@ -2087,7 +2172,10 @@ def _current_item(redis_client: Any, item: Mapping[str, Any]) -> Optional[dict[s
         else:
             return {"key": key, "type": key_type, "value": None}
     except Exception as exc:
-        raise RecoveryError(f"cannot inspect recovery destination: {exc}") from exc
+        raise RecoveryError(
+            "cannot inspect recovery destination; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     return {"key": key, "type": key_type, "value": value}
 
 
@@ -2101,7 +2189,10 @@ def _audit_destination_state(redis_client: Any, plan: RecoveryPlan) -> str:
             for key in (stream_key, meta_key, delivery_key)
         ]
     except Exception as exc:
-        raise RecoveryError(f"cannot inspect privileged audit destination: {exc}") from exc
+        raise RecoveryError(
+            "cannot inspect privileged audit destination; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     if plan.audit_stream_fields is None:
         return "empty" if types == ["none", "none", "none"] else "conflict"
     if types == ["none", "none", "none"]:
@@ -2213,6 +2304,26 @@ def rebuild_redis(
         )
     try:
         pipe = redis_client.pipeline(transaction=True)
+        # Freeze every currently known organization key and every expected
+        # restore key before checking emptiness.  A concurrent writer then
+        # invalidates EXEC instead of being silently mixed into the restore.
+        expected_keys = set(_validate_state_items(
+            plan.organization, plan.redis_state,
+        ))
+        watched_keys = expected_keys | set(
+            _scan(redis_client, RK.org_pattern(plan.organization))
+        ) | {
+            RK.audit_privileged_outbox(organization),
+            RK.audit_privileged_meta(organization),
+            RK.audit_privileged_delivery(organization),
+        }
+        if watched_keys:
+            pipe.watch(*sorted(watched_keys))
+        if _destination_state(redis_client, plan) != "empty":
+            raise RecoveryError(
+                "recovery destination changed after preflight; retry with writers stopped"
+            )
+        pipe.multi()
         _queue_state(pipe, plan.redis_state)
         if plan.audit_stream_fields is not None:
             stream_key = RK.audit_privileged_outbox(organization)
@@ -2233,11 +2344,14 @@ def rebuild_redis(
                 stream_key, _ARCHIVE_GROUP, id=str(plan.audit_last_stream_id),
             )
         pipe.execute()
+    except RecoveryError:
+        raise
     except Exception as exc:
         raise RecoveryError(
             "Redis recovery transaction failed; keep the deployment stopped "
-            f"and inspect destination: {exc}"
-        ) from exc
+            "and inspect destination; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     if _destination_state(redis_client, plan) != "exact":
         raise RecoveryError("Redis recovery failed exact read-back verification")
     return RecoveryResult(
@@ -2273,12 +2387,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
-    from supertable.redis_connector import RedisConnector
-    from supertable.storage.storage_factory import get_storage
-
-    redis_client = RedisConnector().r
-    storage = get_storage()
     try:
+        from supertable.redis_connector import RedisConnector
+        from supertable.storage.storage_factory import get_storage
+
+        redis_client = RedisConnector().r
+        storage = get_storage()
         if args.checkpoint:
             result: Any = create_catalog_checkpoint(
                 redis_client, storage, args.organization,
@@ -2287,8 +2401,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             result = rebuild_redis(
                 redis_client, storage, args.organization, dry_run=not args.apply,
             )
-    except RecoveryError as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))
+    except Exception as exc:
+        print(json.dumps({
+            "ok": False,
+            "error": "recovery_failed",
+            "error_type": _safe_error_type(exc),
+        }, sort_keys=True))
         return 2
     print(json.dumps({"ok": True, **result.__dict__}, sort_keys=True))
     return 0

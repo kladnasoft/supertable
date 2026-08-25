@@ -345,8 +345,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         memory_limit_bytes = (
             parse_byte_size(args.memory_limit) if args.memory_limit else None
         )
-    except ValueError as exc:
-        parser.error(str(exc))
+    except ValueError:
+        parser.error("benchmark arguments are invalid")
 
     root = _default_root().expanduser().resolve()
     corpus_root = (args.corpus_root or root / "corpora").expanduser().resolve()
@@ -375,8 +375,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     engine_memory_bytes=effective_memory_limit,
                 )
             )
-        except ValueError as exc:
-            parser.error(str(exc))
+        except ValueError:
+            parser.error("container benchmark configuration is invalid")
 
     manifests = []
     for tier in tiers:
@@ -474,6 +474,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (BenchmarkParityError, BenchmarkUnavailableError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+    except (BenchmarkParityError, BenchmarkUnavailableError):
+        print("ERROR: benchmark execution failed", file=sys.stderr)
         raise SystemExit(2)

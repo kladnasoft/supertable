@@ -1,5 +1,5 @@
 {
   "category": "RuntimeError",
-  "message_substring": "DuckDB managed query setup failed",
+  "message_substring": "Query execution failed",
   "phase": "execution"
 }

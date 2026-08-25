@@ -41,10 +41,10 @@ class WebshopDataGenerator:
         try:
             self.start_date = pd.Timestamp(config.start_date)
             self.end_date = pd.Timestamp(config.end_date)
-        except Exception as exc:
+        except Exception:
             raise ValueError(
-                f"Invalid date in config. start_date={config.start_date}, end_date={config.end_date}"
-            ) from exc
+                "Invalid date range in webshop demo configuration"
+            ) from None
 
         if self.end_date <= self.start_date:
             raise ValueError("end_date must be later than start_date")

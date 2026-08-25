@@ -6,7 +6,10 @@ production Redis instance.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+from pathlib import Path
 import uuid
 
 import pytest
@@ -15,6 +18,11 @@ import redis
 from supertable import redis_keys as RK
 from supertable.audit.privileged import PrivilegedActionContext
 from supertable.audit.privileged_outbox import PrivilegedAuditOutbox
+from supertable.audit.privileged_worker import (
+    attest_activation_baseline,
+    compute_privileged_state_sha256,
+    verify_activation_baseline,
+)
 from supertable.redis_catalog import RedisCatalog
 
 
@@ -54,8 +62,37 @@ def _context(index: int) -> PrivilegedActionContext:
     )
 
 
+def _install_activation_baseline(
+    outbox: PrivilegedAuditOutbox,
+    organization: str,
+    baseline_path: Path,
+) -> None:
+    """Anchor the empty real-Redis estate through the production verifier."""
+    document = {
+        "version": 1,
+        "kind": "supertable_privileged_activation_baseline",
+        "organization": organization,
+        "activation_id": f"real-redis-audit-gate-{organization}",
+        "created_ms": 1_700_000_000_000,
+        "state_sha256": compute_privileged_state_sha256(outbox, organization),
+    }
+    payload = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    baseline_path.write_bytes(payload)
+    report = verify_activation_baseline(
+        str(baseline_path),
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+        organization=organization,
+    )
+    assert attest_activation_baseline(outbox, report)
+
+
 @pytest.mark.integration
-def test_all_privileged_mutations_roundtrip_through_real_redis_lua():
+def test_all_privileged_mutations_roundtrip_through_real_redis_lua(tmp_path):
     url = os.environ.get("SUPERTABLE_TEST_REDIS_URL", "").strip()
     if not url:
         pytest.skip("SUPERTABLE_TEST_REDIS_URL is not configured")
@@ -69,6 +106,16 @@ def test_all_privileged_mutations_roundtrip_through_real_redis_lua():
     user_id = f"user-{token}"
     catalog = _catalog(client)
     try:
+        outbox = PrivilegedAuditOutbox(
+            client,
+            stream_key=RK.audit_privileged_outbox(organization),
+            delivery_ledger_key=RK.audit_privileged_delivery(organization),
+        )
+        _install_activation_baseline(
+            outbox,
+            organization,
+            tmp_path / "privileged-activation-baseline.json",
+        )
         role = {
             "role_id": role_id,
             "role": "reader",
@@ -115,11 +162,6 @@ def test_all_privileged_mutations_roundtrip_through_real_redis_lua():
             action_context=_context(9),
         )
 
-        outbox = PrivilegedAuditOutbox(
-            client,
-            stream_key=RK.audit_privileged_outbox(organization),
-            delivery_ledger_key=RK.audit_privileged_delivery(organization),
-        )
         entries = outbox.query(newest_first=False)
         assert [entry.event["ledger_sequence"] for entry in entries] == list(
             range(1, 10)

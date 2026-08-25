@@ -45,9 +45,12 @@ Analysis examples (default log at ~/supertable/log/st.log):
 """
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import json
 import logging
 import os
+import re
 import sys
 import time
 import uuid
@@ -64,6 +67,7 @@ from starlette.responses import Response
 # ---------------------------------------------------------------------------
 
 from supertable.config.settings import settings
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 CORRELATION_HEADER = settings.SUPERTABLE_CORRELATION_HEADER
 
@@ -77,6 +81,32 @@ _REDACT_HEADERS = frozenset({
 _SKIP_PATHS = frozenset({
     "/static/", "/favicon.ico", "/healthz",
 })
+
+_CORRELATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+
+
+def _safe_correlation_id(value: object) -> str:
+    """Accept one bounded opaque identifier or mint a server-owned value."""
+
+    candidate = value if isinstance(value, str) else ""
+    if _CORRELATION_ID_RE.fullmatch(candidate):
+        return candidate
+    return uuid.uuid4().hex[:12]
+
+
+def _request_path_metadata(request: Request) -> str:
+    """Return non-reversible correlation metadata for a request path.
+
+    Raw request paths can carry bearer tokens and customer-selected object names.
+    BaseHTTPMiddleware does not reliably receive a matched route template across
+    supported Starlette versions, so every path is represented only by byte count
+    and a short digest.
+    """
+
+    raw_path = str(request.scope.get("path") or "")
+    encoded = raw_path.encode("utf-8", errors="surrogatepass")
+    digest = hashlib.sha256(encoded).hexdigest()[:16]
+    return f"<request-path bytes={len(encoded)} sha256={digest}>"
 
 
 # ---------------------------------------------------------------------------
@@ -119,11 +149,16 @@ class JSONFormatter(logging.Formatter):
         ):
             val = getattr(record, key, None)
             if val is not None:
-                doc[key] = val
+                # ``error`` has historically been supplied by proxy call
+                # sites as arbitrary backend prose.  Keep the field for schema
+                # compatibility, but never serialize its caller-owned value.
+                doc[key] = "request_failed" if key == "error" else val
 
         # Exception info
         if record.exc_info and record.exc_info[1]:
-            doc["exception"] = self.formatException(record.exc_info)
+            doc["exception"] = (
+                f"error_type={safe_exception_type(record.exc_info[1])}"
+            )
 
         return json.dumps(doc, default=str, ensure_ascii=False)
 
@@ -216,13 +251,18 @@ class TextFormatter(logging.Formatter):
         if event == "proxy_error":
             method = getattr(record, "method", "")
             path = getattr(record, "path", "")
-            error = getattr(record, "error", "")
-            return self._wrap(self._RED, f"{prefix}  proxy {method} {path} → FAILED  {error}")
+            return self._wrap(
+                self._RED,
+                f"{prefix}  proxy {method} {path} → FAILED",
+            )
 
         # ── General messages ──────────────────────────────────────
         msg = record.getMessage()
         if record.exc_info and record.exc_info[1]:
-            msg += "\n" + self.formatException(record.exc_info)
+            msg += (
+                "\nerror_type="
+                + safe_exception_type(record.exc_info[1])
+            )
 
         line = f"{prefix}  {msg}"
 
@@ -355,15 +395,14 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next) -> Response:
         # Skip noisy paths
-        path = request.url.path
-        if any(path.startswith(skip) for skip in _SKIP_PATHS):
+        raw_path = request.url.path
+        if any(raw_path.startswith(skip) for skip in _SKIP_PATHS):
             return await call_next(request)
 
         # Correlation ID — reuse incoming or generate new
-        correlation_id = (
+        correlation_id = _safe_correlation_id(
             request.headers.get(CORRELATION_HEADER)
             or request.headers.get(CORRELATION_HEADER.lower())
-            or uuid.uuid4().hex[:12]
         )
 
         # Inject into request state so handlers/proxy can access it
@@ -376,6 +415,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         except Exception as exc:
             duration_ms = round((time.perf_counter() - t0) * 1000, 1)
             proxied = getattr(request.state, "proxied", False)
+            path = _request_path_metadata(request)
             self.logger.error(
                 f"{request.method} {path} → 500 (unhandled)",
                 extra={
@@ -386,13 +426,14 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                     "status": 500,
                     "duration_ms": duration_ms,
                     "client_ip": _client_ip(request),
-                    "error": type(exc).__name__,
+                    "error": safe_exception_type(exc),
                     "proxied": proxied,
                 },
             )
             raise
 
         duration_ms = round((time.perf_counter() - t0) * 1000, 1)
+        path = _request_path_metadata(request)
 
         # Propagate correlation ID to response
         response.headers[CORRELATION_HEADER] = correlation_id
@@ -428,9 +469,15 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
 
 def _client_ip(request: Request) -> str:
-    """Extract client IP, respecting X-Forwarded-For."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+    """Return only the ASGI server's parsed peer IP.
+
+    Forwarded headers are caller-controlled unless a separately configured
+    trusted-proxy layer has already rewritten ``request.client``.
+    """
+
     client = getattr(request, "client", None)
-    return getattr(client, "host", "-") if client else "-"
+    host = getattr(client, "host", "") if client else ""
+    try:
+        return ipaddress.ip_address(str(host).strip()).compressed
+    except ValueError:
+        return "-"

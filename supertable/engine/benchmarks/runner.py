@@ -22,7 +22,6 @@ import sys
 import tempfile
 import threading
 import time
-import traceback
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
@@ -36,6 +35,7 @@ from .corpus import (
     plan_workload,
     repeated_manifest_paths,
 )
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 
 RESULT_FORMAT_VERSION = 1
@@ -72,7 +72,10 @@ def _cgroup_v2_memory_telemetry(
     try:
         proc_text = Path(proc_cgroup).read_text(encoding="utf-8")
     except OSError as exc:
-        telemetry["reason"] = f"proc_cgroup_unavailable:{type(exc).__name__}"
+        telemetry["reason"] = (
+            "proc_cgroup_unavailable; error_type="
+            + safe_exception_type(exc)
+        )
         return telemetry
 
     relative: str | None = None
@@ -90,7 +93,9 @@ def _cgroup_v2_memory_telemetry(
         current = (root / relative).resolve(strict=True)
         current.relative_to(root)
     except (OSError, ValueError) as exc:
-        telemetry["reason"] = f"cgroup_path_invalid:{type(exc).__name__}"
+        telemetry["reason"] = (
+            "cgroup_path_invalid:error_type=" + safe_exception_type(exc)
+        )
         return telemetry
 
     def safe_counter(name: str) -> Path:
@@ -458,7 +463,12 @@ def _profile_metrics(path: Path) -> dict[str, Any]:
     try:
         profile = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
-        return {"profile_error": f"{type(exc).__name__}: {exc}"}
+        return {
+            "profile_error": (
+                "profile unavailable; "
+                f"error_type={safe_exception_type(exc)}"
+            )
+        }
     keys = (
         # Common/DuckDB JSON profiler fields.
         "latency",
@@ -751,10 +761,10 @@ def _postprocess_generated_metric_stats(frame, plan: Mapping[str, Any]):
         value = frame.iloc[0][column]
         try:
             parsed = int(value)
-        except (TypeError, ValueError, OverflowError) as exc:
+        except (TypeError, ValueError, OverflowError):
             raise RuntimeError(
                 f"aggregate_stats {column} is not a finite integer"
-            ) from exc
+            ) from None
         try:
             matches = bool(value == parsed)
         except Exception:
@@ -1084,8 +1094,11 @@ def worker_main(request_path: str | Path, response_path: str | Path) -> int:
     except Exception as exc:  # noqa: BLE001 - preserve worker failure context
         response = {
             "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "traceback": traceback.format_exc(),
+            "error": (
+                "engine benchmark failed; "
+                f"error_type={safe_exception_type(exc)}"
+            ),
+            "traceback": "redacted",
         }
         code = 1
     response_file.write_text(
@@ -1576,13 +1589,19 @@ def environment_metadata() -> dict[str, Any]:
 
         metadata["duckdb"] = duckdb.__version__
     except Exception as exc:
-        metadata["duckdb_error"] = f"{type(exc).__name__}: {exc}"
+        metadata["duckdb_error"] = (
+            "DuckDB probe failed; "
+            f"error_type={safe_exception_type(exc)}"
+        )
     try:
         import pyarrow
 
         metadata["pyarrow"] = pyarrow.__version__
     except Exception as exc:
-        metadata["pyarrow_error"] = f"{type(exc).__name__}: {exc}"
+        metadata["pyarrow_error"] = (
+            "PyArrow probe failed; "
+            f"error_type={safe_exception_type(exc)}"
+        )
     return metadata
 
 

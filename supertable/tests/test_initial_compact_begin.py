@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 from unittest.mock import MagicMock
 
 import fakeredis
@@ -106,6 +107,48 @@ def test_exact_catalog_stable_absence_uses_only_compact_boundary(monkeypatch):
     general.assert_not_called()
     assert _sequence(fake) == "4"
     assert fake.get(RK.meta_leaf(ORG, SUP, SIMPLE)) is None
+
+
+def test_general_begin_never_exposes_table_config_validator_text(monkeypatch):
+    import supertable.redis_catalog as redis_catalog_module
+
+    secret = "api_key=BEGIN_CONFIG_SENTINEL;https://redis.invalid/private"
+
+    class _PoisonedConfigError(ValueError):
+        pass
+
+    def reject(_document):
+        raise _PoisonedConfigError(secret)
+
+    catalog, fake = _catalog()
+    _seed_initial(fake)
+    _seed_live_leaf(fake)
+    fake.set(
+        RK.meta_table_config(ORG, SUP, SIMPLE),
+        json.dumps({"primary_keys": ["id"]}),
+    )
+    monkeypatch.setattr(
+        redis_catalog_module,
+        "_validate_table_config_document",
+        reject,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        catalog.begin_table_mutation(
+            ORG,
+            SUP,
+            SIMPLE,
+            lock_token=LEAF_TOKEN,
+            reserve_count=0,
+        )
+
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert str(raised.value) == (
+        "Corrupt table configuration; error_type=ValueError"
+    )
+    assert secret not in rendered
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_catalog_subclass_retains_general_boundary(monkeypatch):

@@ -97,6 +97,15 @@ def write_bytes(self, path: str, data: bytes) -> None
 Writes raw bytes to the given path. Creates parent directories/prefixes as needed.
 
 ```python
+def create_bytes_if_absent(self, path: str, data: bytes) -> bool
+```
+Atomically publishes a complete immutable object with a provider-native
+no-overwrite precondition. It returns `True` for the creator and `False` only
+for a definite precondition loser; transport and durability ambiguities raise.
+The base implementation intentionally raises `NotImplementedError` so a
+third-party adapter can never fall back to a check-then-write race.
+
+```python
 @abc.abstractmethod
 def read_bytes(self, path: str) -> bytes
 ```
@@ -186,6 +195,7 @@ class LocalStorage(StorageInterface):
 **Key implementation details**:
 
 - **Atomic JSON writes**: Uses `tempfile.mkstemp` in the same directory, writes + `fsync`, then `os.replace()` for an atomic swap. Directory is fsynced on POSIX systems for durability.
+- **Immutable conditional create**: On Linux, complete bytes are written to an unnamed `O_TMPFILE` inode and linked with `linkat` into a descriptor-pinned, no-symlink directory chain. The file and namespace ancestry are fsynced before success. Filesystems or platforms without the required descriptor operations fail closed with `NotImplementedError` rather than exposing a named staging file.
 - **Retry on read**: A micro-retry loop (5 attempts, 20 ms backoff) handles transient races with concurrent writers performing atomic replace.
 - **No authentication**: Operates on the local filesystem relative to `app_home`.
 

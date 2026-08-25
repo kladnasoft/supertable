@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import tempfile
 from typing import Any
 
@@ -39,6 +40,59 @@ def _is_writable_dir(path: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def _private_runtime_fallback() -> str | None:
+    """Return a private, user-owned temp fallback or fail closed.
+
+    A shared ``/tmp/supertable`` directory is unsafe on multi-user hosts: a
+    different user can create it first (or replace it with a symlink) and make
+    DuckDB place spill, cache, and extension data in an attacker-selected
+    location.  Use a per-user directory, open it without following symlinks,
+    and verify ownership before exposing the path to consumers.
+    """
+    try:
+        user_id = os.geteuid()
+        temp_root = os.path.realpath(tempfile.gettempdir())
+        root_info = os.stat(temp_root, follow_symlinks=True)
+    except (AttributeError, OSError):
+        return None
+
+    if not stat.S_ISDIR(root_info.st_mode):
+        return None
+    # A group/world-writable parent needs the sticky bit so another account
+    # cannot rename this user's verified child after the ownership check.
+    if root_info.st_mode & 0o022 and not root_info.st_mode & stat.S_ISVTX:
+        return None
+
+    fallback = os.path.join(temp_root, f"supertable-{user_id}")
+    try:
+        os.mkdir(fallback, mode=0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return None
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(fallback, flags)
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != user_id:
+            return None
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.fchmod(descriptor, 0o700)
+            info = os.fstat(descriptor)
+            if stat.S_IMODE(info.st_mode) != 0o700:
+                return None
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+    return fallback if _is_writable_dir(fallback) else None
 
 def _resolve_app_home() -> str:
     """
@@ -68,27 +122,23 @@ def _resolve_app_home() -> str:
     expanded = os.path.abspath(os.path.expanduser(raw))
 
     if _is_writable_dir(expanded):
-        logging.getLogger(__name__).debug(
-            "Ensured app home directory exists: %s", expanded
-        )
+        logging.getLogger(__name__).debug("Application home directory is ready")
         _resolved_home = expanded
         return _resolved_home
 
-    fallback = os.path.join(tempfile.gettempdir(), "supertable")
-    if _is_writable_dir(fallback):
+    fallback = _private_runtime_fallback()
+    if fallback is not None:
         logging.getLogger(__name__).warning(
-            "SUPERTABLE_HOME=%r is not writable; falling back to %r. Set "
-            "SUPERTABLE_HOME to a writable directory to silence this — "
-            "DuckDB temp/spill, cache and extensions live under it.",
-            expanded,
-            fallback,
+            "SUPERTABLE_HOME is not writable; using the runtime fallback. "
+            "Set SUPERTABLE_HOME to a writable directory to silence this — "
+            "DuckDB temp/spill, cache and extensions live under it."
         )
         _resolved_home = fallback
         return _resolved_home
 
     raise RuntimeError(
-        f"No writable application home: tried SUPERTABLE_HOME={expanded!r} and "
-        f"fallback {fallback!r}. Set SUPERTABLE_HOME to a writable directory."
+        "No writable application home is available. Set SUPERTABLE_HOME to "
+        "a writable directory."
     )
 
 def change_to_app_home(home_dir: str | None = None) -> None:
@@ -101,12 +151,10 @@ def change_to_app_home(home_dir: str | None = None) -> None:
     expanded_dir = os.path.expanduser(target)
     try:
         os.chdir(expanded_dir)
-        logging.getLogger(__name__).debug(
-            "Changed working directory to %s", expanded_dir
-        )
-    except Exception as e:
+        logging.getLogger(__name__).debug("Changed to the application home directory")
+    except Exception:
         logging.getLogger(__name__).error(
-            "Failed to change working directory to %s: %s", expanded_dir, e
+            "Failed to change to the application home directory"
         )
 
 

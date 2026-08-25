@@ -378,9 +378,8 @@ def _make_estimator(monkeypatch, *, query: str, pruning: bool):
     monkeypatch.setattr(de_mod, "SuperTable", _DummySuper)
     monkeypatch.setattr(
         de_mod, "load_stats",
-        lambda path, allow_cache=False, cache_identity=None, profiler=None: stats_by_file[
-            path
-        ],
+        lambda path, allow_cache=False, cache_identity=None, profiler=None,
+        storage=None: stats_by_file[path],
     )
     test_settings = dataclasses.replace(
         settings, SUPERTABLE_READ_PRUNING_ENABLED=pruning

@@ -481,7 +481,9 @@ class TestSimpleTableDelete:
             role_name="admin",
             table_name="events",
         )
-        assert mock_check.call_args_list == [expected, expected, expected]
+        # Initial admission and one post-lock revalidation are distinct
+        # authority boundaries; duplicate consecutive post-lock checks are not.
+        assert mock_check.call_args_list == [expected, expected]
 
     @patch(_P_CHECK_CONTROL)
     def test_rbac_denied_propagates(self, mock_check):
@@ -493,6 +495,25 @@ class TestSimpleTableDelete:
 
         obj.storage.exists.assert_not_called()
         obj.catalog.delete_simple_table.assert_not_called()
+
+    @patch(_P_CHECK_CONTROL)
+    def test_rbac_revoked_while_waiting_for_locks_fails_before_intent(
+        self, mock_check,
+    ):
+        mock_check.side_effect = [None, PermissionError("revoked")]
+        obj = _make_simple()
+
+        with pytest.raises(PermissionError, match="revoked"):
+            obj.delete(role_name="admin")
+
+        obj.catalog.begin_simple_deletion.assert_not_called()
+        obj.storage.delete_prefix.assert_not_called()
+        obj.catalog.release_simple_lock.assert_called_once_with(
+            "org", "sup", "events", "simple-token",
+        )
+        obj.catalog.release_namespace_lock.assert_called_once_with(
+            "org", "sup", "namespace-token",
+        )
 
     @patch(_P_CHECK_CONTROL)
     def test_happy_path_deletes_storage_and_redis(self, mock_check):

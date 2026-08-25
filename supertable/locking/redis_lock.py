@@ -39,6 +39,13 @@ from typing import Dict, Optional, Tuple
 
 import redis
 from supertable.config.defaults import logger
+from supertable.utils.diagnostic_redaction import safe_exception_type
+
+
+def _safe_error_type(error: BaseException) -> str:
+    """Return bounded exception metadata without rendering backend text."""
+
+    return safe_exception_type(error)
 
 
 def _require_positive_ttl_ms(ttl_ms: object) -> int:
@@ -204,7 +211,10 @@ class RedisLocking:
                         self._stop_heartbeat(restart_if_held=True)
                     return token
             except redis.RedisError as e:
-                logger.debug(f"[redis-lock] acquire error on {key}: {e}")
+                logger.debug(
+                    "[redis-lock] acquire failed; error_type=%s",
+                    _safe_error_type(e),
+                )
             time.sleep(retry_interval)
         return None
 
@@ -221,7 +231,10 @@ class RedisLocking:
             res = self._release_if_token(keys=[key], args=[token])
             released = int(res or 0) == 1
         except redis.RedisError as e:
-            logger.debug(f"[redis-lock] release error on {key}: {e}")
+            logger.debug(
+                "[redis-lock] release failed; error_type=%s",
+                _safe_error_type(e),
+            )
             released = False
 
         # Always remove from held tracking (even if Lua returned 0, the key
@@ -480,7 +493,10 @@ class RedisLocking:
                             "Redis heartbeat returned an incomplete batch result"
                         )
                 except Exception as e:
-                    logger.debug(f"[redis-lock] heartbeat batch error: {e}")
+                    logger.debug(
+                        "[redis-lock] heartbeat batch error; error_type=%s",
+                        _safe_error_type(e),
+                    )
                     retry_delay_s = min(
                         1.0,
                         max(
@@ -502,7 +518,7 @@ class RedisLocking:
                 ):
                     if int(result or 0) == 1:
                         continue
-                    logger.debug(f"[redis-lock] heartbeat: lost lock on {key}")
+                    logger.debug("[redis-lock] heartbeat lost a lock")
                     with self._held_lock:
                         held_entry = self._held.get(key)
                         if held_entry is not None and held_entry[0] == token:

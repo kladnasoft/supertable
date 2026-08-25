@@ -11,11 +11,13 @@ runs with only the Python stdlib + pytest.
 """
 import io
 import json
+import multiprocessing
 import os
 import shutil
 import sys
 import tempfile
 import threading
+import traceback
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -164,7 +166,10 @@ _boto3 = _ensure_stub("boto3", {"client": MagicMock()})
 # NOTE: do NOT stub supertable.storage — the real package is on disk
 
 # NOW we can safely import the production code
-from supertable.storage.storage_interface import StorageInterface
+from supertable.storage.storage_interface import (
+    ObjectIdentityMismatch,
+    StorageInterface,
+)
 from supertable.storage.local_storage import LocalStorage
 from supertable.storage.minio_storage import MinioStorage
 from supertable.storage.s3_storage import S3Storage
@@ -174,7 +179,23 @@ from supertable.config.settings import settings as _settings
 from supertable.storage import minio_storage as _minio_module
 from supertable.storage import s3_storage as _s3_module
 from supertable.storage import storage_factory as _factory_module
+from supertable.tests.fork_semantics_probe import run_fork_probe
 from dataclasses import replace as _dc_replace
+
+
+def _publish_create_bytes_if_absent(root, index, start, outcomes):
+    """Spawn-safe worker for the cross-process immutable-create race."""
+
+    storage = LocalStorage(root)
+    start.wait()
+    try:
+        created = storage.create_bytes_if_absent(
+            "process-race/proof.json",
+            f"proof-{index}".encode("ascii"),
+        )
+        outcomes.put((index, created, None))
+    except BaseException as exc:
+        outcomes.put((index, None, type(exc).__name__))
 
 
 class _FakeClientError(_s3_module.ClientError):
@@ -265,6 +286,27 @@ class TestStorageInterface(unittest.TestCase):
         with self.assertRaises(NotImplementedError):
             d.presign("key")
 
+    def test_create_bytes_if_absent_has_no_unsafe_default_fallback(self):
+        class Dummy(StorageInterface):
+            def read_json(self, path): ...
+            def write_json(self, path, data): ...
+            def exists(self, path): ...
+            def size(self, path): ...
+            def makedirs(self, path): ...
+            def list_files(self, path, pattern="*"): ...
+            def delete(self, path): ...
+            def get_directory_structure(self, path): ...
+            def write_parquet(self, table, path): ...
+            def read_parquet(self, path): ...
+            def write_bytes(self, path, data): ...
+            def read_bytes(self, path): ...
+            def write_text(self, path, text, encoding="utf-8"): ...
+            def read_text(self, path, encoding="utf-8"): ...
+            def copy(self, src_path, dst_path): ...
+
+        with self.assertRaises(NotImplementedError):
+            Dummy().create_bytes_if_absent("proof.json", b"proof")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  LOCAL STORAGE
@@ -274,7 +316,7 @@ class TestLocalStorage(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="test_local_storage_")
-        self.storage = LocalStorage()
+        self.storage = LocalStorage(self.tmpdir)
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
@@ -321,6 +363,27 @@ class TestLocalStorage(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             self.storage.read_json(p)
         self.assertIn("Invalid JSON", str(ctx.exception))
+
+    def test_json_and_path_validation_errors_do_not_reflect_secret_paths(self):
+        secret = "tenant-path-token-DO-NOT-LOG"
+        p = self._path(f"{secret}.json")
+        Path(p).write_text("{invalid", encoding="utf-8")
+
+        with self.assertRaises(ValueError) as invalid_json:
+            self.storage.read_json(p)
+        rendered = "".join(
+            traceback.format_exception(
+                type(invalid_json.exception),
+                invalid_json.exception,
+                invalid_json.exception.__traceback__,
+            )
+        )
+        self.assertNotIn(secret, rendered)
+
+        rooted = LocalStorage(root=self.tmpdir)
+        with self.assertRaises(ValueError) as escaped:
+            rooted.read_bytes(f"../{secret}.json")
+        self.assertNotIn(secret, str(escaped.exception))
 
     def test_read_json_unicode(self):
         p = self._path("unicode.json")
@@ -753,6 +816,28 @@ class TestLocalStorage(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.storage.read_parquet(p)
 
+    def test_read_parquet_failure_does_not_expose_path_or_backend_message(self):
+        secret = "signed-path-token-DO-NOT-LOG"
+        p = self._path(f"{secret}.parquet")
+        Path(p).write_bytes(b"not parquet")
+        with patch(
+            "supertable.storage.local_storage.pq.read_table",
+            side_effect=RuntimeError(f"backend-secret-{secret}"),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.storage.read_parquet(p)
+
+        rendered = "".join(
+            traceback.format_exception(
+                type(ctx.exception), ctx.exception, ctx.exception.__traceback__,
+            )
+        )
+        self.assertEqual(
+            str(ctx.exception),
+            "Failed to read Parquet; error_type=RuntimeError",
+        )
+        self.assertNotIn(secret, rendered)
+
     # ---- bytes ----
 
     def test_write_and_read_bytes(self):
@@ -797,6 +882,185 @@ class TestLocalStorage(unittest.TestCase):
         ):
             self.storage.write_bytes(p, b"complete")
         self.assertEqual(self.storage.read_bytes(p), b"complete")
+
+    def test_create_bytes_if_absent_never_overwrites(self):
+        p = self._path("immutable/proof.json")
+        self.assertTrue(self.storage.create_bytes_if_absent(p, b"first"))
+        self.assertFalse(self.storage.create_bytes_if_absent(p, b"second"))
+        self.assertEqual(self.storage.read_bytes(p), b"first")
+        self.assertEqual(
+            list(Path(p).parent.glob(".tmp-create-bytes-*")),
+            [],
+        )
+
+    def test_create_bytes_if_absent_has_one_concurrent_winner(self):
+        storage = LocalStorage(self.tmpdir)
+        barrier = threading.Barrier(8)
+
+        def publish(index):
+            barrier.wait()
+            created = storage.create_bytes_if_absent(
+                "race/proof.json", f"proof-{index}".encode("ascii"),
+            )
+            return index, created
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            outcomes = list(executor.map(publish, range(8)))
+
+        winners = [index for index, created in outcomes if created]
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(
+            storage.read_bytes("race/proof.json"),
+            f"proof-{winners[0]}".encode("ascii"),
+        )
+
+    def test_create_bytes_if_absent_has_one_cross_process_winner(self):
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        outcomes = context.Queue()
+
+        processes = [
+            context.Process(
+                target=_publish_create_bytes_if_absent,
+                args=(self.tmpdir, index, start, outcomes),
+            )
+            for index in range(6)
+        ]
+        for process in processes:
+            process.start()
+        try:
+            start.set()
+            for process in processes:
+                process.join(timeout=15)
+
+            self.assertTrue(all(process.exitcode == 0 for process in processes))
+            results = [outcomes.get(timeout=5) for _ in processes]
+            self.assertTrue(
+                all(error is None for _index, _created, error in results),
+            )
+            winners = [index for index, created, _error in results if created]
+            self.assertEqual(len(winners), 1)
+            self.assertEqual(
+                LocalStorage(self.tmpdir).read_bytes("process-race/proof.json"),
+                f"proof-{winners[0]}".encode("ascii"),
+            )
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+            for process in processes:
+                process.join(timeout=5)
+            outcomes.close()
+            outcomes.join_thread()
+
+    def test_create_bytes_if_absent_directory_fsync_failure_is_ambiguous(self):
+        p = self._path("create-fsync/proof.json")
+        with (
+            patch(
+                "supertable.storage.local_storage.os.fsync",
+                side_effect=[None, OSError("directory fsync failed")],
+            ),
+            self.assertRaisesRegex(OSError, "directory fsync failed"),
+        ):
+            self.storage.create_bytes_if_absent(p, b"complete")
+        # A raised durability acknowledgement is ambiguous by contract: the
+        # caller must reconcile the exact visible object rather than retry an
+        # overwrite.
+        self.assertEqual(self.storage.read_bytes(p), b"complete")
+
+    def test_create_bytes_if_absent_fails_closed_without_unnamed_files(self):
+        storage = LocalStorage(self.tmpdir)
+        with (
+            patch.object(
+                storage,
+                "_open_immutable_unnamed_file",
+                side_effect=NotImplementedError("O_TMPFILE unavailable"),
+            ),
+            self.assertRaisesRegex(NotImplementedError, "O_TMPFILE unavailable"),
+        ):
+            storage.create_bytes_if_absent("proofs/day.json", b"proof")
+
+        self.assertFalse(os.path.lexists(self._path("proofs/day.json")))
+
+    def test_create_bytes_if_absent_has_no_staging_path_to_swap(self):
+        storage = LocalStorage(self.tmpdir)
+        with (
+            patch(
+                "supertable.storage.local_storage.os.link",
+                side_effect=AssertionError("pathname source must not be used"),
+            ),
+            patch(
+                "supertable.storage.local_storage.tempfile.mkstemp",
+                side_effect=AssertionError("named staging must not be used"),
+            ),
+        ):
+            self.assertTrue(
+                storage.create_bytes_if_absent("proofs/day.json", b"proof")
+            )
+
+        self.assertEqual(storage.read_bytes("proofs/day.json"), b"proof")
+        self.assertEqual(list(Path(self.tmpdir).rglob(".tmp-create-bytes-*")), [])
+
+    def test_create_bytes_if_absent_destination_race_preserves_winner(self):
+        from supertable.storage import local_storage as local_module
+
+        storage = LocalStorage(self.tmpdir)
+        outside = self._path("../outside-winner")
+        with open(outside, "wb") as stream:
+            stream.write(b"existing-winner")
+        self.addCleanup(lambda: os.path.lexists(outside) and os.unlink(outside))
+        real_link = local_module._linux_link_file_descriptor_no_replace
+
+        def install_winner_before_link(source_fd, directory_fd, target_name):
+            os.symlink(outside, target_name, dir_fd=directory_fd)
+            return real_link(source_fd, directory_fd, target_name)
+
+        with patch(
+            "supertable.storage.local_storage."
+            "_linux_link_file_descriptor_no_replace",
+            side_effect=install_winner_before_link,
+        ):
+            self.assertFalse(
+                storage.create_bytes_if_absent("race/day.json", b"proof")
+            )
+
+        self.assertTrue(os.path.islink(self._path("race/day.json")))
+        self.assertEqual(Path(outside).read_bytes(), b"existing-winner")
+
+    def test_create_bytes_if_absent_directory_swap_is_never_acknowledged(self):
+        from supertable.storage import local_storage as local_module
+
+        storage = LocalStorage(self.tmpdir)
+        outside = tempfile.mkdtemp(
+            prefix="outside-proof-directory-",
+            dir=os.path.dirname(self.tmpdir),
+        )
+        displaced = self._path("displaced-proof-directory")
+        self.addCleanup(lambda: shutil.rmtree(outside, ignore_errors=True))
+        real_link = local_module._linux_link_file_descriptor_no_replace
+
+        def replace_directory_before_link(source_fd, directory_fd, target_name):
+            os.rename(self._path("proofs"), displaced)
+            os.symlink(outside, self._path("proofs"), target_is_directory=True)
+            return real_link(source_fd, directory_fd, target_name)
+
+        with (
+            patch(
+                "supertable.storage.local_storage."
+                "_linux_link_file_descriptor_no_replace",
+                side_effect=replace_directory_before_link,
+            ),
+            self.assertRaisesRegex(
+                ObjectIdentityMismatch,
+                "directory hierarchy changed",
+            ),
+        ):
+            storage.create_bytes_if_absent("proofs/day.json", b"proof")
+
+        self.assertFalse(os.path.lexists(os.path.join(outside, "day.json")))
+        self.assertEqual(Path(displaced, "day.json").read_bytes(), b"proof")
+        with self.assertRaisesRegex(ValueError, "escapes configured root"):
+            storage.read_bytes("proofs/day.json")
 
     def test_durability_batch_fsyncs_files_then_each_directory_once(self):
         storage = LocalStorage(self.tmpdir)
@@ -1021,43 +1285,11 @@ class TestLocalStorage(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires POSIX fork")
     def test_durability_batch_is_not_inherited_as_active_after_fork(self):
+        result = run_fork_probe("durability_batch", root=self.tmpdir)
+
+        self.assertEqual(result["child_exitcode"], 0)
+        self.assertEqual(result["parent_publication_count"], 1)
         storage = LocalStorage(self.tmpdir)
-        # Materialize the process-global sync pool before fork. The child must
-        # discard those vanished parent threads and be able to create its own
-        # durability batch rather than hanging on inherited executor state.
-        with storage.durability_batch() as seed_batch:
-            storage.write_bytes("seed-object", b"seed")
-            seed_batch.barrier()
-            seed_batch.catalog_commit_started()
-            seed_batch.catalog_commit_succeeded()
-        with storage.durability_batch() as batch:
-            storage.write_bytes("parent-before-fork", b"parent-before")
-            pid = os.fork()
-            if pid == 0:  # pragma: no cover - assertions run in parent
-                try:
-                    # An inherited batch must neither wait on vanished parent
-                    # workers nor unlink the parent's shared filesystem path.
-                    batch.abort()
-                    batch.close()
-                    with storage.durability_batch() as child_batch:
-                        storage.write_bytes("child-object", b"child")
-                        child_batch.barrier()
-                        child_batch.catalog_commit_started()
-                        child_batch.catalog_commit_succeeded()
-                except BaseException:
-                    os._exit(1)
-                os._exit(0)
-            waited, status = os.waitpid(pid, 0)
-            self.assertEqual(waited, pid)
-            self.assertEqual(os.waitstatus_to_exitcode(status), 0)
-            self.assertEqual(
-                storage.read_bytes("parent-before-fork"), b"parent-before",
-            )
-            self.assertEqual(len(batch._publications), 1)
-            storage.write_bytes("parent-object", b"parent")
-            batch.barrier()
-            batch.catalog_commit_started()
-            batch.catalog_commit_succeeded()
         self.assertEqual(storage.read_bytes("child-object"), b"child")
         self.assertEqual(
             storage.read_bytes("parent-before-fork"), b"parent-before",
@@ -1330,13 +1562,12 @@ class TestLocalStorage(unittest.TestCase):
         original_open = open
 
         def flaky_open(path_arg, *args, **kwargs):
-            fh = original_open(path_arg, *args, **kwargs)
             if path_arg == p:
                 call_count["n"] += 1
                 if call_count["n"] <= 1:
                     # Return a file-like that yields bad JSON
                     return io.StringIO("{bad")
-            return fh
+            return original_open(path_arg, *args, **kwargs)
 
         with patch("builtins.open", side_effect=flaky_open):
             with patch("supertable.storage.local_storage.time.sleep"):
@@ -1964,18 +2195,25 @@ class TestMinioStorage(unittest.TestCase):
 
     def test_verified_delete_prefix_surfaces_error_after_listing_exhaustion(self):
         s, client = self._make_storage()
+        secret = "https://minio.invalid/private?signature=DELETE_SECRET"
         listings = iter([
             [types.SimpleNamespace(object_name="prefix/a.parquet")],
             [],
         ])
         client.remove_objects.return_value = [
-            types.SimpleNamespace(message="access denied")
+            types.SimpleNamespace(message=secret)
         ]
         with patch.object(s, "_object_exists", return_value=False), patch.object(
             s, "_list_objects", side_effect=lambda *_a, **_k: next(listings),
         ):
-            with self.assertRaisesRegex(RuntimeError, "access denied"):
+            with self.assertRaisesRegex(
+                RuntimeError, "MinIO prefix deletion failed",
+            ) as caught:
                 s.delete_prefix("prefix")
+        self.assertNotIn(
+            secret,
+            "".join(traceback.format_exception(caught.exception)),
+        )
 
     # ---- get_directory_structure ----
 
@@ -2034,12 +2272,92 @@ class TestMinioStorage(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 s.read_parquet("corrupt.parquet")
 
+    def test_read_parquet_failure_does_not_expose_path_or_backend_message(self):
+        s, _ = self._make_storage()
+        secret = "signed-path-token-DO-NOT-LOG"
+        with (
+            patch.object(s, "_get_object_safe", return_value=b"not parquet"),
+            patch(
+                "supertable.storage.minio_storage.pq.read_table",
+                side_effect=RuntimeError(f"backend-secret-{secret}"),
+            ),
+            self.assertRaises(RuntimeError) as ctx,
+        ):
+            s.read_parquet(f"tenant/{secret}.parquet")
+
+        rendered = "".join(
+            traceback.format_exception(
+                type(ctx.exception), ctx.exception, ctx.exception.__traceback__,
+            )
+        )
+        self.assertEqual(
+            str(ctx.exception),
+            "Failed to read Parquet; error_type=RuntimeError",
+        )
+        self.assertNotIn(secret, rendered)
+
+    def test_read_bytes_not_found_does_not_expose_path_or_backend_message(self):
+        s, _ = self._make_storage()
+        secret = "tenant-path-token-DO-NOT-LOG"
+        with (
+            patch.object(
+                s,
+                "_get_object_safe",
+                side_effect=_FakeS3Error("NoSuchKey", f"backend-{secret}"),
+            ),
+            self.assertRaises(FileNotFoundError) as ctx,
+        ):
+            s.read_bytes(f"tenant/{secret}.bin")
+
+        rendered = "".join(
+            traceback.format_exception(
+                type(ctx.exception), ctx.exception, ctx.exception.__traceback__,
+            )
+        )
+        self.assertNotIn(secret, rendered)
+
     # ---- bytes ----
 
     def test_write_bytes(self):
         s, client = self._make_storage()
         s.write_bytes("key", b"\x00\x01")
         client.put_object.assert_called_once()
+
+    def test_create_bytes_if_absent_uses_conditional_put(self):
+        s, client = self._make_storage()
+        self.assertTrue(s.create_bytes_if_absent("proof.json", b"proof"))
+        client._execute.assert_called_once_with(
+            "PUT",
+            "test-bucket",
+            "proof.json",
+            body=b"proof",
+            headers={
+                "Content-Length": "5",
+                "Content-Type": "application/octet-stream",
+                "If-None-Match": "*",
+            },
+            no_body_trace=True,
+        )
+
+    def test_create_bytes_if_absent_distinguishes_exists_from_failure(self):
+        s, client = self._make_storage()
+        client._execute.side_effect = _FakeS3Error(code="PreconditionFailed")
+        self.assertFalse(s.create_bytes_if_absent("proof.json", b"proof"))
+
+        status_exists = _FakeS3Error(code="ProviderSpecificPrecondition")
+        status_exists.response = types.SimpleNamespace(status=412)
+        client._execute.side_effect = status_exists
+        self.assertFalse(s.create_bytes_if_absent("proof.json", b"proof"))
+
+        conflict = _FakeS3Error(code="ConditionalRequestConflict")
+        conflict.response = types.SimpleNamespace(status=409)
+        client._execute.side_effect = conflict
+        with self.assertRaises(_FakeS3Error):
+            s.create_bytes_if_absent("proof.json", b"proof")
+
+        client._execute.side_effect = _FakeS3Error(code="AccessDenied")
+        with self.assertRaises(_FakeS3Error):
+            s.create_bytes_if_absent("proof.json", b"proof")
 
     def test_read_bytes_success(self):
         s, client = self._make_storage()
@@ -2832,14 +3150,22 @@ class TestS3Storage(unittest.TestCase):
                 # Model an inconsistent adapter which reports failure but no
                 # longer returns the object. The provider error must win.
                 remaining.clear()
-                return {"Errors": [{"Code": "AccessDenied", "Message": "denied"}]}
+                return {"Errors": [{
+                    "Code": "DELETE_SECRET_CODE",
+                    "Message": "https://s3.invalid/private?signature=DELETE_SECRET",
+                }]}
             return {}
 
         with patch.object(s, "_object_exists", return_value=False), patch.object(
             s, "_call", side_effect=delete_call,
         ):
-            with self.assertRaisesRegex(OSError, "AccessDenied"):
+            with self.assertRaisesRegex(
+                OSError, "S3 prefix deletion failed",
+            ) as caught:
                 s.delete_prefix("prefix")
+        rendered = "".join(traceback.format_exception(caught.exception))
+        self.assertNotIn("DELETE_SECRET", rendered)
+        self.assertNotIn("s3.invalid", rendered)
 
     def test_base_prefix_is_removed_from_listings_and_applied_once(self):
         s, _ = self._make_storage()
@@ -2927,6 +3253,49 @@ class TestS3Storage(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     s.read_parquet("corrupt.parquet")
 
+    def test_read_parquet_failure_does_not_expose_path_or_backend_message(self):
+        s, _ = self._make_storage()
+        secret = "signed-path-token-DO-NOT-LOG"
+        with (
+            patch.object(s, "_get_object_safe", return_value=b"not parquet"),
+            patch(
+                "supertable.storage.s3_storage.pq.read_table",
+                side_effect=RuntimeError(f"backend-secret-{secret}"),
+            ),
+            self.assertRaises(RuntimeError) as ctx,
+        ):
+            s.read_parquet(f"tenant/{secret}.parquet")
+
+        rendered = "".join(
+            traceback.format_exception(
+                type(ctx.exception), ctx.exception, ctx.exception.__traceback__,
+            )
+        )
+        self.assertEqual(
+            str(ctx.exception),
+            "Failed to read Parquet; error_type=RuntimeError",
+        )
+        self.assertNotIn(secret, rendered)
+
+    def test_read_bytes_not_found_does_not_expose_path_or_backend_message(self):
+        s, _ = self._make_storage()
+        secret = "tenant-path-token-DO-NOT-LOG"
+        failure = _FakeClientError({
+            "Error": {"Code": "NoSuchKey", "Message": f"backend-{secret}"},
+        })
+        with (
+            patch.object(s, "_get_object_safe", side_effect=failure),
+            self.assertRaises(FileNotFoundError) as ctx,
+        ):
+            s.read_bytes(f"tenant/{secret}.bin")
+
+        rendered = "".join(
+            traceback.format_exception(
+                type(ctx.exception), ctx.exception, ctx.exception.__traceback__,
+            )
+        )
+        self.assertNotIn(secret, rendered)
+
     # ---- bytes ----
 
     def test_write_bytes(self):
@@ -2934,6 +3303,37 @@ class TestS3Storage(unittest.TestCase):
         with patch.object(s, "_call") as mock_call:
             s.write_bytes("key", b"\x00\x01")
             mock_call.assert_called_once()
+
+    def test_create_bytes_if_absent_uses_if_none_match(self):
+        s, _ = self._make_storage()
+        with patch.object(s, "_call") as storage_call:
+            self.assertTrue(s.create_bytes_if_absent("proof.json", b"proof"))
+        storage_call.assert_called_once_with(
+            "put_object",
+            Bucket="test-bucket",
+            Key="proof.json",
+            Body=b"proof",
+            ContentType="application/octet-stream",
+            IfNoneMatch="*",
+        )
+
+    def test_create_bytes_if_absent_distinguishes_412_from_409(self):
+        s, _ = self._make_storage()
+        exists = _FakeClientError({
+            "Error": {"Code": "PreconditionFailed"},
+            "ResponseMetadata": {"HTTPStatusCode": 412},
+        })
+        with patch.object(s, "_call", side_effect=exists):
+            self.assertFalse(s.create_bytes_if_absent("proof.json", b"proof"))
+
+        race = _FakeClientError({
+            "Error": {"Code": "ConditionalRequestConflict"},
+            "ResponseMetadata": {"HTTPStatusCode": 409},
+        })
+        with patch.object(s, "_call", side_effect=race), self.assertRaises(
+            _FakeClientError,
+        ):
+            s.create_bytes_if_absent("proof.json", b"proof")
 
     def test_read_bytes_success(self):
         s, _ = self._make_storage()

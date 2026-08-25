@@ -19,6 +19,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from supertable.audit import retention
+from supertable.audit.crypto import AuditEncryptionError
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,43 @@ class TestIsLegalHoldActive:
 
         assert retention.is_legal_hold_active("acme") is True
 
+    def test_redis_outage_never_falls_back_to_false_setting(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FailingRedis:
+            def get(self, _key: str):
+                raise RuntimeError("redis unavailable")
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "supertable.redis_infra",
+            SimpleNamespace(redis_client=FailingRedis()),
+        )
+        import supertable.config.settings as settings_module
+        monkeypatch.setattr(
+            settings_module,
+            "settings",
+            SimpleNamespace(SUPERTABLE_AUDIT_LEGAL_HOLD=False),
+            raising=True,
+        )
+
+        assert retention.is_legal_hold_active("acme") is True
+
+    @pytest.mark.parametrize("redis_value", ["", "maybe", b"2", b"\xff"])
+    def test_malformed_runtime_value_fails_closed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        redis_value: object,
+    ) -> None:
+        fake_module = SimpleNamespace(
+            redis_client=_make_redis_client(get_value=redis_value),
+        )
+        monkeypatch.setitem(
+            __import__("sys").modules, "supertable.redis_infra", fake_module,
+        )
+
+        assert retention.is_legal_hold_active("acme") is True
+
 
 class TestSetLegalHold:
     def test_requires_organization(
@@ -176,6 +214,7 @@ class TestSetLegalHold:
         fake_client.set.assert_called_once_with(
             "supertable:acme:system:audit:legal_hold", "1"
         )
+
         assert audit_calls and audit_calls[0]["organization"] == "acme"
 
     def test_redis_failure_returns_error(
@@ -188,7 +227,55 @@ class TestSetLegalHold:
 
         result = retention.set_legal_hold(False, organization="acme")
         assert result["ok"] is False
-        assert "redis down" in result["error"]
+        assert result["error"] == "Redis persistence failed"
+        assert result["error_type"] == "RuntimeError"
+        assert "redis down" not in str(result)
+
+    def test_encryption_failure_is_explicit_after_redis_persistence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_client = _make_redis_client()
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "supertable.redis_infra",
+            SimpleNamespace(redis_client=fake_client),
+        )
+
+        import supertable.audit as audit_pkg
+
+        failure = AuditEncryptionError("configured encryption unavailable")
+
+        def fail_encryption(**_kwargs):
+            raise failure
+
+        monkeypatch.setattr(audit_pkg, "emit", fail_encryption, raising=True)
+
+        with pytest.raises(AuditEncryptionError) as raised:
+            retention.set_legal_hold(True, organization="acme")
+
+        assert raised.value is failure
+        fake_client.set.assert_called_once_with(
+            "supertable:acme:system:audit:legal_hold", "1"
+        )
+
+    def test_ordinary_audit_failure_is_not_reported_as_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_client = _make_redis_client()
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "supertable.redis_infra",
+            SimpleNamespace(redis_client=fake_client),
+        )
+        import supertable.audit as audit_pkg
+        monkeypatch.setattr(
+            audit_pkg, "emit", lambda **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("audit unavailable")
+            ), raising=True,
+        )
+        with pytest.raises(retention.AuditRetentionDurabilityError):
+            retention.set_legal_hold(True, organization="acme")
+        fake_client.set.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +295,31 @@ class TestEnforceRetention:
         monkeypatch.setattr(retention, "is_legal_hold_active", lambda org: True)
 
         result = retention.enforce_retention("acme")
+        assert result["skipped_legal_hold"] is True
+        assert result["deleted_partitions"] == 0
+
+    def test_redis_outage_blocks_deletion_even_when_setting_is_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class FailingRedis:
+            def get(self, _key: str):
+                raise RuntimeError("redis unavailable")
+
+        monkeypatch.setitem(
+            __import__("sys").modules,
+            "supertable.redis_infra",
+            SimpleNamespace(redis_client=FailingRedis()),
+        )
+        import supertable.config.settings as settings_module
+        monkeypatch.setattr(
+            settings_module,
+            "settings",
+            SimpleNamespace(SUPERTABLE_AUDIT_LEGAL_HOLD=False),
+            raising=True,
+        )
+
+        result = retention.enforce_retention("acme")
+
         assert result["skipped_legal_hold"] is True
         assert result["deleted_partitions"] == 0
 
@@ -309,4 +421,53 @@ class TestEnforceRetention:
 
         assert result["deleted_partitions"] == 1
         assert deleted_paths == [old_date]
-        assert result["deleted_paths"] == [old_date]
+        assert result["deleted_paths"] == [old_date.removeprefix("audit/")]
+
+    def test_encryption_failure_is_explicit_after_partition_deletion(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(retention, "is_legal_hold_active", lambda org: False)
+
+        import supertable.storage.storage_factory as sf
+        import supertable.config.settings as settings_module
+
+        monkeypatch.setattr(
+            settings_module,
+            "settings",
+            SimpleNamespace(SUPERTABLE_AUDIT_RETENTION_DAYS=10),
+            raising=True,
+        )
+        old_partition = (
+            datetime.now(timezone.utc) - timedelta(days=30)
+        ).strftime("audit/year=%Y/month=%m/day=%d")
+
+        import supertable.audit.writer_parquet as wp
+
+        class FakeWriter:
+            def list_partitions(self, organization: str) -> list[str]:
+                return [old_partition]
+
+        monkeypatch.setattr(wp, "ParquetAuditWriter", FakeWriter, raising=True)
+
+        deleted_paths: list[str] = []
+
+        class FakeStorage:
+            def delete(self, path: str) -> None:
+                deleted_paths.append(path)
+
+        monkeypatch.setattr(sf, "get_storage", lambda: FakeStorage(), raising=True)
+
+        import supertable.audit as audit_pkg
+
+        failure = AuditEncryptionError("configured encryption unavailable")
+
+        def fail_encryption(**_kwargs):
+            raise failure
+
+        monkeypatch.setattr(audit_pkg, "emit", fail_encryption, raising=True)
+
+        with pytest.raises(AuditEncryptionError) as raised:
+            retention.enforce_retention("acme")
+
+        assert raised.value is failure
+        assert deleted_paths == [old_partition]

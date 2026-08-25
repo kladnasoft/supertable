@@ -177,9 +177,11 @@ def normalize_tier(value: str) -> str:
     key = str(value or "").strip().lower().replace("_", "").replace("-", "")
     try:
         return _TIER_ALIASES[key]
-    except KeyError as exc:
+    except KeyError:
         choices = ", ".join(TIER_TARGET_BYTES)
-        raise ValueError(f"unknown size tier {value!r}; choose one of {choices}") from exc
+        raise ValueError(
+            f"unknown size tier; choose one of {choices}"
+        ) from None
 
 
 def normalize_tiers(values: Iterable[str]) -> list[str]:
@@ -228,7 +230,7 @@ def parse_byte_size(value: str | int) -> int:
         if result <= 0 or not math.isfinite(parsed):
             break
         return result
-    raise ValueError(f"invalid byte size {value!r}")
+    raise ValueError("invalid byte size")
 
 
 def _default_shard_bytes(target_bytes: int) -> int:
@@ -950,8 +952,10 @@ def plan_workload(
         schema_names = [metadata.schema.column(i).name for i in range(metadata.num_columns)]
         try:
             id_index = schema_names.index("id")
-        except ValueError as exc:
-            raise RuntimeError(f"benchmark parquet lacks id column: {path}") from exc
+        except ValueError:
+            raise RuntimeError(
+                "benchmark parquet lacks id column"
+            ) from None
         estimated_reflection += _column_chunk_bytes(
             metadata, selected, None, id_index
         )

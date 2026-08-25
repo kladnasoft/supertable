@@ -42,8 +42,8 @@ def _validate_identifier(value: object, *, label: str, wildcard: bool) -> str:
         raise ValueError(f"{label} cannot be '*'")
     try:
         encoded = value.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise ValueError(f"{label} must be valid UTF-8") from exc
+    except UnicodeEncodeError:
+        raise ValueError(f"{label} must be valid UTF-8") from None
     if len(encoded) > MAX_ROLE_IDENTIFIER_BYTES:
         raise ValueError(
             f"{label} exceeds the {MAX_ROLE_IDENTIFIER_BYTES}-byte limit"
@@ -147,9 +147,7 @@ def _canonicalize_filter_json(
                     f"role filter string exceeds the {MAX_ROLE_SCALAR_BYTES}-byte limit"
                 )
             return value
-        raise ValueError(
-            f"role filters must contain only JSON values, got {type(value).__name__}"
-        )
+        raise ValueError("role filters must contain only JSON values")
 
     return visit(raw, 0)
 
@@ -284,16 +282,20 @@ def canonicalize_role_tables(
         # not for the first time on a user query.  A malformed stored filter
         # must never turn an otherwise valid role into a runtime 500/DoS.
         from supertable.rbac.filter_builder import FilterBuilder
+        filter_error = False
         try:
             FilterBuilder(
                 "__rbac_policy_validation__",
                 ["*"],
                 {"filters": filters},
             )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"invalid filters for table policy {table_name!r}: {exc}"
-            ) from exc
+        except (KeyError, TypeError, ValueError):
+            # Persisted filter literals can contain credentials or customer
+            # data.  Keep both the public message and exception chain free of
+            # the rejected value.
+            filter_error = True
+        if filter_error:
+            raise ValueError("invalid filters for table policy")
 
         entry: dict[str, object] = {
             "columns": columns,

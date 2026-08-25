@@ -17,13 +17,16 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, Iterable, Mapping, Optional
-from urllib.parse import urlsplit, urlunsplit
 
 from supertable import redis_keys as RK
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.engine.adaptive_router import EngineHistory
 from supertable.engine.engine_enum import Engine
+from supertable.utils.diagnostic_redaction import (
+    redact_sensitive_diagnostic_text,
+    safe_exception_type,
+)
 
 
 PROFILE_SCHEMA_VERSION = 2
@@ -48,15 +51,60 @@ _DURATION_SOURCES = frozenset({
     "engine_profile", "executing_query", "total_execute", "unknown",
 })
 _HEX_16_64 = re.compile(r"^[0-9a-f]{16,64}$")
-_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)(x-amz-(?:signature|credential|security-token)|"
     r"sig|signature|sas|token|password|secret|access[_-]?key)="
     r"([^&\s,;]+)"
 )
-_SENSITIVE_KEY_RE = re.compile(
-    r"(?i)(authorization|cookie|password|passwd|secret|token|signature|"
-    r"credential|access[_-]?key|session[_-]?key|sas)"
+_PROFILE_CONTAINER_KEYS = frozenset({
+    "auto_routing", "auto_routing_outcome", "cache", "children",
+    "extra_info", "features", "island_cache", "island_telemetry",
+    "island_spill", "metrics", "operator", "operators", "spill",
+})
+_PROFILE_NUMERIC_KEYS = frozenset({
+    "actual_scan_bytes", "blocked_thread_time", "cache_hit_bytes",
+    "budget_bytes", "cache_hits", "cache_remote_bytes", "candidate_files",
+    "candidate_row_groups", "candidate_rows", "cpu_time", "cpu_time_ms",
+    "cpu_time_us", "cumulative_cardinality", "cumulative_rows_scanned",
+    "decoded_bytes", "elapsed_ms", "engine_wall_us",
+    "estimated_candidate_files", "estimated_candidate_row_groups",
+    "estimated_bytes", "estimated_candidate_rows", "estimated_scan_bytes", "latency",
+    "logical_scan_bytes", "operator_cardinality", "operator_rows_scanned",
+    "operator_timing", "peak_memory_bytes", "physical_read_bytes",
+    "planned_files", "planned_row_groups", "planned_rows",
+    "range_cache_hit_bytes", "range_cache_hit_chunks", "range_remote_bytes",
+    "reflection_size", "reflections", "result_bytes", "result_columns",
+    "result_rows", "result_set_size", "rows_returned", "rows_scanned",
+    "rss_baseline_bytes", "rss_final_bytes", "rss_peak_bytes",
+    "rss_peak_delta_bytes", "rss_retained_delta_bytes", "schema_version",
+    "selected_row_groups", "spill_bytes", "system_peak_buffer_memory",
+    "system_peak_temp_dir_size", "total_bytes_read", "total_bytes_written",
+    "total_files", "total_wall_us", "work_bytes",
+})
+_PROFILE_BOOLEAN_KEYS = frozenset({
+    "actual_scan_bytes_measured", "candidate_files_complete",
+    "candidate_row_groups_complete", "candidate_rows_complete",
+    "cpu_time_measured", "decoded_bytes_complete", "duration_measured",
+    "fallback", "forced", "logical_scan_bytes_complete",
+    "physical_read_bytes_measured", "planned_files_complete",
+    "planned_row_groups_complete", "planned_rows_complete",
+    "result_bytes_measured", "result_complete", "result_rows_measured",
+    "rows_scanned_measured", "rss_measured", "spill_bytes_measured",
+    "triggered",
+})
+_PROFILE_ENUM_VALUES = {
+    "actual_engine": _ENGINE_VALUES | {"unknown"},
+    "engine": _ENGINE_VALUES | {"unknown"},
+    "requested_engine": _REQUESTED_ENGINE_VALUES,
+    "selected_engine": _ENGINE_VALUES | {"unknown"},
+    "status": _STATUS_VALUES,
+}
+_PROFILE_KEY_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z", re.ASCII)
+_PROFILE_ALLOWED_KEYS = frozenset().union(
+    _PROFILE_CONTAINER_KEYS,
+    _PROFILE_NUMERIC_KEYS,
+    _PROFILE_BOOLEAN_KEYS,
+    _PROFILE_ENUM_VALUES,
 )
 
 
@@ -84,35 +132,28 @@ def _signed_integer(value: object, *, maximum: int = (1 << 63) - 1) -> int:
     return max(-maximum, min(maximum, int(number)))
 
 
-def _redact_url(match: re.Match[str]) -> str:
-    raw = match.group(0)
-    trailing = raw[len(raw.rstrip(").,;]}")) :]
-    url = raw[: len(raw) - len(trailing)] if trailing else raw
-    try:
-        parsed = urlsplit(url)
-        hostname = parsed.hostname or ""
-        if not hostname:
-            raise ValueError("missing hostname")
-        host = f"[{hostname}]" if ":" in hostname else hostname
-        if parsed.port is not None:
-            host = f"{host}:{parsed.port}"
-        query = "<redacted>" if parsed.query or parsed.fragment else ""
-        clean = urlunsplit((parsed.scheme, host, parsed.path, query, ""))
-    except Exception:
-        clean = url.split("?", 1)[0]
-        if "?" in url:
-            clean += "?<redacted>"
-    return clean + trailing
-
-
 def redact_text(value: object, *, limit: int = MAX_PROFILE_STRING) -> str:
-    """Remove URL credentials/query strings and common secret assignments."""
+    """Remove remote URL paths and common secret assignments."""
     text = str(value or "")
-    text = _URL_RE.sub(_redact_url, text)
+    text = redact_sensitive_diagnostic_text(text)
     text = _SECRET_ASSIGNMENT_RE.sub(lambda m: f"{m.group(1)}=<redacted>", text)
     if len(text) > max(0, int(limit)):
         text = text[: max(0, int(limit))] + "<truncated>"
     return text
+
+
+def diagnostic_text_identity(value: object) -> str:
+    """Represent arbitrary diagnostic prose only by a digest and byte count."""
+
+    text = str(value or "")
+    if not text:
+        return ""
+    encoded = text.encode("utf-8", errors="surrogatepass")
+    return (
+        "<redacted-diagnostic "
+        f"sha256={hashlib.sha256(encoded).hexdigest()[:16]} "
+        f"bytes={len(encoded)}>"
+    )
 
 
 def canonical_sql_shape(query: object, *, limit: int = 2_000) -> str:
@@ -154,54 +195,92 @@ class _SanitizeBudget:
         return True
 
 
+def _sanitize_profile_metric(
+    key: str, value: object, budget: _SanitizeBudget,
+) -> object:
+    if key in _PROFILE_NUMERIC_KEYS:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            budget.take(16)
+            return "<redacted>"
+        if isinstance(value, float) and not math.isfinite(value):
+            budget.take(4)
+            return None
+        budget.take(24)
+        if isinstance(value, int):
+            return max(-(1 << 63), min((1 << 63) - 1, value))
+        return value
+    if key in _PROFILE_BOOLEAN_KEYS:
+        budget.take(5 if isinstance(value, bool) else 16)
+        return value if isinstance(value, bool) else "<redacted>"
+    allowed = _PROFILE_ENUM_VALUES.get(key)
+    if allowed is not None and isinstance(value, str):
+        normalized = value.casefold()
+        if normalized in allowed:
+            budget.take(len(normalized) + 2)
+            return normalized
+    budget.take(16)
+    return "<redacted>"
+
+
 def _sanitize(value: object, budget: _SanitizeBudget, depth: int) -> object:
     if depth > MAX_PROFILE_DEPTH or budget.remaining <= 0:
         return "<truncated>"
-    if value is None or isinstance(value, bool):
-        budget.take(5)
-        return value
-    if isinstance(value, int):
-        budget.take(24)
-        return max(-(1 << 63), min((1 << 63) - 1, value))
-    if isinstance(value, float):
-        budget.take(24)
-        return value if math.isfinite(value) else None
-    if isinstance(value, str):
-        clean = redact_text(value)
-        if not budget.take(len(clean.encode("utf-8")) + 2):
-            return "<truncated>"
-        return clean
     if isinstance(value, Mapping):
         result: Dict[str, object] = {}
+        redacted_fields = 0
         for index, (raw_key, child) in enumerate(value.items()):
             if index >= MAX_PROFILE_ITEMS or budget.remaining <= 0:
                 result["_truncated"] = True
                 break
-            key = redact_text(raw_key, limit=128)
-            if not budget.take(len(key.encode("utf-8")) + 4):
+            if not isinstance(raw_key, str):
+                redacted_fields += 1
+                continue
+            key = raw_key.casefold()
+            if not _PROFILE_KEY_RE.fullmatch(key):
+                redacted_fields += 1
+                continue
+            if key not in _PROFILE_ALLOWED_KEYS:
+                redacted_fields += 1
+                continue
+            if not budget.take(len(key) + 4):
                 result["_truncated"] = True
                 break
             result[key] = (
-                "<redacted>"
-                if _SENSITIVE_KEY_RE.search(key)
-                else _sanitize(child, budget, depth + 1)
+                _sanitize(child, budget, depth + 1)
+                if key in _PROFILE_CONTAINER_KEYS
+                else _sanitize_profile_metric(key, child, budget)
             )
+        if redacted_fields and budget.take(32):
+            result["_redacted_fields"] = redacted_fields
         return result
     if isinstance(value, (list, tuple, set, frozenset)):
-        result = []
+        sequence_result: list[object] = []
+        redacted_items = 0
         for index, child in enumerate(value):
             if index >= MAX_PROFILE_ITEMS or budget.remaining <= 0:
-                result.append("<truncated>")
+                sequence_result.append("<truncated>")
                 break
-            result.append(_sanitize(child, budget, depth + 1))
-        return result
-    return _sanitize(str(value), budget, depth + 1)
+            if isinstance(child, (Mapping, list, tuple, set, frozenset)):
+                sequence_result.append(_sanitize(child, budget, depth + 1))
+            else:
+                redacted_items += 1
+        if redacted_items and budget.take(32):
+            sequence_result.append({"_redacted_items": redacted_items})
+        return sequence_result
+    budget.take(16)
+    return "<redacted>"
 
 
 def sanitize_profile(
     value: object, *, max_bytes: int = MAX_SANITIZED_PROFILE_BYTES,
 ) -> object:
-    """Recursively redact and cap an engine profile before persistence."""
+    """Persist only allowlisted scalar metrics from an engine profile.
+
+    Query plans contain SQL, RBAC predicates, identifiers, local paths, remote
+    object names, headers, and connector response bodies in version-dependent
+    free-form fields.  Unknown keys and every unrecognized string are therefore
+    represented only by fixed redaction counters.
+    """
     capped = min(MAX_SANITIZED_PROFILE_BYTES, max(256, int(max_bytes)))
     result = _sanitize(value, _SanitizeBudget(capped - 128), 0)
     try:
@@ -682,6 +761,10 @@ def normalize_query_profile(
         metrics["result_rows_scope"] = "materialized_result_shape"
     elif bool(metrics["result_rows_measured"]):
         rows = _integer(metrics["result_rows"])
+    raw_result_complete = metrics["result_complete"]
+    result_complete = (
+        raw_result_complete if isinstance(raw_result_complete, bool) else None
+    )
 
     return NormalizedQueryProfile(
         schema_version=PROFILE_SCHEMA_VERSION,
@@ -765,7 +848,7 @@ def normalize_query_profile(
         rows_scanned=_integer(metrics["rows_scanned"]),
         rows_scanned_measured=bool(metrics["rows_scanned_measured"]),
         execution_outcome=str(metrics["execution_outcome"]),
-        result_complete=metrics["result_complete"],
+        result_complete=result_complete,
         routing_decision=sanitize_profile(routing, max_bytes=16 * 1024),
     )
 
@@ -996,7 +1079,10 @@ class QueryObservationStore:
             self._trim_signature_index(r, index_key)
             return True
         except Exception as exc:
-            logger.debug("[query-observations] record skipped: %s", exc)
+            logger.debug(
+                "[query-observations] record skipped; error_type=%s",
+                safe_exception_type(exc),
+            )
             return False
 
     def _trim_signature_index(self, r: object, index_key: str) -> None:
@@ -1026,7 +1112,10 @@ class QueryObservationStore:
             pipe.zrem(index_key, *signatures)
             pipe.execute()
         except Exception as exc:
-            logger.debug("[query-observations] cardinality trim skipped: %s", exc)
+            logger.debug(
+                "[query-observations] cardinality trim skipped; error_type=%s",
+                safe_exception_type(exc),
+            )
 
     def load_history(
         self, query_shape_hash: str, feature_signature: str,
@@ -1093,7 +1182,10 @@ class QueryObservationStore:
                     feature_signature=feature_signature,
                 )
         except Exception as exc:
-            logger.debug("[query-observations] history lookup skipped: %s", exc)
+            logger.debug(
+                "[query-observations] history lookup skipped; error_type=%s",
+                safe_exception_type(exc),
+            )
             return {}
         return histories
 
@@ -1110,6 +1202,6 @@ class QueryObservationStore:
 
 __all__ = [
     "NormalizedQueryProfile", "QueryObservation", "QueryObservationStore",
-    "canonical_sql_shape", "flatten_plan_stats", "normalize_query_profile",
-    "redact_text", "sanitize_profile",
+    "canonical_sql_shape", "diagnostic_text_identity", "flatten_plan_stats",
+    "normalize_query_profile", "redact_text", "sanitize_profile",
 ]

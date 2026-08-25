@@ -26,6 +26,7 @@ Covers:
 
 from __future__ import annotations
 
+import traceback
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
@@ -387,6 +388,10 @@ class TestDelete:
         assert raised.value.core_result == "namespace-delete-intent"
         assert raised.value.intent_id == "namespace-delete-intent"
         assert "secret" not in str(raised.value)
+        rendered = "".join(traceback.format_exception(raised.value))
+        assert "redis://secret@internal" not in rendered
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
         st.storage.delete_prefix.assert_called_once_with("org/sup")
         st.catalog.delete_super_table.assert_called_once()
         st.catalog.release_namespace_lock.assert_called_once_with(

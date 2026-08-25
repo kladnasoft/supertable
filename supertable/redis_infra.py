@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import json
 from typing import Dict, Iterator, List, Optional, Tuple
 from pathlib import Path
@@ -12,6 +13,7 @@ import redis
 
 from supertable.config.settings import settings as _cfg
 from supertable import redis_keys as RK
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 logger = logging.getLogger(__name__)
 # ------------------------------ Settings ------------------------------
@@ -208,7 +210,10 @@ class _FallbackCatalog:
                             data["roles"] = []
                     users.append(data)
         except Exception as e:
-            logger.warning("_FallbackCatalog.get_users error: %s", e)
+            logger.warning(
+                "_FallbackCatalog.get_users failed; error_type=%s",
+                safe_exception_type(e),
+            )
         return users
 
     def get_roles(self, org: str, sup: str) -> List[Dict]:
@@ -232,7 +237,10 @@ class _FallbackCatalog:
                                 pass
                     roles.append(data)
         except Exception as e:
-            logger.warning("_FallbackCatalog.get_roles error: %s", e)
+            logger.warning(
+                "_FallbackCatalog.get_roles failed; error_type=%s",
+                safe_exception_type(e),
+            )
         return roles
 
     def get_user_details(self, org: str, sup: str, user_id: str) -> Optional[Dict]:
@@ -249,7 +257,10 @@ class _FallbackCatalog:
                     data["roles"] = []
             return data
         except Exception as e:
-            logger.warning("_FallbackCatalog.get_user_details error: %s", e)
+            logger.warning(
+                "_FallbackCatalog.get_user_details failed; error_type=%s",
+                safe_exception_type(e),
+            )
         return None
 
     def get_role_details(self, org: str, sup: str, role_id: str) -> Optional[Dict]:
@@ -267,7 +278,10 @@ class _FallbackCatalog:
                         pass
             return data
         except Exception as e:
-            logger.warning("_FallbackCatalog.get_role_details error: %s", e)
+            logger.warning(
+                "_FallbackCatalog.get_role_details failed; error_type=%s",
+                safe_exception_type(e),
+            )
         return None
 
     def rbac_get_user_id_by_username(self, org: str, sup: str, username: str) -> Optional[str]:
@@ -278,7 +292,11 @@ class _FallbackCatalog:
                 return None
             return self._decode_member(val)
         except Exception as e:
-            logger.warning("_FallbackCatalog.rbac_get_user_id_by_username error: %s", e)
+            logger.warning(
+                "_FallbackCatalog.rbac_get_user_id_by_username failed; "
+                "error_type=%s",
+                safe_exception_type(e),
+            )
         return None
 
 
@@ -315,4 +333,37 @@ def _build_catalog() -> Tuple[object, redis.Redis]:
     return catalog, r
 
 
-catalog, redis_client = _build_catalog()
+class _LazyRedisClient:
+    def __init__(self) -> None:
+        self._client = None
+        self._lock = threading.Lock()
+
+    def _get(self):
+        if self._client is None:
+            with self._lock:
+                if self._client is None:
+                    self._client = _build_redis_client()
+        return self._client
+
+    def __getattr__(self, name: str):
+        return getattr(self._get(), name)
+
+
+class _LazyCatalog:
+    def __init__(self) -> None:
+        self._catalog = None
+        self._lock = threading.Lock()
+
+    def _get(self):
+        if self._catalog is None:
+            with self._lock:
+                if self._catalog is None:
+                    self._catalog, _ = _build_catalog()
+        return self._catalog
+
+    def __getattr__(self, name: str):
+        return getattr(self._get(), name)
+
+
+catalog = _LazyCatalog()
+redis_client = _LazyRedisClient()

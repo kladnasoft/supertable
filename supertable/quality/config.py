@@ -32,6 +32,9 @@ from typing import Any, Dict, List, Optional
 import redis
 
 from supertable.quality.serialization import normalize_json_value
+from supertable.utils.diagnostic_redaction import (
+    safe_exception_type as _safe_error_type,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +47,14 @@ class DQConfigConflictError(RuntimeError):
     """A quality-rule mutation was based on a stale authoritative document."""
 
 
+class _DQRuleAlreadyExistsError(ValueError):
+    """Controlled public duplicate-rule validation failure."""
+
+
+class _DQRuleValidationError(ValueError):
+    """Controlled public update validation failure."""
+
+
 _MISSING = object()
 # Keep scheduler-controlled expirations in a conservative range supported by
 # every Redis deployment we target.  Lua represents numbers as doubles and
@@ -51,6 +62,19 @@ _MISSING = object()
 # bound also prevents a late SET/EX error from turning a script into a partial
 # success publication.
 _MAX_REDIS_TTL_SECONDS = (1 << 31) - 1
+_MAX_QUALITY_DOCUMENT_BYTES = 1 * 1024 * 1024
+
+
+def _validate_document_budget(document: object, label: str) -> None:
+    try:
+        encoded = json.dumps(
+            document, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        raise ValueError(f"{label} cannot be serialized safely") from None
+    if len(encoded) > _MAX_QUALITY_DOCUMENT_BYTES:
+        raise ValueError(f"{label} exceeds the document size limit")
 
 
 def _now_iso() -> str:
@@ -233,7 +257,10 @@ class DQConfig:
                     return None
             return root_raw, leaf_raw
         except Exception as exc:
-            logger.error("[dq-config] catalog lifecycle read error: %s", exc)
+            logger.error(
+                "[dq-config] catalog_lifecycle_read_failed; error_type=%s",
+                _safe_error_type(exc),
+            )
             return None
 
     def _mutate_if_live(
@@ -285,7 +312,10 @@ class DQConfig:
             ))
             return result == 1
         except Exception as exc:
-            logger.error("[dq-config] lifecycle-fenced mutation error: %s", exc)
+            logger.error(
+                "[dq-config] lifecycle_fenced_mutation_failed; error_type=%s",
+                _safe_error_type(exc),
+            )
             return False
 
     def _require_watched_namespace_live(self, pipe: Any) -> None:
@@ -310,17 +340,20 @@ class DQConfig:
         try:
             raw = self.r.get(key)
         except Exception as exc:
-            logger.error("[dq-config] %s backend read error: %s", label, exc)
-            raise DQConfigReadError(f"could not read {label}") from exc
+            logger.error(
+                "[dq-config] backend_read_failed; error_type=%s",
+                _safe_error_type(exc),
+            )
+            raise DQConfigReadError(f"could not read {label}") from None
         if raw is None:
             if missing is _MISSING:
                 raise DQConfigReadError(f"required {label} is missing")
             return deepcopy(missing)
         try:
             document = json.loads(raw)
-        except (TypeError, ValueError, UnicodeError) as exc:
+        except (TypeError, ValueError, UnicodeError):
             logger.error("[dq-config] %s contains malformed JSON", label)
-            raise DQConfigReadError(f"persisted {label} is malformed") from exc
+            raise DQConfigReadError(f"persisted {label} is malformed") from None
         if not isinstance(document, expected_type):
             expected_name = getattr(expected_type, "__name__", str(expected_type))
             logger.error(
@@ -403,18 +436,18 @@ class DQConfig:
             )
         try:
             from supertable.quality.cron import CronValidationError, validate_cron
-        except ImportError as exc:
+        except ImportError:
             raise DQConfigReadError(
                 "timezone-aware cron support is unavailable"
-            ) from exc
+            ) from None
         try:
             # Validate the timezone even when this document inherits every cron
             # field from its parent schedule.
             validate_cron("0 0 * * *", timezone_name)
-        except CronValidationError as exc:
+        except CronValidationError:
             raise DQConfigReadError(
-                f"persisted {label} has an invalid timezone: {exc}"
-            ) from exc
+                f"persisted {label} has an invalid timezone"
+            ) from None
         for field_name in ("quick_cron", "deep_cron", "custom_cron"):
             if field_name in document and (
                 not isinstance(document[field_name], str)
@@ -426,10 +459,10 @@ class DQConfig:
             if field_name in document:
                 try:
                     validate_cron(document[field_name], timezone_name)
-                except CronValidationError as exc:
+                except CronValidationError:
                     raise DQConfigReadError(
-                        f"persisted {label} has an invalid {field_name}: {exc}"
-                    ) from exc
+                        f"persisted {label} has an invalid {field_name}"
+                    ) from None
 
     # ── Global config ─────────────────────────────────────────────────
 
@@ -456,6 +489,7 @@ class DQConfig:
         try:
             if not isinstance(config, dict) or _incremental_scope_requested(config):
                 return False
+            _validate_document_budget(config, "global quality config")
             self._validate_config_document(config, "global quality config")
             stored = deepcopy(config)
             stored["updated_by"] = updated_by
@@ -467,7 +501,10 @@ class DQConfig:
             )
             return bool(persisted)
         except Exception as e:
-            logger.error(f"[dq-config] set_global_config error: {e}")
+            logger.error(
+                "[dq-config] set_global_config_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             return False
 
     # ── Per-table config ──────────────────────────────────────────────
@@ -488,6 +525,7 @@ class DQConfig:
         try:
             if not isinstance(config, dict) or _incremental_scope_requested(config):
                 return False
+            _validate_document_budget(config, "table quality config")
             self._validate_config_document(
                 config,
                 f"quality config for table {table!r}",
@@ -502,7 +540,10 @@ class DQConfig:
             )
             return bool(persisted)
         except Exception as e:
-            logger.error(f"[dq-config] set_table_config error: {e}")
+            logger.error(
+                "[dq-config] set_table_config_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             return False
 
     def delete_table_config(self, table: str) -> bool:
@@ -511,7 +552,10 @@ class DQConfig:
                 self._key("config", table), table=table, payload=None,
             )
         except Exception as e:
-            logger.error(f"[dq-config] delete_table_config error: {e}")
+            logger.error(
+                "[dq-config] delete_table_config_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             return False
 
     def get_effective_config(self, table: str) -> Dict[str, Any]:
@@ -613,8 +657,11 @@ class DQConfig:
             index_key = self._key("rules", "index")
             rule_ids = self.r.smembers(index_key) or set()
         except Exception as exc:
-            logger.error("[dq-config] list_rules index read error: %s", exc)
-            raise DQConfigReadError("could not read quality rule index") from exc
+            logger.error(
+                "[dq-config] rule_index_read_failed; error_type=%s",
+                _safe_error_type(exc),
+            )
+            raise DQConfigReadError("could not read quality rule index") from None
         if not isinstance(rule_ids, (set, frozenset, list, tuple)):
             raise DQConfigReadError("quality rule index has the wrong shape")
 
@@ -626,8 +673,10 @@ class DQConfig:
                     if isinstance(rid_raw, str)
                     else rid_raw.decode("utf-8")
                 )
-            except (AttributeError, UnicodeError) as exc:
-                raise DQConfigReadError("quality rule index contains an invalid id") from exc
+            except (AttributeError, UnicodeError):
+                raise DQConfigReadError(
+                    "quality rule index contains an invalid id"
+                ) from None
             document = self._read_json(
                 self._key("rules", "doc", rid),
                 expected_type=dict,
@@ -658,13 +707,14 @@ class DQConfig:
                 ensure_ascii=False,
                 allow_nan=False,
             ).encode("utf-8")
-        except (TypeError, ValueError, UnicodeError) as exc:
-            raise ValueError("quality rule cannot be fingerprinted") from exc
+        except (TypeError, ValueError, UnicodeError):
+            raise ValueError("quality rule cannot be fingerprinted") from None
         return hashlib.sha256(payload).hexdigest()
 
     def create_rule(self, rule: Dict[str, Any], created_by: str = "") -> Dict[str, Any]:
         if not isinstance(rule, dict):
             raise ValueError("quality rule must be an object")
+        _validate_document_budget(rule, "quality rule")
         candidate = deepcopy(rule)
         rule_id = candidate.get("rule_id") or f"rule_{uuid.uuid4().hex[:8]}"
         candidate["rule_id"] = rule_id
@@ -706,9 +756,9 @@ class DQConfig:
         namespace_intent_key = RK.meta_namespace_deletion_intent(
             self.org, self.sup,
         )
-        payload = json.dumps(candidate, default=str)
         pipe = None
         try:
+            payload = json.dumps(candidate, default=str)
             # WATCH prevents a caller-supplied ID from turning create into an
             # undocumented upsert. Watching both authorities also treats an
             # indexed-but-missing legacy document as occupied instead of
@@ -733,7 +783,7 @@ class DQConfig:
                             "quality rule index has the wrong Redis type"
                         )
                     if pipe.exists(document_key) or pipe.sismember(index_key, rule_id):
-                        raise ValueError(
+                        raise _DQRuleAlreadyExistsError(
                             f"quality rule {rule_id!r} already exists"
                         )
                     pipe.multi()
@@ -745,13 +795,16 @@ class DQConfig:
                     # Re-read both watched authorities. A competing creator
                     # will be reported as a duplicate on the next iteration.
                     continue
-        except ValueError:
+        except _DQRuleAlreadyExistsError:
             raise
         except Exception as e:
-            logger.error(f"[dq-config] create_rule error: {e}")
+            logger.error(
+                "[dq-config] create_rule_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             raise RuntimeError(
                 f"could not persist quality rule {rule_id!r}"
-            ) from e
+            ) from None
         finally:
             if pipe is not None:
                 try:
@@ -759,17 +812,13 @@ class DQConfig:
                 except Exception:
                     pass
         if (
-            not isinstance(results, (list, tuple))
+            type(results) not in (list, tuple)
             or len(results) != 2
-            or not results[0]
-            or isinstance(results[1], bool)
-            or not isinstance(results[1], int)
+            or results[0] is not True
+            or type(results[1]) is not int
             or results[1] != 1
         ):
-            logger.error(
-                "[dq-config] create_rule returned invalid transaction result: %r",
-                results,
-            )
+            logger.error("[dq-config] create_rule_invalid_transaction_result")
             raise RuntimeError(f"could not persist quality rule {rule_id!r}")
         return candidate
 
@@ -818,10 +867,10 @@ class DQConfig:
                         )
                     try:
                         existing = json.loads(raw)
-                    except (TypeError, ValueError, UnicodeError) as exc:
+                    except (TypeError, ValueError, UnicodeError):
                         raise DQConfigReadError(
                             f"persisted quality rule {rule_id!r} is malformed"
-                        ) from exc
+                        ) from None
                     if not isinstance(existing, dict):
                         raise DQConfigReadError(
                             f"persisted quality rule {rule_id!r} has the wrong shape"
@@ -841,7 +890,9 @@ class DQConfig:
                     candidate["rule_id"] = rule_id
                     candidate.setdefault("severity", "warning")
                     if not isinstance(candidate.get("enabled"), bool):
-                        raise ValueError("quality rule enabled must be a boolean")
+                        raise _DQRuleValidationError(
+                            "quality rule enabled must be a boolean"
+                        )
                     from supertable.quality.checker import (
                         quality_table_fqn,
                         validate_custom_rule,
@@ -857,7 +908,7 @@ class DQConfig:
                             allow_wildcard=candidate.get("rule_type") != "custom_sql",
                         )
                         if not table_validation.valid:
-                            raise ValueError(
+                            raise _DQRuleValidationError(
                                 f"invalid quality rule ({table_validation.code}): "
                                 f"{table_validation.message}"
                             )
@@ -871,7 +922,7 @@ class DQConfig:
                             table_fqn=table_fqn,
                         )
                         if not validation.valid:
-                            raise ValueError(
+                            raise _DQRuleValidationError(
                                 f"invalid quality rule ({validation.code}): "
                                 f"{validation.message}"
                             )
@@ -894,13 +945,20 @@ class DQConfig:
                     # Re-read both authorities. A completed concurrent delete
                     # becomes a normal absent result on the next iteration.
                     continue
-        except (DQConfigConflictError, DQConfigReadError, ValueError):
+        except (
+            DQConfigConflictError,
+            DQConfigReadError,
+            _DQRuleValidationError,
+        ):
             raise
         except Exception as e:
-            logger.error(f"[dq-config] update_rule error: {e}")
+            logger.error(
+                "[dq-config] update_rule_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             raise RuntimeError(
                 f"could not persist quality rule {rule_id!r} update"
-            ) from e
+            ) from None
         finally:
             if pipe is not None:
                 try:
@@ -908,15 +966,14 @@ class DQConfig:
                 except Exception:
                     pass
         if (
-            not isinstance(results, (list, tuple))
+            type(results) not in (list, tuple)
             or len(results) != 1
-            or not results[0]
+            or results[0] is not True
         ):
             logger.error(
                 "[dq-config] update_rule transaction did not acknowledge "
-                "persistence for %s: %r",
+                "persistence for %s",
                 rule_id,
-                results,
             )
             raise RuntimeError(
                 f"could not persist quality rule {rule_id!r} update"
@@ -973,10 +1030,10 @@ class DQConfig:
                     if expected_fingerprint is not None:
                         try:
                             existing = json.loads(raw)
-                        except (TypeError, ValueError, UnicodeError) as exc:
+                        except (TypeError, ValueError, UnicodeError):
                             raise DQConfigReadError(
                                 f"persisted quality rule {rule_id!r} is malformed"
-                            ) from exc
+                            ) from None
                         if not isinstance(existing, dict):
                             raise DQConfigReadError(
                                 f"persisted quality rule {rule_id!r} has the wrong shape"
@@ -998,7 +1055,10 @@ class DQConfig:
         except DQConfigConflictError:
             raise
         except Exception as e:
-            logger.error(f"[dq-config] delete_rule error: {e}")
+            logger.error(
+                "[dq-config] delete_rule_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             return False
         finally:
             if pipe is not None:
@@ -1007,11 +1067,10 @@ class DQConfig:
                 except Exception:
                     pass
         return bool(
-            isinstance(results, (list, tuple))
+            type(results) in (list, tuple)
             and len(results) == 2
             and all(
-                isinstance(result, int)
-                and not isinstance(result, bool)
+                type(result) is int
                 and result == 1
                 for result in results
             )
@@ -1050,6 +1109,7 @@ class DQConfig:
         try:
             if not isinstance(schedule, dict):
                 return False
+            _validate_document_budget(schedule, "quality schedule")
             self._validate_schedule_document(schedule, "global quality schedule")
             stored = deepcopy(schedule)
             stored["updated_at"] = _now_iso()
@@ -1060,7 +1120,10 @@ class DQConfig:
             )
             return bool(persisted)
         except Exception as e:
-            logger.error(f"[dq-config] set_schedule error: {e}")
+            logger.error(
+                "[dq-config] set_schedule_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             return False
 
     def get_table_schedule(self, table: str) -> Optional[Dict[str, Any]]:
@@ -1094,7 +1157,10 @@ class DQConfig:
             )
             return bool(persisted)
         except Exception as e:
-            logger.error(f"[dq-config] set_table_schedule error: {e}")
+            logger.error(
+                "[dq-config] set_table_schedule_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             return False
 
     def delete_table_schedule(self, table: str) -> bool:
@@ -1104,7 +1170,10 @@ class DQConfig:
                 self._key("schedule", table), table=table, payload=None,
             )
         except Exception as e:
-            logger.error(f"[dq-config] delete_table_schedule error: {e}")
+            logger.error(
+                "[dq-config] delete_table_schedule_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             return False
 
     def get_all_table_schedules(self) -> Dict[str, Dict[str, Any]]:
@@ -1141,10 +1210,10 @@ class DQConfig:
                         )
                     try:
                         document = json.loads(raw)
-                    except (TypeError, ValueError, UnicodeError) as exc:
+                    except (TypeError, ValueError, UnicodeError):
                         raise DQConfigReadError(
                             f"quality schedule for table {suffix!r} is malformed"
-                        ) from exc
+                        ) from None
                     if not isinstance(document, dict):
                         raise DQConfigReadError(
                             f"quality schedule for table {suffix!r} has the wrong shape"
@@ -1157,10 +1226,13 @@ class DQConfig:
         except DQConfigReadError:
             raise
         except Exception as exc:
-            logger.error("[dq-config] get_all_table_schedules error: %s", exc)
+            logger.error(
+                "[dq-config] table_schedule_inventory_read_failed; error_type=%s",
+                _safe_error_type(exc),
+            )
             raise DQConfigReadError(
                 "could not read quality table schedule inventory"
-            ) from exc
+            ) from None
         return results
 
     # ── Latest results (fast UI cache) ────────────────────────────────
@@ -1187,7 +1259,10 @@ class DQConfig:
             )
             return bool(persisted)
         except Exception as e:
-            logger.error(f"[dq-config] set_latest error: {e}")
+            logger.error(
+                "[dq-config] set_latest_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             return False
 
     def get_latest_column(self, table: str, column: str) -> Optional[Dict[str, Any]]:
@@ -1212,7 +1287,10 @@ class DQConfig:
             )
             return bool(persisted)
         except Exception as e:
-            logger.error(f"[dq-config] set_latest_column error: {e}")
+            logger.error(
+                "[dq-config] set_latest_column_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             return False
 
     def get_anomalies(self, table: str) -> List[Dict[str, Any]]:
@@ -1237,7 +1315,10 @@ class DQConfig:
             )
             return bool(persisted)
         except Exception as e:
-            logger.error(f"[dq-config] set_anomalies error: {e}")
+            logger.error(
+                "[dq-config] set_anomalies_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             return False
 
     # ── Bulk listing (for overview page) ──────────────────────────────
@@ -1280,11 +1361,11 @@ class DQConfig:
                         )
                     try:
                         document = json.loads(raw)
-                    except (TypeError, ValueError, UnicodeError) as exc:
+                    except (TypeError, ValueError, UnicodeError):
                         raise DQConfigReadError(
                             f"latest quality result for table {table_name!r} "
                             "is malformed"
-                        ) from exc
+                        ) from None
                     if not isinstance(document, dict):
                         raise DQConfigReadError(
                             f"latest quality result for table {table_name!r} "
@@ -1294,8 +1375,11 @@ class DQConfig:
         except DQConfigReadError:
             raise
         except Exception as exc:
-            logger.error("[dq-config] get_all_latest error: %s", exc)
+            logger.error(
+                "[dq-config] latest_inventory_read_failed; error_type=%s",
+                _safe_error_type(exc),
+            )
             raise DQConfigReadError(
                 "could not read latest quality result inventory"
-            ) from exc
+            ) from None
         return results

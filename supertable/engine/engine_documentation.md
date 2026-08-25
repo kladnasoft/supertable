@@ -20,7 +20,7 @@ query_sql() / DataReader.execute()
   ├─ Executor._auto_pick   Choose engine (DuckDB / IslandDB / bounded IslandDB / Spark)
   └─ Engine.execute
        ├─ Create reflection views (parquet_scan)
-       ├─ Create tombstone view    (soft-delete anti-join)
+       ├─ Create deletion-vector view (sealed composite anti-join)
        ├─ Create RBAC view         (column + row filtering)
        ├─ Rewrite SQL table refs → hashed view names
        └─ Execute + return DataFrame
@@ -106,6 +106,12 @@ first full-object cache fill.
 ### Spark Thrift (`spark_thrift.py`)
 Connects to a remote Spark Thrift Server via PyHive. Registers parquet files as temp views (batched unions for multi-file tables), applies timestamp CAST wrappers for DuckDB-written nanos columns, transpiles SQL from DuckDB dialect to Spark dialect. Per-statement timeout via `_execute_with_stmt_timeout`. Best for work that exceeds the safely admitted single-node plan.
 
+Spark currently admits only snapshots without an active deletion vector. Its
+view-registration path cannot yet preserve the protected
+`__supertable_source_file__` identity required to anti-join persisted
+`(__file__, __rowid__)` entries safely. AUTO therefore excludes those plans,
+and explicit Spark fails closed before cluster selection or connection.
+
 ## Engine Auto-Selection
 
 `Executor._auto_pick()` first applies SQL capability, immutable-identity,
@@ -140,9 +146,10 @@ parquet_scan → tombstone/system-column view → RBAC view → user query
 clause) from the pinned role/share definition. It is applied after system
 columns and deleted rows have been removed.
 
-**Tombstone view**: sealed composite `(canonical source file, __rowid__)`
-anti-join against the pinned deletion-vector Parquet artifact. The same layer
-always strips reserved system columns before user SQL/RBAC can expose them.
+**Tombstone view**: sealed composite
+`(__supertable_source_file__, __rowid__)` anti-join against the persisted
+deletion-vector identity `(__file__, __rowid__)`. The same layer always strips
+reserved system columns before user SQL/RBAC can expose them.
 
 Each view name includes a per-query UUID suffix to prevent collisions under concurrency.
 
@@ -156,7 +163,7 @@ Each view name includes a per-query UUID suffix to prevent collisions under conc
   incomplete estimates stay on DuckDB rather than being routed as tiny jobs
 - `freshness_ms: int` — max last_updated_ms across snapshots
 - `rbac_views: Dict[str, RbacViewDef]` — per-alias RBAC filters
-- `tombstone_views: Dict[str, TombstoneDef]` — per-alias soft-delete keys
+- `tombstone_views: Dict[str, TombstoneDef]` — per-alias, snapshot-pinned deletion-vector definitions
 
 **`TableDefinition`** — From `SQLParser.get_table_tuples()`:
 - `super_name, simple_name, alias` — table identity
@@ -239,11 +246,10 @@ and exact snapshot resource membership
 ```
 supertable/engine/
 ├── __init__.py              Package exports (Engine, Executor, PlanStats, DataEstimator)
-├── engine_enum.py           Engine enum (AUTO, DUCKDB, ISLANDDB, ISLANDDB, SPARK_SQL) + dialect
-├── engine_common.py         Shared: S3 config, httpfs, view creation (reflection/RBAC/dedup/tombstone), query rewriting, connection init, augment_rbac_columns
+├── engine_enum.py           Engine enum (AUTO, DUCKDB, ISLANDDB, SPARK_SQL) + dialect
+├── engine_common.py         Shared: storage config, protected deletion-vector/RBAC views, query rewriting, connection init
 ├── executor.py              Engine router + auto-pick logic
-├── duckdb.py           Ephemeral DuckDB executor (fire-and-forget)
-├── duckdb_engine.py            Persistent DuckDB executor (singleton, view cache, ref-counting)
+├── duckdb_engine.py         Scoped DuckDB executor and view lifecycle
 ├── islanddb.py              Conservative native lazy-Parquet executor
 ├── file_cache.py            Shared atomic local Parquet object cache
 ├── range_cache.py           Conditional persistent Parquet byte-range cache
@@ -254,10 +260,11 @@ supertable/engine/
 ├── plan_stats.py            Simple stat accumulator for execution plans
 └── tests/
     ├── conftest.py          Shared fixtures (mock Redis, DuckDB connection, clean env)
-    ├── test_engine.py        198 tests covering all modules
-    └── test_dedup_read.py   27 tests for dedup-on-read flow
+    ├── test_engine.py        Core executor and engine behavior
+    ├── test_executor_safety_regressions.py  Routing/security boundaries
+    └── test_tombstone_source_rowid_integrity.py  Composite deletion identity
 
-supertable/data_classes.py   Reflection, SuperSnapshot, RbacViewDef, DedupViewDef, TombstoneDef, TableDefinition
+supertable/data_classes.py   Reflection, SuperSnapshot, RbacViewDef, TombstoneDef, TableDefinition
 supertable/data_reader.py    Facade: parse → RBAC → estimate → wire views → execute → extend plan
 supertable/utils/sql_parser.py  SQLParser: table/column extraction via sqlglot
 

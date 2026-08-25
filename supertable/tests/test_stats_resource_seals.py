@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import io
+import struct
 from unittest.mock import MagicMock, patch
 
 import polars as pl
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from supertable.data_classes import ResourceStatsSeal, RowGroupSelection
@@ -168,6 +173,179 @@ def test_primary_write_resource_seals_match_exact_extracted_rows():
     assert resources[0]["file_size"] == len(uploaded[resources[0]["file"]])
 
 
+def test_metadata_seal_streams_one_row_group_at_a_time():
+    payload = io.BytesIO()
+    pq.write_table(
+        pa.table({"id": list(range(8)), "payload": ["x"] * 8}),
+        payload,
+        row_group_size=1,
+    )
+    metadata = pq.read_metadata(pa.BufferReader(payload.getvalue()))
+    original = processing._stats_rows_for_metadata
+    observed_groups: list[tuple[int, ...] | None] = []
+
+    def observe(*args, **kwargs):
+        selected = kwargs.get("row_group_indices")
+        observed_groups.append(
+            tuple(selected) if selected is not None else None
+        )
+        return original(*args, **kwargs)
+
+    expected_rows = original("part.parquet", metadata)
+    expected = processing.stats_seal_for_metadata(
+        "part.parquet", metadata, rows=expected_rows,
+    )
+    with patch(
+        "supertable.processing._stats_rows_for_metadata",
+        side_effect=observe,
+    ):
+        actual = processing.stats_seal_for_metadata("part.parquet", metadata)
+
+    assert actual == expected
+    assert observed_groups == [
+        (row_group_id,) for row_group_id in range(metadata.num_row_groups)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("rowids", "expected_minimum", "expected_maximum"),
+    [([7, 2, 9], 2, 9), ([], None, None)],
+)
+def test_primary_write_publishes_exact_rowid_integrity_seal(
+    rowids, expected_minimum, expected_maximum,
+):
+    storage = MagicMock()
+    uploaded = {}
+    storage.write_bytes.side_effect = (
+        lambda path, data: uploaded.update({path: data})
+    )
+    resources = []
+    footer_cache = {}
+    frame = pl.DataFrame({
+        "id": pl.Series("id", list(range(len(rowids))), dtype=pl.Int64),
+        "__rowid__": pl.Series("__rowid__", rowids, dtype=pl.Int64),
+    })
+
+    with (
+        patch("supertable.processing._get_storage", return_value=storage),
+        patch(
+            "supertable.processing.generate_filename",
+            return_value="rowids.parquet",
+        ),
+    ):
+        if rowids:
+            write_parquet_and_collect_resources(
+                frame,
+                [],
+                "/table/data",
+                resources,
+                compression_level=1,
+                footer_md_out=footer_cache,
+            )
+        else:
+            # The public batch helper intentionally emits no empty shards. The
+            # low-level resource publisher nevertheless has a canonical empty
+            # seal for compatibility/compaction callers that do publish one.
+            processing._write_single_parquet_file(
+                frame,
+                [],
+                "/table/data",
+                resources,
+                compression_level=1,
+                footer_md_out=footer_cache,
+            )
+
+    digest = hashlib.sha256(b"supertable-rowid-integrity-v1\0")
+    for rowid in rowids:
+        digest.update(struct.pack(">q", rowid))
+    resource = resources[0]
+    footer = footer_cache[resource["file"]].metadata
+    assert resource["rowid_integrity"] == {
+        "version": 1,
+        "rows": len(rowids),
+        "nonnull": len(rowids),
+        "unique": len(rowids),
+        "minimum": expected_minimum,
+        "maximum": expected_maximum,
+        "digest": digest.hexdigest(),
+        "footer_sha256": processing.parquet_footer_sha256(footer),
+    }
+    assert resource["rowid_integrity"]["footer_sha256"] == resource[
+        "footer_sha256"
+    ]
+    assert resource["file"] in uploaded
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        pl.DataFrame({"__rowid__": pl.Series([1, 1], dtype=pl.Int64)}),
+        pl.DataFrame({"__rowid__": pl.Series([1, 2, 2, 4], dtype=pl.Int64)}),
+        pl.DataFrame({
+            "__rowid__": pl.Series(
+                [1, 2, 2, 10_000_000], dtype=pl.Int64,
+            ),
+        }),
+        pl.DataFrame({"__rowid__": pl.Series([0, 2], dtype=pl.Int64)}),
+        pl.DataFrame({"__rowid__": pl.Series([1, None], dtype=pl.Int64)}),
+        pl.DataFrame({"__rowid__": pl.Series([1, 2], dtype=pl.Int32)}),
+    ],
+)
+def test_invalid_rowid_integrity_aborts_before_resource_publication(frame):
+    storage = MagicMock()
+    resources = []
+
+    with (
+        patch("supertable.processing._get_storage", return_value=storage),
+        patch(
+            "supertable.processing.generate_filename",
+            return_value="invalid-rowids.parquet",
+        ),
+        pytest.raises(ValueError, match="__rowid__"),
+    ):
+        write_parquet_and_collect_resources(
+            frame,
+            [],
+            "/table/data",
+            resources,
+            compression_level=1,
+        )
+
+    assert resources == []
+    storage.write_bytes.assert_not_called()
+
+
+def test_rowid_integrity_rejects_values_above_table_ceiling(monkeypatch):
+    storage = MagicMock()
+    resources = []
+    frame = pl.DataFrame({
+        "__rowid__": pl.Series([1, 2], dtype=pl.Int64),
+    })
+    # The production ceiling is signed BIGINT's maximum, which Int64 cannot
+    # exceed. Lower it here to exercise the writer's explicit contract check
+    # independently of Polars' dtype validation.
+    monkeypatch.setattr(processing, "MAX_TABLE_ROWID", 1)
+
+    with (
+        patch("supertable.processing._get_storage", return_value=storage),
+        patch(
+            "supertable.processing.generate_filename",
+            return_value="out-of-range-rowids.parquet",
+        ),
+        pytest.raises(ValueError, match="signed BIGINT"),
+    ):
+        write_parquet_and_collect_resources(
+            frame,
+            [],
+            "/table/data",
+            resources,
+            compression_level=1,
+        )
+
+    assert resources == []
+    storage.write_bytes.assert_not_called()
+
+
 def test_compaction_outputs_carry_exact_resource_seals(tmp_path, monkeypatch):
     from supertable.storage.local_storage import LocalStorage
 
@@ -302,6 +480,30 @@ def test_cached_immutable_stats_validation_skips_warm_rehash_and_groupby(monkeyp
         assert calls == 1
     finally:
         processing._STATS_CACHE.discard(processing.stats_cache_identity(stats_path))
+
+
+def test_implicit_stats_cache_identity_never_resolves_global_storage(monkeypatch):
+    stats = _frame(_stat_row("f.parquet", 1, "a" * 64))
+    expected = stats_resource_seals(stats)
+    stats_path = "sealed-table/stats/no-provider-lookup.parquet"
+
+    def global_storage_must_not_resolve():
+        raise AssertionError("cache identity attempted provider resolution")
+
+    monkeypatch.setattr(processing, "_get_storage", global_storage_must_not_resolve)
+    identity = processing.stats_cache_identity(stats_path)
+    processing.cache_stats(stats_path, stats)
+    try:
+        safe = stats_for_complete_files(
+            stats,
+            {"f.parquet": 1},
+            expected,
+            stats_path=stats_path,
+        )
+        assert safe.height == 1
+        assert processing._STATS_CACHE.get(identity) is stats
+    finally:
+        processing._STATS_CACHE.discard(identity)
 
 
 def test_stats_cache_identity_isolates_organization_and_auth_scope():

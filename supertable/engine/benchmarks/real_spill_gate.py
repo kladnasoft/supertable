@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .runner import ENGINE_DUCKDB, ENGINE_ISLAND
+from supertable.utils.diagnostic_redaction import safe_exception_type
 from .spill_gate import (
     GIB,
     CONTAINER_CPUS,
@@ -124,8 +125,10 @@ def _validate_manifest_and_files(
     manifest_path = corpus_root / "manifest.json"
     try:
         manifest = _read_json(manifest_path)
-    except Exception as exc:
-        raise RealSpillConfigurationError(str(exc)) from exc
+    except Exception:
+        raise RealSpillConfigurationError(
+            "corpus manifest is unavailable"
+        ) from None
     spec = manifest.get("spec")
     if not isinstance(spec, Mapping):
         raise RealSpillConfigurationError("corpus manifest has no generator spec")
@@ -163,10 +166,10 @@ def _validate_manifest_and_files(
         try:
             host_path.relative_to(corpus_root)
             stat = host_path.stat()
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError):
             raise RealSpillConfigurationError(
-                f"cannot validate corpus file {relative!r}: {exc}"
-            ) from exc
+                "cannot validate corpus file"
+            ) from None
         declared_bytes = int(entry.get("bytes") or 0)
         if stat.st_size != declared_bytes:
             raise RealSpillConfigurationError(
@@ -198,8 +201,10 @@ def load_real_spill_inputs(
     """Transform the sealed full-projection request into a real external sort."""
     try:
         template = _read_json(request_template)
-    except Exception as exc:
-        raise RealSpillConfigurationError(str(exc)) from exc
+    except Exception:
+        raise RealSpillConfigurationError(
+            "benchmark request template is unavailable"
+        ) from None
     plan = template.get("plan")
     if not isinstance(plan, Mapping):
         raise RealSpillConfigurationError("request template has no plan")
@@ -425,7 +430,12 @@ def _cleanup_spill_root(spill_root: Path, *, attempt_root: Path) -> dict[str, An
         if resolved_spill.relative_to(resolved_attempt) != Path("engine-spill"):
             raise ValueError("spill path is not this attempt's engine-spill")
     except (OSError, ValueError) as exc:
-        return {"attempted": False, "errors": [f"unsafe_path:{exc}"]}
+        return {
+            "attempted": False,
+            "errors": [
+                "unsafe_path; error_type=" + safe_exception_type(exc)
+            ],
+        }
     for child in list(resolved_spill.iterdir()):
         try:
             if child.is_dir() and not child.is_symlink():
@@ -433,7 +443,10 @@ def _cleanup_spill_root(spill_root: Path, *, attempt_root: Path) -> dict[str, An
             else:
                 child.unlink()
         except OSError as exc:
-            errors.append(f"{child.name}:{type(exc).__name__}:{exc}")
+            errors.append(
+                "spill cleanup failed; "
+                f"error_type={safe_exception_type(exc)}"
+            )
     return {"attempted": True, "errors": errors}
 
 
@@ -611,7 +624,10 @@ def run_engine_attempt(
                 stdout, stderr = process.communicate()
         returncode = process.returncode
     except OSError as exc:
-        launch_error = f"{type(exc).__name__}: {exc}"
+        launch_error = (
+            "real-spill launch failed; "
+            f"error_type={safe_exception_type(exc)}"
+        )
     finally:
         sampler.stop()
         docker_state = _docker_state(docker, container_name)
@@ -627,7 +643,10 @@ def run_engine_attempt(
         try:
             response = _read_json(response_path)
         except Exception as exc:
-            response_error = str(exc)
+            response_error = (
+                "worker response unavailable; "
+                f"error_type={safe_exception_type(exc)}"
+            )
 
     raw_sampler_summary = sampler.summary()
     host_sampler = _sampler_summary(raw_sampler_summary)
@@ -675,7 +694,10 @@ def run_engine_attempt(
             else:
                 status, exit_code = "passed", EXIT_SUCCESS
         except RealSpillGateError as exc:
-            validation_error = str(exc)
+            validation_error = (
+                "real-spill validation failed; "
+                f"error_type={safe_exception_type(exc)}"
+            )
 
     spill_after_worker = _tree_footprint(attempt_root / "engine-spill")
     if exit_code == EXIT_SUCCESS and spill_after_worker["files"]:
@@ -901,8 +923,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             corpus_root=corpus_root,
         )
         disk_preflight(output_root)
-    except RealSpillConfigurationError as exc:
-        parser.error(str(exc))
+    except RealSpillConfigurationError:
+        parser.error("real-spill benchmark configuration is invalid")
     code, comparison = run_comparison(
         inputs=inputs,
         output_root=output_root,

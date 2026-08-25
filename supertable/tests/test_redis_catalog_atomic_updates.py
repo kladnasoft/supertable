@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import traceback
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +16,7 @@ from supertable.data_writer import DataWriter
 from supertable.errors import LockLostError, SnapshotCommitConflictError
 from supertable.redis_catalog import (
     DeletionIntentConflictError,
+    RbacIntegrityError,
     ReadOnlyCatalogError,
     RedisCatalog,
 )
@@ -61,6 +63,157 @@ def _snapshot_payload(version: int) -> dict:
         "tombstone_digest": None,
         "_row_filter": None,
     }
+
+
+def test_write_authority_generation_is_atomic_and_fail_closed() -> None:
+    catalog, client = _catalog()
+    _seed_root(client)
+    client.hset(
+        RK.rbac_role_meta("acme", "lake"),
+        mapping={"version": "3", "initialized": "true"},
+    )
+    client.hset(
+        RK.rbac_user_meta("acme", "lake"),
+        mapping={"version": "7", "initialized": "true"},
+    )
+
+    generation = catalog.sample_write_authority_generation("acme", "lake")
+
+    assert generation == (3, 7, 0, 1)
+    assert catalog.validate_write_authority_generation(
+        "acme", "lake", generation,
+    ) is True
+    client.hincrby(RK.rbac_role_meta("acme", "lake"), "version", 1)
+    assert catalog.validate_write_authority_generation(
+        "acme", "lake", generation,
+    ) is False
+
+    client.set(
+        RK.meta_namespace_deletion_intent("acme", "lake"),
+        json.dumps({"intent_id": "delete"}),
+    )
+    with pytest.raises(DeletionIntentConflictError):
+        catalog.sample_write_authority_generation("acme", "lake")
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+@pytest.mark.parametrize("changed_generation", ["role", "user", "root"])
+def test_snapshot_commit_atomically_fences_write_authority_generation(
+    pinned_no_mirrors: bool,
+    changed_generation: str,
+) -> None:
+    catalog, client = _catalog()
+    _seed_root(client)
+    client.hset(
+        RK.rbac_role_meta("acme", "lake"),
+        mapping={"version": "3", "initialized": "true"},
+    )
+    client.hset(
+        RK.rbac_user_meta("acme", "lake"),
+        mapping={"version": "7", "initialized": "true"},
+    )
+    client.set(RK.lock_leaf("acme", "lake", "orders"), "owner")
+    generation = catalog.sample_write_authority_generation("acme", "lake")
+
+    if changed_generation == "role":
+        client.hincrby(RK.rbac_role_meta("acme", "lake"), "version", 1)
+    elif changed_generation == "user":
+        client.hincrby(RK.rbac_user_meta("acme", "lake"), "version", 1)
+    else:
+        client.set(
+            RK.meta_root("acme", "lake"),
+            json.dumps({"version": 1, "ts": 2}),
+        )
+
+    commit_kwargs = {"expected_mirror_pin": None} if pinned_no_mirrors else {}
+    with pytest.raises(PermissionError, match="Write authority changed"):
+        catalog.commit_snapshot(
+            "acme",
+            "lake",
+            "orders",
+            _snapshot_payload(0),
+            "acme/lake/tables/orders/snapshots/v0.json",
+            expected_version=-1,
+            expected_path="",
+            lock_token="owner",
+            expected_write_authority_generation=generation,
+            **commit_kwargs,
+        )
+
+    assert client.get(RK.meta_leaf("acme", "lake", "orders")) is None
+    assert client.get(RK.schema("acme", "lake", "orders")) is None
+    assert client.sismember(RK.meta_table_names("acme", "lake"), "orders") == 0
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_snapshot_commit_accepts_exact_write_authority_generation(
+    pinned_no_mirrors: bool,
+) -> None:
+    catalog, client = _catalog()
+    _seed_root(client)
+    client.set(RK.lock_leaf("acme", "lake", "orders"), "owner")
+    generation = catalog.sample_write_authority_generation("acme", "lake")
+    commit_kwargs = {"expected_mirror_pin": None} if pinned_no_mirrors else {}
+
+    assert catalog.commit_snapshot(
+        "acme",
+        "lake",
+        "orders",
+        _snapshot_payload(0),
+        "acme/lake/tables/orders/snapshots/v0.json",
+        expected_version=-1,
+        expected_path="",
+        lock_token="owner",
+        expected_write_authority_generation=generation,
+        **commit_kwargs,
+    ) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    "corrupt_meta",
+    [
+        ("string", "not-a-hash"),
+        ("hash", {"initialized": "true"}),
+        ("hash", {"version": "01"}),
+        ("hash", {"version": "9223372036854775808"}),
+    ],
+)
+def test_write_authority_generation_rejects_corrupt_rbac_meta(
+    corrupt_meta,
+) -> None:
+    catalog, client = _catalog()
+    _seed_root(client)
+    kind, value = corrupt_meta
+    key = RK.rbac_role_meta("acme", "lake")
+    if kind == "string":
+        client.set(key, value)
+    else:
+        client.hset(key, mapping=value)
+
+    with pytest.raises(RbacIntegrityError):
+        catalog.sample_write_authority_generation("acme", "lake")
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        {"version": 0, "ts": 1, "read_only": True},
+        {
+            "version": 0,
+            "ts": 1,
+            "read_only": True,
+            "clone_type": "replica",
+            "cloned_from": "source",
+            "clone_ts": 1,
+        },
+    ],
+)
+def test_write_authority_generation_rejects_non_writable_root(root) -> None:
+    catalog, client = _catalog()
+    client.set(RK.meta_root("acme", "lake"), json.dumps(root))
+
+    with pytest.raises(ReadOnlyCatalogError):
+        catalog.sample_write_authority_generation("acme", "lake")
 
 
 def _coordinate_first_reads(monkeypatch, client, key: str) -> None:
@@ -677,14 +830,26 @@ def test_root_flag_update_rejects_identity_or_lifecycle_corruption(flags):
 def test_root_flag_update_accepts_complete_valid_replica_contract():
     catalog, client = _catalog()
     _seed_root(client)
+    client.set(
+        RK.meta_root("acme", "source"),
+        json.dumps({"version": 0, "ts": 1}),
+    )
+    client.set(RK.lock_namespace("acme", "source"), "source-owner")
+    client.set(RK.lock_namespace("acme", "lake"), "target-owner")
 
-    assert catalog.update_root_flags("acme", "lake", {
-        "read_only": True,
-        "clone_type": "replica",
-        "cloned_from": "source",
-        "clone_ts": 7,
-        "replica_tables": ["orders", "customers"],
-    })
+    assert catalog.transition_clone_owners(
+        "acme",
+        "lake",
+        {
+            "read_only": True,
+            "clone_type": "replica",
+            "cloned_from": "source",
+            "clone_ts": 7,
+            "replica_tables": ["orders", "customers"],
+        },
+        namespace_token="target-owner",
+        source_namespace_tokens={"source": "source-owner"},
+    )
 
     root = catalog.get_root("acme", "lake")
     assert root["version"] == 0
@@ -780,6 +945,64 @@ def test_table_config_read_rejects_corrupt_or_nonobject_state(raw):
 
     with pytest.raises(RuntimeError, match="Corrupt table configuration"):
         catalog.get_table_config("acme", "lake", "orders")
+
+
+def test_table_config_read_never_exposes_validator_or_identity_text(monkeypatch):
+    import supertable.redis_catalog as redis_catalog_module
+
+    secret = "access_token=TABLE_CONFIG_SENTINEL;https://redis.invalid/private"
+    organization = "tenant-table-config-identity"
+    super_name = "lake-table-config-identity"
+    table_name = "orders-table-config-identity"
+
+    class _PoisonedConfigError(ValueError):
+        pass
+
+    def reject(_document):
+        raise _PoisonedConfigError(secret)
+
+    catalog, client = _catalog()
+    client.set(
+        RK.meta_table_config(organization, super_name, table_name),
+        json.dumps({"max_overlapping_files": 2}),
+    )
+    monkeypatch.setattr(
+        redis_catalog_module,
+        "_validate_table_config_document",
+        reject,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        catalog.get_table_config(organization, super_name, table_name)
+
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert str(raised.value) == (
+        "Corrupt table configuration; error_type=ValueError"
+    )
+    for forbidden in (secret, organization, super_name, table_name):
+        assert forbidden not in rendered
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def test_table_config_json_error_drops_poisoned_raw_document():
+    secret = "signature=TABLE_CONFIG_JSON_SENTINEL"
+    catalog, client = _catalog()
+    client.set(
+        RK.meta_table_config("acme", "lake", "orders"),
+        '{"primary_keys":["' + secret,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        catalog.get_table_config("acme", "lake", "orders")
+
+    rendered = "".join(traceback.format_exception(raised.value))
+    assert secret not in rendered
+    assert str(raised.value) == (
+        "Corrupt table configuration; error_type=JSONDecodeError"
+    )
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
 
 
 def test_dv_v2_activation_config_round_trips_with_exact_json_types():
@@ -957,6 +1180,93 @@ def test_linked_share_create_and_update_have_atomic_existence_semantics():
     assert not client.sismember(
         RK.linked_share_index("acme", "lake"), "missing",
     )
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+def test_linked_share_document_byte_limit_is_checked_before_lua(operation):
+    catalog, client = _catalog()
+    _seed_root(client)
+    if operation == "update":
+        catalog.create_linked_share(
+            "acme", "lake", "linked", {"id": "linked"},
+        )
+    lua = MagicMock()
+    catalog._upsert_linked_share_fenced = lua
+
+    with patch(
+        "supertable.redis_catalog._MAX_LINKED_SHARE_DOCUMENT_BYTES", 64,
+    ), pytest.raises(ValueError, match="byte limit"):
+        getattr(catalog, f"{operation}_linked_share")(
+            "acme", "lake", "linked", {"payload": "x" * 128},
+        )
+
+    lua.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("document", "message"),
+    [
+        ({"resources": "not-an-array"}, "resources must be an array"),
+        (
+            {"resources": [{"file": "data.parquet", "file_size": -1}]},
+            "resource file_size is invalid",
+        ),
+        ({"value": float("nan")}, "non-finite"),
+    ],
+)
+def test_linked_share_structure_is_checked_before_lua(document, message):
+    catalog, client = _catalog()
+    _seed_root(client)
+    lua = MagicMock()
+    catalog._upsert_linked_share_fenced = lua
+
+    with pytest.raises(ValueError, match=message):
+        catalog.create_linked_share(
+            "acme", "lake", "linked", document,
+        )
+
+    lua.assert_not_called()
+
+
+def test_linked_share_depth_is_checked_iteratively_before_lua():
+    catalog, client = _catalog()
+    _seed_root(client)
+    document = {}
+    cursor = document
+    for _ in range(40):
+        child = {}
+        cursor["child"] = child
+        cursor = child
+    lua = MagicMock()
+    catalog._upsert_linked_share_fenced = lua
+
+    with pytest.raises(ValueError, match="depth limit"):
+        catalog.create_linked_share(
+            "acme", "lake", "linked", document,
+        )
+
+    lua.assert_not_called()
+
+
+def test_linked_share_cached_table_limit_is_checked_before_lua():
+    catalog, client = _catalog()
+    _seed_root(client)
+    lua = MagicMock()
+    catalog._upsert_linked_share_fenced = lua
+    document = {
+        "cached_manifest": {
+            "tables": [{"table": "one"}, {"table": "two"}],
+        },
+    }
+
+    with patch(
+        "supertable.redis_catalog._MAX_LINKED_SHARE_TABLES", 1,
+    ), pytest.raises(ValueError, match="cached tables"):
+        catalog.create_linked_share(
+            "acme", "lake", "linked", document,
+        )
+
+    lua.assert_not_called()
 
 
 def test_linked_share_update_rejects_unindexed_orphan_without_mutation():
@@ -1691,6 +2001,71 @@ def test_linked_leaf_upsert_refreshes_existing_same_link_atomically():
     assert leaf["payload"]["_linked_generation"] == generation_2
     assert leaf["payload"]["_linked_provider_generated_ms"] == 200
     assert leaf["version"] == 1
+
+
+def test_linked_leaf_and_control_mutations_share_root_generation_fence():
+    catalog, client = _catalog()
+    _seed_root(client)
+    generation, server_ms = (
+        catalog.allocate_linked_share_publication_generation(
+            "acme", "lake", "link-1",
+        )
+    )
+    _reserve_linked(
+        catalog,
+        link_id="link-1",
+        provider_generated_ms=100,
+        manifest_digest=_LINKED_DIGEST_A,
+        publication_generation=generation,
+        server_ms=server_ms,
+    )
+
+    catalog.upsert_linked_leaf(
+        "acme",
+        "lake",
+        "orders",
+        _linked_payload(generation, "https://provider.invalid/orders"),
+        "__linked_share__/link-1/orders",
+        link_id="link-1",
+        generation=generation,
+        not_after_ms=server_ms + 10_000,
+    )
+    assert catalog.get_root("acme", "lake")["version"] == 1
+
+    control = {
+        **_linked_control(
+            link_id="link-1",
+            publication_generation=generation,
+            provider_generated_ms=100,
+            manifest_digest=_LINKED_DIGEST_A,
+        ),
+        "alias_prefix": "",
+        "cached_manifest": {"tables": [{"table": "orders"}]},
+    }
+    catalog.create_linked_share("acme", "lake", "link-1", control)
+    assert catalog.get_root("acme", "lake")["version"] == 2
+    index = catalog.list_linked_share_table_indexes(
+        "acme", "lake",
+    )["link-1"]
+    assert index is not None
+    assert index["table_count"] == 1
+    assert index["publication_generation"] == generation
+    assert index["provider_generated_ms"] == 100
+    assert index["manifest_digest"] == _LINKED_DIGEST_A
+
+    assert catalog.delete_linked_leaf_if_generation(
+        "acme",
+        "lake",
+        "orders",
+        link_id="link-1",
+        expected_generation=generation,
+    )
+    assert catalog.get_root("acme", "lake")["version"] == 3
+    assert catalog.begin_unlink_linked_share(
+        "acme", "lake", "link-1",
+    ) == control
+    assert catalog.get_root("acme", "lake")["version"] == 4
+    assert catalog.list_linked_share_table_indexes("acme", "lake") == {}
 
 
 def test_linked_leaf_upsert_rejects_local_and_other_link_owners():
@@ -2450,10 +2825,20 @@ def test_publication_deadline_crossing_before_mutation_changes_no_catalog_keys()
         catalog._linked_unlink_tombstone_key(
             "acme", "lake", "link-control",
         ),
+        catalog._linked_table_index_key(
+            "acme", "lake", "link-control",
+        ),
     ]
     create_result = linked_control(
         keys=control_keys,
-        args=[json.dumps({"link_id": "link-control"}), "link-control", "create", 1],
+        args=[
+            json.dumps({"link_id": "link-control"}),
+            "link-control",
+            "create",
+            1,
+            0,
+            "",
+        ],
     )
     assert int(create_result) == -8
     assert not client.exists(control_keys[0])
@@ -2473,6 +2858,8 @@ def test_publication_deadline_crossing_before_mutation_changes_no_catalog_keys()
             "link-control",
             "update",
             1,
+            0,
+            "",
         ],
     )
     assert int(update_result) == -8

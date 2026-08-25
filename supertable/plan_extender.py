@@ -8,12 +8,16 @@ from supertable.query_plan_manager import QueryPlanManager
 from supertable.engine.plan_stats import PlanStats
 from supertable.monitoring.partitions import MONITORING_SINK_TABLES
 from supertable.monitoring_writer import MonitoringDurabilityError, MonitoringWriter
+from supertable.utils.diagnostic_redaction import (
+    local_path_metadata,
+    safe_exception_type,
+)
 from supertable.engine.query_observations import (
     QueryObservation,
     QueryObservationStore,
     canonical_sql_shape,
+    diagnostic_text_identity,
     normalize_query_profile,
-    redact_text,
     sanitize_profile,
 )
 
@@ -106,9 +110,16 @@ def extend_execution_plan(
                 pass
             base_plan = _read_local_json(plan_path)
         elif plan_path:
-            logger.debug("Plan JSON does not exist at %s", plan_path)
+            logger.debug(
+                "Plan JSON does not exist; %s",
+                local_path_metadata(plan_path),
+            )
     except Exception as e:  # noqa: BLE001
-        logger.warning("Could not read plan JSON (%s): %s", plan_path or "?", e)
+        logger.warning(
+            "Could not read plan JSON; %s; error_type=%s",
+            local_path_metadata(plan_path),
+            safe_exception_type(e),
+        )
         base_plan = {}
 
     # Normalize inputs
@@ -160,12 +171,9 @@ def extend_execution_plan(
 
     # Prepare flat metric payload for the monitoring table
     try:
-        # Extract engine from plan_stats (stored as {"ENGINE": "duckdb"} entry)
-        _engine_used = "unknown"
-        for _entry in (plan_stats.stats if hasattr(plan_stats, "stats") else []):
-            if isinstance(_entry, dict) and "ENGINE" in _entry:
-                _engine_used = str(_entry["ENGINE"])
-                break
+        # The normalized enum is allowlisted; never persist arbitrary PlanStats
+        # prose through a field that happens to be named ``ENGINE``.
+        _engine_used = normalized.actual_engine
 
         stats = {
             "query_id": getattr(query_plan_manager, "query_id", ""),
@@ -188,7 +196,7 @@ def extend_execution_plan(
             "forced_engine": normalized.forced,
             "engine_fallback": normalized.fallback,
             "status": status,
-            "message": redact_text(message, limit=1_000),
+            "message": diagnostic_text_identity(message),
             "result_rows": int(display_result_shape[0]),
             "result_columns": int(display_result_shape[1]),
             # Store complex parts as JSON strings to keep row schema flat
@@ -198,7 +206,10 @@ def extend_execution_plan(
             "normalized_profile": _safe_json(extended_plan["normalized_profile"]),
         }
     except Exception as e:  # noqa: BLE001
-        logger.error("Failed to build monitoring stats payload: %s", e)
+        logger.error(
+            "Failed to build monitoring stats payload; error_type=%s",
+            safe_exception_type(e),
+        )
         try:
             if plan_path and os.path.isfile(plan_path):
                 os.remove(plan_path)
@@ -233,7 +244,10 @@ def extend_execution_plan(
                 # spool; only spool durability/backpressure reaches here.
                 raise
             except Exception as e:  # noqa: BLE001
-                logger.warning("Monitoring logging failed (non-fatal): %s", e)
+                logger.warning(
+                    "Monitoring logging failed (non-fatal); error_type=%s",
+                    safe_exception_type(e),
+                )
 
         # Persist only exact, successful, non-fallback AUTO observations in the
         # compact router store. Forced/failed/fallback executions remain visible
@@ -251,13 +265,22 @@ def extend_execution_plan(
                 )
                 store.record(observation)
         except Exception as e:  # noqa: BLE001
-            logger.debug("Query observation persistence skipped: %s", e)
+            logger.debug(
+                "Query observation persistence skipped; error_type=%s",
+                safe_exception_type(e),
+            )
     finally:
         # Raw profiles can include operational details. Always remove them even
         # when monitoring durability/backpressure is propagated to the caller.
         try:
             if plan_path and os.path.isfile(plan_path):
                 os.remove(plan_path)
-                logger.debug("Deleted plan JSON: %s", plan_path)
+                logger.debug(
+                    "Deleted plan JSON; %s", local_path_metadata(plan_path),
+                )
         except Exception as e:  # noqa: BLE001
-            logger.warning("Failed to delete plan JSON (non-fatal): %s", e)
+            logger.warning(
+                "Failed to delete plan JSON (non-fatal); %s; error_type=%s",
+                local_path_metadata(plan_path),
+                safe_exception_type(e),
+            )

@@ -154,7 +154,9 @@ def test_failed_query_cannot_be_evaluated_as_an_empty_success():
     assert result.ok is False
     assert result.actual_engine is None
     assert result.island_supported is False
-    with pytest.raises(QualitySQLExecutionError, match="binder error"):
+    assert result.message == "Quality SQL execution failed"
+    assert "binder error" not in repr(result)
+    with pytest.raises(QualitySQLExecutionError, match="Quality SQL execution failed"):
         result.require_success()
 
 
@@ -174,7 +176,10 @@ def test_rbac_or_reader_exception_is_a_structured_failure():
     assert result.ok is False
     assert result.status == "error"
     assert result.actual_engine is None
-    assert result.message == "quality role denied"
+    assert result.message == (
+        "Quality SQL execution failed; error_type=PermissionError"
+    )
+    assert "quality role denied" not in repr(result)
 
 
 def test_reader_is_tagged_as_quality_source_and_auto_is_default():
@@ -238,6 +243,51 @@ def test_reader_construction_failure_is_structured_without_plan_stats():
 
     assert result.ok is False
     assert result.status == "error"
-    assert result.message == "reader construction failed"
+    assert result.message == (
+        "Quality SQL execution failed; error_type=RuntimeError"
+    )
+    assert "reader construction failed" not in repr(result)
     assert result.actual_engine is None
     assert result.plan_stats == ()
+
+
+def test_backend_failure_text_never_crosses_quality_execution_boundary():
+    secret = "token=sentinel-secret&sig=deadbeef SELECT private_value"
+    reader = _reader_factory(
+        response=(pd.DataFrame(), Status.OK, None),
+        error=RuntimeError(secret),
+    )
+
+    result = execute_quality_sql(
+        organization="org",
+        super_name="sup",
+        sql="SELECT COUNT(*) FROM sup.t",
+        reader_factory=reader,
+    )
+
+    assert secret not in repr(result)
+    with pytest.raises(QualitySQLExecutionError) as raised:
+        result.require_success()
+    assert secret not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
+def test_dynamic_exception_class_name_never_crosses_quality_boundary():
+    secret = "RuntimeBackend_CAUSE_CLASS_SECRET"
+    hostile_error = type(secret, (RuntimeError,), {})("safe-message")
+    reader = _reader_factory(
+        response=(pd.DataFrame(), Status.OK, None),
+        error=hostile_error,
+    )
+
+    result = execute_quality_sql(
+        organization="org",
+        super_name="sup",
+        sql="SELECT COUNT(*) FROM sup.t",
+        reader_factory=reader,
+    )
+
+    assert result.message == (
+        "Quality SQL execution failed; error_type=RuntimeError"
+    )
+    assert secret not in repr(result)

@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+_EXPORT_QUERY_LIMIT = 10_000
+
 
 def export_events(
     events: List[Dict[str, Any]],
@@ -53,8 +55,16 @@ def _to_csv(events: List[Dict[str, Any]]) -> bytes:
     writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     for event in events:
-        writer.writerow(event)
+        writer.writerow({
+            key: _csv_cell(value) for key, value in event.items()
+        })
     return buf.getvalue().encode("utf-8")
+
+
+def _csv_cell(value: Any) -> Any:
+    if isinstance(value, str) and value[:1] in {"=", "+", "-", "@"}:
+        return "'" + value
+    return value
 
 
 def export_dora_incident_report(
@@ -69,7 +79,17 @@ def export_dora_incident_report(
     TODO Phase 7: align with RTS/ITS templates (Regulation 2024/1772).
     """
     from supertable.audit.reader import query_audit_log
-    events = query_audit_log(organization, start_ms=start_ms, end_ms=end_ms, limit=50000)
+    events = query_audit_log(
+        organization, start_ms=start_ms, end_ms=end_ms, limit=_EXPORT_QUERY_LIMIT,
+    )
+    incident_id = str(incident_id or "").strip()
+    if not incident_id:
+        raise ValueError("incident_id is required")
+    events = [
+        event for event in events
+        if str(event.get("incident_id", "")) == incident_id
+        or str((event.get("detail") or {}).get("incident_id", "")) == incident_id
+    ]
     return export_events(events, output_format)
 
 
@@ -144,7 +164,9 @@ def export_soc2_evidence(
         },
     }
 
-    spec = criteria_map.get(criteria, {"category": None, "actions": []})
+    if criteria not in criteria_map:
+        raise ValueError("unsupported SOC 2 criterion")
+    spec = criteria_map[criteria]
     category_filter = spec.get("category")
     action_filter_set = set(spec.get("actions", []))
     multi_categories = set(spec.get("categories", []))
@@ -161,7 +183,7 @@ def export_soc2_evidence(
                 start_ms=period_start_ms,
                 end_ms=period_end_ms,
                 category=cat,
-                limit=50000,
+                limit=_EXPORT_QUERY_LIMIT,
             )
             for ev in cat_events:
                 eid = ev.get("event_id", "")
@@ -175,7 +197,7 @@ def export_soc2_evidence(
             start_ms=period_start_ms,
             end_ms=period_end_ms,
             category=category_filter,
-            limit=50000,
+            limit=_EXPORT_QUERY_LIMIT,
         )
 
     # Apply action-level filtering if the criterion specifies specific actions

@@ -8,6 +8,7 @@ from sqlglot import exp
 from sqlglot.errors import ParseError
 from sqlglot.optimizer.scope import traverse_scope
 from supertable.data_classes import JoinEdge, PredInterval, TableDefinition
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 
 @dataclass(frozen=True)
@@ -43,19 +44,21 @@ def _build_scoped_table_bindings(
     if scopes is None:
         try:
             scopes = tuple(traverse_scope(parsed))
-        except Exception as exc:
-            raise ValueError("Unable to resolve SQL table scopes") from exc
+        except Exception:
+            raise ValueError("Unable to resolve SQL table scopes") from None
 
     table_scope: Dict[int, int] = {}
     cte_references: Set[int] = set()
     for scope_index, scope in enumerate(scopes):
         try:
             selected_sources = scope.selected_sources.values()
-        except Exception as exc:
+        except Exception:
             # sqlglot reports duplicate aliases in a SELECT while constructing
             # selected_sources.  Such a query cannot have an unambiguous
             # protected-source rewrite.
-            raise ValueError("Table alias is ambiguous within a SQL scope") from exc
+            raise ValueError(
+                "Table alias is ambiguous within a SQL scope"
+            ) from None
         for selected in selected_sources:
             try:
                 node, source = selected
@@ -922,39 +925,25 @@ class SQLParser:
     @staticmethod
     def _build_parse_error_message(error: ParseError) -> str:
         """
-        Build a concise, user-facing message from sqlglot.ParseError.
+        Build a concise error without reflecting query text or parser details.
+
+        sqlglot's description and context fields can contain arbitrary SQL
+        literals.  Parse failures frequently cross API and logging boundaries,
+        so retain only validated numeric location metadata.
         """
         errors = getattr(error, "errors", None) or []
         if errors:
             err = errors[0]
-
-            description = (err.get("description") or "").strip()
-            if not description:
-                raw_lines = str(error).strip().splitlines()
-                first_line = raw_lines[0] if raw_lines else "Unknown parse error"
-                description = first_line.rstrip(".")
-
             line = err.get("line")
             col = err.get("col")
-
-            header = description
-            if line is not None and col is not None:
-                header = f"{header} Line {line}, Col: {col}."
-
-            start = (err.get("start_context") or "")
-            highlight = (err.get("highlight") or "")
-            end = (err.get("end_context") or "")
-            context = f"{start}{highlight}{end}".rstrip("\n").rstrip()
-
-            if context:
-                return f"{header}\n  {context}"
-
-            return header or "Invalid SQL syntax."
-
-        raw = str(error).strip()
-        if not raw:
-            return "Invalid SQL syntax."
-        return raw.splitlines()[0]
+            if (
+                type(line) is int
+                and type(col) is int
+                and line > 0
+                and col > 0
+            ):
+                return f"Invalid SQL syntax. Line {line}, Col: {col}."
+        return "Invalid SQL syntax."
 
     @staticmethod
     def _parse_query(query: str, dialect: str) -> exp.Expression:
@@ -980,7 +969,8 @@ class SQLParser:
             raise
         except Exception as e:
             raise ValueError(
-                f"An unexpected error occurred while parsing SQL query: {e}"
+                "An unexpected error occurred while parsing SQL query; "
+                f"error_type={safe_exception_type(e)}"
             ) from None
 
     @staticmethod

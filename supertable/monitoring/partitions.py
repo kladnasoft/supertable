@@ -51,8 +51,12 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, NamedTuple, Optional, Sequence
 
 from supertable import redis_keys as RK
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 logger = logging.getLogger(__name__)
+
+def _safe_error_type(error: BaseException) -> str:
+    return safe_exception_type(error)
 
 
 # Safety cap on read_recent's max_days_back kwarg. Going further back is
@@ -184,18 +188,26 @@ def _parse_entries(raw_entries: List[Any]) -> List[Dict[str, Any]]:
     cannot poison the whole drain.
     """
     out: List[Dict[str, Any]] = []
-    for raw in raw_entries or []:
+    for index, raw in enumerate(raw_entries or []):
         s = _decode(raw)
         try:
             obj = json.loads(s)
         except (json.JSONDecodeError, TypeError) as e:
-            logger.debug("[monitoring.partitions] skipping malformed entry: %s", e)
+            logger.debug(
+                "[monitoring.partitions] skipping malformed entry %d; "
+                "error_type=%s",
+                index,
+                _safe_error_type(e),
+            )
             continue
         if isinstance(obj, dict):
             out.append(obj)
         else:
             logger.debug(
-                "[monitoring.partitions] skipping non-object entry: %r", obj
+                "[monitoring.partitions] skipping non-object entry %d; "
+                "value_type=%s",
+                index,
+                "unexpected_value",
             )
     return out
 
@@ -208,10 +220,10 @@ def _parse_entries_strict(raw_entries: Sequence[Any]) -> List[Dict[str, Any]]:
         value = _decode(raw)
         try:
             item = json.loads(value)
-        except (json.JSONDecodeError, TypeError, UnicodeError) as exc:
+        except (json.JSONDecodeError, TypeError, UnicodeError):
             raise MonitoringPartitionError(
                 f"monitoring drain entry {index} is not valid JSON"
-            ) from exc
+            ) from None
         if not isinstance(item, dict):
             raise MonitoringPartitionError(
                 f"monitoring drain entry {index} is not a JSON object"
@@ -286,10 +298,10 @@ def _claim_without_expiry(r: Any, source: str, drain: str) -> bool:
         return bool(renamed)
     except MonitoringPartitionError:
         raise
-    except Exception as exc:
+    except Exception:
         raise MonitoringPartitionError(
             "could not atomically claim monitoring partition"
-        ) from exc
+        ) from None
 
 
 def claim_partition(
@@ -314,11 +326,10 @@ def claim_partition(
     try:
         _claim_without_expiry(r, src, drain)
         raw_entries = r.lrange(drain, 0, -1)
-    except Exception as exc:
+    except Exception:
         raise MonitoringPartitionError(
-            f"could not read claimed monitoring partition "
-            f"{organization}/{monitor_type}/{date}"
-        ) from exc
+            "could not read claimed monitoring partition"
+        ) from None
     if not raw_entries:
         return None
 
@@ -326,10 +337,10 @@ def claim_partition(
     try:
         created = r.set(receipt_key, receipt, nx=True)
         persisted = r.get(receipt_key)
-    except Exception as exc:
+    except Exception:
         raise MonitoringPartitionError(
             "could not persist monitoring drain receipt"
-        ) from exc
+        ) from None
     # Minimal Redis duck-types used by embedders sometimes acknowledge SET NX
     # without implementing a value-returning GET. Production redis-py always
     # returns bytes/text here; accept the acknowledged creation in that narrow
@@ -356,8 +367,8 @@ def claim_partition(
 def _bounded_chunk_size(chunk_size: int) -> int:
     try:
         value = int(chunk_size)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("chunk_size must be an integer") from exc
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("chunk_size must be an integer") from None
     return max(1, min(value, 1_000_000))
 
 
@@ -389,10 +400,10 @@ def claim_partition_chunks(
         total = int(r.llen(drain) or 0)
     except MonitoringPartitionError:
         raise
-    except Exception as exc:
+    except Exception:
         raise MonitoringPartitionError(
             "could not inspect claimed monitoring partition"
-        ) from exc
+        ) from None
     if total == 0:
         return None
 
@@ -401,10 +412,10 @@ def claim_partition_chunks(
         stop = min(start + size, total) - 1
         try:
             raw = r.lrange(drain, start, stop)
-        except Exception as exc:
+        except Exception:
             raise MonitoringPartitionError(
                 f"could not read monitoring claim window {start}..{stop}"
-            ) from exc
+            ) from None
         if len(raw) != stop - start + 1:
             raise MonitoringPartitionError(
                 "monitoring drain changed while its receipt was calculated"
@@ -423,10 +434,10 @@ def claim_partition_chunks(
         persisted = r.get(receipt_key)
     except MonitoringPartitionError:
         raise
-    except Exception as exc:
+    except Exception:
         raise MonitoringPartitionError(
             "could not persist bounded monitoring drain receipt"
-        ) from exc
+        ) from None
     persisted_receipt = _decode(persisted) if isinstance(persisted, (bytes, str)) else None
     if persisted_receipt is None and created:
         persisted_receipt = receipt
@@ -470,10 +481,10 @@ def iter_claimed_partition_chunks(
         persisted = r.get(receipt_key)
         total = int(r.llen(drain) or 0)
         pttl = int(r.pttl(drain))
-    except Exception as exc:
+    except Exception:
         raise MonitoringPartitionError(
             "could not reopen bounded monitoring drain claim"
-        ) from exc
+        ) from None
     if not isinstance(persisted, (bytes, str)) or _decode(persisted) != claim.receipt:
         raise MonitoringPartitionError("monitoring chunk claim receipt is no longer current")
     if total != claim.entry_count:
@@ -486,10 +497,10 @@ def iter_claimed_partition_chunks(
         stop = min(start + size, total) - 1
         try:
             raw = r.lrange(drain, start, stop)
-        except Exception as exc:
+        except Exception:
             raise MonitoringPartitionError(
                 f"could not stream monitoring claim window {start}..{stop}"
-            ) from exc
+            ) from None
         if len(raw) != stop - start + 1:
             raise MonitoringPartitionError("monitoring chunk claim changed during delivery")
         _update_receipt_hasher(digest, raw)
@@ -532,10 +543,10 @@ def acknowledge_partition(
     """
     try:
         return bool(r.eval(script, 2, drain, receipt_key, receipt))
-    except Exception as exc:
+    except Exception:
         raise MonitoringPartitionError(
             "monitoring partition acknowledgement was not confirmed"
-        ) from exc
+        ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -609,8 +620,8 @@ def list_drainable_partitions(
             out.add(MonitorPartition(organization=org, monitor_type=mt, date=dt))
     except Exception as e:  # noqa: BLE001 — best-effort discovery
         logger.warning(
-            "[monitoring.partitions] list scan failed for %s/%s: %s",
-            organization, monitor_type or "*", e,
+            "[monitoring.partitions] list scan failed; error_type=%s",
+            _safe_error_type(e),
         )
         return []
 
@@ -676,7 +687,10 @@ def drain_partition(
             date=date,
         )
     except MonitoringPartitionError as exc:
-        logger.warning("[monitoring.partitions] claim failed: %s", exc)
+        logger.warning(
+            "[monitoring.partitions] claim failed; error_type=%s",
+            _safe_error_type(exc),
+        )
         return []
     return list(claim.entries) if claim is not None else []
 
@@ -756,8 +770,8 @@ def iter_partition_chunks(
         total = int(r.llen(drain) or 0)
     except Exception as e:  # noqa: BLE001
         logger.warning(
-            "[monitoring.partitions] chunk LLEN failed for %s/%s/%s: %s",
-            organization, monitor_type, date, e,
+            "[monitoring.partitions] chunk LLEN failed; error_type=%s",
+            _safe_error_type(e),
         )
         return
 
@@ -772,9 +786,10 @@ def iter_partition_chunks(
                 raw = r.lrange(drain, start, stop)
             except Exception as e:  # noqa: BLE001
                 logger.warning(
-                    "[monitoring.partitions] chunk LRANGE [%d..%d] failed for "
-                    "%s/%s/%s: %s — leaving drain handle for retry",
-                    start, stop, organization, monitor_type, date, e,
+                    "[monitoring.partitions] chunk LRANGE [%d..%d] failed; "
+                    "error_type=%s — leaving drain handle for retry",
+                    start, stop,
+                    _safe_error_type(e),
                 )
                 return
             chunk = _parse_entries(raw)
@@ -884,8 +899,9 @@ def read_recent(
             raw = r.lrange(key, -remaining, -1)
         except Exception as e:  # noqa: BLE001
             logger.warning(
-                "[monitoring.partitions] read_recent LRANGE failed for %s: %s",
-                key, e,
+                "[monitoring.partitions] read_recent LRANGE failed; "
+                "error_type=%s",
+                _safe_error_type(e),
             )
             # Skip this day but keep walking back; partial results are
             # better than empty.

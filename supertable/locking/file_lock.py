@@ -25,6 +25,13 @@ import atexit
 from typing import Callable, Dict, List, Optional, Tuple
 
 from supertable.config.defaults import logger
+from supertable.utils.diagnostic_redaction import safe_exception_type
+
+
+def _safe_error_type(error: BaseException) -> str:
+    """Return inert, bounded exception metadata without rendering its text."""
+
+    return safe_exception_type(error)
 
 
 def _require_positive_ttl_ms(ttl_ms: object) -> int:
@@ -132,10 +139,13 @@ class FileLocking:
                 data = f.read()
                 if not data:
                     raise RuntimeError("file-lock state is empty or truncated")
+                decode_failed = False
                 try:
                     records = json.loads(data)
-                except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                    raise RuntimeError("file-lock state is not valid JSON") from exc
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    decode_failed = True
+                if decode_failed:
+                    raise RuntimeError("file-lock state is not valid JSON")
                 self._validate_records(records)
                 new_records = callback(records)
                 self._validate_records(new_records)
@@ -150,16 +160,26 @@ class FileLocking:
 
     def _read_file(self) -> List[Dict]:
         """Read records under a shared lock, failing closed on damaged state."""
-        with open(self.lock_path, "r") as f:
+        try:
+            handle = open(self.lock_path, "r")
+        except OSError as exc:
+            raise RuntimeError(
+                "file-lock read failed; "
+                f"error_type={_safe_error_type(exc)}"
+            ) from None
+        with handle as f:
             fcntl.flock(f, fcntl.LOCK_SH)
             try:
                 data = f.read()
                 if not data:
                     raise RuntimeError("file-lock state is empty or truncated")
+                decode_failed = False
                 try:
                     records = json.loads(data)
-                except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                    raise RuntimeError("file-lock state is not valid JSON") from exc
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    decode_failed = True
+                if decode_failed:
+                    raise RuntimeError("file-lock state is not valid JSON")
                 self._validate_records(records)
                 return records
             finally:
@@ -265,7 +285,10 @@ class FileLocking:
                         self._stop_heartbeat(restart_if_held=True)
                     return token
             except Exception as e:
-                logger.debug(f"[file-lock] acquire error on {key}: {e}")
+                logger.debug(
+                    "[file-lock] acquire_failed; error_type=%s",
+                    _safe_error_type(e),
+                )
 
             time.sleep(interval)
 
@@ -293,7 +316,10 @@ class FileLocking:
         try:
             self._atomic_read_write(_try_release)
         except Exception as e:
-            logger.debug(f"[file-lock] release error on {key}: {e}")
+            logger.debug(
+                "[file-lock] release_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             return False
         finally:
             if released:
@@ -351,7 +377,10 @@ class FileLocking:
                         ):
                             restart_heartbeat = True
         except Exception as e:
-            logger.debug(f"[file-lock] extend error on {key}: {e}")
+            logger.debug(
+                "[file-lock] extend_failed; error_type=%s",
+                _safe_error_type(e),
+            )
             return False
         finally:
             self._drop_lease_op_lock_reference(
@@ -543,7 +572,10 @@ class FileLocking:
 
                     self._atomic_read_write(_refresh)
                 except Exception as e:
-                    logger.debug(f"[file-lock] heartbeat error: {e}")
+                    logger.debug(
+                        "[file-lock] heartbeat_failed; error_type=%s",
+                        _safe_error_type(e),
+                    )
                     retry_delay_s = min(0.25, max(0.05, min_ttl_s / 10.0))
                     continue
                 finally:

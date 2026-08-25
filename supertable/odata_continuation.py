@@ -20,6 +20,7 @@ from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
 from typing import Any, Optional
 
+import duckdb
 from sqlglot import exp
 
 from supertable.row_identity import MAX_TABLE_ROWID, ODATA_INTERNAL_ROWID_COLUMN
@@ -38,6 +39,12 @@ _UINT64_MAX = (1 << 64) - 1
 _SIGNED_INTEGER_RE = re.compile(r"-?(?:0|[1-9][0-9]*)\Z")
 _UNSIGNED_INTEGER_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _DECIMAL_RE = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?\Z")
+_TEMPORAL_RE = re.compile(
+    r"(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})T"
+    r"(?P<clock>[0-9]{2}:[0-9]{2}:[0-9]{2})"
+    r"(?:\.(?P<fraction>[0-9]{1,9}))?"
+    r"(?P<offset>Z|[+-][0-9]{2}:[0-9]{2})?\Z"
+)
 
 
 @dataclass(frozen=True)
@@ -82,6 +89,73 @@ def _canonical_integer(raw: Any, *, signed: bool) -> int:
     return value
 
 
+def _duckdb_temporal_parameter(value_type: str, raw: Any) -> object:
+    """Validate a Core ISO timestamp and retain all nine fractional digits.
+
+    Python's :class:`datetime` is microsecond-only.  Parsing a Pandas/Arrow
+    ``timestamp[ns]`` boundary through it silently truncates the last three
+    digits and can skip or repeat an OData page.  Validate calendar/offset
+    structure with ``datetime`` but hand DuckDB the original canonical string
+    through its explicitly typed values. ``TIMESTAMP_NS`` then compares at
+    nanosecond precision; timezone-aware values use DuckDB's native
+    ``TIMESTAMPTZ`` lane (whose physical precision is defined by DuckDB).
+    """
+    if not isinstance(raw, str) or len(raw) > 64:
+        raise ValueError("OData continuation temporal value is invalid")
+    match = _TEMPORAL_RE.fullmatch(raw)
+    if match is None:
+        raise ValueError("OData continuation temporal value is invalid")
+
+    fraction = match.group("fraction") or ""
+    offset = match.group("offset")
+    if value_type == "datetime":
+        if offset is None:
+            raise ValueError("OData continuation datetime requires an offset")
+    elif offset is not None:
+        raise ValueError("OData continuation timestamp must not have an offset")
+
+    # Core emits pandas.Timestamp.isoformat().  Values exactly representable
+    # in microseconds use six digits; true nanosecond values use nine.  Keeping
+    # this canonical form prevents multiple token encodings for one boundary.
+    if fraction:
+        padded = fraction.ljust(9, "0")
+        canonical_length = 9 if int(padded[6:]) else 6
+        if len(fraction) != canonical_length:
+            raise ValueError(
+                "OData continuation temporal value is not canonical"
+            )
+
+    normalized_offset = "+00:00" if offset == "Z" else (offset or "")
+    microseconds = (fraction + "000000")[:6]
+    validation_value = (
+        f"{match.group('date')}T{match.group('clock')}"
+        f"{('.' + microseconds) if fraction else ''}{normalized_offset}"
+    )
+    try:
+        parsed = datetime.fromisoformat(validation_value)
+    except ValueError:
+        raise ValueError(
+            "OData continuation temporal value is invalid"
+        ) from None
+    if value_type == "datetime":
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("OData continuation datetime requires an offset")
+        # Offsets beyond ISO's valid range are rejected by fromisoformat.  A
+        # zero offset may use Core's ``+00:00`` or the established compact Z.
+        try:
+            return duckdb.TimestampTimeZoneValue(raw)
+        except Exception:
+            raise ValueError(
+                "OData continuation temporal value is invalid"
+            ) from None
+    if parsed.tzinfo is not None or parsed.utcoffset() is not None:
+        raise ValueError("OData continuation timestamp must not have an offset")
+    try:
+        return duckdb.TimestampNanosecondValue(raw)
+    except Exception:
+        raise ValueError("OData continuation temporal value is invalid") from None
+
+
 def _typed_value(raw: Any) -> ODataBoundaryValue:
     if not isinstance(raw, Mapping):
         raise ValueError("OData continuation value must be a mapping")
@@ -95,6 +169,7 @@ def _typed_value(raw: Any) -> ODataBoundaryValue:
 
     _exact_keys(raw, {"type", "value"}, "OData continuation value")
     value = raw.get("value")
+    converted: Any
     if value_type == "boolean":
         if type(value) is not bool:
             raise ValueError("OData continuation boolean is invalid")
@@ -121,8 +196,8 @@ def _typed_value(raw: Any) -> ODataBoundaryValue:
             raise ValueError("OData continuation decimal exceeds precision")
         try:
             converted = Decimal(value)
-        except InvalidOperation as exc:  # defensive; the regex is stricter
-            raise ValueError("OData continuation decimal is invalid") from exc
+        except InvalidOperation:  # defensive; the regex is stricter
+            raise ValueError("OData continuation decimal is invalid") from None
         if not converted.is_finite():
             raise ValueError("OData continuation decimal must be finite")
     elif value_type == "string":
@@ -137,8 +212,8 @@ def _typed_value(raw: Any) -> ODataBoundaryValue:
             raise ValueError("OData continuation binary is invalid")
         try:
             converted = base64.b64decode(value.encode("ascii"), validate=True)
-        except (UnicodeEncodeError, ValueError) as exc:
-            raise ValueError("OData continuation binary is invalid") from exc
+        except (UnicodeEncodeError, ValueError):
+            raise ValueError("OData continuation binary is invalid") from None
         if (
             len(converted) > _MAX_BINARY_BYTES
             or base64.b64encode(converted).decode("ascii") != value
@@ -149,8 +224,8 @@ def _typed_value(raw: Any) -> ODataBoundaryValue:
             raise ValueError("OData continuation date is invalid")
         try:
             converted = date.fromisoformat(value)
-        except ValueError as exc:
-            raise ValueError("OData continuation date is invalid") from exc
+        except ValueError:
+            raise ValueError("OData continuation date is invalid") from None
         if converted.isoformat() != value:
             raise ValueError("OData continuation date is not canonical")
     elif value_type == "time":
@@ -158,41 +233,19 @@ def _typed_value(raw: Any) -> ODataBoundaryValue:
             raise ValueError("OData continuation time is invalid")
         try:
             converted = time.fromisoformat(value)
-        except ValueError as exc:
-            raise ValueError("OData continuation time is invalid") from exc
+        except ValueError:
+            raise ValueError("OData continuation time is invalid") from None
         if converted.tzinfo is not None or converted.isoformat() != value:
             raise ValueError("OData continuation time is not canonical")
     elif value_type in {"datetime", "timestamp"}:
-        if not isinstance(value, str) or len(value) > 64 or "T" not in value:
-            raise ValueError("OData continuation temporal value is invalid")
-        normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
-        try:
-            converted = datetime.fromisoformat(normalized)
-        except ValueError as exc:
-            raise ValueError("OData continuation temporal value is invalid") from exc
-        if value_type == "datetime":
-            if converted.tzinfo is None or converted.utcoffset() is None:
-                raise ValueError(
-                    "OData continuation datetime requires an offset"
-                )
-        elif converted.tzinfo is not None or converted.utcoffset() is not None:
-            raise ValueError(
-                "OData continuation timestamp must not have an offset"
-            )
-        canonical = converted.isoformat()
-        if value != canonical and not (
-            value_type == "datetime"
-            and value.endswith("Z")
-            and canonical == normalized
-        ):
-            raise ValueError("OData continuation temporal value is not canonical")
+        converted = _duckdb_temporal_parameter(value_type, value)
     elif value_type == "uuid":
         if not isinstance(value, str) or len(value) != 36:
             raise ValueError("OData continuation UUID is invalid")
         try:
             converted = uuid.UUID(value)
-        except (ValueError, AttributeError) as exc:
-            raise ValueError("OData continuation UUID is invalid") from exc
+        except (ValueError, AttributeError):
+            raise ValueError("OData continuation UUID is invalid") from None
         if str(converted) != value:
             raise ValueError("OData continuation UUID is not canonical")
     else:
@@ -234,8 +287,8 @@ def validate_odata_continuation_boundary(
             separators=(",", ":"),
             allow_nan=False,
         ).encode("utf-8")
-    except (TypeError, ValueError, UnicodeError) as exc:
-        raise ValueError("OData continuation boundary is not JSON-safe") from exc
+    except (TypeError, ValueError, UnicodeError):
+        raise ValueError("OData continuation boundary is not JSON-safe") from None
     if len(encoded) > _MAX_BOUNDARY_BYTES:
         raise ValueError("OData continuation boundary exceeds its size limit")
 
@@ -310,18 +363,131 @@ def normalized_odata_order(parsed: exp.Select) -> tuple[tuple[str, str], ...]:
     return tuple(result)
 
 
+def _odata_physical_type_family(type_name: object) -> Optional[str]:
+    """Map one pinned schema spelling to the continuation scalar family."""
+    if not isinstance(type_name, str) or not type_name.strip():
+        return None
+    compact = re.sub(r"\s+", "", type_name).casefold()
+
+    if compact in {"bool", "boolean"}:
+        return "boolean"
+    if compact in {
+        "int8", "int16", "int32", "int64", "tinyint", "smallint",
+        "integer", "int", "bigint", "byte", "short", "long",
+    }:
+        return "int64"
+    if compact in {
+        "uint8", "uint16", "uint32", "uint64", "utinyint", "usmallint",
+        "uinteger", "ubigint",
+    }:
+        return "uint64"
+    if compact in {
+        "float16", "float32", "float64", "float", "real", "double",
+    }:
+        return "float64"
+    if compact.startswith(("decimal(", "decimal128(", "decimal256(")):
+        return "decimal"
+    if compact == "decimal":
+        return "decimal"
+    if compact in {"uuid"}:
+        return "uuid"
+    if compact in {
+        "string", "str", "utf8", "largeutf8", "varchar", "text",
+    } or compact.startswith(("varchar(", "char(")):
+        return "string"
+    if compact in {
+        "binary", "largebinary", "blob", "bytes",
+    } or compact.startswith(("binary(", "fixedsizebinary(", "fixed_size_binary(")):
+        return "binary"
+
+    # Check timestamps before date/time because common spellings begin with
+    # ``datetime`` or ``timestamp``. Core intentionally distinguishes naive
+    # timestamp values from offset-bearing instants.
+    if compact.startswith(("timestamp", "datetime")):
+        timezone_aware = any(token in compact for token in (
+            "timestamptz",
+            "timestampwithtimezone",
+            "timestamp_tz",
+        ))
+        for marker in ("tz=", "timezone="):
+            marker_at = compact.find(marker)
+            if marker_at < 0:
+                continue
+            timezone_value = compact[marker_at + len(marker):]
+            timezone_value = timezone_value.split(",", 1)[0]
+            timezone_value = timezone_value.rstrip("])").strip("'\"")
+            if timezone_value not in {"", "none", "null"}:
+                timezone_aware = True
+        # Pandas commonly renders aware dtypes as datetime64[ns, UTC].
+        if compact.startswith("datetime64[") and "," in compact:
+            timezone_aware = True
+        return "datetime" if timezone_aware else "timestamp"
+    if compact in {"date", "date32", "date64"}:
+        return "date"
+    if compact in {"time"} or compact.startswith(("time32[", "time64[")):
+        return "time"
+    return None
+
+
+def _odata_order_type_families(
+    parsed: exp.Select,
+    column_types: Mapping[str, object],
+) -> tuple[tuple[str, str], ...]:
+    """Resolve every direct ORDER BY column against one pinned schema."""
+    if not isinstance(column_types, Mapping):
+        raise ValueError("OData continuation physical schema is unavailable")
+    folded_types: dict[str, object] = {}
+    for raw_name, raw_type in column_types.items():
+        if not isinstance(raw_name, str) or not raw_name:
+            raise ValueError("OData continuation physical schema is invalid")
+        folded = raw_name.casefold()
+        if folded in folded_types:
+            raise ValueError("OData continuation physical schema is ambiguous")
+        folded_types[folded] = raw_type
+
+    resolved: list[tuple[str, str]] = []
+    for column, _direction in normalized_odata_order(parsed):
+        family = _odata_physical_type_family(folded_types.get(column.casefold()))
+        if family is None:
+            raise ValueError(
+                "OData continuation ORDER BY physical type is unsupported"
+            )
+        resolved.append((column, family))
+    return tuple(resolved)
+
+
+def odata_float_order_columns(
+    parsed: exp.Select,
+    column_types: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Return float order keys after fail-closed physical-schema binding."""
+    return tuple(
+        column
+        for column, family in _odata_order_type_families(parsed, column_types)
+        if family == "float64"
+    )
+
+
 def bind_odata_continuation_boundary(
     parsed: exp.Select,
     boundary: Optional[ODataContinuationBoundary],
+    *,
+    column_types: Optional[Mapping[str, object]] = None,
 ) -> Optional[ODataContinuationBoundary]:
     """Require boundary metadata to equal the reparsed SQL order tuple."""
     if boundary is None:
+        if column_types is not None:
+            _odata_order_type_families(parsed, column_types)
         return None
     if parsed.args.get("offset") is not None:
         raise ValueError("OData continuation cannot be combined with OFFSET")
     if any(isinstance(node, exp.Placeholder) for node in parsed.walk()):
         raise ValueError("OData continuation SQL cannot contain parameters")
     actual = normalized_odata_order(parsed)
+    physical_families = (
+        dict(_odata_order_type_families(parsed, column_types))
+        if column_types is not None else None
+    )
     if len(actual) != len(boundary.order):
         raise ValueError("OData continuation order count does not match SQL")
     rebound: list[ODataOrderBoundary] = []
@@ -331,6 +497,12 @@ def bind_odata_continuation_boundary(
             or actual_direction != supplied.direction
         ):
             raise ValueError("OData continuation order does not match SQL")
+        if physical_families is not None:
+            expected_type = physical_families[actual_column]
+            if supplied.value.type not in {"null", expected_type}:
+                raise ValueError(
+                    "OData continuation value type does not match ORDER BY"
+                )
         # Retain the spelling from the freshly parsed SQL, never from token
         # state, for backend identifier construction.
         rebound.append(ODataOrderBoundary(
@@ -351,5 +523,6 @@ __all__ = [
     "ODataOrderBoundary",
     "bind_odata_continuation_boundary",
     "normalized_odata_order",
+    "odata_float_order_columns",
     "validate_odata_continuation_boundary",
 ]

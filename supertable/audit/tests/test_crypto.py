@@ -10,14 +10,13 @@ Covers:
 """
 from __future__ import annotations
 
+import builtins
+import json
 from types import SimpleNamespace
 
 import pytest
 
-# cryptography is a transitive dependency we already exercise in the audit
-# pipeline; require it for these tests.
-cryptography = pytest.importorskip("cryptography")
-from cryptography.fernet import Fernet  # noqa: E402  (after importorskip)
+from cryptography.fernet import Fernet
 
 from supertable.audit import crypto
 
@@ -27,9 +26,11 @@ def reset_crypto_module_state() -> None:
     """Force every test to re-initialize the lazy module-level cache."""
     crypto._fernet_instance = None
     crypto._fernet_loaded = False
+    crypto._fernet_key = None
     yield
     crypto._fernet_instance = None
     crypto._fernet_loaded = False
+    crypto._fernet_key = None
 
 
 @pytest.fixture
@@ -77,13 +78,11 @@ class TestWithFernetKey:
         assert crypto.encrypt_field("") == ""
         assert crypto.decrypt_field("") == ""
 
-    def test_decrypt_passes_through_non_fernet_token(
+    def test_decrypt_rejects_non_fernet_token(
         self, with_fernet_key: str
     ) -> None:
-        # Legacy plaintext stored before encryption was enabled should be
-        # returned as-is rather than failing the audit reader.
         legacy = "this is not a fernet token"
-        assert crypto.decrypt_field(legacy) == legacy
+        assert crypto.decrypt_field(legacy) is None
 
     def test_is_encryption_available_true(self, with_fernet_key: str) -> None:
         assert crypto.is_encryption_available() is True
@@ -119,7 +118,7 @@ class TestLazyInit:
             "Fernet object must be cached after first load"
         )
 
-    def test_no_settings_object_falls_back_to_plaintext(
+    def test_no_settings_object_fails_closed(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Simulate import failure: deleting the attribute makes the
@@ -127,6 +126,208 @@ class TestLazyInit:
         import supertable.config.settings as settings_module
 
         monkeypatch.delattr(settings_module, "settings", raising=False)
-        assert crypto.encrypt_field("plain") == "plain"
-        assert crypto.decrypt_field("plain") == "plain"
-        assert crypto.is_encryption_available() is False
+        with pytest.raises(
+            crypto.AuditEncryptionError,
+            match="configuration is unavailable",
+        ):
+            crypto.encrypt_field("plain")
+
+
+class TestConfiguredEncryptionFailures:
+    def test_missing_cryptography_dependency_fails_closed(
+        self,
+        with_fernet_key: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        real_import = builtins.__import__
+
+        def missing_cryptography(name, *args, **kwargs):
+            if name == "cryptography.fernet":
+                raise ImportError("simulated missing cryptography")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", missing_cryptography)
+
+        with pytest.raises(
+            crypto.AuditEncryptionError,
+            match="cryptography is required",
+        ):
+            crypto.protect_sensitive_detail(
+                {"sql": "must-not-be-returned-as-plaintext"},
+                action="query_execute",
+            )
+        assert crypto._fernet_loaded is False
+
+    def test_invalid_configured_key_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import supertable.config.settings as settings_module
+
+        monkeypatch.setattr(
+            settings_module,
+            "settings",
+            SimpleNamespace(SUPERTABLE_AUDIT_FERNET_KEY="not-a-fernet-key"),
+            raising=True,
+        )
+
+        with pytest.raises(
+            crypto.AuditEncryptionError,
+            match="failed to initialize configured audit encryption",
+        ):
+            crypto.encrypt_field("must-not-be-returned-as-plaintext")
+        assert crypto._fernet_loaded is False
+
+    def test_runtime_encryption_error_fails_closed(
+        self, with_fernet_key: str
+    ) -> None:
+        class BrokenFernet:
+            def encrypt(self, _value: bytes) -> bytes:
+                raise RuntimeError("simulated encryption failure")
+
+        crypto._fernet_instance = BrokenFernet()
+        crypto._fernet_loaded = True
+        crypto._fernet_key = with_fernet_key
+
+        with pytest.raises(
+            crypto.AuditEncryptionError,
+            match="configured audit encryption failed",
+        ):
+            crypto.encrypt_field("must-not-be-returned-as-plaintext")
+
+
+class TestDetailProtectionBudgets:
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            [{"sql": "SELECT list_secret"}],
+            ({"statement": "DELETE tuple_secret"},),
+            '[{"nested":{"query_text":"SELECT json_array_secret"}}]',
+        ],
+    )
+    def test_root_containers_protect_nested_sensitive_fields(
+        self,
+        without_fernet_key: None,
+        detail: object,
+    ) -> None:
+        protected = crypto.protect_sensitive_detail(
+            detail, action="data_write",
+        )
+        rendered = json.dumps(protected, default=str)
+        assert "list_secret" not in rendered
+        assert "tuple_secret" not in rendered
+        assert "json_array_secret" not in rendered
+        assert "_redacted" in rendered
+
+    @pytest.mark.parametrize(
+        "reserved_name",
+        [
+            "sql_encrypted",
+            "SQL_SHA256",
+            "query_text_redacted",
+            "statement_encrypted",
+        ],
+    )
+    def test_reserved_output_names_are_rejected_without_raw_field(
+        self,
+        without_fernet_key: None,
+        reserved_name: str,
+    ) -> None:
+        with pytest.raises(
+            crypto.AuditEncryptionError,
+            match="reserved sensitive-field output names",
+        ):
+            crypto.protect_sensitive_detail(
+                {"nested": {reserved_name: "plaintext masquerade"}},
+                action="data_write",
+            )
+
+    def test_container_item_limit_fails_before_transformation(
+        self, without_fernet_key: None
+    ) -> None:
+        with pytest.raises(
+            crypto.AuditEncryptionError,
+            match="container item limit",
+        ):
+            crypto.protect_sensitive_detail(
+                {"items": list(range(crypto._MAX_DETAIL_CONTAINER_ITEMS + 1))},
+                action="data_write",
+            )
+
+    def test_node_limit_fails_before_transformation(
+        self, without_fernet_key: None
+    ) -> None:
+        payload = {
+            f"group_{index}": [1, 2, 3, 4]
+            for index in range(crypto._MAX_DETAIL_CONTAINER_ITEMS)
+        }
+        with pytest.raises(
+            crypto.AuditEncryptionError,
+            match="structural node limit",
+        ):
+            crypto.protect_sensitive_detail(payload, action="data_write")
+
+    def test_string_byte_limit_fails_before_encryption(
+        self, without_fernet_key: None
+    ) -> None:
+        with pytest.raises(
+            crypto.AuditEncryptionError,
+            match="string byte limit",
+        ):
+            crypto.protect_sensitive_detail(
+                "x" * (crypto._MAX_DETAIL_STRING_BYTES + 1),
+                action="query_execute",
+            )
+
+    def test_total_serialized_byte_limit_rejects_many_valid_strings(
+        self, without_fernet_key: None
+    ) -> None:
+        payload = {
+            "one": "x" * 24_000,
+            "two": "y" * 24_000,
+            "three": "z" * 24_000,
+        }
+        with pytest.raises(
+            crypto.AuditEncryptionError,
+            match="byte limit",
+        ):
+            crypto.protect_sensitive_detail(payload, action="data_write")
+
+    @pytest.mark.parametrize(
+        "value, message",
+        [
+            (1 << (crypto._MAX_DETAIL_INTEGER_BITS + 1), "numeric limit"),
+            (float("nan"), "non-finite"),
+            (float("inf"), "non-finite"),
+        ],
+    )
+    def test_numeric_limits_fail_before_serialization(
+        self,
+        without_fernet_key: None,
+        value: object,
+        message: str,
+    ) -> None:
+        with pytest.raises(crypto.AuditEncryptionError, match=message):
+            crypto.protect_sensitive_detail(
+                {"value": value}, action="data_write",
+            )
+
+    def test_configured_key_change_replaces_cached_fernet(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import supertable.config.settings as settings_module
+
+        key_one = Fernet.generate_key().decode("utf-8")
+        key_two = Fernet.generate_key().decode("utf-8")
+        mutable_settings = SimpleNamespace(
+            SUPERTABLE_AUDIT_FERNET_KEY=key_one,
+        )
+        monkeypatch.setattr(
+            settings_module, "settings", mutable_settings, raising=True,
+        )
+        first = crypto.encrypt_field("first")
+        mutable_settings.SUPERTABLE_AUDIT_FERNET_KEY = key_two
+        second = crypto.encrypt_field("second")
+
+        assert Fernet(key_one.encode()).decrypt(first.encode()) == b"first"
+        assert Fernet(key_two.encode()).decrypt(second.encode()) == b"second"
+        assert crypto.decrypt_field(first) is None

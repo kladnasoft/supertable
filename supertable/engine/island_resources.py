@@ -880,7 +880,7 @@ class ByteBoundedArrowBatchIterator(Iterator[pa.RecordBatch]):
                 self.close()
                 raise TypeError(
                     "Arrow batch producer yielded "
-                    f"{type(self._pending).__name__}, not RecordBatch"
+                    "an unexpected value, not RecordBatch"
                 )
             if not self._pending.schema.equals(
                 self.schema, check_metadata=False,
@@ -1023,7 +1023,9 @@ class ArrowBatchStream(Iterator[pa.RecordBatch]):
             raise StopIteration
         if not isinstance(batch, pa.RecordBatch):
             self.close()
-            raise TypeError(f"result producer yielded {type(batch).__name__}, not RecordBatch")
+            raise TypeError(
+                "result producer yielded an unexpected value, not RecordBatch"
+            )
         if not batch.schema.equals(self.schema, check_metadata=False):
             self.close()
             raise ValueError("result batch schema changed during execution")

@@ -1,10 +1,12 @@
 """Failure- and retry-focused tests for the durable privileged audit outbox."""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
 import threading
+import traceback
 from pathlib import Path
 
 import fakeredis
@@ -432,9 +434,26 @@ class FakeStorage:
         self.files[path] = payload
 
     def read_bytes(self, path):
+        raise AssertionError("privileged archives must not use unbounded reads")
+
+    def stat_object(self, path):
+        from supertable.storage.storage_interface import ObjectMetadata
+
+        payload = self.files[path]
+        return ObjectMetadata(
+            size=len(payload),
+            checksum_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+    def download_to_file(
+        self, path, file_obj, *, expected=None, chunk_size=1024 * 1024,
+    ):
         if self.failures:
             raise self.failures.pop(0)
-        return self.files[path]
+        payload = self.files[path]
+        for offset in range(0, len(payload), chunk_size):
+            file_obj.write(payload[offset:offset + chunk_size])
+        return len(payload)
 
     def size(self, path):
         return len(self.files[path])
@@ -477,8 +496,56 @@ def test_query_decodes_event_json_and_distinguishes_empty_from_backend_failure(b
     backend.entries = []
     assert outbox.query() == []
     backend.fail_once("xrevrange", ConnectionError("redis unavailable"))
-    with pytest.raises(OutboxBackendError, match="redis unavailable"):
+    with pytest.raises(OutboxBackendError, match="error_type=ConnectionError"):
         outbox.query()
+
+
+def test_backend_failure_never_exposes_or_retains_secret_diagnostics(
+    backend,
+    outbox,
+):
+    secret = (
+        "redis://admin:never-log@example.test/0?access_token=never-log "
+        "SELECT * FROM confidential_customer"
+    )
+    original = ConnectionError(secret)
+    backend.fail_once("xrevrange", original)
+
+    with pytest.raises(OutboxBackendError) as caught:
+        outbox.query()
+
+    error = caught.value
+    rendered = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__)
+    )
+    assert error.cause_type == "ConnectionError"
+    assert error.cause is not original
+    assert error.__suppress_context__ is True
+    assert secret not in str(error)
+    assert secret not in str(error.cause)
+    assert secret not in rendered
+
+
+def test_poisoned_stream_metadata_is_rejected_without_echoing_content(
+    backend,
+    outbox,
+):
+    secret = "s3://admin:never-log@example.test/private/customer-token"
+    raw_id, fields = _raw("1-0")
+    fields.pop(b"payload_hash")
+    fields[secret.encode()] = b"poisoned"
+    backend.entries = [(raw_id, fields)]
+
+    with pytest.raises(OutboxRecordError) as caught:
+        outbox.query()
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value), caught.value, caught.value.__traceback__,
+        )
+    )
+    assert secret not in str(caught.value)
+    assert secret not in rendered
 
 
 @pytest.mark.parametrize(
@@ -707,7 +774,7 @@ def test_archive_is_verified_marked_and_idempotent_across_ack_retry(backend):
     entry = _source_entry(backend, outbox)
     backend.fail_once("xack", ConnectionError("ack interrupted"))
 
-    with pytest.raises(OutboxBackendError, match="ack interrupted"):
+    with pytest.raises(OutboxBackendError, match="error_type=ConnectionError"):
         outbox.archive_batch("acme", "archive", [entry])
     assert len(writer.storage.writes) == 2
     batch_id = outbox.batch_id("acme", [entry])
@@ -770,7 +837,7 @@ def test_role_delete_archive_requires_and_round_trips_exact_cascade_sidecar(
         "name": "archive", "pending": 0, "last-delivered-id": "2-0",
     }]
     backend.fail_once("eval", ConnectionError("atomic trim interrupted"))
-    with pytest.raises(OutboxBackendError, match="atomic trim interrupted"):
+    with pytest.raises(OutboxBackendError, match="error_type=ConnectionError"):
         outbox.trim_delivered("archive", through_id="2-0")
     assert manifest_key in backend.hashes
     assert [entry[0] for entry in backend.entries] == [b"1-0", b"2-0"]
@@ -968,7 +1035,7 @@ def test_archive_verification_failure_retries_verification_without_rewriting(bac
     )
     entry = _source_entry(backend, outbox)
 
-    with pytest.raises(OutboxBackendError, match="storage read unavailable"):
+    with pytest.raises(OutboxBackendError, match="error_type=ConnectionError"):
         outbox.archive_batch("acme", "archive", [entry])
     assert len(writer.storage.writes) == 1
 
@@ -985,7 +1052,7 @@ def test_storage_write_failure_leaves_retryable_deterministic_claim(backend):
     )
     entry = _source_entry(backend, outbox)
 
-    with pytest.raises(OutboxBackendError, match="storage write failed"):
+    with pytest.raises(OutboxBackendError, match="error_type=OSError"):
         outbox.archive_batch("acme", "archive", [entry])
     retried = outbox.archive_batch("acme", "archive", [entry])
     assert retried.reused is True
@@ -1001,7 +1068,7 @@ def test_headless_first_batch_claim_is_recoverable_but_not_reported_empty(backen
     )
     entry = _source_entry(backend, outbox)
 
-    with pytest.raises(OutboxBackendError, match="storage write failed"):
+    with pytest.raises(OutboxBackendError, match="error_type=OSError"):
         outbox.archive_batch("acme", "archive", [entry])
     assert outbox._ARCHIVE_HEAD_FIELD not in backend.hashes[LEDGER]
     assert set(backend.hashes[LEDGER]) == {
@@ -1026,7 +1093,7 @@ def test_headless_written_verified_first_batch_is_recoverable(backend):
     # Claim, writing->written_verified CAS, then fail the final head/marker CAS.
     backend.fail_eval_call(3, ConnectionError("finalize interrupted"))
 
-    with pytest.raises(OutboxBackendError, match="finalize interrupted"):
+    with pytest.raises(OutboxBackendError, match="error_type=ConnectionError"):
         outbox.archive_batch("acme", "archive", [entry])
     batch_id = outbox.batch_id("acme", [entry])
     assert json.loads(backend.hashes[LEDGER][f"batch:{batch_id}"])[
@@ -1049,7 +1116,7 @@ def test_tampered_headless_writing_artifact_claim_is_integrity_failure(backend):
     )
     entry = _source_entry(backend, outbox)
 
-    with pytest.raises(OutboxBackendError, match="storage write failed"):
+    with pytest.raises(OutboxBackendError, match="error_type=OSError"):
         outbox.archive_batch("acme", "archive", [entry])
     batch_id = outbox.batch_id("acme", [entry])
     field = f"batch:{batch_id}"
@@ -1098,7 +1165,7 @@ def test_redis_claim_failure_prevents_archive_write(backend):
     entry = _source_entry(backend, outbox)
     backend.fail_once("eval", ConnectionError("ledger unavailable"))
 
-    with pytest.raises(OutboxBackendError, match="ledger unavailable"):
+    with pytest.raises(OutboxBackendError, match="error_type=ConnectionError"):
         outbox.archive_batch("acme", "archive", [entry])
     assert writer.storage.writes == []
 
@@ -1111,7 +1178,7 @@ def test_ledger_update_failure_reconciles_same_archive_path_without_duplicate_wr
     entry = _source_entry(backend, outbox)
     backend.fail_eval_call(2, ConnectionError("ledger update interrupted"))
 
-    with pytest.raises(OutboxBackendError, match="ledger update interrupted"):
+    with pytest.raises(OutboxBackendError, match="error_type=ConnectionError"):
         outbox.archive_batch("acme", "archive", [entry])
     assert len(writer.storage.writes) == 2
 
@@ -1169,7 +1236,7 @@ def test_trim_refuses_pending_unmarked_or_overlarge_ranges(backend, outbox):
 def test_trim_backend_failure_is_never_reported_as_zero(backend, outbox):
     backend.groups = [{"name": "archive", "pending": 0, "last-delivered-id": "2-0"}]
     backend.fail_once("xrange", ConnectionError("range unavailable"))
-    with pytest.raises(OutboxBackendError, match="range unavailable"):
+    with pytest.raises(OutboxBackendError, match="error_type=ConnectionError"):
         outbox.trim_delivered("archive", through_id="2-0")
 
 
@@ -1180,7 +1247,7 @@ def test_health_distinguishes_missing_stream_from_backend_failure(backend, outbo
     assert health.stream_exists is False
 
     backend.fail_once("ping", ConnectionError("redis unavailable"))
-    with pytest.raises(OutboxBackendError, match="redis unavailable"):
+    with pytest.raises(OutboxBackendError, match="error_type=ConnectionError"):
         outbox.health()
 
 
@@ -1266,7 +1333,7 @@ def test_local_atomic_archive_retry_survives_interrupted_replace(
         raise OSError("replace acknowledgement interrupted")
 
     monkeypatch.setattr(os, "replace", replace_then_interrupt)
-    with pytest.raises(OutboxBackendError, match="replace acknowledgement interrupted"):
+    with pytest.raises(OutboxBackendError, match="error_type=OSError"):
         outbox.archive_batch("acme", "archive", [entry])
 
     batch_id = outbox.batch_id("acme", [entry])
@@ -1379,7 +1446,7 @@ def test_ack_failure_recovery_never_merges_delivered_and_fresh_batches(backend):
     backend.entries = [raw_one]
     first = outbox._decode_entry(raw_one)
     backend.fail_once("xack", ConnectionError("ack response lost"))
-    with pytest.raises(OutboxBackendError, match="ack response lost"):
+    with pytest.raises(OutboxBackendError, match="error_type=ConnectionError"):
         outbox.archive_batch("acme", "archive", [first])
 
     raw_two = _raw("2-0", _event("two").with_ledger_sequence(2))
@@ -1490,7 +1557,7 @@ def test_archive_claim_and_membership_are_atomic_on_redis_failure(backend):
     entry = _source_entry(backend, outbox)
     backend.fail_once("eval", ConnectionError("claim interrupted"))
 
-    with pytest.raises(OutboxBackendError, match="claim interrupted"):
+    with pytest.raises(OutboxBackendError, match="error_type=ConnectionError"):
         outbox.archive_batch("acme", "archive", [entry])
 
     assert LEDGER not in backend.hashes
@@ -1623,7 +1690,7 @@ def test_trim_cas_rejects_delivery_marker_changed_after_verification():
         "name": "archive", "pending": 0, "last-delivered-id": "2-0",
     }]
 
-    with pytest.raises(OutboxBackendError, match="metadata changed"):
+    with pytest.raises(OutboxBackendError, match="error_type=RuntimeError"):
         outbox.trim_delivered("archive", through_id="2-0")
 
     assert [item[0] for item in backend.entries] == [b"1-0", b"2-0"]
@@ -1802,7 +1869,7 @@ def test_existing_local_archive_retry_propagates_directory_fsync_failure(
     monkeypatch.setattr(
         LocalStorage, "_fsync_directory", staticmethod(fail_directory_fsync),
     )
-    with pytest.raises(OutboxBackendError, match="directory fsync failed"):
+    with pytest.raises(OutboxBackendError, match="error_type=OSError"):
         outbox.archive_batch("acme", "archive", [entry])
     assert backend.acks == []
     archive_path = tmp_path / outbox._archive_path(
@@ -1811,7 +1878,7 @@ def test_existing_local_archive_retry_propagates_directory_fsync_failure(
     assert archive_path.is_file()
 
     # The visible existing-object retry must try to establish durability again.
-    with pytest.raises(OutboxBackendError, match="directory fsync failed"):
+    with pytest.raises(OutboxBackendError, match="error_type=OSError"):
         outbox.archive_batch("acme", "archive", [entry])
     assert backend.acks == []
 

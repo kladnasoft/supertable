@@ -24,6 +24,7 @@ from supertable.engine.duckdb_engine import (
     DuckDB,
     _DuckDBArrowBatchIterator,
     _harden_user_query_connection,
+    _redact_duckdb_backend_message,
 )
 from supertable.engine.engine_common import (
     configure_httpfs_and_s3,
@@ -423,6 +424,24 @@ def test_query_connection_disables_secret_and_extension_escape_hatches():
         con.close()
 
 
+def test_httpfs_load_fails_closed_when_auto_download_cannot_be_disabled():
+    con = MagicMock()
+
+    def execute(statement, *_args, **_kwargs):
+        if statement == "SET autoinstall_known_extensions=false;":
+            raise RuntimeError("unsupported setting")
+        raise AssertionError("httpfs LOAD ran without the required policy fence")
+
+    con.execute.side_effect = execute
+
+    with pytest.raises(RuntimeError, match="auto-download policy"):
+        configure_httpfs_and_s3(
+            con, ["https://example.test/object.parquet"],
+        )
+
+    assert con.execute.call_count == 1
+
+
 @pytest.mark.parametrize(
     "predicate",
     [
@@ -504,6 +523,22 @@ def test_explain_analyze_rejected_without_returning_local_source_path(tmp_path):
         )
     assert str(source) not in str(exc_info.value)
     assert not (tmp_path / "profile.json").exists()
+
+
+def test_explain_options_cannot_inject_additional_statements(tmp_path):
+    _source, reflection = _local_reflection(tmp_path)
+    with pytest.raises(ValueError, match="EXPLAIN options"):
+        DuckDB().execute(
+            reflection,
+            SQLParser("lake", "SELECT id FROM lake.cards", "duckdb"),
+            SimpleNamespace(
+                temp_dir=str(tmp_path),
+                query_plan_path=str(tmp_path / "profile.json"),
+            ),
+            lambda _event: None,
+            explain=True,
+            explain_options="SELECT 1; CREATE TABLE injected(x INTEGER); --",
+        )
 
 
 def test_plain_explain_rejects_signed_source_without_returning_bearer_url(tmp_path):
@@ -653,7 +688,31 @@ def test_public_error_redaction_removes_url_userinfo_query_and_fragment():
     assert "password" not in redacted
     assert "bearer-token" not in redacted
     assert "fragment" not in redacted
-    assert "example.test/path/data.parquet" in redacted
+    assert "/path/data.parquet" not in redacted
+    assert "data.parquet" not in redacted
+    assert "https://example.test/<redacted-path>" in redacted
+
+
+@pytest.mark.parametrize(
+    "backend_detail, secret",
+    [
+        ("Authorization: Bearer DUCK_AUTH_SECRET", "DUCK_AUTH_SECRET"),
+        ("Cookie: session=DUCK_COOKIE_SECRET", "DUCK_COOKIE_SECRET"),
+        ("X-Api-Key: DUCK_API_SECRET", "DUCK_API_SECRET"),
+        ('{"access_token":"DUCK_BODY_SECRET"}', "DUCK_BODY_SECRET"),
+    ],
+)
+def test_duckdb_backend_diagnostic_never_preserves_arbitrary_prose(
+    backend_detail, secret,
+):
+    rendered = _redact_duckdb_backend_message(RuntimeError(backend_detail))
+
+    assert secret not in rendered
+    assert backend_detail not in rendered
+    assert rendered.startswith("DuckDB backend diagnostic redacted;")
+    assert "error_type=RuntimeError" in rendered
+    assert "diagnostic_id=" in rendered
+    assert "diagnostic_bytes=" in rendered
 
 
 def _exception_chain_messages(exc):
@@ -713,7 +772,9 @@ def test_direct_duckdb_executor_redacts_backend_url_and_secret_causes(
                 lambda _event: None,
             )
         public_chain = _exception_chain_messages(exc_info.value)
-        assert str(exc_info.value) == "DuckDB managed query setup failed"
+        assert str(exc_info.value).startswith("DuckDB managed query setup failed;")
+        assert "error_type=IOException" in str(exc_info.value)
+        assert "diagnostic_id=" in str(exc_info.value)
         for secret in (
             "alice", "password", "signature", "bearer-token", "fragment",
             "deep-cause-secret", "echoed-token",
@@ -751,7 +812,9 @@ def test_late_duckdb_stream_error_uses_same_safe_boundary():
     with pytest.raises(RuntimeError) as exc_info:
         next(iterator)
     public_chain = _exception_chain_messages(exc_info.value)
-    assert str(exc_info.value) == "DuckDB result stream failed"
+    assert str(exc_info.value).startswith("DuckDB result stream failed;")
+    assert "error_type=RuntimeError" in str(exc_info.value)
+    assert "diagnostic_id=" in str(exc_info.value)
     for secret in (
         "user", "pass", "token", "stream-secret",
         "example.test/part.parquet",
@@ -776,4 +839,4 @@ def test_data_reader_returns_clean_status_for_function_policy_rejection(monkeypa
     )
     assert frame.empty
     assert status is Status.ERROR
-    assert "current_setting" in message
+    assert message == "Query is invalid or unsupported"

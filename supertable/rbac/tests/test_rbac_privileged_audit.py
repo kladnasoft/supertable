@@ -353,6 +353,20 @@ def test_auth_token_create_delete_and_no_change_are_durable_and_typed(
     ) == "2"
 
 
+def test_auth_token_rejects_coercible_boolean_and_expiry_types(
+    catalog: RedisCatalog,
+) -> None:
+    context = next(_contexts())
+    with pytest.raises(ValueError, match="enabled"):
+        catalog.create_auth_token(
+            ORG, "security.admin", enabled="false", action_context=context,
+        )
+    with pytest.raises(ValueError, match="expires_ms"):
+        catalog.create_auth_token(
+            ORG, "security.admin", expires_ms="123", action_context=next(_contexts()),
+        )
+
+
 def test_auth_token_mutation_requires_context_and_fails_closed_with_audit_down(
     catalog: RedisCatalog,
 ) -> None:

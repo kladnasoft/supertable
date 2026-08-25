@@ -15,6 +15,8 @@ real Parquet I/O.
 from __future__ import annotations
 
 import os
+import logging
+import traceback
 from unittest.mock import MagicMock, call, patch
 
 import polars as pl
@@ -92,6 +94,26 @@ def _dv_frame(n_rows: int, file: str = "a"):
         {"__file__": [file] * n_rows, "__rowid__": list(range(1, n_rows + 1))},
         schema={"__file__": pl.Utf8, "__rowid__": pl.Int64},
     )
+
+
+def test_compact_schema_fallback_log_never_exposes_storage_text(caplog):
+    secret = (
+        "COMPACTION_SCHEMA_SECRET_72fd "
+        "https://bucket.invalid/object?X-Amz-Signature=BEARER_TOKEN"
+    )
+    writer = _build_writer()
+    writer.super_table.storage.read_parquet.side_effect = OSError(secret)
+    caplog.set_level(logging.DEBUG)
+
+    result = writer._build_compact_model_df(
+        [{"file": secret}],
+        {},
+    )
+
+    assert result.is_empty()
+    assert secret not in caplog.text
+    assert "BEARER_TOKEN" not in caplog.text
+    assert "error_type=OSError" in caplog.text
 
 
 def _mk_simple_mock(snap: dict, *, snap_path: str = "/snap/v1.json",
@@ -222,6 +244,63 @@ class TestAccessAndLock:
             role_name="admin", table_name="tbl",
         )
         assert mock_check_write.call_args_list == [expected, expected]
+
+    @patch(_P_AUDIT)
+    @patch(_P_MON_WRITER)
+    @patch(_P_MIRROR)
+    @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
+    @patch(_P_COMPACT_TOMB, return_value=(0, [], set()))
+    @patch(_P_SETTINGS, new_callable=_stub_settings)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
+    def test_stable_authority_generation_reuses_full_compaction_check(
+        self, mock_check_write, MockSimple, mock_settings,
+        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+        monkeypatch,
+    ):
+        dw = _build_writer()
+        MockSimple.return_value = _mk_simple_mock(_snapshot([]))
+        dw._get_table_config = MagicMock(return_value={})
+        generation = ("roles-4", "users-7", "root-2")
+        sample = MagicMock(return_value=generation)
+        validate = MagicMock(return_value=True)
+        monkeypatch.setattr(
+            type(dw.catalog), "sample_write_authority_generation",
+            lambda self, *args: sample(*args), raising=False,
+        )
+        monkeypatch.setattr(
+            type(dw.catalog), "validate_write_authority_generation",
+            lambda self, *args: validate(*args), raising=False,
+        )
+
+        dw.compact("admin", "tbl")
+
+        assert mock_check_write.call_count == 1
+        assert sample.call_count == 1
+        assert validate.call_count == 2
+        assert all(call_.args[-1] == generation for call_ in validate.call_args_list)
+
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
+    def test_continuous_authority_churn_blocks_compaction_before_lock(
+        self, mock_check_write, MockSimple, monkeypatch,
+    ):
+        dw = _build_writer()
+        monkeypatch.setattr(
+            type(dw.catalog), "sample_write_authority_generation",
+            lambda *_args: object(), raising=False,
+        )
+        monkeypatch.setattr(
+            type(dw.catalog), "validate_write_authority_generation",
+            lambda *_args: False, raising=False,
+        )
+
+        with pytest.raises(PermissionError, match="changed continuously"):
+            dw.compact("admin", "tbl")
+
+        assert mock_check_write.call_count == 3
+        dw.catalog.acquire_simple_lock.assert_not_called()
+        MockSimple.assert_not_called()
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)
@@ -862,13 +941,52 @@ class TestSnapshotCommit:
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
+    def test_audit_encryption_failure_is_explicit_after_snapshot_commit(
+        self, mock_check_write, MockSimple, mock_settings,
+        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+    ):
+        from supertable.audit import AuditEncryptionError
+
+        dw = _build_writer()
+        snap = _snapshot([_resource("a"), _resource("b")])
+        MockSimple.return_value = _mk_simple_mock(snap)
+        mock_compact_res.return_value = (
+            2,
+            200,
+            [{"file": "c", "file_size": 1, "columns": []}],
+            {"a", "b"},
+        )
+        dw._get_table_config = MagicMock(return_value={})
+        failure = AuditEncryptionError("configured encryption unavailable")
+        mock_audit.side_effect = failure
+
+        with pytest.raises(AuditEncryptionError) as raised:
+            dw.compact("admin", "tbl")
+
+        assert raised.value is failure
+        dw.catalog.commit_snapshot_mock.assert_called_once()
+        dw.catalog.release_simple_lock.assert_called_once()
+
+    @patch(_P_AUDIT)
+    @patch(_P_MON_WRITER)
+    @patch(_P_MIRROR)
+    @patch(_P_COMPACT_RES)
+    @patch(_P_COMPACT_TOMB, return_value=(0, [], set()))
+    @patch(_P_SETTINGS, new_callable=_stub_settings)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
     def test_mirror_failure_reports_committed_compaction_and_releases_lock(
         self, mock_check_write, MockSimple, mock_settings,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+        caplog,
     ):
         """Mirror failure is not success, but cannot roll back the core commit."""
         from supertable.mirroring.mirror_formats import MirrorPublicationError
 
+        secret = (
+            "MIRROR_COMPACT_SECRET_4d90 "
+            "https://bucket.invalid/object?X-Goog-Signature=BEARER_TOKEN"
+        )
         dw = _build_writer()
         dw.catalog._mirrors = ["PARQUET"]
         snap = _snapshot([_resource("a"), _resource("b")])
@@ -880,7 +998,8 @@ class TestSnapshotCommit:
             [{"file": "c.parquet", "file_size": 5000, "columns": [{"name": "id"}]}],
             {"a", "b"},
         )
-        MockMirror.mirror_if_enabled.side_effect = OSError("mirror unavailable")
+        cause = OSError(secret)
+        MockMirror.mirror_if_enabled.side_effect = cause
         dw._get_table_config = MagicMock(return_value={})
 
         with pytest.raises(MirrorPublicationError) as raised:
@@ -891,7 +1010,12 @@ class TestSnapshotCommit:
         assert error.snapshot_path == "/snap/v2.json"
         assert error.mirrors == ("PARQUET",)
         assert error.core_result["files_after"] == 1
-        assert isinstance(error.__cause__, OSError)
+        assert error.cause is cause
+        assert error.__cause__ is None
+        assert secret not in str(error)
+        assert secret not in caplog.text
+        assert secret not in repr(MockMW.mock_calls)
+        assert secret not in repr(mock_audit.call_args_list)
         dw.catalog.commit_snapshot_mock.assert_called_once()
         dw.catalog.release_simple_lock.assert_called_once()
         mock_audit.assert_called_once()
@@ -1199,8 +1323,12 @@ class TestMonitoring:
         mock_compact_res.return_value = (
             1, 100, [{"file": "c", "file_size": 1, "columns": []}], {"a"},
         )
+        secret = (
+            "/private/spool/TOP-SECRET "
+            "https://host/capability/TOP-SECRET?sig=sentinel"
+        )
         mock_mon = MagicMock()
-        mock_mon.log_metric.side_effect = MonitoringBackpressureError("spool full")
+        mock_mon.log_metric.side_effect = MonitoringBackpressureError(secret)
         MockMW.return_value.__enter__.return_value = mock_mon
         dw._get_table_config = MagicMock(return_value={})
 
@@ -1210,6 +1338,14 @@ class TestMonitoring:
         assert raised.value.core_committed is True
         assert raised.value.operation == "compact"
         assert raised.value.core_result["files_after"] == 1
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+        assert secret not in str(raised.value)
+        assert secret not in str(raised.value.cause)
+        rendered = "".join(traceback.format_exception(
+            type(raised.value), raised.value, raised.value.__traceback__,
+        ))
+        assert secret not in rendered
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)

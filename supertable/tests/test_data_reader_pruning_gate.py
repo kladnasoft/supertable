@@ -164,6 +164,7 @@ def test_disabled_pruning_skips_predicate_and_join_analysis(monkeypatch):
         predicate_constraints={},
         join_edges=[],
         join_pruning_lanes={"numeric", "date", "timestamp", "timestamptz"},
+        require_odata_identity=False,
         plan_stats=plan_stats,
     )
     estimator.estimate.assert_called_once_with()

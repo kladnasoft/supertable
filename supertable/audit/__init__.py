@@ -39,9 +39,11 @@ Compliance: DORA (Regulation 2022/2554), SOC 2 Type II.
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Optional
 
+from supertable.audit.diagnostics import safe_audit_error_type
 from supertable.audit.events import (
     AuditEvent,
     EventCategory,
@@ -52,8 +54,15 @@ from supertable.audit.events import (
     make_detail,
 )
 from supertable.audit.logger import (
+    AuditLogger,
+    NullAuditLogger,
+    _PROTECTED_EVENT_CAPABILITY,
     get_audit_logger,
     shutdown_all,
+)
+from supertable.audit.crypto import (
+    AuditEncryptionError,
+    protect_sensitive_detail,
 )
 from supertable.audit.privileged import (
     PrivilegedActionContext,
@@ -82,6 +91,7 @@ __all__ = [
     "ActorType",
     "Actions",
     "make_detail",
+    "AuditEncryptionError",
     "PrivilegedActionContext",
     "PrivilegedAuditRecord",
     "PrivilegedAuditOutbox",
@@ -139,7 +149,7 @@ def emit(
     actor_user_agent: str = "",
     resource_type: str = "",
     resource_id: str = "",
-    detail: str | dict | None = None,
+    detail: str | dict | list | tuple | None = None,
     outcome: str = Outcome.SUCCESS,
     reason: str = "",
     severity: str = Severity.INFO,
@@ -159,10 +169,40 @@ def emit(
     if not organization:
         return
 
+    # Resolve event admission before touching detail. Disabled auditing and a
+    # disabled query lane must have zero payload-protection work and cannot be
+    # made to fail by encryption policy that is irrelevant to the suppressed
+    # event.
+    try:
+        audit_logger = get_audit_logger(organization, action=action)
+    except AuditEncryptionError:
+        raise
+    except Exception as exc:
+        logger.error(
+            "[audit] logger resolution failed: %s",
+            safe_audit_error_type(exc),
+        )
+        return
+    if isinstance(audit_logger, NullAuditLogger):
+        return
+
+    # Protect reversible SQL/query text before the event can enter any queue,
+    # log, webhook, Redis stream, or Parquet object.  Configured encryption
+    # errors intentionally propagate so callers cannot continue under a false
+    # assumption that sensitive audit fields were protected.
+    detail = protect_sensitive_detail(detail, action=action)
+
     # Serialize detail dict if needed
     detail_str = ""
     if isinstance(detail, dict):
         detail_str = make_detail(**detail)
+    elif isinstance(detail, list):
+        detail_str = json.dumps(
+            detail,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
     elif isinstance(detail, str):
         detail_str = detail
     elif detail is not None:
@@ -193,17 +233,26 @@ def emit(
     )
 
     try:
-        audit_logger = get_audit_logger(organization)
-        audit_logger.emit(event)
+        if isinstance(audit_logger, AuditLogger):
+            audit_logger._enqueue_protected(
+                event,
+                capability=_PROTECTED_EVENT_CAPABILITY,
+            )
+        else:
+            # Test doubles and compatibility adapters receive only the already
+            # protected immutable event; production loggers use the capability
+            # path above to avoid a second pass that would confuse trusted
+            # generated output names with caller-supplied masquerades.
+            audit_logger.emit(event)
+    except AuditEncryptionError:
+        raise
     except Exception as exc:
         # Audit backends can surface connection strings or record contents in
         # exception messages.  Keep diagnostics useful without copying those
         # messages into the application log.
         logger.error(
-            "[audit] emit failed: %s — event: %s/%s",
-            type(exc).__name__,
-            category,
-            action,
+            "[audit] emit failed: %s",
+            safe_audit_error_type(exc),
         )
 
 

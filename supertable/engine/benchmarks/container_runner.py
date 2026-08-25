@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .runner import _cgroup_v2_memory_telemetry, _duckdb_memory_limit_text
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 
 GIB = 1024**3
@@ -208,7 +209,8 @@ def _cgroup_v2_extended_telemetry(
         current.relative_to(root)
     except (OSError, ValueError) as exc:
         result["extended_reason"] = (
-            f"cgroup_path_invalid:{type(exc).__name__}"
+            "cgroup_path_invalid; error_type="
+            + safe_exception_type(exc)
         )
         return result
 
@@ -217,8 +219,8 @@ def _cgroup_v2_extended_telemetry(
         try:
             resolved = candidate.resolve(strict=False)
             resolved.relative_to(current)
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"unsafe cgroup member {name!r}") from exc
+        except (OSError, ValueError):
+            raise ValueError(f"unsafe cgroup member {name!r}") from None
         return candidate
 
     cpu_pressure_raw = _read_text(member("cpu.pressure"))
@@ -461,7 +463,10 @@ class _ContainerSampler:
                         "elapsed_seconds": max(
                             0.0, time.monotonic() - self.started
                         ),
-                        "sampler_error": f"{type(exc).__name__}: {exc}",
+                        "sampler_error": (
+                            "sampler failed; "
+                            f"error_type={safe_exception_type(exc)}"
+                        ),
                     }
                 )
             self._stop.wait(self.interval_seconds)
@@ -573,10 +578,10 @@ def _container_path(path: str, corpus_root: Path) -> str:
         host = Path(raw).expanduser().resolve(strict=True)
     try:
         relative = host.relative_to(corpus_root)
-    except ValueError as exc:
+    except ValueError:
         raise ContainerConfigurationError(
-            f"benchmark source path escapes corpus root: {raw!r}"
-        ) from exc
+            "benchmark source path escapes corpus root"
+        ) from None
     return "/corpus/" + relative.as_posix()
 
 
@@ -788,10 +793,10 @@ def _json_command(arguments: Sequence[str], *, timeout: float = 30) -> Any:
         )
     try:
         return json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
+    except json.JSONDecodeError:
         raise ContainerBenchmarkError(
-            f"command returned invalid JSON: {list(arguments)!r}"
-        ) from exc
+            "benchmark command returned invalid JSON"
+        ) from None
 
 
 def _image_provenance(docker: str, image: str) -> dict[str, Any]:
@@ -1022,7 +1027,10 @@ def run_container_series(
     try:
         image_provenance = _image_provenance(config.docker, config.image)
     except Exception as exc:  # preserve a useful artifact for setup failures
-        image_error = f"{type(exc).__name__}: {exc}"
+        image_error = (
+            "image provenance failed; "
+            f"error_type={safe_exception_type(exc)}"
+        )
     git = _git_identity(repo_root)
     command = _docker_command(
         config=config,
@@ -1073,7 +1081,10 @@ def run_container_series(
                     stdout, stderr = process.communicate()
             returncode = process.returncode
         except OSError as exc:
-            launch_error = f"{type(exc).__name__}: {exc}"
+            launch_error = (
+                "container launch failed; "
+                f"error_type={safe_exception_type(exc)}"
+            )
         finally:
             if sampler_started:
                 sampler.stop()
@@ -1093,7 +1104,10 @@ def run_container_series(
             else:
                 response_error = "response root is not an object"
         except (OSError, json.JSONDecodeError) as exc:
-            response_error = f"{type(exc).__name__}: {exc}"
+            response_error = (
+                "container response unavailable; "
+                f"error_type={safe_exception_type(exc)}"
+            )
 
     status = "worker_failed"
     validation_error: str | None = None
@@ -1131,7 +1145,10 @@ def run_container_series(
             status = "passed"
         except ContainerBenchmarkError as exc:
             status = "boundary_failed"
-            validation_error = str(exc)
+            validation_error = (
+                "container boundary validation failed; "
+                f"error_type={safe_exception_type(exc)}"
+            )
 
     sampler_summary = sampler.summary()
     artifact = {
@@ -1184,8 +1201,7 @@ def run_container_series(
     _atomic_write_json(attempt_root / "attempt.json", artifact)
     if status != "passed" or result is None:
         raise ContainerBenchmarkError(
-            f"container benchmark {status}: {validation_error}; "
-            f"artifact={attempt_root / 'attempt.json'}"
+            f"container benchmark {status}: {validation_error}"
         )
 
     # Keep the complete raw response in attempt.json without recursively

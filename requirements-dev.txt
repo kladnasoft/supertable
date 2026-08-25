@@ -1,9 +1,14 @@
 # Pinned release-gate tooling. Runtime dependencies remain in requirements.txt.
+pip==26.2.1
+setuptools==84.0.0
 pytest==9.1.1
 pytest-asyncio==1.3.0
+httpx2==2.12.0
 fakeredis==2.35.1
 lupa==2.8
 boto3==1.43.78
+azure-storage-blob==12.30.0
+azure-identity==1.25.3
 build==1.5.0
 twine==6.2.0
 ruff==0.16.0

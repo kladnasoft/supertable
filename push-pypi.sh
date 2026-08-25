@@ -122,19 +122,17 @@ if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
 fi
 
 VERSION="$("${RELEASE_PYTHON}" - <<'PY'
-import pathlib
-import re
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
-text = pathlib.Path("pyproject.toml").read_text(encoding="utf-8")
-project = re.search(r"(?ms)^\[project\]\s*$\n(.*?)(?=^\[|\Z)", text)
-version = (
-    re.search(r'(?m)^version\s*=\s*["\']([^"\']+)["\']\s*(?:#.*)?$', project.group(1))
-    if project
-    else None
-)
-if version is None:
-    raise SystemExit("ERROR: pyproject.toml has no literal [project].version")
-print(version.group(1))
+with open("pyproject.toml", "rb") as handle:
+    project = tomllib.load(handle).get("project", {})
+version = project.get("version")
+if not isinstance(version, str) or not version:
+    raise SystemExit("ERROR: pyproject.toml has no non-empty [project].version")
+print(version)
 PY
 )"
 if ! [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -154,13 +152,12 @@ fi
 "${RELEASE_PYTHON}" - "${VERSION}" <<'PY'
 import ast
 import pathlib
-import re
 import sys
 
 expected = sys.argv[1]
 
 init_tree = ast.parse(pathlib.Path("supertable/__init__.py").read_text(encoding="utf-8"))
-init_version = next(
+init_versions = [
     node.value.value
     for node in init_tree.body
     if isinstance(node, ast.Assign)
@@ -168,14 +165,12 @@ init_version = next(
     if isinstance(target, ast.Name)
     and target.id == "__version__"
     and isinstance(node.value, ast.Constant)
-)
-setup_text = pathlib.Path("setup.py").read_text(encoding="utf-8")
-match = re.search(r"\bversion\s*=\s*['\"]([^'\"]+)['\"]", setup_text)
-setup_version = match.group(1) if match else None
-if init_version != expected or setup_version != expected:
+    and isinstance(node.value.value, str)
+]
+if len(init_versions) != 1 or init_versions[0] != expected:
     raise SystemExit(
         "ERROR: version mismatch: "
-        f"pyproject={expected}, __init__={init_version}, setup.py={setup_version}"
+        f"pyproject={expected}, __init__={init_versions}"
     )
 PY
 
@@ -212,7 +207,7 @@ echo "==> Running source security gate"
 "${RELEASE_PYTHON}" -m bandit -q -r supertable -lll
 AUDIT_LOG="$(mktemp)"
 if ! "${RELEASE_PYTHON}" -m pip_audit -r requirements.txt \
-  --ignore-vuln GHSA-rgxp-2hwp-jwgg >"${AUDIT_LOG}" 2>&1; then
+  --strict --progress-spinner off >"${AUDIT_LOG}" 2>&1; then
   if ! "${RELEASE_PYTHON}" -m ensurepip --version >/dev/null 2>&1 \
     && "${RELEASE_PYTHON}" - "${AUDIT_LOG}" <<'PY'
 import pathlib
@@ -228,8 +223,8 @@ PY
     echo "WARN: stdlib venv support is unavailable; auditing the checked release environment instead."
     echo "WARN: CI's exact requirements audit remains mandatory before any token upload."
     "${RELEASE_PYTHON}" -m pip check
-    "${RELEASE_PYTHON}" -m pip_audit --local \
-      --ignore-vuln GHSA-rgxp-2hwp-jwgg
+    "${RELEASE_PYTHON}" -m pip_audit --local --skip-editable \
+      --progress-spinner off
   else
     cat "${AUDIT_LOG}" >&2
     rm -f "${AUDIT_LOG}"
@@ -350,6 +345,8 @@ expected = {
     "full tests / Python 3.13": "success",
     "dependencies / minimum": "success",
     "dependencies / latest-supported": "success",
+    "cloud storage adapters / minimum": "success",
+    "cloud storage adapters / latest-supported": "success",
     "Delta and Iceberg external conformance": "success",
     "lint, types, and dependency security": "success",
     "build and install immutable artifacts": "success",

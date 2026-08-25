@@ -367,8 +367,8 @@ class RangeCache:
         if expected is None:
             try:
                 expected = self.storage.stat_object(raw_key)
-            except Exception as exc:
-                raise RangeCacheUnavailable("could not stat ranged object") from exc
+            except Exception:
+                raise RangeCacheUnavailable("could not stat ranged object") from None
         if not isinstance(expected, ObjectMetadata):
             try:
                 expected = ObjectMetadata(
@@ -382,8 +382,8 @@ class RangeCache:
                         getattr(expected, "checksum_sha256", "") or ""
                     ),
                 )
-            except Exception as exc:
-                raise RangeCacheUnavailable("invalid ranged object metadata") from exc
+            except Exception:
+                raise RangeCacheUnavailable("invalid ranged object metadata") from None
         if expected.size < 0:
             raise RangeCacheUnavailable("ranged object has a negative size")
         if expected.size and not expected.identity_token():
@@ -671,7 +671,7 @@ class RangeCache:
                 self._merge_metrics(metrics)
                 if isinstance(exc, RangeCacheError):
                     raise
-                raise RangeCacheUnavailable("range cache could not serve bytes") from exc
+                raise RangeCacheUnavailable("range cache could not serve bytes") from None
             # Cache filesystem/capacity problems may bypass, but the fallback
             # remains the exact same conditional provider range.
             metrics.errors += 1
@@ -713,33 +713,33 @@ class RangeCache:
             raise RangeCacheUnavailable("storage does not override bounded read_range")
         try:
             payload = method(raw_key, offset, length, expected=metadata)
-        except ObjectIdentityMismatch as exc:
+        except ObjectIdentityMismatch:
             raise RangeCacheIntegrityError(
                 "source object identity changed during conditional range read"
-            ) from exc
-        except (ValueError, FileNotFoundError) as exc:
+            ) from None
+        except (ValueError, FileNotFoundError):
             # A disappeared/shrunk object cannot be replaced with whatever now
             # occupies the key; this snapshot is no longer safely readable.
             raise RangeCacheIntegrityError(
                 "source object no longer satisfies its snapshot range"
-            ) from exc
-        except NotImplementedError as exc:
-            raise RangeCacheUnavailable("bounded provider read unavailable") from exc
-        except Exception as exc:
+            ) from None
+        except NotImplementedError:
+            raise RangeCacheUnavailable("bounded provider read unavailable") from None
+        except Exception:
             # Separate a version race from transient provider availability.
             try:
                 current = self.storage.stat_object(raw_key)
-            except FileNotFoundError as missing:
-                raise RangeCacheIntegrityError("source object disappeared") from missing
+            except FileNotFoundError:
+                raise RangeCacheIntegrityError("source object disappeared") from None
             except Exception:
-                raise RangeCacheUnavailable("bounded provider read failed") from exc
+                raise RangeCacheUnavailable("bounded provider read failed") from None
             if (
                 _metadata_size(current) != metadata.size
                 or _metadata_identity_token(current)
                 != _metadata_identity_token(metadata)
             ):
-                raise RangeCacheIntegrityError("source object identity changed") from exc
-            raise RangeCacheUnavailable("bounded provider read failed") from exc
+                raise RangeCacheIntegrityError("source object identity changed") from None
+            raise RangeCacheUnavailable("bounded provider read failed") from None
         if not isinstance(payload, (bytes, bytearray, memoryview)):
             raise RangeCacheUnavailable("bounded provider read returned non-bytes")
         payload = bytes(payload)
@@ -1013,8 +1013,8 @@ class RangeCache:
             return payload
         except RangeCacheIntegrityError:
             raise
-        except Exception as exc:
-            raise RangeCacheIntegrityError("range entry is corrupt") from exc
+        except Exception:
+            raise RangeCacheIntegrityError("range entry is corrupt") from None
         finally:
             if data_fd >= 0:
                 os.close(data_fd)
@@ -1036,8 +1036,8 @@ class RangeCache:
                     paths = self._chunk_paths(obj, start, length)
                     if os.path.isfile(paths.data) and os.path.isfile(paths.manifest):
                         result.append(_Interval(start, start + length, paths))
-        except OSError as exc:
-            raise RangeCacheUnavailable("could not inspect cached ranges") from exc
+        except OSError:
+            raise RangeCacheUnavailable("could not inspect cached ranges") from None
         return result
 
     def _missing_bytes(
@@ -1594,8 +1594,8 @@ class RangeCache:
             return value
         except RangeCacheIntegrityError:
             raise
-        except Exception as exc:
-            raise RangeCacheIntegrityError("range manifest is corrupt") from exc
+        except Exception:
+            raise RangeCacheIntegrityError("range manifest is corrupt") from None
         finally:
             os.close(fd)
 
@@ -1924,8 +1924,8 @@ class RangeCache:
         root = Path(self.cache_root)
         try:
             relative = Path(directory).relative_to(root)
-        except ValueError as exc:
-            raise RangeCacheUnavailable("range cache path escaped its root") from exc
+        except ValueError:
+            raise RangeCacheUnavailable("range cache path escaped its root") from None
         current = root
         for component in ("", *relative.parts):
             if component:
@@ -1941,8 +1941,8 @@ class RangeCache:
         root = Path(self.cache_root)
         try:
             relative = Path(directory).relative_to(root)
-        except ValueError as exc:
-            raise RangeCacheUnavailable("range cache path escaped its root") from exc
+        except ValueError:
+            raise RangeCacheUnavailable("range cache path escaped its root") from None
         current = root
         for component in ("", *relative.parts):
             if component:
@@ -1950,7 +1950,9 @@ class RangeCache:
             try:
                 info = os.lstat(current)
                 if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                    raise RangeCacheUnavailable("unsafe range cache directory chain")
+                    raise RangeCacheUnavailable(
+                        "unsafe range cache directory chain"
+                    ) from None
                 created = False
             except FileNotFoundError:
                 created = True
@@ -1965,7 +1967,9 @@ class RangeCache:
                     pass
                 info = os.lstat(current)
                 if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                    raise RangeCacheUnavailable("unsafe range cache directory chain")
+                    raise RangeCacheUnavailable(
+                        "unsafe range cache directory chain"
+                    ) from None
             if created:
                 os.chmod(current, 0o700)
             info = os.stat(current, follow_symlinks=False)

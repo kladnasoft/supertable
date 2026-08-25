@@ -256,6 +256,38 @@ class TestVisibleColumnValidation:
 
 class TestCustomRuleSafety:
 
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            {
+                "rule_type": "signed-url-token-DO-NOT-LOG",
+            },
+            {
+                "rule_type": "column_min",
+                "column_name": "signed-url-token-DO-NOT-LOG",
+                "threshold": 0,
+            },
+            {
+                "rule_type": "custom_sql",
+                "sql": (
+                    'SELECT COUNT("_sys_signed-url-token-DO-NOT-LOG") '
+                    "AS violations FROM demo.t"
+                ),
+            },
+        ],
+    )
+    def test_rejected_rule_diagnostic_never_reflects_persisted_identifiers(
+        self,
+        rule,
+        caplog,
+    ):
+        result = validate_custom_rule(rule, _SCHEMA, table_fqn="demo.t")
+        assert not result.valid
+        assert "signed-url-token-DO-NOT-LOG" not in result.message
+
+        assert build_custom_rule_sql(rule, "demo.t", _SCHEMA) is None
+        assert "signed-url-token-DO-NOT-LOG" not in caplog.text
+
     def test_structured_rules_validate_against_visible_schema(self):
         valid = {"rule_type": "column_min", "column_name": "amount", "threshold": 0}
         assert validate_custom_rule(valid, _SCHEMA).valid

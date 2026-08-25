@@ -168,7 +168,13 @@ def _wired(orders_on_disk, *, pruning: bool):
             _STATS_CACHE.clear()
 
 
-def _estimate(query: str, orders_on_disk, *, pruning: bool):
+def _estimate(
+    query: str,
+    orders_on_disk,
+    *,
+    pruning: bool,
+    require_odata_identity: bool = False,
+):
     with _wired(orders_on_disk, pruning=pruning) as local:
         parser = SQLParser(_SUPER, query, "duckdb")
         tables = parser.get_physical_tables()
@@ -178,6 +184,7 @@ def _estimate(query: str, orders_on_disk, *, pruning: bool):
             storage=local,
             tables=tables,
             predicate_constraints=constraints,
+            require_odata_identity=require_odata_identity,
         )
         reflection = est.estimate()
         return reflection, est.plan_stats
@@ -248,6 +255,27 @@ class TestEstimatorRealWiringPruning:
         # OR across columns bails predicate extraction -> no constraint -> no drop.
         reflection, _ = _estimate(_NOPRUNE_Q, orders_on_disk, pruning=True)
         assert reflection.total_reflections == 3
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            f"SELECT * FROM {_SIMPLE} WHERE id BETWEEN 120 AND 180",
+            f"SELECT * FROM {_SIMPLE} WHERE id BETWEEN 1 AND 10",
+        ],
+    )
+    def test_odata_identity_keeps_table_global_manifest_across_pages(
+        self, orders_on_disk, query,
+    ):
+        reflection, _ = _estimate(
+            query,
+            orders_on_disk,
+            pruning=True,
+            require_odata_identity=True,
+        )
+        snapshot = reflection.supers[0]
+        assert snapshot.resource_keys == orders_on_disk["files"]
+        assert snapshot.snapshot_resource_keys == orders_on_disk["files"]
+        assert snapshot.files == orders_on_disk["files"]
 
 
 # ---------------------------------------------------------------------------

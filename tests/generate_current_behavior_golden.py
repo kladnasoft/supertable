@@ -224,9 +224,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"  - {f}")
         return 1
 
-    ids = [s.scenario_id for s in selected]
-    write_manifest(ids)
-    print(f"\nWrote SEALED_MANIFEST.json for {len(ids)} scenario(s).")
+    # A subset reseal updates only the requested artifacts, but the checksum
+    # manifest must continue to cover the complete compatibility corpus.
+    # Writing only ``selected`` here makes the documented subset command
+    # invalidate every unselected scenario on the next normal test run.
+    sealed_ids = [s.scenario_id for s in ALL_SCENARIOS]
+    write_manifest(sealed_ids)
+    print(
+        f"\nWrote SEALED_MANIFEST.json for {len(sealed_ids)} scenario(s)."
+    )
     print("Review the golden diff before committing.")
     return 0
 

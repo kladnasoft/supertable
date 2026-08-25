@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import random
+import re
 import signal
 import stat
 import threading
@@ -32,6 +33,7 @@ from supertable.audit.privileged_outbox import (
     OutboxRecordError,
     PrivilegedOutboxError,
 )
+from supertable.audit.diagnostics import safe_audit_error_type
 
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,96 @@ MAX_VERIFY_BATCHES = 1_000_000
 MAX_ACTIVATION_STATE_KEYS = 100_000
 MAX_ACTIVATION_STATE_ENTRIES = 2_000_000
 MAX_ACTIVATION_STATE_BYTES = 256 * 1024 * 1024
+_MAX_EXCEPTION_ARG_BYTES = 4096
+_SAFE_STREAM_ID_RE = re.compile(
+    r"(?:0|[1-9][0-9]{0,19})-(?:0|[1-9][0-9]{0,19})"
+)
+
+
+def _safe_error_type(exc: BaseException) -> str:
+    """Return bounded exception-type metadata without rendering a failure."""
+
+    return safe_audit_error_type(exc)
+
+
+def _exception_has_token(exc: BaseException, token: str) -> bool:
+    try:
+        arguments = exc.args
+    except Exception:
+        return False
+    if not isinstance(arguments, tuple):
+        return False
+    for value in arguments[:4]:
+        if isinstance(value, bytes):
+            if len(value) > _MAX_EXCEPTION_ARG_BYTES:
+                continue
+            text = value.decode("ascii", errors="ignore")
+        elif isinstance(value, str):
+            if len(value.encode("utf-8", errors="ignore")) > _MAX_EXCEPTION_ARG_BYTES:
+                continue
+            text = value
+        else:
+            continue
+        if token in text:
+            return True
+    return False
+
+
+def _identity_ref(value: str) -> str:
+    """Create a stable operational correlation value without logging identity text."""
+
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _is_safe_stream_id(value: Any) -> bool:
+    if not isinstance(value, str) or not _SAFE_STREAM_ID_RE.fullmatch(value):
+        return False
+    milliseconds, sequence = value.split("-", 1)
+    return all(
+        int(component) <= 18_446_744_073_709_551_615
+        for component in (milliseconds, sequence)
+    )
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_durability_report(report: Any) -> None:
+    try:
+        values = (
+            report.stream_type,
+            report.delivery_type,
+            report.appendonly,
+            report.appendfsync,
+            report.maxmemory_policy,
+            report.configured_min_replicas,
+            report.connected_replicas,
+        )
+    except Exception:
+        raise RedisDurabilityError(
+            "Redis durability checker returned an invalid report"
+        ) from None
+    if (
+        values[0] not in {"none", "stream"}
+        or values[1] not in {"none", "hash"}
+        or values[2] != "yes"
+        or values[3] not in {"always", "everysec"}
+        or values[4] != "noeviction"
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= 1_000_000
+            for value in values[5:]
+        )
+    ):
+        raise RedisDurabilityError(
+            "Redis durability checker returned an invalid report"
+        )
 
 
 class WorkerExitCode(IntEnum):
@@ -257,7 +349,11 @@ class WorkerStats:
 def _text(value: Any) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8")
-    return str(value)
+    if isinstance(value, str):
+        return value
+    if type(value) is int:
+        return str(value)
+    raise TypeError("Redis response value must be bytes or text")
 
 
 def _mapping_text(mapping: Mapping[Any, Any]) -> dict[str, str]:
@@ -271,7 +367,7 @@ def _config_value(redis_client: Any, name: str) -> str:
         raise RedisDurabilityError(
             f"Redis CONFIG GET {name!r} is unavailable; strict durability "
             "preflight requires CONFIG GET ACL permission"
-        ) from exc
+        ) from None
     if not isinstance(raw, Mapping):
         raise RedisDurabilityError(
             f"Redis CONFIG GET {name!r} returned an invalid response"
@@ -281,7 +377,7 @@ def _config_value(redis_client: Any, name: str) -> str:
     except (TypeError, UnicodeError, ValueError) as exc:
         raise RedisDurabilityError(
             f"Redis CONFIG GET {name!r} returned undecodable data"
-        ) from exc
+        ) from None
     value = decoded.get(name)
     if value is None:
         raise RedisDurabilityError(f"Redis CONFIG GET {name!r} returned no setting")
@@ -294,7 +390,7 @@ def _redis_key_type(redis_client: Any, key: str, *, label: str) -> str:
     except Exception as exc:
         raise RedisDurabilityError(
             f"Redis TYPE preflight failed for the privileged {label} key"
-        ) from exc
+        ) from None
     return value
 
 
@@ -343,20 +439,32 @@ def verify_redis_durability(
     delivery_type = _redis_key_type(redis_client, delivery_key, label="delivery")
     if stream_type not in {"none", "stream"}:
         raise RedisDurabilityError(
-            f"privileged stream key has Redis type {stream_type!r}, expected 'stream' or 'none'"
+            "privileged stream key has an unexpected Redis type"
         )
     if delivery_type not in {"none", "hash"}:
         raise RedisDurabilityError(
-            f"privileged delivery key has Redis type {delivery_type!r}, expected 'hash' or 'none'"
+            "privileged delivery key has an unexpected Redis type"
         )
 
     try:
         health = outbox.health()
     except Exception as exc:
         raise RedisDurabilityError(
-            f"privileged outbox Redis health preflight failed: {exc}"
-        ) from exc
-    if not bool(getattr(health, "reachable", False)):
+            "privileged outbox Redis health preflight failed; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
+    try:
+        reachable = health.reachable
+    except Exception as exc:
+        raise RedisDurabilityError(
+            "privileged outbox Redis health response is invalid; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
+    if not isinstance(reachable, bool):
+        raise RedisDurabilityError(
+            "privileged outbox Redis health response is invalid"
+        )
+    if not reachable:
         raise RedisDurabilityError("privileged outbox Redis health is not reachable")
 
     appendonly = _config_value(redis_client, "appendonly")
@@ -387,7 +495,7 @@ def verify_redis_durability(
         except ValueError as exc:
             raise RedisDurabilityError(
                 "Redis min-replicas-to-write is not an integer"
-            ) from exc
+            ) from None
         if configured_min_replicas < min_replicas_to_write:
             failures.append(
                 "min-replicas-to-write must be at least "
@@ -398,7 +506,7 @@ def verify_redis_durability(
         except ValueError as exc:
             raise RedisDurabilityError(
                 "Redis min-replicas-max-lag is not an integer"
-            ) from exc
+            ) from None
         if replica_lag <= 0:
             failures.append("min-replicas-max-lag must be positive")
 
@@ -410,7 +518,7 @@ def verify_redis_durability(
             raise RedisDurabilityError(
                 "Redis INFO replication is unavailable; the configured connected-replica "
                 "threshold cannot be verified"
-            ) from exc
+            ) from None
         if not isinstance(raw_replication, Mapping):
             raise RedisDurabilityError(
                 "Redis INFO replication returned an invalid response"
@@ -424,7 +532,7 @@ def verify_redis_durability(
         except ValueError as exc:
             raise RedisDurabilityError(
                 "Redis INFO replication connected-replica count is invalid"
-            ) from exc
+            ) from None
         if connected_replicas < min_connected_replicas:
             failures.append(
                 "connected replicas must be at least "
@@ -477,8 +585,9 @@ def verify_activation_baseline(
         descriptor = os.open(path, flags)
     except OSError as exc:
         raise ActivationBaselineError(
-            f"cannot open pinned activation baseline: {exc}"
-        ) from exc
+            "cannot open pinned activation baseline; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -516,7 +625,7 @@ def verify_activation_baseline(
     except (UnicodeDecodeError, TypeError, ValueError) as exc:
         raise ActivationBaselineError(
             "activation baseline is not valid JSON"
-        ) from exc
+        ) from None
     if not isinstance(document, dict):
         raise ActivationBaselineError("activation baseline must be a JSON object")
     required_fields = {
@@ -629,8 +738,9 @@ def compute_privileged_state_sha256(outbox: Any, organization: str) -> str:
         raise
     except Exception as exc:
         raise ActivationBaselineError(
-            f"cannot enumerate live privileged Redis state: {exc}"
-        ) from exc
+            "cannot enumerate live privileged Redis state; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
 
     digest = hashlib.sha256()
     digest.update(b"supertable-privileged-state-v1\x00")
@@ -673,7 +783,7 @@ def compute_privileged_state_sha256(outbox: Any, organization: str) -> str:
                 ]
             else:
                 raise ActivationBaselineError(
-                    f"privileged-state key has unsupported Redis type {key_type!r}"
+                    "privileged-state key has an unsupported Redis type"
                 )
 
             entry_count += len(items)
@@ -700,8 +810,9 @@ def compute_privileged_state_sha256(outbox: Any, organization: str) -> str:
         raise
     except Exception as exc:
         raise ActivationBaselineError(
-            f"cannot read live privileged Redis state: {exc}"
-        ) from exc
+            "cannot read live privileged Redis state; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     return digest.hexdigest()
 
 
@@ -797,8 +908,9 @@ def attest_activation_baseline(
         current = redis_client.get(activation_key)
     except Exception as exc:
         raise ActivationBaselineError(
-            f"cannot read privileged activation anchor: {exc}"
-        ) from exc
+            "cannot read privileged activation anchor; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     if current is None:
         actual_state = compute_privileged_state_sha256(outbox, report.organization)
         if not hmac.compare_digest(actual_state, report.state_sha256):
@@ -816,9 +928,39 @@ def attest_activation_baseline(
             payload,
         ))
     except Exception as exc:
+        controlled_failures = (
+            (
+                "privileged activation anchor differs from baseline",
+                "privileged activation anchor differs from baseline",
+            ),
+            (
+                "privileged ledger exists without its immutable activation anchor",
+                "privileged ledger exists without its immutable activation anchor",
+            ),
+            (
+                "privileged activation anchor has wrong Redis type",
+                "privileged activation anchor has an invalid Redis type",
+            ),
+            (
+                "privileged audit outbox has wrong Redis type",
+                "privileged audit outbox has an invalid Redis type",
+            ),
+            (
+                "privileged audit meta has wrong Redis type",
+                "privileged audit meta has an invalid Redis type",
+            ),
+            (
+                "privileged audit delivery has wrong Redis type",
+                "privileged audit delivery has an invalid Redis type",
+            ),
+        )
+        for token, safe_message in controlled_failures:
+            if _exception_has_token(exc, token):
+                raise ActivationBaselineError(safe_message) from None
         raise ActivationBaselineError(
-            f"privileged activation anchor attestation failed: {exc}"
-        ) from exc
+            "privileged activation anchor attestation failed; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     if result not in {1, 2}:
         raise ActivationBaselineError(
             "privileged activation anchor returned an invalid result"
@@ -931,24 +1073,60 @@ class PrivilegedArchiveWorker:
             raise OutboxRecordError(
                 "archive checkpoint verification returned an invalid result"
             )
+        checkpoint_batch_id = "-"
+        checkpoint_last_sequence = 0
+        if checkpoint is not None:
+            raw_batch_id = checkpoint.get("batch_id")
+            raw_last_sequence = checkpoint.get("last_sequence")
+            if (
+                not isinstance(raw_batch_id, str)
+                or len(raw_batch_id) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in raw_batch_id
+                )
+                or isinstance(raw_last_sequence, bool)
+                or not isinstance(raw_last_sequence, int)
+                or raw_last_sequence < 1
+            ):
+                raise OutboxRecordError(
+                    "archive checkpoint verification returned invalid metadata"
+                )
+            checkpoint_batch_id = raw_batch_id
+            checkpoint_last_sequence = raw_last_sequence
         self.stats.checkpoint_verifications += 1
         health = self.outbox.health()
+        stream_exists = getattr(health, "stream_exists", None)
+        stream_length = getattr(health, "stream_length", None)
+        group_count = getattr(health, "group_count", None)
+        if (
+            not isinstance(stream_exists, bool)
+            or isinstance(stream_length, bool)
+            or not isinstance(stream_length, int)
+            or stream_length < 0
+            or isinstance(group_count, bool)
+            or not isinstance(group_count, int)
+            or group_count < 0
+        ):
+            raise OutboxRecordError(
+                "privileged outbox health returned invalid metadata"
+            )
         self._logger.info(
-            "privileged_audit_worker_heartbeat organization=%s consumer=%s "
+            "privileged_audit_worker_heartbeat organization_ref=%s consumer_ref=%s "
             "checkpoint_present=%s checkpoint_pending=%s checkpoint_batch_id=%s "
             "checkpoint_last_sequence=%s stream_exists=%s stream_length=%s "
             "group_count=%s cycles=%s checkpoint_verifications=%s "
             "archived_batches=%s archived_events=%s acknowledged_events=%s "
             "trimmed_entries=%s transient_failures=%s",
-            self.config.organization,
-            self.config.consumer,
+            _identity_ref(self.config.organization),
+            _identity_ref(self.config.consumer),
             checkpoint is not None,
             checkpoint_pending,
-            checkpoint.get("batch_id", "-") if checkpoint is not None else "-",
-            checkpoint.get("last_sequence", 0) if checkpoint is not None else 0,
-            bool(getattr(health, "stream_exists", False)),
-            int(getattr(health, "stream_length", 0)),
-            int(getattr(health, "group_count", 0)),
+            checkpoint_batch_id,
+            checkpoint_last_sequence,
+            stream_exists,
+            stream_length,
+            group_count,
             self.stats.cycles,
             self.stats.checkpoint_verifications,
             self.stats.archived_batches,
@@ -967,7 +1145,7 @@ class PrivilegedArchiveWorker:
         except (TypeError, ValueError) as exc:
             raise OutboxRecordError(
                 "archive checkpoint chain rejected stored evidence"
-            ) from exc
+            ) from None
         if not isinstance(result, Mapping):
             raise OutboxRecordError(
                 "archive checkpoint chain verification returned an invalid result"
@@ -1001,10 +1179,11 @@ class PrivilegedArchiveWorker:
             )
         self.stats.chain_verifications += 1
         self._logger.info(
-            "privileged_audit_worker_chain_verified organization=%s consumer=%s "
+            "privileged_audit_worker_chain_verified organization_ref=%s "
+            "consumer_ref=%s "
             "batch_count=%s first_sequence=%s last_sequence=%s latest_batch_id=%s",
-            self.config.organization,
-            self.config.consumer,
+            _identity_ref(self.config.organization),
+            _identity_ref(self.config.consumer),
             batch_count,
             first_sequence,
             last_sequence,
@@ -1023,10 +1202,10 @@ class PrivilegedArchiveWorker:
         )
         self.stats.trimmed_entries += int(removed)
         self._logger.info(
-            "privileged_audit_worker_trim organization=%s consumer=%s "
+            "privileged_audit_worker_trim organization_ref=%s consumer_ref=%s "
             "through_id=%s removed_entries=%s",
-            self.config.organization,
-            self.config.consumer,
+            _identity_ref(self.config.organization),
+            _identity_ref(self.config.consumer),
             through_id,
             int(removed),
         )
@@ -1051,27 +1230,53 @@ class PrivilegedArchiveWorker:
             self.stats.empty_cycles += 1
             return False
 
-        stream_ids = tuple(getattr(result, "stream_ids", ()))
-        if not stream_ids:
+        raw_stream_ids = getattr(result, "stream_ids", None)
+        if not isinstance(raw_stream_ids, (tuple, list)):
             raise OutboxRecordError(
-                "archive worker received a batch with no stream IDs"
+                "archive worker received invalid stream-ID metadata"
             )
-        acknowledged = int(getattr(result, "acknowledged", 0))
+        stream_ids = tuple(raw_stream_ids)
+        if (
+            not stream_ids
+            or len(stream_ids) > self.config.count
+            or any(not _is_safe_stream_id(value) for value in stream_ids)
+        ):
+            raise OutboxRecordError(
+                "archive worker received invalid stream-ID metadata"
+            )
+        batch_id = getattr(result, "batch_id", None)
+        acknowledged = getattr(result, "acknowledged", None)
+        reused = getattr(result, "reused", None)
+        if (
+            not isinstance(batch_id, str)
+            or len(batch_id) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in batch_id
+            )
+            or isinstance(acknowledged, bool)
+            or not isinstance(acknowledged, int)
+            or not 0 <= acknowledged <= len(stream_ids)
+            or not isinstance(reused, bool)
+        ):
+            raise OutboxRecordError(
+                "archive worker received invalid delivery metadata"
+            )
         self.stats.archived_batches += 1
         self.stats.archived_events += len(stream_ids)
         self.stats.acknowledged_events += acknowledged
         self._logger.info(
-            "privileged_audit_worker_delivery organization=%s consumer=%s "
+            "privileged_audit_worker_delivery organization_ref=%s consumer_ref=%s "
             "batch_id=%s first_stream_id=%s last_stream_id=%s event_count=%s "
             "acknowledged=%s reused=%s",
-            self.config.organization,
-            self.config.consumer,
-            getattr(result, "batch_id", ""),
+            _identity_ref(self.config.organization),
+            _identity_ref(self.config.consumer),
+            batch_id,
             stream_ids[0],
             stream_ids[-1],
             len(stream_ids),
             acknowledged,
-            bool(getattr(result, "reused", False)),
+            reused,
         )
         if self.config.trim:
             # Only a verified result returned by drain_once can establish a trim
@@ -1084,11 +1289,12 @@ class PrivilegedArchiveWorker:
         """Run according to ``WorkerConfig`` and return a stable process code."""
 
         self._logger.info(
-            "privileged_audit_worker_start organization=%s consumer=%s group=%s "
+            "privileged_audit_worker_start organization_ref=%s consumer_ref=%s "
+            "group_ref=%s "
             "mode=%s count=%s reclaim_idle_ms=%s trim=%s max_retries=%s",
-            self.config.organization,
-            self.config.consumer,
-            self.config.group,
+            _identity_ref(self.config.organization),
+            _identity_ref(self.config.consumer),
+            _identity_ref(self.config.group),
             (
                 "verify-chain"
                 if self.config.verify_chain
@@ -1142,40 +1348,39 @@ class PrivilegedArchiveWorker:
                 self.stats.transient_failures += 1
                 if consecutive_failures > self.config.max_retries:
                     self._logger.critical(
-                        "privileged_audit_worker_retry_exhausted organization=%s "
-                        "consumer=%s failures=%s error=%s",
-                        self.config.organization,
-                        self.config.consumer,
+                        "privileged_audit_worker_retry_exhausted "
+                        "organization_ref=%s consumer_ref=%s failures=%s "
+                        "error_type=%s",
+                        _identity_ref(self.config.organization),
+                        _identity_ref(self.config.consumer),
                         consecutive_failures,
-                        exc,
-                        exc_info=True,
+                        _safe_error_type(exc),
                     )
                     exit_code = WorkerExitCode.RETRY_EXHAUSTED
                     reason = "transient retry budget exhausted"
                     break
                 delay = self._retry_delay(consecutive_failures)
                 self._logger.warning(
-                    "privileged_audit_worker_transient_failure organization=%s "
-                    "consumer=%s attempt=%s max_retries=%s retry_seconds=%.3f error=%s",
-                    self.config.organization,
-                    self.config.consumer,
+                    "privileged_audit_worker_transient_failure "
+                    "organization_ref=%s consumer_ref=%s attempt=%s max_retries=%s "
+                    "retry_seconds=%.3f error_type=%s",
+                    _identity_ref(self.config.organization),
+                    _identity_ref(self.config.consumer),
                     consecutive_failures,
                     self.config.max_retries,
                     delay,
-                    exc,
-                    exc_info=True,
+                    _safe_error_type(exc),
                 )
                 if self._wait_for_stop(delay):
                     reason = "shutdown requested during retry backoff"
                     break
             except (ArchiveVerificationError, OutboxRecordError) as exc:
                 self._logger.critical(
-                    "privileged_audit_worker_integrity_failure organization=%s "
-                    "consumer=%s error=%s",
-                    self.config.organization,
-                    self.config.consumer,
-                    exc,
-                    exc_info=True,
+                    "privileged_audit_worker_integrity_failure "
+                    "organization_ref=%s consumer_ref=%s error_type=%s",
+                    _identity_ref(self.config.organization),
+                    _identity_ref(self.config.consumer),
+                    _safe_error_type(exc),
                 )
                 exit_code = WorkerExitCode.INTEGRITY
                 reason = "unrecoverable archive or ledger integrity failure"
@@ -1187,24 +1392,22 @@ class PrivilegedArchiveWorker:
                 ActivationBaselineError,
             ) as exc:
                 self._logger.critical(
-                    "privileged_audit_worker_runtime_config_failure organization=%s "
-                    "consumer=%s error=%s",
-                    self.config.organization,
-                    self.config.consumer,
-                    exc,
-                    exc_info=True,
+                    "privileged_audit_worker_runtime_config_failure "
+                    "organization_ref=%s consumer_ref=%s error_type=%s",
+                    _identity_ref(self.config.organization),
+                    _identity_ref(self.config.consumer),
+                    _safe_error_type(exc),
                 )
                 exit_code = WorkerExitCode.CONFIG
                 reason = "runtime configuration rejected"
                 break
             except PrivilegedOutboxError as exc:
                 self._logger.critical(
-                    "privileged_audit_worker_unclassified_outbox_failure organization=%s "
-                    "consumer=%s error=%s",
-                    self.config.organization,
-                    self.config.consumer,
-                    exc,
-                    exc_info=True,
+                    "privileged_audit_worker_unclassified_outbox_failure "
+                    "organization_ref=%s consumer_ref=%s error_type=%s",
+                    _identity_ref(self.config.organization),
+                    _identity_ref(self.config.consumer),
+                    _safe_error_type(exc),
                 )
                 exit_code = WorkerExitCode.INTEGRITY
                 reason = "unclassified privileged outbox failure"
@@ -1215,23 +1418,23 @@ class PrivilegedArchiveWorker:
                 break
             except Exception as exc:
                 self._logger.critical(
-                    "privileged_audit_worker_unexpected_failure organization=%s "
-                    "consumer=%s error=%s",
-                    self.config.organization,
-                    self.config.consumer,
-                    exc,
-                    exc_info=True,
+                    "privileged_audit_worker_unexpected_failure "
+                    "organization_ref=%s consumer_ref=%s error_type=%s",
+                    _identity_ref(self.config.organization),
+                    _identity_ref(self.config.consumer),
+                    _safe_error_type(exc),
                 )
                 exit_code = WorkerExitCode.UNEXPECTED
                 reason = "unexpected worker failure"
                 break
 
         self._logger.info(
-            "privileged_audit_worker_stop organization=%s consumer=%s exit_code=%s "
+            "privileged_audit_worker_stop organization_ref=%s consumer_ref=%s "
+            "exit_code=%s "
             "reason=%s signal=%s cycles=%s archived_batches=%s archived_events=%s "
             "acknowledged_events=%s trimmed_entries=%s transient_failures=%s",
-            self.config.organization,
-            self.config.consumer,
+            _identity_ref(self.config.organization),
+            _identity_ref(self.config.consumer),
             int(exit_code),
             reason,
             self._stop_signal,
@@ -1408,13 +1611,13 @@ def main(
     try:
         config = _config_from_args(args)
     except ValueError as exc:
-        parser.error(str(exc))
+        parser.error("invalid worker configuration")
 
     if not config.activation_baseline_path:
         logger.critical(
-            "privileged_audit_worker_baseline_missing organization=%s; "
+            "privileged_audit_worker_baseline_missing organization_ref=%s; "
             "--activation-baseline and --activation-baseline-sha256 are mandatory",
-            config.organization,
+            _identity_ref(config.organization),
         )
         return int(WorkerExitCode.CONFIG)
     try:
@@ -1442,16 +1645,28 @@ def main(
         if (
             baseline.organization != config.organization
             or baseline.artifact_sha256 != config.activation_baseline_sha256
+            or not isinstance(baseline.activation_id, str)
+            or not baseline.activation_id
+            or len(baseline.activation_id) > 256
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in baseline.activation_id
+            )
+            or isinstance(baseline.created_ms, bool)
+            or not isinstance(baseline.created_ms, int)
+            or baseline.created_ms < 1
+            or not _is_sha256(baseline.state_sha256)
+            or not _is_sha256(baseline.artifact_sha256)
         ):
             raise ActivationBaselineError(
                 "activation baseline report does not match the deployment pin"
             )
     except Exception as exc:
         logger.critical(
-            "privileged_audit_worker_baseline_failure organization=%s error=%s",
-            config.organization,
-            exc,
-            exc_info=True,
+            "privileged_audit_worker_baseline_failure organization_ref=%s "
+            "error_type=%s",
+            _identity_ref(config.organization),
+            _safe_error_type(exc),
         )
         return int(WorkerExitCode.CONFIG)
 
@@ -1460,10 +1675,9 @@ def main(
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     logger.info(
-        "privileged_audit_worker_baseline_ok organization=%s activation_id=%s "
+        "privileged_audit_worker_baseline_ok organization_ref=%s "
         "created_ms=%s state_sha256=%s artifact_sha256=%s",
-        baseline.organization,
-        baseline.activation_id,
+        _identity_ref(baseline.organization),
         baseline.created_ms,
         baseline.state_sha256,
         baseline.artifact_sha256,
@@ -1473,10 +1687,10 @@ def main(
         outbox = factory(config.organization)
     except Exception as exc:
         logger.critical(
-            "privileged_audit_worker_factory_failure organization=%s error=%s",
-            config.organization,
-            exc,
-            exc_info=True,
+            "privileged_audit_worker_factory_failure organization_ref=%s "
+            "error_type=%s",
+            _identity_ref(config.organization),
+            _safe_error_type(exc),
         )
         return int(WorkerExitCode.CONFIG)
 
@@ -1488,19 +1702,20 @@ def main(
                 min_replicas_to_write=config.min_replicas_to_write,
                 min_connected_replicas=config.min_connected_replicas,
             )
+            _validate_durability_report(report)
         except Exception as exc:
             logger.critical(
-                "privileged_audit_worker_redis_preflight_failure organization=%s error=%s",
-                config.organization,
-                exc,
-                exc_info=True,
+                "privileged_audit_worker_redis_preflight_failure "
+                "organization_ref=%s error_type=%s",
+                _identity_ref(config.organization),
+                _safe_error_type(exc),
             )
             return int(WorkerExitCode.CONFIG)
         logger.info(
-            "privileged_audit_worker_redis_preflight_ok organization=%s "
+            "privileged_audit_worker_redis_preflight_ok organization_ref=%s "
             "stream_type=%s delivery_type=%s appendonly=%s appendfsync=%s "
             "maxmemory_policy=%s configured_min_replicas=%s connected_replicas=%s",
-            config.organization,
+            _identity_ref(config.organization),
             report.stream_type,
             report.delivery_type,
             report.appendonly,
@@ -1523,7 +1738,8 @@ def main(
         return worker.run()
     except (ValueError, OSError) as exc:
         logger.critical(
-            "privileged_audit_worker_signal_setup_failure error=%s", exc, exc_info=True
+            "privileged_audit_worker_signal_setup_failure error_type=%s",
+            _safe_error_type(exc),
         )
         return int(WorkerExitCode.CONFIG)
     finally:

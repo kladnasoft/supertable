@@ -1,15 +1,27 @@
-"""Loopback relay giving rotating bearer URLs one stable DuckDB identity.
+"""Loopback relay isolating rotating bearer URLs behind per-query routes.
 
 DuckDB keys its HTTP metadata and external-file caches by the complete scan
 path.  A freshly signed URL therefore looks like a different immutable object
 even when only its credential query parameters changed.  This module keeps
 credentials out of that identity boundary:
 
-* DuckDB receives an opaque, process-private loopback URL.
+* DuckDB receives an opaque, process-private URL for one query lease.
 * The relay registry maps that URL to the currently admitted bearer URL.
 * Provider-issued linked-share cache identities and locally derived identities
   are bound to an immutable snapshot/object seal, never URL normalization.
 * Registrations are leased for the complete query/Arrow-stream lifetime.
+
+DuckDB's cache identity is the complete URL, while a request received at that
+URL otherwise carries no query/lease identifier.  Object identity and query
+authority are therefore deliberately separate: the first opaque path segment
+is derived from the immutable object descriptor, and every registration gets
+a distinct authenticated lease segment.  Cancellation, expiry, or release can
+then revoke only that query's opens and transfers, and an old lease URL is
+never reissued in the process.  This intentionally gives up cross-query
+DuckDB URL-cache reuse; connection-global HTTP credentials or shared-fate
+revocation would let concurrent queries interfere with one another.  The
+stable object identity remains available for a future independently bounded
+immutable-content cache.
 
 The relay is deliberately tiny.  It accepts only loopback ``HEAD`` and ``GET``
 requests, supports one exact byte range, never follows redirects, and checks
@@ -29,7 +41,9 @@ from __future__ import annotations
 
 import atexit
 import copy
+import heapq
 import hashlib
+import hmac
 import http.client
 import ipaddress
 import json
@@ -40,9 +54,10 @@ import socket
 import ssl
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, cast
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
 from urllib.request import (
@@ -58,7 +73,9 @@ from urllib.request import (
 _CACHE_IDENTITY = re.compile(
     r"(?:share-cache|local-cache)-v1:[0-9a-f]{64}\Z"
 )
-_ROUTE_PATH = re.compile(r"/v1/([0-9a-f]{64})\Z")
+_ROUTE_PATH = re.compile(
+    r"/v1/([0-9a-f]{64})/([0-9a-f]{64})\Z"
+)
 _SINGLE_RANGE = re.compile(r"bytes=(\d*)-(\d*)\Z", re.IGNORECASE)
 _CONTENT_RANGE = re.compile(
     r"bytes\s+(\d+)-(\d+)/(\d+)\Z", re.IGNORECASE
@@ -71,6 +88,16 @@ _MAX_UPSTREAM_URL_BYTES = 16 * 1024
 _RELAY_CHUNK_BYTES = 1024 * 1024
 _UPSTREAM_TIMEOUT_SECONDS = 60.0
 _MAX_RELAY_CONNECTIONS = 64
+# A single reflection can legitimately contain thousands of objects, but an
+# unbounded registry lets one oversized/adversarial query retain an arbitrary
+# number of bearer authorities until its lease is torn down. Keep the bound
+# comfortably above the supported large-manifest regression while failing
+# closed before process memory becomes the admission mechanism.
+_MAX_LIVE_RELAY_ROUTES = 16_384
+# Multiple queries may lease the same immutable route. Bound those lifecycle
+# records separately so duplicate-resource manifests cannot bypass the route
+# cap by concentrating every lease on one identity.
+_MAX_LIVE_RELAY_BOUNDARIES = 65_536
 _HEADER_READ_TIMEOUT_SECONDS = 2.0
 _CLIENT_IO_TIMEOUT_SECONDS = 60.0
 # DuckDB can issue a final loopback probe just after a statement has completed
@@ -80,6 +107,11 @@ _CLIENT_IO_TIMEOUT_SECONDS = 60.0
 # credential, object identity, or authorization boundary.
 _RETIRED_ROUTE_MARKER_TTL_SECONDS = 5.0
 _MAX_RETIRED_ROUTE_MARKERS = 4_096
+# ``threading.Event`` has no multi-event notification API. Exact deadlines are
+# scheduled on a heap; only the smaller set of distinct cancellation Events
+# needs this low-frequency fallback check. Routes without a cancellation Event
+# do not poll at all.
+_CANCEL_EVENT_CHECK_SECONDS = 0.05
 
 
 _LOCAL_CREDENTIAL_GENERATION_LOCK = threading.Lock()
@@ -112,6 +144,18 @@ def _canonical_json(value: Any) -> str:
 
 def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _bounded_scope_text(value: object, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or "\x00" in value
+        or len(value) > 1_024
+        or len(value.encode("utf-8")) > 1_024
+    ):
+        raise StableHttpRelayError(f"{label} is invalid")
+    return value
 
 
 def _seal_payload(seal: object) -> Dict[str, object]:
@@ -151,12 +195,15 @@ def local_resource_cache_identity(
     # immutability. Legacy resources without a provider version/ETag/checksum
     # remain on their per-credential URL and intentionally get no cross-query
     # relay identity.
+    sealed_size = seal_payload.get("size")
     if (
         not raw_key
         or "://" in raw_key
         or int(size) <= 0
         or not seal_payload
-        or int(seal_payload.get("size", -1)) != int(size)
+        or not isinstance(sealed_size, int)
+        or isinstance(sealed_size, bool)
+        or sealed_size != int(size)
         # HTTP If-Match is the enforceable condition available to the relay.
         # A version/checksum-only seal must stay on the direct credential path
         # until the signed URL itself is version-specific or bytes are hashed
@@ -182,6 +229,127 @@ def local_resource_cache_identity(
     return f"local-cache-v1:{_sha256_text(_canonical_json(payload))}"
 
 
+def _linked_snapshot_cache_scope(
+    *,
+    organization: str,
+    policy_fingerprint: object,
+    row_filter: object,
+    publication_generation: object,
+    super_name: str,
+    simple_name: str,
+) -> str:
+    """Seal the consumer/link/policy/publication boundary once per snapshot.
+
+    The policy fingerprint already seals provider organization, link ID,
+    provider schema projection and linked column policy. The row predicate is
+    pinned separately and hashed here without exposing it through a route.
+    """
+    organization = _bounded_scope_text(
+        organization,
+        label="linked stable relay consumer organization",
+    )
+    super_name = _bounded_scope_text(
+        super_name, label="linked stable relay aggregate name",
+    )
+    simple_name = _bounded_scope_text(
+        simple_name, label="linked stable relay table name",
+    )
+    if (
+        not isinstance(policy_fingerprint, str)
+        or re.fullmatch(r"[0-9a-f]{64}", policy_fingerprint) is None
+    ):
+        raise StableHttpRelayError(
+            "linked stable relay policy fingerprint is invalid"
+        )
+    if row_filter is None:
+        row_filter_fingerprint = ""
+    elif (
+        not isinstance(row_filter, str)
+        or "\x00" in row_filter
+        or len(row_filter) > 65_536
+        or len(row_filter.encode("utf-8")) > 65_536
+    ):
+        raise StableHttpRelayError(
+            "linked stable relay row policy is invalid"
+        )
+    else:
+        row_filter_fingerprint = _sha256_text(row_filter)
+    if (
+        not isinstance(publication_generation, int)
+        or isinstance(publication_generation, bool)
+        or publication_generation <= 0
+        or publication_generation > (1 << 53) - 1
+    ):
+        raise StableHttpRelayError(
+            "linked stable relay publication generation is invalid"
+        )
+    return _sha256_text(_canonical_json({
+        "v": 1,
+        "consumer_organization": organization,
+        "linked_policy_fingerprint": policy_fingerprint,
+        "linked_row_filter_fingerprint": row_filter_fingerprint,
+        "publication_generation": publication_generation,
+        "super": super_name,
+        "table": simple_name,
+    }))
+
+
+def _linked_resource_cache_identity(
+    *,
+    linked_scope: str,
+    provider_identity: object,
+    size: int,
+    object_seal: object,
+) -> str:
+    """Derive one resource identity inside a sealed linked snapshot scope.
+
+    A provider cache ID is an input, never the final DuckDB path identity. The
+    linked scope seals the consumer organization, provider/link policy, row
+    predicate, publication order and table identity. Combining that with the
+    provider ID and enforceable immutable object seal means reusing a provider
+    ID after retirement cannot make a new object inherit DuckDB's cached bytes.
+    """
+    if re.fullmatch(r"[0-9a-f]{64}", linked_scope) is None:
+        raise StableHttpRelayError(
+            "linked stable relay snapshot scope is invalid"
+        )
+    provider_identity = _validate_identity(provider_identity)
+    if not provider_identity.startswith("share-cache-v1:"):
+        raise StableHttpRelayError(
+            "linked stable relay cache identity is invalid"
+        )
+    seal_payload = _seal_payload(object_seal)
+    normalized_etag = _normalized_etag(seal_payload.get("etag", ""))
+    sealed_size = seal_payload.get("size")
+    if (
+        int(size) <= 0
+        or not isinstance(sealed_size, int)
+        or isinstance(sealed_size, bool)
+        or sealed_size != int(size)
+        or not normalized_etag
+    ):
+        raise StableHttpRelayError(
+            "linked stable relay immutable object seal is invalid"
+        )
+    payload = {
+        "v": 2,
+        "linked_snapshot_scope": linked_scope,
+        "provider_identity": provider_identity,
+        "size": int(size),
+        "object_seal": {
+            **seal_payload,
+            "etag": normalized_etag,
+        },
+    }
+    try:
+        digest = _sha256_text(_canonical_json(payload))
+    except (TypeError, ValueError, OverflowError):
+        raise StableHttpRelayError(
+            "linked stable relay immutable object seal is invalid"
+        ) from None
+    return f"share-cache-v1:{digest}"
+
+
 def _validate_identity(value: object) -> str:
     candidate = str(value or "")
     if _CACHE_IDENTITY.fullmatch(candidate) is None:
@@ -204,10 +372,10 @@ def _validate_upstream_url(
     try:
         parsed = urlsplit(candidate)
         parsed.port
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError):
         raise StableHttpRelayError(
             "stable relay upstream URL is invalid"
-        ) from exc
+        ) from None
     if (
         parsed.scheme.casefold() not in {"http", "https"}
         or not parsed.netloc
@@ -245,7 +413,15 @@ def _validate_upstream_url(
             raise StableHttpRelayError(
                 "linked stable relay upstream must use an allowlisted hostname"
             )
+        if not _is_secure_external_share_url(parsed):
+            raise StableHttpRelayError(
+                "linked stable relay upstream must use HTTPS"
+            )
     return candidate
+
+
+def _is_secure_external_share_url(parsed) -> bool:
+    return parsed.scheme.casefold() == "https"
 
 
 def _normalized_etag(value: object) -> str:
@@ -313,11 +489,12 @@ class _ActiveTransfer:
 class _ActiveOpen:
     """One pre-response connection attempt cancellable across threads."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, reject_private: bool = False) -> None:
         self._lock = threading.Lock()
         self._connection = None
         self._response = None
         self._closed = False
+        self.reject_private = bool(reject_private)
 
     def attach_connection(self, connection) -> None:
         with self._lock:
@@ -404,7 +581,12 @@ class _TrackedHTTPConnection(http.client.HTTPConnection):
 
     def connect(self) -> None:
         self._open_attempt.check()
-        super().connect()
+        self.sock = _connect_upstream_socket(
+            self.host,
+            self.port,
+            self.timeout,
+            reject_private=self._open_attempt.reject_private,
+        )
         self._open_attempt.check()
 
 
@@ -418,10 +600,22 @@ class _TrackedHTTPSConnection(http.client.HTTPSConnection):
         self._open_attempt.check()
         # Keep the attempt-visible connection object attached while exposing
         # the raw TCP socket before a potentially slow TLS handshake.
-        http.client.HTTPConnection.connect(self)
+        self.sock = _connect_upstream_socket(
+            self.host,
+            self.port,
+            self.timeout,
+            reject_private=self._open_attempt.reject_private,
+        )
         self._open_attempt.check()
-        server_hostname = self._tunnel_host or self.host
-        self.sock = self._context.wrap_socket(
+        server_hostname = str(
+            getattr(self, "_tunnel_host", None) or self.host
+        )
+        context = getattr(self, "_context", None)
+        if not isinstance(context, ssl.SSLContext) or self.sock is None:
+            raise StableHttpRelayError(
+                "stable relay TLS boundary is unavailable"
+            )
+        self.sock = context.wrap_socket(
             self.sock,
             server_hostname=server_hostname,
             do_handshake_on_connect=False,
@@ -429,6 +623,55 @@ class _TrackedHTTPSConnection(http.client.HTTPSConnection):
         self._open_attempt.check()
         self.sock.do_handshake()
         self._open_attempt.check()
+
+
+def _connect_upstream_socket(
+    host: str,
+    port: int,
+    timeout: Optional[float],
+    *,
+    reject_private: bool,
+) -> socket.socket:
+    """Resolve and connect using the same vetted address set.
+
+    Linked-share routes must not resolve to non-public addresses.  Connecting
+    to the sockaddr returned by this resolution avoids validating one DNS
+    answer and then letting a second resolver call choose a different target.
+    """
+    try:
+        addresses = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM,
+        )
+    except OSError as exc:
+        raise StableHttpRelayError(
+            "stable relay upstream host could not be resolved"
+        ) from exc
+    last_error: Optional[BaseException] = None
+    for family, socktype, proto, _canonname, sockaddr in addresses:
+        try:
+            address = ipaddress.ip_address(str(sockaddr[0]))
+        except ValueError:
+            continue
+        if reject_private and not _is_public_upstream_address(address):
+            continue
+        connection = socket.socket(family, socktype, proto)
+        try:
+            if timeout is not None:
+                connection.settimeout(timeout)
+            connection.connect(sockaddr)
+            return connection
+        except OSError as exc:
+            last_error = exc
+            connection.close()
+    if reject_private:
+        raise StableHttpRelayError(
+            "linked stable relay upstream resolved to a non-public address"
+        ) from last_error
+    raise OSError("stable relay upstream connection failed") from last_error
+
+
+def _is_public_upstream_address(address: ipaddress._BaseAddress) -> bool:
+    return bool(address.is_global)
 
 
 def _request_open_attempt(request: Request) -> _ActiveOpen:
@@ -466,8 +709,8 @@ class _TrackedHTTPSHandler(HTTPSHandler):
         response = self.do_open(
             connection,
             request,
-            context=self._context,
-            check_hostname=self._check_hostname,
+            context=getattr(self, "_context", None),
+            check_hostname=getattr(self, "_check_hostname", None),
         )
         attempt.attach_response(response)
         return response
@@ -545,9 +788,9 @@ class _RelayHandler(BaseHTTPRequestHandler):
     def setup(self) -> None:
         super().setup()
         self._header_deadline_lock = threading.Lock()
-        self._header_deadline_token = None
-        self._header_deadline_timer = None
-        self._header_request_token = None
+        self._header_deadline_token: Optional[object] = None
+        self._header_deadline_timer: Optional[threading.Timer] = None
+        self._header_request_token: Optional[object] = None
         self._header_deadline_expired = False
 
     def log_message(self, format, *args) -> None:
@@ -573,9 +816,9 @@ class _RelayHandler(BaseHTTPRequestHandler):
             self._header_deadline_expired = False
         timer.start()
         original_rfile = self.rfile
-        self.rfile = _BoundedHeaderReader(
+        self.rfile = cast(Any, _BoundedHeaderReader(
             original_rfile, _MAX_REQUEST_HEADER_BYTES,
-        )
+        ))
         try:
             self.connection.settimeout(_HEADER_READ_TIMEOUT_SECONDS)
             super().handle_one_request()
@@ -671,7 +914,15 @@ class _RelayHandler(BaseHTTPRequestHandler):
         return total <= _MAX_REQUEST_HEADER_BYTES
 
     def _relay_request(self, *, head_only: bool) -> None:
-        relay = self.server.relay  # type: ignore[attr-defined]
+        server = self.server
+        if not isinstance(server, _RelayHttpServer):
+            # BaseHTTPRequestHandler's public type permits any BaseServer,
+            # even though this handler is constructed only by our typed
+            # _RelayHttpServer. Keep that invariant checked at runtime rather
+            # than suppressing static attribute validation.
+            self._empty_response(500)
+            return
+        relay = server.relay
         response_started = False
         if not self._request_headers_are_bounded():
             relay._record_rejection()
@@ -696,7 +947,7 @@ class _RelayHandler(BaseHTTPRequestHandler):
         except OSError:
             self.close_connection = True
             return
-        route_key = match.group(1)
+        route_key = f"{match.group(1)}/{match.group(2)}"
         route, retired_route = relay._route(route_key)
         if route is None:
             if retired_route:
@@ -845,7 +1096,13 @@ class _RelayHandler(BaseHTTPRequestHandler):
             else:
                 self._empty_response(status if 400 <= status <= 599 else 502)
         except StableHttpRelayError:
-            relay._record_rejection()
+            # Once response bytes have started, the only remaining relay
+            # exception is lifecycle revocation/expiry while the handler is
+            # unwinding.  A consumer may legitimately release its query lease
+            # as soon as DuckDB has completed the request; that must close the
+            # transfer, but it is not a malformed or rejected request.
+            if not response_started:
+                relay._record_rejection()
             self.close_connection = True
         except Exception:
             if response_started:
@@ -898,7 +1155,7 @@ def _validated_range(
 
 def _response_matches_route(
     response,
-    route: _Route,
+    route: _RouteView,
     *,
     expected_start: Optional[int],
     expected_end: Optional[int],
@@ -967,10 +1224,18 @@ class _RouteLease:
         self._closed = False
 
     def close(self) -> None:
+        release = self._claim_release()
+        if release is not None:
+            relay, route_key, lease_token = release
+            relay._release_many(((route_key, lease_token),))
+
+    def _claim_release(
+        self,
+    ) -> Optional[Tuple["_StableHttpRelay", str, object]]:
         if self._closed:
-            return
+            return None
         self._closed = True
-        self._relay._release(self._route_key, self._lease_token)
+        return self._relay, self._route_key, self._lease_token
 
 
 class StableRelayLease:
@@ -984,8 +1249,15 @@ class StableRelayLease:
         if self._closed:
             return
         self._closed = True
+        grouped: Dict[_StableHttpRelay, List[Tuple[str, object]]] = {}
         for lease in reversed(self._leases):
-            lease.close()
+            release = lease._claim_release()
+            if release is None:
+                continue
+            relay, route_key, lease_token = release
+            grouped.setdefault(relay, []).append((route_key, lease_token))
+        for relay, releases in grouped.items():
+            relay._release_many(releases)
 
 
 class _StableHttpRelay:
@@ -993,8 +1265,15 @@ class _StableHttpRelay:
         self._lock = threading.RLock()
         self._route_condition = threading.Condition(self._lock)
         self._process_secret = secrets.token_bytes(32)
+        self._lease_serial = 0
         self._routes: Dict[str, _Route] = {}
-        self._retired_routes: Dict[str, float] = {}
+        self._retired_routes: OrderedDict[str, float] = OrderedDict()
+        self._deadline_heap: List[Tuple[float, int, str, object]] = []
+        self._deadline_serial = 0
+        self._active_boundary_count = 0
+        self._cancel_boundaries: Dict[
+            int, Tuple[threading.Event, Set[Tuple[str, object]]]
+        ] = {}
         self._active_open_count = 0
         self._metrics = _RelayMetrics()
         self._closed = False
@@ -1006,10 +1285,10 @@ class _StableHttpRelay:
         )
         try:
             self._server = _RelayHttpServer(("127.0.0.1", 0), self)
-        except OSError as exc:
+        except OSError:
             raise StableHttpRelayError(
                 "stable loopback relay is unavailable"
-            ) from exc
+            ) from None
         self._thread = threading.Thread(
             target=self._server.serve_forever,
             kwargs={"poll_interval": 0.1},
@@ -1045,10 +1324,10 @@ class _StableHttpRelay:
         )
         try:
             expected_size = int(expected_size)
-        except (TypeError, ValueError, OverflowError) as exc:
+        except (TypeError, ValueError, OverflowError):
             raise StableHttpRelayError(
                 "stable relay object size is invalid"
-            ) from exc
+            ) from None
         if expected_size <= 0:
             raise StableHttpRelayError("stable relay object size is invalid")
         expected_etag = _normalized_etag(expected_etag)
@@ -1108,10 +1387,10 @@ class _StableHttpRelay:
             deadline_monotonic = time.monotonic() + _UPSTREAM_TIMEOUT_SECONDS
         try:
             deadline_monotonic = float(deadline_monotonic)
-        except (TypeError, ValueError, OverflowError) as exc:
+        except (TypeError, ValueError, OverflowError):
             raise StableHttpRelayError(
                 "stable relay transfer deadline is invalid"
-            ) from exc
+            ) from None
         if (
             not math.isfinite(deadline_monotonic)
             or deadline_monotonic <= time.monotonic()
@@ -1129,118 +1408,141 @@ class _StableHttpRelay:
                 raise StableHttpRelayError(
                     "stable relay transfer was cancelled"
                 )
-        route_key = hashlib.sha256(
-            self._process_secret + b"\0" + identity.encode("ascii")
+        # Even private/direct callers cannot make a changed object inherit an
+        # old DuckDB URL by reusing a nominal identity after its route retired.
+        # The aliasing boundary adds consumer/link/policy/publication scope;
+        # this final descriptor additionally fences the immutable HTTP proof.
+        route_descriptor = _canonical_json({
+            "identity": identity,
+            "expected_size": expected_size,
+            "expected_etag": expected_etag,
+        }).encode("utf-8")
+        object_key = hmac.new(
+            self._process_secret,
+            b"object\0" + route_descriptor,
+            hashlib.sha256,
         ).hexdigest()
+        route_key = ""
         lease_token = object()
         boundary = _LeaseBoundary(
             deadline_monotonic=deadline_monotonic,
             cancel_event=cancel_event,
         )
-        retired: List[object] = []
-        try:
-            with self._route_condition:
-                if self._closed:
-                    raise StableHttpRelayError(
-                        "stable loopback relay is closed"
-                    )
-                if cancel_event is not None and cancel_event.is_set():
-                    raise StableHttpRelayError(
-                        "stable relay transfer was cancelled"
-                    )
-                existing = self._routes.get(route_key)
-                if existing is not None and self._prune_inactive_boundaries_locked(
-                    existing, time.monotonic()
-                ):
-                    retired.extend(self._retire_route_locked(
-                        route_key, existing
-                    ))
-                    existing = None
-                if existing is not None and (
-                    existing.identity != identity
-                    or existing.expected_size != expected_size
-                    or existing.expected_etag != expected_etag
-                ):
-                    raise StableHttpRelayError(
-                        "stable relay identity has conflicting immutable metadata"
-                    )
-                if existing is None:
-                    # A new lease is authoritative immediately.  Removing the
-                    # diagnostic tombstone under the route lock ensures a
-                    # request is never classified as retired while this new
-                    # registration is visible.
-                    self._retired_routes.pop(route_key, None)
-                    existing = _Route(
-                        identity=identity,
-                        upstream_url=upstream_url,
-                        expected_size=expected_size,
-                        expected_etag=expected_etag,
-                        credential_expires_ms=credential_expires_ms,
-                        credential_generation=credential_generation,
-                        share_publication_generation=(
-                            share_publication_generation
-                        ),
-                    )
-                    self._routes[route_key] = existing
-                else:
-                    # While any query leases this stable URL, never trade a
-                    # longer-valid credential for a shorter one. Equal-expiry
-                    # ties use the authority's monotonic issuance/publication
-                    # order; equal metadata with different URLs is ambiguous.
-                    assert credential_expires_ms is not None
-                    assert existing.credential_expires_ms is not None
-                    should_refresh = False
-                    if credential_expires_ms > existing.credential_expires_ms:
-                        should_refresh = True
-                    elif credential_expires_ms == existing.credential_expires_ms:
-                        if external_share:
-                            new_order = share_publication_generation
-                            old_order = existing.share_publication_generation
-                            ambiguity = "linked publication generation is ambiguous"
-                        else:
-                            new_order = credential_generation
-                            old_order = existing.credential_generation
-                            ambiguity = "local credential generation is ambiguous"
-                        if new_order is not None and old_order is not None:
-                            should_refresh = new_order > old_order
-                            if (
-                                new_order == old_order
-                                and upstream_url != existing.upstream_url
-                            ):
-                                raise StableHttpRelayError(ambiguity)
-                        elif upstream_url != existing.upstream_url:
-                            raise StableHttpRelayError(ambiguity)
-                    if should_refresh:
-                        existing.upstream_url = upstream_url
-                        existing.credential_expires_ms = credential_expires_ms
-                        existing.credential_generation = credential_generation
-                        existing.share_publication_generation = (
-                            share_publication_generation
-                        )
-                existing.boundaries[lease_token] = boundary
-                existing.leases = len(existing.boundaries)
-                self._route_condition.notify_all()
-                port = int(self._server.server_address[1])
-                relay_url = f"http://127.0.0.1:{port}/v1/{route_key}"
-        finally:
-            self._close_transfers(retired)
+        with self._route_condition:
+            if self._closed:
+                raise StableHttpRelayError(
+                    "stable loopback relay is closed"
+                )
+            if cancel_event is not None and cancel_event.is_set():
+                raise StableHttpRelayError(
+                    "stable relay transfer was cancelled"
+                )
+            if self._active_boundary_count >= _MAX_LIVE_RELAY_BOUNDARIES:
+                raise StableHttpRelayError(
+                    "stable relay lease capacity is exhausted"
+                )
+            if len(self._routes) >= _MAX_LIVE_RELAY_ROUTES:
+                raise StableHttpRelayError(
+                    "stable relay route capacity is exhausted"
+                )
+
+            # The object component is stable and immutable-proof scoped; the
+            # monotonically minted HMAC lease component is unique and
+            # unguessable. Thus DuckDB can never issue one query's request
+            # under another query's cancellation/deadline authority.
+            self._lease_serial += 1
+            lease_key = hmac.new(
+                self._process_secret,
+                b"lease\0"
+                + str(self._lease_serial).encode("ascii")
+                + b"\0"
+                + route_descriptor,
+                hashlib.sha256,
+            ).hexdigest()
+            route_key = f"{object_key}/{lease_key}"
+            if route_key in self._routes:
+                raise StableHttpRelayError(
+                    "stable relay opaque lease collision"
+                )
+            route = _Route(
+                identity=identity,
+                upstream_url=upstream_url,
+                expected_size=expected_size,
+                expected_etag=expected_etag,
+                credential_expires_ms=credential_expires_ms,
+                credential_generation=credential_generation,
+                share_publication_generation=share_publication_generation,
+            )
+            route.boundaries[lease_token] = boundary
+            route.leases = 1
+            self._routes[route_key] = route
+            self._index_boundary_locked(route_key, lease_token, boundary)
+            self._route_condition.notify_all()
+            port = int(self._server.server_address[1])
+            relay_url = f"http://127.0.0.1:{port}/v1/{route_key}"
         return _RouteLease(self, route_key, lease_token, relay_url)
 
-    @staticmethod
-    def _prune_inactive_boundaries_locked(route: _Route, now: float) -> bool:
-        inactive = [
-            token
-            for token, boundary in route.boundaries.items()
-            if boundary.deadline_monotonic <= now
+    def _index_boundary_locked(
+        self,
+        route_key: str,
+        lease_token: object,
+        boundary: _LeaseBoundary,
+    ) -> None:
+        self._deadline_serial += 1
+        heapq.heappush(
+            self._deadline_heap,
+            (
+                boundary.deadline_monotonic,
+                self._deadline_serial,
+                route_key,
+                lease_token,
+            ),
+        )
+        self._active_boundary_count += 1
+        cancel_event = boundary.cancel_event
+        if cancel_event is not None:
+            event_key = id(cancel_event)
+            indexed = self._cancel_boundaries.get(event_key)
+            if indexed is None or indexed[0] is not cancel_event:
+                indexed = (cancel_event, set())
+                self._cancel_boundaries[event_key] = indexed
+            indexed[1].add((route_key, lease_token))
+
+    def _unindex_boundary_locked(
+        self,
+        route_key: str,
+        lease_token: object,
+        boundary: _LeaseBoundary,
+    ) -> None:
+        self._active_boundary_count = max(
+            0, self._active_boundary_count - 1,
+        )
+        cancel_event = boundary.cancel_event
+        if cancel_event is None:
+            return
+        event_key = id(cancel_event)
+        indexed = self._cancel_boundaries.get(event_key)
+        if indexed is None or indexed[0] is not cancel_event:
+            return
+        indexed[1].discard((route_key, lease_token))
+        if not indexed[1]:
+            self._cancel_boundaries.pop(event_key, None)
+
+    def _route_is_revoked_locked(
+        self,
+        route: _Route,
+        now: float,
+    ) -> bool:
+        # A route is a single lease authority. Its one lifecycle boundary owns
+        # every open/transfer registered beneath this opaque URL.
+        return any(
+            boundary.deadline_monotonic <= now
             or (
                 boundary.cancel_event is not None
                 and boundary.cancel_event.is_set()
             )
-        ]
-        for token in inactive:
-            route.boundaries.pop(token, None)
-        route.leases = len(route.boundaries)
-        return not route.boundaries
+            for boundary in route.boundaries.values()
+        )
 
     def _retire_route_locked(
         self,
@@ -1250,6 +1552,8 @@ class _StableHttpRelay:
         if self._routes.get(route_key) is route:
             self._routes.pop(route_key, None)
             self._mark_route_retired_locked(route_key, time.monotonic())
+        for token, boundary in list(route.boundaries.items()):
+            self._unindex_boundary_locked(route_key, token, boundary)
         route.boundaries.clear()
         route.leases = 0
         opens = list(route.active_opens.values())
@@ -1257,7 +1561,8 @@ class _StableHttpRelay:
             0, self._active_open_count - len(opens)
         )
         route.active_opens.clear()
-        transfers: List[object] = opens
+        transfers: List[object] = []
+        transfers.extend(opens)
         transfers.extend(route.active_transfers.values())
         route.active_transfers.clear()
         return transfers
@@ -1265,17 +1570,15 @@ class _StableHttpRelay:
     def _mark_route_retired_locked(self, route_key: str, now: float) -> None:
         """Remember a revoked opaque route briefly, without retaining authority."""
         cutoff = now - _RETIRED_ROUTE_MARKER_TTL_SECONDS
-        stale = [
-            key for key, retired_at in self._retired_routes.items()
-            if retired_at < cutoff
-        ]
-        for key in stale:
+        while self._retired_routes:
+            key, retired_at = next(iter(self._retired_routes.items()))
+            if retired_at >= cutoff:
+                break
             self._retired_routes.pop(key, None)
+        self._retired_routes.pop(route_key, None)
         self._retired_routes[route_key] = now
-        overflow = len(self._retired_routes) - _MAX_RETIRED_ROUTE_MARKERS
-        if overflow > 0:
-            for key in list(self._retired_routes)[:overflow]:
-                self._retired_routes.pop(key, None)
+        while len(self._retired_routes) > _MAX_RETIRED_ROUTE_MARKERS:
+            self._retired_routes.popitem(last=False)
 
     @staticmethod
     def _close_transfers(transfers: Iterable[object]) -> None:
@@ -1290,7 +1593,7 @@ class _StableHttpRelay:
         known_retired = False
         with self._route_condition:
             route = self._routes.get(route_key)
-            if route is not None and self._prune_inactive_boundaries_locked(
+            if route is not None and self._route_is_revoked_locked(
                 route, time.monotonic()
             ):
                 retired.extend(self._retire_route_locked(route_key, route))
@@ -1301,7 +1604,7 @@ class _StableHttpRelay:
                     upstream_url=route.upstream_url,
                     expected_size=route.expected_size,
                     expected_etag=route.expected_etag,
-                    deadline_monotonic=max(
+                    deadline_monotonic=min(
                         item.deadline_monotonic
                         for item in route.boundaries.values()
                     ),
@@ -1333,16 +1636,18 @@ class _StableHttpRelay:
             if (
                 route is None
                 or route.incarnation is not incarnation
-                or self._prune_inactive_boundaries_locked(route, now)
+                or self._route_is_revoked_locked(
+                    route, now,
+                )
             ):
                 if route is not None:
                     if route.incarnation is incarnation:
                         retired.extend(self._retire_route_locked(
-                            route_key, route
+                            route_key, route,
                         ))
                         self._route_condition.notify_all()
             else:
-                remaining = max(
+                remaining = min(
                     item.deadline_monotonic
                     for item in route.boundaries.values()
                 ) - now
@@ -1366,7 +1671,7 @@ class _StableHttpRelay:
             if (
                 route is not None
                 and route.incarnation is incarnation
-                and self._prune_inactive_boundaries_locked(
+                and self._route_is_revoked_locked(
                     route, time.monotonic()
                 )
             ):
@@ -1379,7 +1684,9 @@ class _StableHttpRelay:
                         "stable relay upstream open capacity is exhausted"
                     )
                 open_token = object()
-                attempt = _ActiveOpen()
+                attempt = _ActiveOpen(
+                    reject_private=route.identity.startswith("share-cache-v1:")
+                )
                 route.active_opens[open_token] = attempt
                 self._active_open_count += 1
         self._close_transfers(retired)
@@ -1407,17 +1714,17 @@ class _StableHttpRelay:
                 and route.incarnation is incarnation
                 and route.active_opens.get(open_token) is attempt
             )
-            if registered:
+            if registered and route is not None:
                 route.active_opens.pop(open_token, None)
                 self._active_open_count = max(
                     0, self._active_open_count - 1
                 )
-                if self._prune_inactive_boundaries_locked(
+                if self._route_is_revoked_locked(
                     route, time.monotonic()
                 ):
                     retired.append(attempt)
                     retired.extend(self._retire_route_locked(
-                        route_key, route
+                        route_key, route,
                     ))
                     self._route_condition.notify_all()
                 else:
@@ -1459,20 +1766,131 @@ class _StableHttpRelay:
             if route is not None:
                 route.active_transfers.pop(transfer_token, None)
 
-    def _release(self, route_key: str, lease_token: object) -> None:
+    def _release_many(
+        self,
+        releases: Iterable[Tuple[str, object]],
+    ) -> None:
+        """Release a query's routes in one registry critical section."""
         retired: List[object] = []
+        changed = False
         with self._route_condition:
-            route = self._routes.get(route_key)
-            if route is None:
-                return
-            route.boundaries.pop(lease_token, None)
-            route.leases = len(route.boundaries)
-            if not route.boundaries:
-                # DuckDB retains the opaque path as a cache identity, but no
-                # bearer URL or in-flight response survives its final query.
-                retired.extend(self._retire_route_locked(route_key, route))
-            self._route_condition.notify_all()
+            released_at = time.monotonic()
+            for route_key, lease_token in releases:
+                route = self._routes.get(route_key)
+                if route is None:
+                    continue
+                boundary = route.boundaries.get(lease_token)
+                if boundary is None:
+                    continue
+                changed = True
+                if (
+                    boundary.deadline_monotonic <= released_at
+                    or (
+                        boundary.cancel_event is not None
+                        and boundary.cancel_event.is_set()
+                    )
+                ):
+                    # Closing a lease must not erase cancellation/expiry just
+                    # before the watchdog observes it. Linearize the batch at
+                    # lock acquisition and preserve route revocation.
+                    retired.extend(self._retire_route_locked(
+                        route_key, route,
+                    ))
+                    continue
+                route.boundaries.pop(lease_token, None)
+                self._unindex_boundary_locked(
+                    route_key, lease_token, boundary,
+                )
+                route.leases = len(route.boundaries)
+                if not route.boundaries:
+                    # No bearer URL or in-flight response survives its query;
+                    # the per-lease opaque path is never minted again.
+                    retired.extend(self._retire_route_locked(
+                        route_key, route,
+                    ))
+            if changed:
+                self._route_condition.notify_all()
+            self._compact_deadline_heap_locked()
         self._close_transfers(retired)
+
+    def _compact_deadline_heap_locked(self) -> None:
+        # Released entries are removed lazily. Rebuild only when stale entries
+        # materially dominate, keeping ordinary registration/release O(log N)
+        # while bounding a long-lived relay's heap memory.
+        if len(self._deadline_heap) <= max(
+            1_024, self._active_boundary_count * 2,
+        ):
+            return
+        rebuilt: List[Tuple[float, int, str, object]] = []
+        for route_key, route in self._routes.items():
+            for lease_token, boundary in route.boundaries.items():
+                self._deadline_serial += 1
+                rebuilt.append((
+                    boundary.deadline_monotonic,
+                    self._deadline_serial,
+                    route_key,
+                    lease_token,
+                ))
+        heapq.heapify(rebuilt)
+        self._deadline_heap = rebuilt
+
+    def _discard_stale_deadlines_locked(self) -> None:
+        while self._deadline_heap:
+            deadline, _serial, route_key, lease_token = self._deadline_heap[0]
+            route = self._routes.get(route_key)
+            boundary = (
+                route.boundaries.get(lease_token)
+                if route is not None else None
+            )
+            if (
+                boundary is not None
+                and boundary.deadline_monotonic == deadline
+            ):
+                return
+            heapq.heappop(self._deadline_heap)
+
+    def _expire_deadlines_locked(self, now: float) -> List[object]:
+        retired: List[object] = []
+        self._discard_stale_deadlines_locked()
+        while self._deadline_heap and self._deadline_heap[0][0] <= now:
+            deadline, _serial, route_key, lease_token = heapq.heappop(
+                self._deadline_heap
+            )
+            route = self._routes.get(route_key)
+            boundary = (
+                route.boundaries.get(lease_token)
+                if route is not None else None
+            )
+            if (
+                boundary is None
+                or boundary.deadline_monotonic != deadline
+            ):
+                self._discard_stale_deadlines_locked()
+                continue
+            assert route is not None
+            retired.extend(self._retire_route_locked(route_key, route))
+            self._discard_stale_deadlines_locked()
+        return retired
+
+    def _expire_cancelled_boundaries_locked(self) -> List[object]:
+        retired: List[object] = []
+        cancelled = [
+            (event, tuple(references))
+            for event, references in list(self._cancel_boundaries.values())
+            if event.is_set()
+        ]
+        for event, references in cancelled:
+            for route_key, lease_token in references:
+                route = self._routes.get(route_key)
+                boundary = (
+                    route.boundaries.get(lease_token)
+                    if route is not None else None
+                )
+                if boundary is None or boundary.cancel_event is not event:
+                    continue
+                assert route is not None
+                retired.extend(self._retire_route_locked(route_key, route))
+        return retired
 
     def _watch_route_boundaries(self) -> None:
         while True:
@@ -1481,25 +1899,24 @@ class _StableHttpRelay:
                 if self._closed:
                     return
                 now = time.monotonic()
-                for route_key, route in list(self._routes.items()):
-                    if self._prune_inactive_boundaries_locked(route, now):
-                        retired.extend(self._retire_route_locked(
-                            route_key, route
-                        ))
+                retired.extend(self._expire_deadlines_locked(now))
+                retired.extend(self._expire_cancelled_boundaries_locked())
+                self._compact_deadline_heap_locked()
                 if not retired:
-                    # Cancellation Events cannot notify this Condition, so a
-                    # short bounded poll complements exact deadline wakeups.
-                    nearest = min(
-                        (
-                            boundary.deadline_monotonic
-                            for route in self._routes.values()
-                            for boundary in route.boundaries.values()
-                        ),
-                        default=now + 0.01,
-                    )
-                    self._route_condition.wait(timeout=max(
-                        0.001, min(0.01, nearest - now)
-                    ))
+                    self._discard_stale_deadlines_locked()
+                    timeout = None
+                    if self._deadline_heap:
+                        timeout = max(
+                            0.0, self._deadline_heap[0][0] - now,
+                        )
+                    if self._cancel_boundaries:
+                        timeout = min(
+                            _CANCEL_EVENT_CHECK_SECONDS,
+                            timeout
+                            if timeout is not None
+                            else _CANCEL_EVENT_CHECK_SECONDS,
+                        )
+                    self._route_condition.wait(timeout=timeout)
             self._close_transfers(retired)
 
     def _record_upstream_request(self) -> None:
@@ -1541,6 +1958,9 @@ class _StableHttpRelay:
             self._closed = True
             for route_key, route in list(self._routes.items()):
                 retired.extend(self._retire_route_locked(route_key, route))
+            self._deadline_heap.clear()
+            self._cancel_boundaries.clear()
+            self._retired_routes.clear()
             self._route_condition.notify_all()
         self._close_transfers(retired)
         self._server.shutdown()
@@ -1583,14 +2003,58 @@ def shutdown_stable_http_relay() -> None:
 
 
 def _path_is_bearer_http_url(value: object) -> bool:
+    # This helper is reached for every reflected file. Most paths are local or
+    # native provider URIs; reject those using bounded string checks without
+    # paying for ``urlsplit`` and its component allocations.
+    if not isinstance(value, str) or "?" not in value:
+        return False
+    prefix = value[:8].casefold()
+    if not (prefix.startswith("http://") or prefix.startswith("https://")):
+        return False
     try:
-        parsed = urlsplit(str(value or ""))
+        parsed = urlsplit(value)
     except Exception:
         return False
     return (
         parsed.scheme.casefold() in {"http", "https"}
         and bool(parsed.query)
     )
+
+
+def _execution_snapshot_with_relay_proof(
+    snapshot: Any,
+    *,
+    files: List[Any],
+    relay_identities: Dict[str, str],
+) -> Tuple[Any, bool]:
+    """Replace only execution-derived paths/proof, clearing catalog input.
+
+    ``resource_relay_cache_identities`` is never trusted from a manifest or
+    estimator.  It attests only registrations completed in this call, where
+    the relay will enforce the exact immutable ETag and size on every request.
+    """
+    current_files = list(getattr(snapshot, "files", ()) or ())
+    incoming_proof = getattr(
+        snapshot, "resource_relay_cache_identities", None,
+    )
+    if (
+        files == current_files
+        and not incoming_proof
+        and not relay_identities
+    ):
+        return snapshot, False
+    proof = dict(relay_identities)
+    try:
+        replaced = replace(
+            snapshot,
+            files=files,
+            resource_relay_cache_identities=proof,
+        )
+    except TypeError:
+        replaced = copy.copy(snapshot)
+        replaced.files = files
+        replaced.resource_relay_cache_identities = proof
+    return replaced, True
 
 
 def alias_stable_remote_paths(
@@ -1601,11 +2065,13 @@ def alias_stable_remote_paths(
     deadline_monotonic: Optional[float] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> Tuple[Any, StableRelayLease]:
-    """Clone a reflection and replace rotating bearer paths with stable URLs.
+    """Clone a reflection and replace bearer paths with isolated relay URLs.
 
     Linked snapshots must carry provider-issued identities one-for-one.  Local
-    presigns derive an authorization/snapshot-scoped identity from their raw
-    catalog key.  Ordinary local, S3, and unsigned HTTPS paths are unchanged.
+    presigns derive an authorization/snapshot-scoped immutable object identity
+    from their raw catalog key. Ordinary local, S3, and unsigned HTTPS paths
+    are unchanged. Execution-only relay proof is rebuilt from successful
+    registrations and never accepted from the input reflection.
     """
     route_leases: List[_RouteLease] = []
     supers = []
@@ -1614,6 +2080,22 @@ def alias_stable_remote_paths(
     try:
         for snapshot in list(getattr(reflection, "supers", ()) or ()):
             files = list(getattr(snapshot, "files", ()) or ())
+            bearer_indices = [
+                index
+                for index, path in enumerate(files)
+                if _path_is_bearer_http_url(path)
+            ]
+            if not bearer_indices:
+                snapshot, snapshot_changed = (
+                    _execution_snapshot_with_relay_proof(
+                        snapshot,
+                        files=files,
+                        relay_identities={},
+                    )
+                )
+                changed = changed or snapshot_changed
+                supers.append(snapshot)
+                continue
             raw_keys = list(getattr(snapshot, "resource_keys", ()) or ())
             sizes = list(getattr(snapshot, "resource_sizes", ()) or ())
             supplied_identities = list(
@@ -1642,27 +2124,46 @@ def alias_stable_remote_paths(
                 raise StableHttpRelayError(
                     "stable resource identities do not match the reflection"
                 )
-            if is_linked and any(
-                _path_is_bearer_http_url(path) for path in files
-            ) and len(supplied_identities) != len(files):
+            if is_linked and len(supplied_identities) != len(files):
                 raise StableHttpRelayError(
                     "linked reflection has no stable resource identities"
                 )
             if len(files) != len(raw_keys) or (sizes and len(sizes) != len(files)):
-                if is_linked and any(
-                    _path_is_bearer_http_url(path) for path in files
-                ):
+                if is_linked:
                     raise StableHttpRelayError(
                         "linked reflection resource metadata is incomplete"
                     )
+                snapshot, snapshot_changed = (
+                    _execution_snapshot_with_relay_proof(
+                        snapshot,
+                        files=files,
+                        relay_identities={},
+                    )
+                )
+                changed = changed or snapshot_changed
                 supers.append(snapshot)
                 continue
 
             aliased_files = list(files)
+            relay_identities: Dict[str, str] = {}
             seals = getattr(snapshot, "resource_object_seals", None) or {}
-            for index, (path, raw_key) in enumerate(zip(files, raw_keys)):
-                if not _path_is_bearer_http_url(path):
-                    continue
+            linked_scope = None
+            if is_linked:
+                linked_scope = _linked_snapshot_cache_scope(
+                    organization=organization,
+                    policy_fingerprint=getattr(
+                        snapshot, "share_policy_fingerprint", "",
+                    ),
+                    row_filter=getattr(
+                        snapshot, "share_row_filter", None,
+                    ),
+                    publication_generation=share_publication_generation,
+                    super_name=getattr(snapshot, "super_name", ""),
+                    simple_name=getattr(snapshot, "simple_name", ""),
+                )
+            for index in bearer_indices:
+                path = files[index]
+                raw_key = raw_keys[index]
                 try:
                     size = int(sizes[index]) if sizes else 0
                 except (TypeError, ValueError, OverflowError):
@@ -1676,16 +2177,19 @@ def alias_stable_remote_paths(
 
                 seal = seals.get(str(raw_key))
                 expected_etag = getattr(seal, "etag", "") if seal else ""
-                # Stable cache reuse is admitted only when the relay can send
-                # If-Match and verify the response ETag. Provider identities
-                # scoped by a per-manifest nonce remain direct when no such
-                # immutable condition exists.
+                # Relay admission/proof exists only when every request can use
+                # If-Match and verify the strong response ETag. Provider
+                # identities without that immutable condition remain direct.
                 if not expected_etag:
                     continue
 
                 if is_linked:
-                    cache_identity = _validate_identity(
-                        supplied_identities[index]
+                    assert linked_scope is not None
+                    cache_identity = _linked_resource_cache_identity(
+                        linked_scope=linked_scope,
+                        provider_identity=supplied_identities[index],
+                        size=size,
+                        object_seal=seal,
                     )
                 else:
                     if (
@@ -1753,14 +2257,23 @@ def alias_stable_remote_paths(
                 )
                 route_leases.append(route_lease)
                 aliased_files[index] = route_lease.url
+                raw_key_text = str(raw_key)
+                prior_identity = relay_identities.get(raw_key_text)
+                if (
+                    prior_identity is not None
+                    and prior_identity != cache_identity
+                ):
+                    raise StableHttpRelayError(
+                        "relay proof has conflicting resource identities"
+                    )
+                relay_identities[raw_key_text] = cache_identity
 
-            if aliased_files != files:
-                changed = True
-                try:
-                    snapshot = replace(snapshot, files=aliased_files)
-                except TypeError:
-                    snapshot = copy.copy(snapshot)
-                    snapshot.files = aliased_files
+            snapshot, snapshot_changed = _execution_snapshot_with_relay_proof(
+                snapshot,
+                files=aliased_files,
+                relay_identities=relay_identities,
+            )
+            changed = changed or snapshot_changed
             supers.append(snapshot)
 
         if not changed:

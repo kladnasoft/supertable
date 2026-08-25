@@ -21,6 +21,7 @@ an omission in any one layer cannot turn into a column disclosure.
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1180,6 +1181,39 @@ def test_existing_default_superuser_is_repaired_during_manager_bootstrap():
     assert context.context_missing is False
 
 
+def test_user_manager_logs_never_render_identity_or_backend_text(caplog):
+    from supertable.rbac.user_manager import UserManager
+
+    secret = "api_token=RBAC_USER_SENTINEL;https://idp.invalid/private"
+    unsafe_error_type = type(
+        f"IdentityBackend_{secret}",
+        (RuntimeError,),
+        {},
+    )
+    catalog = MagicMock()
+    catalog.rbac_get_user_id_by_username.return_value = None
+    catalog.rbac_get_superadmin_role_id.return_value = "superadmin-role"
+    manager = _user_manager_shell(catalog)
+    manager.create_user = MagicMock(side_effect=unsafe_error_type(secret))
+    caplog.set_level(logging.DEBUG)
+
+    with pytest.raises(unsafe_error_type):
+        manager._ensure_default_superuser()
+
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret not in rendered
+    assert "RBAC_USER_SENTINEL" not in rendered
+    assert "Default superuser creation failed; error_type=RuntimeError" in rendered
+    assert all(record.exc_info is None for record in caplog.records)
+
+    caplog.clear()
+    manager.create_user = UserManager.create_user.__get__(manager, UserManager)
+    username = "customer-secret@example.invalid"
+    manager.create_user({"username": username, "roles": []})
+    assert username not in caplog.text
+    assert "User created" in caplog.text
+
+
 def test_default_superuser_cannot_be_renamed_or_deprivileged():
     catalog = MagicMock()
     catalog.get_user_details.return_value = {
@@ -1315,6 +1349,33 @@ def test_corrupt_persisted_role_fails_closed_at_enforcement(bad_entry, monkeypat
     corrupt = _role(tables={"*": bad_entry})
     with pytest.raises((PermissionError, TypeError, ValueError)):
         _restrict("SELECT * FROM card", monkeypatch, corrupt)
+
+
+def test_corrupt_filter_literal_is_absent_from_logs_and_exception_chain(caplog):
+    secret = "api_token=sentinel-secret;--signed-value"
+    corrupt = {
+        "card": {
+            "columns": ["*"],
+            "filters": [
+                {
+                    "id": {
+                        "operation": "=",
+                        "type": "value",
+                        "value": secret,
+                    }
+                }
+            ],
+        }
+    }
+
+    with pytest.raises(PermissionError) as denied:
+        access_control._normalize_tables(corrupt)
+
+    assert denied.value.__cause__ is None
+    assert denied.value.__context__ is None
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret not in rendered
+    assert secret not in str(denied.value)
 
 
 def test_case_colliding_persisted_table_keys_fail_closed(monkeypatch):
@@ -1495,6 +1556,10 @@ def test_metadata_resource_stats_do_not_disclose_excluded_names(monkeypatch):
         "simple_name": "card",
         "cols_count": 1,
         "files": 1,
+        "resources": [{
+            "rows": 1,
+            "column_max_value_bytes": {"id": 8},
+        }],
         "rows": 1,
     }]
 
@@ -1552,6 +1617,7 @@ def test_meta_only_linked_stats_never_return_storage_control_data(monkeypatch):
         "last_updated_ms": 1234,
         "cols_count": 1,
         "files": 1,
+        "resources": [{"rows": 17, "file_size": 2048}],
         "size": 2048,
         "rows": 17,
     }]
@@ -1596,11 +1662,14 @@ def test_show_stats_removes_rows_for_excluded_columns(monkeypatch):
     reader.storage = MagicMock()
     reader._assert_targets_exist = MagicMock()
     reader._resolve_latest_stats_context = MagicMock(
-        return_value=("stats.parquet", False),
+        return_value=("stats.parquet", stats.height, False),
     )
     command = classify_query("SHOW STATS card", SUPER)
 
-    with patch("supertable.processing.load_stats", return_value=stats):
+    with patch(
+        "supertable.processing.load_bounded_stats_diagnostic",
+        return_value=stats,
+    ):
         result, status, message = reader._execute_show_stats(command, ROLE)
 
     assert status is Status.OK

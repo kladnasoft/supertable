@@ -30,6 +30,7 @@ from typing import Optional
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +134,9 @@ class AuditMiddleware(BaseHTTPMiddleware):
         except Exception as exc:
             # Exception messages may contain credentials, SQL, or user data.  Keep
             # only the bounded class name and a non-secret correlation reference.
-            self._emit_error_event(request, 500, type(exc).__name__, start_ms)
+            self._emit_error_event(
+                request, 500, safe_exception_type(exc), start_ms,
+            )
             raise
 
         status = response.status_code if response else 500
@@ -181,7 +184,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
         except Exception as exc:
             logger.debug(
                 "[audit-middleware] auth event emit failed: %s",
-                type(exc).__name__,
+                safe_exception_type(exc),
             )
 
     def _emit_authz_event(self, request: Request, status: int, start_ms: int) -> None:
@@ -217,7 +220,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
         except Exception as exc:
             logger.debug(
                 "[audit-middleware] authz event emit failed: %s",
-                type(exc).__name__,
+                safe_exception_type(exc),
             )
 
     def _emit_error_event(self, request: Request, status: int, error_type: str, start_ms: int) -> None:
@@ -263,5 +266,5 @@ class AuditMiddleware(BaseHTTPMiddleware):
         except Exception as exc:
             logger.debug(
                 "[audit-middleware] error event emit failed: %s",
-                type(exc).__name__,
+                safe_exception_type(exc),
             )

@@ -858,10 +858,10 @@ def test_reader_aborts_when_any_v2_segment_cannot_be_proved(
 
     assert status is reader_module.Status.ERROR
     assert result.empty
-    if failure == "size":
-        assert "segment size does not match" in message
-    else:
-        assert "Unable to resolve required deletion-vector" in message
+    # Provider errors can embed object paths, signed URLs, or response bodies.
+    # The detailed cause remains in the safe type-only diagnostic log; the
+    # reader boundary returns one controlled message for either proof failure.
+    assert message == "Query execution failed"
     executor.execute.assert_not_called()
 
 
@@ -890,7 +890,7 @@ def test_reader_fails_closed_when_pinned_tombstone_resolution_fails(monkeypatch)
 
     assert status is reader_module.Status.ERROR
     assert result.empty
-    assert "Unable to resolve required deletion-vector" in message
+    assert message == "Query execution failed"
     executor.execute.assert_not_called()
     catalog.get_leaf.assert_not_called()
 
@@ -921,7 +921,7 @@ def test_object_store_bare_key_fallback_is_not_accepted_as_resolved(monkeypatch)
 
     assert status is reader_module.Status.ERROR
     assert result.empty
-    assert "Unable to resolve required deletion-vector" in message
+    assert message == "Query execution failed"
     executor.execute.assert_not_called()
 
 
@@ -1030,6 +1030,6 @@ def test_reader_rejects_pinned_pointer_with_zero_rows(monkeypatch):
 
     assert status is reader_module.Status.ERROR
     assert result.empty
-    assert "positive row count" in message
+    assert message == "Query execution failed"
     estimator._to_duckdb_path.assert_not_called()
     executor.execute.assert_not_called()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import traceback
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -30,6 +31,7 @@ from supertable.redis_catalog import _canonicalize_role_document
 from supertable.storage.storage_interface import (
     ObjectIdentityMismatch,
     ObjectMetadata,
+    write_all,
 )
 from supertable.tombstone_manifest_v2 import (
     TombstoneManifestV2,
@@ -49,6 +51,15 @@ DV_SEGMENT = (
     f"{ORG}/{SUP}/tables/{TABLE}/tombstone/generation-3/segment.parquet"
 )
 DV_V3 = f"{ORG}/{SUP}/tables/{TABLE}/tombstone/deleted-v3.parquet"
+_BACKEND_SECRET = (
+    "https://objects.example/private?X-Amz-Credential=TOPSECRET "
+    "/srv/supertable/private/recovery.sql "
+    "SELECT password FROM credentials"
+)
+
+
+class _SecretBackendError(RuntimeError):
+    pass
 
 
 class MemoryStorage:
@@ -78,6 +89,30 @@ class MemoryStorage:
             raise ObjectIdentityMismatch(f"object changed: {path}")
         return self.files[path][offset:offset + length]
 
+    def download_to_file(
+        self,
+        path,
+        file_obj,
+        *,
+        expected=None,
+        chunk_size=8 * 1024 * 1024,
+    ):
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        before = self.stat_object(path)
+        if expected is not None and before != expected:
+            raise ObjectIdentityMismatch("object changed before download")
+        payload = self.files[path]
+        written = 0
+        for offset in range(0, len(payload), chunk_size):
+            written += write_all(file_obj, payload[offset:offset + chunk_size])
+        after = self.stat_object(path)
+        if after != before:
+            raise ObjectIdentityMismatch("object changed during download")
+        if written != before.size:
+            raise OSError("short test-storage download")
+        return written
+
     def write_bytes(self, path, payload):
         self.files[path] = bytes(payload)
 
@@ -99,6 +134,72 @@ class MemoryStorage:
             if "/" not in suffix and fnmatch.fnmatch(suffix, pattern):
                 result.append(key)
         return sorted(result)
+
+
+class _ReadFailureStorage:
+    def __init__(self, delegate):
+        self._delegate = delegate
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+    def read_bytes(self, _path):
+        raise _SecretBackendError(_BACKEND_SECRET)
+
+
+class _ExecuteFailurePipeline:
+    def __init__(self, delegate):
+        self._delegate = delegate
+
+    def __getattr__(self, name):
+        method = getattr(self._delegate, name)
+
+        def queue(*args, **kwargs):
+            method(*args, **kwargs)
+            return self
+
+        return queue
+
+    def execute(self):
+        raise _SecretBackendError(_BACKEND_SECRET)
+
+
+class _ExecuteFailureRedis:
+    def __init__(self, delegate):
+        self._delegate = delegate
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+    def pipeline(self, transaction=True):
+        return _ExecuteFailurePipeline(
+            self._delegate.pipeline(transaction=transaction),
+        )
+
+
+def _raise_secret_backend_error():
+    raise _SecretBackendError(_BACKEND_SECRET)
+
+
+def _assert_secret_absent(rendered):
+    for fragment in (
+        _BACKEND_SECRET,
+        "TOPSECRET",
+        "/srv/supertable/private/recovery.sql",
+        "SELECT password FROM credentials",
+    ):
+        assert fragment not in rendered
+
+
+def _assert_safe_recovery_exception(error):
+    rendered = "".join(
+        traceback.format_exception(type(error), error, error.__traceback__),
+    )
+    _assert_secret_absent(str(error))
+    _assert_secret_absent(repr(error))
+    _assert_secret_absent(rendered)
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
 
 
 def _redis():
@@ -895,16 +996,16 @@ def test_checkpoint_caps_second_manifest_seal_before_content_read():
 
 
 @pytest.mark.parametrize(
-    "mutation, error",
+    "mutation, reason",
     [
-        ("noncanonical", "canonical"),
-        ("root_digest", "SHA-256"),
-        ("table", "pinned table"),
-        ("lineage", "immediate successor"),
-        ("count", "total_rows"),
+        ("noncanonical", "manifest_noncanonical"),
+        ("root_digest", "manifest_digest_mismatch"),
+        ("table", "manifest_identity_mismatch"),
+        ("lineage", "manifest_lineage_invalid"),
+        ("count", "manifest_row_count_mismatch"),
     ],
 )
-def test_checkpoint_rejects_invalid_v2_manifest_contract(mutation, error):
+def test_checkpoint_rejects_invalid_v2_manifest_contract(mutation, reason):
     source = _redis()
     storage = MemoryStorage()
     manifest = _seed_v2_catalog(source, storage)
@@ -935,7 +1036,7 @@ def test_checkpoint_rejects_invalid_v2_manifest_contract(mutation, error):
     leaf["payload"] = snapshot
     source.set(RK.meta_leaf(ORG, SUP, TABLE), json.dumps(leaf))
 
-    with pytest.raises(RecoveryError, match=error):
+    with pytest.raises(RecoveryError, match=f"reason={reason}"):
         _checkpoint(source, storage)
 
 
@@ -1124,3 +1225,101 @@ def test_recovery_cli_apply_and_followup_dry_run_are_idempotent(
     assert verified["ok"] is True
     assert verified["already_current"] is True
     assert verified["applied"] is False
+
+
+@pytest.mark.parametrize(
+    "failure_stage,expected_error_type",
+    [
+        ("redis_connector", "_SecretBackendError"),
+        ("storage_factory", "_SecretBackendError"),
+        ("storage_read", "RecoveryError"),
+        ("redis_transaction", "RecoveryError"),
+    ],
+)
+def test_recovery_cli_never_exposes_backend_failure_details(
+    failure_stage,
+    expected_error_type,
+    monkeypatch,
+    capsys,
+):
+    storage = MemoryStorage()
+    destination = _redis()
+    arguments = ["--organization", ORG, "--dry-run"]
+
+    if failure_stage == "redis_connector":
+        monkeypatch.setattr(
+            "supertable.redis_connector.RedisConnector",
+            _raise_secret_backend_error,
+        )
+    else:
+        source = _redis()
+        _seed_catalog(source, storage)
+        _checkpoint(source, storage)
+        redis_client = destination
+        selected_storage = storage
+        if failure_stage == "storage_factory":
+            selected_storage = None
+        elif failure_stage == "storage_read":
+            selected_storage = _ReadFailureStorage(storage)
+        elif failure_stage == "redis_transaction":
+            redis_client = _ExecuteFailureRedis(destination)
+            arguments[-1] = "--apply"
+        monkeypatch.setattr(
+            "supertable.redis_connector.RedisConnector",
+            lambda: SimpleNamespace(r=redis_client),
+        )
+        monkeypatch.setattr(
+            "supertable.storage.storage_factory.get_storage",
+            (
+                _raise_secret_backend_error
+                if selected_storage is None
+                else lambda: selected_storage
+            ),
+        )
+
+    assert main(arguments) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload == {
+        "error": "recovery_failed",
+        "error_type": expected_error_type,
+        "ok": False,
+    }
+    assert captured.err == ""
+    rendered = captured.out + captured.err
+    _assert_secret_absent(rendered)
+    assert "Traceback" not in rendered
+    assert "During handling of the above exception" not in rendered
+
+
+def test_recovery_read_failure_has_safe_public_exception_surface():
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    _checkpoint(source, storage)
+
+    with pytest.raises(RecoveryError) as raised:
+        plan_redis_rebuild(_ReadFailureStorage(storage), ORG)
+
+    _assert_safe_recovery_exception(raised.value)
+    assert str(raised.value) == (
+        "cannot read catalog checkpoint; error_type=_SecretBackendError"
+    )
+
+
+def test_recovery_transaction_failure_has_safe_public_exception_surface():
+    source = _redis()
+    storage = MemoryStorage()
+    _seed_catalog(source, storage)
+    _checkpoint(source, storage)
+
+    with pytest.raises(RecoveryError) as raised:
+        rebuild_redis(
+            _ExecuteFailureRedis(_redis()),
+            storage,
+            ORG,
+            dry_run=False,
+        )
+
+    _assert_safe_recovery_exception(raised.value)
+    assert "error_type=_SecretBackendError" in str(raised.value)

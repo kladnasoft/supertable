@@ -20,7 +20,15 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from supertable.audit.chain import compute_file_hash
-from supertable.audit.writer_parquet import ParquetAuditWriter
+from supertable.audit.diagnostics import safe_audit_error_type
+from supertable.audit.writer_parquet import (
+    AuditReadError,
+    AuditReadLimitError,
+    ParquetAuditWriter,
+    _BoundedSpillWriter,
+    _validated_object_metadata,
+)
+from supertable.utils.diagnostic_redaction import safe_value_type
 
 try:
     import pyarrow as pa
@@ -28,6 +36,44 @@ try:
 except ImportError:  # pragma: no cover - pyarrow is a required project dependency
     pa = None  # type: ignore
     pq = None  # type: ignore
+
+
+_MAX_EXCEPTION_ARG_BYTES = 4096
+
+
+def _safe_error_type(exc: BaseException) -> str:
+    """Return a bounded, non-message diagnostic for an untrusted failure."""
+
+    return safe_audit_error_type(exc)
+
+
+def _safe_type_name(value: Any) -> str:
+    return safe_value_type(value)
+
+
+def _exception_has_token(exc: BaseException, token: str) -> bool:
+    """Recognize one transport status token without rendering the exception."""
+
+    try:
+        arguments = exc.args
+    except Exception:
+        return False
+    if not isinstance(arguments, tuple):
+        return False
+    for value in arguments[:4]:
+        if isinstance(value, bytes):
+            if len(value) > _MAX_EXCEPTION_ARG_BYTES:
+                continue
+            text = value.decode("ascii", errors="ignore")
+        elif isinstance(value, str):
+            if len(value.encode("utf-8", errors="ignore")) > _MAX_EXCEPTION_ARG_BYTES:
+                continue
+            text = value
+        else:
+            continue
+        if token.casefold() in text.casefold():
+            return True
+    return False
 
 
 class PrivilegedOutboxError(RuntimeError):
@@ -38,9 +84,15 @@ class OutboxBackendError(PrivilegedOutboxError):
     """Redis or archive storage failed; an empty result must not be inferred."""
 
     def __init__(self, operation: str, cause: BaseException):
-        super().__init__(f"privileged outbox {operation} failed: {cause}")
+        cause_type = _safe_error_type(cause)
+        super().__init__(
+            f"privileged outbox {operation} failed; error_type={cause_type}"
+        )
         self.operation = operation
-        self.cause = cause
+        self.cause_type = cause_type
+        self.cause = RuntimeError(
+            f"privileged outbox backend failure; error_type={cause_type}"
+        )
 
 
 class OutboxRecordError(PrivilegedOutboxError):
@@ -172,10 +224,12 @@ def _text(value: Any, *, field: str) -> str:
         try:
             return value.decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise OutboxRecordError(f"{field} is not valid UTF-8") from exc
+            raise OutboxRecordError(f"{field} is not valid UTF-8") from None
     if isinstance(value, str):
         return value
-    raise OutboxRecordError(f"{field} must be bytes or str, got {type(value).__name__}")
+    raise OutboxRecordError(
+        f"{field} must be bytes or str; value_type={_safe_type_name(value)}"
+    )
 
 
 def _stream_id_tuple(stream_id: str) -> Tuple[int, int]:
@@ -197,7 +251,7 @@ def _stream_id_tuple(stream_id: str) -> Tuple[int, int]:
             raise ValueError("Redis stream ID component exceeds uint64")
         return parsed
     except (AttributeError, TypeError, ValueError) as exc:
-        raise OutboxRecordError(f"invalid Redis stream id: {stream_id!r}") from exc
+        raise OutboxRecordError("invalid Redis stream id") from None
 
 
 def _safe_archive_organization(value: Any) -> str:
@@ -208,7 +262,7 @@ def _safe_archive_organization(value: Any) -> str:
     try:
         RK.audit_privileged_outbox(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError("organization is not safe for audit storage") from exc
+        raise ValueError("organization is not safe for audit storage") from None
     return value
 
 
@@ -236,7 +290,7 @@ def _load_shared_record(payload: Dict[str, Any], event_json: str) -> Mapping[str
         if exc.name == "supertable.audit.privileged":
             raise OutboxRecordError(
                 "supertable.audit.privileged is unavailable; privileged records cannot be verified"
-            ) from exc
+            ) from None
         raise
 
     record_type = getattr(module, "PrivilegedAuditRecord", None)
@@ -246,7 +300,10 @@ def _load_shared_record(payload: Dict[str, Any], event_json: str) -> Mapping[str
         from_json = getattr(record_type, "from_json", None)
         record = from_json(event_json) if callable(from_json) else record_type.from_dict(payload)
     except Exception as exc:
-        raise OutboxRecordError(f"event_json failed privileged record validation: {exc}") from exc
+        raise OutboxRecordError(
+            "event_json failed privileged record validation; "
+            f"error_type={_safe_error_type(exc)}"
+        ) from None
     if hasattr(record, "to_dict"):
         value = record.to_dict()
         if isinstance(value, Mapping):
@@ -512,10 +569,68 @@ return {removed_entries, removed_manifests, removed_metadata}
     def _redis_call(self, operation: str, method: str, *args: Any, **kwargs: Any) -> Any:
         try:
             return getattr(self._redis, method)(*args, **kwargs)
-        except PrivilegedOutboxError:
-            raise
         except Exception as exc:
-            raise OutboxBackendError(operation, exc) from exc
+            raise OutboxBackendError(operation, exc) from None
+
+    @staticmethod
+    def _sealed_read_bytes(
+        storage: Any,
+        path: str,
+        *,
+        maximum_size: int,
+        expected_size: Optional[int] = None,
+        artifact: str = "privileged archive",
+    ) -> bytes:
+        """Read one exact object version through a hard byte ceiling."""
+        stat_object = getattr(storage, "stat_object", None)
+        download_to_file = getattr(storage, "download_to_file", None)
+        if not callable(stat_object) or not callable(download_to_file):
+            raise ArchiveVerificationError(
+                "privileged archive storage lacks sealed streaming reads"
+            )
+        try:
+            observed = _validated_object_metadata(
+                stat_object(path), minimum_size=1, maximum_size=maximum_size,
+            )
+            if expected_size is not None and observed.size != expected_size:
+                raise ArchiveVerificationError(
+                    f"{artifact} size differs from its immutable claim"
+                )
+            buffer = io.BytesIO()
+            sink = _BoundedSpillWriter(buffer, observed.size)
+            downloaded = download_to_file(
+                path,
+                sink,
+                expected=observed,
+                chunk_size=min(1024 * 1024, maximum_size),
+            )
+            if (
+                type(downloaded) is not int
+                or downloaded != observed.size
+                or sink.written != observed.size
+                or buffer.tell() != observed.size
+            ):
+                raise ArchiveVerificationError(
+                    f"{artifact} download is incomplete"
+                )
+            resealed = _validated_object_metadata(
+                stat_object(path), minimum_size=1, maximum_size=maximum_size,
+            )
+            if resealed != observed:
+                raise ArchiveVerificationError(
+                    f"{artifact} identity changed during download"
+                )
+            return buffer.getvalue()
+        except ArchiveVerificationError:
+            raise
+        except AuditReadLimitError as exc:
+            raise ArchiveVerificationError(
+                f"{artifact} exceeded its reader safety limit"
+            ) from None
+        except AuditReadError as exc:
+            raise ArchiveVerificationError(
+                f"{artifact} identity seal is invalid"
+            ) from None
 
     # -- decoding and query --------------------------------------------
 
@@ -527,7 +642,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         stream_id = _text(raw_id, field="stream_id")
         _stream_id_tuple(stream_id)
         if not isinstance(raw_fields, Mapping):
-            raise OutboxRecordError(f"stream {stream_id} fields must be a mapping")
+            raise OutboxRecordError("Redis stream entry fields must be a mapping")
         allowed_fields = {
             "event_json", *PrivilegedAuditOutbox._INDEX_FIELDS,
             *PrivilegedAuditOutbox._COMMIT_FIELDS,
@@ -545,7 +660,7 @@ return {removed_entries, removed_manifests, removed_metadata}
             name = _text(raw_name, field="field name")
             if name not in allowed_fields:
                 raise OutboxRecordError(
-                    f"stream {stream_id} contains unexpected field {name!r}"
+                    "Redis stream entry contains an unexpected field"
                 )
             if name in fields:
                 raise OutboxRecordError(
@@ -576,7 +691,9 @@ return {removed_entries, removed_manifests, removed_metadata}
         try:
             event = json.loads(event_json)
         except (TypeError, ValueError) as exc:
-            raise OutboxRecordError(f"stream {stream_id} has invalid event_json: {exc}") from exc
+            raise OutboxRecordError(
+                "Redis stream entry has invalid event_json"
+            ) from None
         if not isinstance(event, dict):
             raise OutboxRecordError(f"stream {stream_id} event_json must decode to an object")
         validated = dict(_load_shared_record(event, event_json))
@@ -615,8 +732,9 @@ return {removed_entries, removed_manifests, removed_metadata}
             committed_event_json = committed_record.to_json()
         except Exception as exc:
             raise OutboxRecordError(
-                f"stream {stream_id} commit envelope is invalid: {exc}"
-            ) from exc
+                "Redis stream entry commit envelope is invalid; "
+                f"error_type={_safe_error_type(exc)}"
+            ) from None
         for field in PrivilegedAuditOutbox._INDEX_FIELDS:
             if field in fields:
                 duplicate = _text(fields[field], field=field)
@@ -672,8 +790,8 @@ return {removed_entries, removed_manifests, removed_metadata}
             return RK.audit_privileged_cascade(organization, manifest_id)
         except (TypeError, ValueError) as exc:
             raise OutboxRecordError(
-                f"cascade manifest identity is not a safe Redis key segment: {exc}"
-            ) from exc
+                "cascade manifest identity is not a safe Redis key segment"
+            ) from None
 
     @staticmethod
     def _parse_cascade_manifest(
@@ -703,10 +821,8 @@ return {removed_entries, removed_manifests, removed_metadata}
                 raise OutboxRecordError("cascade manifest field value is too large")
             key = _text(raw_key, field="cascade manifest field")
             if key in decoded:
-                raise OutboxRecordError(
-                    f"cascade manifest contains duplicate field {key!r}"
-                )
-            decoded[key] = _text(raw_value, field=f"cascade manifest {key}")
+                raise OutboxRecordError("cascade manifest contains a duplicate field")
+            decoded[key] = _text(raw_value, field="cascade manifest value")
 
         missing = _CASCADE_META_FIELDS - set(decoded)
         unknown = {
@@ -715,10 +831,7 @@ return {removed_entries, removed_manifests, removed_metadata}
             if field not in _CASCADE_META_FIELDS and not field.startswith("user:")
         }
         if missing or unknown:
-            raise OutboxRecordError(
-                "cascade manifest field set is invalid: "
-                f"missing={sorted(missing)}, unknown={sorted(unknown)}"
-            )
+            raise OutboxRecordError("cascade manifest field set is invalid")
 
         schema_version = _bounded_decimal(
             decoded["schema_version"], field="cascade schema_version", minimum=1,
@@ -782,7 +895,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         except (TypeError, ValueError) as exc:
             raise OutboxRecordError(
                 "cascade parent contains invalid numeric fields"
-            ) from exc
+            ) from None
         if (
             user_count != expected_user_count
             or removed_count != expected_removed_count
@@ -800,20 +913,16 @@ return {removed_entries, removed_manifests, removed_metadata}
                 continue
             user_id = field[5:]
             if not _SAFE_CASCADE_USER_ID.fullmatch(user_id):
-                raise OutboxRecordError(
-                    f"cascade manifest has unsafe user ID {user_id!r}"
-                )
+                raise OutboxRecordError("cascade manifest has an unsafe user ID")
             if len(packed) > 128:
                 raise OutboxRecordError("cascade evidence row exceeds 128 bytes")
             parts = packed.split("|")
             if len(parts) != 5:
-                raise OutboxRecordError(
-                    f"cascade evidence for user {user_id!r} is malformed"
-                )
+                raise OutboxRecordError("cascade evidence row is malformed")
             before_doc, after_doc, occurrences, before_roles, after_roles = (
                 _bounded_decimal(
                     part,
-                    field=f"cascade {user_id} {name}",
+                    field="cascade row counter",
                     minimum=minimum,
                 )
                 for part, name, minimum in zip(
@@ -829,12 +938,10 @@ return {removed_entries, removed_manifests, removed_metadata}
                 )
             )
             if after_doc != before_doc + 1:
-                raise OutboxRecordError(
-                    f"cascade evidence for user {user_id!r} has a version gap"
-                )
+                raise OutboxRecordError("cascade evidence row has a version gap")
             if occurrences > before_roles or after_roles != before_roles - occurrences:
                 raise OutboxRecordError(
-                    f"cascade evidence for user {user_id!r} has inconsistent role counts"
+                    "cascade evidence row has inconsistent role counts"
                 )
             rows.append(CascadeEvidenceRow(
                 user_id=user_id,
@@ -973,9 +1080,9 @@ return {removed_entries, removed_manifests, removed_metadata}
             self._redis.xgroup_create(self.stream_key, group, id=start_id, mkstream=True)
             return True
         except Exception as exc:
-            if "busygroup" in str(exc).lower():
+            if _exception_has_token(exc, "BUSYGROUP"):
                 return False
-            raise OutboxBackendError("create consumer group", exc) from exc
+            raise OutboxBackendError("create consumer group", exc) from None
 
     def read_group(
         self,
@@ -1017,7 +1124,7 @@ return {removed_entries, removed_manifests, removed_metadata}
                 raise OutboxRecordError("XREADGROUP returned a malformed stream result")
             returned_key = _text(stream_result[0], field="stream key")
             if returned_key != self.stream_key:
-                raise OutboxRecordError(f"XREADGROUP returned unexpected stream {returned_key!r}")
+                raise OutboxRecordError("XREADGROUP returned an unexpected stream")
             entries.extend(self._decode_entry(item) for item in stream_result[1])
             if len(entries) > count:
                 raise OutboxRecordError(
@@ -1082,7 +1189,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         try:
             return int(result)
         except (TypeError, ValueError) as exc:
-            raise OutboxRecordError(f"XACK returned a non-integer result: {result!r}") from exc
+            raise OutboxRecordError("XACK returned a non-integer result") from None
 
     # -- durable archive ledger ---------------------------------------
 
@@ -1127,7 +1234,7 @@ return {removed_entries, removed_manifests, removed_metadata}
             template_payload = json.loads(entry.event_json)
             committed_payload = json.loads(entry.committed_event_json)
         except (TypeError, ValueError) as exc:
-            raise OutboxRecordError(f"archive entry contains invalid JSON: {exc}") from exc
+            raise OutboxRecordError("archive entry contains invalid JSON") from None
         if not isinstance(template_payload, dict) or not isinstance(committed_payload, dict):
             raise OutboxRecordError("archive entry JSON must contain objects")
 
@@ -1143,8 +1250,9 @@ return {removed_entries, removed_manifests, removed_metadata}
             canonical_committed_json = committed_record.to_json()
         except Exception as exc:
             raise OutboxRecordError(
-                f"archive entry committed record is invalid: {exc}"
-            ) from exc
+                "archive entry committed record is invalid; "
+                f"error_type={_safe_error_type(exc)}"
+            ) from None
         if canonical_committed_json != entry.committed_event_json:
             raise OutboxRecordError("archive entry committed JSON is not canonical")
 
@@ -1175,7 +1283,9 @@ return {removed_entries, removed_manifests, removed_metadata}
                     "successful archive entry namespace_version must be positive"
                 )
         except (TypeError, ValueError) as exc:
-            raise OutboxRecordError("archive entry commit fields are invalid") from exc
+            raise OutboxRecordError(
+                "archive entry commit fields are invalid"
+            ) from None
         if dict(entry.event) != committed:
             raise OutboxRecordError(
                 "archive entry mapping differs from its exact committed JSON"
@@ -1212,7 +1322,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         try:
             record = json.loads(value)
         except (TypeError, ValueError) as exc:
-            raise OutboxRecordError(f"delivery ledger contains invalid JSON: {exc}") from exc
+            raise OutboxRecordError("delivery ledger contains invalid JSON") from None
         if not isinstance(record, dict) or record.get("version") != PrivilegedAuditOutbox._LEDGER_VERSION:
             raise OutboxRecordError("delivery ledger contains an unsupported record")
         return record
@@ -1245,12 +1355,12 @@ return {removed_entries, removed_manifests, removed_metadata}
         )
         if raw is None or len(raw) != 1:
             raise OutboxRecordError(
-                f"privileged source stream has no exact entry {expected.stream_id}"
+                "privileged source stream has no exact entry"
             )
         actual = self._decode_entry(raw[0])
         if not self._same_entry(actual, expected):
             raise OutboxRecordError(
-                f"privileged source stream entry {expected.stream_id} differs from the archive input"
+                "privileged source stream entry differs from the archive input"
             )
         return actual
 
@@ -1293,7 +1403,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         except (KeyError, TypeError, ValueError) as exc:
             raise OutboxRecordError(
                 "delivery ledger archive head has an invalid sequence"
-            ) from exc
+            ) from None
         if first_sequence < 1 or sequence < first_sequence:
             raise OutboxRecordError(
                 "delivery ledger archive head sequence is invalid"
@@ -1330,7 +1440,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         except (TypeError, ValueError) as exc:
             raise OutboxRecordError(
                 "delivery ledger HLEN returned a non-integer"
-            ) from exc
+            ) from None
         if count < 0:
             raise OutboxRecordError("delivery ledger HLEN returned a negative count")
         return count
@@ -1635,7 +1745,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         except (TypeError, ValueError) as exc:
             raise OutboxRecordError(
                 "archive claim Lua returned a non-integer status"
-            ) from exc
+            ) from None
         if code == -1:
             raise DeliveryPendingError(
                 "privileged archive head advanced concurrently; retry the batch"
@@ -1676,7 +1786,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         try:
             code = int(result[0])
         except (TypeError, ValueError) as exc:
-            raise OutboxRecordError("archive batch CAS status is invalid") from exc
+            raise OutboxRecordError("archive batch CAS status is invalid") from None
         current = _text(result[1], field="archive batch CAS record")
         if code in {1, 2}:
             return True, current
@@ -1982,7 +2092,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         try:
             byte_count = int(value.get("bytes_written", -1))
         except (TypeError, ValueError) as exc:
-            raise OutboxRecordError("archive artifact byte count is invalid") from exc
+            raise OutboxRecordError("archive artifact byte count is invalid") from None
         if path != expected_path or schema != expected_schema:
             raise OutboxRecordError("archive artifact path/schema claim is invalid")
         if (
@@ -2087,13 +2197,19 @@ return {removed_entries, removed_manifests, removed_metadata}
                     atomic_write(path, expected)
                 else:
                     storage.write_bytes(path, expected)
-            actual = storage.read_bytes(path)
+            actual = self._sealed_read_bytes(
+                storage,
+                path,
+                maximum_size=self._MAX_LEDGER_RECORD_BYTES,
+                expected_size=len(expected),
+                artifact="archive checkpoint",
+            )
         except PrivilegedOutboxError:
             raise
         except Exception as exc:
             raise OutboxBackendError(
                 "write/read immutable archive checkpoint", exc,
-            ) from exc
+            ) from None
         if (
             actual != expected
             or compute_file_hash(actual) != spec["file_hash"]
@@ -2106,7 +2222,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         except (TypeError, ValueError) as exc:
             raise ArchiveVerificationError(
                 "immutable archive checkpoint is not valid JSON"
-            ) from exc
+            ) from None
         if parsed != spec["manifest"]:
             raise ArchiveVerificationError(
                 "immutable archive checkpoint content is not canonical"
@@ -2150,11 +2266,17 @@ return {removed_entries, removed_manifests, removed_metadata}
                     atomic_write(path, candidate)
                 else:
                     storage.write_bytes(path, candidate)
-            actual = storage.read_bytes(path)
+            actual = self._sealed_read_bytes(
+                storage,
+                path,
+                maximum_size=self._MAX_PARQUET_ARTIFACT_BYTES,
+                expected_size=int(spec["bytes_written"]),
+                artifact=operation,
+            )
         except PrivilegedOutboxError:
             raise
         except Exception as exc:
-            raise OutboxBackendError(operation, exc) from exc
+            raise OutboxBackendError(operation, exc) from None
 
         if (
             len(actual) != int(spec["bytes_written"])
@@ -2166,7 +2288,10 @@ return {removed_entries, removed_manifests, removed_metadata}
         try:
             actual_rows = pq.read_table(io.BytesIO(actual)).to_pylist()
         except Exception as exc:
-            raise ArchiveVerificationError(f"{operation} cannot be read: {exc}") from exc
+            raise ArchiveVerificationError(
+                f"{operation} cannot be read; "
+                f"error_type={_safe_error_type(exc)}"
+            ) from None
         if actual_rows != list(rows):
             raise ArchiveVerificationError(f"{operation} rows differ from source evidence")
         return actual
@@ -2186,7 +2311,9 @@ return {removed_entries, removed_manifests, removed_metadata}
         try:
             storage = self._writer._get_storage()
         except Exception as exc:
-            raise OutboxBackendError("open privileged archive storage", exc) from exc
+            raise OutboxBackendError(
+                "open privileged archive storage", exc
+            ) from None
         parent_spec = self._validated_artifact_spec(
             artifact_claim.get("parent") if isinstance(artifact_claim, Mapping) else None,
             expected_path=self._archive_path(org, batch_id),
@@ -2252,7 +2379,9 @@ return {removed_entries, removed_manifests, removed_metadata}
             try:
                 extra_verified = self._archive_verifier(archive)
             except Exception as exc:
-                raise OutboxBackendError("run additional archive verifier", exc) from exc
+                raise OutboxBackendError(
+                    "run additional archive verifier", exc
+                ) from None
             if not extra_verified:
                 raise ArchiveVerificationError("additional privileged archive verifier rejected delivery")
         return archive
@@ -2321,7 +2450,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         try:
             code = int(result[0])
         except (TypeError, ValueError) as exc:
-            raise OutboxRecordError("archive finalize status is invalid") from exc
+            raise OutboxRecordError("archive finalize status is invalid") from None
         current = _text(result[1], field="archive finalize batch record")
         if code == 1:
             return True, current
@@ -2535,9 +2664,7 @@ return {removed_entries, removed_manifests, removed_metadata}
                 continue
 
             if status != "delivered":
-                raise OutboxRecordError(
-                    f"delivery ledger has unsupported status {status!r}"
-                )
+                raise OutboxRecordError("delivery ledger has an unsupported status")
             raw_head = self._ledger_get(self._ARCHIVE_HEAD_FIELD)
             if raw_head is None:
                 raise OutboxRecordError(
@@ -2715,7 +2842,7 @@ return {removed_entries, removed_manifests, removed_metadata}
             except (TypeError, ValueError) as exc:
                 raise OutboxRecordError(
                     "XPENDING returned an invalid pending count"
-                ) from exc
+                ) from None
             if pending_count < 0:
                 raise OutboxRecordError("XPENDING returned a negative pending count")
             if pending_count:
@@ -2764,16 +2891,18 @@ return {removed_entries, removed_manifests, removed_metadata}
             raise ArchiveVerificationError("archive checkpoint path is not deterministic")
         try:
             storage = self._writer._get_storage()
-            size = getattr(storage, "size", None)
-            if callable(size) and int(size(path)) > self._MAX_LEDGER_RECORD_BYTES:
-                raise ArchiveVerificationError(
-                    "archive checkpoint exceeds the 1-MiB limit"
-                )
-            payload = storage.read_bytes(path)
+            payload = self._sealed_read_bytes(
+                storage,
+                path,
+                maximum_size=self._MAX_LEDGER_RECORD_BYTES,
+                artifact="archive checkpoint",
+            )
         except PrivilegedOutboxError:
             raise
         except Exception as exc:
-            raise OutboxBackendError("read immutable archive checkpoint", exc) from exc
+            raise OutboxBackendError(
+                "read immutable archive checkpoint", exc
+            ) from None
         if len(payload) > self._MAX_LEDGER_RECORD_BYTES:
             raise ArchiveVerificationError("archive checkpoint exceeds the 1-MiB limit")
         if (
@@ -2786,7 +2915,9 @@ return {removed_entries, removed_manifests, removed_metadata}
         try:
             manifest = json.loads(payload)
         except (TypeError, ValueError) as exc:
-            raise ArchiveVerificationError("archive checkpoint is invalid JSON") from exc
+            raise ArchiveVerificationError(
+                "archive checkpoint is invalid JSON"
+            ) from None
         if not isinstance(manifest, dict):
             raise ArchiveVerificationError("archive checkpoint must be an object")
         supplied_hash = manifest.get("manifest_sha256")
@@ -2818,7 +2949,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         except (KeyError, TypeError, ValueError) as exc:
             raise ArchiveVerificationError(
                 "archive checkpoint range is invalid"
-            ) from exc
+            ) from None
         if (
             first_sequence < 1
             or last_sequence < first_sequence
@@ -2857,7 +2988,7 @@ return {removed_entries, removed_manifests, removed_metadata}
             except OutboxRecordError as exc:
                 raise ArchiveVerificationError(
                     "archive checkpoint predecessor stream ID is invalid"
-                ) from exc
+                ) from None
             if previous_stream_id >= _stream_id_tuple(first_stream_id):
                 raise ArchiveVerificationError(
                     "archive checkpoint stream range does not advance its predecessor"
@@ -2935,7 +3066,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         if raw_ledger is not None:
             ledger = self._decode_ledger(raw_ledger)
             if ledger.get("status") != "delivered":
-                raise DeliveryPendingError(f"archive batch {batch_id} is not delivered")
+                raise DeliveryPendingError("archive batch is not delivered")
             ledger_organization = ledger.get("organization")
             if not isinstance(ledger_organization, str) or not ledger_organization:
                 raise OutboxRecordError("delivered batch organization is invalid")
@@ -2992,18 +3123,19 @@ return {removed_entries, removed_manifests, removed_metadata}
             raise OutboxRecordError("archive metadata has no valid path")
         try:
             storage = self._writer._get_storage()
-            size = getattr(storage, "size", None)
-            if callable(size) and int(size(path)) != int(
-                archive.get("bytes_written", -1)
-            ):
-                raise ArchiveVerificationError(
-                    "privileged archive size differs from checkpoint"
-                )
-            payload = storage.read_bytes(path)
+            payload = self._sealed_read_bytes(
+                storage,
+                path,
+                maximum_size=self._MAX_PARQUET_ARTIFACT_BYTES,
+                expected_size=int(archive.get("bytes_written", -1)),
+                artifact="privileged archive",
+            )
         except PrivilegedOutboxError:
             raise
         except Exception as exc:
-            raise OutboxBackendError("read privileged Parquet archive", exc) from exc
+            raise OutboxBackendError(
+                "read privileged Parquet archive", exc
+            ) from None
         if len(payload) != int(archive.get("bytes_written", -1)):
             raise ArchiveVerificationError(
                 "privileged archive size differs from checkpoint"
@@ -3013,7 +3145,10 @@ return {removed_entries, removed_manifests, removed_metadata}
         try:
             rows = pq.read_table(io.BytesIO(payload)).to_pylist()
         except Exception as exc:
-            raise ArchiveVerificationError(f"privileged archive cannot be decoded: {exc}") from exc
+            raise ArchiveVerificationError(
+                "privileged archive cannot be decoded; "
+                f"error_type={_safe_error_type(exc)}"
+            ) from None
         if len(rows) != int(archive.get("event_count", -1)):
             raise ArchiveVerificationError("privileged archive row count differs from ledger")
 
@@ -3093,18 +3228,19 @@ return {removed_entries, removed_manifests, removed_metadata}
             raise ArchiveVerificationError("no ParquetAuditWriter is configured")
         try:
             storage = self._writer._get_storage()
-            size = getattr(storage, "size", None)
-            if callable(size) and int(size(path)) != int(
-                cascade_meta.get("bytes_written", -1)
-            ):
-                raise ArchiveVerificationError(
-                    "cascade archive size differs from checkpoint"
-                )
-            payload = storage.read_bytes(path)
+            payload = self._sealed_read_bytes(
+                storage,
+                path,
+                maximum_size=self._MAX_PARQUET_ARTIFACT_BYTES,
+                expected_size=int(cascade_meta.get("bytes_written", -1)),
+                artifact="cascade archive",
+            )
         except PrivilegedOutboxError:
             raise
         except Exception as exc:
-            raise OutboxBackendError("read role-delete cascade archive", exc) from exc
+            raise OutboxBackendError(
+                "read role-delete cascade archive", exc
+            ) from None
         if len(payload) != int(cascade_meta.get("bytes_written", -1)):
             raise ArchiveVerificationError(
                 "cascade archive size differs from checkpoint"
@@ -3117,8 +3253,9 @@ return {removed_entries, removed_manifests, removed_metadata}
             rows = pq.read_table(io.BytesIO(payload)).to_pylist()
         except Exception as exc:
             raise ArchiveVerificationError(
-                f"cascade archive cannot be decoded: {exc}"
-            ) from exc
+                "cascade archive cannot be decoded; "
+                f"error_type={_safe_error_type(exc)}"
+            ) from None
         try:
             expected_row_count = int(cascade_meta.get("row_count", -1))
             expected_manifest_count = int(
@@ -3127,7 +3264,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         except (TypeError, ValueError) as exc:
             raise ArchiveVerificationError(
                 "cascade archive metadata counters are invalid"
-            ) from exc
+            ) from None
         if len(rows) != expected_row_count:
             raise ArchiveVerificationError(
                 "cascade archive row count differs from ledger"
@@ -3442,15 +3579,25 @@ return {removed_entries, removed_manifests, removed_metadata}
     def health(self) -> OutboxHealth:
         """Check Redis reachability and stream/group metadata without swallowing errors."""
         pong = self._redis_call("ping", "ping")
-        if pong is not True and pong != b"PONG" and str(pong).upper() != "PONG":
-            raise OutboxRecordError(f"Redis PING returned an unexpected response: {pong!r}")
-        exists = bool(self._redis_call("check stream existence", "exists", self.stream_key))
+        if pong is not True and pong != b"PONG" and pong != "PONG":
+            raise OutboxRecordError("Redis PING returned an unexpected response")
+        raw_exists = self._redis_call(
+            "check stream existence", "exists", self.stream_key
+        )
+        if isinstance(raw_exists, bool):
+            exists = raw_exists
+        elif type(raw_exists) is int and raw_exists >= 0:
+            exists = raw_exists > 0
+        else:
+            raise OutboxRecordError("Redis EXISTS returned an invalid response")
         if not exists:
             return OutboxHealth(True, False, 0, 0)
-        length = int(self._redis_call("read stream length", "xlen", self.stream_key))
+        length = self._redis_call("read stream length", "xlen", self.stream_key)
+        if isinstance(length, bool) or not isinstance(length, int) or length < 0:
+            raise OutboxRecordError("Redis XLEN returned an invalid response")
         groups = self._redis_call("list consumer groups", "xinfo_groups", self.stream_key)
-        if groups is None:
-            raise OutboxRecordError("XINFO GROUPS returned None")
+        if not isinstance(groups, (list, tuple)):
+            raise OutboxRecordError("XINFO GROUPS returned an invalid response")
         return OutboxHealth(True, True, length, len(groups))
 
     def trim_delivered(self, group: str, *, through_id: str, max_entries: int = 1000) -> int:
@@ -3476,12 +3623,12 @@ return {removed_entries, removed_manifests, removed_metadata}
                 group_info = decoded
                 break
         if group_info is None:
-            raise DeliveryPendingError(f"consumer group {group!r} does not exist")
+            raise DeliveryPendingError("consumer group does not exist")
         pending = int(group_info.get("pending", 0))
         last_delivered = _text(group_info.get("last-delivered-id", "0-0"), field="last-delivered-id")
         if pending or _stream_id_tuple(last_delivered) < _stream_id_tuple(through_id):
             raise DeliveryPendingError(
-                f"consumer group {group!r} has not acknowledged delivery through {through_id}"
+                "consumer group has not acknowledged delivery through the cutoff"
             )
 
         raw_entries = self._redis_call(
@@ -3613,7 +3760,7 @@ return {removed_entries, removed_manifests, removed_metadata}
                 except (KeyError, TypeError, ValueError) as exc:
                     raise OutboxRecordError(
                         "delivered batch first sequence is invalid"
-                    ) from exc
+                    ) from None
                 gc_expected[self._sequence_claim_field(first_sequence)] = batch_id
                 gc_expected[self._batch_field(batch_id)] = batch_raws[batch_id]
         unique_gc_fields = tuple(gc_expected)
@@ -3661,7 +3808,7 @@ return {removed_entries, removed_manifests, removed_metadata}
         except (TypeError, ValueError) as exc:
             raise OutboxRecordError(
                 "privileged trim Lua returned non-integer counts"
-            ) from exc
+            ) from None
         if (
             removed_entries != len(entries)
             or removed_manifests != len(unique_cascade_keys)

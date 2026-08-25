@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import sqlglot
 
+import supertable.engine.spark_thrift as spark_thrift_module
 from supertable.data_classes import Reflection, RbacViewDef, SuperSnapshot
 from supertable.engine.spark_thrift import (
     SparkThriftExecutor,
@@ -20,6 +21,7 @@ from supertable.engine.spark_thrift import (
     _spark_create_parquet_view,
     _spark_create_rbac_view,
     _spark_create_tombstone_view,
+    _spark_table_name,
     _revalidate_spark_parser,
     _spark_string_literal,
     _validate_spark_user_functions,
@@ -45,6 +47,64 @@ _STORAGE_CREDENTIAL_KEY_VARIANTS = [
     "awsAccessKeyId",
     "fs.gs.auth.service.account.json.keyfile",
 ]
+
+
+class _IntVersionSubclass(int):
+    pass
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        True,
+        False,
+        1.0,
+        "1); DROP VIEW protected_data; --",
+        _IntVersionSubclass(1),
+        -1,
+        9_007_199_254_740_992,
+    ],
+)
+def test_spark_table_name_rejects_non_exact_or_out_of_range_version(version):
+    with pytest.raises(
+        RuntimeError,
+        match=r"^Spark snapshot version is invalid$",
+    ):
+        _spark_table_name("s", "t", version)
+
+
+@pytest.mark.parametrize("version", [0, 9_007_199_254_740_991])
+def test_spark_table_name_accepts_catalog_version_bounds(version):
+    assert _spark_table_name("s", "t", version).endswith(f"_v{version}")
+
+
+def test_malformed_snapshot_version_fails_before_cluster_connection_or_sql():
+    payload = "1); DROP VIEW protected_data; --"
+    snapshot = SuperSnapshot("s", "t", 1, [], {"id"})
+    setattr(snapshot, "simple_version", payload)
+    reflection = Reflection(
+        storage_type="mock",
+        reflection_bytes=1,
+        total_reflections=1,
+        supers=[snapshot],
+    )
+    cursor = MagicMock()
+    connection = MagicMock()
+    connection.cursor.return_value = cursor
+    executor = SparkThriftExecutor.__new__(SparkThriftExecutor)
+    executor._select_cluster = MagicMock()
+    executor._get_connection = MagicMock(return_value=connection)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"^Spark snapshot version is invalid$",
+    ) as error:
+        executor.execute(reflection, MagicMock(), None, lambda _event: None)
+
+    assert payload not in str(error.value)
+    executor._select_cluster.assert_not_called()
+    executor._get_connection.assert_not_called()
+    cursor.execute.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -165,7 +225,8 @@ def test_bare_spark_session_identity_rejected_before_cluster_lookup(
 def test_qualified_and_quoted_session_named_data_columns_remain_allowed():
     parser = SQLParser(
         "s",
-        "SELECT t.user, `session_user` FROM t",
+        "SELECT t.user, `session_user`, t.localtimestamp, "
+        "`localtimestamp` FROM t",
         "spark",
     )
     _validate_spark_user_functions(parser)
@@ -258,6 +319,41 @@ def test_common_analytics_remain_allowed_for_auto_route():
         "duckdb",
     )
     _validate_spark_user_functions(parser)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT to_timestamp_ntz('2026-01-01') FROM t",
+        "SELECT make_timestamp_ntz(2026, 1, 1, 0, 0, 0) FROM t",
+        "SELECT try_make_timestamp_ntz(2026, 1, 1, 0, 0, 0) FROM t",
+        "SELECT CAST('2026-01-01' AS TIMESTAMP_NTZ) FROM t",
+        "SELECT localtimestamp() FROM t",
+        "SELECT localtimestamp FROM t",
+    ],
+)
+def test_timestamp_ntz_surface_rejected_before_cluster_lookup(query):
+    parser = SimpleNamespace(
+        original_query=query,
+        dialect="spark",
+        default_super_name="s",
+        # The backend must reparse the original text rather than trusting this
+        # caller-supplied benign tree.
+        _parsed=sqlglot.parse_one("SELECT id FROM t", read="spark"),
+    )
+    reflection = Reflection(
+        storage_type="mock",
+        reflection_bytes=1,
+        total_reflections=1,
+        supers=[SuperSnapshot("s", "t", 1, [], {"id"})],
+    )
+    executor = SparkThriftExecutor.__new__(SparkThriftExecutor)
+    executor._select_cluster = MagicMock()
+
+    with pytest.raises(ValueError, match="TIMESTAMP_NTZ"):
+        executor.execute(reflection, parser, None, lambda _event: None)
+
+    executor._select_cluster.assert_not_called()
 
 
 def test_internal_bounded_collection_aggregate_rejects_spark_pre_cluster():
@@ -385,16 +481,38 @@ def test_spark_protected_projection_strips_every_reserved_system_column():
     assert "__file__" not in projection
 
 
-def test_session_variable_substitution_guard_is_mandatory():
+_MANDATORY_SPARK_SESSION_SQL = [
+    "SET spark.sql.variable.substitute=false",
+    "SET spark.sql.session.timeZone=UTC",
+    "SET spark.sql.timestampType=TIMESTAMP_LTZ",
+    "SET spark.sql.parquet.inferTimestampNTZ.enabled=false",
+]
+
+
+def test_session_security_and_utc_ltz_contract_are_mandatory():
     cursor = MagicMock()
     _configure_spark_session_security(cursor)
-    cursor.execute.assert_called_once_with(
-        "SET spark.sql.variable.substitute=false"
-    )
 
-    cursor.execute.side_effect = RuntimeError("server refused")
+    assert [
+        item.args[0] for item in cursor.execute.call_args_list
+    ] == _MANDATORY_SPARK_SESSION_SQL
+
+
+@pytest.mark.parametrize("rejected_sql", _MANDATORY_SPARK_SESSION_SQL)
+def test_mandatory_spark_session_setting_failure_is_fail_closed(rejected_sql):
+    cursor = MagicMock()
+
+    def execute(statement):
+        if statement == rejected_sql:
+            raise RuntimeError("server refused")
+
+    cursor.execute.side_effect = execute
     with pytest.raises(RuntimeError, match="session security configuration"):
         _configure_spark_session_security(cursor)
+
+    issued = [item.args[0] for item in cursor.execute.call_args_list]
+    assert issued[-1] == rejected_sql
+    assert issued == _MANDATORY_SPARK_SESSION_SQL[: len(issued)]
 
 
 def test_spark_string_literal_round_trips_quote_and_backslash():
@@ -510,14 +628,42 @@ def test_storage_setting_logs_never_include_value_or_backend_echo(caplog):
 
 def test_public_spark_error_redacts_url_userinfo_query_and_assignments():
     rendered = _redact_spark_sensitive_text(
-        "GET https://alice:open-sesame@storage.example/private "
-        "and https://storage.example/object?sig=SIGNED; "
+        "GET https://alice:open-sesame@storage.example/PRIVATE_PATH_TOKEN "
+        "and s3a://user:password@bucket.example/OBJECT_PATH_TOKEN"
+        "?sig=SIGNED#FRAGMENT_TOKEN; "
         "spark.hadoop.fs.s3a.secret.key=STATIC-SECRET"
     )
 
-    for secret in ("alice", "open-sesame", "SIGNED", "STATIC-SECRET"):
+    for secret in (
+        "alice", "open-sesame", "password", "PRIVATE_PATH_TOKEN",
+        "OBJECT_PATH_TOKEN", "SIGNED", "FRAGMENT_TOKEN", "STATIC-SECRET",
+    ):
         assert secret not in rendered
-    assert "<redacted>" in rendered
+    assert "storage.example" not in rendered
+    assert "bucket.example" not in rendered
+    assert rendered.startswith("Spark query failed; error_type=str;")
+    assert "diagnostic_id=" in rendered
+    assert "diagnostic_bytes=" in rendered
+
+
+@pytest.mark.parametrize(
+    "backend_detail, secret",
+    [
+        ("Authorization: Bearer SPARK_AUTH_SECRET", "SPARK_AUTH_SECRET"),
+        ("Cookie: session=SPARK_COOKIE_SECRET", "SPARK_COOKIE_SECRET"),
+        ("X-Api-Key: SPARK_API_SECRET", "SPARK_API_SECRET"),
+        ('{"access_token":"SPARK_BODY_SECRET"}', "SPARK_BODY_SECRET"),
+    ],
+)
+def test_spark_backend_diagnostic_never_preserves_header_or_body_secrets(
+    backend_detail, secret,
+):
+    rendered = _redact_spark_sensitive_text(RuntimeError(backend_detail))
+
+    assert secret not in rendered
+    assert backend_detail not in rendered
+    assert "error_type=RuntimeError" in rendered
+    assert "diagnostic_id=" in rendered
 
 
 def test_plan_redactor_removes_paths_and_literal_payloads():
@@ -621,7 +767,9 @@ def test_persisted_spark_plan_contains_no_source_or_secret(
         "thrift_host": "spark.internal",
     }
     cursor = MagicMock()
-    cursor.description = [("id",)]
+    cursor.description = [
+        ("id", "BIGINT_TYPE", None, None, None, None, True),
+    ]
     cursor.fetchall.side_effect = [
         [("id", "bigint")],
         [
@@ -650,14 +798,15 @@ def test_persisted_spark_plan_contains_no_source_or_secret(
             )
         ],
     )
-    plan_path = tmp_path / "spark-plan.json"
+    plan_path = tmp_path / "APP_HOME_TOKEN" / "SPARK_PLAN_TOKEN.json"
     executor = SparkThriftExecutor(storage=MagicMock(), organization="org")
-    executor.execute(
-        reflection,
-        parser,
-        SimpleNamespace(query_plan_path=str(plan_path)),
-        lambda _event: None,
-    )
+    with patch.object(spark_thrift_module.logger, "debug") as debug_log:
+        executor.execute(
+            reflection,
+            parser,
+            SimpleNamespace(query_plan_path=str(plan_path)),
+            lambda _event: None,
+        )
 
     persisted = plan_path.read_text(encoding="utf-8")
     for secret in (
@@ -671,3 +820,8 @@ def test_persisted_spark_plan_contains_no_source_or_secret(
     ):
         assert secret not in persisted
     assert "<spark-plan-redacted>" in persisted
+    rendered_log_calls = repr(debug_log.call_args_list)
+    assert "APP_HOME_TOKEN" not in rendered_log_calls
+    assert "SPARK_PLAN_TOKEN" not in rendered_log_calls
+    assert str(plan_path) not in rendered_log_calls
+    assert "path_sha256=" in rendered_log_calls

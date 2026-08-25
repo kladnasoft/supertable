@@ -51,6 +51,7 @@ from .real_spill_gate import (
     _validate_worker_response,
 )
 from .runner import ENGINE_DUCKDB, ENGINE_ISLAND
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 
 GIB = 1024**3
@@ -102,12 +103,14 @@ def _read_json(path: str | Path) -> dict[str, Any]:
     source = Path(path).expanduser().resolve()
     try:
         value = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError):
         raise BoundedSpillConfigurationError(
-            f"cannot read JSON from {source}: {type(exc).__name__}: {exc}"
-        ) from exc
+            "cannot read benchmark JSON"
+        ) from None
     if not isinstance(value, dict):
-        raise BoundedSpillConfigurationError(f"{source} is not a JSON object")
+        raise BoundedSpillConfigurationError(
+            "benchmark JSON is not an object"
+        )
     return value
 
 
@@ -186,10 +189,10 @@ def _validate_corpus(
             source = (root / relative_path).resolve(strict=True)
             source.relative_to(root)
             stat = source.stat()
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError):
             raise BoundedSpillConfigurationError(
-                f"cannot resolve corpus file {relative!r}: {exc}"
-            ) from exc
+                "cannot resolve corpus file"
+            ) from None
         declared_bytes = int(raw_entry.get("bytes") or 0)
         file_rows = int(raw_entry.get("rows") or 0)
         minimum = int(raw_entry.get("min_id"))
@@ -488,7 +491,9 @@ def _cleanup_spill_root(spill_root: Path, *, attempt_root: Path) -> dict[str, An
     except (OSError, ValueError) as exc:
         return {
             "attempted": False,
-            "errors": [f"unsafe_path:{type(exc).__name__}:{exc}"],
+            "errors": [
+                "unsafe_path; error_type=" + safe_exception_type(exc)
+            ],
         }
     for child in list(resolved_spill.iterdir()):
         try:
@@ -497,7 +502,10 @@ def _cleanup_spill_root(spill_root: Path, *, attempt_root: Path) -> dict[str, An
             else:
                 child.unlink()
         except OSError as exc:
-            errors.append(f"{child.name}:{type(exc).__name__}:{exc}")
+            errors.append(
+                "spill cleanup failed; "
+                f"error_type={safe_exception_type(exc)}"
+            )
     return {"attempted": True, "errors": errors}
 
 
@@ -543,7 +551,10 @@ def _container_absence_fence(
             observations.append(
                 {
                     "attempt": index + 1,
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "error": (
+                        "cache-drop probe failed; "
+                        f"error_type={safe_exception_type(exc)}"
+                    ),
                 }
             )
         if index + 1 < max(1, attempts):
@@ -666,7 +677,10 @@ def run_engine_attempt(
                 "resolved image digest differs from requested digest"
             )
     except Exception as exc:  # preserve a diagnostic artifact
-        image_error = f"{type(exc).__name__}: {exc}"
+        image_error = (
+            "image provenance failed; "
+            f"error_type={safe_exception_type(exc)}"
+        )
 
     container_name = f"bounded-spill-{engine}-{uuid.uuid4().hex[:12]}"
     command = _docker_command(
@@ -719,7 +733,10 @@ def run_engine_attempt(
                     stdout, stderr = process.communicate()
             returncode = process.returncode
         except OSError as exc:
-            launch_error = f"{type(exc).__name__}: {exc}"
+            launch_error = (
+                "bounded-spill launch failed; "
+                f"error_type={safe_exception_type(exc)}"
+            )
         finally:
             if sampler_started:
                 sampler.stop()
@@ -737,7 +754,10 @@ def run_engine_attempt(
         try:
             response = _read_json(response_path)
         except BoundedSpillConfigurationError as exc:
-            response_error = str(exc)
+            response_error = (
+                "worker response unavailable; "
+                f"error_type={safe_exception_type(exc)}"
+            )
     sampler_summary = sampler.summary()
     host_spill = int(sampler_summary.get("spill_high_water_bytes") or 0)
     status = "worker_failed"
@@ -786,7 +806,10 @@ def run_engine_attempt(
             else:
                 status, exit_code = "passed", EXIT_SUCCESS
         except (RealSpillGateError, ValueError, TypeError) as exc:
-            validation_errors.append(str(exc))
+            validation_errors.append(
+                "bounded-spill validation failed; "
+                f"error_type={safe_exception_type(exc)}"
+            )
 
     spill_after_worker = _tree_footprint(attempt_root / "engine-spill")
     cleanup = {"attempted": False, "errors": []}
@@ -1077,8 +1100,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             request_template=args.request_template,
             corpus_root=corpus_root,
         )
-    except BoundedSpillConfigurationError as exc:
-        parser.error(str(exc))
+    except BoundedSpillConfigurationError:
+        parser.error("bounded-spill benchmark configuration is invalid")
     code, comparison = run_comparison(
         inputs=inputs,
         output_root=output_root,

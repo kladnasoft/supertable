@@ -575,7 +575,9 @@ def test_legacy_private_custom_rule_fails_before_sql_and_never_cools_down(
 
     assert outcome.state == "failed"
     assert outcome.errors == 1
-    assert "hidden" in outcome.message.casefold() or "private" in outcome.message.casefold()
+    # Configuration failures remain distinguishable by a bounded class name,
+    # without reflecting rule/schema details into the scheduler result.
+    assert outcome.message == "quality check failed; error_type=DQConfigReadError"
     assert executed == []
     assert fake.get(scheduler._cooldown_key(ORG, SUPER, table, "custom")) is None
     assert fake.get(scheduler._retry_key(ORG, SUPER, table, "custom")) is not None

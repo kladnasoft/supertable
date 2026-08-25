@@ -5,8 +5,10 @@ from __future__ import annotations
 import threading
 import math
 import re
+import secrets
 import time
 import uuid as _uuid
+from collections.abc import Mapping
 from typing import Any, Optional, List
 from urllib.parse import urlsplit
 
@@ -19,6 +21,7 @@ from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
+from supertable.utils.diagnostic_redaction import safe_exception_type
 from supertable.data_classes import Reflection
 
 from supertable.engine.engine_common import (
@@ -33,7 +36,7 @@ from supertable.engine.engine_common import (
     create_tombstone_view,
     TombstoneCache,
     create_typed_empty_view,
-    redact_url_credentials,
+    safe_sql_diagnostic,
     _validated_rbac_predicate_sql,
     tombstone_data_paths,
     validate_rbac_binding_stability,
@@ -53,6 +56,7 @@ from supertable.odata_continuation import (
     ODataContinuationBoundary,
     bind_odata_continuation_boundary,
     normalized_odata_order,
+    odata_float_order_columns,
 )
 
 
@@ -186,8 +190,8 @@ def _prepare_protected_odata_query(
         raise RuntimeError("Invalid protected OData identity projection")
     try:
         parsed = sqlglot.parse_one(sql, read="duckdb")
-    except Exception as exc:
-        raise RuntimeError("Unable to prepare protected OData query") from exc
+    except Exception:
+        raise RuntimeError("Unable to prepare protected OData query") from None
     if (
         not isinstance(parsed, exp.Select)
         or parsed.args.get("joins")
@@ -211,8 +215,8 @@ def _prepare_protected_odata_query(
         continuation_boundary = bind_odata_continuation_boundary(
             parsed, continuation_boundary,
         )
-    except ValueError as exc:
-        raise RuntimeError("Protected OData continuation is invalid") from exc
+    except ValueError:
+        raise RuntimeError("Protected OData continuation is invalid") from None
 
     identity = exp.column(column_name, quoted=True)
     parameters: list[Any] = []
@@ -245,6 +249,65 @@ def _prepare_protected_odata_query(
         copy=False,
     )
     return _render_protected_odata_select(parsed), parameters
+
+
+def _protected_odata_nonfinite_guard_query(
+    sql: str,
+    float_order_columns: tuple[str, ...],
+) -> Optional[str]:
+    """Build a full-domain guard independent of LIMIT/keyset page state.
+
+    Core's public JSON representation cannot carry NaN or infinities as an
+    exact continuation value. The guard therefore runs over the complete
+    RBAC/tombstone/user-filtered relation before the page seek is added. A
+    non-finite key anywhere in that domain rejects the query before row one is
+    returned, including when the value would lie beyond the current LIMIT.
+    """
+    if not float_order_columns:
+        return None
+    try:
+        parsed = sqlglot.parse_one(sql, read="duckdb")
+    except Exception:
+        raise RuntimeError("Unable to validate protected OData ordering") from None
+    if not isinstance(parsed, exp.Select):
+        raise RuntimeError("Protected OData ordering is invalid")
+    order = parsed.args.get("order")
+    if not isinstance(order, exp.Order):
+        raise RuntimeError("Protected OData ordering is invalid")
+
+    float_names = {name.casefold() for name in float_order_columns}
+    predicates: list[exp.Expression] = []
+    for term in order.expressions:
+        if (
+            isinstance(term, exp.Ordered)
+            and isinstance(term.this, exp.Column)
+            and str(term.this.name).casefold() in float_names
+        ):
+            predicates.append(exp.Not(this=exp.Anonymous(
+                this="isfinite",
+                expressions=[term.this.copy()],
+            )))
+    if len(predicates) != len(float_names):
+        raise RuntimeError("Protected OData float ordering is ambiguous")
+    nonfinite = predicates[0]
+    for predicate in predicates[1:]:
+        nonfinite = exp.or_(nonfinite, predicate)
+
+    guard = parsed.copy()
+    guard.set("expressions", [exp.Literal.number(1)])
+    guard.set("order", None)
+    guard.set("limit", None)
+    guard.set("offset", None)
+    current_where = guard.args.get("where")
+    if current_where is None:
+        guard.set("where", exp.Where(this=nonfinite))
+    else:
+        guard.set(
+            "where",
+            exp.Where(this=exp.and_(current_where.this.copy(), nonfinite)),
+        )
+    guard.set("limit", exp.Limit(expression=exp.Literal.number(1)))
+    return guard.sql(dialect="duckdb")
 
 
 def _harden_user_query_connection(con: duckdb.DuckDBPyConnection) -> None:
@@ -305,18 +368,6 @@ def _tombstone_source_paths(reflection: Reflection) -> List[str]:
     ]
 
 
-_SENSITIVE_ERROR_ASSIGNMENT_RE = re.compile(
-    r"(?i)\b(authorization|password|passwd|secret(?:_access_key)?|"
-    r"aws_secret_access_key|access_key(?:_id)?|aws_access_key_id|"
-    r"session_token|access_token|token|credential)\b(\s*(?:=|:)\s*)"
-    r"(?:'[^']*'|\"[^\"]*\"|[^\s,;)]+)"
-)
-_SENSITIVE_SECRET_SQL_RE = re.compile(
-    r"(?i)\b(KEY_ID|SECRET|SESSION_TOKEN)\s+(?:'[^']*'|\"[^\"]*\")"
-)
-_MAX_PUBLIC_DUCKDB_ERROR_CHARS = 4096
-
-
 class DuckDBPresignRefreshRequired(RuntimeError):
     """A remote credential failed before any result batch was exposed.
 
@@ -351,20 +402,33 @@ def _is_refreshable_remote_auth_error(exc: BaseException) -> bool:
     ))
 
 
+def _duckdb_backend_diagnostic(value: object) -> tuple[str, str, int]:
+    """Return a type/digest/size identity without backend prose."""
+
+    error_type = (
+        safe_exception_type(value)
+        if isinstance(value, BaseException)
+        else "str" if type(value) is str else "Exception"
+    )
+    try:
+        raw = str(value)
+    except Exception:
+        raw = error_type
+    diagnostic_id, diagnostic_bytes = safe_sql_diagnostic(raw)
+    return error_type, diagnostic_id, diagnostic_bytes
+
+
 def _redact_duckdb_backend_message(value: object) -> str:
-    """Return a bounded backend diagnostic with credential material removed."""
-    message = redact_url_credentials(value)
-    message = _SENSITIVE_ERROR_ASSIGNMENT_RE.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]",
-        message,
+    """Return fixed correlation metadata and never arbitrary backend prose."""
+
+    error_type, diagnostic_id, diagnostic_bytes = _duckdb_backend_diagnostic(
+        value,
     )
-    message = _SENSITIVE_SECRET_SQL_RE.sub(
-        lambda match: f"{match.group(1)} '[REDACTED]'",
-        message,
+    return (
+        "DuckDB backend diagnostic redacted; "
+        f"error_type={error_type}; diagnostic_id={diagnostic_id}; "
+        f"diagnostic_bytes={diagnostic_bytes}"
     )
-    if len(message) > _MAX_PUBLIC_DUCKDB_ERROR_CHARS:
-        message = message[:_MAX_PUBLIC_DUCKDB_ERROR_CHARS] + "…"
-    return message or "DuckDB backend error"
 
 
 def _scrub_exception_chain(
@@ -403,19 +467,24 @@ def _safe_duckdb_backend_exception(
     """Build a public exception without retaining raw backend diagnostics."""
     if not isinstance(exc, Exception):
         return exc
+    error_type, diagnostic_id, diagnostic_bytes = _duckdb_backend_diagnostic(exc)
+    diagnostic = (
+        f"error_type={error_type}; diagnostic_id={diagnostic_id}; "
+        f"diagnostic_bytes={diagnostic_bytes}"
+    )
     if isinstance(exc, TimeoutError):
         _scrub_exception_chain(exc, replacement="DuckDB backend detail redacted")
-        return TimeoutError(f"DuckDB {phase} timed out")
+        return TimeoutError(f"DuckDB {phase} timed out; {diagnostic}")
     if isinstance(exc, ResourceReservationCancelled):
         _scrub_exception_chain(exc, replacement="DuckDB backend detail redacted")
         return ResourceReservationCancelled(
-            f"DuckDB {phase} was cancelled"
+            f"DuckDB {phase} was cancelled; {diagnostic}"
         )
     # Managed view DDL can contain RBAC predicates and physical source paths.
     # Even a URL-redacted backend message could expose hidden policy columns or
     # literal values, so arbitrary backend failures get a phase-only message.
     _scrub_exception_chain(exc, replacement="DuckDB backend detail redacted")
-    return RuntimeError(f"DuckDB {phase} failed")
+    return RuntimeError(f"DuckDB {phase} failed; {diagnostic}")
 
 
 def _assert_reflection_covers_requested_tables(
@@ -569,9 +638,9 @@ class _DuckDBSetupInterruptGuard:
         self._cancelled = threading.Event()
         self._stop = threading.Event()
         self._target_lock = threading.Lock()
-        self._target = None
-        self._timer = None
-        self._watcher = None
+        self._target: Any = None
+        self._timer: Optional[threading.Timer] = None
+        self._watcher: Optional[threading.Thread] = None
 
     def _interrupt(self) -> None:
         with self._target_lock:
@@ -611,10 +680,11 @@ class _DuckDBSetupInterruptGuard:
                 self._timer.daemon = True
                 self._timer.start()
 
-        if self._cancel_event is not None:
+        cancel_event = self._cancel_event
+        if cancel_event is not None:
             def watch() -> None:
                 while not self._stop.wait(0.05):
-                    if self._cancel_event.is_set():
+                    if cancel_event.is_set():
                         self._cancelled.set()
                         self._interrupt()
                         return
@@ -813,7 +883,7 @@ class _DuckDBResultLifecycleStream:
         self._timed_out = threading.Event()
         self._cancelled = threading.Event()
         self._stop = threading.Event()
-        self._watcher = None
+        self._watcher: Optional[threading.Thread] = None
         self._start_monitors()
 
     def __iter__(self):
@@ -1040,6 +1110,7 @@ def _duckdb_fixed_result_row_bytes(description) -> Optional[int]:
             type_name = str(field[1]).strip().upper()
         except (IndexError, TypeError):
             return None
+        width: Optional[int]
         if type_name.startswith("DECIMAL("):
             width = 16
         else:
@@ -1116,6 +1187,7 @@ class DuckDB:
         self.storage = storage
         self.organization = str(organization or "")
         self._lock = threading.Lock()
+        self._runtime_config_lock = threading.RLock()
         self._con: Optional[duckdb.DuckDBPyConnection] = None
         self._httpfs_configured = False
         self._s3_secret_configured = False
@@ -1123,6 +1195,14 @@ class DuckDB:
         self._active_queries = 0
         self._cache_eviction_requested = False
         self._setup_context = threading.local()
+        # Process-unique authority for backend row-ID proof cache keys. Object
+        # ``id()`` values can be reused after a storage client is collected;
+        # a random nonce cannot make a later provider inherit that authority.
+        # This namespace is process-private cache fencing, not a query/view
+        # identifier. Keep it independent from the UUID source used for DDL
+        # names so callers/tests that replace that source cannot accidentally
+        # consume or predict the proof-cache lane.
+        self._odata_cache_nonce = secrets.token_hex(16)
         # Shared deletion-vector table cache: per-table eviction (idle TTL +
         # per-table version cap), bounded by config. Tables live on the
         # persistent connection and are forgotten when it resets.
@@ -1343,6 +1423,8 @@ class DuckDB:
 
         self._begin_query_use()
         stream_owns_lease = False
+        if not _streaming:
+            self._runtime_config_lock.acquire()
         relay_lease = StableRelayLease()
         try:
             execution_reflection = reflection
@@ -1449,8 +1531,8 @@ class DuckDB:
         else:
             try:
                 deadline_value = float(deadline_monotonic)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError("query deadline must be finite") from exc
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("query deadline must be finite") from None
             if not math.isfinite(deadline_value):
                 raise ValueError("query deadline must be finite")
             timeout_value = max(0.0, deadline_value - started_monotonic)
@@ -1469,9 +1551,9 @@ class DuckDB:
         # Cancellation and one absolute deadline cover parser/RBAC validation,
         # connection creation, extension setup, query execution, and delivery.
         check_request_boundary()
-        if explain and str(explain_options or "").strip().casefold() == "analyze":
+        if explain and str(explain_options or "").strip():
             raise ValueError(
-                "EXPLAIN ANALYZE is not available on the untrusted read path"
+                "EXPLAIN options are not available on the managed read path"
             )
         # This is an execution-boundary invariant, not merely a parser
         # convenience. Reparse original SQL and rebuild table bindings before a
@@ -1485,6 +1567,7 @@ class DuckDB:
         odata_continuation_boundary = getattr(
             reflection, "odata_continuation_boundary", None,
         )
+        float_order_columns: tuple[str, ...] = ()
         if odata_continuation_boundary is not None and not isinstance(
             odata_continuation_boundary, ODataContinuationBoundary,
         ):
@@ -1500,18 +1583,48 @@ class DuckDB:
                 != [ODATA_INTERNAL_ROWID_COLUMN]
             ):
                 raise RuntimeError("Invalid protected OData identity request")
-            table_aliases = {str(td.alias) for td in parser.get_table_tuples()}
+            parsed_table_definitions = list(parser.get_table_tuples())
+            table_aliases = {str(td.alias) for td in parsed_table_definitions}
             if set(odata_identity_aliases) != table_aliases:
                 raise RuntimeError("Protected OData identity binding is invalid")
+            identity_alias = next(iter(odata_identity_aliases))
+            matching_definitions = [
+                definition
+                for definition in parsed_table_definitions
+                if str(definition.alias) == identity_alias
+            ]
+            if len(matching_definitions) != 1:
+                raise RuntimeError("Protected OData identity binding is invalid")
+            identity_definition = matching_definitions[0]
+            matching_snapshots = [
+                snapshot
+                for snapshot in reflection.supers
+                if (
+                    snapshot.super_name == identity_definition.super_name
+                    and snapshot.simple_name == identity_definition.simple_name
+                )
+            ]
+            if len(matching_snapshots) != 1:
+                raise RuntimeError("Protected OData physical schema is ambiguous")
+            identity_column_types = getattr(
+                matching_snapshots[0], "column_types", None,
+            )
+            if not isinstance(identity_column_types, Mapping):
+                raise RuntimeError("Protected OData physical schema is invalid")
             try:
+                float_order_columns = odata_float_order_columns(
+                    validated_ast,
+                    identity_column_types,
+                )
                 odata_continuation_boundary = bind_odata_continuation_boundary(
                     validated_ast,
                     odata_continuation_boundary,
+                    column_types=identity_column_types,
                 )
-            except ValueError as exc:
+            except ValueError:
                 raise RuntimeError(
                     "Invalid protected OData continuation request"
-                ) from exc
+                ) from None
         _assert_reflection_covers_requested_tables(parser, reflection)
         validate_rbac_binding_stability(
             parser,
@@ -1665,6 +1778,7 @@ class DuckDB:
         alias_to_files = {}
         alias_to_resource_keys = {}
         alias_to_columns = {}
+        alias_to_definition = {}
 
         for td in table_defs:
             key = (td.super_name, td.simple_name)
@@ -1682,15 +1796,15 @@ class DuckDB:
             # project.  Load the complete pinned relation for those queries;
             # the RBAC view reapplies the column policy before user SQL runs.
             view_def = (getattr(reflection, "rbac_views", None) or {}).get(td.alias)
-            if view_def is not None and getattr(view_def, "where_clause", ""):
+            if view_def is not None and view_def.where_clause:
                 cols = []
 
-            # When specific columns are requested, also pull the system
-            # columns (__rowid__/__timestamp__) so the tombstone view can
-            # anti-join on __rowid__ and then statically EXCLUDE both from
-            # the output. Every written file carries both columns, so they
-            # are always threaded in. A bare SELECT * (cols == []) already
-            # carries them.
+            # When specific columns are requested, also pull the stored system
+            # columns (__rowid__/__timestamp__). The reflection builder adds the
+            # protected source-file identity, so the tombstone view can anti-join
+            # on the composite source-file + row-id key and then strip every
+            # system column. Every file carries the stored columns; a bare
+            # SELECT * (cols == []) already carries them.
             if cols:
                 lower = {x.lower() for x in cols}
                 for c in ("__rowid__", "__timestamp__"):
@@ -1702,6 +1816,7 @@ class DuckDB:
             )
             name = f"{name}_{query_suffix}"
             alias_to_table_name[td.alias] = name
+            alias_to_definition[td.alias] = td
             alias_to_files[td.alias] = list(sup.files)
             alias_to_resource_keys[td.alias] = list(
                 getattr(sup, "resource_keys", ()) or ()
@@ -1903,7 +2018,7 @@ class DuckDB:
                 cols = alias_to_columns[alias]
 
                 if not files:
-                    td = next(t for t in table_defs if t.alias == alias)
+                    td = alias_to_definition[alias]
                     sup = snapshots_by_key[(td.super_name, td.simple_name)]
                     empty_types = dict(
                         getattr(sup, "column_types", {}) or {}
@@ -1945,6 +2060,109 @@ class DuckDB:
             for alias in list(query_alias_to_name.keys()):
                 check_deadline()
                 source = query_alias_to_name[alias]
+                protected_identity = odata_identity_aliases.get(alias)
+                odata_proof_kwargs = {}
+                if protected_identity is not None:
+                    table_definition = alias_to_definition[alias]
+                    pinned_snapshot = snapshots_by_key[
+                        (
+                            table_definition.super_name,
+                            table_definition.simple_name,
+                        )
+                    ]
+                    proof_resource_keys = alias_to_resource_keys[alias]
+                    snapshot_resource_keys = getattr(
+                        pinned_snapshot, "snapshot_resource_keys", None,
+                    )
+                    if (
+                        not isinstance(snapshot_resource_keys, (list, tuple))
+                        or list(snapshot_resource_keys) != proof_resource_keys
+                    ):
+                        raise RuntimeError(
+                            "OData row-id global resource proof is incomplete"
+                        )
+                    raw_resource_cache_identities = list(
+                        getattr(
+                            pinned_snapshot,
+                            "resource_cache_identities",
+                            (),
+                        )
+                        or ()
+                    )
+                    if raw_resource_cache_identities and len(
+                        raw_resource_cache_identities
+                    ) != len(proof_resource_keys):
+                        raise RuntimeError(
+                            "OData row-id provider authority is ambiguous"
+                        )
+                    resource_cache_identities = {
+                        key: (
+                            raw_resource_cache_identities[index]
+                            if raw_resource_cache_identities
+                            else None
+                        )
+                        for index, key in enumerate(proof_resource_keys)
+                    }
+                    raw_relay_identities = getattr(
+                        pinned_snapshot,
+                        "resource_relay_cache_identities",
+                        None,
+                    )
+                    relay_identities = (
+                        dict(raw_relay_identities)
+                        if isinstance(raw_relay_identities, dict)
+                        else {}
+                    )
+                    read_identity_enforced = (
+                        bool(proof_resource_keys)
+                        and set(relay_identities) == set(proof_resource_keys)
+                        and all(
+                            type(relay_identities.get(key)) is str
+                            and bool(relay_identities[key])
+                            for key in proof_resource_keys
+                        )
+                    )
+                    odata_proof_kwargs = {
+                        "odata_rowid_high_watermark": getattr(
+                            pinned_snapshot, "rowid_high_watermark", None,
+                        ),
+                        "odata_resource_keys": proof_resource_keys,
+                        "odata_resource_rows": getattr(
+                            pinned_snapshot, "resource_row_counts", None,
+                        ),
+                        "odata_rowid_integrity_seals": getattr(
+                            pinned_snapshot,
+                            "resource_rowid_integrity_seals",
+                            None,
+                        ),
+                        "odata_resource_object_seals": getattr(
+                            pinned_snapshot, "resource_object_seals", None,
+                        ),
+                        "odata_resource_cache_identities": (
+                            resource_cache_identities
+                        ),
+                        "odata_enforced_read_identities": relay_identities,
+                        "odata_share_policy_fingerprint": getattr(
+                            pinned_snapshot, "share_policy_fingerprint", None,
+                        ),
+                        "odata_share_publication_generation": getattr(
+                            pinned_snapshot,
+                            "share_publication_generation",
+                            None,
+                        ),
+                        # Only successfully registered stable-relay routes can
+                        # populate this execution-only map. Direct/versioned
+                        # paths and partial aliasing remain conservatively false.
+                        "odata_read_identity_enforced": (
+                            read_identity_enforced
+                        ),
+                        "odata_cache_namespace": (
+                            self.organization,
+                            type(self.storage).__module__,
+                            type(self.storage).__qualname__,
+                            self._odata_cache_nonce,
+                        ),
+                    }
                 tomb_def = tombstone_views.get(alias)
                 view = f"tomb_{source}_{query_suffix}"
                 # Reuse a materialised deletion-vector table when the cache is
@@ -1975,16 +2193,20 @@ class DuckDB:
                         allowed_files=allowed_dv_files,
                     )
                 if dv_table:
-                    acquired_dv_keys.append(
-                        getattr(dv_table, "cache_key", cache_key)
-                    )
+                    acquired_key = getattr(dv_table, "cache_key", cache_key)
+                    if not isinstance(acquired_key, str) or not acquired_key:
+                        raise RuntimeError(
+                            "Validated deletion-vector cache identity is invalid"
+                        )
+                    acquired_dv_keys.append(acquired_key)
                 create_tombstone_view(
                     con,
                     source,
                     view,
                     tomb_def,
                     dv_table=dv_table,
-                    preserve_rowid_as=odata_identity_aliases.get(alias),
+                    preserve_rowid_as=protected_identity,
+                    **odata_proof_kwargs,
                 )
                 created_views.append(view)
                 query_alias_to_name[alias] = view
@@ -2016,6 +2238,13 @@ class DuckDB:
                 query_alias_to_name,
                 parsed_expression=validated_ast,
                 default_super_name=parser.default_super_name,
+            )
+            nonfinite_guard_query = (
+                _protected_odata_nonfinite_guard_query(
+                    executing_query,
+                    float_order_columns,
+                )
+                if odata_identity_aliases else None
             )
             executing_parameters: list[Any] = []
             if odata_identity_aliases:
@@ -2062,19 +2291,39 @@ class DuckDB:
 
             # Re-apply live engine config (memory/threads/http/cache) so UI
             # changes take effect on this persistent connection per query.
-            check_deadline()
-            apply_runtime_pragmas(con, engine_config)
-            _harden_user_query_connection(con)
+            self._runtime_config_lock.acquire()
+            try:
+                check_deadline()
+                apply_runtime_pragmas(con, engine_config)
+                _harden_user_query_connection(con)
 
-            logger.debug(f"{log_prefix}[duckdb] executing: {executing_query}")
-            check_deadline()
-            backend_phase = "query execution"
-            query_result = (
-                con.execute(executing_query, executing_parameters)
-                if executing_parameters
-                else con.execute(executing_query)
-            )
-            check_deadline()
+                if nonfinite_guard_query is not None:
+                    check_deadline()
+                    backend_phase = "protected OData order validation"
+                    if con.execute(nonfinite_guard_query).fetchone() is not None:
+                        raise RuntimeError(
+                            "Protected OData ordering contains a non-finite value"
+                        )
+                    check_deadline()
+
+                if logger.isEnabledFor(10):
+                    sql_digest, sql_bytes = safe_sql_diagnostic(executing_query)
+                    logger.debug(
+                        "%s[duckdb] executing sql_sha256=%s sql_bytes=%d",
+                        log_prefix,
+                        sql_digest,
+                        sql_bytes,
+                    )
+                check_deadline()
+                backend_phase = "query execution"
+                query_result = (
+                    con.execute(executing_query, executing_parameters)
+                    if executing_parameters
+                    else con.execute(executing_query)
+                )
+                check_deadline()
+            finally:
+                self._runtime_config_lock.release()
 
             if _streaming:
                 assert resolved_stream_batch_rows is not None
@@ -2160,6 +2409,8 @@ class DuckDB:
             raise safe_error from None
 
         finally:
+            if not _streaming:
+                self._runtime_config_lock.release()
             if not stream_owns_cleanup:
                 cleanup_query()
 

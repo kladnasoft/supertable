@@ -1,0 +1,8 @@
+include LICENSE
+include README.md
+include requirements.txt
+
+# The published source archive is an installable runtime artifact.  Repository
+# release-gate tests depend on workflow and baseline files that are deliberately
+# not shipped, so do not include a misleading, incomplete top-level test tree.
+prune tests

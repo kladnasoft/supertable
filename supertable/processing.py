@@ -8,6 +8,7 @@ import os
 import io
 import stat
 import struct
+import tempfile
 import time
 import threading
 import uuid
@@ -46,6 +47,11 @@ from supertable.tombstone_manifest_v2 import (
     tombstone_v3_artifact_digest,
 )
 from supertable.utils.profiler import Profiler, get_null_profiler
+from supertable.utils.diagnostic_redaction import (
+    local_path_metadata,
+    safe_exception_type,
+    safe_storage_path_for_diagnostic,
+)
 from supertable.utils.snapshot import read_bounded_tombstone_manifest_bytes
 from supertable.data_classes import (
     IntegerDomainBound,
@@ -55,6 +61,7 @@ from supertable.data_classes import (
     RowGroupSelection,
     TombstoneSegmentDef,
 )
+from supertable.row_identity import MAX_TABLE_ROWID
 
 # Target row-group size for all Parquet writes.
 # 122 880 rows ≈ 120 K — sits comfortably in the recommended 100 K–1 M range.
@@ -93,11 +100,12 @@ def _local_artifact_cache_identity_state(
 
         if type(storage) is not LocalStorage:
             return None
-        if storage.cache_namespace() != {"provider": "local"}:
+        local_storage = cast(LocalStorage, storage)
+        if local_storage.cache_namespace() != {"provider": "local"}:
             return None
-        if storage.is_local_storage() is not True:
+        if local_storage.is_local_storage() is not True:
             return None
-        root = storage.root
+        root = local_storage.root
         if type(root) is not str or not root or not os.path.isabs(root):
             return None
     except Exception:
@@ -144,35 +152,51 @@ def _artifact_cache_identity(
     if value.startswith(prefix):
         return value
     active_storage = storage
-    if active_storage is None:
-        try:
-            active_storage = _get_storage()
-        except Exception:
-            active_storage = None
     scope = identity_scope
     if scope is None:
-        local_state = _local_artifact_cache_identity_state(
-            organization, active_storage,
-        )
-        if local_state is not None:
-            scope = _local_artifact_cache_scope(local_state)
+        if active_storage is None:
+            # Compatibility callers that do not carry an explicitly pinned
+            # reader must never instantiate the sticky global storage merely
+            # to probe an in-memory cache. Besides turning a cache hit into
+            # network/auth work, doing so can select a different backend than
+            # the writer that seeded the frame. Modern reader/writer paths pass
+            # ``storage`` or a precomputed identity; retain a process-local,
+            # organization-scoped legacy lane for direct helpers/tests.
+            scope = hashlib.sha256(json.dumps(
+                {
+                    "organization": str(organization or ""),
+                    "process_id": os.getpid(),
+                    "storage_namespace": {"provider": "implicit-legacy"},
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
         else:
-            try:
-                # Remote/custom adapters stay byte-for-byte on FileCache's
-                # hardened namespace contract, including live credential
-                # fingerprints and opaque-client isolation.  Do not retain this
-                # result: refreshable authorization may change between calls.
-                from supertable.engine.file_cache import FileCache
-                namespace = FileCache(
-                    active_storage, organization, max_bytes=0, workers=1,
-                )
-                scope = f"{namespace._organization_hash}{namespace._storage_hash}"
-            except Exception:
-                fallback = (
-                    f"{organization}\0{type(active_storage).__module__}."
-                    f"{type(active_storage).__qualname__}\0{id(active_storage)}"
-                )
-                scope = hashlib.sha256(fallback.encode("utf-8")).hexdigest()
+            local_state = _local_artifact_cache_identity_state(
+                organization, active_storage,
+            )
+            if local_state is not None:
+                scope = _local_artifact_cache_scope(local_state)
+            else:
+                try:
+                    # Remote/custom adapters stay byte-for-byte on FileCache's
+                    # hardened namespace contract, including live credential
+                    # fingerprints and opaque-client isolation. Do not retain
+                    # this result: refreshable authorization may change.
+                    from supertable.engine.file_cache import FileCache
+                    namespace = FileCache(
+                        active_storage, organization, max_bytes=0, workers=1,
+                    )
+                    scope = (
+                        f"{namespace._organization_hash}"
+                        f"{namespace._storage_hash}"
+                    )
+                except Exception:
+                    fallback = (
+                        f"{organization}\0{type(active_storage).__module__}."
+                        f"{type(active_storage).__qualname__}\0{id(active_storage)}"
+                    )
+                    scope = hashlib.sha256(fallback.encode("utf-8")).hexdigest()
     table_key = _PathKeyedFrameCache._key(value) if value else ""
     table_hash = hashlib.sha256(table_key.encode("utf-8")).hexdigest()
     version_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -300,8 +324,14 @@ def _resolve_limits(table_config: Optional[dict]) -> Tuple[int, int]:
       2. Global default (from environment / defaults.py)
     """
     cfg = table_config or {}
-    max_mem = int(cfg.get("max_memory_chunk_size") or getattr(default, "MAX_MEMORY_CHUNK_SIZE", 16 * 1024 * 1024))
-    max_files = int(cfg.get("max_overlapping_files") or getattr(default, "MAX_OVERLAPPING_FILES", 100))
+    max_mem = int(cast(Any, (
+        cfg.get("max_memory_chunk_size")
+        or getattr(default, "MAX_MEMORY_CHUNK_SIZE", 16 * 1024 * 1024)
+    )))
+    max_files = int(cast(Any, (
+        cfg.get("max_overlapping_files")
+        or getattr(default, "MAX_OVERLAPPING_FILES", 100)
+    )))
     return max_mem, max_files
 
 # Lazy storage accessor to avoid import-time initialization failures
@@ -644,6 +674,18 @@ def concat_many_with_union(frames: List[polars.DataFrame]) -> polars.DataFrame:
 # Safe storage I/O helpers
 # =========================
 
+def _safe_storage_path_for_log(value: object) -> str:
+    """Return non-secret local metadata or a redacted remote authority."""
+
+    try:
+        text = str(value or "")
+    except Exception:
+        return "<path-unavailable>"
+    if "://" in text:
+        return safe_storage_path_for_diagnostic(text)
+    return local_path_metadata(text)
+
+
 def _safe_exists(
         path: str,
         profiler: Optional[Profiler] = None,
@@ -697,9 +739,12 @@ def _read_parquet_safe(
     else:
         exists = _safe_exists(path, profiler=p, strict=required)
     if not exists:
-        logging.info(f"[race] file already sunset by another writer: {path}")
+        safe_path = _safe_storage_path_for_log(path)
+        logging.info("[race] file already sunset by another writer: %s", safe_path)
         if required:
-            raise FileNotFoundError(f"Required parquet object is missing: {path}")
+            raise FileNotFoundError(
+                f"Required parquet object is missing: {safe_path}"
+            )
         return None
     try:
         active_storage = cast(
@@ -721,14 +766,28 @@ def _read_parquet_safe(
         p.add("rows_read", int(df.height))
         return df
     except FileNotFoundError:
-        logging.info(f"[race] file vanished before read: {path}")
+        safe_path = _safe_storage_path_for_log(path)
+        logging.info(
+            "[race] file vanished before read: %s",
+            safe_path,
+        )
         if required:
-            raise
+            raise FileNotFoundError(
+                f"Required parquet object vanished before read: {safe_path}"
+            ) from None
         return None
     except Exception as e:
-        logging.warning(f"[read] failed to read parquet at {path}: {e}")
+        logging.warning(
+            "[read] failed to read parquet at %s; error_type=%s",
+            _safe_storage_path_for_log(path),
+            safe_exception_type(e),
+        )
         if required:
-            raise
+            raise RuntimeError(
+                "Required parquet read failed at "
+                f"{_safe_storage_path_for_log(path)}; "
+                f"error_type={safe_exception_type(e)}"
+            ) from None
         return None
 
 
@@ -923,7 +982,10 @@ def _iter_parquet_frames_safe(
         return None if frame is None else iter((frame,))
     if not _safe_exists(path, profiler=p, strict=required):
         if required:
-            raise FileNotFoundError(f"Required parquet object is missing: {path}")
+            raise FileNotFoundError(
+                "Required parquet object is missing: "
+                f"{_safe_storage_path_for_log(path)}"
+            )
         return None
     storage = _get_storage()
 
@@ -970,13 +1032,24 @@ def _iter_parquet_frames_safe(
         except FileNotFoundError:
             if required or yielded:
                 raise
-            logging.info(f"[race] file vanished before streaming read: {path}")
-            raise _OptionalParquetStreamUnavailable(path)
+            logging.info(
+                "[race] file vanished before streaming read: %s",
+                _safe_storage_path_for_log(path),
+            )
+            raise _OptionalParquetStreamUnavailable(
+                "optional parquet stream is unavailable"
+            ) from None
         except Exception as exc:
             if required or yielded:
                 raise
-            logging.warning(f"[read] failed to stream parquet at {path}: {exc}")
-            raise _OptionalParquetStreamUnavailable(path) from exc
+            logging.warning(
+                "[read] failed to stream parquet at %s; error_type=%s",
+                _safe_storage_path_for_log(path),
+                safe_exception_type(exc),
+            )
+            raise _OptionalParquetStreamUnavailable(
+                "optional parquet stream is unavailable"
+            ) from None
 
     return _generate()
 
@@ -1119,6 +1192,10 @@ def find_overlapping_files(  # keep name/signature for compatibility
 # Public API: standalone compaction (no incoming data)
 # =========================
 
+class _CompactionDuplicateRowidsError(ValueError):
+    """Internal signal for an unsafe duplicate row-identity lane."""
+
+
 def _validate_compaction_source_rowids(
         frame: polars.DataFrame,
         file_path: str,
@@ -1138,32 +1215,37 @@ def _validate_compaction_source_rowids(
     if not folded:
         if required:
             raise ValueError(
-                f"Cannot drain deletion-vector: {file_path!r} lacks "
+                "Cannot drain deletion-vector: "
+                f"{_safe_storage_path_for_log(file_path)!r} lacks "
                 f"{ROWID_COL!r}"
             )
         return None
     if folded != [ROWID_COL]:
         raise ValueError(
             f"Compaction encountered an ambiguous reserved rowid column in "
-            f"{file_path!r}"
+            f"{_safe_storage_path_for_log(file_path)!r}"
         )
     rowids = frame.get_column(ROWID_COL)
     if rowids.dtype != polars.Int64:
         raise ValueError(
-            f"Compaction requires canonical {ROWID_COL} Int64 in {file_path!r}"
+            f"Compaction requires canonical {ROWID_COL} Int64 in "
+            f"{_safe_storage_path_for_log(file_path)!r}"
         )
     if rowids.null_count() > 0:
         raise ValueError(
-            f"Compaction cannot consume NULL rowids in {file_path!r}"
+            "Compaction cannot consume NULL rowids in "
+            f"{_safe_storage_path_for_log(file_path)!r}"
         )
     minimum = rowids.min()
     if minimum is None or minimum <= 0:
         raise ValueError(
-            f"Compaction requires positive rowids in {file_path!r}"
+            "Compaction requires positive rowids in "
+            f"{_safe_storage_path_for_log(file_path)!r}"
         )
     if rowids.n_unique() != frame.height:
-        raise ValueError(
-            f"Compaction found duplicate rowids in {file_path!r}"
+        raise _CompactionDuplicateRowidsError(
+            "Compaction found duplicate rowids in "
+            f"{_safe_storage_path_for_log(file_path)!r}"
         )
     return rowids
 
@@ -1174,16 +1256,14 @@ def _prove_safe_compacted_rowids(frame: polars.DataFrame) -> None:
         _validate_compaction_source_rowids(
             frame, "compaction output", required=False,
         )
-    except ValueError as exc:
+    except _CompactionDuplicateRowidsError:
         # Keep the long-standing compaction diagnostic: callers and runbooks
         # need to distinguish unsafe cross-file identity collapse from a
         # malformed rowid lane in one source file.
-        if "duplicate rowids" in str(exc):
-            raise ValueError(
-                "Compaction would merge duplicate __rowid__ values into one "
-                "file and make future tombstones over-delete live rows"
-            ) from exc
-        raise
+        raise ValueError(
+            "Compaction would merge duplicate __rowid__ values into one "
+            "file and make future tombstones over-delete live rows"
+        ) from None
 
 
 def _cleanup_compaction_outputs(resources: List[Dict]) -> None:
@@ -1200,8 +1280,9 @@ def _cleanup_compaction_outputs(resources: List[Dict]) -> None:
     except BaseException as cleanup_error:
         try:
             logging.warning(
-                "[compaction] could not resolve storage for output cleanup: %s",
-                cleanup_error,
+                "[compaction] could not resolve storage for output cleanup; "
+                "error_type=%s",
+                safe_exception_type(cleanup_error),
             )
         except BaseException:
             pass
@@ -1273,7 +1354,8 @@ def _compact_resources_with_tombstones(
             continue
         if path in by_path:
             raise ValueError(
-                f"Compaction snapshot contains duplicate resource path {path!r}"
+                "Compaction snapshot contains duplicate resource path "
+                f"{_safe_storage_path_for_log(path)!r}"
             )
         by_path[path] = resource
         ordered_resources.append(resource)
@@ -1333,10 +1415,10 @@ def _compact_resources_with_tombstones(
 
     cfg = table_config or {}
     try:
-        configured_workers = int(
+        configured_workers = int(cast(Any, (
             cfg.get("tombstone_compaction_workers")
             or getattr(default, "TOMBSTONE_COMPACTION_WORKERS", 2)
-        )
+        )))
     except (TypeError, ValueError):
         configured_workers = 2
     # Keep one core available for the coordinator's read/union/anti-join work.
@@ -1586,7 +1668,7 @@ def _compact_resources_with_tombstones(
             # projection lane; identity equality is still proved from rowids.
             if has_tombstones and file_tombstones is not None:
                 try:
-                    declared_rows = int(resource.get("rows"))
+                    declared_rows = int(cast(Any, resource.get("rows")))
                 except (TypeError, ValueError):
                     declared_rows = -1
                 if declared_rows == file_tombstones.height:
@@ -1600,6 +1682,10 @@ def _compact_resources_with_tombstones(
                     _validate_compaction_source_rowids(
                         projected, file_path, required=True,
                     )
+                    if projected is None:  # pragma: no cover - required read
+                        raise RuntimeError(
+                            "Required compaction projection disappeared"
+                        )
                     physical = projected.select(ROWID_COL)
                     dead_ids = file_tombstones.select(ROWID_COL)
                     if (
@@ -1659,7 +1745,8 @@ def _compact_resources_with_tombstones(
                     continue
                 if declared_rows and streamed_rows != declared_rows:
                     raise RuntimeError(
-                        f"Parquet row count changed while compacting {file_path!r}: "
+                        "Parquet row count changed while compacting "
+                        f"{_safe_storage_path_for_log(file_path)!r}: "
                         f"expected {declared_rows}, streamed {streamed_rows}"
                     )
                 sunset_files.add(file_path)
@@ -1700,7 +1787,7 @@ def _compact_resources_with_tombstones(
                 if removed != file_tombstones.height:
                     raise RuntimeError(
                         f"Deletion-vector cardinality proof failed for "
-                        f"{file_path!r}"
+                        f"{_safe_storage_path_for_log(file_path)!r}"
                     )
                 removed_rows += removed
                 p.add("tombstone_files_touched", 1)
@@ -2001,12 +2088,14 @@ def compact_resources(
                 if ROWID_COL not in existing_df.columns:
                     raise ValueError(
                         f"Cannot apply deletion-vector while materialising "
-                        f"{file_path!r}: missing canonical {ROWID_COL!r} column"
+                        f"{_safe_storage_path_for_log(file_path)!r}: missing "
+                        f"canonical {ROWID_COL!r} column"
                     )
                 if existing_df.get_column(ROWID_COL).null_count() > 0:
                     raise ValueError(
                         f"Cannot apply deletion-vector while materialising "
-                        f"{file_path!r}: NULL rowids are not allowed"
+                        f"{_safe_storage_path_for_log(file_path)!r}: NULL "
+                        "rowids are not allowed"
                     )
                 file_dead_rowids = (
                     set(dead_rowids_by_file.get(file_path, set()))
@@ -2163,9 +2252,9 @@ def _cleanup_unpublished_parquet_path(storage: object, path: str) -> None:
     except BaseException as cleanup_error:
         try:
             logging.warning(
-                "[write] failed to clean unpublished parquet %s: %s",
-                path,
-                cleanup_error,
+                "[write] failed to clean unpublished parquet %s; error_type=%s",
+                _safe_storage_path_for_log(path),
+                safe_exception_type(cleanup_error),
             )
         except BaseException:
             # Logging is diagnostic only. Even a hostile exception formatter
@@ -2201,6 +2290,90 @@ def _write_single_parquet_file(
             if storage is not None and isinstance(path, str):
                 _cleanup_unpublished_parquet_path(storage, path)
         raise
+
+
+_ROWID_INTEGRITY_DIGEST_DOMAIN = b"supertable-rowid-integrity-v1\0"
+_ROWID_INTEGRITY_HASH_CHUNK_ROWS = 1_048_576
+_ROWID_INTEGRITY_BITMAP_MAX_ROWS = 1_048_576
+
+
+def _rowid_integrity_facts(
+    frame: polars.DataFrame,
+) -> Optional[Dict[str, Any]]:
+    """Return exact physical-order row-ID facts for a resource write.
+
+    Generic processing helpers that genuinely have no ``__rowid__`` remain
+    compatible and publish no capability seal. Once the column is present it
+    must be canonical positive Int64 and globally unique within this resource;
+    an invalid modern resource is never admitted to a snapshot.
+    """
+    if ROWID_COL not in frame.columns:
+        return None
+    rowids = frame.get_column(ROWID_COL)
+    rows = int(frame.height)
+    if rowids.dtype != polars.Int64 or len(rowids) != rows:
+        raise ValueError("Resource __rowid__ column must be canonical Int64")
+    nulls = int(rowids.null_count())
+    nonnull = rows - nulls
+    if nulls:
+        raise ValueError("Resource __rowid__ column contains NULL values")
+    values = rowids.to_numpy()
+    minimum = None if rows == 0 else int(values.min())
+    maximum = None if rows == 0 else int(values.max())
+    if (
+        minimum is not None
+        and (minimum <= 0 or maximum is None or maximum > MAX_TABLE_ROWID)
+    ):
+        raise ValueError(
+            "Resource __rowid__ values must be positive signed BIGINTs"
+        )
+    if rows:
+        assert minimum is not None and maximum is not None
+        span = maximum - minimum + 1
+        if span < rows:
+            # Pigeonhole proof: fewer representable values than physical rows.
+            unique = -1
+        elif span == rows and rows <= _ROWID_INTEGRITY_BITMAP_MAX_ROWS:
+            # Modern writer batches allocate one contiguous global row-ID
+            # interval, even when a business-key sort shuffles physical order.
+            # Marking that exact interval is an O(n), one-byte/value proof and
+            # avoids Polars' more expensive general-purpose distinct hash set.
+            # ``values < minimum`` creates the correctly sized all-False array
+            # without introducing a direct NumPy dependency in this module.
+            seen = values < minimum
+            seen[values - minimum] = True
+            unique = rows if bool(seen.all()) else -1
+        else:
+            # Compaction/deletes can create sparse row-ID domains. Retain the
+            # exact general proof for those resources; no range heuristic is
+            # ever accepted as uniqueness.
+            unique = int(rowids.n_unique())
+        if unique != rows:
+            raise ValueError(
+                "Resource __rowid__ column contains duplicate values"
+            )
+    else:
+        unique = 0
+
+    digest = hashlib.sha256(_ROWID_INTEGRITY_DIGEST_DOMAIN)
+    for offset in range(0, rows, _ROWID_INTEGRITY_HASH_CHUNK_ROWS):
+        chunk = values[offset:offset + _ROWID_INTEGRITY_HASH_CHUNK_ROWS]
+        # Canonical signed big-endian bytes make the digest independent of
+        # host endianness, Arrow buffers, JSON formatting, and Parquet codec.
+        canonical = chunk.astype(">i8", copy=False)
+        # NumPy arrays expose the contiguous buffer protocol. Feed that view
+        # directly to OpenSSL instead of allocating/copying a second bytes
+        # object (8 MiB per million row IDs with the current chunk bound).
+        digest.update(canonical)
+    return {
+        "version": 1,
+        "rows": rows,
+        "nonnull": nonnull,
+        "unique": unique,
+        "minimum": minimum,
+        "maximum": maximum,
+        "digest": digest.hexdigest(),
+    }
 
 
 def _write_single_parquet_file_attempt(
@@ -2258,6 +2431,11 @@ def _write_single_parquet_file_attempt(
         with p.span("write.sort"):
             write_df = write_df.sort(sort_cols)
 
+    # The digest follows exact physical order, so compute it after the final
+    # writer sort but before any object can be published.
+    with p.span("write.rowid_integrity"):
+        rowid_integrity = _rowid_integrity_facts(write_df)
+
     write_bytes = getattr(storage, "write_bytes", None)
     write_parquet = getattr(storage, "write_parquet", None)
 
@@ -2290,8 +2468,9 @@ def _write_single_parquet_file_attempt(
             fallback_reason = "encode_error"
             p.add("parquet_codec_polars_encode_error", 1)
             logging.warning(
-                "[write] native Polars parquet encode failed; using PyArrow: %s",
-                exc,
+                "[write] native Polars parquet encode failed; using PyArrow; "
+                "error_type=%s",
+                safe_exception_type(exc),
             )
     if data is None:
         with p.span("write.to_arrow"):
@@ -2334,11 +2513,11 @@ def _write_single_parquet_file_attempt(
         # but must never publish an ambiguously identified resource.
         try:
             footer_md = pq.read_metadata(io.BytesIO(data))
-        except Exception as exc:
+        except Exception:
             raise RuntimeError(
                 f"Could not parse freshly encoded Parquet footer for "
-                f"{new_parquet_path!r}"
-            ) from exc
+                f"{_safe_storage_path_for_log(new_parquet_path)!r}"
+            ) from None
     elif callable(write_parquet):
         if arrow_tbl is None:  # pragma: no cover - guarded by codec selection
             raise RuntimeError("Compatibility parquet backend requires Arrow")
@@ -2394,10 +2573,10 @@ def _write_single_parquet_file_attempt(
             try:
                 lengths = pc.binary_length(column)
                 maximum = pc.max(lengths).as_py()
-            except Exception as exc:
+            except Exception:
                 raise RuntimeError(
                     f"Could not compute Binary value-width seal for {name!r}"
-                ) from exc
+                ) from None
             binary_value_bounds[str(name)] = max(0, int(maximum or 0))
     else:
         # Do not materialise a full Arrow table solely for this seal on the fast
@@ -2407,12 +2586,12 @@ def _write_single_parquet_file_attempt(
                 continue
             try:
                 maximum = write_df.get_column(name).bin.size().max()
-            except Exception as exc:
+            except Exception:
                 # This seal is an execution-memory boundary. A writer capable
                 # of publishing Binary data must never omit or guess it.
                 raise RuntimeError(
                     f"Could not compute Binary value-width seal for {name!r}"
-                ) from exc
+                ) from None
             binary_value_bounds[str(name)] = max(0, int(maximum or 0))
     if binary_value_bounds:
         resource["column_max_value_bytes"] = binary_value_bounds
@@ -2442,6 +2621,11 @@ def _write_single_parquet_file_attempt(
             "stats_rows": seal.stats_rows,
             "stats_digest": seal.stats_digest,
         })
+        if rowid_integrity is not None:
+            resource["rowid_integrity"] = {
+                **rowid_integrity,
+                "footer_sha256": footer_sha256,
+            }
         if footer_md_out is not None:
             # Reuse both products of the one footer traversal in the subsequent
             # combined stats-artifact build. Logical schema publication is
@@ -2451,12 +2635,14 @@ def _write_single_parquet_file_attempt(
                 metadata=footer_md,
                 rows=exact_stats_rows,
             )
+    elif rowid_integrity is not None:
+        raise RuntimeError(
+            "Could not seal row-ID integrity without the published Parquet footer"
+        )
     # Exact LocalStorage publication is a trusted, durable exact-byte boundary.
-    # Retain only the physical schema and projected-byte routing map already
-    # available in the encoded footer. Complete rowid integrity deliberately
-    # remains lazy: decoding that column here taxes every append, including
-    # files that are never mutation candidates. Compatibility backends may
-    # re-encode ``data`` and therefore cannot seed from the submitted bytes.
+    # Retain the physical schema and projected-byte routing map already
+    # available in the encoded footer. Compatibility backends may re-encode
+    # ``data`` and therefore cannot seed from the submitted bytes.
     if (
         callable(write_bytes)
         and footer_md is not None
@@ -2569,7 +2755,9 @@ def filter_stale_incoming_rows(
             if required:
                 missing = [c for c in overwrite_columns if c not in available_cols]
                 raise ValueError(
-                    f"Mutation candidate {file_path!r} lacks overwrite column(s) {missing!r}"
+                    "Mutation candidate "
+                    f"{_safe_storage_path_for_log(file_path)!r} lacks "
+                    f"overwrite column(s) {missing!r}"
                 )
             continue
         existing_parts.append(part.select(available_cols))
@@ -2614,7 +2802,7 @@ def filter_stale_incoming_rows(
 # Deletes and upserts no longer rewrite data files in the common case.
 # Instead, the ``__rowid__`` of every logically-removed row is recorded in a
 # per-table deletion-vector parquet (columns ``__file__`` + ``__rowid__``).
-# The read path anti-joins live data against that vector on ``__rowid__``.
+# Reads anti-join on the protected composite ``(__file__, __rowid__)`` identity.
 # Physical removal happens lazily, only when the vector grows past
 # ``max_tombstone_rows`` (see ``compact_tombstones``).
 
@@ -2756,16 +2944,20 @@ def _validate_mutation_source_rowids(
     """
     if ROWID_COL not in frame.columns:
         raise ValueError(
-            f"Mutation candidate {file_path!r} has no required {ROWID_COL!r} column"
+            "Mutation candidate "
+            f"{_safe_storage_path_for_log(file_path)!r} has no required "
+            f"{ROWID_COL!r} column"
         )
     rowids = frame.get_column(ROWID_COL)
     if rowids.dtype != polars.Int64:
         raise ValueError(
-            f"Mutation candidate {file_path!r} has non-Int64 rowids"
+            "Mutation candidate "
+            f"{_safe_storage_path_for_log(file_path)!r} has non-Int64 rowids"
         )
     if rowids.null_count() > 0:
         raise ValueError(
-            f"Mutation candidate {file_path!r} contains NULL rowids"
+            "Mutation candidate "
+            f"{_safe_storage_path_for_log(file_path)!r} contains NULL rowids"
         )
     if frame.height and (
         rowids.min() is None
@@ -2773,7 +2965,8 @@ def _validate_mutation_source_rowids(
         or rowids.n_unique() != frame.height
     ):
         raise ValueError(
-            f"Mutation candidate {file_path!r} contains non-positive or "
+            "Mutation candidate "
+            f"{_safe_storage_path_for_log(file_path)!r} contains non-positive or "
             "duplicate rowids"
         )
 
@@ -2787,8 +2980,8 @@ def _checked_tombstone_expected_rows(
         raise ValueError(f"{source} has invalid expected row count")
     try:
         expected = int(expected_rows)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{source} has invalid expected row count") from exc
+    except (TypeError, ValueError):
+        raise ValueError(f"{source} has invalid expected row count") from None
     if expected < 0:
         raise ValueError(f"{source} has invalid expected row count")
     return expected
@@ -3034,7 +3227,10 @@ def _max_tombstone_rows(table_config: Optional[dict]) -> int:
     ``MAX_MEMORY_CHUNK_SIZE`` / ``MAX_OVERLAPPING_FILES``).
     """
     cfg = table_config or {}
-    return int(cfg.get("max_tombstone_rows") or getattr(default, "MAX_TOMBSTONE_ROWS", 1_000_000))
+    return int(cast(Any, (
+        cfg.get("max_tombstone_rows")
+        or getattr(default, "MAX_TOMBSTONE_ROWS", 1_000_000)
+    )))
 
 
 def _write_df_parquet(
@@ -3075,8 +3271,8 @@ def _write_df_parquet(
                 p.add("parquet_codec_polars_encode_error", 1)
                 logging.warning(
                     "[write] native Polars system parquet encode failed; "
-                    "using PyArrow: %s",
-                    exc,
+                    "using PyArrow; error_type=%s",
+                    safe_exception_type(exc),
                 )
                 arrow_tbl = write_df.to_arrow()
                 data = _encode_system_parquet_pyarrow(
@@ -3119,7 +3315,7 @@ def _write_df_parquet(
     if wrote_exact_bytes and data is not None:
         return len(data)
     try:
-        return int(active_storage.size(path))
+        return int(cast(Any, active_storage).size(path))
     except Exception:
         try:
             return os.path.getsize(path)
@@ -3339,7 +3535,10 @@ def _storage_duckdb_path(storage, key: str, force_presign: bool = False) -> str:
                 pass
             except Exception as e:
                 logging.debug(
-                    f"[write-probe] local to_duckdb_path failed for {key}: {e}"
+                    "[write-probe] local to_duckdb_path failed for %s; "
+                    "error_type=%s",
+                    _safe_storage_path_for_log(key),
+                    safe_exception_type(e),
                 )
         raise ValueError(
             f"local storage could not resolve a DuckDB filesystem path: {key!r}"
@@ -3354,7 +3553,11 @@ def _storage_duckdb_path(storage, key: str, force_presign: bool = False) -> str:
                 if isinstance(url, str) and url:
                     return url
             except Exception as e:
-                logging.debug(f"[write-probe] presign failed for {key}: {e}")
+                logging.debug(
+                    "[write-probe] presign failed for %s; error_type=%s",
+                    _safe_storage_path_for_log(key),
+                    safe_exception_type(e),
+                )
 
     fn = getattr(storage, "to_duckdb_path", None)
     if callable(fn):
@@ -3365,7 +3568,11 @@ def _storage_duckdb_path(storage, key: str, force_presign: bool = False) -> str:
         except NotImplementedError:
             pass
         except Exception as e:
-            logging.debug(f"[write-probe] to_duckdb_path failed for {key}: {e}")
+            logging.debug(
+                "[write-probe] to_duckdb_path failed for %s; error_type=%s",
+                _safe_storage_path_for_log(key),
+                safe_exception_type(e),
+            )
     return key
 
 
@@ -3488,7 +3695,10 @@ def _pin_local_probe_files(
     except BaseException as exc:
         for pin in pins:
             pin.close()
-        logging.debug(f"[write-probe] local integrity cache unavailable: {exc}")
+        logging.debug(
+            "[write-probe] local integrity cache unavailable; error_type=%s",
+            safe_exception_type(exc),
+        )
         return None
 
 
@@ -3771,9 +3981,10 @@ def _seed_local_write_probe_metadata(
     except Exception as exc:
         p.add("write_probe_publication_metadata_failures", 1)
         logging.debug(
-            "[write-probe] local publication metadata not cached for %r: %s",
-            file_key,
-            exc,
+            "[write-probe] local publication metadata not cached for %s; "
+            "error_type=%s",
+            _safe_storage_path_for_log(file_key),
+            safe_exception_type(exc),
         )
 
 
@@ -3827,12 +4038,16 @@ def _local_projected_parquet_bytes(
                 for column_index in range(row_group.num_columns):
                     column = row_group.column(column_index)
                     if column.path_in_schema in wanted:
-                        compressed = int(column.total_compressed_size or 0)
-                        if compressed > 0:
-                            total += compressed
+                        compressed_bytes = int(
+                            column.total_compressed_size or 0
+                        )
+                        if compressed_bytes > 0:
+                            total += compressed_bytes
     except Exception as e:
         logging.debug(
-            f"[write-probe] projected local cost unavailable; using polars: {e}"
+            "[write-probe] projected local cost unavailable; using polars; "
+            "error_type=%s",
+            safe_exception_type(e),
         )
         return None
     return total
@@ -3987,7 +4202,9 @@ def _island_probe_overlap_matches(
             storage = _get_storage()
         except Exception as exc:
             logging.info(
-                f"[write-probe] local storage unavailable, using polars path: {exc}"
+                "[write-probe] local storage unavailable, using polars path; "
+                "error_type=%s",
+                safe_exception_type(exc),
             )
             return None
     # Open-fd pinning and its proof cache are intentionally restricted to the
@@ -4008,7 +4225,9 @@ def _island_probe_overlap_matches(
         ]
     except Exception as exc:
         logging.info(
-            f"[write-probe] local path resolution failed, using polars path: {exc}"
+            "[write-probe] local path resolution failed, using polars path; "
+            "error_type=%s",
+            safe_exception_type(exc),
         )
         return None
 
@@ -4180,7 +4399,9 @@ def _island_probe_overlap_matches(
         return matched
     except Exception as exc:
         logging.info(
-            f"[write-probe] island-native probe failed, using polars path: {exc}"
+            "[write-probe] island-native probe failed, using polars path; "
+            "error_type=%s",
+            safe_exception_type(exc),
         )
         return None
     finally:
@@ -4257,7 +4478,10 @@ def _duckdb_probe_overlap_matches(
             quote_if_needed,
         )
     except Exception as e:
-        logging.info(f"[write-probe] duckdb unavailable, using polars path: {e}")
+        logging.info(
+            "[write-probe] duckdb unavailable, using polars path; error_type=%s",
+            safe_exception_type(e),
+        )
         return None
 
     if storage is None:
@@ -4299,7 +4523,8 @@ def _duckdb_probe_overlap_matches(
         duck_paths, duck_to_key = _resolve(force_presign=False)
     except Exception as e:
         logging.info(
-            f"[write-probe] unsafe path identity, using polars path: {e}"
+            "[write-probe] unsafe path identity, using polars path; error_type=%s",
+            safe_exception_type(e),
         )
         return None
 
@@ -4468,14 +4693,16 @@ def _duckdb_probe_overlap_matches(
         with p.span("io.duckdb_probe"):
             return con.execute(sql).pl()
 
-    con = None
+    con: Any = None
     try:
         # Reuse this thread's pooled connection (cold-built exactly like the
         # read path: same pragmas, pinned home_directory so the probe never
         # falls back to the OS home, which is absent under a restricted service
         # user).  The pool re-applies httpfs/S3 for remote paths, so a warm
         # connection is configured for the current probe's object store.
-        con = get_pooled_duckdb_connection(temp_dir="write_probe", for_paths=duck_paths)
+        con = get_pooled_duckdb_connection(
+            temp_dir="write_probe", for_paths=duck_paths, storage=storage,
+        )
         con.register(ik_name, incoming_keys.to_arrow())
         try:
             matched = _run(duck_paths)
@@ -4484,13 +4711,26 @@ def _duckdb_probe_overlap_matches(
             # create_reflection_view_with_presign_retry: a private object store
             # rejects an unsigned/expired read (403 / AccessDenied /
             # SignatureDoesNotMatch / HTTP …); presign the keys and retry once.
-            msg = str(e)
+            # Backend text is inspected only as a retry classifier.  Never
+            # render the complete exception: it can contain a signed URL,
+            # request headers, or a response body.  DuckDB exceptions expose
+            # their diagnostic as string args, which are sufficient for the
+            # stable authorization tokens below.
+            error_parts = tuple(
+                part for part in getattr(e, "args", ())
+                if isinstance(part, str)
+            )
             if local_pins is None and getattr(storage, "presign", None) and any(
-                tok in msg for tok in _PRESIGN_RETRY_TOKENS
+                tok in part
+                for part in error_parts
+                for tok in _PRESIGN_RETRY_TOKENS
             ):
-                logging.warning(f"[write-probe] presign fallback after: {msg}")
+                logging.warning(
+                    "[write-probe] presign fallback; error_type=%s",
+                    safe_exception_type(e),
+                )
                 duck_paths, duck_to_key = _resolve(force_presign=True)
-                configure_httpfs_and_s3(con, duck_paths)
+                configure_httpfs_and_s3(con, duck_paths, storage=storage)
                 matched = _run(duck_paths)
             else:
                 raise
@@ -4500,7 +4740,10 @@ def _duckdb_probe_overlap_matches(
             _LOCAL_ROWID_INTEGRITY_CACHE.finish(cache_owned, cache_scanned)
             cache_finished = True
     except Exception as e:
-        logging.info(f"[write-probe] probe failed, using polars path: {e}")
+        logging.info(
+            "[write-probe] probe failed, using polars path; error_type=%s",
+            safe_exception_type(e),
+        )
         return None
     finally:
         if not cache_finished and cache_owned:
@@ -4730,7 +4973,10 @@ def resolve_overwrite_writes(
                 incoming_df, matched, overwrite_columns, newer_than_col, profiler=p,
             )
         except Exception as e:
-            logging.warning(f"[write-probe] derive failed, using polars path: {e}")
+            logging.warning(
+                "[write-probe] derive failed, using polars path; error_type=%s",
+                safe_exception_type(e),
+            )
         else:
             return filtered, (
                 _prove_live_tombstone_delta_pairs(
@@ -4822,15 +5068,22 @@ def _partitioned_new_artifact_path(
     try:
         # Direct makedirs (idempotent local, no-op object) — avoids a 404 prefix HEAD.
         active_storage = storage if storage is not None else _get_storage()
-        active_storage.makedirs(part_dir)
+        cast(Any, active_storage).makedirs(part_dir)
     except Exception:
         pass
     return os.path.join(part_dir, generate_filename(alias, extension))
 
 
-def _partitioned_new_path(base_dir: str, alias: str) -> str:
+def _partitioned_new_path(
+        base_dir: str,
+        alias: str,
+        *,
+        storage: Optional[object] = None,
+) -> str:
     """Backward-compatible Parquet spelling for existing metadata writers."""
-    return _partitioned_new_artifact_path(base_dir, alias, "parquet")
+    return _partitioned_new_artifact_path(
+        base_dir, alias, "parquet", storage=storage,
+    )
 
 
 def build_tombstone_file(
@@ -4878,7 +5131,11 @@ def build_tombstone_file(
         prev_df = _read_parquet_safe(prev_tombstone_path, profiler=p, required=True)
     if prev_df is not None and not prev_df_validated:
         prev_df = validate_tombstone_frame(
-            prev_df, source=f"deletion-vector {prev_tombstone_path or '<memory>'}"
+            prev_df,
+            source=(
+                "deletion-vector "
+                f"{_safe_storage_path_for_log(prev_tombstone_path or '<memory>')}"
+            ),
         )
     if prev_df is not None and prev_df.height > 0:
         combined = polars.concat(
@@ -4963,7 +5220,10 @@ def build_tombstone_v3(
         validate_immutable_tombstone_frame(
             prev_df,
             expected_rows=expected_previous_rows,
-            source=f"immutable predecessor {prev_tombstone_path}",
+            source=(
+                "immutable predecessor "
+                f"{_safe_storage_path_for_log(prev_tombstone_path)}"
+            ),
         )
         if prev_df is not None else _empty_tombstone_df()
     )
@@ -5555,6 +5815,230 @@ STATS_SCHEMA: Dict[str, polars.DataType] = {
 
 STATS_FILE_PATH_COL = "file_path"
 
+# ``SHOW STATS`` is a control-plane diagnostic, not an unbounded data export.
+# These caps are deliberately independent of the cache admission limit: cache
+# admission happens after a frame has already been decoded and therefore cannot
+# protect a worker from a compressed or oversized artifact.
+MAX_SHOW_STATS_OBJECT_BYTES = 64 * 1024 * 1024
+MAX_SHOW_STATS_FOOTER_BYTES = 8 * 1024 * 1024
+MAX_SHOW_STATS_ROWS = 100_000
+MAX_SHOW_STATS_DECODED_BYTES = 64 * 1024 * 1024
+MAX_SHOW_STATS_PHYSICAL_COLUMNS = 128
+MAX_SHOW_STATS_ROW_GROUPS = 100_000
+MAX_SHOW_STATS_COLUMN_CHUNKS = 1_000_000
+MAX_SHOW_STATS_STRING_BYTES = 64 * 1024
+MAX_SHOW_STATS_DICTIONARY_VALUES = MAX_SHOW_STATS_ROWS
+
+_SHOW_STATS_STRING_COLUMNS = frozenset(
+    name for name, dtype in STATS_SCHEMA.items() if dtype == polars.Utf8
+)
+
+
+def _show_stats_arrow_type_is_safe(name: str, arrow_type: pa.DataType) -> bool:
+    """Return whether a canonical stats lane has a bounded lossless input type."""
+    expected = STATS_SCHEMA[name]
+    if expected == polars.Utf8:
+        value_type = (
+            arrow_type.value_type
+            if pa.types.is_dictionary(arrow_type) else arrow_type
+        )
+        return pa.types.is_string(value_type) or pa.types.is_large_string(
+            value_type
+        )
+    if expected == polars.Int64:
+        return arrow_type == pa.int64()
+    if expected == polars.Float64:
+        return arrow_type == pa.float64()
+    if expected == polars.Boolean:
+        return arrow_type == pa.bool_()
+    if isinstance(expected, polars.Datetime):
+        return arrow_type == pa.timestamp("us")
+    return False
+
+
+def _arrow_array_value_is_valid(array: pa.Array, index: int) -> bool:
+    if array.null_count == 0:
+        return True
+    validity = array.buffers()[0]
+    if validity is None:
+        return True
+    bit_index = int(array.offset) + index
+    return bool(memoryview(validity)[bit_index // 8] & (1 << (bit_index % 8)))
+
+
+def _arrow_string_value_bytes(array: pa.Array, index: int) -> int:
+    """Measure one UTF-8 value from Arrow offsets without materialising it."""
+    if not (
+        pa.types.is_string(array.type) or pa.types.is_large_string(array.type)
+    ):
+        raise RuntimeError("Statistics string storage is not canonical")
+    offsets = array.buffers()[1]
+    if offsets is None:
+        raise RuntimeError("Statistics string offsets are unavailable")
+    data = array.buffers()[2]
+    width = 8 if pa.types.is_large_string(array.type) else 4
+    fmt = "<q" if width == 8 else "<i"
+    offset_index = int(array.offset) + index
+    required_offsets = (offset_index + 2) * width
+    if required_offsets > offsets.size:
+        raise RuntimeError("Statistics string offsets are invalid")
+    start = struct.unpack_from(fmt, memoryview(offsets), offset_index * width)[0]
+    end = struct.unpack_from(fmt, memoryview(offsets), (offset_index + 1) * width)[0]
+    if (
+        start < 0
+        or end < start
+        or (data is None and end != 0)
+        or (data is not None and end > data.size)
+    ):
+        raise RuntimeError("Statistics string offsets are invalid")
+    return int(end - start)
+
+
+def _show_stats_string_logical_bytes(
+    array: pa.Array,
+    *,
+    validated_dictionaries: dict[
+        tuple[int, int, int, int, int, int, str], tuple[pa.Array, int]
+    ],
+) -> tuple[int, int]:
+    """Measure post-dictionary UTF-8 storage without expanding any value."""
+    row_count = len(array)
+    validity_bytes = (row_count + 7) // 8 if array.null_count else 0
+    output_bytes = 4 * (row_count + 1) + validity_bytes
+
+    if pa.types.is_dictionary(array.type):
+        dictionary_array = cast(pa.DictionaryArray, array)
+        dictionary = dictionary_array.dictionary
+        if (
+            len(dictionary) > MAX_SHOW_STATS_DICTIONARY_VALUES
+            or not (
+                pa.types.is_string(dictionary.type)
+                or pa.types.is_large_string(dictionary.type)
+            )
+        ):
+            raise ValueError(
+                "Statistics string dictionary exceeds its diagnostic limit"
+            )
+        offsets = dictionary.buffers()[1]
+        data = dictionary.buffers()[2]
+        dictionary_key = (
+            int(offsets.address if offsets is not None else 0),
+            int(offsets.size if offsets is not None else 0),
+            int(data.address if data is not None else 0),
+            int(data.size if data is not None else 0),
+            int(dictionary.offset),
+            len(dictionary),
+            str(dictionary.type),
+        )
+        newly_retained_bytes = 0
+        if dictionary_key not in validated_dictionaries:
+            for dictionary_index in range(len(dictionary)):
+                value_bytes = _arrow_string_value_bytes(
+                    dictionary, dictionary_index,
+                )
+                if value_bytes > MAX_SHOW_STATS_STRING_BYTES:
+                    raise ValueError(
+                        "Statistics string scalar exceeds its diagnostic limit"
+                    )
+            # Keep the owning Array alive for the complete decode. Otherwise a
+            # later batch could reuse the same allocator addresses and evade
+            # scalar validation by colliding with this cache key.
+            newly_retained_bytes = sum(
+                int(buffer.size)
+                for buffer in dictionary.buffers()
+                if buffer is not None
+            )
+            validated_dictionaries[dictionary_key] = (
+                dictionary,
+                newly_retained_bytes,
+            )
+
+        indices = dictionary_array.indices
+        if not pa.types.is_integer(indices.type):
+            raise RuntimeError("Statistics dictionary indices are invalid")
+        for row_index in range(row_count):
+            if not _arrow_array_value_is_valid(indices, row_index):
+                continue
+            dictionary_index = indices[row_index].as_py()
+            if (
+                not isinstance(dictionary_index, int)
+                or isinstance(dictionary_index, bool)
+                or not 0 <= dictionary_index < len(dictionary)
+            ):
+                raise RuntimeError("Statistics dictionary index is invalid")
+            if _arrow_array_value_is_valid(dictionary, dictionary_index):
+                output_bytes += _arrow_string_value_bytes(
+                    dictionary, dictionary_index,
+                )
+        return output_bytes, newly_retained_bytes
+
+    for row_index in range(row_count):
+        value_bytes = _arrow_string_value_bytes(array, row_index)
+        if value_bytes > MAX_SHOW_STATS_STRING_BYTES:
+            raise ValueError(
+                "Statistics string scalar exceeds its diagnostic limit"
+            )
+        # Include every physical span conservatively, including a malformed
+        # non-empty NULL slot. It is already allocated and may survive a cast.
+        output_bytes += value_bytes
+    return output_bytes, 0
+
+
+def _normalize_show_stats_batch(
+    batch: pa.RecordBatch,
+    *,
+    max_decoded_bytes: int,
+    retained_bytes: int,
+    retained_dictionary_bytes: int,
+    validated_dictionaries: dict[
+        tuple[int, int, int, int, int, int, str], tuple[pa.Array, int]
+    ],
+) -> tuple[pa.RecordBatch, int, int]:
+    """Admit dictionary expansion before performing any Arrow string cast."""
+    logical_bytes = 0
+    cast_output_bytes = 0
+    newly_retained_dictionary_bytes = 0
+    for name, array in zip(batch.schema.names, batch.columns):
+        if name in _SHOW_STATS_STRING_COLUMNS:
+            string_bytes, retained_now = _show_stats_string_logical_bytes(
+                array,
+                validated_dictionaries=validated_dictionaries,
+            )
+            logical_bytes += string_bytes
+            newly_retained_dictionary_bytes += retained_now
+            if array.type != pa.string():
+                cast_output_bytes += string_bytes
+        else:
+            logical_bytes += max(0, int(array.nbytes))
+    decoder_bytes = max(0, int(batch.nbytes))
+    # During a dictionary cast, the decoded dictionary/index buffers and the
+    # expanded output coexist. Bound that peak before requesting the cast.
+    if (
+        retained_bytes + retained_dictionary_bytes + decoder_bytes
+        > max_decoded_bytes
+        or retained_bytes + retained_dictionary_bytes + decoder_bytes
+        + cast_output_bytes > max_decoded_bytes
+    ):
+        raise ValueError("Statistics decoded data exceeds its diagnostic limit")
+
+    columns: list[pa.Array] = []
+    fields: list[pa.Field] = []
+    for field, array in zip(batch.schema, batch.columns):
+        if field.name in _SHOW_STATS_STRING_COLUMNS and array.type != pa.string():
+            array = pc.cast(array, pa.string(), safe=True)
+            field = pa.field(field.name, pa.string(), nullable=field.nullable)
+        columns.append(array)
+        fields.append(field)
+    normalized = pa.RecordBatch.from_arrays(columns, schema=pa.schema(fields))
+    normalized_bytes = max(0, int(normalized.nbytes))
+    if (
+        normalized_bytes > logical_bytes
+        or retained_bytes + normalized_bytes + retained_dictionary_bytes
+        + newly_retained_dictionary_bytes > max_decoded_bytes
+    ):
+        raise ValueError("Statistics decoded data exceeds its diagnostic limit")
+    return normalized, normalized_bytes, newly_retained_dictionary_bytes
+
 
 @dataclass(frozen=True)
 class _FooterStatsCacheEntry:
@@ -5694,6 +6178,8 @@ def stats_resource_seals(
                 footer_valid = False
             if not isinstance(footer, str):
                 footer_valid = False
+            if current_digest is None:  # pragma: no cover - assigned above
+                return None
             current_digest.update(_canonical_stats_row_bytes(row))
             current_rows += 1
         finish()
@@ -5778,9 +6264,10 @@ def _uploaded_resource_object_seal(
         metadata = stat_object(path)
     except Exception as exc:
         logging.warning(
-            "[write.object_seal] immutable object metadata unavailable for %r: %s",
-            path,
-            exc,
+            "[write.object_seal] immutable object metadata unavailable for %s; "
+            "error_type=%s",
+            _safe_storage_path_for_log(path),
+            safe_exception_type(exc),
         )
         return None
     # StorageInterface's contract is deliberately strict here. Duck-typing an
@@ -5790,9 +6277,9 @@ def _uploaded_resource_object_seal(
         return None
     if metadata.size != expected_size:
         logging.warning(
-            "[write.object_seal] uploaded object size mismatch for %r: "
+            "[write.object_seal] uploaded object size mismatch for %s: "
             "encoded=%d observed=%d; HEAD elision disabled",
-            path,
+            _safe_storage_path_for_log(path),
             expected_size,
             metadata.size,
         )
@@ -6009,17 +6496,27 @@ def _read_footer_metadata(path: str, profiler: Optional[Profiler] = None):
     """
     p = profiler or get_null_profiler()
     if not _safe_exists(path, profiler=p):
-        logging.info(f"[stats] file already sunset before footer read: {path}")
+        logging.info(
+            "[stats] file already sunset before footer read: %s",
+            _safe_storage_path_for_log(path),
+        )
         return None
     try:
         with p.span("stats.read_footer"):
             data = _get_storage().read_bytes(path)
             return pq.read_metadata(io.BytesIO(data))
     except FileNotFoundError:
-        logging.info(f"[stats] file vanished before footer read: {path}")
+        logging.info(
+            "[stats] file vanished before footer read: %s",
+            _safe_storage_path_for_log(path),
+        )
         return None
     except Exception as e:
-        logging.warning(f"[stats] failed to read footer at {path}: {e}")
+        logging.warning(
+            "[stats] failed to read footer at %s; error_type=%s",
+            _safe_storage_path_for_log(path),
+            safe_exception_type(e),
+        )
         return None
 
 
@@ -6031,10 +6528,11 @@ def parquet_footer_sha256(md) -> str:
 
 
 def _stats_rows_for_metadata(
-        file_path: str,
-        md,
-        *,
-        footer_sha256: Optional[str] = None,
+    file_path: str,
+    md,
+    *,
+    footer_sha256: Optional[str] = None,
+    row_group_indices: Optional[Iterable[int]] = None,
 ) -> List[dict]:
     """Build the per-(row_group × column) stats rows for one file's footer."""
     rows: List[dict] = []
@@ -6045,7 +6543,11 @@ def _stats_rows_for_metadata(
             # Stats remain usable for conservative file pruning, but no executor may
             # trust row-group IDs that are not bound to an exact live footer.
             footer_sha256 = None
-    for rg in range(md.num_row_groups):
+    groups = (
+        range(md.num_row_groups)
+        if row_group_indices is None else row_group_indices
+    )
+    for rg in groups:
         g = md.row_group(rg)
         rg_rows = int(g.num_rows)
         for c in range(g.num_columns):
@@ -6057,7 +6559,7 @@ def _stats_rows_for_metadata(
                 stat = col.statistics if col.is_stats_set else None
             except Exception:
                 stat = None
-            row = {k: None for k in STATS_SCHEMA}
+            row: Dict[str, Any] = {k: None for k in STATS_SCHEMA}
             row["file_path"] = file_path
             row["footer_sha256"] = footer_sha256
             row["row_group_id"] = int(rg)
@@ -6131,50 +6633,58 @@ def stats_seal_for_metadata(
 ) -> ResourceStatsSeal:
     """Build the exact footer + canonical stats-row seal for a new resource."""
     exact_footer_sha256 = footer_sha256 or parquet_footer_sha256(md)
-    exact_rows = (
-        _stats_rows_for_metadata(
-            file_path,
-            md,
-            footer_sha256=exact_footer_sha256,
-        )
-        if rows is None else rows
-    )
-    if not exact_rows:
-        # A system-column-only file has no STATS_SCHEMA rows.  Seal that exact
-        # empty stream anyway, although absence pruning will remain unavailable
-        # because there are no user-column ranges to prove anything.
-        return ResourceStatsSeal(
-            footer_sha256=exact_footer_sha256,
-            stats_rows=0,
-            stats_digest=_new_stats_resource_hasher(file_path).hexdigest(),
-        )
     # These rows were generated from one freshly parsed footer.  Hash their
     # canonical stream directly instead of constructing a second DataFrame,
-    # sorting it, iterating it, and serialising the same footer again.  The
-    # ordering and row encoder are exactly those used by stats_resource_seals.
+    # sorting it, iterating it, and serialising the same footer again. When a
+    # caller supplies only metadata, hold at most one row group's columns in
+    # memory instead of materializing row_groups × columns Python dictionaries.
+    # The ordering and row encoder are exactly those used by
+    # stats_resource_seals.
     try:
-        ordered = sorted(
-            exact_rows,
-            key=lambda row: (row["row_group_id"], row["column_name"]),
-        )
         digest = _new_stats_resource_hasher(file_path)
-        for row in ordered:
-            if (
-                row.get("file_path") != file_path
-                or row.get("footer_sha256") != exact_footer_sha256
-            ):
-                raise ValueError("stats rows do not match their footer resource")
-            values = tuple(row.get(name) for name in STATS_SCHEMA)
-            digest.update(_canonical_stats_row_bytes(values))
+        row_count = 0
+
+        def _hash_rows(group_rows: Iterable[dict]) -> None:
+            nonlocal row_count
+            for row in group_rows:
+                if (
+                    row.get("file_path") != file_path
+                    or row.get("footer_sha256") != exact_footer_sha256
+                ):
+                    raise ValueError(
+                        "stats rows do not match their footer resource"
+                    )
+                values = tuple(row.get(name) for name in STATS_SCHEMA)
+                digest.update(_canonical_stats_row_bytes(values))
+                row_count += 1
+
+        if rows is None:
+            for row_group_id in range(md.num_row_groups):
+                group_rows = _stats_rows_for_metadata(
+                    file_path,
+                    md,
+                    footer_sha256=exact_footer_sha256,
+                    row_group_indices=(row_group_id,),
+                )
+                _hash_rows(sorted(
+                    group_rows,
+                    key=lambda row: row["column_name"],
+                ))
+        else:
+            _hash_rows(sorted(
+                rows,
+                key=lambda row: (row["row_group_id"], row["column_name"]),
+            ))
         return ResourceStatsSeal(
             footer_sha256=exact_footer_sha256,
-            stats_rows=len(ordered),
+            stats_rows=row_count,
             stats_digest=digest.hexdigest(),
         )
-    except Exception as exc:
+    except Exception:
         raise ValueError(
-            f"could not seal statistics for resource {file_path!r}"
-        ) from exc
+            "could not seal statistics for resource "
+            f"{_safe_storage_path_for_log(file_path)!r}"
+        ) from None
 
 
 def _empty_stats_df() -> polars.DataFrame:
@@ -6304,6 +6814,7 @@ def build_stats_file(
         profiler: Optional[Profiler] = None,
         prev_cache_identity: Optional[str] = None,
         validation_out: Optional[Dict[str, _StatsFrameValidation]] = None,
+        storage: Optional[object] = None,
 ) -> Tuple[Optional[str], Optional[polars.DataFrame]]:
     """Carry forward the previous stats parquet and apply this write's delta.
 
@@ -6339,6 +6850,7 @@ def build_stats_file(
             allow_cache=True,
             profiler=p,
             cache_identity=prev_cache_identity,
+            storage=storage,
         )
         if prev_stats_path else None
     )
@@ -6424,8 +6936,16 @@ def build_stats_file(
     if combined_validation is None:
         combined_validation = _validate_stats_frame_once(combined)
 
-    new_path = _partitioned_new_path(stats_dir, "stats")
-    _write_df_parquet(combined, new_path, compression_level, profiler=p)
+    new_path = _partitioned_new_path(
+        stats_dir, "stats", storage=storage,
+    )
+    _write_df_parquet(
+        combined,
+        new_path,
+        compression_level,
+        profiler=p,
+        storage=storage,
+    )
     p.add("stats_rows_total", int(combined.height))
     if validation_out is not None:
         validation_out["validation"] = combined_validation
@@ -6534,7 +7054,13 @@ def _normalise_probe_bounds(lane: str, lo, hi):
 def probe_ranges_from_df(
         df: polars.DataFrame,
         key_cols: List[str],
-) -> Dict[str, Optional[Tuple[str, object, object]]]:
+) -> Dict[
+    str,
+    Optional[
+        Tuple[str, object, object]
+        | Tuple[str, object, object, str]
+    ],
+]:
     """Derive the incoming dataframe's per-key-column range ("probe").
 
     For each column in *key_cols* returns ``(lane, lo, hi)`` — the closed range
@@ -6556,7 +7082,13 @@ def probe_ranges_from_df(
     against the stored stats is mathematically equivalent to comparing footers,
     without opening a single file.
     """
-    out: Dict[str, Optional[Tuple[str, object, object]]] = {}
+    out: Dict[
+        str,
+        Optional[
+            Tuple[str, object, object]
+            | Tuple[str, object, object, str]
+        ],
+    ] = {}
     for name in key_cols:
         if name not in df.columns:
             out[name] = None
@@ -6698,6 +7230,9 @@ def _stored_select_lane_values(
     # stats.  Avoid building a short-lived list on this per-row hot path.
     if bigint_populated == timestamp_populated:
         return None
+    lane: str
+    lo: Any
+    hi: Any
     if bigint_populated:
         if (
             min_bigint is None
@@ -7061,7 +7596,13 @@ def integer_domains_from_complete_stats(
 def prune_overlapping_files_by_stats(
         overlapping_files: Set[Tuple[str, bool, int]],
         stored_stats_df: Optional[polars.DataFrame],
-        probe_ranges: Dict[str, Optional[Tuple[str, object, object]]],
+        probe_ranges: Dict[
+            str,
+            Optional[
+                Tuple[str, object, object]
+                | Tuple[str, object, object, str]
+            ],
+        ],
         profiler: Optional[Profiler] = None,
 ) -> Set[Tuple[str, bool, int]]:
     """Narrow the overwrite/delete candidate set using the stored stats.
@@ -7093,7 +7634,16 @@ def prune_overlapping_files_by_stats(
     constrained_cols = list(constraints.keys())
     needed = stored_stats_df.filter(polars.col("column_name").is_in(constrained_cols))
     # index: file -> row group -> column -> (range, physical/logical row)
-    index: Dict[str, Dict[int, Dict[str, Tuple[object, dict]]]] = {}
+    index: Dict[
+        str,
+        Dict[
+            int,
+            Dict[
+                str,
+                Tuple[Optional[Tuple[str, object, object]], dict],
+            ],
+        ],
+    ] = {}
     for row in needed.iter_rows(named=True):
         fp = row["file_path"]
         rg = row["row_group_id"]
@@ -7164,6 +7714,13 @@ def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]
     """
     p_lane = pred.lane
     s_lane, s_min, s_max = stored
+    # Lane compatibility below proves the runtime scalar families. ``Any`` is
+    # deliberate here so the static checker does not reject their comparisons;
+    # the guarded comparison block remains fail-open for corrupt values.
+    stored_min = cast(Any, s_min)
+    stored_max = cast(Any, s_max)
+    pred_lo = cast(Any, pred.lo)
+    pred_hi = cast(Any, pred.hi)
     if p_lane in ("numeric", "numeric_cast") and s_lane == "bigint":
         # Integer literals/ranges compare exactly.  A floating predicate bound
         # against BIGINT is deliberately incomparable: DuckDB may coerce the
@@ -7174,13 +7731,13 @@ def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]
             if v is not None
         ):
             return True
-        smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
+        smin, smax, plo, phi = stored_min, stored_max, pred_lo, pred_hi
     elif p_lane == "date" and s_lane == "date":
-        smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
+        smin, smax, plo, phi = stored_min, stored_max, pred_lo, pred_hi
     elif p_lane == "timestamp" and s_lane == "timestamp":
-        smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
+        smin, smax, plo, phi = stored_min, stored_max, pred_lo, pred_hi
     elif p_lane == "timestamptz" and s_lane == "timestamptz":
-        smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
+        smin, smax, plo, phi = stored_min, stored_max, pred_lo, pred_hi
     else:
         return True  # incomparable lanes → cannot exclude
 
@@ -7878,7 +8435,11 @@ def _stats_validation_for_frame(
     calculated = _validate_stats_frame_once(stats_df)
     # Only attach metadata when this exact frame is already an admitted entry.
     # Historical allow_cache=False reads must not evict the current version.
-    if cache_entry is not None and cache_entry[0] is stats_df:
+    if (
+        cache_key is not None
+        and cache_entry is not None
+        and cache_entry[0] is stats_df
+    ):
         _STATS_CACHE.put(
             cache_key, stats_df, _StatsCacheMetadata(calculated),
         )
@@ -7886,11 +8447,12 @@ def _stats_validation_for_frame(
 
 
 def load_stats(
-        stats_path: Optional[str],
-        *,
-        allow_cache: bool = True,
-        cache_identity: Optional[str] = None,
-        profiler: Optional[Profiler] = None,
+    stats_path: Optional[str],
+    *,
+    allow_cache: bool = True,
+    cache_identity: Optional[str] = None,
+    profiler: Optional[Profiler] = None,
+    storage: Optional[object] = None,
 ) -> Optional[polars.DataFrame]:
     """Load a table's stats parquet, serving the latest version from memory.
 
@@ -7902,13 +8464,15 @@ def load_stats(
     if not stats_path:
         return None
     p = profiler or get_null_profiler()
-    identity = cache_identity or stats_cache_identity(stats_path)
+    identity = cache_identity or stats_cache_identity(
+        stats_path, storage=storage,
+    )
     cached = _STATS_CACHE.get(identity)
     if cached is not None:
         p.add("stats_cache_hit", 1)
         return cached
     p.add("stats_cache_miss", 1)
-    df = _read_parquet_safe(stats_path, profiler=p)
+    df = _read_parquet_safe(stats_path, profiler=p, storage=storage)
     if df is not None and df.schema != STATS_SCHEMA:
         try:
             df = _conform_stats_schema(df)
@@ -7917,12 +8481,253 @@ def load_stats(
             # corrupt schema cannot be made conservative must behave as absent,
             # never abort a SELECT/write or feed untyped values into pruning.
             logging.warning(
-                f"[stats] incompatible stats schema at {stats_path}: {e}"
+                "[stats] incompatible stats schema at %s; error_type=%s",
+                _safe_storage_path_for_log(stats_path),
+                safe_exception_type(e),
             )
             return None
     if df is not None and allow_cache:
         _STATS_CACHE.put(identity, df)
     return df
+
+
+def load_bounded_stats_diagnostic(
+    stats_path: str,
+    *,
+    expected_rows: int,
+    storage: Optional[object] = None,
+    max_object_bytes: int = MAX_SHOW_STATS_OBJECT_BYTES,
+    max_rows: int = MAX_SHOW_STATS_ROWS,
+    max_decoded_bytes: int = MAX_SHOW_STATS_DECODED_BYTES,
+) -> polars.DataFrame:
+    """Load one stats artifact only after proving bounded immutable state.
+
+    The ordinary stats loader optimizes trusted query pruning and may decode a
+    complete artifact before its cache byte cap is evaluated. ``SHOW STATS``
+    is reachable as an interactive diagnostic, so it uses a stricter lane:
+
+    * the snapshot-pinned row count is checked before any storage operation;
+    * the object is size/identity sealed and conditionally spilled to disk;
+    * footer cardinality and projected uncompressed chunks are admitted before
+      decoding any data page;
+    * bounded batches are measured incrementally before the canonical
+      projection is returned.
+
+    No whole-object ``read_parquet``/``read_bytes`` fallback is allowed. A
+    third-party backend without conditional streaming support fails closed.
+    """
+    if not isinstance(stats_path, str) or not stats_path or "\x00" in stats_path:
+        raise ValueError("Statistics artifact path is invalid")
+    for name, value in (
+        ("max_object_bytes", max_object_bytes),
+        ("max_rows", max_rows),
+        ("max_decoded_bytes", max_decoded_bytes),
+    ):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    for name, value, hard_maximum in (
+        ("max_object_bytes", max_object_bytes, MAX_SHOW_STATS_OBJECT_BYTES),
+        ("max_rows", max_rows, MAX_SHOW_STATS_ROWS),
+        ("max_decoded_bytes", max_decoded_bytes, MAX_SHOW_STATS_DECODED_BYTES),
+    ):
+        if value > hard_maximum:
+            raise ValueError(f"{name} may only tighten its diagnostic limit")
+    if (
+        type(expected_rows) is not int
+        or expected_rows < 0
+        or expected_rows > max_rows
+    ):
+        raise ValueError("Statistics row count exceeds its diagnostic limit")
+
+    active_storage = cast(
+        StorageInterface,
+        storage if storage is not None else _get_storage(),
+    )
+    stat_object = getattr(active_storage, "stat_object", None)
+    download_to_file = getattr(active_storage, "download_to_file", None)
+    if not callable(stat_object) or not callable(download_to_file):
+        raise RuntimeError(
+            "Statistics storage lacks bounded immutable download support"
+        )
+
+    observed = stat_object(stats_path)
+    if (
+        not isinstance(observed, ObjectMetadata)
+        or type(observed.size) is not int
+        or observed.size < 12
+        or observed.size > max_object_bytes
+        or not observed.identity_token()
+    ):
+        raise ValueError("Statistics artifact exceeds its sealed size limit")
+
+    with tempfile.TemporaryFile(prefix="supertable-show-stats-") as spill:
+        written = download_to_file(
+            stats_path,
+            spill,
+            expected=observed,
+            chunk_size=min(1024 * 1024, max_object_bytes),
+        )
+        spill.seek(0, os.SEEK_END)
+        spilled_size = spill.tell()
+        if (
+            type(written) is not int
+            or written != observed.size
+            or spilled_size != observed.size
+        ):
+            raise RuntimeError("Statistics artifact download was incomplete")
+        resealed = stat_object(stats_path)
+        if not isinstance(resealed, ObjectMetadata) or resealed != observed:
+            raise RuntimeError("Statistics artifact changed during download")
+
+        spill.seek(observed.size - 8)
+        tail = spill.read(8)
+        if len(tail) != 8 or tail[4:] != b"PAR1":
+            raise RuntimeError("Statistics artifact is not valid Parquet")
+        footer_size = struct.unpack("<I", tail[:4])[0]
+        if (
+            footer_size <= 0
+            or footer_size > MAX_SHOW_STATS_FOOTER_BYTES
+            or footer_size > observed.size - 12
+        ):
+            raise ValueError("Statistics footer exceeds its diagnostic limit")
+
+        spill.seek(0)
+        try:
+            # Preserve every canonical UTF-8 lane as an Arrow dictionary where
+            # possible.  Otherwise a tiny index page referencing one large
+            # dictionary scalar can expand into a many-megabyte string batch
+            # before ``RecordBatch.nbytes`` is available to enforce the cap.
+            parquet = pq.ParquetFile(
+                spill,
+                read_dictionary=sorted(_SHOW_STATS_STRING_COLUMNS),
+            )
+            metadata = parquet.metadata
+            arrow_schema = parquet.schema_arrow
+        except Exception:
+            raise RuntimeError(
+                "Statistics artifact has invalid Parquet metadata"
+            ) from None
+        if metadata is None:
+            raise RuntimeError("Statistics artifact has no Parquet metadata")
+        if (
+            metadata.num_rows != expected_rows
+            or metadata.num_rows > max_rows
+            or metadata.num_columns > MAX_SHOW_STATS_PHYSICAL_COLUMNS
+            or metadata.num_row_groups > MAX_SHOW_STATS_ROW_GROUPS
+            or metadata.num_row_groups * metadata.num_columns
+            > MAX_SHOW_STATS_COLUMN_CHUNKS
+        ):
+            raise ValueError("Statistics metadata exceeds its diagnostic limit")
+
+        schema_names = list(arrow_schema.names)
+        if len(schema_names) != len(set(schema_names)):
+            raise RuntimeError("Statistics artifact has ambiguous columns")
+        projected_columns = [
+            name for name in STATS_SCHEMA if name in schema_names
+        ]
+        for name in projected_columns:
+            arrow_type = arrow_schema.field(name).type
+            if (
+                pa.types.is_nested(arrow_type)
+                or not _show_stats_arrow_type_is_safe(name, arrow_type)
+            ):
+                raise RuntimeError(
+                    "Statistics canonical columns have an unsafe scalar type"
+                )
+
+        # Parquet must decompress a complete page before Arrow can report the
+        # resulting batch size. Admit every selected encoded page/chunk from
+        # the sealed footer first, preventing a compressed page bomb from
+        # crossing the diagnostic memory boundary before measurement.
+        projected_names = set(projected_columns)
+        projected_uncompressed_bytes = 0
+        for row_group_index in range(metadata.num_row_groups):
+            row_group = metadata.row_group(row_group_index)
+            for column_index in range(row_group.num_columns):
+                column = row_group.column(column_index)
+                if column.path_in_schema not in projected_names:
+                    continue
+                chunk_bytes = column.total_uncompressed_size
+                if type(chunk_bytes) is not int or chunk_bytes < 0:
+                    raise RuntimeError(
+                        "Statistics footer has an invalid decoded-size bound"
+                    )
+                projected_uncompressed_bytes += chunk_bytes
+                if projected_uncompressed_bytes > max_decoded_bytes:
+                    raise ValueError(
+                        "Statistics decoded data exceeds its diagnostic limit"
+                    )
+
+        # Retain at most a few hundred bounded wrappers at the 100k-row ceiling;
+        # the footer gate above bounds page allocation before this measured
+        # Arrow-buffer accounting runs.
+        retained_bytes = 0
+        decoded_rows = 0
+        batches: list[pa.RecordBatch] = []
+        validated_dictionaries: dict[
+            tuple[int, int, int, int, int, int, str], tuple[pa.Array, int]
+        ] = {}
+        retained_dictionary_bytes = 0
+        try:
+            for batch in parquet.iter_batches(
+                batch_size=256,
+                columns=projected_columns,
+                use_threads=False,
+                ):
+                if batch.num_rows <= 0 or batch.num_rows > 256:
+                    raise RuntimeError(
+                        "Statistics decoder violated its batch-row bound"
+                    )
+                decoded_rows += int(batch.num_rows)
+                if decoded_rows > expected_rows:
+                    raise ValueError(
+                        "Statistics decoded data exceeds its diagnostic limit"
+                    )
+                (
+                    normalized_batch,
+                    normalized_bytes,
+                    retained_dictionary_bytes_now,
+                ) = _normalize_show_stats_batch(
+                    batch,
+                    max_decoded_bytes=max_decoded_bytes,
+                    retained_bytes=retained_bytes,
+                    retained_dictionary_bytes=retained_dictionary_bytes,
+                    validated_dictionaries=validated_dictionaries,
+                )
+                retained_dictionary_bytes += retained_dictionary_bytes_now
+                retained_bytes += normalized_bytes
+                batches.append(normalized_batch)
+                # Avoid holding the raw index/page wrapper across the next
+                # decoder call. Dictionary buffers deliberately retained for
+                # validation are separately included in the live-byte bound.
+                del batch
+        except ValueError:
+            raise
+        except Exception:
+            raise RuntimeError(
+                "Statistics artifact could not be decoded safely"
+            ) from None
+        if decoded_rows != expected_rows:
+            raise RuntimeError("Statistics artifact row count changed during decode")
+
+        if expected_rows == 0:
+            return _empty_stats_df()
+        try:
+            arrow_table = pa.Table.from_batches(batches)
+            frame = _conform_stats_schema(polars.from_arrow(arrow_table))
+        except Exception:
+            raise RuntimeError(
+                "Statistics diagnostic projection is invalid"
+            ) from None
+        try:
+            final_bytes = int(frame.estimated_size())
+        except Exception:
+            raise RuntimeError(
+                "Statistics diagnostic size could not be measured"
+            ) from None
+        if final_bytes > max_decoded_bytes:
+            raise ValueError("Statistics decoded data exceeds its diagnostic limit")
+        return frame
 
 
 def cache_stats(
@@ -7970,15 +8775,18 @@ def _v1_loaded_tombstone_state(
         expected_segment_prefix: Optional[str],
 ) -> LoadedTombstoneState:
     logical_digest = _checked_tombstone_expected_digest(
-        digest, source=f"legacy deletion-vector {path}"
+        digest,
+        source=f"legacy deletion-vector {_safe_storage_path_for_log(path)}",
     ) or tombstone_digest(frame, assume_valid=True)
     active_storage = storage if storage is not None else _get_storage()
     try:
-        file_size = int(active_storage.size(path))
+        file_size = int(cast(Any, active_storage).size(path))
     except Exception as exc:
         raise TombstoneManifestV2Error(
-            f"Unable to seal legacy deletion-vector size at {path!r}"
-        ) from exc
+            "Unable to seal legacy deletion-vector size at "
+            f"{_safe_storage_path_for_log(path)!r}; "
+            f"error_type={safe_exception_type(exc)}"
+        ) from None
     if expected_segment_prefix is not None:
         prefix = validate_logical_storage_path(
             expected_segment_prefix.rstrip("/"),
@@ -8021,14 +8829,16 @@ def _v3_loaded_tombstone_state(
         allowed_files: Optional[Set[str]],
 ) -> LoadedTombstoneState:
     rows = _checked_tombstone_expected_rows(
-        expected_rows, source=f"immutable deletion-vector {path}",
+        expected_rows,
+        source=f"immutable deletion-vector {_safe_storage_path_for_log(path)}",
     )
     if rows is None or rows <= 0:
         raise TombstoneManifestV2Error(
             "active format-3 deletion-vector requires a positive row count"
         )
     checked = _checked_tombstone_expected_digest(
-        digest, source=f"immutable deletion-vector {path}",
+        digest,
+        source=f"immutable deletion-vector {_safe_storage_path_for_log(path)}",
     )
     if checked != observed_digest:
         raise TombstoneManifestV2Error(
@@ -8037,7 +8847,7 @@ def _v3_loaded_tombstone_state(
     validate_immutable_tombstone_frame(
         frame,
         expected_rows=rows,
-        source=f"immutable deletion-vector {path}",
+        source=f"immutable deletion-vector {_safe_storage_path_for_log(path)}",
     )
     referenced_files = frozenset(
         frame.get_column(TOMBSTONE_FILE_COL).unique().to_list()
@@ -8047,7 +8857,7 @@ def _v3_loaded_tombstone_state(
         if foreign:
             raise TombstoneManifestV2Error(
                 "format-3 deletion-vector references files outside the "
-                f"pinned snapshot: {sorted(foreign)!r}"
+                f"pinned snapshot; foreign_file_count={len(foreign)}"
             )
     return LoadedTombstoneState(
         frame=frame,
@@ -8080,14 +8890,18 @@ def _read_tombstone_v3_artifact(
     except Exception:
         if required:
             raise
-        logging.warning("[read] failed to read format-3 tombstone at %s", path)
+        logging.warning(
+            "[read] failed to read format-3 tombstone at %s",
+            _safe_storage_path_for_log(path),
+        )
         return None, None
     if not isinstance(raw, (bytes, bytearray, memoryview)):
         raise ValueError("Format-3 tombstone read did not return bytes")
     raw = bytes(raw)
     digest = tombstone_v3_artifact_digest(raw)
     checked_digest = _checked_tombstone_expected_digest(
-        expected_digest, source=f"immutable deletion-vector {path}",
+        expected_digest,
+        source=f"immutable deletion-vector {_safe_storage_path_for_log(path)}",
     )
     if checked_digest != digest:
         # An optional/missing read may return None, but a present object whose
@@ -8106,7 +8920,10 @@ def _read_tombstone_v3_artifact(
     except Exception:
         if required:
             raise
-        logging.warning("[read] failed to read format-3 tombstone at %s", path)
+        logging.warning(
+            "[read] failed to read format-3 tombstone at %s",
+            _safe_storage_path_for_log(path),
+        )
         return None, None
 
 
@@ -8176,7 +8993,10 @@ def _read_tombstone_manifest_v2(
     except Exception:
         if required:
             raise
-        logging.warning("[read] failed to read tombstone manifest at %s", path)
+        logging.warning(
+            "[read] failed to read tombstone manifest at %s",
+            _safe_storage_path_for_log(path),
+        )
         return None
 
 
@@ -8244,7 +9064,9 @@ def _load_tombstone_manifest_v2_state(
                 or before.size != segment.file_size
             ):
                 raise TombstoneManifestV2Error(
-                    f"segment {segment.file!r} file_size does not match "
+                    "segment "
+                    f"{_safe_storage_path_for_log(segment.file)!r} "
+                    "file_size does not match "
                     "the manifest"
                 )
             observed_size = before.size
@@ -8266,7 +9088,8 @@ def _load_tombstone_manifest_v2_state(
                 )
             if segment_frame is None:
                 raise FileNotFoundError(
-                    f"Required deletion-vector segment is missing: {segment.file}"
+                    "Required deletion-vector segment is missing: "
+                    f"{_safe_storage_path_for_log(segment.file)}"
                 )
             with profiler.span("tombstone_v2.segment_validate"):
                 segment_frame = validate_tombstone_frame(
@@ -8274,7 +9097,10 @@ def _load_tombstone_manifest_v2_state(
                     expected_rows=segment.rows,
                     expected_digest=segment.digest,
                     allowed_files=allowed_files,
-                    source=f"deletion-vector segment {segment.file}",
+                    source=(
+                        "deletion-vector segment "
+                        f"{_safe_storage_path_for_log(segment.file)}"
+                    ),
                 )
             validate_tombstone_segment_observation(
                 segment,
@@ -8293,7 +9119,8 @@ def _load_tombstone_manifest_v2_state(
                 or after != before
             ):
                 raise TombstoneManifestV2Error(
-                    f"segment {segment.file!r} changed during read"
+                    "tombstone segment changed during read: "
+                    f"{_safe_storage_path_for_log(segment.file)!r}"
                 )
             frames.append(segment_frame)
         except Exception:
@@ -8301,7 +9128,7 @@ def _load_tombstone_manifest_v2_state(
                 raise
             logging.warning(
                 "[read] failed to validate tombstone segment at %s",
-                segment.file,
+                _safe_storage_path_for_log(segment.file),
             )
             return None
     with profiler.span("tombstone_v2.union_integrity"):
@@ -8310,7 +9137,10 @@ def _load_tombstone_manifest_v2_state(
             combined,
             expected_rows=manifest.total_rows,
             allowed_files=allowed_files,
-            source=f"deletion-vector manifest union {tombstone_path}",
+            source=(
+                "deletion-vector manifest union "
+                f"{_safe_storage_path_for_log(tombstone_path)}"
+            ),
         )
     return LoadedTombstoneState(
         frame=combined,
@@ -8532,7 +9362,10 @@ def load_tombstone(
                 expected_rows=expected_rows,
                 expected_digest=expected_digest,
                 allowed_files=allowed_files,
-                source=f"deletion-vector {tombstone_path}",
+                source=(
+                    "deletion-vector "
+                    f"{_safe_storage_path_for_log(tombstone_path)}"
+                ),
             )
             if state_out is not None:
                 loaded_state = _v1_loaded_tombstone_state(
@@ -8560,7 +9393,10 @@ def load_tombstone(
             ),
             state=cache_state,
             trusted_immutable=(normalized_format == TOMBSTONE_FORMAT_V3),
-            source=f"deletion-vector cache entry {tombstone_path}",
+            source=(
+                "deletion-vector cache entry "
+                f"{_safe_storage_path_for_log(tombstone_path)}"
+            ),
         )
         _TOMBSTONE_CACHE.put(identity, cache_frame, seal)
     return df
@@ -8598,14 +9434,14 @@ def load_tombstone_manifest_from_storage(
         )
     except TombstoneManifestV2Error:
         raise
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError):
         # ``urllib.parse.urlsplit`` can raise a plain ValueError for malformed
         # bracketed authorities. Keep provider/path parser details behind the
         # manifest integrity boundary rather than leaking an alternate error
         # type to callers.
         raise TombstoneManifestV2Error(
             "tombstone manifest pointer is not a valid logical storage path"
-        ) from exc
+        ) from None
     exact_body = read_bounded_tombstone_manifest_bytes(storage, key)
     try:
         return load_tombstone_manifest_v2(
@@ -8621,10 +9457,10 @@ def load_tombstone_manifest_from_storage(
         )
     except TombstoneManifestV2Error:
         raise
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError):
         raise TombstoneManifestV2Error(
             "tombstone manifest contains an invalid logical storage path"
-        ) from exc
+        ) from None
 
 
 def _load_one_tombstone_segment(
@@ -8638,10 +9474,10 @@ def _load_one_tombstone_segment(
         raise ValueError("v2 deletion-vector segments are malformed")
     try:
         observed_size = storage.size(segment.cache_key)
-    except Exception as exc:
+    except Exception:
         raise ValueError(
             "Unable to observe required deletion-vector segment size"
-        ) from exc
+        ) from None
     if (
         not isinstance(observed_size, int)
         or isinstance(observed_size, bool)
@@ -8668,10 +9504,10 @@ def _load_one_tombstone_segment(
             frame = polars.from_arrow(storage.read_parquet(segment.cache_key))
     except ValueError:
         raise
-    except Exception as exc:
+    except Exception:
         raise ValueError(
             "Unable to read required deletion-vector segment"
-        ) from exc
+        ) from None
     return validate_tombstone_frame(
         frame,
         expected_rows=segment.expected_rows,
@@ -8728,10 +9564,10 @@ def load_tombstone_segments(
                 field_name="segment cache key",
                 required_suffix=".parquet",
             )
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError):
             raise ValueError(
                 "v2 deletion-vector segment cache key is malformed"
-            ) from exc
+            ) from None
         checked_rows = _checked_tombstone_expected_rows(
             segment.expected_rows,
             source="v2 deletion-vector segment",
@@ -8859,7 +9695,10 @@ def cache_tombstone(
     (``tombstone_path`` is ``None``) or unchanged with no frame in hand.
     """
     if tombstone_path and df is not None:
-        source = f"deletion-vector cache seed {tombstone_path}"
+        source = (
+            "deletion-vector cache seed "
+            f"{_safe_storage_path_for_log(tombstone_path)}"
+        )
         normalized_format = _normalized_tombstone_format(
             loaded_state.tombstone_format
             if loaded_state is not None else tombstone_format
@@ -9010,16 +9849,19 @@ def compact_tombstones(
     def _validate_physical(frame: polars.DataFrame, file_path: str):
         if ROWID_COL not in frame.columns:
             raise ValueError(
-                f"Cannot drain deletion-vector: {file_path!r} lacks {ROWID_COL!r}"
+                "Cannot drain deletion-vector: "
+                f"{_safe_storage_path_for_log(file_path)!r} lacks {ROWID_COL!r}"
             )
         physical_ids = frame.get_column(ROWID_COL)
         if physical_ids.dtype != polars.Int64:
             raise ValueError(
-                f"Cannot drain deletion-vector: {file_path!r} rowids are not Int64"
+                "Cannot drain deletion-vector: "
+                f"{_safe_storage_path_for_log(file_path)!r} rowids are not Int64"
             )
         if physical_ids.null_count() > 0:
             raise ValueError(
-                f"Cannot drain deletion-vector: {file_path!r} contains NULL rowids"
+                "Cannot drain deletion-vector: "
+                f"{_safe_storage_path_for_log(file_path)!r} contains NULL rowids"
             )
         if (
             physical_ids.min() is None
@@ -9027,7 +9869,8 @@ def compact_tombstones(
             or physical_ids.n_unique() != frame.height
         ):
             raise ValueError(
-                f"Cannot drain deletion-vector: {file_path!r} contains "
+                "Cannot drain deletion-vector: "
+                f"{_safe_storage_path_for_log(file_path)!r} contains "
                 "non-positive or duplicate rowids"
             )
         return physical_ids
@@ -9035,7 +9878,7 @@ def compact_tombstones(
     def _drain_group(item):
         group_key, file_tombstones = item
         file_path = group_key[0] if isinstance(group_key, tuple) else group_key
-        local_footer_md = {}
+        local_footer_md: Dict[str, Any] = {}
         resource = by_path.get(file_path)
         if not resource:
             # Do not discard a ghost entry: without its referenced physical file
@@ -9050,7 +9893,7 @@ def compact_tombstones(
         # the DV cardinality, read only the rowid column and prove exact set
         # equality. A match needs no full decode and no successor parquet write.
         try:
-            declared_rows = int(resource.get("rows"))
+            declared_rows = int(cast(Any, resource.get("rows")))
         except (TypeError, ValueError):
             declared_rows = -1
         if declared_rows == file_tombstones.height:
@@ -9062,6 +9905,10 @@ def compact_tombstones(
                 required=True,
             )
             _validate_physical(projected, file_path)
+            if projected is None:  # pragma: no cover - required read
+                raise RuntimeError(
+                    "Required tombstone projection disappeared"
+                )
             projected_ids = projected.select(ROWID_COL)
             if (
                 projected_ids.join(dead_ids, on=ROWID_COL, how="anti").height == 0
@@ -9101,7 +9948,7 @@ def compact_tombstones(
         if difference == 0:
             return 0, [], None, file_tombstones, local_footer_md, sub
 
-        local_resources = []
+        local_resources: List[Dict[str, Any]] = []
         sub.add("tombstone_files_touched", 1)
 
         if kept_df.height > 0:
@@ -9121,10 +9968,10 @@ def compact_tombstones(
     items = list(grouped.items())
     cfg = table_config or {}
     try:
-        configured_workers = int(
+        configured_workers = int(cast(Any, (
             cfg.get("tombstone_compaction_workers")
             or getattr(default, "TOMBSTONE_COMPACTION_WORKERS", 2)
-        )
+        )))
     except (TypeError, ValueError):
         configured_workers = 2
     # Keep the executor bounded: every worker may hold one decoded data file

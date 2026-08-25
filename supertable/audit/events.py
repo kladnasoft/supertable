@@ -13,7 +13,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import socket
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -68,15 +70,56 @@ class ActorType(str, Enum):
 # ---------------------------------------------------------------------------
 
 def _build_instance_id() -> str:
-    """hostname-PID — unique per process, stable for its lifetime."""
+    """Return an RK-safe, boot-unique identity without exposing the hostname."""
     try:
-        host = socket.gethostname()[:32]
+        host = socket.gethostname()
     except Exception:
         host = "unknown"
-    return f"{host}-{os.getpid()}"
+    host_digest = hashlib.sha256(
+        str(host).encode("utf-8", errors="replace")
+    ).hexdigest()[:12]
+    try:
+        pid = max(0, int(os.getpid()))
+    except Exception:
+        pid = 0
+    # Cap the decimal component so a hostile/mocked PID cannot violate the
+    # canonical Redis segment's 64-byte ceiling.  The random boot nonce, not
+    # the PID, supplies uniqueness across container/PID reuse.
+    pid_text = str(pid)[-20:]
+    nonce = secrets.token_hex(8)
+    return f"audit-{host_digest}-{pid_text}-{nonce}"
 
 
+_INSTANCE_ID_LOCK = threading.Lock()
+_INSTANCE_PID = os.getpid()
 INSTANCE_ID: str = _build_instance_id()
+
+
+def _reset_instance_identity_after_fork() -> None:
+    """Give a forked child a fresh identity and an unlocked allocator."""
+    global INSTANCE_ID, _COUNTER, _INSTANCE_ID_LOCK, _INSTANCE_PID
+
+    _INSTANCE_ID_LOCK = threading.Lock()
+    _INSTANCE_PID = os.getpid()
+    INSTANCE_ID = _build_instance_id()
+    _COUNTER = 0
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_instance_identity_after_fork)
+
+
+def current_instance_id() -> str:
+    """Return a fork-safe identity for the calling operating-system process."""
+    global INSTANCE_ID, _INSTANCE_PID
+
+    pid = os.getpid()
+    if pid != _INSTANCE_PID:
+        with _INSTANCE_ID_LOCK:
+            if pid != _INSTANCE_PID:
+                INSTANCE_ID = _build_instance_id()
+                _INSTANCE_PID = pid
+    return INSTANCE_ID
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +142,11 @@ def _uuid7() -> str:
     return f"{ms:012x}-{_COUNTER:04x}-{rand}"
 
 
+def new_event_id() -> str:
+    """Allocate a process-unique, writer-owned audit event identity."""
+    return _uuid7()
+
+
 # ---------------------------------------------------------------------------
 # AuditEvent dataclass
 # ---------------------------------------------------------------------------
@@ -118,7 +166,7 @@ class AuditEvent:
     """
 
     # ── Identity ───────────────────────────────────────────
-    event_id: str = field(default_factory=_uuid7)
+    event_id: str = field(default_factory=new_event_id)
     timestamp_ms: int = field(default_factory=lambda: int(time.time() * 1000))
 
     # ── Classification ─────────────────────────────────────
@@ -153,7 +201,7 @@ class AuditEvent:
     chain_hash: str = ""
 
     # ── Instance (set automatically) ───────────────────────
-    instance_id: str = field(default_factory=lambda: INSTANCE_ID)
+    instance_id: str = field(default_factory=current_instance_id)
 
     # ── Serialization ──────────────────────────────────────
 
@@ -166,13 +214,12 @@ class AuditEvent:
         return json.dumps(self.to_dict(), separators=(",", ":"), ensure_ascii=False)
 
     def event_hash(self) -> str:
-        """SHA-256 hash of the event content (excluding chain_hash and instance_id).
+        """SHA-256 hash of the event content (excluding only chain_hash).
 
         Used as input to the integrity chain. Deterministic for the same event.
         """
         d = self.to_dict()
         d.pop("chain_hash", None)
-        d.pop("instance_id", None)
         canonical = json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 

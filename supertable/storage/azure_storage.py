@@ -12,13 +12,18 @@ from urllib.parse import quote, urlparse
 import pyarrow as pa
 import pyarrow.parquet as pq
 from azure.core import MatchConditions
-from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
+from azure.core.exceptions import (
+    ResourceExistsError,
+    ResourceModifiedError,
+    ResourceNotFoundError,
+)
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
 from supertable.storage.storage_interface import (
     ObjectIdentityMismatch,
     ObjectMetadata,
     StorageInterface,
+    storage_error_type,
     validate_range_request,
     write_all,
 )
@@ -37,7 +42,7 @@ def _parse_abfss(uri: str) -> Tuple[str, str, str, str]:
     else:
         authority, prefix = rest, ""
     if "@" not in authority or ".dfs.core.windows.net" not in authority:
-        raise ValueError(f"Malformed ABFSS authority: {authority}")
+        raise ValueError("Malformed ABFSS authority")
     container, host = authority.split("@", 1)
     account = host.split(".dfs.core.windows.net")[0]
     blob_endpoint = f"https://{account}.blob.core.windows.net"
@@ -66,7 +71,7 @@ class AzureBlobStorage(StorageInterface):
         # authorization-scoped storage instance while it covers the requested
         # SAS lifetime.  The lock also prevents a concurrent refresh stampede.
         self._delegation_key_lock = threading.Lock()
-        self._delegation_key_cache = None
+        self._delegation_key_cache: Optional[Tuple[Any, Any]] = None
 
     # -------------------------
     # Factory
@@ -123,9 +128,9 @@ class AzureBlobStorage(StorageInterface):
             if key:
                 svc = BlobServiceClient(account_url=endpoint, credential=key)
             elif sas:
-                if not sas.startswith("?"):
-                    sas = "?" + sas
-                svc = BlobServiceClient(account_url=endpoint + sas)
+                sas = sas.lstrip("?")
+                svc = BlobServiceClient(account_url=endpoint, credential=sas)
+                setattr(svc, "_supertable_sas_token", sas)
             else:
                 # Managed Identity / AAD
                 from azure.identity import DefaultAzureCredential
@@ -166,6 +171,10 @@ class AzureBlobStorage(StorageInterface):
         credential = self.svc.credential
         account_name = self.svc.account_name
 
+        configured_sas = getattr(self.svc, "_supertable_sas_token", None)
+        if isinstance(configured_sas, str) and configured_sas:
+            return f"{blob_client.url}?{configured_sas}"
+
         if hasattr(credential, "account_key"):
             account_key = credential.account_key
         elif isinstance(credential, str):
@@ -174,8 +183,8 @@ class AzureBlobStorage(StorageInterface):
             # AAD / managed identity: use user delegation key
             try:
                 lifetime = int(expiry_seconds)
-            except (TypeError, ValueError, OverflowError) as exc:
-                raise ValueError("expiry_seconds must be a positive integer") from exc
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("expiry_seconds must be a positive integer") from None
             if lifetime <= 0:
                 raise ValueError("expiry_seconds must be a positive integer")
             now = datetime.now(timezone.utc)
@@ -287,16 +296,16 @@ class AzureBlobStorage(StorageInterface):
         blob = self.container.get_blob_client(path)
         try:
             data = blob.download_blob().readall()
-        except ResourceNotFoundError as e:
-            raise FileNotFoundError(f"File not found: {path}") from e
+        except ResourceNotFoundError:
+            raise FileNotFoundError("File not found") from None
 
         if len(data) == 0:
-            raise ValueError(f"File is empty: {path}")
+            raise ValueError("File is empty")
 
         try:
             return json.loads(data)
-        except json.JSONDecodeError as je:
-            raise ValueError(f"Invalid JSON in {path}") from je
+        except json.JSONDecodeError:
+            raise ValueError("Invalid JSON") from None
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
         path = self._with_base(path)
@@ -319,8 +328,8 @@ class AzureBlobStorage(StorageInterface):
         try:
             props = self.container.get_blob_client(path).get_blob_properties()
             return int(props.size)
-        except ResourceNotFoundError as e:
-            raise FileNotFoundError(f"File not found: {path}") from e
+        except ResourceNotFoundError:
+            raise FileNotFoundError("File not found") from None
 
     @staticmethod
     def _metadata_from_properties(properties: Any) -> ObjectMetadata:
@@ -339,8 +348,8 @@ class AzureBlobStorage(StorageInterface):
         path = self._with_base(path)
         try:
             properties = self.container.get_blob_client(path).get_blob_properties()
-        except ResourceNotFoundError as e:
-            raise FileNotFoundError(f"File not found: {path}") from e
+        except ResourceNotFoundError:
+            raise FileNotFoundError("File not found") from None
         return self._metadata_from_properties(properties)
 
     def download_to_file(
@@ -370,11 +379,11 @@ class AzureBlobStorage(StorageInterface):
                 # split SDK chunks so the destination still sees bounded writes.
                 for offset in range(0, len(sdk_chunk), chunk_size):
                     written += write_all(file_obj, sdk_chunk[offset:offset + chunk_size])
-        except ResourceNotFoundError as e:
-            raise FileNotFoundError(f"File not found: {path}") from e
+        except ResourceNotFoundError:
+            raise FileNotFoundError("File not found") from None
         if expected is not None and written != expected.size:
             raise OSError(
-                f"Short download for {path}: expected {expected.size} bytes, wrote {written}"
+                f"Short download: expected {expected.size} bytes, wrote {written}"
             )
         return written
 
@@ -402,14 +411,12 @@ class AzureBlobStorage(StorageInterface):
             request["match_condition"] = MatchConditions.IfNotModified
         try:
             payload = blob.download_blob(**request).readall()
-        except ResourceModifiedError as exc:
-            raise ObjectIdentityMismatch(f"Object version changed: {path}") from exc
-        except ResourceNotFoundError as exc:
-            raise FileNotFoundError(f"File not found: {path}") from exc
+        except ResourceModifiedError:
+            raise ObjectIdentityMismatch("Object version changed") from None
+        except ResourceNotFoundError:
+            raise FileNotFoundError("File not found") from None
         if len(payload) != length:
-            raise ObjectIdentityMismatch(
-                f"Short or oversized conditional range read for {path}"
-            )
+            raise ObjectIdentityMismatch("Short or oversized conditional range read")
         return payload
 
     def cache_namespace(self) -> Dict[str, str]:
@@ -460,7 +467,7 @@ class AzureBlobStorage(StorageInterface):
         logical = self._without_base(path)
         prefix = path if path.endswith("/") else f"{path}/"
         if next(iter(self.container.list_blobs(name_starts_with=prefix)), None) is None:
-            raise FileNotFoundError(f"File or folder not found: {path}")
+            raise FileNotFoundError("File or folder not found")
         self.delete_prefix(logical)
 
     def delete_prefix(self, path: str) -> None:
@@ -475,16 +482,20 @@ class AzureBlobStorage(StorageInterface):
         previous_batch = None
         stagnant = 0
         prior_errors: List[Exception] = []
+        attempts = 0
         while True:
+            attempts += 1
+            if attempts > 32:
+                raise OSError("Azure prefix deletion exceeded retry bound")
             blobs = list(itertools.islice(
                 self.container.list_blobs(name_starts_with=prefix), 1000,
             ))
             if not blobs:
                 if prior_errors:
                     raise OSError(
-                        f"Azure reported {len(prior_errors)} failed deletion(s) "
-                        f"under {path!r}"
-                    ) from prior_errors[0]
+                        "Azure prefix deletion failed; "
+                        f"failures={len(prior_errors)}"
+                    ) from None
                 return
             names = tuple(str(blob.name) for blob in blobs)
             errors: List[Exception] = []
@@ -499,13 +510,10 @@ class AzureBlobStorage(StorageInterface):
             if stagnant >= 3:
                 if prior_errors:
                     raise OSError(
-                        f"Azure reported {len(prior_errors)} failed deletion(s) "
-                        f"under {path!r}"
-                    ) from prior_errors[0]
-                raise OSError(
-                    f"Azure prefix made no deletion progress: {path!r}; "
-                    f"remaining={names[0]!r}"
-                )
+                        "Azure prefix deletion failed; "
+                        f"failures={len(prior_errors)}"
+                    ) from None
+                raise OSError("Azure prefix deletion made no progress")
 
     # -------------------------
     # Directory structure
@@ -552,8 +560,8 @@ class AzureBlobStorage(StorageInterface):
         blob = self.container.get_blob_client(path)
         try:
             data = blob.download_blob().readall()
-        except ResourceNotFoundError as e:
-            raise FileNotFoundError(f"Parquet file not found: {path}") from e
+        except ResourceNotFoundError:
+            raise FileNotFoundError("Parquet file not found") from None
         try:
             buf = io.BytesIO(data)
             proj = None
@@ -562,7 +570,9 @@ class AzureBlobStorage(StorageInterface):
                 buf.seek(0)
             return pq.read_table(buf, columns=proj)
         except Exception as e:
-            raise RuntimeError(f"Failed to read Parquet at '{path}': {e}")
+            raise RuntimeError(
+                f"Failed to read Parquet; error_type={storage_error_type(e)}"
+            ) from None
 
     # -------------------------
     # Bytes / Text / Copy
@@ -576,13 +586,28 @@ class AzureBlobStorage(StorageInterface):
             content_settings=ContentSettings(content_type="application/octet-stream"),
         )
 
+    def create_bytes_if_absent(self, path: str, data: bytes) -> bool:
+        path = self._with_base(path)
+        blob = self.container.get_blob_client(path)
+        try:
+            blob.upload_blob(
+                data,
+                overwrite=False,
+                content_settings=ContentSettings(
+                    content_type="application/octet-stream",
+                ),
+            )
+        except ResourceExistsError:
+            return False
+        return True
+
     def read_bytes(self, path: str) -> bytes:
         path = self._with_base(path)
         blob = self.container.get_blob_client(path)
         try:
             return blob.download_blob().readall()
-        except ResourceNotFoundError as e:
-            raise FileNotFoundError(f"File not found: {path}") from e
+        except ResourceNotFoundError:
+            raise FileNotFoundError("File not found") from None
 
     def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None:
         self.write_bytes(path, text.encode(encoding))

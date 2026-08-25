@@ -59,6 +59,7 @@ except ImportError:  # pragma: no cover - exercised on non-POSIX platforms
 from supertable import redis_keys as RK
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 # ---------------------------------------------------------------------------
 # Instance identity — stable for the lifetime of this process.
@@ -104,6 +105,21 @@ class MonitoringExpiredRecordError(MonitoringDurabilityError):
     """A retained record outlived its immutable Redis partition window."""
 
 
+def monitoring_error_type(error: BaseException) -> str:
+    """Return bounded exception metadata without rendering backend text."""
+
+    return safe_exception_type(error)
+
+
+def _safe_durability_error(
+    context: str,
+    error: BaseException,
+) -> MonitoringDurabilityError:
+    return MonitoringDurabilityError(
+        f"{context}; error_type={monitoring_error_type(error)}"
+    )
+
+
 class MonitoringPostCommitError(MonitoringDurabilityError):
     """Core data committed, but its monitoring event was not durable.
 
@@ -128,12 +144,17 @@ class MonitoringPostCommitError(MonitoringDurabilityError):
         self.operation = operation
         self.core_result = core_result
         self.core_committed = True
-        self.cause = cause
+        self.cause_type = monitoring_error_type(cause)
+        self.cause = MonitoringDurabilityError(
+            "monitoring durability failure; "
+            f"error_type={self.cause_type}"
+        )
         self.mirror_error: Exception | None = None
         super().__init__(
             "Core data committed, but the monitoring record could not be "
-            f"durably retained for {organization}/{super_name}/{table_name} "
-            f"({operation}): {cause}. Do not blindly retry the mutation."
+            "durably retained; "
+            f"error_type={self.cause_type}. "
+            "Do not blindly retry the mutation."
         )
 
 
@@ -154,11 +175,15 @@ class MonitoringPostExecutionError(MonitoringDurabilityError):
         self.query_id = query_id
         self.status = status
         self.execution_completed = True
-        self.cause = cause
+        self.cause_type = monitoring_error_type(cause)
+        self.cause = MonitoringDurabilityError(
+            "monitoring durability failure; "
+            f"error_type={self.cause_type}"
+        )
         super().__init__(
             "Query execution completed, but its monitoring record could not "
-            f"be durably retained for {organization}/{super_name}; "
-            f"query_id={query_id!r}, status={status!r}: {cause}."
+            "be durably retained; "
+            f"error_type={self.cause_type}."
         )
 
 
@@ -291,6 +316,21 @@ redis.call('EXPIREAT', KEYS[1], ARGV[4])
 redis.call('EXPIREAT', KEYS[2], ARGV[5])
 return 1
 """
+_DELIVERY_ID_COLLISION_ERROR = "monitoring delivery id collision"
+
+
+def _is_delivery_id_collision(error: BaseException) -> bool:
+    """Recognize our exact Lua error without rendering backend exception text."""
+
+    args = getattr(error, "args", ())
+    if not isinstance(args, tuple) or len(args) != 1:
+        return False
+    message = args[0]
+    return (
+        isinstance(message, str)
+        and len(message) == len(_DELIVERY_ID_COLLISION_ERROR)
+        and message.casefold() == _DELIVERY_ID_COLLISION_ERROR
+    )
 
 
 def _canonical_json(value: Any) -> str:
@@ -375,6 +415,7 @@ class _DurableMonitoringSpool:
                 "durable monitoring spool requires POSIX fcntl locking on this "
                 "release; disable monitoring explicitly on unsupported hosts"
             )
+        failure: Optional[MonitoringDurabilityError] = None
         try:
             # A newly-created directory is not crash-durable until the parent
             # containing its directory entry has also been fsynced.  Remember
@@ -394,11 +435,11 @@ class _DurableMonitoringSpool:
             root_stat = os.lstat(self.root)
             if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
                 raise MonitoringDurabilityError(
-                    f"monitoring spool root is not a real directory: {self.root!r}"
+                    "monitoring spool root is not a real directory"
                 )
             if hasattr(os, "geteuid") and root_stat.st_uid != os.geteuid():
                 raise MonitoringDurabilityError(
-                    f"monitoring spool root is not owned by this process user: {self.root!r}"
+                    "monitoring spool root is not owned by this process user"
                 )
             os.chmod(self.root, 0o700)
             self._fsync_directory(self.root)
@@ -416,9 +457,11 @@ class _DurableMonitoringSpool:
         except MonitoringDurabilityError:
             raise
         except OSError as exc:
-            raise MonitoringDurabilityError(
-                f"could not initialize monitoring spool {self.root!r}: {exc}"
-            ) from exc
+            failure = _safe_durability_error(
+                "could not initialize monitoring spool", exc,
+            )
+        if failure is not None:
+            raise failure
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
@@ -429,12 +472,18 @@ class _DurableMonitoringSpool:
             )
         flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
         with self._thread_lock:
+            open_failure: Optional[MonitoringDurabilityError] = None
+            fd: Optional[int] = None
             try:
                 fd = os.open(self._lock_path, flags, 0o600)
             except OSError as exc:
-                raise MonitoringDurabilityError(
-                    f"could not open monitoring spool lock: {exc}"
-                ) from exc
+                open_failure = _safe_durability_error(
+                    "could not open monitoring spool lock", exc,
+                )
+            if open_failure is not None:
+                raise open_failure
+            assert fd is not None
+            operation_failure: Optional[MonitoringDurabilityError] = None
             try:
                 lock_stat = os.fstat(fd)
                 if not stat.S_ISREG(lock_stat.st_mode):
@@ -447,14 +496,16 @@ class _DurableMonitoringSpool:
             except MonitoringDeliveryError:
                 raise
             except OSError as exc:
-                raise MonitoringDurabilityError(
-                    f"monitoring spool lock operation failed: {exc}"
-                ) from exc
+                operation_failure = _safe_durability_error(
+                    "monitoring spool lock operation failed", exc,
+                )
             finally:
                 try:
                     lock_module.flock(fd, lock_module.LOCK_UN)
                 finally:
                     os.close(fd)
+            if operation_failure is not None:
+                raise operation_failure
 
     @staticmethod
     def _key_hash(key: _MonitorKey) -> str:
@@ -501,11 +552,11 @@ class _DurableMonitoringSpool:
                 file_stat = os.fstat(fd)
                 if not stat.S_ISREG(file_stat.st_mode):
                     raise MonitoringDurabilityError(
-                        f"monitoring spool entry is not a regular file: {path!r}"
+                        "monitoring spool entry is not a regular file"
                     )
                 if file_stat.st_size <= 0 or file_stat.st_size > self.max_bytes:
                     raise MonitoringDurabilityError(
-                        f"monitoring spool entry has invalid size: {path!r}"
+                        "monitoring spool entry has invalid size"
                     )
                 chunks: list[bytes] = []
                 remaining = file_stat.st_size
@@ -518,7 +569,7 @@ class _DurableMonitoringSpool:
                 data = b"".join(chunks)
                 if len(data) != file_stat.st_size:
                     raise MonitoringDurabilityError(
-                        f"monitoring spool entry changed while reading: {path!r}"
+                        "monitoring spool entry changed while reading"
                     )
                 return data
             finally:
@@ -526,18 +577,22 @@ class _DurableMonitoringSpool:
         except MonitoringDeliveryError:
             raise
         except OSError as exc:
-            raise MonitoringDurabilityError(
-                f"could not read monitoring spool entry {path!r}: {exc}"
-            ) from exc
+            failure = _safe_durability_error(
+                "could not read monitoring spool entry", exc,
+            )
+        raise failure
 
     @staticmethod
     def _decode_envelope(data: bytes) -> Dict[str, Any]:
+        decode_failed = False
         try:
             envelope = json.loads(data.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            decode_failed = True
+        if decode_failed:
             raise MonitoringDurabilityError(
                 "monitoring spool contains a corrupt record"
-            ) from exc
+            )
         if not isinstance(envelope, dict) or envelope.get("version") != _SPOOL_VERSION:
             raise MonitoringDurabilityError(
                 "monitoring spool contains an unsupported record"
@@ -550,6 +605,7 @@ class _DurableMonitoringSpool:
         }
         if not required.issubset(envelope):
             raise MonitoringDurabilityError("monitoring spool record is incomplete")
+        coordinates_invalid = False
         try:
             key = _MonitorKey(
                 organization=str(envelope["organization"]),
@@ -565,10 +621,12 @@ class _DurableMonitoringSpool:
             expires_at = int(envelope["partition_expires_at"])
             receipt_expires_at = int(envelope["receipt_expires_at"])
             created_ns = int(envelope["created_ns"])
-        except (TypeError, ValueError, KeyError) as exc:
+        except (TypeError, ValueError, KeyError):
+            coordinates_invalid = True
+        if coordinates_invalid:
             raise MonitoringDurabilityError(
                 "monitoring spool record coordinates are invalid"
-            ) from exc
+            )
         if (
             envelope["partition_key"] != expected_partition
             or envelope["receipt_key"] != expected_receipt
@@ -589,12 +647,15 @@ class _DurableMonitoringSpool:
             raise MonitoringDurabilityError(
                 "monitoring spool payload digest failed validation"
             )
+        payload_corrupt = False
         try:
             payload = json.loads(payload_json)
-        except json.JSONDecodeError as exc:
+        except json.JSONDecodeError:
+            payload_corrupt = True
+        if payload_corrupt:
             raise MonitoringDurabilityError(
                 "monitoring spool payload JSON is corrupt"
-            ) from exc
+            )
         if not isinstance(payload, dict):
             raise MonitoringDurabilityError(
                 "monitoring spool payload must be a JSON object"
@@ -620,7 +681,7 @@ class _DurableMonitoringSpool:
             entry_stat = entry.stat(follow_symlinks=False)
             if not stat.S_ISREG(entry_stat.st_mode):
                 raise MonitoringDurabilityError(
-                    f"unsafe monitoring spool temporary entry: {entry.name!r}"
+                    "unsafe monitoring spool temporary entry"
                 )
             # A crash before the temporary file was completely written/fsynced
             # leaves an unacknowledged fragment.  It was never published and
@@ -638,8 +699,7 @@ class _DurableMonitoringSpool:
                 os.unlink(path)
                 changed = True
                 logger.warning(
-                    "[monitor] discarded incomplete unacknowledged spool temp %s",
-                    entry.name,
+                    "[monitor] discarded incomplete unacknowledged spool temp"
                 )
                 continue
             final_path = self._safe_path(self._final_name(envelope))
@@ -665,13 +725,14 @@ class _DurableMonitoringSpool:
             entry_stat = entry.stat(follow_symlinks=False)
             if not stat.S_ISREG(entry_stat.st_mode):
                 raise MonitoringDurabilityError(
-                    f"unsafe monitoring spool entry: {entry.name!r}"
+                    "unsafe monitoring spool entry"
                 )
             records += 1
             total_bytes += int(entry_stat.st_size)
         return records, total_bytes
 
     def enqueue(self, key: _MonitorKey, payload: Dict[str, Any]) -> _SpoolRecord:
+        canonical_failure: Optional[MonitoringDurabilityError] = None
         try:
             date = _today_utc_date()
             partition_key = RK.monitor_partition(
@@ -704,9 +765,11 @@ class _DurableMonitoringSpool:
         except MonitoringDeliveryError:
             raise
         except (TypeError, ValueError, OverflowError) as exc:
-            raise MonitoringDurabilityError(
-                f"monitoring payload is not canonical JSON: {exc}"
-            ) from exc
+            canonical_failure = _safe_durability_error(
+                "monitoring payload is not canonical JSON", exc,
+            )
+        if canonical_failure is not None:
+            raise canonical_failure
         if len(serialized) > self.max_bytes:
             raise MonitoringBackpressureError(
                 "one monitoring record exceeds SUPERTABLE_MONITOR_SPOOL_MAX_BYTES"
@@ -733,6 +796,7 @@ class _DurableMonitoringSpool:
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL
                 | getattr(os, "O_NOFOLLOW", 0)
             )
+            publish_failure: Optional[MonitoringDurabilityError] = None
             try:
                 fd = os.open(temp_path, flags, 0o600)
                 try:
@@ -745,9 +809,11 @@ class _DurableMonitoringSpool:
                 os.replace(temp_path, final_path)
                 self._fsync_directory(self.root)
             except OSError as exc:
-                raise MonitoringDurabilityError(
-                    f"could not durably publish monitoring spool record: {exc}"
-                ) from exc
+                publish_failure = _safe_durability_error(
+                    "could not durably publish monitoring spool record", exc,
+                )
+            if publish_failure is not None:
+                raise publish_failure
         decoded = self._decode_envelope(serialized)
         return _SpoolRecord(final_path, decoded, len(serialized))
 
@@ -805,13 +871,16 @@ class _DurableMonitoringSpool:
                 raise MonitoringDurabilityError(
                     "monitoring spool record changed before acknowledgement"
                 )
+            delete_failure: Optional[MonitoringDurabilityError] = None
             try:
                 os.unlink(path)
                 self._fsync_directory(self.root)
             except OSError as exc:
-                raise MonitoringDurabilityError(
-                    f"could not durably remove delivered monitoring record: {exc}"
-                ) from exc
+                delete_failure = _safe_durability_error(
+                    "could not durably remove delivered monitoring record", exc,
+                )
+            if delete_failure is not None:
+                raise delete_failure
 
 
 def _deliver_spool_record(
@@ -830,14 +899,12 @@ def _deliver_spool_record(
                 "spool and requires explicit operator disposition"
             )
         logger.debug(
-            "[monitor] %s/%s metric: %s",
-            envelope["organization"],
-            envelope["monitor_type"],
-            envelope["payload"],
+            "[monitor] metric accepted",
         )
         return True
     if redis_connector is None:
         return False
+    receipt_collision = False
     try:
         result = redis_connector.r.eval(
             _IDEMPOTENT_ENQUEUE_LUA,
@@ -851,20 +918,33 @@ def _deliver_spool_record(
             int(envelope["receipt_expires_at"]),
         )
     except Exception as exc:
-        if "monitoring delivery id collision" in str(exc).lower():
-            raise MonitoringDurabilityError(
-                "Redis producer receipt conflicts with the spooled payload"
-            ) from exc
-        return False
-    if int(result) not in (0, 1):
-        if int(result) == -1:
+        if _is_delivery_id_collision(exc):
+            receipt_collision = True
+        else:
+            return False
+    if receipt_collision:
+        raise MonitoringDurabilityError(
+            "Redis producer receipt conflicts with the spooled payload"
+        )
+    invalid_receipt = False
+    try:
+        receipt = int(result)
+    except (TypeError, ValueError, OverflowError):
+        invalid_receipt = True
+        receipt = 0
+    if invalid_receipt:
+        raise MonitoringDurabilityError(
+            "Redis returned an invalid monitoring receipt"
+        )
+    if receipt not in (0, 1):
+        if receipt == -1:
             raise MonitoringExpiredRecordError(
                 "Redis refused a monitoring record at/after its immutable "
                 f"partition expiry ({envelope['partition_date']}); the record "
                 "remains in the local spool"
             )
         raise MonitoringDurabilityError(
-            f"Redis returned an invalid monitoring receipt: {result!r}"
+            "Redis returned an invalid monitoring receipt"
         )
     return True
 
@@ -917,7 +997,7 @@ def drain_monitoring_spool(
     if pending:
         raise MonitoringDeliveryError(
             f"{pending} monitoring metric(s) remain durable in "
-            f"the local spool {spool.root!r} but unaccepted by Redis"
+            "the local spool but unaccepted by Redis"
         )
     return delivered
 
@@ -987,7 +1067,10 @@ class _AsyncMonitoringLogger:
             try:
                 self._redis = RedisConnector()
             except Exception as e:
-                logger.debug(f"[monitor] redis unavailable for {self._key.path_key}: {e}")
+                logger.debug(
+                    "[monitor] redis unavailable; error_type=%s",
+                    monitoring_error_type(e),
+                )
                 self._redis = None
 
         if start_worker:
@@ -1032,6 +1115,7 @@ class _AsyncMonitoringLogger:
         # window where Redis could accept a write but its reply is lost, and it
         # makes retry safe across process restart.
         with self._ship_lock:
+            enqueue_failure: Optional[MonitoringDurabilityError] = None
             try:
                 self._spool.enqueue(self._key, payload)
                 # Oldest-first: a new live event never leaps over an existing
@@ -1045,9 +1129,11 @@ class _AsyncMonitoringLogger:
                 # failure for optional telemetry.  If publication succeeded,
                 # the record remains durable; if it did not, this explicit
                 # error prevents an acknowledged gap.
-                raise MonitoringDurabilityError(
-                    f"monitoring durable enqueue failed: {exc}"
-                ) from exc
+                enqueue_failure = _safe_durability_error(
+                    "monitoring durable enqueue failed", exc,
+                )
+            if enqueue_failure is not None:
+                raise enqueue_failure
 
     def request_flush(self, timeout_s: float = 2.0) -> None:
         """
@@ -1071,7 +1157,7 @@ class _AsyncMonitoringLogger:
             self._refresh_size(pending=pending)
         if pending:
             raise MonitoringDeliveryError(
-                f"{pending} monitoring metric(s) for {self._key.path_key} "
+                f"{pending} monitoring metric(s) "
                 "remain unaccepted by Redis but durable locally"
             )
 
@@ -1125,11 +1211,11 @@ class _AsyncMonitoringLogger:
             return
         self._thread = threading.Thread(
             target=self._worker,
-            name=f"monitor:{self._key.path_key}",
+            name="supertable-monitor",
             daemon=True,
         )
         self._thread.start()
-        logger.info(f"[monitor] started dequeue thread for {self._key.path_key}")
+        logger.info("[monitor] started dequeue thread")
 
     def _worker(self) -> None:
         backoff = 0.1
@@ -1146,8 +1232,8 @@ class _AsyncMonitoringLogger:
                     self._stop.wait(0.1)
                 elif delivered == 0:
                     logger.warning(
-                        "[monitor] %d metric(s) durable in local spool for %s",
-                        pending, self._key.path_key,
+                        "[monitor] %d metric(s) durable in local spool",
+                        pending,
                     )
                     self._stop.wait(backoff)
                     backoff = min(5.0, backoff * 2.0)
@@ -1157,11 +1243,17 @@ class _AsyncMonitoringLogger:
                 # Never recreate/re-date an old partition after its producer
                 # receipts expire.  The immutable file stays for explicit
                 # operator disposition and naturally applies backpressure.
-                logger.error("[monitor] fail-closed spool record: %s", exc)
+                logger.error(
+                    "[monitor] fail-closed spool record; error_type=%s",
+                    monitoring_error_type(exc),
+                )
                 self._stop.wait(5.0)
             except Exception as e:
                 self._clear_current_batch()
-                logger.warning(f"[monitor] spool retry failed for {self._key.path_key}: {e}")
+                logger.warning(
+                    "[monitor] spool retry failed; error_type=%s",
+                    monitoring_error_type(e),
+                )
                 self._stop.wait(backoff)
                 backoff = min(5.0, backoff * 2.0)
             finally:
@@ -1245,7 +1337,7 @@ def _evict_oldest_monitor() -> bool:
         close_if_idle = getattr(candidate, "close_if_idle", None)
         if callable(close_if_idle) and bool(close_if_idle(timeout_s=0.5)):
             _MONITORS.pop(oldest_key, None)
-            logger.debug(f"[monitor] evicted idle cached logger for {oldest_key}")
+            logger.debug("[monitor] evicted idle cached logger")
             return True
         # Pending records are no longer owned by volatile worker memory: they
         # are immutable files in the shared spool.  It is therefore safe to
@@ -1257,7 +1349,7 @@ def _evict_oldest_monitor() -> bool:
         ):
             _MONITORS.pop(oldest_key, None)
             logger.debug(
-                f"[monitor] evicted cached logger with durable WAL for {oldest_key}"
+                "[monitor] evicted cached logger with durable WAL"
             )
             return True
     return False
@@ -1292,6 +1384,7 @@ def get_monitoring_logger(
     key = _MonitorKey(organization=organization, monitor_type=monitor_type)
     cache_key = key.path_key
 
+    logger_failure: Optional[MonitoringDurabilityError] = None
     try:
         # Validate tenant/type before allocating a thread or touching the cache.
         key.redis_partition_today()
@@ -1317,10 +1410,15 @@ def get_monitoring_logger(
     except MonitoringDeliveryError:
         raise
     except Exception as e:
-        logger.warning(f"Monitoring logging failed: {e}")
-        raise MonitoringDurabilityError(
-            f"could not create monitoring logger for {cache_key}: {e}"
-        ) from e
+        logger.warning(
+            "Monitoring logger creation failed; error_type=%s",
+            monitoring_error_type(e),
+        )
+        logger_failure = _safe_durability_error(
+            "could not create monitoring logger", e,
+        )
+    assert logger_failure is not None
+    raise logger_failure
 
 
 class MonitoringWriter:

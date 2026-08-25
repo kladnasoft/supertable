@@ -9,6 +9,7 @@ private projection name used for that integration.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -23,6 +24,128 @@ _LINKED_MARKERS = frozenset({
     "_linked_instance_nonce",
     "_share_columns",
 })
+_ROWID_INTEGRITY_VERSION = 1
+_LOWER_HEX = frozenset("0123456789abcdef")
+
+
+@dataclass(frozen=True)
+class ResourceRowIdIntegritySeal:
+    """Writer-attested row-ID facts tied to one immutable Parquet footer.
+
+    The digest is the domain-separated physical-order stream of signed BIGINT
+    identities.  It is retained for immutable-object/cache fencing and future
+    verification; eligibility additionally requires the exact count/domain
+    facts below and the matching resource footer seal.
+    """
+
+    version: int
+    rows: int
+    nonnull: int
+    unique: int
+    minimum: int | None
+    maximum: int | None
+    digest: str
+    footer_sha256: str
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("version", self.version),
+            ("rows", self.rows),
+            ("nonnull", self.nonnull),
+            ("unique", self.unique),
+        ):
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                raise ValueError(f"row-ID integrity {name} is invalid")
+        if self.version != _ROWID_INTEGRITY_VERSION:
+            raise ValueError("row-ID integrity version is unsupported")
+        if (self.minimum is None) != (self.maximum is None):
+            raise ValueError("row-ID integrity extrema are incomplete")
+        if self.minimum is not None and (
+            not isinstance(self.minimum, int)
+            or isinstance(self.minimum, bool)
+            or not isinstance(self.maximum, int)
+            or isinstance(self.maximum, bool)
+            or self.minimum > self.maximum
+            or self.minimum < -(1 << 63)
+            or self.maximum > MAX_TABLE_ROWID
+        ):
+            raise ValueError("row-ID integrity extrema are invalid")
+        for name, scalar in (
+            ("digest", self.digest),
+            ("footer_sha256", self.footer_sha256),
+        ):
+            if (
+                not isinstance(scalar, str)
+                or len(scalar) != 64
+                or any(character not in _LOWER_HEX for character in scalar)
+            ):
+                raise ValueError(f"row-ID integrity {name} is invalid")
+
+
+def resource_rowid_integrity_seal(
+    resource: object,
+) -> ResourceRowIdIntegritySeal | None:
+    """Parse one exact resource seal; malformed/extended documents fail closed."""
+    if not isinstance(resource, dict):
+        return None
+    raw = resource.get("rowid_integrity")
+    if not isinstance(raw, dict) or set(raw) != {
+        "version",
+        "rows",
+        "nonnull",
+        "unique",
+        "minimum",
+        "maximum",
+        "digest",
+        "footer_sha256",
+    }:
+        return None
+    try:
+        return ResourceRowIdIntegritySeal(
+            version=raw["version"],
+            rows=raw["rows"],
+            nonnull=raw["nonnull"],
+            unique=raw["unique"],
+            minimum=raw["minimum"],
+            maximum=raw["maximum"],
+            digest=raw["digest"],
+            footer_sha256=raw["footer_sha256"],
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _resource_has_valid_rowid_integrity(
+    resource: dict[str, Any],
+    *,
+    high_watermark: int,
+) -> bool:
+    seal = resource_rowid_integrity_seal(resource)
+    rows = resource.get("rows")
+    footer_sha256 = resource.get("footer_sha256")
+    if (
+        seal is None
+        or not isinstance(rows, int)
+        or isinstance(rows, bool)
+        or rows < 0
+        or seal.rows != rows
+        or seal.nonnull != rows
+        or seal.unique != rows
+        or seal.footer_sha256 != footer_sha256
+    ):
+        return False
+    if rows == 0:
+        return seal.minimum is None and seal.maximum is None
+    return bool(
+        seal.minimum is not None
+        and seal.maximum is not None
+        and seal.minimum > 0
+        and seal.maximum <= high_watermark
+    )
 
 
 def _metadata_wrappers(document: object) -> tuple[dict[str, Any], ...]:
@@ -115,6 +238,14 @@ def snapshot_proves_stable_rowids(
         physical_rows += rows
         if physical_rows > MAX_TABLE_ROWID:
             return False
+        # Stable identity requires a writer-attested physical integrity seal.
+        # Metadata-only legacy snapshots cannot establish uniqueness.
+        if "rowid_integrity" not in resource or not (
+            _resource_has_valid_rowid_integrity(
+                resource, high_watermark=high_watermark,
+            )
+        ):
+            return False
 
     # Every extant physical row consumed one table-global allocation.  Deletes
     # and compaction can make this inequality strict, never reverse it.
@@ -124,5 +255,7 @@ def snapshot_proves_stable_rowids(
 __all__ = [
     "MAX_TABLE_ROWID",
     "ODATA_INTERNAL_ROWID_COLUMN",
+    "ResourceRowIdIntegritySeal",
+    "resource_rowid_integrity_seal",
     "snapshot_proves_stable_rowids",
 ]

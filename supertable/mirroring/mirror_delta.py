@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple, Set
 
 from supertable.config.defaults import logger
+from supertable.mirroring.failure_safety import mirror_error_type
 
 
 # ---- Spark/Delta schema normalization helpers ----
@@ -107,6 +108,47 @@ def _schema_to_structtype_json(schema_string: Any = None, schema_list: Any = Non
 
     # empty struct fallback
     return json.dumps({"type": "struct", "fields": []}, separators=(",", ":"))
+
+
+def _require_nonempty_delta_schema(schema_json: str) -> str:
+    """Reject a non-empty snapshot whose Delta schema is not publishable."""
+    error = (
+        "Delta mirroring requires a valid non-empty schema for non-empty "
+        "resources"
+    )
+    try:
+        parsed = json.loads(schema_json)
+    except Exception:
+        raise RuntimeError(error) from None
+
+    fields = parsed.get("fields") if isinstance(parsed, dict) else None
+    if (
+        not isinstance(parsed, dict)
+        or parsed.get("type") != "struct"
+        or not isinstance(fields, list)
+        or not fields
+    ):
+        raise RuntimeError(error)
+
+    names: Set[str] = set()
+    for field in fields:
+        if not isinstance(field, dict):
+            raise RuntimeError(error)
+        name = field.get("name")
+        field_type = field.get("type")
+        if (
+            not isinstance(name, str)
+            or not name
+            or name.strip() != name
+            or name in names
+            or not isinstance(field_type, (str, dict))
+            or not field_type
+            or not isinstance(field.get("nullable"), bool)
+            or not isinstance(field.get("metadata"), dict)
+        ):
+            raise RuntimeError(error)
+        names.add(name)
+    return schema_json
 
 
 
@@ -324,7 +366,10 @@ def _binary_copy_if_possible(storage, src_path: str, dst_path: str) -> bool:
             storage.copy(src_path, dst_path)
             return True
         except Exception as e:
-            logger.warning(f"[mirror][delta] storage.copy failed ({src_path} -> {dst_path}): {e}")
+            logger.warning(
+                "[mirror][delta] storage.copy failed; error_type=%s",
+                mirror_error_type(e),
+            )
 
     # --- Byte copy fallback --------------------------------------------------
     read_bytes = getattr(storage, "read_bytes", None)
@@ -335,7 +380,10 @@ def _binary_copy_if_possible(storage, src_path: str, dst_path: str) -> bool:
             storage.write_bytes(dst_path, read_bytes(src_path))
             return True
         except Exception as e:
-            logger.warning(f"[mirror][delta] byte copy failed ({src_path} -> {dst_path}): {e}")
+            logger.warning(
+                "[mirror][delta] byte copy failed; error_type=%s",
+                mirror_error_type(e),
+            )
 
     return False
 
@@ -353,7 +401,7 @@ def _co_locate_or_reuse_path(storage, table_files_dir: str, catalog_file_path: s
     dst_path = os.path.join(table_files_dir, rel_name)
     ok = _binary_copy_if_possible(storage, catalog_file_path, dst_path)
     if not ok:
-        raise RuntimeError(f"Failed to copy data file into Delta table dir: {catalog_file_path}")
+        raise RuntimeError("Failed to copy data file into Delta table dir")
     return rel_path
 
 
@@ -411,7 +459,7 @@ def _read_delta_actions(storage, log_dir: str, version: int) -> List[Dict[str, A
             continue
         value = json.loads(line)
         if not isinstance(value, dict):
-            raise RuntimeError(f"Invalid Delta action in {path!r}")
+            raise RuntimeError("Invalid Delta action in commit log")
         actions.append(value)
     return actions
 
@@ -486,15 +534,15 @@ def verify_delta_table(
             if isinstance(remove, dict) and remove.get("path"):
                 active.pop(str(remove["path"]), None)
     if not found_commit:
-        raise RuntimeError(f"Delta mirror does not contain commit {commit_id!r}")
+        raise RuntimeError("Delta mirror does not contain the requested commit")
 
     expected = _expected_co_located_paths(simple_snapshot)
     physical = _list_co_located_paths(super_table.storage, files_dir)
     if set(active) != expected or physical != expected:
         raise RuntimeError(
-            "Delta mirror does not match the committed snapshot: "
-            f"log={sorted(active)!r}, files={sorted(physical)!r}, "
-            f"expected={sorted(expected)!r}"
+            "Delta mirror does not match the committed snapshot; "
+            f"log_count={len(active)}; file_count={len(physical)}; "
+            f"expected_count={len(expected)}"
         )
     expected_by_path: Dict[str, Dict[str, Any]] = {}
     for resource in simple_snapshot.get("resources", []) or []:
@@ -515,9 +563,7 @@ def verify_delta_table(
             (add.get("tags") or {}).get("supertable.sha256") or ""
         )
         if not recorded_digest:
-            raise RuntimeError(
-                f"Delta add action lacks an artifact digest: {relative!r}"
-            )
+            raise RuntimeError("Delta add action lacks an artifact digest")
         actual_size, actual_digest = super_table.storage.content_sha256(
             os.path.join(base, relative)
         )
@@ -527,7 +573,7 @@ def verify_delta_table(
             or actual_digest != recorded_digest
         ):
             raise RuntimeError(
-                f"Delta mirrored artifact failed its content seal: {relative!r}"
+                "Delta mirrored artifact failed its content seal"
             )
 
 
@@ -547,7 +593,11 @@ def _write_checkpoint_if_possible(storage, log_dir: str, version: int, add_paths
     pq.write_table(table, buf)
     storage.makedirs(log_dir)
     storage.write_bytes(chk_path, buf.getvalue())
-    logger.debug(f"[mirror][delta] wrote checkpoint {chk_path} with {len(add_paths)} entries")
+    logger.debug(
+        "[mirror][delta] wrote checkpoint v%s with %s entries",
+        version,
+        len(add_paths),
+    )
 
 
 def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, Any]) -> None:
@@ -620,13 +670,9 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
             os.path.join(base, used_rel_path)
         )
         if declared_size and source_size != declared_size:
-            raise RuntimeError(
-                f"Delta source size changed before mirroring: {src_file!r}"
-            )
+            raise RuntimeError("Delta source size changed before mirroring")
         if mirror_size != source_size or mirror_digest != source_digest:
-            raise RuntimeError(
-                f"Delta copy failed its content seal: {src_file!r}"
-            )
+            raise RuntimeError("Delta copy failed its content seal")
         sealed_resource = dict(r)
         sealed_resource["_mirror_sha256"] = source_digest
         current_paths.append(used_rel_path)
@@ -653,8 +699,8 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
             commit_id=mirror_commit_id,
         )
         logger.info(
-            f"[mirror][delta] commit {mirror_commit_id} already published "
-            f"at v{existing_commit_version}"
+            "[mirror][delta] requested commit already published at v%s",
+            existing_commit_version,
         )
         return
     if repair_version is not None:
@@ -669,6 +715,12 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
             schema_list = _infer_schema_list_from_any_parquet(super_table.storage, [first_full])
         except Exception:
             pass
+
+    delta_schema_json = _schema_to_structtype_json(
+        schema_string_from_snapshot, schema_list,
+    )
+    if resources:
+        delta_schema_json = _require_nonempty_delta_schema(delta_schema_json)
 
     # Files to remove = those present before but not now
     to_remove = sorted(list(prev_paths - current_set))
@@ -701,7 +753,10 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
         and hasattr(super_table.storage, "exists")
         and super_table.storage.exists(commit_path)
     ):
-        logger.info(f"[mirror][delta] commit {commit_path} already exists; skipping rewrite")
+        logger.info(
+            "[mirror][delta] commit v%s already exists; skipping rewrite",
+            version,
+        )
         return
 
     with io.StringIO() as s:
@@ -733,7 +788,7 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
             "metaData": {
                 "id": meta_id,
                 "format": {"provider": "parquet", "options": {}},
-                "schemaString": _schema_to_structtype_json(schema_string_from_snapshot, schema_list),
+                "schemaString": delta_schema_json,
                 "partitionColumns": [],
                 "configuration": {
                     "delta.enableChangeDataFeed": "true",
@@ -798,7 +853,7 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
         visible_bytes = super_table.storage.read_bytes(commit_path)
         if visible_bytes != commit_bytes:
             raise RuntimeError(
-                f"Delta commit failed read-after-write verification: {commit_path!r}"
+                "Delta commit failed read-after-write verification"
             )
 
     # Only after the new Delta log is durable may obsolete physical files be
@@ -824,14 +879,18 @@ def write_delta_table(super_table, table_name: str, simple_snapshot: Dict[str, A
             super_table.storage.delete(abs_path)
         except Exception as exc:
             logger.warning(
-                f"[mirror][delta] post-commit cleanup failed for {rel}: {exc}"
+                "[mirror][delta] post-commit cleanup failed; error_type=%s",
+                mirror_error_type(exc),
             )
 
     # Optional checkpoint (disabled)
     try:
         _write_checkpoint_if_possible(super_table.storage, log_dir, version, current_paths)
     except Exception as e:
-        logger.warning(f"[mirror][delta] checkpoint skipped: {e}")
+        logger.warning(
+            "[mirror][delta] checkpoint skipped; error_type=%s",
+            mirror_error_type(e),
+        )
 
     logger.info(
         f"[mirror][delta] v{version} wrote {_pad_version(version)}.json  "

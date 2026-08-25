@@ -5,6 +5,10 @@ from typing import List
 from datetime import datetime, timezone
 
 from supertable.config.defaults import logger
+from supertable.utils.diagnostic_redaction import (
+    local_path_metadata,
+    safe_exception_type,
+)
 from supertable.utils.helper import generate_hash_uid
 
 try:
@@ -54,7 +58,9 @@ class QueryPlanManager:
         except OSError:
             # Best effort on filesystems without POSIX mode support.
             pass
-        logger.debug(f"Using temp dir {self.temp_dir}")
+        logger.debug(
+            "Using temp dir; %s", local_path_metadata(self.temp_dir),
+        )
 
         # Compose a deterministic (short) hash from meta path + parsed SQL
 
@@ -70,7 +76,9 @@ class QueryPlanManager:
         try:
             self._cleanup_old_plans(max_keep=200)
         except Exception as e:
-            logger.debug(f"Plan cleanup skipped: {e}")
+            logger.debug(
+                "Plan cleanup skipped; error_type=%s", safe_exception_type(e),
+            )
 
     def generate_query_plan_filename(self, alias: str, extension: str = "json") -> str:
         """
@@ -127,7 +135,11 @@ class QueryPlanManager:
             except FileNotFoundError:
                 continue
             except Exception as e:
-                logger.debug(f"Could not delete old plan file {old_file}: {e}")
+                logger.debug(
+                    "Could not delete old plan file; %s; error_type=%s",
+                    local_path_metadata(old_file),
+                    safe_exception_type(e),
+                )
 
 
 def _extract_ts_from_filename(path: str) -> int:

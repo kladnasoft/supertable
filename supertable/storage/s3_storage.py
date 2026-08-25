@@ -21,6 +21,7 @@ from supertable.storage.storage_interface import (
     StorageInterface,
     normalize_sha256_checksum,
     read_exact_range_body,
+    storage_error_type,
     validate_range_request,
     write_all,
 )
@@ -465,14 +466,14 @@ class S3Storage(StorageInterface):
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code")
             if code in ("NoSuchKey", "404"):
-                raise FileNotFoundError(f"File not found: {path}") from e
+                raise FileNotFoundError("File not found") from None
             raise
         if len(data) == 0:
-            raise ValueError(f"File is empty: {path}")
+            raise ValueError("File is empty")
         try:
             return json.loads(data)
-        except json.JSONDecodeError as je:
-            raise ValueError(f"Invalid JSON in {path}") from je
+        except json.JSONDecodeError:
+            raise ValueError("Invalid JSON") from None
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
         path = self._with_base(path)
@@ -499,7 +500,7 @@ class S3Storage(StorageInterface):
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code")
             if code in ("404", "NoSuchKey", "NotFound"):
-                raise FileNotFoundError(f"File not found: {path}") from e
+                raise FileNotFoundError("File not found") from None
             raise
 
     @staticmethod
@@ -530,7 +531,7 @@ class S3Storage(StorageInterface):
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code")
             if code in ("404", "NoSuchKey", "NotFound"):
-                raise FileNotFoundError(f"File not found: {path}") from e
+                raise FileNotFoundError("File not found") from None
             raise
 
     def download_to_file(
@@ -557,7 +558,7 @@ class S3Storage(StorageInterface):
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code")
             if code in ("404", "NoSuchKey", "NotFound", "NoSuchVersion"):
-                raise FileNotFoundError(f"File not found: {path}") from e
+                raise FileNotFoundError("File not found") from None
             raise
 
         body = response["Body"]
@@ -566,11 +567,11 @@ class S3Storage(StorageInterface):
             if expected is not None:
                 response_meta = self._metadata_from_response(response)
                 if response_meta.size != expected.size:
-                    raise OSError(f"Object changed before download: {path}")
+                    raise OSError("Object changed before download")
                 if response_meta.version and expected.version and response_meta.version != expected.version:
-                    raise OSError(f"Object version changed before download: {path}")
+                    raise OSError("Object version changed before download")
                 if response_meta.etag and expected.etag and response_meta.etag != expected.etag:
-                    raise OSError(f"Object ETag changed before download: {path}")
+                    raise OSError("Object ETag changed before download")
             while True:
                 chunk = body.read(chunk_size)
                 if not chunk:
@@ -581,7 +582,7 @@ class S3Storage(StorageInterface):
         expected_size = expected.size if expected is not None else int(response.get("ContentLength") or written)
         if written != expected_size:
             raise OSError(
-                f"Short download for {path}: expected {expected_size} bytes, wrote {written}"
+                f"Short download: expected {expected_size} bytes, wrote {written}"
             )
         return written
 
@@ -616,9 +617,9 @@ class S3Storage(StorageInterface):
             code = str(exc.response.get("Error", {}).get("Code") or "")
             status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
             if code in ("PreconditionFailed", "NoSuchVersion") or status == 412:
-                raise ObjectIdentityMismatch(f"Object version changed: {path}") from exc
+                raise ObjectIdentityMismatch("Object version changed") from None
             if code in ("404", "NoSuchKey", "NotFound"):
-                raise FileNotFoundError(f"File not found: {path}") from exc
+                raise FileNotFoundError("File not found") from None
             raise
         body = response["Body"]
         try:
@@ -629,9 +630,9 @@ class S3Storage(StorageInterface):
             version = str(response.get("VersionId") or "")
             etag = str(response.get("ETag") or "").strip('"')
             if expected.version and version and version != expected.version:
-                raise ObjectIdentityMismatch(f"Object version changed: {path}")
+                raise ObjectIdentityMismatch("Object version changed")
             if expected.etag and etag and etag != expected.etag.strip('"'):
-                raise ObjectIdentityMismatch(f"Object ETag changed: {path}")
+                raise ObjectIdentityMismatch("Object ETag changed")
         return payload
 
     def cache_namespace(self) -> Dict[str, str]:
@@ -680,9 +681,8 @@ class S3Storage(StorageInterface):
             self._call("delete_object", Bucket=self.bucket_name, Key=path)
             return
 
-        logical = self._without_base(path)
         if not self._prefix_has_objects(path):
-            raise FileNotFoundError(f"File or folder not found: {path}")
+            raise FileNotFoundError("File or folder not found")
         # Compatibility single-pass deletion. Destructive table APIs call the
         # explicit verified ``delete_prefix`` operation below.
         errors: List[Dict[str, Any]] = []
@@ -703,10 +703,9 @@ class S3Storage(StorageInterface):
             ) or {}
             errors.extend(response.get("Errors", []) or [])
         if errors:
-            first = errors[0]
             raise OSError(
-                f"S3 partial deletion failure for {logical!r}: "
-                f"{first.get('Code')}: {first.get('Message')}"
+                "S3 prefix deletion failed; "
+                f"failures={len(errors)}"
             )
 
     def _iter_prefix_keys(self, physical_prefix: str):
@@ -754,20 +753,14 @@ class S3Storage(StorageInterface):
             if empty_after and not last_errors:
                 return
             if empty_after and last_errors:
-                first = last_errors[0]
                 raise OSError(
-                    f"S3 reported a partial prefix deletion failure for {path!r}: "
-                    f"{first.get('Code')}: {first.get('Message')}"
+                    "S3 prefix deletion failed; "
+                    f"failures={len(last_errors)}"
                 )
 
-        remaining = next(self._iter_prefix_keys(physical), None)
-        detail = ""
-        if last_errors:
-            first = last_errors[0]
-            detail = f"; provider error={first.get('Code')}: {first.get('Message')}"
         raise OSError(
-            f"S3 prefix is not empty after verified deletion: {path!r}; "
-            f"remaining={remaining!r}{detail}"
+            "S3 prefix deletion made no progress; "
+            f"failures={len(last_errors)}"
         )
 
     # -------------------------
@@ -825,7 +818,7 @@ class S3Storage(StorageInterface):
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code")
             if code in ("NoSuchKey", "404"):
-                raise FileNotFoundError(f"Parquet file not found: {path}") from e
+                raise FileNotFoundError("Parquet file not found") from None
             raise
         try:
             buf = io.BytesIO(data)
@@ -835,7 +828,9 @@ class S3Storage(StorageInterface):
                 buf.seek(0)
             return pq.read_table(buf, columns=proj)
         except Exception as e:
-            raise RuntimeError(f"Failed to read Parquet at '{path}': {e}")
+            raise RuntimeError(
+                f"Failed to read Parquet; error_type={storage_error_type(e)}"
+            ) from None
 
     # -------------------------
     # Bytes / Text / Copy
@@ -847,6 +842,26 @@ class S3Storage(StorageInterface):
                    Bucket=self.bucket_name, Key=path, Body=data, ContentType="application/octet-stream"
                    )
 
+    def create_bytes_if_absent(self, path: str, data: bytes) -> bool:
+        path = self._with_base(path)
+        self._ensure_bucket_region()
+        try:
+            self._call(
+                "put_object",
+                Bucket=self.bucket_name,
+                Key=path,
+                Body=data,
+                ContentType="application/octet-stream",
+                IfNoneMatch="*",
+            )
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code", ""))
+            status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if code == "PreconditionFailed" or status == 412:
+                return False
+            raise
+        return True
+
     def read_bytes(self, path: str) -> bytes:
         path = self._with_base(path)
         self._ensure_bucket_region()
@@ -855,7 +870,7 @@ class S3Storage(StorageInterface):
         except ClientError as e:
             code = e.response.get("Error", {}).get("Code")
             if code in ("NoSuchKey", "404"):
-                raise FileNotFoundError(f"File not found: {path}") from e
+                raise FileNotFoundError("File not found") from None
             raise
 
     def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None:

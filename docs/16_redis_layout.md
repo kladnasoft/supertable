@@ -243,10 +243,10 @@ by this configuration.
 
 Read/write via `supertable.audit.admin.{get,set}_audit_config`, which
 is exposed over HTTP at `GET / POST /api/v1/audit/config` and bound
-to the **Compliance** tab on `/ui/audit`. Toggles propagate within
-the in-process cache TTL (30 s); the API endpoint invalidates the
-cache for the affected org so the change is immediate on the
-responding instance.
+to the **Compliance** tab on `/ui/audit`. The runtime resolver reads the
+authoritative policy on each resolution; the API endpoint also invalidates
+the affected organization's local cache. Writes use Redis `WATCH/MULTI/EXEC`
+when available so concurrent instances do not silently overwrite one another.
 
 Every config write itself emits a `CONFIG_CHANGE` audit event so
 that turning auditing OFF is recorded — DORA Art. 6 / SOC 2 CC8.1.

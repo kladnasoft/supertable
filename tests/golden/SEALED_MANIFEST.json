@@ -112,8 +112,8 @@
     },
     "error_corrupt_parquet": {
       "files": {
-        "error_corrupt_parquet/expected/error.json": "26242d8182824a84d3bda2fbf2ac23884af4d976a98403af14d5ab34ac9f2037",
-        "error_corrupt_parquet/expected/manifest.json": "4a4cfb1329e13c3ac348494694281e68fcf88fc28270fcae1211136c491c52b8",
+        "error_corrupt_parquet/expected/error.json": "01090e872695e33b123cc2982f52ff794922f8dfb42998c528d78ae0590c233c",
+        "error_corrupt_parquet/expected/manifest.json": "56938080a03a3b606ef470a93e55af072e06361a5e2384f9040d0a071c9dfe7a",
         "error_corrupt_parquet/input/catalog.json": "0606d07a6add554f9d81f735a0f8ba01cecc6893956f25733f5ee5cc40d8814d",
         "error_corrupt_parquet/input/t__f1.parquet": "224d71090ad8eebfb7480930bf467bf9cf970b6c3b5119e0cf9ce41bf82e8bed"
       }
@@ -128,8 +128,8 @@
     },
     "error_missing_parquet": {
       "files": {
-        "error_missing_parquet/expected/error.json": "26242d8182824a84d3bda2fbf2ac23884af4d976a98403af14d5ab34ac9f2037",
-        "error_missing_parquet/expected/manifest.json": "380679d493fc2bbd192b6813722e0425a99799836f8e4221a816e4091039789f",
+        "error_missing_parquet/expected/error.json": "01090e872695e33b123cc2982f52ff794922f8dfb42998c528d78ae0590c233c",
+        "error_missing_parquet/expected/manifest.json": "cd8cd32f3ecb2bdd7d911299024fed76cf5713cd4ecf69c1c4870a0d4c1be063",
         "error_missing_parquet/input/catalog.json": "de6ddb72b7a001906d82e8e3b4fe5f42dab9f06d175d94073020143ca31f2ed3"
       }
     },
@@ -371,8 +371,8 @@
     },
     "query_timestamp_explicit_access": {
       "files": {
-        "query_timestamp_explicit_access/expected/error.json": "8269984b906ff7a526d9e65db04a7e1ba19421e5d34273410d7f6e36cb6a02ce",
-        "query_timestamp_explicit_access/expected/manifest.json": "7b307356bf9163e27c34437e3cb76dba28b056d2fcc0f923f55c99e75d693259",
+        "query_timestamp_explicit_access/expected/error.json": "01090e872695e33b123cc2982f52ff794922f8dfb42998c528d78ae0590c233c",
+        "query_timestamp_explicit_access/expected/manifest.json": "3b8b322d81a81da857682e84d88cc3e44a698506f4276f5eeb3434a9902e95f2",
         "query_timestamp_explicit_access/input/catalog.json": "15a85d4c9dbe8395ae019224b98632e9eb0ae95d67257b373895248bef88c50e",
         "query_timestamp_explicit_access/input/t__f1.parquet": "ae8f67ae88b788df34f58b10e262f2b4fac48d859968f2ddc3c884acd889ed19"
       }

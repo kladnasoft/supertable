@@ -1,12 +1,15 @@
 # route: supertable.storage.local_storage
+import contextvars
+import ctypes
+import errno
+import fnmatch
 import json
 import os
-import fnmatch
-import contextvars
 import pyarrow as pa
 import pyarrow.parquet as pq
 import shutil
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -22,6 +25,7 @@ from supertable.storage.storage_interface import (
     ObjectIdentityMismatch,
     ObjectMetadata,
     StorageInterface,
+    storage_error_type,
     validate_range_request,
     write_all,
 )
@@ -112,6 +116,194 @@ class _DirectoryHandle:
             pass
 
 
+class _PinnedDirectoryChain:
+    """Descriptor-pinned path from one trusted ancestor to a destination.
+
+    Immutable publication must never re-resolve a shared directory pathname
+    at its commit point. Every child in this chain was opened relative to its
+    already-pinned parent with ``O_NOFOLLOW``. Relationship checks make a
+    rename, symlink substitution, or delete/recreate race an ambiguous failure
+    instead of an acknowledgement in the wrong namespace.
+    """
+
+    __slots__ = ("handles", "entry_names")
+
+    def __init__(
+        self,
+        handles: Sequence[_DirectoryHandle],
+        entry_names: Sequence[str],
+    ) -> None:
+        if not handles or len(entry_names) != len(handles) - 1:
+            raise ValueError("invalid pinned directory chain")
+        self.handles = tuple(handles)
+        self.entry_names = tuple(entry_names)
+
+    @property
+    def directory(self) -> _DirectoryHandle:
+        return self.handles[-1]
+
+    @staticmethod
+    def _same_directory(
+        stat_result: os.stat_result,
+        handle: _DirectoryHandle,
+    ) -> bool:
+        return bool(
+            stat.S_ISDIR(stat_result.st_mode)
+            and (int(stat_result.st_dev), int(stat_result.st_ino))
+            == handle.identity
+        )
+
+    def validate(self) -> None:
+        first = self.handles[0]
+        if not first.matches_path():
+            raise ObjectIdentityMismatch(
+                "local immutable directory hierarchy changed"
+            )
+        for parent, child, entry_name in zip(
+            self.handles,
+            self.handles[1:],
+            self.entry_names,
+        ):
+            try:
+                entry_state = os.stat(
+                    entry_name,
+                    dir_fd=parent.fd,
+                    follow_symlinks=False,
+                )
+                opened_state = os.fstat(child.fd)
+            except (FileNotFoundError, NotADirectoryError, OSError):
+                raise ObjectIdentityMismatch(
+                    "local immutable directory hierarchy changed"
+                ) from None
+            if (
+                not self._same_directory(entry_state, child)
+                or not self._same_directory(opened_state, child)
+            ):
+                raise ObjectIdentityMismatch(
+                    "local immutable directory hierarchy changed"
+                )
+
+    def fsync(self) -> None:
+        """Persist the destination entry and every component back to anchor."""
+
+        self.validate()
+        for handle in reversed(self.handles):
+            os.fsync(handle.fd)
+        self.validate()
+
+    def close(self) -> None:
+        for handle in reversed(self.handles):
+            handle.close()
+
+
+_AT_FDCWD = -100
+_AT_SYMLINK_FOLLOW = 0x400
+_AT_EMPTY_PATH = 0x1000
+
+
+def _linux_link_file_descriptor_no_replace(
+    source_fd: int,
+    destination_dir_fd: int,
+    destination_name: str,
+) -> bool:
+    """Hard-link one retained inode without resolving a staging pathname.
+
+    Linux's ``linkat(AT_EMPTY_PATH)`` is the direct operation. Unprivileged
+    processes normally lack ``CAP_DAC_READ_SEARCH``, so the documented procfs
+    descriptor-link form is the safe fallback. Both forms retain the kernel
+    file description as source authority and preserve ``EEXIST`` as the only
+    definite loser result.
+    """
+
+    if not sys.platform.startswith("linux"):
+        raise NotImplementedError(
+            "Local immutable create requires Linux descriptor linking"
+        )
+    if not isinstance(destination_name, str) or not destination_name:
+        raise ValueError("local immutable destination name is empty")
+    if "\x00" in destination_name or os.sep in destination_name:
+        raise ValueError("local immutable destination name is invalid")
+
+    source_state = os.fstat(source_fd)
+    if not stat.S_ISREG(source_state.st_mode):
+        raise ObjectIdentityMismatch("local immutable source is not a regular file")
+
+    try:
+        linkat = ctypes.CDLL(None, use_errno=True).linkat
+    except (AttributeError, OSError):  # pragma: no cover - non-glibc Linux
+        raise NotImplementedError(
+            "Local immutable create requires linkat"
+        ) from None
+    linkat.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    )
+    linkat.restype = ctypes.c_int
+    encoded_name = os.fsencode(destination_name)
+
+    ctypes.set_errno(0)
+    result = linkat(
+        source_fd,
+        b"",
+        destination_dir_fd,
+        encoded_name,
+        _AT_EMPTY_PATH,
+    )
+    if result == 0:
+        return True
+    direct_errno = ctypes.get_errno()
+    if direct_errno == errno.EEXIST:
+        return False
+    # AT_EMPTY_PATH requires CAP_DAC_READ_SEARCH. Fall back only for errors
+    # that mean the descriptor form itself was unavailable; I/O, capacity,
+    # permission-on-destination and other ambiguous failures remain errors.
+    fallback_errnos = {
+        errno.EACCES,
+        errno.EINVAL,
+        errno.ENOENT,
+        errno.ENOSYS,
+        errno.EPERM,
+    }
+    if hasattr(errno, "EOPNOTSUPP"):
+        fallback_errnos.add(errno.EOPNOTSUPP)
+    if direct_errno not in fallback_errnos:
+        raise OSError(direct_errno, os.strerror(direct_errno))
+
+    proc_source = f"/proc/self/fd/{source_fd}"
+    try:
+        proc_state = os.stat(proc_source)
+    except OSError:
+        raise NotImplementedError(
+            "Local immutable create requires AT_EMPTY_PATH or procfs"
+        ) from None
+    if (
+        not stat.S_ISREG(proc_state.st_mode)
+        or int(proc_state.st_dev) != int(source_state.st_dev)
+        or int(proc_state.st_ino) != int(source_state.st_ino)
+    ):
+        raise ObjectIdentityMismatch(
+            "local immutable descriptor identity changed"
+        )
+
+    ctypes.set_errno(0)
+    result = linkat(
+        _AT_FDCWD,
+        os.fsencode(proc_source),
+        destination_dir_fd,
+        encoded_name,
+        _AT_SYMLINK_FOLLOW,
+    )
+    if result == 0:
+        return True
+    proc_errno = ctypes.get_errno()
+    if proc_errno == errno.EEXIST:
+        return False
+    raise OSError(proc_errno, os.strerror(proc_errno))
+
+
 class _BatchedPublication:
     """One newly-created immutable object owned by a durability batch."""
 
@@ -149,7 +341,7 @@ class _BatchedPublication:
         try:
             observed = os.fstat(fd)
             if not stat.S_ISREG(observed.st_mode):
-                raise OSError(f"published object is not a regular file: {self.path}")
+                raise OSError("published object is not a regular file") from None
             self.device = int(observed.st_dev)
             self.inode = int(observed.st_ino)
             self.fd = fd
@@ -276,9 +468,8 @@ class _DurabilityBatch:
             publication.published = True
             if not publication.path_still_names_published_file():
                 raise OSError(
-                    "immutable object changed during publication: "
-                    f"{publication.path}"
-                )
+                    "immutable object changed during publication"
+                ) from None
             if publication.fd is None:  # pragma: no cover - pin proves this
                 raise RuntimeError("published immutable object has no pinned fd")
             publication.sync_future = self.storage._submit_file_sync(
@@ -309,9 +500,8 @@ class _DurabilityBatch:
                 and not publication.path_still_names_published_file()
             ):
                 raise OSError(
-                    "immutable object changed before durability barrier: "
-                    f"{publication.path}"
-                )
+                    "immutable object changed before durability barrier"
+                ) from None
 
     def barrier(self) -> None:
         """Make every enrolled rename durable before catalog publication."""
@@ -441,7 +631,9 @@ class LocalStorage(StorageInterface):
         # caller-CWD namespace.  Production construction through
         # storage_factory passes the explicitly initialised application home,
         # so package import never needs to mutate the process CWD.  Absolute
-        # caller paths remain supported for compatibility.
+        # Absolute paths are accepted only when they remain inside this
+        # storage namespace; callers that need another namespace must create a
+        # separate LocalStorage instance explicitly.
         if root is None:
             root = os.getcwd()
         self.root = os.path.realpath(os.path.abspath(os.fspath(root)))
@@ -566,14 +758,21 @@ class LocalStorage(StorageInterface):
     def _resolve_path(self, path: str | os.PathLike[str]) -> str:
         raw = os.fspath(path)
         if os.path.isabs(raw):
-            return os.path.normpath(raw)
+            physical = os.path.realpath(os.path.normpath(raw))
+            try:
+                contained = os.path.commonpath((self.root, physical)) == self.root
+            except ValueError:
+                contained = False
+            if not contained:
+                raise ValueError("Local storage path escapes configured root")
+            return physical
         physical = os.path.realpath(os.path.join(self.root, raw))
         try:
             contained = os.path.commonpath((self.root, physical)) == self.root
         except ValueError:
             contained = False
         if not contained:
-            raise ValueError(f"Local storage path escapes configured root: {raw!r}")
+            raise ValueError("Local storage path escapes configured root")
         return physical
 
     def canonical_uri(self, path: str) -> str:
@@ -605,7 +804,7 @@ class LocalStorage(StorageInterface):
         path = self._resolve_path(path)
         # quick existence check
         if not os.path.isfile(path):
-            raise FileNotFoundError(f"File not found: {path}")
+            raise FileNotFoundError("File not found")
 
         # micro-retry window for transient writer activity
         attempts = 5
@@ -618,24 +817,24 @@ class LocalStorage(StorageInterface):
                 try:
                     if os.path.getsize(path) == 0:
                         if attempt == attempts:
-                            raise ValueError(f"File is empty: {path}")
+                            raise ValueError("File is empty")
                         time.sleep(backoff)
                         continue
                 except FileNotFoundError:
                     # vanished between exists() and getsize(); retry
                     if attempt == attempts:
-                        raise FileNotFoundError(f"File not found: {path}")
+                        raise FileNotFoundError("File not found") from None
                     time.sleep(backoff)
                     continue
 
                 with open(path, "r", encoding="utf-8") as f:
                     return json.load(f)
 
-            except json.JSONDecodeError as e:
+            except json.JSONDecodeError:
                 # reader may have raced with a writer that just replaced the file;
                 # give it a tiny moment to settle, then retry
                 if attempt == attempts:
-                    raise ValueError(f"Invalid JSON in {path}") from e
+                    raise ValueError("Invalid JSON") from None
                 time.sleep(backoff)
             except FileNotFoundError:
                 # replaced again during open—retry
@@ -644,7 +843,7 @@ class LocalStorage(StorageInterface):
                 time.sleep(backoff)
 
         # Should never get here
-        raise RuntimeError(f"Unexpected failure reading JSON at {path}")
+        raise RuntimeError("Unexpected failure reading JSON")
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
         """
@@ -699,7 +898,7 @@ class LocalStorage(StorageInterface):
     def size(self, path: str) -> int:
         path = self._resolve_path(path)
         if not os.path.isfile(path):
-            raise FileNotFoundError(f"File not found: {path}")
+            raise FileNotFoundError("File not found")
         return os.path.getsize(path)
 
     @staticmethod
@@ -753,8 +952,8 @@ class LocalStorage(StorageInterface):
         path = self._resolve_path(path)
         try:
             source = open(path, "rb")
-        except FileNotFoundError as e:
-            raise FileNotFoundError(f"File not found: {path}") from e
+        except FileNotFoundError:
+            raise FileNotFoundError("File not found") from None
         with source:
             return self._metadata_from_open_file(source)
 
@@ -771,13 +970,13 @@ class LocalStorage(StorageInterface):
             raise ValueError("chunk_size must be positive")
         try:
             source = open(path, "rb")
-        except FileNotFoundError as e:
-            raise FileNotFoundError(f"File not found: {path}") from e
+        except FileNotFoundError:
+            raise FileNotFoundError("File not found") from None
 
         with source:
             before = self._metadata_from_open_file(source)
             if expected is not None and before != expected:
-                raise OSError(f"Object changed before download: {path}")
+                raise OSError("Object changed before download")
             written = 0
             while True:
                 chunk = source.read(chunk_size)
@@ -786,10 +985,10 @@ class LocalStorage(StorageInterface):
                 written += write_all(file_obj, chunk)
             after = self._metadata_from_open_file(source)
             if after != before:
-                raise OSError(f"Object changed during download: {path}")
+                raise OSError("Object changed during download")
             if written != before.size:
                 raise OSError(
-                    f"Short download for {path}: expected {before.size} bytes, wrote {written}"
+                    f"Short download: expected {before.size} bytes, wrote {written}"
                 )
             return written
 
@@ -805,8 +1004,8 @@ class LocalStorage(StorageInterface):
         offset, length = validate_range_request(offset, length, expected)
         try:
             source = open(path, "rb")
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(f"File not found: {path}") from exc
+        except FileNotFoundError:
+            raise FileNotFoundError("File not found") from None
         with source:
             before = self._metadata_from_open_file(source)
             if (
@@ -814,10 +1013,10 @@ class LocalStorage(StorageInterface):
                 and before.identity_token() != expected.identity_token()
             ):
                 raise ObjectIdentityMismatch(
-                    f"Object changed before range read: {path}"
+                    "Object changed before range read"
                 )
             if offset > before.size or length > before.size - offset:
-                raise ObjectIdentityMismatch(f"Object shrank before range read: {path}")
+                raise ObjectIdentityMismatch("Object shrank before range read")
             if length == 0:
                 return b""
             chunks = []
@@ -830,15 +1029,13 @@ class LocalStorage(StorageInterface):
                     source.seek(position)
                     chunk = source.read(remaining)
                 if not chunk:
-                    raise ObjectIdentityMismatch(f"Short range read: {path}")
+                    raise ObjectIdentityMismatch("Short range read")
                 chunks.append(chunk)
                 position += len(chunk)
                 remaining -= len(chunk)
             after = self._metadata_from_open_file(source)
             if after.identity_token() != before.identity_token():
-                raise ObjectIdentityMismatch(
-                    f"Object changed during range read: {path}"
-                )
+                raise ObjectIdentityMismatch("Object changed during range read")
             return b"".join(chunks)
 
     def cache_namespace(self) -> Dict[str, str]:
@@ -898,8 +1095,8 @@ class LocalStorage(StorageInterface):
                 contained = False
             if not contained:
                 raise ValueError(
-                    f"Local storage delete path escapes configured root: {raw_path!r}"
-                )
+                    "Local storage delete path escapes configured root"
+                ) from None
         else:
             path = os.path.normpath(raw_path)
         absolute_path = os.path.abspath(path)
@@ -920,7 +1117,7 @@ class LocalStorage(StorageInterface):
             # find the target already absent. Re-sync its surviving parent so
             # callers such as delete_prefix can safely finish the tombstone.
             self._fsync_deleted_parent(path, logical_input=logical_input)
-            raise FileNotFoundError(f"File or folder not found: {path}")
+            raise FileNotFoundError("File or folder not found") from None
         self._fsync_deleted_parent(path, logical_input=logical_input)
 
     @staticmethod
@@ -1064,7 +1261,7 @@ class LocalStorage(StorageInterface):
     def read_parquet(self, path: str, columns: Optional[List[str]] = None) -> pa.Table:
         path = self._resolve_path(path)
         if not os.path.isfile(path):
-            raise FileNotFoundError(f"Parquet file not found at: {path}")
+            raise FileNotFoundError("Parquet file not found") from None
 
         try:
             proj = (
@@ -1082,7 +1279,9 @@ class LocalStorage(StorageInterface):
             # reads with an int32-vs-dictionary merge error.
             return pq.read_table(path, columns=proj, partitioning=None)
         except Exception as e:
-            raise RuntimeError(f"Failed to read Parquet file at '{path}': {e}")
+            raise RuntimeError(
+                f"Failed to read Parquet; error_type={storage_error_type(e)}"
+            ) from None
 
     def write_bytes(self, path: str, data: bytes) -> None:
         # ``processing`` selects this exact-byte path for immutable Parquet
@@ -1090,6 +1289,210 @@ class LocalStorage(StorageInterface):
         # call. Give it the same crash-durable boundary as the explicit audit
         # helper instead of acknowledging a buffered, partially visible file.
         self._write_bytes_atomic_with_identity(path, data)
+
+    def create_bytes_if_absent(self, path: str, data: bytes) -> bool:
+        """Publish complete bytes from an unnamed inode with no overwrite.
+
+        The commit source is an ``O_TMPFILE`` descriptor: it has no staging
+        pathname for another process to swap, follow, truncate, or hard-link
+        into the destination. The target is linked relative to a pinned
+        directory descriptor and the complete directory ancestry is validated
+        and synced before success is acknowledged.
+        """
+
+        chain, target_name = self._open_immutable_parent(path)
+        source_fd: int | None = None
+        try:
+            source_fd = self._open_immutable_unnamed_file(chain.directory.fd)
+            with os.fdopen(source_fd, "wb") as source:
+                source_fd = None
+                write_all(source, data)
+                source.flush()
+                os.fsync(source.fileno())
+                source_state = os.fstat(source.fileno())
+                if not stat.S_ISREG(source_state.st_mode):
+                    raise ObjectIdentityMismatch(
+                        "local immutable source is not a regular file"
+                    )
+
+                chain.validate()
+                if not _linux_link_file_descriptor_no_replace(
+                    source.fileno(),
+                    chain.directory.fd,
+                    target_name,
+                ):
+                    return False
+
+                self._require_immutable_target_identity(
+                    chain.directory.fd,
+                    target_name,
+                    source_state,
+                )
+                chain.fsync()
+                self._require_immutable_target_identity(
+                    chain.directory.fd,
+                    target_name,
+                    source_state,
+                )
+                chain.validate()
+                return True
+        finally:
+            if source_fd is not None:
+                os.close(source_fd)
+            chain.close()
+
+    def _open_immutable_parent(
+        self,
+        path: str,
+    ) -> tuple[_PinnedDirectoryChain, str]:
+        """Open/create a no-symlink parent chain using descriptor-relative I/O."""
+
+        raw_path = os.fspath(path)
+        if not isinstance(raw_path, str):
+            raise TypeError("local immutable path must be a string")
+        if "\x00" in raw_path:
+            raise ValueError("local immutable path contains a null byte")
+        logical_input = not os.path.isabs(raw_path)
+        normalized = os.path.normpath(raw_path)
+        if normalized in {"", "."}:
+            raise ValueError("local immutable path must name an object")
+
+        if logical_input:
+            absolute_path = os.path.abspath(os.path.join(self.root, normalized))
+            try:
+                contained = (
+                    os.path.commonpath((self.root, absolute_path)) == self.root
+                )
+            except ValueError:
+                contained = False
+            if not contained:
+                raise ValueError(
+                    "Local storage path escapes configured root"
+                ) from None
+            anchor_path = self._logical_durability_anchor
+            with self._durability_lock:
+                trusted = self._trusted_durability_anchors.get(anchor_path)
+                if trusted is None or not trusted.matches_path():
+                    raise ObjectIdentityMismatch(
+                        "local immutable durability anchor changed"
+                    )
+                anchor_fd = os.dup(trusted.fd)
+            anchor_state = os.fstat(anchor_fd)
+            anchor = _DirectoryHandle(anchor_path, anchor_fd, anchor_state)
+        else:
+            absolute_path = os.path.abspath(normalized)
+            anchor_path = os.path.abspath(os.path.sep)
+            anchor = self._open_directory(anchor_path)
+
+        directory = os.path.dirname(absolute_path)
+        target_name = os.path.basename(absolute_path)
+        if target_name in {"", ".", ".."} or os.sep in target_name:
+            anchor.close()
+            raise ValueError("local immutable path must name an object")
+        try:
+            relative_directory = os.path.relpath(directory, anchor_path)
+            if relative_directory == os.pardir or relative_directory.startswith(
+                os.pardir + os.sep
+            ):
+                raise ValueError("local immutable parent is outside its anchor")
+            components = (
+                ()
+                if relative_directory == "."
+                else tuple(relative_directory.split(os.sep))
+            )
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            directory_flag = getattr(os, "O_DIRECTORY", 0)
+            if not nofollow or not directory_flag:
+                raise NotImplementedError(
+                    "Local immutable create requires descriptor-safe directories"
+                )
+            open_flags = os.O_RDONLY | directory_flag | nofollow
+            open_flags |= getattr(os, "O_CLOEXEC", 0)
+
+            handles = [anchor]
+            entry_names: list[str] = []
+            for component in components:
+                if component in {"", ".", ".."} or "\x00" in component:
+                    raise ValueError("local immutable parent path is invalid")
+                parent = handles[-1]
+                try:
+                    child_fd = os.open(
+                        component,
+                        open_flags,
+                        dir_fd=parent.fd,
+                    )
+                except FileNotFoundError:
+                    try:
+                        os.mkdir(component, mode=0o777, dir_fd=parent.fd)
+                    except FileExistsError:
+                        pass
+                    child_fd = os.open(
+                        component,
+                        open_flags,
+                        dir_fd=parent.fd,
+                    )
+                child_path = os.path.join(parent.path, component)
+                child_state = os.fstat(child_fd)
+                handles.append(_DirectoryHandle(child_path, child_fd, child_state))
+                entry_names.append(component)
+
+            chain = _PinnedDirectoryChain(handles, entry_names)
+            chain.validate()
+            return chain, target_name
+        except BaseException:
+            for handle in reversed(locals().get("handles", [anchor])):
+                handle.close()
+            raise
+
+    @staticmethod
+    def _open_immutable_unnamed_file(directory_fd: int) -> int:
+        tmpfile_flag = getattr(os, "O_TMPFILE", 0)
+        if not tmpfile_flag:
+            raise NotImplementedError(
+                "Local immutable create requires O_TMPFILE"
+            )
+        flags = tmpfile_flag | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        try:
+            return os.open(".", flags, 0o600, dir_fd=directory_fd)
+        except OSError as exc:
+            unsupported = {
+                errno.EINVAL,
+                errno.EISDIR,
+                errno.ENOSYS,
+            }
+            if hasattr(errno, "EOPNOTSUPP"):
+                unsupported.add(errno.EOPNOTSUPP)
+            if exc.errno in unsupported:
+                raise NotImplementedError(
+                    "Local immutable create requires filesystem O_TMPFILE support"
+                ) from None
+            raise
+
+    @staticmethod
+    def _require_immutable_target_identity(
+        directory_fd: int,
+        target_name: str,
+        source_state: os.stat_result,
+    ) -> None:
+        try:
+            target_state = os.stat(
+                target_name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except (FileNotFoundError, NotADirectoryError, OSError):
+            raise ObjectIdentityMismatch(
+                "local immutable publication identity changed"
+            ) from None
+        if (
+            not stat.S_ISREG(target_state.st_mode)
+            or int(target_state.st_dev) != int(source_state.st_dev)
+            or int(target_state.st_ino) != int(source_state.st_ino)
+            or int(target_state.st_size) != int(source_state.st_size)
+        ):
+            raise ObjectIdentityMismatch(
+                "local immutable publication identity changed"
+            )
 
     def write_bytes_atomic(self, path: str, data: bytes) -> None:
         """Durably replace a byte object without exposing a partial target.
@@ -1221,8 +1624,8 @@ class LocalStorage(StorageInterface):
             parent = os.path.dirname(current)
             if parent == current:
                 raise FileNotFoundError(
-                    f"no existing ancestor directory for {directory!r}"
-                )
+                    "no existing ancestor directory"
+                ) from None
             current = parent
         return current
 
@@ -1238,8 +1641,8 @@ class LocalStorage(StorageInterface):
         stop = os.path.abspath(stop_directory)
         try:
             common = os.path.commonpath((current, stop))
-        except ValueError as exc:
-            raise ValueError("directory durability anchor is on another drive") from exc
+        except ValueError:
+            raise ValueError("directory durability anchor is on another drive") from None
         if common != stop:
             raise ValueError("directory durability anchor is not an ancestor")
         paths = []
@@ -1374,8 +1777,8 @@ class LocalStorage(StorageInterface):
             anchor = self._deepest_durable_anchor_locked(current)
             if anchor is None:
                 raise OSError(
-                    f"no inode-validated durability anchor remains for {current!r}"
-                )
+                    "no inode-validated durability anchor remains"
+                ) from None
 
             if anchor == current:
                 expected = self._valid_durable_handle_locked(current)
@@ -1390,15 +1793,17 @@ class LocalStorage(StorageInterface):
                         or self._deepest_durable_anchor_locked(current) != current
                     ):
                         raise OSError(
-                            f"directory hierarchy changed during publication: {current}"
-                        )
+                            "directory hierarchy changed during publication"
+                        ) from None
                 finally:
                     synced.close()
                 return
 
             expected_anchor = self._valid_durable_handle_locked(anchor)
             if expected_anchor is None:
-                raise OSError(f"durability anchor changed before publication: {anchor}")
+                raise OSError(
+                    "durability anchor changed before publication"
+                ) from None
             handles = self._fsync_directory_chain(
                 current,
                 stop_directory=anchor,
@@ -1411,8 +1816,8 @@ class LocalStorage(StorageInterface):
                     not handle.matches_path() for handle in handles
                 ):
                     raise OSError(
-                        f"directory hierarchy changed during publication: {current}"
-                    )
+                        "directory hierarchy changed during publication"
+                    ) from None
                 anchor_parent = os.path.dirname(anchor)
                 if (
                     anchor_parent != anchor
@@ -1420,8 +1825,8 @@ class LocalStorage(StorageInterface):
                     != anchor_parent
                 ):
                     raise OSError(
-                        f"durability anchor changed during publication: {anchor}"
-                    )
+                        "durability anchor changed during publication"
+                    ) from None
                 self._cache_durable_handles_locked(handles)
             except BaseException:
                 for handle in handles:
@@ -1450,13 +1855,13 @@ class LocalStorage(StorageInterface):
                 anchor = self._deepest_durable_anchor_locked(current)
                 if anchor is None:
                     raise OSError(
-                        f"no inode-validated durability anchor remains for {current!r}"
-                    )
+                        "no inode-validated durability anchor remains"
+                    ) from None
                 expected = self._valid_durable_handle_locked(anchor)
                 if expected is None:
                     raise OSError(
-                        f"durability anchor changed before publication: {anchor}"
-                    )
+                        "durability anchor changed before publication"
+                    ) from None
                 expected_anchors[anchor] = expected.identity
                 required.update(
                     self._directory_chain(current, stop_directory=anchor)
@@ -1488,8 +1893,8 @@ class LocalStorage(StorageInterface):
                     synced = by_path.get(anchor)
                     if synced is None or synced.identity != expected_identity:
                         raise OSError(
-                            f"durability anchor changed during publication: {anchor}"
-                        )
+                            "durability anchor changed during publication"
+                        ) from None
                 if any(not handle.matches_path() for handle in handles):
                     raise OSError("directory hierarchy changed during publication")
                 self._cache_durable_handles_locked(handles)
@@ -1542,7 +1947,7 @@ class LocalStorage(StorageInterface):
     def read_bytes(self, path: str) -> bytes:
         path = self._resolve_path(path)
         if not os.path.isfile(path):
-            raise FileNotFoundError(f"File not found: {path}")
+            raise FileNotFoundError("File not found")
         with open(path, "rb") as f:
             return f.read()
 
@@ -1557,7 +1962,7 @@ class LocalStorage(StorageInterface):
     def read_text(self, path: str, encoding: str = "utf-8") -> str:
         path = self._resolve_path(path)
         if not os.path.isfile(path):
-            raise FileNotFoundError(f"File not found: {path}")
+            raise FileNotFoundError("File not found")
         with open(path, "r", encoding=encoding) as f:
             return f.read()
 

@@ -23,6 +23,8 @@ from supertable.demo.medcenter.helpers import run_query
 from supertable.demo.medcenter.load import RAW_TABLES, load
 from supertable.demo.medcenter.quality import run_quality
 from supertable.demo.medcenter.transform import transform
+from supertable.demo.medcenter.validation import require_canonical_month
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 DEMO_TABLES = RAW_TABLES + [
     defaults.stg_invoices_table,
@@ -56,7 +58,10 @@ def teardown() -> None:
             ).delete(role_name=defaults.role_name)
             print(f"Deleted {table_name}")
         except Exception as exc:  # table may simply not exist yet
-            print(f"Skipping {table_name}: {exc}")
+            print(
+                f"Skipping {table_name}; "
+                f"error_type={safe_exception_type(exc)}"
+            )
 
 
 def show(title: str, query: str) -> None:
@@ -147,13 +152,23 @@ def snapshot_for_idempotency() -> tuple[int, str, str]:
     return stg_count, mart_csv, recon_csv
 
 
+def _month_argument(value: str) -> str:
+    try:
+        return require_canonical_month(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def main() -> None:
     initialize_app_home(change_cwd=True)
     ap = argparse.ArgumentParser(description="Run the full medcenter demo")
     ap.add_argument("--data-dir", default=defaults.generated_data_dir)
     ap.add_argument("--export-dir", default=defaults.export_dir)
     scope = ap.add_mutually_exclusive_group()
-    scope.add_argument("--month", default=None, help="YYYY-MM (one month)")
+    scope.add_argument(
+        "--month", type=_month_argument, default=None,
+        help="YYYY-MM (one month)",
+    )
     scope.add_argument(
         "--year", type=int, default=None,
         help="Run the demo over all 12 months of YYYY",
@@ -177,9 +192,17 @@ def main() -> None:
         return
 
     if args.year is not None:
-        months = [f"{args.year}-{m:02d}" for m in range(1, 13)]
+        try:
+            months = [
+                require_canonical_month(f"{args.year}-{m:02d}")
+                for m in range(1, 13)
+            ]
+        except ValueError as exc:
+            ap.error(str(exc))
     else:
-        months = [args.month or defaults.demo_month]
+        months = [
+            require_canonical_month(args.month or defaults.demo_month)
+        ]
     export_month = months[-1] if args.year is None else months[6]
 
     if not args.skip_generate:

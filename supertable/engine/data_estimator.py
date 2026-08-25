@@ -7,9 +7,10 @@ import json
 import logging
 import os
 import re
+import sys
 from collections import Counter, defaultdict
-from typing import Iterable, Set, List, Dict, Optional, Tuple
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from typing import Any, cast, Iterable, Set, List, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import polars
 
@@ -31,7 +32,15 @@ from supertable.utils.snapshot import (
 from supertable.engine.plan_stats import PlanStats
 from supertable.utils.timer import Timer
 from supertable.utils.profiler import Profiler
-from supertable.redis_catalog import RedisCatalog  # Redis leaf pointers for snapshots
+from supertable.utils.diagnostic_redaction import (
+    local_path_metadata,
+    safe_exception_type,
+    safe_storage_path_for_diagnostic,
+)
+from supertable.redis_catalog import (
+    RedisCatalog,
+    _LINKED_TABLE_INDEX_DOMAIN,
+)  # Redis leaf pointers for snapshots
 
 from supertable.data_classes import JoinEdge
 from supertable.utils.sql_parser import TableDefinition
@@ -51,21 +60,41 @@ from supertable.processing import (
 from supertable.tombstone_manifest_v2 import (
     normalize_snapshot_tombstone_state,
 )
-from supertable.row_identity import snapshot_proves_stable_rowids
+from supertable.row_identity import (
+    ResourceRowIdIntegritySeal,
+    resource_rowid_integrity_seal,
+    snapshot_proves_stable_rowids,
+)
 
 
 def _safe_path_for_log(value: object) -> str:
-    """Render a storage path without leaking presign/SAS credentials."""
-    text = str(value or "")
+    """Return non-secret local metadata or a redacted remote authority."""
+
     try:
-        parsed = urlsplit(text)
-        if parsed.scheme in ("http", "https") and (parsed.query or parsed.fragment):
-            return urlunsplit(
-                (parsed.scheme, parsed.netloc, parsed.path, "<redacted>", "")
-            )
+        text = str(value or "")
     except Exception:
-        pass
-    return text
+        return "<path-unavailable>"
+    if "://" in text:
+        return safe_storage_path_for_diagnostic(text)
+    return local_path_metadata(text)
+
+
+def _trusted_storage_type(storage: object) -> str:
+    """Classify shipped storage adapters without reflecting custom class text."""
+
+    known_adapters = (
+        ("supertable.storage.local_storage", "LocalStorage", "local"),
+        ("supertable.storage.s3_storage", "S3Storage", "s3"),
+        ("supertable.storage.minio_storage", "MinioStorage", "minio"),
+        ("supertable.storage.azure_storage", "AzureBlobStorage", "azure"),
+        ("supertable.storage.gcp_storage", "GCSStorage", "gcp"),
+    )
+    for module_name, class_name, label in known_adapters:
+        module = sys.modules.get(module_name)
+        adapter_type = vars(module).get(class_name) if module is not None else None
+        if isinstance(adapter_type, type) and isinstance(storage, adapter_type):
+            return label
+    return "custom"
 
 
 def _linked_share_policy_state(
@@ -193,10 +222,10 @@ def _linked_share_policy_state(
             label="Linked-share schema type",
             max_bytes=max_type_bytes,
         )
-        folded = name.casefold()
-        if folded in schema_projection:
+        schema_folded = name.casefold()
+        if schema_folded in schema_projection:
             raise RuntimeError("Linked-share schema projection is ambiguous")
-        schema_projection[folded] = type_text
+        schema_projection[schema_folded] = type_text
     if not schema_projection:
         raise RuntimeError("Linked-share schema projection is empty")
 
@@ -240,6 +269,15 @@ _SHARE_CACHE_ID_RE = re.compile(r"share-cache-v1:[0-9a-f]{64}\Z")
 _LINKED_MANIFEST_DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_SAFE_LINKED_INTEGER = (1 << 53) - 1
 _MAX_LINKED_AUTHORITIES_PER_ESTIMATE = 256
+
+
+def _linked_table_names_digest(names: Iterable[str]) -> str:
+    digest = hashlib.sha256(_LINKED_TABLE_INDEX_DOMAIN)
+    for name in sorted(names):
+        encoded = name.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
 def _linked_share_authority_fields(
@@ -518,6 +556,7 @@ class DataEstimator:
         aggregate_children: Optional[
             Dict[Tuple[str, str], Iterable[str]]
         ] = None,
+        require_odata_identity: bool = False,
     ):
         self.organization = organization
         self.storage = storage
@@ -535,6 +574,9 @@ class DataEstimator:
         # Disabled lanes become unknown and therefore retain files.  ``None``
         # preserves the kernel's full safe-lane set for standalone callers.
         self.join_pruning_lanes = join_pruning_lanes
+        if type(require_odata_identity) is not bool:
+            raise TypeError("require_odata_identity must be a bool")
+        self.require_odata_identity = require_odata_identity
         # Aggregate relations (``super_name == simple_name``) are resolved and
         # authorized by DataReader before estimation.  Pin that exact child set
         # here so a table created between authorization and Redis SCAN cannot be
@@ -606,7 +648,10 @@ class DataEstimator:
         for name in candidates:
             val = self._storage_attr(name)
             if val:
-                logger.debug(f"[estimate.env] storage.{name}='{val}'")
+                logger.debug(
+                    f"[estimate.env] storage.{name}="
+                    f"'{_safe_path_for_log(val)}'"
+                )
                 return self._normalize_endpoint_for_s3(val)
 
         host = self._storage_attr("host", "hostname")
@@ -683,8 +728,8 @@ class DataEstimator:
                         return url, None
                 except Exception as e:
                     logger.debug(
-                        f"[estimate.resolve] storage.{attr} failed: "
-                        f"{_safe_path_for_log(e)}"
+                        f"[estimate.resolve] storage.{attr} failed; "
+                        f"error_type={safe_exception_type(e)}"
                     )
 
         # 3) Construct URL from endpoint/bucket
@@ -747,10 +792,10 @@ class DataEstimator:
             control = self.catalog.get_authoritative_linked_share(
                 organization, super_name, link_id,
             )
-        except FileNotFoundError as exc:
+        except FileNotFoundError:
             raise RuntimeError(
                 "Linked-share leaf has no authoritative control"
-            ) from exc
+            ) from None
         if not isinstance(control, dict):
             raise RuntimeError("Linked-share leaf has no authoritative control")
         if control.get("link_id") != link_id:
@@ -805,6 +850,8 @@ class DataEstimator:
             "provider_generated_ms": provider_generation,
             "manifest_digest": manifest_digest,
             "table_names": frozenset(expected_names),
+            "table_count": len(expected_names),
+            "table_names_digest": _linked_table_names_digest(expected_names),
         }
         cache[cache_key] = normalized
         return normalized
@@ -837,13 +884,119 @@ class DataEstimator:
             raise RuntimeError(
                 "Linked-share leaf does not match its authoritative control"
             )
-        if str(simple_name).casefold() not in control["table_names"]:
+        table_names = control.get("table_names")
+        if (
+            table_names is not None
+            and (
+                not isinstance(table_names, (set, frozenset))
+                or str(simple_name).casefold() not in table_names
+            )
+        ):
             raise RuntimeError(
                 "Linked-share leaf is outside its authoritative manifest"
             )
 
     def _collect_snapshots_from_redis(self, organization, super_name) -> List[Dict]:
-        items = list(self.catalog.scan_leaf_items(organization, super_name, count=512))
+        # Keep one root-generation fence open through SCAN, compact authority
+        # acquisition, and exact completeness validation. Linked leaf/control
+        # Lua mutations advance that same root, so a concurrent publication is
+        # either wholly before/after this view or rejected for retry.
+        authority_cache = getattr(self, "_linked_authority_cache", None)
+        if authority_cache is None:
+            authority_cache = {}
+            self._linked_authority_cache = authority_cache
+        pin_snapshot = getattr(self.catalog, "pin_leaf_authority_snapshot", None)
+        pin = (
+            pin_snapshot(organization, super_name)
+            if callable(pin_snapshot) else None
+        )
+        items = list(
+            self.catalog.scan_leaf_items(organization, super_name, count=512)
+        )
+        seen_names: Dict[str, Set[str]] = defaultdict(set)
+        seen_authority: Dict[str, Tuple[int, int, str]] = {}
+        for item in items:
+            authority = _linked_share_authority_fields(item)
+            if authority is None:
+                continue
+            link_id, local_generation, provider_generation, manifest_digest = authority
+            simple_name = str(item.get("simple") or "")
+            if not simple_name:
+                raise RuntimeError("Linked-share leaf name is invalid")
+            identity = (local_generation, provider_generation, manifest_digest)
+            prior = seen_authority.setdefault(link_id, identity)
+            if prior != identity:
+                raise RuntimeError(
+                    "Linked-share leaves span multiple authority generations"
+                )
+            folded = simple_name.casefold()
+            if folded in seen_names[link_id]:
+                raise RuntimeError("Linked-share leaf names are ambiguous")
+            seen_names[link_id].add(folded)
+
+        list_indexes = getattr(
+            self.catalog, "list_linked_share_table_indexes", None,
+        )
+        indexes = (
+            list_indexes(
+                organization,
+                super_name,
+                limit=_MAX_LINKED_AUTHORITIES_PER_ESTIMATE,
+            )
+            if callable(list_indexes)
+            else {link_id: None for link_id in seen_names}
+        )
+        for link_id, compact in indexes.items():
+            cache_key = (str(organization), str(super_name), link_id)
+            if compact is None:
+                control = self._authoritative_linked_control(
+                    organization, super_name, link_id,
+                )
+            else:
+                control = {
+                    "publication_generation": compact["publication_generation"],
+                    "provider_generated_ms": compact["provider_generated_ms"],
+                    "manifest_digest": compact["manifest_digest"],
+                    "table_names": None,
+                    "table_count": compact["table_count"],
+                    "table_names_digest": compact["table_names_digest"],
+                }
+                authority_cache[cache_key] = control
+            observed_identity = seen_authority.get(link_id)
+            expected_identity = (
+                control["publication_generation"],
+                control["provider_generated_ms"],
+                control["manifest_digest"],
+            )
+            if (
+                observed_identity is not None
+                and observed_identity != expected_identity
+            ):
+                raise RuntimeError(
+                    "Linked-share leaves do not match authoritative control"
+                )
+            observed_names = seen_names.get(link_id, set())
+            expected_names = control.get("table_names")
+            if expected_names is not None:
+                complete = observed_names == expected_names
+            else:
+                complete = (
+                    len(observed_names) == control["table_count"]
+                    and _linked_table_names_digest(observed_names)
+                    == control["table_names_digest"]
+                )
+            if not complete:
+                raise RuntimeError(
+                    "Linked-share leaf set is incomplete or non-authoritative"
+                )
+        unknown_links = set(seen_names).difference(indexes)
+        if unknown_links:
+            raise RuntimeError("Linked-share leaf has no authoritative control")
+        verify_snapshot = getattr(
+            self.catalog, "verify_leaf_authority_snapshot", None,
+        )
+        if pin is not None and callable(verify_snapshot):
+            verify_snapshot(organization, super_name, pin)
         snapshots = []
         for it in items:
             if not it.get("path"):
@@ -924,10 +1077,16 @@ class DataEstimator:
             return raw_keys
         try:
             return prune_files_by_predicates(
-                raw_keys, stats_df, occurrences, profiler=profiler,
+                raw_keys,
+                stats_df,
+                cast(List[Dict[str, Any]], occurrences),
+                profiler=profiler,
             )
         except Exception as e:
-            logger.warning(f"[estimate.prune] pruning skipped for {super_name}.{simple_name}: {e}")
+            logger.warning(
+                f"[estimate.prune] pruning skipped for "
+                f"{super_name}.{simple_name}; error_type={safe_exception_type(e)}"
+            )
             return raw_keys
 
     @staticmethod
@@ -1614,6 +1773,12 @@ class DataEstimator:
         """
         self.timer = Timer()
         self._linked_authority_cache = {}
+        # Preserve compatibility with embedders/test harnesses that construct
+        # the estimator through ``__new__`` and populate its historical fields
+        # directly. Only an explicit True enables the OData identity work.
+        require_odata_identity = (
+            getattr(self, "require_odata_identity", False) is True
+        )
         if self.plan_stats is None:
             self.plan_stats = PlanStats()
 
@@ -1675,7 +1840,10 @@ class DataEstimator:
         # Each record carries everything Pass 2 needs to size files and build the
         # SuperSnapshot, plus the own-WHERE survivors + loaded stats that feed the
         # cross-table join propagation that runs between the two passes.
-        records: List[Dict[str, object]] = []
+        # Records intentionally carry heterogeneous estimator state. ``Any``
+        # is scoped to this private staging dictionary; each value is built in
+        # Pass 1 and consumed under the same key contract in Pass 2.
+        records: List[Dict[str, Any]] = []
 
         for super_name, tables in super_map:
             # Collect snapshots ONCE per super_name (avoid redundant SCAN per simple table)
@@ -1701,6 +1869,9 @@ class DataEstimator:
                 resource_seals: Dict[str, Optional[ResourceStatsSeal]] = {}
                 resource_object_seals: Dict[
                     str, Optional[ResourceObjectSeal]
+                ] = {}
+                resource_rowid_integrity_seals: Dict[
+                    str, Optional[ResourceRowIdIntegritySeal]
                 ] = {}
                 resource_cache_identities: Dict[str, Optional[str]] = {}
                 resource_value_bounds: Dict[
@@ -1752,7 +1923,7 @@ class DataEstimator:
                         tombstone_state = normalize_snapshot_tombstone_state(
                             current_snapshot_data,
                         )
-                    except (TypeError, ValueError) as exc:
+                    except (TypeError, ValueError):
                         if raw_tombstone is not None and not (
                             isinstance(raw_tombstone_rows, int)
                             and not isinstance(raw_tombstone_rows, bool)
@@ -1762,7 +1933,7 @@ class DataEstimator:
                                 f"Snapshot for {super_name}.{simple_name} "
                                 "references a deletion vector without a "
                                 "positive row count"
-                            ) from exc
+                            ) from None
                         if raw_tombstone is None and not (
                             isinstance(raw_tombstone_rows, int)
                             and not isinstance(raw_tombstone_rows, bool)
@@ -1771,11 +1942,11 @@ class DataEstimator:
                             raise RuntimeError(
                                 f"Invalid tombstone row count for "
                                 f"{super_name}.{simple_name}"
-                            ) from exc
+                            ) from None
                         raise RuntimeError(
                             f"Invalid deletion-vector state for "
                             f"{super_name}.{simple_name}"
-                        ) from exc
+                        ) from None
 
                     tombstone_key = (
                         str(tombstone_state.pointer)
@@ -1833,9 +2004,12 @@ class DataEstimator:
                             linked=share_policy_fingerprint is not None,
                         )
                     )
-                    stable_rowid_contract = snapshot_proves_stable_rowids(
-                        current_snapshot_data,
-                        snapshot,
+                    stable_rowid_contract = bool(
+                        require_odata_identity
+                        and snapshot_proves_stable_rowids(
+                            current_snapshot_data,
+                            snapshot,
+                        )
                     )
                     pinned_snapshot_metadata.append({
                         "path": current_snapshot_path,
@@ -1854,6 +2028,10 @@ class DataEstimator:
                             share_publication_generation
                         ),
                         "stable_rowid_contract": stable_rowid_contract,
+                        "rowid_high_watermark": (
+                            current_snapshot_data.get("rowid_high_watermark")
+                            if stable_rowid_contract else None
+                        ),
                     })
 
                     lowered_schema = dict_keys_to_lowercase(current_schema)
@@ -1901,6 +2079,10 @@ class DataEstimator:
                         if valid_size:
                             key_size[file_key] = int(raw_size)
                         else:
+                            if share_policy_fingerprint is not None:
+                                raise RuntimeError(
+                                    "Linked-share resource size is unavailable"
+                                )
                             # Legacy snapshots may lack file_size. Recover it
                             # through the storage SDK rather than silently route
                             # a genuinely large scan as zero bytes.
@@ -1949,6 +2131,18 @@ class DataEstimator:
                                 resource_object_seals[file_key] = None
                         else:
                             resource_object_seals[file_key] = parsed_object_seal
+                        if require_odata_identity:
+                            parsed_rowid_seal = resource_rowid_integrity_seal(
+                                resource,
+                            )
+                            if file_key in resource_rowid_integrity_seals:
+                                # Duplicate resource keys cannot borrow one
+                                # occurrence's identity attestation.
+                                resource_rowid_integrity_seals[file_key] = None
+                            else:
+                                resource_rowid_integrity_seals[file_key] = (
+                                    parsed_rowid_seal
+                                )
                         parsed_cache_identity = _linked_resource_cache_identity(
                             resource,
                             linked=share_policy_fingerprint is not None,
@@ -2038,6 +2232,7 @@ class DataEstimator:
                             allow_cache=True,
                             cache_identity=stats_identity,
                             profiler=prune_profiler,
+                            storage=self.storage,
                         )
                     except Exception as stats_err:
                         # Stats are an optional optimisation artifact.  A stale,
@@ -2046,7 +2241,8 @@ class DataEstimator:
                         logger.warning(
                             f"[estimate.stats] stats unavailable for "
                             f"{super_name}.{simple_name}; pruning and precise "
-                            f"projection sizing skipped: {stats_err}"
+                            f"projection sizing skipped; "
+                            f"error_type={safe_exception_type(stats_err)}"
                         )
                         stats_df = None
 
@@ -2112,7 +2308,7 @@ class DataEstimator:
                     literal_survivors = list(raw_keys)
                     literal_row_groups: Dict[str, RowGroupSelection] = {}
                 else:
-                    literal_survivors = validated_literal
+                    literal_survivors = cast(List[str], validated_literal)
                     # Row-group hints come only from this table's literal WHERE.
                     # Join propagation below may remove whole files, but must not
                     # manufacture tighter group ids from cross-table ranges.
@@ -2128,9 +2324,20 @@ class DataEstimator:
                         except Exception as row_group_err:
                             logger.warning(
                                 f"[estimate.row_groups] selection skipped for "
-                                f"{super_name}.{simple_name}: {row_group_err}"
+                                f"{super_name}.{simple_name}; "
+                                f"error_type={safe_exception_type(row_group_err)}"
                             )
                             literal_row_groups = {}
+                if require_odata_identity:
+                    # OData continuation identity is table-global. A WHERE
+                    # predicate may prove that one resource cannot contribute
+                    # rows to this page, but it cannot prove that the pruned
+                    # resource has no row ID duplicated by a survivor or by a
+                    # later page. Keep the exact pinned manifest for the
+                    # backend proof relation; DuckDB still applies the user
+                    # predicate to the final query normally.
+                    literal_survivors = list(raw_keys)
+                    literal_row_groups = {}
                 # Reconcile observability from the validated boundary result,
                 # rather than trusting an inner implementation to update the
                 # profiler exactly once.  This also keeps custom/no-op pruners
@@ -2154,6 +2361,9 @@ class DataEstimator:
                     "resource_rows": resource_rows,
                     "resource_seals": resource_seals,
                     "resource_object_seals": resource_object_seals,
+                    "resource_rowid_integrity_seals": (
+                        resource_rowid_integrity_seals
+                    ),
                     "resource_cache_identities": resource_cache_identities,
                     "resource_value_bounds": resource_value_bounds,
                     "current_version": current_version,
@@ -2179,7 +2389,9 @@ class DataEstimator:
         join_iterations = 0
         # Re-check uniqueness on the concrete records before constructing maps:
         # dictionary comprehensions must never silently collapse two records.
-        records_by_key: Dict[Tuple[str, str], List[Dict[str, object]]] = defaultdict(list)
+        records_by_key: Dict[
+            Tuple[str, str], List[Dict[str, Any]]
+        ] = defaultdict(list)
         for record in records:
             records_by_key[record["key"]].append(record)
         runnable_join_edges = [
@@ -2187,7 +2399,7 @@ class DataEstimator:
             if len(records_by_key.get(edge.left_table, [])) == 1
             and len(records_by_key.get(edge.right_table, [])) == 1
         ]
-        if runnable_join_edges:
+        if runnable_join_edges and not require_odata_identity:
             # Same contract as _prune_files: a pruning failure must degrade to
             # "no pruning" (keep the Pass-1 survivors), never break the read.
             committed_join_plan = False
@@ -2272,7 +2484,10 @@ class DataEstimator:
                         prune_profiler.counts.pop("read_join_pruned_files", None)
                 join_files_removed = 0
                 join_iterations = 0
-                logger.warning(f"[estimate.join_prune] cross-table pruning skipped: {jp_err}")
+                logger.warning(
+                    "[estimate.join_prune] cross-table pruning skipped; "
+                    f"error_type={safe_exception_type(jp_err)}"
+                )
 
         # ---- Pass 2: resolve survivors to scan URLs, size, build snapshots -----
         for r in records:
@@ -2290,7 +2505,9 @@ class DataEstimator:
             survivor_set = set(survivors)
             column_value_bounds = {
                 column_name: max(
-                    resource_value_bounds[file_key][column_name.casefold()]
+                    cast(
+                        Dict[str, int], resource_value_bounds[file_key]
+                    )[column_name.casefold()]
                     for file_key in survivors
                 )
                 for column_name, type_name in schema_types.items()
@@ -2298,7 +2515,9 @@ class DataEstimator:
                 and survivors
                 and all(
                     isinstance(resource_value_bounds.get(file_key), dict)
-                    and column_name.casefold() in resource_value_bounds[file_key]
+                    and column_name.casefold() in cast(
+                        Dict[str, int], resource_value_bounds[file_key]
+                    )
                     for file_key in survivors
                 )
             }
@@ -2351,7 +2570,8 @@ class DataEstimator:
                     # malformed artifact cannot provide a trustworthy index.
                     logger.warning(
                         f"[estimate.projection] precise sizing skipped for "
-                        f"{super_name}.{simple_name}: {projection_err}"
+                        f"{super_name}.{simple_name}; "
+                        f"error_type={safe_exception_type(projection_err)}"
                     )
                     tier3_files, proj = set(), {}
 
@@ -2462,12 +2682,13 @@ class DataEstimator:
                 manifest_rows_complete = all(
                     isinstance(resource_rows.get(file_key), int)
                     and not isinstance(resource_rows.get(file_key), bool)
-                    and resource_rows[file_key] >= 0
+                    and cast(int, resource_rows[file_key]) >= 0
                     for file_key in survivors
                 )
                 if manifest_rows_complete:
                     selected_rows = sum(
-                        resource_rows[file_key] for file_key in survivors
+                        cast(int, resource_rows[file_key])
+                        for file_key in survivors
                     )
                     selected_rows_complete = True
             has_active_tombstone = any(
@@ -2487,7 +2708,7 @@ class DataEstimator:
                 full_rows_complete = all(
                     isinstance(resource_rows.get(file_key), int)
                     and not isinstance(resource_rows.get(file_key), bool)
-                    and resource_rows[file_key] >= 0
+                    and cast(int, resource_rows[file_key]) >= 0
                     for file_key in survivors
                 )
                 full_sizes_complete = all(
@@ -2503,7 +2724,10 @@ class DataEstimator:
                 else:
                     table_selected_decoded_complete = False
                 if full_rows_complete:
-                    full_rows = sum(resource_rows[file_key] for file_key in survivors)
+                    full_rows = sum(
+                        cast(int, resource_rows[file_key])
+                        for file_key in survivors
+                    )
                     # Eight value bytes plus one full byte/value of validity and
                     # alignment slack for the whole-file source-rowid proof.
                     table_proof_decoded_bytes += full_rows * 9
@@ -2606,6 +2830,32 @@ class DataEstimator:
                     stable_rowid_contract=(
                         pinned.get("stable_rowid_contract") is True
                     ),
+                    rowid_high_watermark=(
+                        pinned.get("rowid_high_watermark")
+                        if pinned.get("stable_rowid_contract") is True
+                        else None
+                    ),
+                    resource_rowid_integrity_seals={
+                        key: seal
+                        for key in survivors
+                        for seal in [
+                            r["resource_rowid_integrity_seals"].get(key)
+                        ]
+                        if (
+                            pinned.get("stable_rowid_contract") is True
+                            and isinstance(seal, ResourceRowIdIntegritySeal)
+                        )
+                    },
+                    resource_row_counts={
+                        key: int(cast(int, resource_rows[key]))
+                        for key in survivors
+                        if (
+                            require_odata_identity
+                            and isinstance(resource_rows.get(key), int)
+                            and not isinstance(resource_rows.get(key), bool)
+                            and cast(int, resource_rows[key]) >= 0
+                        )
+                    },
                     row_group_selections=literal_row_groups,
                     candidate_rows=(selected_rows if selected_rows_complete else 0),
                     candidate_rows_complete=selected_rows_complete,
@@ -2744,7 +2994,7 @@ class DataEstimator:
                 self.plan_stats.add_stat({"PRUNE_COUNTS": prune_counts})
 
         return Reflection(
-            storage_type=type(self.storage).__name__,
+            storage_type=_trusted_storage_type(self.storage),
             reflection_bytes=int(reflection_file_size),
             total_reflections=total_reflections,
             supers=supers,

@@ -308,28 +308,28 @@ class RbacViewDef:
 
 Defines RBAC-based column and row filtering for a table alias. Produced by `restrict_read_access()` and consumed by query executors to create a filtered view. `["*"]` means unrestricted column access; a non-empty `where_clause` is injected as a SQL WHERE predicate.
 
-### DedupViewDef
-
-```python
-@dataclass
-class DedupViewDef:
-    primary_keys: List[str] = field(default_factory=list)
-    order_column: str = "__timestamp__"
-    visible_columns: List[str] = field(default_factory=list)
-```
-
-Defines dedup-on-read semantics. The query engine creates a `ROW_NUMBER()` window partitioned by `primary_keys` and ordered by `order_column` DESC, keeping only the latest row per key combination. `visible_columns` controls projection; when empty or `["*"]`, all columns except `__rn__` are exposed.
-
 ### TombstoneDef
 
 ```python
 @dataclass
 class TombstoneDef:
-    primary_keys: List[str] = field(default_factory=list)
-    deleted_keys: List = field(default_factory=list)
+    tombstone_path: Optional[str] = None
+    cache_key: Optional[str] = None
+    expected_rows: Optional[int] = None
+    tombstone_digest: Optional[str] = None
+    resource_keys: Tuple[str, ...] = field(default_factory=tuple)
+    snapshot_resource_keys: Optional[Tuple[str, ...]] = None
+    tombstone_format: Optional[int] = None
+    segments: Tuple[TombstoneSegmentDef, ...] = field(default_factory=tuple)
 ```
 
-Defines soft-delete filtering. The executor builds a view that excludes rows whose primary-key tuple appears in `deleted_keys`. Each entry in `deleted_keys` is a list of scalar values matching the order of `primary_keys`.
+Defines the snapshot-pinned deletion vector for one table alias. Each logical
+entry identifies one deleted physical row by the exact composite identity
+`(__file__, __rowid__)`; it is not a business-key tombstone. The path, row
+count, digest, format, snapshot resource membership, and (for format 2)
+immutable segment seals let readers validate the artifact before applying its
+anti-join. Formats 1 and 3 point directly to Parquet; format 2 points to a JSON
+manifest whose `segments` resolve the sealed Parquet artifacts.
 
 ### Reflection
 
@@ -342,11 +342,12 @@ class Reflection:
     supers: List[SuperSnapshot]
     freshness_ms: int = 0
     rbac_views: Dict[str, RbacViewDef] = field(default_factory=dict)
-    dedup_views: Dict[str, DedupViewDef] = field(default_factory=dict)
     tombstone_views: Dict[str, TombstoneDef] = field(default_factory=dict)
 ```
 
-The top-level query plan object. Aggregates all resolved SuperSnapshots with their associated RBAC, dedup, and tombstone view definitions. Key fields:
+The top-level query plan object. Aggregates all resolved SuperSnapshots with
+their associated RBAC and snapshot-pinned deletion-vector definitions. Key
+fields:
 
 | Field | Purpose |
 |-------|---------|
@@ -356,8 +357,7 @@ The top-level query plan object. Aggregates all resolved SuperSnapshots with the
 | `supers` | List of `SuperSnapshot` objects, one per SimpleTable involved. |
 | `freshness_ms` | Maximum `last_updated_ms` across snapshots -- helps the engine decide between caching and re-reading. |
 | `rbac_views` | Alias-keyed RBAC filter definitions. |
-| `dedup_views` | Alias-keyed dedup-on-read definitions. |
-| `tombstone_views` | Alias-keyed tombstone (soft-delete) definitions. |
+| `tombstone_views` | Alias-keyed, snapshot-pinned deletion-vector definitions. |
 
 ---
 

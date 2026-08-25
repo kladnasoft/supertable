@@ -13,8 +13,9 @@ default — once ``set_legal_hold()`` is called, the Redis value takes
 precedence.
 
 All deletions are recorded as audit events (meta-event: the audit log
-audits its own cleanup).  If audit emission fails, the deletion still
-proceeds — audit failures must never block retention.
+audits its own cleanup).  Ordinary delivery failures remain best-effort,
+but configured encryption failures propagate after deletion so callers
+cannot mistake an unaudited protected mutation for success.
 
 Compliance: DORA Art. 12 (5+ year retention), SOC 2 A1.2.
 """
@@ -26,8 +27,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from supertable import redis_keys as RK
+from supertable.audit.crypto import AuditEncryptionError
+from supertable.audit.diagnostics import safe_audit_error_type
 
 logger = logging.getLogger(__name__)
+
+
+class AuditRetentionDurabilityError(RuntimeError):
+    """A retention mutation completed without a durable audit event."""
 
 
 def _legal_hold_key(org: str) -> str:
@@ -43,7 +50,7 @@ _PARTITION_RE = re.compile(
 )
 
 
-def _parse_partition_date(partition_path: str) -> Optional[datetime]:
+def _parse_partition_date(partition_path: Any) -> Optional[datetime]:
     """Extract the date from a Hive-style partition path.
 
     Matches paths like ``…/year=2024/month=03/day=15`` or
@@ -52,6 +59,8 @@ def _parse_partition_date(partition_path: str) -> Optional[datetime]:
     Returns a timezone-aware UTC datetime at midnight, or None if the
     path does not match the expected partition naming convention.
     """
+    if not isinstance(partition_path, str):
+        return None
     m = _PARTITION_RE.search(partition_path)
     if not m:
         return None
@@ -80,25 +89,42 @@ def is_legal_hold_active(organization: str) -> bool:
     Fail-safe: if both lookups fail, returns True (hold active) so
     that data is never accidentally deleted.
     """
-    # Try Redis first (runtime override)
+    # Try Redis first (runtime override).  Once runtime overrides are supported,
+    # an unreadable authoritative key cannot safely be treated as "no
+    # override": doing so could turn a Redis outage into destructive deletion
+    # under a false environment default.
     try:
         from supertable.redis_infra import redis_client
         val = redis_client.get(_legal_hold_key(organization))
         if val is not None:
             decoded = val if isinstance(val, str) else val.decode("utf-8")
-            return decoded.lower() in ("1", "true", "yes")
-    except Exception as e:
-        logger.debug("[audit-retention] Redis legal_hold lookup failed: %s", e)
+            normalized = decoded.strip().lower()
+            if normalized in ("1", "true", "yes"):
+                return True
+            if normalized in ("0", "false", "no"):
+                return False
+            logger.warning(
+                "[audit-retention] malformed legal_hold value; "
+                "deletion disabled"
+            )
+            return True
+    except Exception as exc:
+        logger.debug(
+            "[audit-retention] Redis legal_hold lookup failed; error_type=%s",
+            safe_audit_error_type(exc),
+        )
+        return True
 
     # Fall back to settings default
     try:
         from supertable.config.settings import settings
-        return bool(settings.SUPERTABLE_AUDIT_LEGAL_HOLD)
+        configured = settings.SUPERTABLE_AUDIT_LEGAL_HOLD
+        return configured if type(configured) is bool else True
     except Exception:
-        pass
+        return True
 
     # Fail-safe: if we cannot determine, treat as hold active (never delete)
-    return True
+    return True  # pragma: no cover - both branches above return explicitly
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +139,8 @@ def set_legal_hold(enabled: bool, organization: str = "") -> Dict[str, Any]:
 
     Returns: {"ok": True, "legal_hold": bool, "organization": str}
     """
+    if type(enabled) is not bool:
+        return {"ok": False, "error": "enabled must be boolean"}
     if not organization:
         try:
             from supertable.config.settings import settings
@@ -121,14 +149,26 @@ def set_legal_hold(enabled: bool, organization: str = "") -> Dict[str, Any]:
             pass
     if not organization:
         return {"ok": False, "error": "organization required"}
+    try:
+        _legal_hold_key(organization)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "organization is invalid"}
 
     # Persist to Redis
     try:
         from supertable.redis_infra import redis_client
         redis_client.set(_legal_hold_key(organization), "1" if enabled else "0")
-    except Exception as e:
-        logger.error("[audit-retention] Failed to persist legal hold to Redis: %s", e)
-        return {"ok": False, "error": f"Redis persistence failed: {e}"}
+    except Exception as exc:
+        error_type = safe_audit_error_type(exc)
+        logger.error(
+            "[audit-retention] legal hold persistence failed; error_type=%s",
+            error_type,
+        )
+        return {
+            "ok": False,
+            "error": "Redis persistence failed",
+            "error_type": error_type,
+        }
 
     logger.info(
         "[audit-retention] Legal hold %s for org=%s",
@@ -136,7 +176,8 @@ def set_legal_hold(enabled: bool, organization: str = "") -> Dict[str, Any]:
         organization,
     )
 
-    # Audit the change (never fail the operation if audit fails)
+    # Legal-hold changes are compliance mutations; never report success when
+    # their audit event could not be durably admitted.
     try:
         from supertable.audit import emit as _audit, EventCategory, Actions, Severity, make_detail
         _audit(
@@ -151,8 +192,12 @@ def set_legal_hold(enabled: bool, organization: str = "") -> Dict[str, Any]:
                 action="activated" if enabled else "deactivated",
             ),
         )
-    except Exception:
-        pass
+    except AuditEncryptionError:
+        raise
+    except Exception as exc:
+        raise AuditRetentionDurabilityError(
+            "legal-hold mutation was not durably audited"
+        ) from exc
 
     return {"ok": True, "legal_hold": enabled, "organization": organization}
 
@@ -176,8 +221,8 @@ def enforce_retention(organization: str) -> Dict[str, Any]:
             "skipped_legal_hold": bool,
             "retention_days": int,
             "cutoff_date": str,          # ISO date
-            "errors": [...],             # partition paths that failed
-            "deleted_paths": [...],      # paths that were deleted
+            "errors": [...],             # sanitized operation failures
+            "deleted_paths": [...],      # canonical date labels, not paths
         }
     """
     result: Dict[str, Any] = {
@@ -192,6 +237,12 @@ def enforce_retention(organization: str) -> Dict[str, Any]:
 
     if not organization:
         result["errors"].append("organization is empty")
+        return result
+    try:
+        _legal_hold_key(organization)
+    except (TypeError, ValueError):
+        result["organization"] = ""
+        result["errors"].append("organization is invalid")
         return result
 
     # ── Legal hold check (fail-safe: if check fails, do not delete) ──
@@ -221,9 +272,15 @@ def enforce_retention(organization: str) -> Dict[str, Any]:
         from supertable.audit.writer_parquet import ParquetAuditWriter
         writer = ParquetAuditWriter()
         partitions = writer.list_partitions(organization)
-    except Exception as e:
-        logger.error("[audit-retention] Failed to enumerate partitions: %s", e)
-        result["errors"].append(f"partition enumeration failed: {e}")
+    except Exception as exc:
+        error_type = safe_audit_error_type(exc)
+        logger.error(
+            "[audit-retention] partition enumeration failed; error_type=%s",
+            error_type,
+        )
+        result["errors"].append(
+            f"partition enumeration failed; error_type={error_type}"
+        )
         return result
 
     if not partitions:
@@ -234,9 +291,15 @@ def enforce_retention(organization: str) -> Dict[str, Any]:
     try:
         from supertable.storage.storage_factory import get_storage
         storage = get_storage()
-    except Exception as e:
-        logger.error("[audit-retention] Failed to get storage backend: %s", e)
-        result["errors"].append(f"storage init failed: {e}")
+    except Exception as exc:
+        error_type = safe_audit_error_type(exc)
+        logger.error(
+            "[audit-retention] storage initialization failed; error_type=%s",
+            error_type,
+        )
+        result["errors"].append(
+            f"storage initialization failed; error_type={error_type}"
+        )
         return result
 
     deleted_count = 0
@@ -244,7 +307,9 @@ def enforce_retention(organization: str) -> Dict[str, Any]:
     for partition_path in partitions:
         partition_date = _parse_partition_date(partition_path)
         if partition_date is None:
-            logger.debug("[audit-retention] Skipping unparseable partition: %s", partition_path)
+            logger.debug(
+                "[audit-retention] Skipping unparseable partition entry"
+            )
             continue
 
         if partition_date >= cutoff:
@@ -253,20 +318,31 @@ def enforce_retention(organization: str) -> Dict[str, Any]:
             break
 
         # Delete the partition directory
+        partition_label = partition_date.strftime(
+            "year=%Y/month=%m/day=%d"
+        )
         try:
             storage.delete(partition_path)
             deleted_count += 1
-            result["deleted_paths"].append(partition_path)
+            result["deleted_paths"].append(partition_label)
             logger.info(
-                "[audit-retention] Deleted partition %s (date=%s, cutoff=%s)",
-                partition_path, partition_date.strftime("%Y-%m-%d"), result["cutoff_date"],
+                "[audit-retention] Deleted partition date=%s cutoff=%s",
+                partition_date.strftime("%Y-%m-%d"), result["cutoff_date"],
             )
         except FileNotFoundError:
             # Already deleted (race condition or concurrent cleanup) — not an error
             pass
-        except Exception as e:
-            logger.error("[audit-retention] Failed to delete %s: %s", partition_path, e)
-            result["errors"].append(f"{partition_path}: {e}")
+        except Exception as exc:
+            error_type = safe_audit_error_type(exc)
+            logger.error(
+                "[audit-retention] partition deletion failed; "
+                "partition=%s error_type=%s",
+                partition_label, error_type,
+            )
+            result["errors"].append(
+                "partition deletion failed "
+                f"({partition_label}); error_type={error_type}"
+            )
 
     result["deleted_partitions"] = deleted_count
 
@@ -287,7 +363,11 @@ def enforce_retention(organization: str) -> Dict[str, Any]:
                 error_count=len(result["errors"]),
             ),
         )
-    except Exception:
-        pass
+    except AuditEncryptionError:
+        raise
+    except Exception as exc:
+        raise AuditRetentionDurabilityError(
+            "retention mutation was not durably audited"
+        ) from exc
 
     return result

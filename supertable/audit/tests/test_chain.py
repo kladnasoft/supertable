@@ -21,6 +21,7 @@ from supertable.audit.chain import (
     InstanceChain,
     MerkleProof,
     compute_batch_hash,
+    compute_event_batch_hash,
     compute_chain_hash,
     compute_file_hash,
     verify_batch_chain,
@@ -53,6 +54,35 @@ class TestComputeBatchHash:
         h1 = compute_batch_hash(["x"], "f")
         h2 = compute_batch_hash(["x"], "f")
         assert h1 == h2
+
+
+class TestContentBoundBatchHash:
+    def test_binds_all_event_content_but_not_chain_hash(self) -> None:
+        first = {
+            "event_id": "evt-1",
+            "instance_id": "instance-1",
+            "actor_id": "alice",
+            "detail": "protected",
+            "chain_hash": "a" * 64,
+        }
+        changed = dict(first, actor_id="mallory")
+        same_content = dict(first, chain_hash="b" * 64)
+
+        assert compute_event_batch_hash([first]) != compute_event_batch_hash(
+            [changed]
+        )
+        assert compute_event_batch_hash([first]) == compute_event_batch_hash(
+            [same_content]
+        )
+
+    def test_order_is_stable_and_duplicate_ids_are_rejected(self) -> None:
+        one = {"event_id": "one", "detail": "a"}
+        two = {"event_id": "two", "detail": "b"}
+        assert compute_event_batch_hash([one, two]) == compute_event_batch_hash(
+            [two, one]
+        )
+        with pytest.raises(ValueError, match="duplicate"):
+            compute_event_batch_hash([one, dict(one)])
 
 
 class TestComputeChainHash:
@@ -153,6 +183,19 @@ class TestMerkleProof:
         assert rebuilt.merkle_root == p.merkle_root
         assert rebuilt.total_events == 5
         assert rebuilt.instances == p.instances
+
+    def test_duplicate_instance_cannot_corrupt_event_total(self) -> None:
+        chain = InstanceChain(
+            instance_id="srv-1", head="a" * 64, batch_count=1,
+        )
+        proof = MerkleProof(date="2025-01-15")
+        proof.add_instance(chain, event_count=2)
+
+        with pytest.raises(ValueError, match="unique"):
+            proof.add_instance(chain, event_count=3)
+
+        assert proof.total_events == 2
+        assert proof.instances["srv-1"]["events"] == 2
 
 
 # ---------------------------------------------------------------------------

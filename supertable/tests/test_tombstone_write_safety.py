@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import polars as pl
+import pyarrow as pa
 import pytest
 
 os.environ.setdefault("SUPERTABLE_ORGANIZATION", "test_org")
@@ -807,16 +808,85 @@ def test_legacy_targeted_delete_derives_and_carries_rowid_floor(monkeypatch):
 
 def test_legacy_highwater_rejects_nonpositive_physical_rowid(monkeypatch):
     writer = DataWriter.__new__(DataWriter)
-    writer.super_table = SimpleNamespace(organization="o", super_name="s")
-    monkeypatch.setattr(
-        "supertable.data_writer._read_parquet_safe",
-        lambda *a, **k: pl.DataFrame({
-            "__rowid__": pl.Series([0, 2], dtype=pl.Int64)
-        }),
+    storage = SimpleNamespace(
+        iter_parquet_batches=lambda *_args, **_kwargs: iter((
+            pa.table({"__rowid__": pa.array([0, 2], type=pa.int64())}),
+        )),
+    )
+    writer.super_table = SimpleNamespace(
+        organization="o", super_name="s", storage=storage,
     )
     with pytest.raises(ValueError, match="positive"):
         writer._derive_legacy_rowid_high_watermark(
-            {"resources": [{"file": "f.parquet", "file_size": 1}]},
+            {"resources": [{"file": "f.parquet", "file_size": 1, "rows": 2}]},
+            simple_name="t",
+            profiler=Profiler(),
+        )
+
+
+def test_legacy_highwater_uses_bounded_disk_backed_global_proof(monkeypatch):
+    writer = DataWriter.__new__(DataWriter)
+    calls = []
+    rows_per_file = 50_000
+
+    class StreamingStorage:
+        def iter_parquet_batches(
+            self, path, *, max_decoded_bytes, columns,
+        ):
+            calls.append((path, max_decoded_bytes, columns))
+            offset = 0 if path == "a.parquet" else rows_per_file
+            for start in range(0, rows_per_file, 5_000):
+                yield pa.table({
+                    "__rowid__": pa.array(
+                        range(offset + start + 1, offset + start + 5_001),
+                        type=pa.int64(),
+                    ),
+                })
+
+    writer.super_table = SimpleNamespace(
+        organization="o",
+        super_name="s",
+        storage=StreamingStorage(),
+    )
+    monkeypatch.setattr(
+        "supertable.data_writer._read_parquet_safe",
+        lambda *_args, **_kwargs: pytest.fail(
+            "legacy rowid proof materialized an entire Parquet resource"
+        ),
+    )
+
+    assert writer._derive_legacy_rowid_high_watermark(
+        {
+            "resources": [
+                {"file": "a.parquet", "file_size": 1, "rows": rows_per_file},
+                {"file": "b.parquet", "file_size": 1, "rows": rows_per_file},
+            ],
+        },
+        simple_name="t",
+        profiler=Profiler(),
+    ) == rows_per_file * 2
+    assert calls == [
+        ("a.parquet", 8 * 1024 * 1024, ["__rowid__"]),
+        ("b.parquet", 8 * 1024 * 1024, ["__rowid__"]),
+    ]
+
+
+def test_legacy_highwater_rejects_duplicate_across_bounded_batches():
+    writer = DataWriter.__new__(DataWriter)
+
+    class DuplicateStorage:
+        def iter_parquet_batches(self, *_args, **_kwargs):
+            yield pa.table({"__rowid__": pa.array([1, 2], type=pa.int64())})
+            yield pa.table({"__rowid__": pa.array([2, 3], type=pa.int64())})
+
+    writer.super_table = SimpleNamespace(
+        organization="o",
+        super_name="s",
+        storage=DuplicateStorage(),
+    )
+    with pytest.raises(ValueError, match="table-global unique"):
+        writer._derive_legacy_rowid_high_watermark(
+            {"resources": [{"file": "f.parquet", "file_size": 1, "rows": 4}]},
             simple_name="t",
             profiler=Profiler(),
         )

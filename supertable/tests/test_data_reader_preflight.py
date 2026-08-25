@@ -214,8 +214,7 @@ class TestExecuteSurfacesNotFoundError:
         df, status, message = reader.execute(role_name="r", engine=Engine.AUTO)
 
         assert status == Status.ERROR
-        assert "SuperTable not found" in (message or "")
-        assert "ghost_sup" in (message or "")
+        assert message == "Query target is unavailable"
         assert df.empty
 
     @patch(_P_RESTRICT_READ)
@@ -248,7 +247,7 @@ class TestExecuteSurfacesNotFoundError:
 
         # Pre-flight raised → Status.ERROR returned
         assert status == Status.ERROR
-        assert "SuperTable not found" in (message or "")
+        assert message == "Query target is unavailable"
 
         # CRITICAL: restrict_read_access (which would bootstrap RBAC for
         # the supertable as a side effect of building RoleManager) MUST
@@ -281,6 +280,5 @@ class TestExecuteSurfacesNotFoundError:
         df, status, message = reader.execute(role_name="r", engine=Engine.AUTO)
 
         assert status == Status.ERROR
-        assert "Table not found" in (message or "")
-        assert "ghost_tbl" in (message or "")
+        assert message == "Query target is unavailable"
         assert df.empty

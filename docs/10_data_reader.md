@@ -26,10 +26,10 @@ User SQL
 [4] Estimate       -- DataEstimator resolves files and byte totals
     |
     v
-[5] Build views    -- dedup, tombstone, RBAC views attached to Reflection
+[5] Build views    -- snapshot-pinned deletion-vector + RBAC definitions
     |
     v
-[6] Select engine  -- AUTO picks DuckDB/IslandDB/Spark based on size + freshness
+[6] Select engine  -- AUTO applies capability/safety gates, then cost routing
     |
     v
 [7] Execute        -- Executor runs query against chosen backend
@@ -243,43 +243,38 @@ materialise.
 
 **Step 5 -- Build View Definitions**
 
-After estimation, the `DataReader` attaches view definitions to the `Reflection` object for the executor to consume:
+After estimation, `DataReader` attaches the authorized RBAC definitions and the
+deletion vector from the same pinned snapshot to the `Reflection`. It never
+re-reads the current Redis leaf after estimation: combining an older file set
+with a newer vector could hide an old row without including its replacement.
 
 **RBAC views:**
 ```python
 reflection.rbac_views = rbac_views
 ```
 
-**Dedup-on-read views** (from table config in Redis):
+There is no read-time primary-key collapse. Overwrites and deletes are writer
+decisions represented by physical row identities in the snapshot's deletion
+vector. If the pinned snapshot has an active vector, the reader resolves its
+sealed artifact and constructs an executor definition equivalent to:
+
 ```python
-catalog = RedisCatalog()
-for td in tables:
-    tbl_cfg = catalog.get_table_config(
-        self.organization, td.super_name, td.simple_name,
-    )
-    if tbl_cfg and tbl_cfg.get("dedup_on_read"):
-        pk = tbl_cfg.get("primary_keys", [])
-        if pk:
-            reflection.dedup_views[td.alias] = DedupViewDef(
-                primary_keys=pk,
-                order_column="__timestamp__",
-                visible_columns=list(td.columns or []),
-            )
+reflection.tombstone_views[td.alias] = TombstoneDef(
+    tombstone_path=resolved_tombstone,
+    cache_key=snapshot.tombstone_key,
+    expected_rows=snapshot.tombstone_rows,
+    tombstone_digest=snapshot.tombstone_digest,
+    resource_keys=tuple(snapshot.resource_keys),
+    snapshot_resource_keys=tuple(snapshot.snapshot_resource_keys),
+    tombstone_format=snapshot.tombstone_format,
+    segments=resolved_v2_segments,
+)
 ```
 
-**Tombstone views** (from snapshot metadata in Redis):
-```python
-leaf = catalog.get_leaf(
-    self.organization, td.super_name, td.simple_name,
-)
-payload = (leaf or {}).get("payload")
-tomb_block = payload.get("tombstones")
-if tomb_block:
-    reflection.tombstone_views[td.alias] = TombstoneDef(
-        primary_keys=tomb_block.get("primary_keys", []),
-        deleted_keys=tomb_block.get("deleted_keys", []),
-    )
-```
+The executor may remove a row only when the protected source identity
+`(__supertable_source_file__, __rowid__)` matches the persisted deletion-vector
+identity `(__file__, __rowid__)`. Row-id-only filtering is not a safe
+substitute.
 
 **Linked-share row filters** (provider-side row filter on shared tables):
 ```python
@@ -307,7 +302,13 @@ result_df, engine_used = executor.execute(
 )
 ```
 
-The `Executor` applies the AUTO selection logic (documented in the Query Engine chapter) and delegates to the chosen backend.
+The `Executor` applies the AUTO selection logic (documented in the Query Engine
+chapter) and delegates to the chosen backend. Active deletion vectors are a
+hard Spark eligibility gate: AUTO excludes Spark, while an explicit Spark
+request fails before cluster selection or connection with the internal
+composite-identity capability error. The public inline facade returns the
+stable sanitized `Query execution failed` message; it never ignores the vector
+or returns deleted rows.
 
 **Step 7 -- Record Execution Plan**
 
@@ -359,18 +360,24 @@ def query_sql(
 
 This function:
 1. Applies `_ensure_sql_limit()` and clamps it to the server maximum.
-2. Routes SELECTs through `execute_stream()` (DuckDB, IslandDB, or AUTO) and
-   converts one Arrow row at a time without constructing a pandas result.
+2. Routes DuckDB, IslandDB, and AUTO SELECTs through `execute_stream()` and
+   converts bounded Arrow batches without constructing a pandas result.
 3. Accounts for each encoded row before retaining it and cancels the stream
    when the complete JSON response would exceed
    `SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES`.
-4. Uses the materialized path only for bounded diagnostic commands. Explicit
-   Spark SELECTs fail because Spark has no cancellable incremental result
-   contract in this API.
+4. Routes an explicit Spark SELECT through its bounded materialized path. The
+   Thrift cursor fetches at most 256 rows upstream, enforces the inline row and
+   pre-materialization byte budgets while fetching, and honors the request
+   deadline/cancellation token. The complete public payload then passes the
+   same authoritative exact JSON byte accounting as every other engine.
 
 DuckDB fetches at most `SUPERTABLE_RESULT_STREAM_BATCH_ROWS` rows per Arrow
 batch (hard-clamped to 1–4096). A single row remains the indivisible memory
 floor, but a wide response cannot be prefetched in the old 64K-row batch.
+Spark remains unavailable through `execute_stream()` and `query_sql_stream()`;
+only the bounded inline `query_sql()` facade materializes Spark results. That
+facade does not widen Spark's data capability: an active deletion vector still
+fails closed before fleet selection.
 
 Returns:
 - `columns`: list of column name strings.
@@ -393,19 +400,20 @@ queries against the parquet files listed in each snapshot.
 
 ## View Chain
 
-The view chain is a stack of SQL views built on top of raw parquet files. Each layer adds a data integrity or security concern:
+The successful read path builds protected SQL views on top of the raw parquet
+files. DuckDB and IslandDB can apply active deletion vectors; Spark uses the
+same protected projection only when no vector is active.
 
 ```
 [Base]  parquet_scan(files) -> reflection table
    |
    v
-[RBAC]  SELECT allowed_columns FROM base WHERE role_filter
-   |
-   v
-[Tombstone]  SELECT * FROM rbac WHERE NOT EXISTS (deleted_keys)
-   |
-   v
-[Dedup]  SELECT visible_cols FROM (ROW_NUMBER() OVER ...) WHERE __rn__=1
+[Protected projection]
+        composite (__supertable_source_file__, __rowid__) anti-join against
+        validated deletion vector; strip internal columns
+    |
+    v
+[RBAC]  SELECT allowed_columns FROM protected WHERE role_filter
    |
    v
   User query references the top-most view
@@ -433,13 +441,17 @@ Applies column-level and row-level security based on the authenticated role:
 - **Row filtering**: applies a WHERE clause from the role's filter definition.
 - **Share filters**: linked-share row filters are merged with RBAC filters via AND.
 
-### Tombstone Layer
+### Protected Deletion-Vector Layer
 
-Excludes soft-deleted rows using an anti-join against a VALUES list of deleted composite keys. Positioned after RBAC (so deleted rows are never visible) and before dedup (so deleted rows do not participate in the ROW_NUMBER window).
+The vector contains the stable logical source-object key and row ID for each
+obsolete/deleted physical row. Before the anti-join, the executor validates the
+artifact's schema, row count, digest, referenced snapshot files, and source
+row-id integrity. It then joins on both source file and row ID and strips
+`__rowid__`, `__timestamp__`, and protected filename columns before RBAC or user
+SQL can see them.
 
-### Dedup Layer
-
-Keeps only the latest row per primary key combination using `ROW_NUMBER() OVER (PARTITION BY pk ORDER BY __timestamp__ DESC)`. Only `visible_columns` are projected in the outer SELECT, hiding internal columns (`__rn__`, `__timestamp__`) from the user query.
+Spark cannot yet carry the stable logical source key through its resolved
+Parquet views, so an active vector is rejected before any Spark fleet I/O.
 
 ## Data Classes
 
@@ -483,28 +495,23 @@ class RbacViewDef:
 
 Column and row filter definitions produced by `restrict_read_access()`.
 
-### `DedupViewDef`
-
-```python
-@dataclass
-class DedupViewDef:
-    primary_keys: List[str] = field(default_factory=list)
-    order_column: str = "__timestamp__"
-    visible_columns: List[str] = field(default_factory=list)
-```
-
-Dedup-on-read configuration from the table config in Redis.
-
 ### `TombstoneDef`
 
 ```python
 @dataclass
 class TombstoneDef:
-    primary_keys: List[str] = field(default_factory=list)
-    deleted_keys: List = field(default_factory=list)
+    tombstone_path: Optional[str] = None
+    cache_key: Optional[str] = None
+    expected_rows: Optional[int] = None
+    tombstone_digest: Optional[str] = None
+    resource_keys: Tuple[str, ...] = field(default_factory=tuple)
+    snapshot_resource_keys: Optional[Tuple[str, ...]] = None
+    tombstone_format: Optional[int] = None
+    segments: Tuple[TombstoneSegmentDef, ...] = field(default_factory=tuple)
 ```
 
-Soft-delete keys from the snapshot metadata.
+Snapshot-pinned, sealed deletion-vector identity and the exact set of data
+objects against which it may be applied.
 
 ### `Reflection`
 
@@ -517,7 +524,6 @@ class Reflection:
     supers: List[SuperSnapshot]
     freshness_ms: int = 0
     rbac_views: Dict[str, RbacViewDef] = field(default_factory=dict)
-    dedup_views: Dict[str, DedupViewDef] = field(default_factory=dict)
     tombstone_views: Dict[str, TombstoneDef] = field(default_factory=dict)
 ```
 
@@ -529,9 +535,15 @@ The `DataReader` is the single point through which all data leaves SuperTable. T
 
 - **Uniform security enforcement**: every query path passes through the same RBAC check and view chain. There is no way to bypass column or row restrictions by using a different interface.
 
-- **Consistent data view**: dedup-on-read and tombstone filtering ensure that all consumers see the same logical state of the data, even when the underlying parquet files contain historical duplicates or soft-deleted rows.
+- **Consistent data view**: writer-produced deletion vectors and their exact
+  composite anti-join ensure consumers do not see obsolete or soft-deleted
+  physical rows. Engines that cannot prove the same view are excluded by AUTO
+  or fail closed; they never return an approximate result.
 
-- **Auditable execution**: every query produces an execution plan with timing breakdowns, engine choice, file counts, and result shape. This enables performance debugging and compliance auditing.
+- **Auditable execution**: every query produces an execution plan with timing
+  breakdowns, engine choice, file counts, and result shape. Successful and
+  failed materialized outcomes emit attributed audit events; audit delivery
+  failures do not replace the original query result or exception.
 
 - **Snapshot linked list for compliance**: every write chains via `previous_snapshot`, so older parquet sets remain reachable for point-in-time inspection without maintaining separate historical tables.
 

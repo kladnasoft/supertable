@@ -227,18 +227,15 @@ def _safe(label: str, value: str) -> str:
     """
     if value is None:
         raise ValueError(
-            f"Invalid Redis key segment for {label!r}: None "
-            f"(must match {_SAFE_SEGMENT.pattern!r})"
+            "Invalid Redis key segment; value must be a bounded safe string"
         )
     if not isinstance(value, str):
         raise ValueError(
-            f"Invalid Redis key segment for {label!r}: {value!r} "
-            f"(must be a str, got {type(value).__name__})"
+            "Invalid Redis key segment; value must be a bounded safe string"
         )
     if not _SAFE_SEGMENT.match(value):
         raise ValueError(
-            f"Invalid Redis key segment for {label!r}: {value!r} "
-            f"(must match {_SAFE_SEGMENT.pattern!r})"
+            "Invalid Redis key segment; value must be a bounded safe string"
         )
     if SENTINEL_RE.match(value):
         raise ValueError(
@@ -1247,15 +1244,15 @@ def registry(
     """
     if service_type not in _VALID_SERVICE_TYPES:
         raise ValueError(
-            f"Invalid service_type {service_type!r}; "
-            f"must be one of {sorted(_VALID_SERVICE_TYPES)}"
+            "Invalid service_type; must be one of "
+            f"{sorted(_VALID_SERVICE_TYPES)}"
         )
     if not isinstance(host, str) or not host or ":" in host:
-        raise ValueError(f"Invalid host: {host!r}")
+        raise ValueError("Invalid host")
     try:
         pid_int = int(pid)
     except (TypeError, ValueError):
-        raise ValueError(f"Invalid pid: {pid!r}")
+        raise ValueError("Invalid pid") from None
     if pid_int <= 0:
         raise ValueError(f"pid must be positive: {pid_int}")
     return (

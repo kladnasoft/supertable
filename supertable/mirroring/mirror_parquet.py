@@ -19,6 +19,7 @@ import hashlib
 from typing import Any, Dict, List, Set, Tuple
 
 from supertable.config.defaults import logger
+from supertable.mirroring.failure_safety import mirror_error_type
 
 
 def _binary_copy_if_possible(storage, src_path: str, dst_path: str) -> bool:
@@ -35,7 +36,10 @@ def _binary_copy_if_possible(storage, src_path: str, dst_path: str) -> bool:
             storage.copy(src_path, dst_path)
             return True
         except Exception as e:
-            logger.warning(f"[mirror] storage.copy failed ({src_path} -> {dst_path}): {e}")
+            logger.warning(
+                "[mirror][parquet] storage.copy failed; error_type=%s",
+                mirror_error_type(e),
+            )
 
     # --- Byte copy fallback --------------------------------------------------
     read_bytes = getattr(storage, "read_bytes", None)
@@ -46,7 +50,10 @@ def _binary_copy_if_possible(storage, src_path: str, dst_path: str) -> bool:
             storage.write_bytes(dst_path, read_bytes(src_path))
             return True
         except Exception as e:
-            logger.warning(f"[mirror] byte copy failed ({src_path} -> {dst_path}): {e}")
+            logger.warning(
+                "[mirror][parquet] byte copy failed; error_type=%s",
+                mirror_error_type(e),
+            )
 
     return False
 
@@ -100,7 +107,7 @@ def _co_locate_or_reuse_path(storage, table_files_dir: str, catalog_file_path: s
             pass
     ok = _binary_copy_if_possible(storage, catalog_file_path, dst_path)
     if not ok:
-        raise RuntimeError(f"Failed to copy data file into Parquet table dir: {catalog_file_path}")
+        raise RuntimeError("Failed to copy data file into Parquet table dir")
     return rel_path
 
 
@@ -134,9 +141,7 @@ def write_parquet_table(super_table, table_name: str, simple_snapshot: Dict[str,
         source_size, source_digest = super_table.storage.content_sha256(src_file)
         declared_size = int(r.get("file_size") or 0)
         if declared_size and source_size != declared_size:
-            raise RuntimeError(
-                f"Parquet mirror source size changed: {src_file!r}"
-            )
+            raise RuntimeError("Parquet mirror source size changed")
         try:
             mirror_size, mirror_digest = (
                 super_table.storage.content_sha256(destination)
@@ -149,16 +154,12 @@ def write_parquet_table(super_table, table_name: str, simple_snapshot: Dict[str,
             if not _binary_copy_if_possible(
                 super_table.storage, src_file, destination,
             ):
-                raise RuntimeError(
-                    f"Failed to repair Parquet mirror file: {src_file!r}"
-                )
+                raise RuntimeError("Failed to repair Parquet mirror file")
             mirror_size, mirror_digest = (
                 super_table.storage.content_sha256(destination)
             )
         if mirror_size != source_size or mirror_digest != source_digest:
-            raise RuntimeError(
-                f"Parquet mirror copy failed its content seal: {src_file!r}"
-            )
+            raise RuntimeError("Parquet mirror copy failed its content seal")
         current_paths.append(used_rel_path)
 
     current_set = set(current_paths)
@@ -193,7 +194,7 @@ def write_parquet_table(super_table, table_name: str, simple_snapshot: Dict[str,
             and super_table.storage.exists(abs_path)
         ):
             raise RuntimeError(
-                f"Obsolete Parquet mirror file is still visible after delete: {abs_path}"
+                "Obsolete Parquet mirror file is still visible after delete"
             )
 
     # Some storage adapters expose ``delete`` without ``exists`` and may
@@ -207,8 +208,8 @@ def write_parquet_table(super_table, table_name: str, simple_snapshot: Dict[str,
     )
     if remaining_obsolete:
         raise RuntimeError(
-            "Obsolete Parquet mirror files remain visible after delete: "
-            f"{sorted(remaining_obsolete)!r}"
+            "Obsolete Parquet mirror files remain visible after delete; "
+            f"file_count={len(remaining_obsolete)}"
         )
 
     logger.info(
@@ -239,8 +240,8 @@ def verify_parquet_table(
     actual = _list_co_located_paths(super_table.storage, files_dir)
     if actual != expected:
         raise RuntimeError(
-            "Parquet mirror does not match the committed snapshot: "
-            f"actual={sorted(actual)!r}, expected={sorted(expected)!r}"
+            "Parquet mirror does not match the committed snapshot; "
+            f"actual_count={len(actual)}; expected_count={len(expected)}"
         )
     base = os.path.dirname(files_dir)
     for relative, resource in source_by_relative.items():
@@ -256,6 +257,5 @@ def verify_parquet_table(
             or mirror_digest != source_digest
         ):
             raise RuntimeError(
-                f"Parquet mirrored artifact failed its content seal: "
-                f"{relative!r}"
+                "Parquet mirrored artifact failed its content seal"
             )

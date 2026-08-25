@@ -7,6 +7,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.triggers.cron import CronTrigger
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 
 class CronValidationError(ValueError):
@@ -30,16 +31,15 @@ class CronSchedule:
         timezone_name = timezone_name.strip()
         try:
             tz = ZoneInfo(timezone_name)
-        except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise CronValidationError(
-                f"unknown IANA timezone {timezone_name!r}"
-            ) from exc
+        except (ZoneInfoNotFoundError, ValueError):
+            raise CronValidationError("unknown IANA timezone") from None
         try:
             trigger = CronTrigger.from_crontab(expression, timezone=tz)
         except (TypeError, ValueError) as exc:
             raise CronValidationError(
-                f"invalid five-field cron expression {expression!r}: {exc}"
-            ) from exc
+                "invalid five-field cron expression; "
+                f"error_type={safe_exception_type(exc)}"
+            ) from None
         return cls(expression, timezone_name, tz, trigger)
 
     def next_after_ms(self, epoch_ms: int) -> int:
@@ -53,8 +53,10 @@ class CronSchedule:
 
         try:
             value = int(epoch_ms)
-        except (TypeError, ValueError) as exc:
-            raise CronValidationError("cron base time must be epoch milliseconds") from exc
+        except (TypeError, ValueError):
+            raise CronValidationError(
+                "cron base time must be epoch milliseconds"
+            ) from None
         base = datetime.fromtimestamp(value / 1000.0, tz=self.timezone)
         next_fire = self.trigger.get_next_fire_time(None, base)
         if next_fire is None:

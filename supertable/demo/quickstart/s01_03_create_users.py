@@ -7,6 +7,7 @@ through ``UserManager.get_or_create_default_user``.
 from supertable.config.defaults import logger
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 from supertable.demo.quickstart.defaults import super_name, organization
 
@@ -57,8 +58,10 @@ logger.info(f"charlie state: {user_manager.get_user(charlie_id)}")
 try:
     user_manager.delete_user(bob_id)
     logger.info(f"bob deleted: {bob_id}")
-except Exception as e:
-    logger.error(f"bob delete failed: {e}")
+except Exception as exc:
+    logger.error(
+        "bob delete failed; error_type=%s", safe_exception_type(exc),
+    )
 
 # Final listing
 for user in user_manager.list_users():

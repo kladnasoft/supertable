@@ -57,8 +57,8 @@ def _endpoint(value: object) -> str:
     try:
         parsed = urlparse(value)
         port = parsed.port
-    except ValueError as exc:
-        raise ValueError("Spark s3_endpoint must be a valid HTTP(S) endpoint") from exc
+    except ValueError:
+        raise ValueError("Spark s3_endpoint must be a valid HTTP(S) endpoint") from None
     if (
         parsed.scheme.casefold() not in {"http", "https"}
         or not parsed.hostname

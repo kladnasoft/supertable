@@ -749,3 +749,131 @@ def test_auto_materialized_stop_is_not_replayed_on_duckdb(
         stat.get("ENGINE_ATTEMPT", {}).get("engine") == Engine.DUCKDB.value
         for stat in plan_stats.stats
     )
+
+
+def test_materialized_duckdb_receives_caller_cancellation(monkeypatch):
+    executor = executor_module.Executor()
+    executor._file_cache = False
+    executor.duckdb_exec = MagicMock()
+    executor.duckdb_exec.cache_state.return_value = {}
+    executor.duckdb_exec.execute.return_value = MagicMock()
+    monkeypatch.setattr(
+        executor_module,
+        "resolve_engine_bundle",
+        lambda *_args: ({"duckdb": MagicMock()}, ()),
+    )
+    monkeypatch.setattr(executor, "_get_catalog", lambda: None)
+    cancelled = threading.Event()
+
+    executor.execute(
+        Engine.DUCKDB,
+        _reflection("/tmp/events.parquet"),
+        MagicMock(original_query="SELECT id FROM events"),
+        SimpleNamespace(temp_dir="/tmp", query_plan_path="/tmp/plan.json"),
+        MagicMock(),
+        PlanStats(),
+        "test",
+        deadline_monotonic=time.monotonic() + 10,
+        cancel_event=cancelled,
+    )
+
+    assert executor.duckdb_exec.execute.call_args.kwargs["cancel_event"] is cancelled
+
+
+def test_materialized_island_receives_caller_cancellation(monkeypatch):
+    executor = executor_module.Executor()
+    executor._file_cache = False
+    executor.island_exec = MagicMock()
+    executor.island_exec.prepare_execution.return_value = SimpleNamespace(
+        capability=SimpleNamespace(supported=True, reasons=()),
+    )
+    executor.island_exec.execute.return_value = MagicMock()
+    monkeypatch.setattr(
+        executor_module,
+        "resolve_engine_bundle",
+        lambda *_args: ({"duckdb": MagicMock()}, ()),
+    )
+    monkeypatch.setattr(executor, "_get_catalog", lambda: None)
+    cancelled = threading.Event()
+
+    executor.execute(
+        Engine.ISLANDDB,
+        _reflection("/tmp/events.parquet"),
+        MagicMock(original_query="SELECT id FROM events"),
+        SimpleNamespace(temp_dir="/tmp", query_plan_path="/tmp/plan.json"),
+        MagicMock(),
+        PlanStats(),
+        "test",
+        deadline_monotonic=time.monotonic() + 10,
+        cancel_event=cancelled,
+    )
+
+    assert executor.island_exec.execute.call_args.kwargs["cancel_event"] is cancelled
+
+
+def test_engine_config_resolution_is_inside_absolute_deadline(monkeypatch):
+    executor = executor_module.Executor()
+    executor._file_cache = False
+    executor.duckdb_exec = MagicMock()
+    started = threading.Event()
+
+    def blocking_resolver(*_args):
+        started.set()
+        time.sleep(0.3)
+        return {"duckdb": MagicMock()}, ()
+
+    monkeypatch.setattr(
+        executor_module, "resolve_engine_bundle", blocking_resolver,
+    )
+    monkeypatch.setattr(executor, "_get_catalog", lambda: None)
+    before = time.monotonic()
+    with pytest.raises(TimeoutError, match="deadline"):
+        executor.execute(
+            Engine.DUCKDB,
+            _reflection("/tmp/events.parquet"),
+            MagicMock(original_query="SELECT id FROM events"),
+            SimpleNamespace(temp_dir="/tmp", query_plan_path="/tmp/plan.json"),
+            MagicMock(),
+            PlanStats(),
+            "test",
+            deadline_monotonic=before + 0.05,
+        )
+    assert started.is_set()
+    assert time.monotonic() - before < 0.2
+    executor.duckdb_exec.execute.assert_not_called()
+
+
+def test_auto_fleet_discovery_is_inside_absolute_deadline(monkeypatch):
+    executor = executor_module.Executor()
+    executor._file_cache = False
+    executor.duckdb_exec = MagicMock()
+    catalog = MagicMock()
+    started = threading.Event()
+
+    def blocking_fleet(_organization):
+        started.set()
+        time.sleep(0.3)
+        return []
+
+    catalog.list_spark_clusters.side_effect = blocking_fleet
+    monkeypatch.setattr(executor, "_get_catalog", lambda: catalog)
+    monkeypatch.setattr(
+        executor_module,
+        "resolve_engine_bundle",
+        lambda *_args: ({"duckdb": MagicMock()}, ()),
+    )
+    before = time.monotonic()
+    with pytest.raises(TimeoutError, match="deadline"):
+        executor.execute(
+            Engine.AUTO,
+            _reflection("/tmp/events.parquet"),
+            MagicMock(original_query="SELECT id FROM events"),
+            SimpleNamespace(temp_dir="/tmp", query_plan_path="/tmp/plan.json"),
+            MagicMock(),
+            PlanStats(),
+            "test",
+            deadline_monotonic=before + 0.05,
+        )
+    assert started.is_set()
+    assert time.monotonic() - before < 0.2
+    executor.duckdb_exec.execute.assert_not_called()

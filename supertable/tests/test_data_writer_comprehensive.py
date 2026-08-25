@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -26,6 +27,8 @@ from unittest.mock import MagicMock, PropertyMock, call, patch
 import pyarrow as pa
 import polars as pl
 import pytest
+
+from supertable.mirroring.failure_safety import mirror_error_type
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +126,7 @@ class FakeCatalog:
         self.set_leaf_payload_cas_calls: list = []
         self.set_leaf_path_cas_calls: list = []
         self.release_calls: list = []
+        self.commit_snapshot_authority_generations: list = []
         self.leaf_payload_cas_should_fail: bool = False
 
     def reserve_rowids(self, org, sup, simple, count) -> int:
@@ -175,11 +179,15 @@ class FakeCatalog:
             expected_path, lock_token, commit_id=None,
             mirror_publication=False, expected_mirrors=None, now_ms=None,
             one_shot_initial=False,
+            expected_write_authority_generation=None,
     ):
         """Test-double implementation of the production atomic primitive."""
         key = f"{org}:{sup}:{simple}"
         if self._locks.get(key) != lock_token:
             raise RuntimeError("lost lock")
+        self.commit_snapshot_authority_generations.append(
+            expected_write_authority_generation
+        )
         # Individual tests exercise the writer orchestration with a mocked
         # SimpleTable snapshot. Preserve their call tracking while exposing the
         # required fenced API; production Redis atomicity is covered separately.
@@ -221,7 +229,7 @@ class FakeCatalog:
         assert self._mirror_publication["commit_id"] == commit_id
         self._mirror_publication.update({
             "status": "failed", "failure_stage": failure_stage,
-            "error": {"type": type(error).__name__, "message": str(error)},
+            "error": {"type": mirror_error_type(error)},
         })
         self.mirror_state_events.append("failed")
         return dict(self._mirror_publication)
@@ -911,6 +919,24 @@ class TestWriteAppend:
         writer.write("admin", "t1", data, overwrite_columns=[])
         assert len(fake_catalog.set_leaf_payload_cas_calls) == 1
 
+    def test_audit_encryption_failure_is_explicit_after_snapshot_commit(
+        self, writer, fake_catalog,
+    ):
+        from supertable.audit import AuditEncryptionError
+
+        failure = AuditEncryptionError("configured encryption unavailable")
+        with patch(
+            "supertable.data_writer._audit_emit", side_effect=failure,
+        ):
+            with pytest.raises(AuditEncryptionError) as raised:
+                writer.write(
+                    "admin", "t1", _simple_arrow(3), overwrite_columns=[],
+                )
+
+        assert raised.value is failure
+        assert fake_catalog.set_leaf_payload_cas_calls
+        assert fake_catalog.release_calls
+
     def test_monitoring_enqueued(self, writer):
         data = _simple_arrow(3)
         writer.write("admin", "t1", data, overwrite_columns=[])
@@ -1359,6 +1385,120 @@ class TestWriteNewerThan:
 
 class TestWriteLocking:
 
+    def test_stable_authority_generation_reuses_one_full_policy_check(
+        self, writer, fake_catalog, monkeypatch,
+    ):
+        samples: list[object] = []
+        validations: list[object] = []
+
+        def sample(_catalog, organization, super_name):
+            assert (organization, super_name) == ("testorg", "testsuper")
+            generation = ("stable", len(samples))
+            samples.append(generation)
+            return generation
+
+        def validate(_catalog, organization, super_name, generation):
+            assert (organization, super_name) == ("testorg", "testsuper")
+            validations.append(generation)
+            return True
+
+        monkeypatch.setattr(
+            type(fake_catalog), "sample_write_authority_generation",
+            sample, raising=False,
+        )
+        monkeypatch.setattr(
+            type(fake_catalog), "validate_write_authority_generation",
+            validate, raising=False,
+        )
+        callback_calls = 0
+
+        def authorize() -> str:
+            nonlocal callback_calls
+            callback_calls += 1
+            return "admin"
+
+        with (
+            patch("supertable.data_writer.check_create_access") as create,
+            patch("supertable.data_writer.check_write_access") as write,
+        ):
+            writer.write(
+                "admin",
+                "t1",
+                _simple_arrow(1),
+                overwrite_columns=[],
+                authorization_callback=authorize,
+            )
+
+        assert callback_calls == 3
+        assert create.call_count == 1
+        write.assert_not_called()
+        assert len(samples) == 1
+        # One validation brackets the full check, then the lock and exact
+        # publication boundaries each atomically revalidate that same proof.
+        assert validations == [samples[0], samples[0], samples[0]]
+        assert fake_catalog.commit_snapshot_authority_generations == [samples[0]]
+
+    def test_authority_change_during_full_check_forces_complete_retry(
+        self, writer, fake_catalog, monkeypatch,
+    ):
+        events: list[str] = []
+        generation_counter = 0
+
+        def sample(_catalog, _organization, _super_name):
+            nonlocal generation_counter
+            generation_counter += 1
+            events.append(f"sample:{generation_counter}")
+            return generation_counter
+
+        validation_results = iter((False, True, True, True))
+
+        def validate(_catalog, _organization, _super_name, generation):
+            events.append(f"validate:{generation}")
+            return next(validation_results)
+
+        monkeypatch.setattr(
+            type(fake_catalog), "sample_write_authority_generation",
+            sample, raising=False,
+        )
+        monkeypatch.setattr(
+            type(fake_catalog), "validate_write_authority_generation",
+            validate, raising=False,
+        )
+
+        with patch(
+            "supertable.data_writer.check_create_access",
+            side_effect=lambda **_kwargs: events.append("full-check"),
+        ) as create:
+            writer.write("admin", "t1", _simple_arrow(1), overwrite_columns=[])
+
+        assert create.call_count == 2
+        assert events[:6] == [
+            "sample:1", "full-check", "validate:1",
+            "sample:2", "full-check", "validate:2",
+        ]
+
+    def test_continuous_authority_churn_fails_before_table_lock(
+        self, writer, fake_catalog, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            type(fake_catalog), "sample_write_authority_generation",
+            lambda *_args: object(), raising=False,
+        )
+        monkeypatch.setattr(
+            type(fake_catalog), "validate_write_authority_generation",
+            lambda *_args: False, raising=False,
+        )
+
+        with patch("supertable.data_writer.check_create_access") as create:
+            with pytest.raises(PermissionError, match="changed continuously"):
+                writer.write(
+                    "admin", "t1", _simple_arrow(1), overwrite_columns=[],
+                )
+
+        assert create.call_count == 3
+        assert fake_catalog._locks == {}
+        writer._mocks["process"].assert_not_called()
+
     def test_authorization_callback_fences_lock_and_publication(
         self, writer, fake_catalog,
     ):
@@ -1479,36 +1619,53 @@ class TestWriteMirroring:
         assert fake_catalog.release_calls
 
     def test_outbox_completion_failure_is_reported_as_post_commit_ambiguity(
-        self, writer, fake_catalog,
+        self, writer, fake_catalog, caplog,
     ):
         from supertable.mirroring.mirror_formats import MirrorPublicationError
 
+        secret = (
+            "MIRROR_COMPLETE_SECRET_37e4 "
+            "https://bucket.invalid/object?sig=BEARER_TOKEN"
+        )
         fake_catalog._mirrors = ["PARQUET"]
+        cause = OSError(secret)
         fake_catalog.complete_mirror_publication = MagicMock(
-            side_effect=OSError("completion reply lost")
+            side_effect=cause
         )
 
         with pytest.raises(MirrorPublicationError) as raised:
             writer.write("admin", "t1", _simple_arrow(3), overwrite_columns=[])
 
         assert raised.value.core_committed is True
-        assert isinstance(raised.value.cause, OSError)
+        assert raised.value.cause is cause
+        assert secret not in str(raised.value)
+        assert secret not in caplog.text
         assert fake_catalog.set_leaf_payload_cas_calls
         assert fake_catalog._mirror_publication["status"] == "failed"
         assert fake_catalog._mirror_publication["failure_stage"] == "outbox_complete"
+        assert fake_catalog._mirror_publication["error"] == {"type": "OSError"}
+        assert secret not in json.dumps(fake_catalog._mirror_publication)
         assert fake_catalog.release_calls
 
     def test_mirror_failure_reports_core_commit_explicitly(
-        self, writer, fake_catalog,
+        self, writer, fake_catalog, caplog,
     ):
         """A failed mirror raises only after the core snapshot is committed."""
         from supertable.mirroring.mirror_formats import MirrorPublicationError
 
+        secret = (
+            "MIRROR_WRITER_SECRET_052a "
+            "https://bucket.invalid/object?X-Amz-Signature=BEARER_TOKEN"
+        )
         fake_catalog._mirrors = ["PARQUET"]
         mock_mirror = writer._mocks["mirror"]
-        mock_mirror.mirror_if_enabled.side_effect = Exception("mirror failed")
+        cause = OSError(secret)
+        mock_mirror.mirror_if_enabled.side_effect = cause
 
-        with patch("supertable.data_writer.MirrorFormats", mock_mirror):
+        with (
+            patch("supertable.data_writer.MirrorFormats", mock_mirror),
+            patch("supertable.data_writer._audit_emit") as audit_emit,
+        ):
             data = _simple_arrow(3)
             with pytest.raises(MirrorPublicationError) as raised:
                 writer.write("admin", "t1", data, overwrite_columns=[])
@@ -1519,11 +1676,18 @@ class TestWriteMirroring:
         assert error.snapshot_path.endswith("snapshots/new.json")
         assert error.mirrors == ("PARQUET",)
         assert "do not blindly retry" in str(error)
+        assert error.cause is cause
+        assert secret not in str(error)
+        assert secret not in caplog.text
         assert fake_catalog.set_leaf_payload_cas_calls
         assert fake_catalog.release_calls
         assert fake_catalog._mirror_publication["status"] == "failed"
         assert fake_catalog._mirror_publication["core_committed"] is True
-        assert fake_catalog._mirror_publication["error"]["message"] == "mirror failed"
+        assert fake_catalog._mirror_publication["failure_stage"] == "mirror"
+        assert fake_catalog._mirror_publication["error"] == {"type": "OSError"}
+        assert secret not in json.dumps(fake_catalog._mirror_publication)
+        assert secret not in json.dumps(writer._mocks["monitor"].metrics)
+        assert secret not in repr(audit_emit.call_args_list)
         assert fake_catalog.mirror_state_events == [
             "prepared", "core_committed", "failed",
         ]
@@ -1591,9 +1755,13 @@ class TestWriteMonitoring:
             MonitoringPostCommitError,
         )
 
+        secret = (
+            "/private/spool/TOP-SECRET "
+            "https://host/capability/TOP-SECRET?sig=sentinel"
+        )
         monitor = writer._mocks["monitor"]
         monitor.log_metric = MagicMock(
-            side_effect=MonitoringBackpressureError("spool full")
+            side_effect=MonitoringBackpressureError(secret)
         )
         with patch("supertable.data_writer.MonitoringWriter") as monitor_cls:
             monitor_cls.return_value.__enter__.return_value = monitor
@@ -1605,6 +1773,14 @@ class TestWriteMonitoring:
         assert raised.value.core_committed is True
         assert raised.value.core_result is not None
         assert raised.value.operation == "write"
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+        assert secret not in str(raised.value)
+        assert secret not in str(raised.value.cause)
+        rendered = "".join(traceback.format_exception(
+            type(raised.value), raised.value, raised.value.__traceback__,
+        ))
+        assert secret not in rendered
 
     def test_monitoring_backpressure_preserves_mirror_recovery_error(
         self, writer, fake_catalog,

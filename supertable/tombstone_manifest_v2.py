@@ -117,7 +117,7 @@ def _strict_identity(value: object, *, field_name: str) -> str:
     except (TypeError, ValueError) as exc:
         raise TombstoneManifestV2Error(
             f"{field_name} is not a canonical table identifier"
-        ) from exc
+        ) from None
     return value
 
 
@@ -143,7 +143,7 @@ def validate_logical_storage_path(
     except UnicodeEncodeError as exc:
         raise TombstoneManifestV2Error(
             f"{field_name} is not valid UTF-8"
-        ) from exc
+        ) from None
     if len(encoded) > MAX_TOMBSTONE_SEGMENT_PATH_BYTES:
         raise TombstoneManifestV2Error(f"{field_name} is too long")
     if value != value.strip() or "\\" in value:
@@ -162,7 +162,7 @@ def validate_logical_storage_path(
         # cannot accidentally treat parser-specific exceptions differently.
         raise TombstoneManifestV2Error(
             f"{field_name} is not a valid logical storage path"
-        ) from exc
+        ) from None
     if split.scheme or split.netloc or split.query or split.fragment:
         raise TombstoneManifestV2Error(
             f"{field_name} must not be a URI or carry URL parameters"
@@ -472,7 +472,7 @@ def canonical_tombstone_manifest_v2_bytes(value: Mapping[str, Any]) -> bytes:
     except (TypeError, ValueError, OverflowError, UnicodeEncodeError) as exc:
         raise TombstoneManifestV2Error(
             "manifest is not canonical JSON data"
-        ) from exc
+        ) from None
     if len(encoded) > MAX_TOMBSTONE_MANIFEST_V2_BYTES:
         raise TombstoneManifestV2Error("canonical manifest is too large")
     return encoded
@@ -502,7 +502,7 @@ def _decode_manifest(raw: _RawManifest) -> tuple[Mapping[str, Any], Optional[byt
         try:
             encoded = raw.encode("utf-8")
         except UnicodeEncodeError as exc:
-            raise TombstoneManifestV2Error("manifest JSON is not valid UTF-8") from exc
+            raise TombstoneManifestV2Error("manifest JSON is not valid UTF-8") from None
     elif isinstance(raw, (bytes, bytearray, memoryview)):
         encoded = bytes(raw)
     else:
@@ -514,7 +514,7 @@ def _decode_manifest(raw: _RawManifest) -> tuple[Mapping[str, Any], Optional[byt
     try:
         text = encoded.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise TombstoneManifestV2Error("manifest JSON is not valid UTF-8") from exc
+        raise TombstoneManifestV2Error("manifest JSON is not valid UTF-8") from None
     try:
         decoded = json.loads(
             text,
@@ -524,7 +524,7 @@ def _decode_manifest(raw: _RawManifest) -> tuple[Mapping[str, Any], Optional[byt
     except TombstoneManifestV2Error:
         raise
     except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as exc:
-        raise TombstoneManifestV2Error("manifest is not valid JSON") from exc
+        raise TombstoneManifestV2Error("manifest is not valid JSON") from None
     if not isinstance(decoded, Mapping):
         raise TombstoneManifestV2Error("manifest JSON root must be an object")
     return decoded, encoded

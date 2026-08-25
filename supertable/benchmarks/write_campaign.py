@@ -45,6 +45,7 @@ from supertable.engine.benchmarks.container_runner import (
     _tree_footprint,
     _write_text,
 )
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 
 FORMAT_VERSION = 1
@@ -443,7 +444,10 @@ def _read_result(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return None, f"{type(exc).__name__}: {exc}"
+        return None, (
+            "result artifact is unavailable; "
+            f"error_type={safe_exception_type(exc)}"
+        )
     if not isinstance(loaded, dict):
         return None, "result root is not a JSON object"
     return loaded, None
@@ -559,7 +563,10 @@ def _execute_attempt(
                 stdout, stderr = process.communicate()
         returncode = process.returncode
     except OSError as exc:
-        launch_error = f"{type(exc).__name__}: {exc}"
+        launch_error = (
+            "campaign launch failed; "
+            f"error_type={safe_exception_type(exc)}"
+        )
     finally:
         if sampler_started:
             sampler.stop()
@@ -593,7 +600,10 @@ def _execute_attempt(
         try:
             cleanup = _cleanup_generated_work(attempt_root, attempt_root / "work")
         except (OSError, WriteCampaignError) as exc:
-            errors.append(f"work cleanup failed: {type(exc).__name__}: {exc}")
+            errors.append(
+                "work cleanup failed; "
+                f"error_type={safe_exception_type(exc)}"
+            )
 
     status = "passed" if not errors else "failed"
     artifact = {
@@ -726,10 +736,10 @@ def _summarize_attempts(attempts: Sequence[Mapping[str, Any]]) -> dict[str, Any]
 def _validate_existing_manifest(path: Path, workload: TombstoneWorkload) -> dict[str, Any]:
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError):
         raise WriteCampaignConfigurationError(
-            f"cannot read existing corpus manifest {path}: {exc}"
-        ) from exc
+            "cannot read existing corpus manifest"
+        ) from None
     if not isinstance(manifest, dict):
         raise WriteCampaignConfigurationError("corpus manifest root is not an object")
     if manifest.get("format") != "supertable-tombstone-corpus-v1":

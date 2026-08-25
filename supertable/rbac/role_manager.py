@@ -72,14 +72,14 @@ class RoleManager:
                         "role_name": "superadmin",
                         "tables": {"*": {"columns": ["*"], "filters": ["*"]}},
                     }
-                    role_id = self.create_role(
+                    self.create_role(
                         sysadmin_data,
                         action_context=PrivilegedActionContext.system(
                             "Create the bootstrap superadmin role",
                             cause="rbac_bootstrap",
                         ),
                     )
-                    logger.info(f"Default superadmin role created: {role_id}")
+                    logger.info("Default superadmin role created")
             finally:
                 if lock_token:
                     self._catalog.release_simple_lock(
@@ -261,7 +261,7 @@ class RoleManager:
                 ):
                     return winner_id
             raise
-        logger.debug(f"Role created: {role_id} ({rcs.role.value})")
+        logger.debug("Role created")
         return role_id
 
     @audit_rbac_manager_rejections(
@@ -375,8 +375,9 @@ class RoleManager:
             update_fields,
             action_context=action_context,
         )
-        logger.debug(f"Role updated: {role_id}")
+        logger.debug("Role updated")
 
+        assert rcs.content_hash is not None
         return rcs.content_hash
 
     @audit_rbac_manager_rejections(
@@ -402,7 +403,7 @@ class RoleManager:
             action_context=action_context,
         )
         if result:
-            logger.debug(f"Role deleted: {role_id}")
+            logger.debug("Role deleted")
         return result
 
     def get_role(self, role_id: str) -> Dict:

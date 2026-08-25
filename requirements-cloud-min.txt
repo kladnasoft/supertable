@@ -1,0 +1,10 @@
+# Exact lower bounds for every optional production storage adapter.
+# The release workflow installs this beside requirements-min.txt so provider
+# precondition and sealed-read contracts cannot silently require a newer SDK.
+# botocore 1.35.2 is the first model containing PutObject.IfNoneMatch.
+boto3==1.35.2
+botocore==1.35.2
+minio==7.2.0
+azure-storage-blob==12.26.0
+azure-identity==1.17.0
+google-cloud-storage==3.1.0

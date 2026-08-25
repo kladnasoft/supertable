@@ -7,12 +7,12 @@ import json
 import os
 import platform
 import sys
-import traceback
 from pathlib import Path
 from typing import Any, Sequence
 
 from .container_runner import _cgroup_v2_extended_telemetry
 from .runner import run_engine_series_in_process
+from supertable.utils.diagnostic_redaction import safe_exception_type
 
 
 DEPENDENCY_DISTRIBUTIONS = (
@@ -41,7 +41,9 @@ def runtime_provenance() -> dict[str, Any]:
         module_path = str(Path(supertable.__file__).resolve())
     except Exception as exc:  # pragma: no cover - runner import already loads it
         module_version = None
-        module_path = f"unavailable:{type(exc).__name__}:{exc}"
+        module_path = (
+            "unavailable; error_type=" + safe_exception_type(exc)
+        )
     affinity = (
         sorted(int(cpu) for cpu in os.sched_getaffinity(0))
         if hasattr(os, "sched_getaffinity")
@@ -81,8 +83,11 @@ def worker_main(request_path: str | Path, response_path: str | Path) -> int:
     except Exception as exc:  # noqa: BLE001 - preserve complete worker failure
         response = {
             "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "traceback": traceback.format_exc(),
+            "error": (
+                "container worker failed; "
+                f"error_type={safe_exception_type(exc)}"
+            ),
+            "traceback": "redacted",
             "worker_provenance": {
                 "before": before,
                 "after": runtime_provenance(),

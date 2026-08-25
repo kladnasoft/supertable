@@ -24,6 +24,7 @@ from supertable.storage.storage_interface import (
     StorageInterface,
     normalize_sha256_checksum,
     read_exact_range_body,
+    storage_error_type,
     validate_range_request,
     write_all,
 )
@@ -52,7 +53,7 @@ class MinioStorage(StorageInterface):
     def _build_client(endpoint: str, access_key: str, secret_key: str, region: Optional[str]) -> Minio:
         parsed = urlparse(endpoint)
         if parsed.scheme not in ("http", "https"):
-            raise ValueError(f"Unsupported scheme in STORAGE_ENDPOINT_URL: {endpoint}")
+            raise ValueError("Unsupported scheme in STORAGE_ENDPOINT_URL")
         secure = parsed.scheme == "https"
         host = parsed.netloc or parsed.path  # tolerate "localhost:9000"
         return Minio(
@@ -226,16 +227,16 @@ class MinioStorage(StorageInterface):
             data = self._get_object_safe(path)
         except S3Error as e:
             if e.code in ("NoSuchKey", "NotFound"):
-                raise FileNotFoundError(f"File not found: {path}") from e
+                raise FileNotFoundError("File not found") from None
             raise
 
         if len(data) == 0:
-            raise ValueError(f"File is empty: {path}")
+            raise ValueError("File is empty")
 
         try:
             return json.loads(data)
-        except json.JSONDecodeError as je:
-            raise ValueError(f"Invalid JSON in {path}") from je
+        except json.JSONDecodeError:
+            raise ValueError("Invalid JSON") from None
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
         path = self._with_base(path)
@@ -261,7 +262,7 @@ class MinioStorage(StorageInterface):
             return stat.size
         except S3Error as e:
             if e.code in ("NoSuchKey", "NotFound"):
-                raise FileNotFoundError(f"File not found: {path}") from e
+                raise FileNotFoundError("File not found") from None
             raise
 
     @staticmethod
@@ -299,7 +300,7 @@ class MinioStorage(StorageInterface):
             )
         except S3Error as e:
             if e.code in ("NoSuchKey", "NotFound", "NoSuchVersion"):
-                raise FileNotFoundError(f"File not found: {path}") from e
+                raise FileNotFoundError("File not found") from None
             raise
 
     def download_to_file(
@@ -324,7 +325,7 @@ class MinioStorage(StorageInterface):
             response = self.client.get_object(self.bucket_name, path, **request)
         except S3Error as e:
             if e.code in ("NoSuchKey", "NotFound", "NoSuchVersion"):
-                raise FileNotFoundError(f"File not found: {path}") from e
+                raise FileNotFoundError("File not found") from None
             raise
 
         written = 0
@@ -341,7 +342,7 @@ class MinioStorage(StorageInterface):
                 response.release_conn()
         if expected is not None and written != expected.size:
             raise OSError(
-                f"Short download for {path}: expected {expected.size} bytes, wrote {written}"
+                f"Short download: expected {expected.size} bytes, wrote {written}"
             )
         return written
 
@@ -371,9 +372,9 @@ class MinioStorage(StorageInterface):
             response = self.client.get_object(self.bucket_name, path, **request)
         except S3Error as exc:
             if exc.code in ("PreconditionFailed", "NoSuchVersion"):
-                raise ObjectIdentityMismatch(f"Object version changed: {path}") from exc
+                raise ObjectIdentityMismatch("Object version changed") from None
             if exc.code in ("NoSuchKey", "NotFound"):
-                raise FileNotFoundError(f"File not found: {path}") from exc
+                raise FileNotFoundError("File not found") from None
             raise
         try:
             payload = read_exact_range_body(response, length)
@@ -433,7 +434,7 @@ class MinioStorage(StorageInterface):
         obj_iter = iter(self._list_objects(prefix, recursive=True))
         first = next(obj_iter, None)
         if first is None:
-            raise FileNotFoundError(f"File or folder not found: {path}")
+            raise FileNotFoundError("File or folder not found")
         import itertools
         objects = itertools.chain((first,), obj_iter)
         errors = list(self.client.remove_objects(
@@ -445,8 +446,8 @@ class MinioStorage(StorageInterface):
         ))
         if errors:
             raise RuntimeError(
-                f"Failed to delete {len(errors)} object(s) under {path}: "
-                f"{getattr(errors[0], 'message', errors[0])}"
+                "MinIO prefix deletion failed; "
+                f"failures={len(errors)}"
             )
         self.delete_prefix(logical)
 
@@ -462,7 +463,11 @@ class MinioStorage(StorageInterface):
         previous_batch = None
         stagnant = 0
         prior_errors = []
+        attempts = 0
         while True:
+            attempts += 1
+            if attempts > 32:
+                raise OSError("MinIO prefix deletion exceeded retry bound")
             objects = list(itertools.islice(
                 self._list_objects(prefix, recursive=True), 1000,
             ))
@@ -472,10 +477,9 @@ class MinioStorage(StorageInterface):
                 # subsequently return an exhausted/empty iterator; that must
                 # not turn the failed delete into a false success.
                 if prior_errors:
-                    first = prior_errors[0]
                     raise RuntimeError(
-                        f"Failed to delete {len(prior_errors)} object(s) under "
-                        f"{path}: {getattr(first, 'message', first)}"
+                        "MinIO prefix deletion failed; "
+                        f"failures={len(prior_errors)}"
                     )
                 return
             names = tuple(obj.object_name for obj in objects)
@@ -491,15 +495,11 @@ class MinioStorage(StorageInterface):
             previous_batch = names
             if stagnant >= 3:
                 if prior_errors:
-                    first = prior_errors[0]
                     raise RuntimeError(
-                        f"Failed to delete {len(prior_errors)} object(s) under "
-                        f"{path}: {getattr(first, 'message', first)}"
+                        "MinIO prefix deletion failed; "
+                        f"failures={len(prior_errors)}"
                     )
-                raise OSError(
-                    f"MinIO prefix made no deletion progress: {path!r}; "
-                    f"remaining={names[0]!r}"
-                )
+                raise OSError("MinIO prefix deletion made no progress")
 
     # ---------- directory structure ----------
 
@@ -544,7 +544,7 @@ class MinioStorage(StorageInterface):
             data = self._get_object_safe(path)
         except S3Error as e:
             if e.code in ("NoSuchKey", "NotFound"):
-                raise FileNotFoundError(f"Parquet file not found: {path}") from e
+                raise FileNotFoundError("Parquet file not found") from None
             raise
         try:
             buf = io.BytesIO(data)
@@ -554,7 +554,9 @@ class MinioStorage(StorageInterface):
                 buf.seek(0)
             return pq.read_table(buf, columns=proj)
         except Exception as e:
-            raise RuntimeError(f"Failed to read Parquet at '{path}': {e}")
+            raise RuntimeError(
+                f"Failed to read Parquet; error_type={storage_error_type(e)}"
+            ) from None
 
     # ---------- bytes / text / copy ----------
 
@@ -569,13 +571,39 @@ class MinioStorage(StorageInterface):
             content_type="application/octet-stream",
         )
 
+    def create_bytes_if_absent(self, path: str, data: bytes) -> bool:
+        """Issue one S3 conditional PUT through MinIO's signed request path."""
+        path = self._with_base(path)
+        try:
+            self.client._execute(
+                "PUT",
+                self.bucket_name,
+                path,
+                body=data,
+                headers={
+                    "Content-Length": str(len(data)),
+                    "Content-Type": "application/octet-stream",
+                    "If-None-Match": "*",
+                },
+                no_body_trace=True,
+            )
+        except S3Error as exc:
+            status = getattr(getattr(exc, "response", None), "status", None)
+            if (
+                str(getattr(exc, "code", "")) == "PreconditionFailed"
+                or status == 412
+            ):
+                return False
+            raise
+        return True
+
     def read_bytes(self, path: str) -> bytes:
         path = self._with_base(path)
         try:
             return self._get_object_safe(path)
         except S3Error as e:
             if e.code in ("NoSuchKey", "NotFound"):
-                raise FileNotFoundError(f"File not found: {path}") from e
+                raise FileNotFoundError("File not found") from None
             raise
 
     def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None:

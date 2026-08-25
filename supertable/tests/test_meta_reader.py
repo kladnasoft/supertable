@@ -23,8 +23,10 @@ Covers:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
+import traceback
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch, call
 
@@ -370,8 +372,13 @@ class TestTryParseLeafMeta:
 
     def test_invalid_json(self):
         from supertable.meta_reader import _try_parse_leaf_meta
-        with pytest.raises(RuntimeError, match="not valid JSON"):
-            _try_parse_leaf_meta("{not json}")
+        secret = "signature=META_LEAF_JSON_SENTINEL"
+        with pytest.raises(RuntimeError, match="not valid JSON") as raised:
+            _try_parse_leaf_meta('{"path":"' + secret)
+        rendered = "".join(traceback.format_exception(raised.value))
+        assert secret not in rendered
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
 
     def test_non_string_non_bytes(self):
         from supertable.meta_reader import _try_parse_leaf_meta
@@ -544,6 +551,22 @@ class TestGetAllTables:
         )
         with pytest.raises(RuntimeError, match="invalid table name"):
             reader._get_all_tables()
+
+    def test_invalid_catalog_table_name_drops_poisoned_identity(self):
+        secret = "api_token=META_TABLE_NAME_SENTINEL"
+        reader = _make_reader()
+        _wire_catalog_scan(
+            reader.catalog,
+            "supertable:org:lakes:sup:meta:leaf:doc:" + secret,
+        )
+
+        with pytest.raises(RuntimeError, match="invalid table name") as raised:
+            reader._get_all_tables()
+
+        rendered = "".join(traceback.format_exception(raised.value))
+        assert secret not in rendered
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
 
     @pytest.mark.parametrize(
         "bad_item",
@@ -865,6 +888,35 @@ class TestCollectSimpleTableSchema:
         assert len(schemas) == 1
 
 
+def test_metadata_failure_logs_never_render_identity_or_backend_text(caplog):
+    secret = "api_token=META_SENTINEL;https://metadata.invalid/private"
+    table_name = "customer-meta-sentinel"
+    role_name = "customer-role-sentinel"
+    reader = _make_reader()
+    reader.catalog.r.get.return_value = None
+    caplog.set_level(logging.DEBUG, logger=_MOD)
+
+    with patch(_P_CHECK_META), patch(_P_SIMPLE_TABLE) as MockST:
+        MockST.return_value.get_simple_table_snapshot.side_effect = (
+            FileNotFoundError(secret)
+        )
+        assert reader.get_table_schema(table_name, role_name) == [{}]
+        assert reader.get_table_stats(table_name, role_name) == []
+
+    with patch(_P_CHECK_META, side_effect=PermissionError(secret)):
+        schemas = set()
+        reader.collect_simple_table_schema(schemas, table_name, role_name)
+        assert schemas == set()
+
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret not in rendered
+    assert table_name not in rendered
+    assert role_name not in rendered
+    assert "snapshot_missing; error_type=FileNotFoundError" in rendered
+    assert "metadata_access_denied; error_type=PermissionError" in rendered
+    assert all(record.exc_info is None for record in caplog.records)
+
+
 # ===========================================================================
 # 12. MetaReader.get_table_stats
 # ===========================================================================
@@ -901,6 +953,61 @@ class TestGetTableStats:
         # Non-pruned keys kept
         assert stat["simple_name"] == "events"
         assert stat["snapshot_version"] == 3
+        # Keep the legacy resource list shape without exposing storage paths.
+        assert stat["resources"] == [{}]
+        assert "file" not in stat["resources"][0]
+
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_META)
+    def test_resource_projection_rejects_nested_control_data(
+        self, mock_check, MockST,
+    ):
+        reader = _make_reader()
+        MockST.return_value.get_simple_table_snapshot.return_value = ({
+            "simple_name": "events",
+            "schema": {"id": "long", "name": "string"},
+            "resources": [
+                {
+                    "file": "https://storage.invalid/object?signature=secret",
+                    "rows": 1,
+                    "file_size": 10,
+                    "stats_rows": True,
+                    "object_seal": {"etag": "secret"},
+                    "integer_domain_bounds": {
+                        "id": {"min": 0, "source": "/private/path"},
+                    },
+                    "column_max_value_bytes": {
+                        "id": 8,
+                        "unknown": "/private/path",
+                    },
+                },
+                {
+                    "rows": 1,
+                    "file_size": 11,
+                    "column_max_value_bytes": {
+                        "name": {"nested": "credential"},
+                    },
+                },
+            ],
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+        }, "/path")
+
+        stat = reader.get_table_stats("events", "admin")[0]
+
+        assert stat["resources"] == [
+            {
+                "rows": 1,
+                "file_size": 10,
+                "column_max_value_bytes": {"id": 8},
+            },
+            {"rows": 1, "file_size": 11},
+        ]
+        serialized = json.dumps(stat)
+        assert "secret" not in serialized
+        assert "private" not in serialized
+        assert "credential" not in serialized
 
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_META)
@@ -1091,8 +1198,9 @@ class TestGetSuperMeta:
 
     @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
     @patch(_P_CHECK_META)
-    def test_table_exception_skipped(self, mock_check, mock_ttl):
+    def test_table_exception_skipped(self, mock_check, mock_ttl, caplog):
         """FileNotFoundError for a table → that table skipped in totals."""
+        secret = "access_token=META_SUPER_SENTINEL"
         reader = _make_reader("sup", "org")
         reader.catalog.get_root.return_value = {"version": 1, "ts": 1000}
         _wire_catalog_scan(
@@ -1105,12 +1213,18 @@ class TestGetSuperMeta:
             [{"file": "f", "rows": 5, "file_size": 50}],
         )).encode()]
 
+        caplog.set_level(logging.DEBUG, logger=_MOD)
         with patch(_P_SIMPLE_TABLE) as MockST:
-            MockST.return_value.get_simple_table_snapshot.side_effect = FileNotFoundError()
+            MockST.return_value.get_simple_table_snapshot.side_effect = (
+                FileNotFoundError(secret)
+            )
             result = reader.get_super_meta("admin")
             # "bad" skipped, "good" counted
             assert result["super"]["rows"] == 5
             assert len(result["super"]["tables"]) == 1
+        assert secret not in caplog.text
+        assert "snapshot_missing; error_type=FileNotFoundError" in caplog.text
+        assert all(record.exc_info is None for record in caplog.records)
 
     @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
     @patch(_P_CHECK_META)

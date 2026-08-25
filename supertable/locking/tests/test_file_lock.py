@@ -11,14 +11,17 @@ path rather than mocking it.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import pytest
 
 from supertable.locking.file_lock import FileLocking
+from supertable.tests.fork_semantics_probe import run_fork_probe
 
 
 # ---------------------------------------------------------------------------
@@ -114,25 +117,11 @@ class TestAcquireRelease:
     def test_fork_child_cleanup_cannot_release_live_parent_lock(
         self, lock_dir,
     ):
-        owner = FileLocking(working_dir=lock_dir, retry_interval=0.01)
-        contender = FileLocking(working_dir=lock_dir, retry_interval=0.01)
-        token = owner.acquire("parent-owned", ttl_s=5, timeout_s=1)
-        assert token is not None
+        result = run_fork_probe("file_lock", root=lock_dir)
 
-        pid = os.fork()
-        if pid == 0:  # pragma: no cover - assertions execute in parent
-            owner._on_exit()
-            os._exit(0)
-        try:
-            _, status = os.waitpid(pid, 0)
-            assert os.waitstatus_to_exitcode(status) == 0
-            assert owner.who("parent-owned") == token
-            assert contender.acquire(
-                "parent-owned", ttl_s=2, timeout_s=1, retry_interval=0.01,
-            ) is None
-        finally:
-            owner._on_exit()
-            contender._on_exit()
+        assert result["child_exitcode"] == 0
+        assert result["parent_token_survived"] is True
+        assert result["contender_blocked"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +390,97 @@ class TestExpiry:
         finally:
             owner._stop_heartbeat()
             contender._stop_heartbeat()
+
+    def test_corrupt_lock_document_never_escapes_poisoned_content(
+        self, locker, lock_dir,
+    ):
+        secret = "https://locks.invalid/private?signature=LOCK_SECRET"
+        with open(os.path.join(lock_dir, ".lock.json"), "w") as handle:
+            handle.write("{" + secret)
+
+        with pytest.raises(RuntimeError) as raised:
+            locker.who("customer-selected-key")
+
+        rendered = "".join(traceback.format_exception(raised.value))
+        assert secret not in rendered
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+
+    def test_missing_lock_file_never_exposes_local_path(self, locker):
+        local_path = locker.lock_path
+        os.unlink(local_path)
+
+        with pytest.raises(RuntimeError) as raised:
+            locker.who("customer-selected-key")
+
+        rendered = "".join(traceback.format_exception(raised.value))
+        assert local_path not in rendered
+        assert str(raised.value) == (
+            "file-lock read failed; error_type=FileNotFoundError"
+        )
+        assert raised.value.__cause__ is None
+        assert raised.value.__suppress_context__ is True
+
+
+def test_failure_diagnostics_never_render_key_or_backend_text(
+    locker, monkeypatch, caplog,
+):
+    import supertable.locking.file_lock as file_lock_module
+
+    secret = "api_token=LOCK_SENTINEL;https://locks.invalid/private"
+    unsafe_error_type = type(
+        f"Backend_{secret}",
+        (RuntimeError,),
+        {},
+    )
+
+    def fail(_callback):
+        raise unsafe_error_type(secret)
+
+    class _FastClock:
+        def __init__(self):
+            self.now = 0.0
+
+        def time(self):
+            return self.now
+
+        def sleep(self, _seconds):
+            self.now += 2.0
+
+    class _OneHeartbeatCycle:
+        def __init__(self):
+            self.checks = 0
+
+        def is_set(self):
+            self.checks += 1
+            return self.checks >= 3
+
+        def wait(self, timeout):
+            assert timeout > 0
+
+    monkeypatch.setattr(file_lock_module, "time", _FastClock())
+    monkeypatch.setattr(locker, "_atomic_read_write", fail)
+    caplog.set_level(logging.DEBUG)
+
+    assert locker.acquire(secret, timeout_s=1) is None
+    assert locker.release(secret, "opaque-token") is False
+    assert locker.extend(secret, "opaque-token", ttl_ms=1_000) is False
+    locker._held = {secret: ("opaque-token", 1.0)}
+    locker._hb_loop(_OneHeartbeatCycle())
+    locker._held = {}
+
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert secret not in rendered
+    assert "LOCK_SENTINEL" not in rendered
+    assert "error_type=RuntimeError" in rendered
+    for phase in (
+        "acquire_failed",
+        "release_failed",
+        "extend_failed",
+        "heartbeat_failed",
+    ):
+        assert phase in rendered
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 # ---------------------------------------------------------------------------

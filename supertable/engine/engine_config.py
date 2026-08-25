@@ -167,19 +167,19 @@ def normalize_auto_routing_policy(raw: Any) -> Tuple[AutoRoutingRule, ...]:
             raise ValueError(f"auto_policy[{index}] must be an object")
         try:
             minimum = int(item.get("min_bytes", 0))
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"auto_policy[{index}].min_bytes is invalid") from exc
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"auto_policy[{index}].min_bytes is invalid") from None
         maximum_raw = item.get("max_bytes")
         try:
             maximum = None if maximum_raw in (None, "") else int(maximum_raw)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(f"auto_policy[{index}].max_bytes is invalid") from exc
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"auto_policy[{index}].max_bytes is invalid") from None
         if minimum < 0 or (maximum is not None and maximum <= minimum):
             raise ValueError(f"auto_policy[{index}] has an empty/negative interval")
         try:
             engine = Engine(str(item.get("engine", "")).strip().lower())
-        except ValueError as exc:
-            raise ValueError(f"auto_policy[{index}].engine is invalid") from exc
+        except ValueError:
+            raise ValueError(f"auto_policy[{index}].engine is invalid") from None
         if engine is Engine.AUTO:
             raise ValueError("auto_policy cannot route AUTO to itself")
         rules.append(AutoRoutingRule(minimum, maximum, engine))

@@ -11,10 +11,11 @@ import threading
 import time
 from datetime import date, datetime, timezone
 from enum import Enum
-from typing import Callable, Optional, Tuple, Any, List, Dict, Mapping
+from typing import Callable, Optional, Tuple, Any, List, Dict, Iterable, Mapping
 
 import pandas as pd
 import polars as pl
+import pyarrow as pa
 import sqlglot
 from sqlglot import exp
 
@@ -24,6 +25,7 @@ from supertable.errors import SuperTableNotFoundError, TableNotFoundError
 from supertable.storage.storage_factory import get_storage
 from supertable.storage.storage_interface import StorageInterface
 from supertable.utils.timer import Timer
+from supertable.utils.diagnostic_redaction import safe_exception_type
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
 from supertable.utils.snapshot import (
@@ -76,6 +78,22 @@ from supertable.odata_continuation import (
 class Status(Enum):
     OK = "ok"
     ERROR = "error"
+
+
+_QUERY_VALIDATION_ERROR = "Query is invalid or unsupported"
+_QUERY_AGGREGATE_ERROR = "Query aggregate resolution failed"
+_QUERY_TARGET_ERROR = "Query target is unavailable"
+_QUERY_EXECUTION_ERROR = "Query execution failed"
+_QUERY_STREAM_ERROR = "Query result stream failed"
+
+
+def _log_query_phase_failure(phase: str, exc: BaseException) -> None:
+    """Log a useful phase and exception class without attacker-controlled text."""
+    logger.warning(
+        "%s failed; error_type=%s",
+        phase,
+        safe_exception_type(exc),
+    )
 
 
 # Process-local capability used only by ``query_odata_sql_stream``.  The raw
@@ -134,7 +152,8 @@ def _cancel_and_close_stream(stream: Any) -> None:
             cancel()
     except Exception as exc:
         logger.warning(
-            "Arrow result cancellation during monitoring failure: %s", exc,
+            "Arrow result cancellation failed; error_type=%s",
+            safe_exception_type(exc),
         )
     finally:
         close = getattr(stream, "close", None)
@@ -143,7 +162,8 @@ def _cancel_and_close_stream(stream: Any) -> None:
                 close()
         except Exception as exc:
             logger.warning(
-                "Arrow result close during monitoring failure: %s", exc,
+                "Arrow result close failed; error_type=%s",
+                safe_exception_type(exc),
             )
 
 
@@ -241,19 +261,27 @@ class _MonitoredResultStream:
                     close()
             except BaseException as exc:
                 try:
-                    self._finish(Status.ERROR.value, str(exc))
+                    self._finish(Status.ERROR.value, _QUERY_STREAM_ERROR)
                 except BaseException as monitoring_exc:
-                    setattr(monitoring_exc, "stream_error", exc)
-                    raise monitoring_exc from exc
+                    setattr(
+                        monitoring_exc, "stream_error_type", safe_exception_type(exc),
+                    )
+                    raise monitoring_exc from None
+                if isinstance(exc, Exception):
+                    raise RuntimeError(_QUERY_STREAM_ERROR) from None
                 raise
             self._finish(Status.OK.value, None)
             raise
         except BaseException as exc:
             try:
-                self._finish(Status.ERROR.value, str(exc))
+                self._finish(Status.ERROR.value, _QUERY_STREAM_ERROR)
             except BaseException as monitoring_exc:
-                setattr(monitoring_exc, "stream_error", exc)
-                raise monitoring_exc from exc
+                setattr(
+                    monitoring_exc, "stream_error_type", safe_exception_type(exc),
+                )
+                raise monitoring_exc from None
+            if isinstance(exc, Exception):
+                raise RuntimeError(_QUERY_STREAM_ERROR) from None
             raise
         self._record_batch(batch)
         if bool(getattr(self._inner, "successful_completion", False)):
@@ -266,6 +294,7 @@ class _MonitoredResultStream:
 
     def cancel(self) -> None:
         cancel = getattr(self._inner, "cancel", None)
+        backend_error: BaseException | None = None
         try:
             if callable(cancel):
                 cancel()
@@ -273,19 +302,48 @@ class _MonitoredResultStream:
                 close = getattr(self._inner, "close", None)
                 if callable(close):
                     close()
-        finally:
-            self._finish(Status.ERROR.value, "result stream cancelled")
+        except BaseException as exc:
+            backend_error = exc
+        if backend_error is not None:
+            try:
+                self._finish(Status.ERROR.value, _QUERY_STREAM_ERROR)
+            except BaseException as monitoring_exc:
+                setattr(
+                    monitoring_exc,
+                    "stream_error_type",
+                    safe_exception_type(backend_error),
+                )
+                raise monitoring_exc from None
+            if isinstance(backend_error, Exception):
+                raise RuntimeError(_QUERY_STREAM_ERROR) from None
+            raise backend_error
+        self._finish(Status.ERROR.value, "result stream cancelled")
 
     def close(self) -> None:
         close = getattr(self._inner, "close", None)
+        backend_error: BaseException | None = None
         try:
             if callable(close):
                 close()
-        finally:
-            self._finish(
-                Status.ERROR.value,
-                "result stream closed before exhaustion",
-            )
+        except BaseException as exc:
+            backend_error = exc
+        if backend_error is not None:
+            try:
+                self._finish(Status.ERROR.value, _QUERY_STREAM_ERROR)
+            except BaseException as monitoring_exc:
+                setattr(
+                    monitoring_exc,
+                    "stream_error_type",
+                    safe_exception_type(backend_error),
+                )
+                raise monitoring_exc from None
+            if isinstance(backend_error, Exception):
+                raise RuntimeError(_QUERY_STREAM_ERROR) from None
+            raise backend_error
+        self._finish(
+            Status.ERROR.value,
+            "result stream closed before exhaustion",
+        )
 
     @property
     def closed(self) -> bool:
@@ -502,8 +560,8 @@ def _caller_deadline(timeout_sec: Optional[float]) -> Optional[float]:
         raise ValueError("timeout_sec must be a finite positive number")
     try:
         timeout = float(timeout_sec)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("timeout_sec must be a finite positive number") from exc
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("timeout_sec must be a finite positive number") from None
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("timeout_sec must be a finite positive number")
     return time.monotonic() + timeout
@@ -527,8 +585,8 @@ def _ensure_request_active(
         return
     try:
         deadline = float(deadline_monotonic)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("query deadline must be finite") from exc
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("query deadline must be finite") from None
     if not math.isfinite(deadline):
         raise ValueError("query deadline must be finite")
     if time.monotonic() >= deadline:
@@ -544,8 +602,8 @@ def _validate_query_complexity(sql: str) -> None:
             for statement in sqlglot.parse(sql, read="duckdb")
             if statement is not None
         ]
-    except Exception as exc:
-        raise ValueError("SQL query is invalid") from exc
+    except Exception:
+        raise ValueError("SQL query is invalid") from None
     if len(statements) != 1 or statements[0] is None:
         raise ValueError("Exactly one SQL statement is required")
 
@@ -586,8 +644,8 @@ def _validated_share_row_filter(raw_filter: object) -> str:
         statements = sqlglot.parse(
             f"SELECT 1 WHERE {raw_filter}", read="duckdb"
         )
-    except Exception as exc:
-        raise RuntimeError("Linked-share row filter is invalid") from exc
+    except Exception:
+        raise RuntimeError("Linked-share row filter is invalid") from None
     if len(statements) != 1 or not isinstance(statements[0], exp.Select):
         raise RuntimeError("Linked-share row filter is invalid")
     select = statements[0]
@@ -790,6 +848,8 @@ class DataReader:
         source: str = "sdk",
         *,
         _allow_bounded_collection_aggregates: bool = False,
+        audit_actor_id: str = "",
+        audit_actor_username: str = "",
     ):
         self.super_name = super_name
         self.organization = organization
@@ -798,6 +858,8 @@ class DataReader:
         # default for direct SDK callers; the API/OData/MCP entry points
         # pass "api"/"odata"/"mcp" so each query records where it came from.
         self.source = source
+        self.audit_actor_id = str(audit_actor_id or "")
+        self.audit_actor_username = str(audit_actor_username or "")
         self._allow_bounded_collection_aggregates = bool(
             _allow_bounded_collection_aggregates
         )
@@ -814,6 +876,62 @@ class DataReader:
 
     def _lp(self, msg: str) -> str:
         return f"{self._log_ctx}{msg}"
+
+    def _emit_successful_query_audit(
+        self,
+        *,
+        role_name: str,
+        engine_used: Any,
+        result_rows: int,
+        result_columns: int,
+        outcome: str = "success",
+    ) -> None:
+        """Record one protected event after a query has actually succeeded.
+
+        The read facade has an authorization role but no authenticated-user
+        identity, so the role stays in structured detail instead of being
+        misrepresented as a user.  The public audit boundary removes raw SQL
+        before any queue or backend can observe the event.
+        """
+        from supertable.audit import (
+            Actions,
+            ActorType,
+            EventCategory,
+            Outcome,
+            emit,
+        )
+
+        query_manager = self.query_plan_manager
+        query_id = str(getattr(query_manager, "query_id", "") or "")[:128]
+        query_hash = str(
+            getattr(query_manager, "query_hash", "") or ""
+        )[:128]
+        actual_engine = str(
+            getattr(engine_used, "value", engine_used) or ""
+        )[:64]
+        emit(
+            category=EventCategory.DATA_ACCESS,
+            action=Actions.QUERY_EXECUTE,
+            organization=self.organization,
+            actor_type=ActorType.SYSTEM,
+            actor_id=self.audit_actor_id,
+            actor_username=self.audit_actor_username,
+            resource_type="query",
+            resource_id=query_id,
+            super_name=self.super_name,
+            detail={
+                "sql": self.query,
+                "query_id": query_id,
+                "query_hash": query_hash,
+                "authorization_role": role_name,
+                "source": self.source,
+                "engine": actual_engine,
+                "row_count": max(0, int(result_rows)),
+                "column_count": max(0, int(result_columns)),
+                "outcome": outcome,
+            },
+            outcome=Outcome.SUCCESS,
+        )
 
     def _assert_targets_exist(self, physical_tables) -> None:
         """Fail fast if any referenced (super, simple) is missing in Redis.
@@ -903,14 +1021,22 @@ class DataReader:
         return resolved
 
     def _resolve_latest_stats_context(
-        self, super_name: str, simple_name: str,
-    ) -> Tuple[Optional[str], bool]:
-        """Return the latest stats pointer and whether a share filter exists.
+        self,
+        super_name: str,
+        simple_name: str,
+        *,
+        include_bounds: bool = False,
+    ) -> Any:
+        """Return the latest stats pointer, bounds, and share-filter state.
 
         Prefers the leaf payload (already in Redis); falls back to reading the
         snapshot JSON from storage.  The filter marker is read from the same
         pinned leaf/snapshot context as the pointer so ``SHOW STATS`` cannot
         authorize one version and then expose another version's raw artifact.
+
+        The compatibility default remains ``(stats_file, filtered)``. The
+        diagnostic caller requests ``(stats_file, stats_rows, filtered)`` so
+        the immutable artifact's row bound is pinned by that same document.
 
         A malformed non-null ``_row_filter`` is treated as present.  Corrupt
         authorization metadata must disable raw statistics rather than silently
@@ -925,10 +1051,16 @@ class DataReader:
                 # metadata exactly like a present restriction.
                 return True
 
+        def result(document: Mapping[str, Any], filtered: bool) -> Any:
+            stats_file = document.get("stats_file")
+            if include_bounds:
+                return stats_file, document.get("stats_rows"), filtered
+            return stats_file, filtered
+
         catalog = RedisCatalog()
         leaf = catalog.get_leaf(self.organization, super_name, simple_name)
         if not isinstance(leaf, dict):
-            return None, False
+            return (None, None, False) if include_bounds else (None, False)
         payload = leaf.get("payload")
         filtered = has_row_filter(leaf) or has_row_filter(payload)
         complete_payload = complete_snapshot_payload(
@@ -937,20 +1069,20 @@ class DataReader:
             require_policy_marker=True,
         )
         if complete_payload is not None:
-            return (
-                complete_payload.get("stats_file"),
+            return result(
+                complete_payload,
                 filtered or has_row_filter(complete_payload),
             )
         path = leaf.get("path")
         if not path:
-            return None, filtered
+            return (None, None, filtered) if include_bounds else (None, filtered)
         from supertable.super_table import SuperTable
         snapshot = SuperTable(
             super_name, self.organization, create_if_missing=False,
         ).read_simple_table_snapshot(path)
         if not isinstance(snapshot, dict):
-            return None, filtered
-        return snapshot.get("stats_file"), filtered or has_row_filter(snapshot)
+            return (None, None, filtered) if include_bounds else (None, filtered)
+        return result(snapshot, filtered or has_row_filter(snapshot))
 
     def _resolve_latest_stats_file(
         self, super_name: str, simple_name: str,
@@ -970,8 +1102,7 @@ class DataReader:
         """
         from supertable.data_classes import TableDefinition
         from supertable.processing import (
-            load_stats,
-            stats_cache_identity,
+            load_bounded_stats_diagnostic,
             STATS_SCHEMA,
         )
 
@@ -988,8 +1119,8 @@ class DataReader:
         try:
             self._assert_targets_exist([td])
         except (SuperTableNotFoundError, TableNotFoundError) as e:
-            logger.warning(self._lp(f"[show-stats] target missing: {e}"))
-            return pd.DataFrame(), Status.ERROR, str(e)
+            _log_query_phase_failure("show-stats target resolution", e)
+            return pd.DataFrame(), Status.ERROR, _QUERY_TARGET_ERROR
 
         # RBAC raises when the table is denied and returns the effective view
         # definition used below to remove column-level statistics.
@@ -1023,16 +1154,26 @@ class DataReader:
             )
 
         try:
-            stats_file, share_row_filtered = self._resolve_latest_stats_context(
-                super_name, simple_name,
+            (
+                stats_file,
+                expected_stats_rows,
+                share_row_filtered,
+            ) = self._resolve_latest_stats_context(
+                super_name,
+                simple_name,
+                include_bounds=True,
             )
         except Exception as e:
             # Resolving the linked-share overlay may require the immutable
             # snapshot document.  Backend failures can contain its physical
-            # key or a presigned URL, so retain details only in trusted logs.
-            # More importantly, an unreadable overlay cannot prove that raw
-            # full-table statistics are safe for this caller.
-            logger.error(self._lp(f"[show-stats] policy resolution failed: {e}"))
+            # key or a presigned URL. Log only the exception class; even a
+            # trusted sink must not become a credential disclosure channel.
+            # An unreadable overlay cannot prove that raw full-table
+            # statistics are safe for this caller.
+            logger.error(self._lp(
+                "[show-stats] policy resolution failed; "
+                f"error_type={safe_exception_type(e)}"
+            ))
             raise PermissionError(
                 "SHOW STATS is unavailable under the effective access policy"
             ) from None
@@ -1047,20 +1188,23 @@ class DataReader:
 
         try:
             stats_df = (
-                load_stats(
+                load_bounded_stats_diagnostic(
                     stats_file,
-                    allow_cache=True,
-                    cache_identity=stats_cache_identity(
-                        stats_file,
-                        organization=self.organization,
-                        storage=self.storage,
-                    ),
+                    expected_rows=expected_stats_rows,
+                    storage=self.storage,
                 )
                 if stats_file else None
             )
         except Exception as e:
-            logger.error(self._lp(f"[show-stats] failed to load stats: {e}"))
-            return pd.DataFrame(), Status.ERROR, str(e)
+            logger.error(self._lp(
+                "[show-stats] failed to load stats; "
+                f"error_type={safe_exception_type(e)}"
+            ))
+            return (
+                pd.DataFrame(),
+                Status.ERROR,
+                "SHOW STATS artifact is unavailable",
+            )
 
         if stats_df is None:
             return pd.DataFrame(columns=list(STATS_SCHEMA.keys())), Status.OK, None
@@ -1210,8 +1354,8 @@ class DataReader:
         try:
             command = classify_query(self.query, self.super_name)
         except ValueError as e:
-            logger.warning(self._lp(f"rejected query: {e}"))
-            return pd.DataFrame(), Status.ERROR, str(e)
+            _log_query_phase_failure("query classification", e)
+            return pd.DataFrame(), Status.ERROR, _QUERY_VALIDATION_ERROR
 
         # DuckDB's EXPLAIN ANALYZE result includes physical Filename(s). Those
         # can be local server paths or presigned bearer URLs used by a managed
@@ -1226,8 +1370,8 @@ class DataReader:
             try:
                 _validate_query_complexity(command.sql)
             except ValueError as e:
-                logger.warning(self._lp(f"rejected query: {e}"))
-                return pd.DataFrame(), Status.ERROR, str(e)
+                _log_query_phase_failure("query complexity validation", e)
+                return pd.DataFrame(), Status.ERROR, _QUERY_VALIDATION_ERROR
         _ensure_request_active(_deadline_monotonic, _cancel_event)
 
         bounded_sql = command.sql
@@ -1278,25 +1422,29 @@ class DataReader:
                 ),
             )
         except ValueError as e:
-            logger.warning(self._lp(f"rejected query: {e}"))
-            return pd.DataFrame(), Status.ERROR, str(e)
-        tables = parser.get_table_tuples()
-        physical_tables = parser.get_physical_tables()
-        odata_identity_alias = (
-            _odata_identity_binding(parser) if _odata_identity else None
-        )
-        odata_continuation_boundary = bind_odata_continuation_boundary(
-            parser._parsed,
-            _odata_continuation_boundary,
-        ) if _odata_identity else None
+            _log_query_phase_failure("query parsing", e)
+            return pd.DataFrame(), Status.ERROR, _QUERY_VALIDATION_ERROR
+        try:
+            tables = parser.get_table_tuples()
+            physical_tables = parser.get_physical_tables()
+            odata_identity_alias = (
+                _odata_identity_binding(parser) if _odata_identity else None
+            )
+            odata_continuation_boundary = bind_odata_continuation_boundary(
+                parser._parsed,
+                _odata_continuation_boundary,
+            ) if _odata_identity else None
+        except Exception as exc:
+            _log_query_phase_failure("query parse binding", exc)
+            return pd.DataFrame(), Status.ERROR, _QUERY_VALIDATION_ERROR
 
         try:
             aggregate_children = self._resolve_aggregate_children(
                 physical_tables
             )
         except Exception as e:
-            logger.warning(self._lp(f"aggregate expansion failed: {e}"))
-            return pd.DataFrame(), Status.ERROR, str(e)
+            _log_query_phase_failure("query aggregate expansion", e)
+            return pd.DataFrame(), Status.ERROR, _QUERY_AGGREGATE_ERROR
 
         # Read-path policy: reads never create. Verify every referenced
         # (super, simple) exists in the Redis catalog **before** anything
@@ -1319,27 +1467,22 @@ class DataReader:
         try:
             self._assert_targets_exist(physical_tables)
         except (SuperTableNotFoundError, TableNotFoundError) as e:
-            logger.warning(self._lp(f"target missing: {e}"))
-            return pd.DataFrame(), Status.ERROR, str(e)
+            _log_query_phase_failure("query target resolution", e)
+            return pd.DataFrame(), Status.ERROR, _QUERY_TARGET_ERROR
 
         # RBAC check — also returns per-alias column/row filter definitions.
         # PermissionError propagates to the caller (legacy behaviour).
-        rbac_kwargs = {
-            "super_name": self.super_name,
-            "organization": self.organization,
-            "role_name": role_name,
-            "tables": tables,
-            "physical_tables": physical_tables,
-        }
         role_policy_fingerprints: Dict[str, str] = {}
-        rbac_kwargs["policy_fingerprints_out"] = role_policy_fingerprints
-        if expected_role_policy_fingerprint is not None:
-            rbac_kwargs["expected_role_policy_fingerprint"] = (
-                expected_role_policy_fingerprint
-            )
-        if aggregate_children:
-            rbac_kwargs["aggregate_children"] = aggregate_children
-        rbac_views = restrict_read_access(**rbac_kwargs)
+        rbac_views = restrict_read_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            tables=tables,
+            physical_tables=physical_tables,
+            aggregate_children=aggregate_children or None,
+            expected_role_policy_fingerprint=expected_role_policy_fingerprint,
+            policy_fingerprints_out=role_policy_fingerprints,
+        )
         self.role_policy_fingerprint = role_policy_fingerprints.get(
             str(self.super_name).casefold(), "",
         )
@@ -1359,7 +1502,7 @@ class DataReader:
                 logger.debug(
                     self._lp(
                         "[engine.auto] observation history unavailable: "
-                        f"{observation_error}"
+                        f"error_type={safe_exception_type(observation_error)}"
                     )
                 )
             # Initialize plan manager and query id/hash (same as before)
@@ -1395,7 +1538,8 @@ class DataReader:
                     predicate_constraints = parser.get_predicate_constraints()
                 except Exception as pc_err:
                     logger.debug(self._lp(
-                        f"[prune] predicate extraction failed: {pc_err}"))
+                        "[prune] predicate extraction failed; "
+                        f"error_type={safe_exception_type(pc_err)}"))
                 predicate_constraints = _engine_safe_predicate_constraints(
                     predicate_constraints, engine,
                 )
@@ -1403,7 +1547,8 @@ class DataReader:
                     join_edges = parser.get_join_edges()
                 except Exception as je_err:
                     logger.debug(self._lp(
-                        f"[prune] join-edge extraction failed: {je_err}"))
+                        "[prune] join-edge extraction failed; "
+                        f"error_type={safe_exception_type(je_err)}"))
 
             # 1) ESTIMATE — use physical_tables so CTE aliases are excluded
             estimator_kwargs = dict(
@@ -1414,6 +1559,7 @@ class DataReader:
                 join_edges=join_edges,
                 join_pruning_lanes=_engine_safe_join_pruning_lanes(engine),
                 plan_stats=self.plan_stats,
+                require_odata_identity=(_odata_identity is True),
             )
             if aggregate_children:
                 estimator_kwargs["aggregate_children"] = aggregate_children
@@ -1440,18 +1586,21 @@ class DataReader:
                 (sup.super_name.lower(), sup.simple_name.lower()): sup
                 for sup in reflection.supers
             }
-            resolved_tombstones = {}
+            resolved_tombstones: Dict[
+                Tuple[str, str],
+                Tuple[str, Tuple[TombstoneSegmentDef, ...]],
+            ] = {}
 
             def _resolve_required_tombstone_artifact(
                     raw_key: str, *, super_name: str, simple_name: str,
             ) -> str:
                 try:
                     resolved = estimator._to_duckdb_path(raw_key)
-                except Exception as resolve_err:
+                except Exception:
                     raise RuntimeError(
                         f"Unable to resolve required deletion-vector for "
                         f"{super_name}.{simple_name}"
-                    ) from resolve_err
+                    ) from None
                 if not isinstance(resolved, str) or not resolved:
                     raise RuntimeError(
                         f"Unable to resolve required deletion-vector for "
@@ -1494,7 +1643,7 @@ class DataReader:
                             format_present=(raw_tombstone_format is not None),
                             tombstone_format=raw_tombstone_format,
                         )
-                    except (TypeError, ValueError) as state_err:
+                    except (TypeError, ValueError):
                         if tombstone_key and not (
                             isinstance(tombstone_rows, int)
                             and not isinstance(tombstone_rows, bool)
@@ -1504,11 +1653,11 @@ class DataReader:
                                 f"Snapshot for {td.super_name}."
                                 f"{td.simple_name} references a deletion "
                                 "vector without a positive row count"
-                            ) from state_err
+                            ) from None
                         raise RuntimeError(
                             f"Invalid deletion-vector state for "
                             f"{td.super_name}.{td.simple_name}"
-                        ) from state_err
+                        ) from None
                 else:
                     # Legacy/direct Reflection callers may omit the canonical
                     # empty-state count. Production estimator snapshots always
@@ -1600,11 +1749,11 @@ class DataReader:
                                         identity_fn()
                                         if callable(identity_fn) else None
                                     )
-                                except Exception as size_err:
+                                except Exception:
                                     raise RuntimeError(
                                         "Unable to observe required "
                                         "deletion-vector segment"
-                                    ) from size_err
+                                    ) from None
                                 if (
                                     not isinstance(observed_size, int)
                                     or isinstance(observed_size, bool)
@@ -1912,14 +2061,23 @@ class DataReader:
             # service layers and never turn them into an empty successful result.
             raise
         except (ResourceReservationCancelled, TimeoutError) as e:
-            typed_failure = e
-            message = _redact_storage_credentials(e)
-            logger.warning(self._lp(f"query stopped: {message}"))
+            message = (
+                "Query was cancelled"
+                if isinstance(e, ResourceReservationCancelled)
+                else "Query timed out"
+            )
+            typed_failure = type(e)(message)
+            _log_query_phase_failure("query execution", e)
             result_value = pd.DataFrame()
             result_shape = result_value.shape
         except Exception as e:
-            message = _redact_storage_credentials(e)
-            logger.error(self._lp(f"Exception: {message}"))
+            message = _QUERY_EXECUTION_ERROR
+            logger.error(
+                self._lp(
+                    "query execution failed; "
+                    f"error_type={safe_exception_type(e)}"
+                )
+            )
             result_value = pd.DataFrame()
             result_shape = result_value.shape
 
@@ -1969,15 +2127,25 @@ class DataReader:
                         result_shape=(result_rows, result_columns),
                     )
                 except MonitoringDurabilityError as exc:
+                    safe_cause = MonitoringDurabilityError(
+                        "monitoring durability failure"
+                    )
                     raise MonitoringPostExecutionError(
                         organization=stream_qpm.organization,
                         super_name=stream_qpm.super_name,
                         query_id=str(getattr(stream_qpm, "query_id", "")),
                         status=final_status,
-                        cause=exc,
-                    ) from exc
+                        cause=safe_cause,
+                    ) from None
                 finally:
                     stream_timer.capture_and_reset_timing(event="EXTENDING_PLAN")
+                if final_status == Status.OK.value:
+                    self._emit_successful_query_audit(
+                        role_name=role_name,
+                        engine_used=_engine_used,
+                        result_rows=result_rows,
+                        result_columns=result_columns,
+                    )
 
             return (
                 _MonitoredResultStream(result_value, _finalize_stream_monitoring),
@@ -2000,23 +2168,51 @@ class DataReader:
                 message=message,
                 result_shape=result_shape,
             )
-        except MonitoringDurabilityError as e:
+        except MonitoringDurabilityError:
             if _streaming:
                 _cancel_and_close_stream(result_value)
             qpm = self.query_plan_manager
+            safe_cause = MonitoringDurabilityError(
+                "monitoring durability failure"
+            )
             raise MonitoringPostExecutionError(
                 organization=str(getattr(qpm, "organization", self.organization)),
                 super_name=str(getattr(qpm, "super_name", self.super_name)),
                 query_id=str(getattr(qpm, "query_id", "")),
                 status=str(status.value),
-                cause=e,
-            ) from e
+                cause=safe_cause,
+            ) from None
         except Exception as e:
-            logger.error(self._lp(f"extend_execution_plan exception: {e}"))
+            logger.error(self._lp(
+                "extend_execution_plan failed; "
+                f"error_type={safe_exception_type(e)}"
+            ))
 
         self.timer.capture_and_reset_timing(event="EXTENDING_PLAN")
         if typed_failure is not None:
+            try:
+                self._emit_successful_query_audit(
+                    role_name=role_name, engine_used=_engine_used,
+                    result_rows=0, result_columns=0, outcome="failure",
+                )
+            except Exception:
+                logger.debug(self._lp("failed to emit query failure audit"), exc_info=True)
             raise typed_failure
+        if status is Status.OK:
+            self._emit_successful_query_audit(
+                role_name=role_name,
+                engine_used=_engine_used,
+                result_rows=int(result_shape[0]),
+                result_columns=int(result_shape[1]),
+            )
+        else:
+            try:
+                self._emit_successful_query_audit(
+                    role_name=role_name, engine_used=_engine_used,
+                    result_rows=0, result_columns=0, outcome="failure",
+                )
+            except Exception:
+                logger.debug(self._lp("failed to emit query failure audit"), exc_info=True)
         return result_value, status, message
 
     def execute_stream(
@@ -2243,8 +2439,8 @@ def _ensure_sql_limit(
     """
     try:
         requested = int(default_limit)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("Query limit must be an integer") from exc
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("Query limit must be an integer") from None
     requested = max(0, requested)
     if maximum_limit is None:
         maximum = _positive_budget("SUPERTABLE_MAX_LIMIT", 10000)
@@ -2352,7 +2548,9 @@ def _ensure_sql_limit(
     return f"{stripped}\nLIMIT {enforced}"
 
 
-def _json_safe_result_value(value: Any) -> Any:
+def _json_safe_result_value(
+    value: Any, *, assume_naive_datetime_utc: bool = False,
+) -> Any:
     """Return the exact JSON-safe value retained in a public result row.
 
     Arrow can produce nested values, datetimes, decimals, bytes and non-finite
@@ -2360,18 +2558,34 @@ def _json_safe_result_value(value: Any) -> Any:
     returns; using ``default=str`` only while measuring would under-specify the
     downstream payload and leave raw unserializable objects in ``rows``.
     """
-    if value is None or value is pd.NA or value is pd.NaT:
+    if value is None:
+        return None
+    # The overwhelmingly common Arrow result cells need no conversion. Keep
+    # this exact-type path before pandas/numpy/temporal inspection; subclasses
+    # still flow through the specialized handling below.
+    if type(value) in (str, int, bool):
+        return value
+    if value is pd.NA or value is pd.NaT:
         return None
     if type(value).__module__.startswith("numpy"):
         item = getattr(value, "item", None)
         if callable(item):
             try:
-                return _json_safe_result_value(item())
+                return _json_safe_result_value(
+                    item(),
+                    assume_naive_datetime_utc=assume_naive_datetime_utc,
+                )
             except (TypeError, ValueError, OverflowError):
                 return str(value)
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, datetime):
+        if value.tzinfo is None and assume_naive_datetime_utc:
+            # Spark's HiveServer2 protocol returns naive Python datetimes even
+            # for TIMESTAMP_LTZ. The executor marks only fields proven to come
+            # from a mandatory UTC/LTZ session; unmarked SQL TIMESTAMP values
+            # remain wall-clock values and deliberately receive no ``Z``.
+            value = value.replace(tzinfo=timezone.utc)
         if value.tzinfo is not None:
             # DuckDB materializes TIMESTAMPTZ in the connection/session zone.
             # Public rows and their serialized-byte accounting must be stable
@@ -2388,16 +2602,111 @@ def _json_safe_result_value(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, dict):
         return {
-            str(key): _json_safe_result_value(item)
+            str(key): _json_safe_result_value(
+                item,
+                assume_naive_datetime_utc=assume_naive_datetime_utc,
+            )
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [_json_safe_result_value(item) for item in value]
-    try:
-        json.dumps(value, ensure_ascii=False, allow_nan=False)
-    except (TypeError, ValueError):
-        return str(value)
-    return value
+        return [
+            _json_safe_result_value(
+                item,
+                assume_naive_datetime_utc=assume_naive_datetime_utc,
+            )
+            for item in value
+        ]
+    # These are the complete scalar domains accepted by JSONEncoder after the
+    # special temporal/numpy/float handling above. Avoid invoking json.dumps
+    # for every ordinary Arrow cell merely to rediscover that fact.
+    if isinstance(value, (str, int, bool)):
+        return value
+    return str(value)
+
+
+# Keep Spark's public column metadata in the pandas-style vocabulary returned
+# before the lossless object-frame fix.  The mapping is now stable and logical:
+# nullable integral values remain ``int64`` instead of being mislabeled as the
+# float dtype pandas previously used after coercing them.
+_SPARK_PUBLIC_RESULT_TYPE_NAMES = {
+    "BOOLEAN_TYPE": "bool",
+    "TINYINT_TYPE": "int64",
+    "SMALLINT_TYPE": "int64",
+    "INT_TYPE": "int64",
+    "BIGINT_TYPE": "int64",
+    "FLOAT_TYPE": "float64",
+    "DOUBLE_TYPE": "float64",
+    "STRING_TYPE": "object",
+    "TIMESTAMP_TYPE": "datetime64[ns]",
+    "BINARY_TYPE": "object",
+    "ARRAY_TYPE": "object",
+    "MAP_TYPE": "object",
+    "STRUCT_TYPE": "object",
+    "UNION_TYPE": "object",
+    "USER_DEFINED_TYPE": "object",
+    "DECIMAL_TYPE": "object",
+    "NULL_TYPE": "object",
+    "DATE_TYPE": "object",
+    "VARCHAR_TYPE": "object",
+    "CHAR_TYPE": "object",
+    "INTERVAL_YEAR_MONTH_TYPE": "object",
+    "INTERVAL_DAY_TIME_TYPE": "object",
+}
+
+
+_JSON_STRING_ESCAPE_RE = re.compile(r'["\\\x00-\x1f]')
+
+
+def _json_wire_size(value: Any) -> int:
+    """Exact compact UTF-8 JSON size without constructing discarded JSON.
+
+    ``query_sql`` returns Python rows, so the service still performs the real
+    response serialization once. The previous guard serialized every row a
+    first time and immediately discarded those bytes. This counter implements
+    the exact ``ensure_ascii=False``/compact-separator contract used by that
+    guard, including control escaping and UTF-8 validation.
+    """
+    if value is None:
+        return 4
+    if value is True:
+        return 4
+    if value is False:
+        return 5
+    if isinstance(value, str):
+        encoded_size = len(value.encode("utf-8"))
+        if _JSON_STRING_ESCAPE_RE.search(value) is None:
+            return encoded_size + 2
+        size = 2
+        for character in value:
+            codepoint = ord(character)
+            if character in {'"', "\\"} or character in {
+                "\b", "\f", "\n", "\r", "\t",
+            }:
+                size += 2
+            elif codepoint <= 0x1F:
+                size += 6
+            else:
+                size += len(character.encode("utf-8"))
+        return size
+    if isinstance(value, int):
+        return len(str(value))
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("non-finite float is unavailable in JSON")
+        # JSONEncoder deliberately calls the base float repr for subclasses.
+        return len(float.__repr__(value))
+    if isinstance(value, list):
+        return 2 + max(0, len(value) - 1) + sum(
+            _json_wire_size(item) for item in value
+        )
+    if isinstance(value, dict):
+        size = 2 + max(0, len(value) - 1)
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError("JSON object keys must be strings")
+            size += _json_wire_size(key) + 1 + _json_wire_size(item)
+        return size
+    raise TypeError("unsupported JSON result value type")
 
 
 def _public_arrow_type_name(field_type: Any) -> str:
@@ -2412,6 +2721,42 @@ def _public_arrow_type_name(field_type: Any) -> str:
     if source_timezone is not None and unit:
         return f"timestamp[{unit}, tz=UTC]"
     return str(field_type)
+
+
+def _arrow_batch_preserves_values_through_pandas(batch: Any) -> bool:
+    """Whether bounded ``to_pandas`` rows preserve the public scalar domain.
+
+    Native per-column ``to_pylist`` conversion is surprisingly expensive for
+    wide Arrow batches. Pandas performs a vectorized conversion, but nullable
+    integers would become floats and nested values can change representation.
+    Admit only primitive/temporal types proven equivalent after
+    ``_json_safe_result_value``; every other batch retains the conservative
+    Arrow scalar path.
+    """
+    if not batch.num_columns:
+        return False
+    for column in batch.columns:
+        field_type = column.type
+        if pa.types.is_integer(field_type):
+            if column.null_count:
+                return False
+            continue
+        if any((
+            pa.types.is_floating(field_type),
+            pa.types.is_boolean(field_type),
+            pa.types.is_string(field_type),
+            pa.types.is_large_string(field_type),
+            pa.types.is_binary(field_type),
+            pa.types.is_large_binary(field_type),
+            pa.types.is_fixed_size_binary(field_type),
+            pa.types.is_decimal(field_type),
+            pa.types.is_date32(field_type),
+            pa.types.is_timestamp(field_type),
+            pa.types.is_null(field_type),
+        )):
+            continue
+        return False
+    return True
 
 
 def _latest_plan_stat(stats: Tuple[dict, ...], key: str) -> Any:
@@ -2572,19 +2917,50 @@ def query_sql(
         organization=organization, super_name=super_name, query=sql, source=source,
     )
 
+    max_serialized_bytes = _positive_budget(
+        "SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES", 16 * 1024 * 1024,
+    )
+
     # SELECT responses use the Arrow stream in the normal API path.  Applying
     # the JSON byte budget after ``fetchdf()`` is too late: a few very wide
     # cells can consume unbounded pandas memory despite the outer row LIMIT.
-    # Spark does not expose a cancellable incremental result contract here, so
-    # fail explicitly instead of silently falling back to materialization.
+    # Spark has no Arrow result stream, but its Thrift executor has a separate
+    # bounded incremental materialization contract for this inline facade.
     from supertable.engine.engine_enum import Engine as _EngineEnum
 
-    stream_response = bool(is_select and isinstance(engine, _EngineEnum))
-    if stream_response and engine is _EngineEnum.SPARK_SQL:
-        raise RuntimeError(
-            "Bounded query_sql responses do not support Spark SQL streaming"
+    spark_materialized_response = bool(
+        is_select
+        and isinstance(engine, _EngineEnum)
+        and engine is _EngineEnum.SPARK_SQL
+    )
+    stream_response = bool(
+        is_select
+        and isinstance(engine, _EngineEnum)
+        and not spark_materialized_response
+    )
+    effective_inline_limit: Optional[int] = None
+    if spark_materialized_response:
+        # _ensure_sql_limit() above already validated/coerced ``limit``.  The
+        # private materialization budget must remain positive even for LIMIT 0;
+        # the postcondition below still requires the public result to be empty.
+        effective_inline_limit = min(
+            max(0, int(limit)),
+            _positive_budget("SUPERTABLE_MAX_LIMIT", 10000),
         )
-    if stream_response:
+        try:
+            result_value, status, message = reader.execute(
+                role_name=role_name,
+                engine=engine,
+                with_scan=False,
+                _materialized_row_limit=max(1, effective_inline_limit),
+                _materialized_result_bytes=max_serialized_bytes,
+                _deadline_monotonic=request_deadline,
+                _cancel_event=cancel_event,
+            )
+        except BaseException:
+            _update_query_out(reader, out, requested_engine=engine)
+            raise
+    elif stream_response:
         try:
             result_value, status, message = reader.execute_stream(
                 role_name=role_name,
@@ -2614,11 +2990,22 @@ def query_sql(
     _update_query_out(reader, out, requested_engine=engine)
 
     if status == Status.ERROR:
-        raise RuntimeError(f"Query execution failed: {message}")
+        # ``message`` crosses several storage and execution boundaries and may
+        # contain paths, signed URLs, or provider response bodies.  DataReader
+        # records a bounded type-only diagnostic; the public facade exposes one
+        # stable error contract and never repeats backend prose.
+        raise RuntimeError(_QUERY_EXECUTION_ERROR)
 
-    max_serialized_bytes = _positive_budget(
-        "SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES", 16 * 1024 * 1024,
-    )
+    if spark_materialized_response:
+        try:
+            materialized_rows = int(result_value.shape[0])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            raise RuntimeError(_QUERY_EXECUTION_ERROR) from None
+        if (
+            effective_inline_limit is None
+            or materialized_rows > effective_inline_limit
+        ):
+            raise RuntimeError(_QUERY_EXECUTION_ERROR)
 
     if stream_response:
         stream = result_value
@@ -2638,11 +3025,17 @@ def query_sql(
             for field in schema
         ]
         rows: List[List[Any]] = []
-        serialized_bytes = len(json.dumps(
-            {"columns": columns, "rows": [], "columns_meta": columns_meta},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8"))
+        try:
+            serialized_bytes = _json_wire_size({
+                "columns": columns,
+                "rows": [],
+                "columns_meta": columns_meta,
+            })
+        except (TypeError, ValueError):
+            stream.close()
+            raise RuntimeError(
+                "Query result is not JSON serializable"
+            ) from None
         if serialized_bytes > max_serialized_bytes:
             stream.close()
             raise RuntimeError(
@@ -2650,40 +3043,70 @@ def query_sql(
             )
         try:
             for batch in stream:
-                # Convert one row at a time. ``RecordBatch.to_pylist()`` would
-                # allocate a second copy of the complete batch before the byte
-                # guard gets a chance to stop consumption.
-                for row_index in range(batch.num_rows):
-                    row = [
-                        _json_safe_result_value(
-                            batch.column(column_index)[row_index].as_py()
-                        )
-                        for column_index in range(batch.num_columns)
-                    ]
+                # Convert each bounded Arrow column in one native call. The
+                # former scalar ``as_py`` loop crossed the Python/C boundary
+                # once per cell. At the configured 256-row/4-MiB batch limits,
+                # temporary conversion state stays bounded and the complete
+                # batch is admitted atomically by the exact wire-size guard.
+                raw_rows: Optional[Iterable[Tuple[Any, ...]]] = None
+                if _arrow_batch_preserves_values_through_pandas(batch):
                     try:
-                        encoded = json.dumps(
-                            row,
-                            ensure_ascii=False,
-                            allow_nan=False,
-                            separators=(",", ":"),
-                        ).encode("utf-8")
-                    except (TypeError, ValueError) as exc:
-                        raise RuntimeError(
-                            "Query result is not JSON serializable"
-                        ) from exc
-                    serialized_bytes += len(encoded) + (1 if rows else 0)
-                    if serialized_bytes > max_serialized_bytes:
-                        cancel = getattr(stream, "cancel", None)
-                        try:
-                            if callable(cancel):
-                                cancel()
-                        except Exception:
-                            pass
-                        raise RuntimeError(
-                            "Query result exceeds "
-                            "SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES"
+                        pandas_batch = batch.to_pandas()
+                    except Exception:
+                        # Extremely wide/out-of-range temporal domains may not
+                        # be representable by the installed pandas version.
+                        # Preserve the Arrow scalar contract in that case.
+                        pass
+                    else:
+                        raw_rows = pandas_batch.itertuples(
+                            index=False, name=None,
                         )
-                    rows.append(row)
+                if raw_rows is None:
+                    if batch.num_columns:
+                        python_columns = [
+                            batch.column(column_index).to_pylist()
+                            for column_index in range(batch.num_columns)
+                        ]
+                        raw_rows = zip(*python_columns)
+                    else:
+                        raw_rows = (() for _ in range(batch.num_rows))
+                batch_rows = [
+                    [
+                        _json_safe_result_value(value)
+                        for value in raw_row
+                    ]
+                    for raw_row in raw_rows
+                ]
+                try:
+                    encoded_batch = json.dumps(
+                        batch_rows,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                except (TypeError, ValueError):
+                    raise RuntimeError(
+                        "Query result is not JSON serializable"
+                    ) from None
+                # Remove the batch's surrounding ``[]``. The response's rows
+                # array already contributes those two bytes in the skeleton;
+                # only a comma between non-empty batches remains to add.
+                additional_bytes = len(encoded_batch) - 2
+                if rows and batch_rows:
+                    additional_bytes += 1
+                if serialized_bytes + additional_bytes > max_serialized_bytes:
+                    cancel = getattr(stream, "cancel", None)
+                    try:
+                        if callable(cancel):
+                            cancel()
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        "Query result exceeds "
+                        "SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES"
+                    )
+                serialized_bytes += additional_bytes
+                rows.extend(batch_rows)
         finally:
             stream.close()
             _update_query_out(reader, out, requested_engine=engine)
@@ -2692,13 +3115,59 @@ def query_sql(
     # Convert DataFrame to the expected format
     result_df = result_value
     columns = list(result_df.columns)
+    result_dtypes = list(result_df.dtypes)
+    spark_type_codes: Tuple[str, ...] = ()
+    spark_utc_timestamp_indexes: frozenset[int] = frozenset()
+    if spark_materialized_response:
+        from supertable.engine.spark_thrift import (
+            SPARK_RESULT_TYPE_CODES_ATTR,
+            SPARK_THRIFT_TYPE_CODES,
+            SPARK_UTC_TIMESTAMP_INDEXES_ATTR,
+        )
+
+        attrs = getattr(result_df, "attrs", {})
+        raw_type_codes = (
+            attrs.get(SPARK_RESULT_TYPE_CODES_ATTR)
+            if isinstance(attrs, dict)
+            else None
+        )
+        raw_utc_indexes = (
+            attrs.get(SPARK_UTC_TIMESTAMP_INDEXES_ATTR)
+            if isinstance(attrs, dict)
+            else None
+        )
+        if (
+            type(raw_type_codes) is not tuple
+            or len(raw_type_codes) != len(columns)
+            or not raw_type_codes
+            or any(
+                type(code) is not str or code not in SPARK_THRIFT_TYPE_CODES
+                for code in raw_type_codes
+            )
+            or type(raw_utc_indexes) is not tuple
+            or any(type(index) is not int for index in raw_utc_indexes)
+        ):
+            raise RuntimeError(_QUERY_EXECUTION_ERROR)
+        spark_type_codes = raw_type_codes
+        expected_utc_indexes = tuple(
+            index
+            for index, code in enumerate(spark_type_codes)
+            if code == "TIMESTAMP_TYPE"
+        )
+        if raw_utc_indexes != expected_utc_indexes:
+            raise RuntimeError(_QUERY_EXECUTION_ERROR)
+        spark_utc_timestamp_indexes = frozenset(raw_utc_indexes)
     columns_meta = [
         {
             "name": col,
-            "type": str(result_df[col].dtype),
+            "type": (
+                _SPARK_PUBLIC_RESULT_TYPE_NAMES[spark_type_codes[index]]
+                if spark_type_codes
+                else str(result_dtypes[index])
+            ),
             "nullable": True
         }
-        for col in columns
+        for index, col in enumerate(columns)
     ]
 
     # Sanitize pandas NA variants (pd.NA, pd.NaT, np.nan) to Python None
@@ -2707,32 +3176,58 @@ def query_sql(
     # nullable dtypes (Int64, string) or np.nan in float columns.
     # We must sanitize the final Python objects after .tolist().
     rows = []
-    serialized_bytes = len(json.dumps(
-        {"columns": columns, "rows": [], "columns_meta": columns_meta},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8"))
+    try:
+        serialized_bytes = _json_wire_size({
+            "columns": columns,
+            "rows": [],
+            "columns_meta": columns_meta,
+        })
+    except (TypeError, ValueError):
+        raise RuntimeError("Query result is not JSON serializable") from None
     if serialized_bytes > max_serialized_bytes:
         raise RuntimeError(
             "Query result exceeds SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES"
         )
-    for raw_row in result_df.itertuples(index=False, name=None):
-        row = [_json_safe_result_value(value) for value in raw_row]
+    result_batch_rows = _configured_result_stream_batch_rows()
+    pending_rows: List[List[Any]] = []
+
+    def admit_pending_rows() -> None:
+        nonlocal serialized_bytes
+        if not pending_rows:
+            return
         try:
-            encoded = json.dumps(
-                row,
+            encoded_batch = json.dumps(
+                pending_rows,
                 ensure_ascii=False,
                 allow_nan=False,
                 separators=(",", ":"),
             ).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("Query result is not JSON serializable") from exc
-        serialized_bytes += len(encoded) + (1 if rows else 0)
-        if serialized_bytes > max_serialized_bytes:
+        except (TypeError, ValueError):
+            raise RuntimeError("Query result is not JSON serializable") from None
+        additional_bytes = len(encoded_batch) - 2
+        if rows:
+            additional_bytes += 1
+        if serialized_bytes + additional_bytes > max_serialized_bytes:
             raise RuntimeError(
                 "Query result exceeds SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES"
             )
-        rows.append(row)
+        serialized_bytes += additional_bytes
+        rows.extend(pending_rows)
+        pending_rows.clear()
+
+    for raw_row in result_df.itertuples(index=False, name=None):
+        pending_rows.append([
+            _json_safe_result_value(
+                value,
+                assume_naive_datetime_utc=(
+                    column_index in spark_utc_timestamp_indexes
+                ),
+            )
+            for column_index, value in enumerate(raw_row)
+        ])
+        if len(pending_rows) >= result_batch_rows:
+            admit_pending_rows()
+    admit_pending_rows()
 
     return columns, rows, columns_meta
 
@@ -2767,8 +3262,10 @@ def query_sql_policy_fingerprint(
     _ensure_request_active(request_deadline, cancel_event)
     try:
         command = classify_query(sql, super_name)
-    except ValueError as exc:
-        raise ValueError("policy query must be one valid SELECT statement") from exc
+    except ValueError:
+        raise ValueError(
+            "policy query must be one valid SELECT statement"
+        ) from None
     if command.kind is not CommandKind.SELECT:
         raise ValueError("policy query must be a SELECT statement")
 
@@ -2835,8 +3332,10 @@ def estimate_query_sql(
     _ensure_request_active(request_deadline, cancel_event)
     try:
         command = classify_query(sql, super_name)
-    except ValueError as exc:
-        raise ValueError("estimate query must be one valid SELECT statement") from exc
+    except ValueError:
+        raise ValueError(
+            "estimate query must be one valid SELECT statement"
+        ) from None
     if command.kind is not CommandKind.SELECT:
         raise ValueError("estimate query must be a SELECT statement")
     reader = DataReader(
@@ -2970,8 +3469,10 @@ def query_sql_stream(
         raise ValueError("max_total_rows must be a positive integer")
     try:
         command = classify_query(sql, super_name)
-    except ValueError as exc:
-        raise ValueError("export query must be one valid SELECT statement") from exc
+    except ValueError:
+        raise ValueError(
+            "export query must be one valid SELECT statement"
+        ) from None
     if command.kind is not CommandKind.SELECT:
         raise ValueError("export query must be a SELECT statement")
 
@@ -3035,7 +3536,7 @@ def query_sql_stream(
     _update_query_out(reader, out, requested_engine=engine)
     if status == Status.ERROR:
         _cancel_and_close_stream(stream)
-        raise RuntimeError(f"Query execution failed: {message}")
+        raise RuntimeError(_QUERY_EXECUTION_ERROR)
     return _QueryOutResultStream(
         stream,
         lambda: _update_query_out(reader, out, requested_engine=engine),

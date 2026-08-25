@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Iterable, List, Dict, Any, Optional
 
 from supertable.config.defaults import logger
+from supertable.mirroring.failure_safety import mirror_error_type
 from supertable.redis_catalog import RedisCatalog
 from supertable.tombstone_manifest_v2 import (
     TombstoneManifestV2Error,
@@ -46,12 +47,34 @@ class MirrorSyncError(RuntimeError):
         self.completed_formats = tuple(completed_formats)
         self.cause = cause
         cause_detail = (
-            f", error={type(cause).__name__}: {cause}" if cause is not None else ""
+            f", error_type={mirror_error_type(cause)}"
+            if cause is not None
+            else ""
         )
         super().__init__(
             f"Mirror sync failed for table {table_name!r}, format "
             f"{failed_format}; completed={list(self.completed_formats)!r}"
             f"{cause_detail}"
+        )
+
+
+class MirrorRecoveryError(RuntimeError):
+    """A recovery-stage failure whose public text cannot expose its cause."""
+
+    def __init__(
+        self,
+        *,
+        table_name: str,
+        stage: str,
+        cause: Exception,
+    ) -> None:
+        self.table_name = table_name
+        self.stage = stage
+        self.error_type = mirror_error_type(cause)
+        self.cause = cause
+        super().__init__(
+            f"Mirror recovery failed for table {table_name!r}; "
+            f"stage={stage}, error_type={self.error_type}"
         )
 
 
@@ -115,8 +138,8 @@ class MirrorRecoveryConfirmationRequired(RuntimeError):
             "Mirror recovery requires explicit confirmation that the previous "
             "publisher has stopped for "
             f"{organization}/{super_name}/{table_name}; "
-            f"expected_commit_id={commit_id!r}, "
-            f"expected_previous_owner={publication_owner!r}"
+            f"expected_commit_id={commit_id!r}. The exact previous owner is "
+            "available only as structured recovery metadata."
         )
 
 
@@ -152,10 +175,10 @@ def _canonical_snapshot_bytes(snapshot: Dict[str, Any]) -> bytes:
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError):
         raise RuntimeError(
             "Committed mirror snapshot is not canonical JSON"
-        ) from exc
+        ) from None
 
 
 class MirrorFormats:
@@ -243,12 +266,12 @@ class MirrorFormats:
             tombstone_state = normalize_snapshot_tombstone_state(
                 simple_snapshot,
             )
-        except (TypeError, TombstoneManifestV2Error) as exc:
+        except (TypeError, TombstoneManifestV2Error):
             raise RuntimeError(
                 "Cannot mirror a snapshot with an active deletion vector or "
                 "invalid deletion-vector state; compact/drain and repair the "
                 "snapshot first"
-            ) from exc
+            ) from None
         if tombstone_state.pointer is not None:
             raise RuntimeError(
                 "Cannot mirror a snapshot with an active deletion vector; "
@@ -291,7 +314,7 @@ class MirrorFormats:
                     failed_format=mirror_format,
                     completed_formats=completed,
                     cause=exc,
-                ) from exc
+                ) from None
             completed.append(mirror_format)
         return completed
 
@@ -330,7 +353,14 @@ class MirrorFormats:
                 f"Could not acquire mirror recovery lock for {org}/{sup}/{table_name}"
         )
         try:
-            state = catalog.get_mirror_publication(org, sup, table_name)
+            try:
+                state = catalog.get_mirror_publication(org, sup, table_name)
+            except Exception as exc:
+                raise MirrorRecoveryError(
+                    table_name=table_name,
+                    stage="state_read",
+                    cause=exc,
+                ) from None
             if state is None:
                 return state
             if not isinstance(state, dict):
@@ -353,7 +383,14 @@ class MirrorFormats:
                     "Mirror publication state is missing immutable identity"
                 )
 
-            leaf = catalog.get_leaf(org, sup, table_name)
+            try:
+                leaf = catalog.get_leaf(org, sup, table_name)
+            except Exception as exc:
+                raise MirrorRecoveryError(
+                    table_name=table_name,
+                    stage="leaf_read",
+                    cause=exc,
+                ) from None
             leaf_matches = bool(
                 isinstance(leaf, dict)
                 and str(leaf.get("commit_id") or "") == commit_id
@@ -389,15 +426,22 @@ class MirrorFormats:
                     raise RuntimeError(
                         "Catalog does not support durable mirror owner claims"
                     )
-                claimed = catalog.claim_mirror_publication(
-                    org,
-                    sup,
-                    table_name,
-                    commit_id=commit_id,
-                    expected_previous_owner=publication_owner,
-                    lock_token=token,
-                    confirm_previous_owner_stopped=exact_confirmation,
-                )
+                try:
+                    claimed = catalog.claim_mirror_publication(
+                        org,
+                        sup,
+                        table_name,
+                        commit_id=commit_id,
+                        expected_previous_owner=publication_owner,
+                        lock_token=token,
+                        confirm_previous_owner_stopped=exact_confirmation,
+                    )
+                except Exception as exc:
+                    raise MirrorRecoveryError(
+                        table_name=table_name,
+                        stage="owner_claim",
+                        cause=exc,
+                    ) from None
                 if (
                     not isinstance(claimed, dict)
                     or str(claimed.get("commit_id") or "") != commit_id
@@ -418,11 +462,19 @@ class MirrorFormats:
                 error = RuntimeError(
                     "Prepared mirror publication has no committed core snapshot"
                 )
-                return catalog.fail_mirror_publication(
-                    org, sup, table_name, commit_id=commit_id,
-                    lock_token=token, failure_stage="recovery:core_not_committed",
-                    error=error,
-                )
+                try:
+                    return catalog.fail_mirror_publication(
+                        org, sup, table_name, commit_id=commit_id,
+                        lock_token=token,
+                        failure_stage="recovery:core_not_committed",
+                        error=error,
+                    )
+                except Exception as exc:
+                    raise MirrorRecoveryError(
+                        table_name=table_name,
+                        stage="failure_state",
+                        cause=exc,
+                    ) from None
             if not leaf_matches:
                 raise RuntimeError(
                     "Current catalog leaf does not match the mirror recovery commit"
@@ -443,7 +495,14 @@ class MirrorFormats:
                     "Committed catalog leaf has no complete mirror snapshot payload"
                 )
 
-            stored_snapshot = super_table.storage.read_json(snapshot_path)
+            try:
+                stored_snapshot = super_table.storage.read_json(snapshot_path)
+            except Exception as exc:
+                raise MirrorRecoveryError(
+                    table_name=table_name,
+                    stage="snapshot_read",
+                    cause=exc,
+                ) from None
             stored_snapshot = complete_snapshot_payload(
                 stored_snapshot,
                 expected_version=leaf.get("version"),
@@ -488,16 +547,34 @@ class MirrorFormats:
                     verify=True,
                 )
             except Exception as exc:
-                catalog.fail_mirror_publication(
+                try:
+                    catalog.fail_mirror_publication(
+                        org, sup, table_name, commit_id=commit_id,
+                        lock_token=token, failure_stage="recovery:mirror",
+                        error=exc,
+                    )
+                except Exception as state_exc:
+                    raise MirrorRecoveryError(
+                        table_name=table_name,
+                        stage="failure_state",
+                        cause=state_exc,
+                    ) from None
+                raise MirrorRecoveryError(
+                    table_name=table_name,
+                    stage="mirror",
+                    cause=exc,
+                ) from None
+            try:
+                return catalog.complete_mirror_publication(
                     org, sup, table_name, commit_id=commit_id,
-                    lock_token=token, failure_stage="recovery:mirror",
-                    error=exc,
+                    lock_token=token,
                 )
-                raise
-            return catalog.complete_mirror_publication(
-                org, sup, table_name, commit_id=commit_id,
-                lock_token=token,
-            )
+            except Exception as exc:
+                raise MirrorRecoveryError(
+                    table_name=table_name,
+                    stage="completion",
+                    cause=exc,
+                ) from None
         finally:
             catalog.release_simple_lock(org, sup, table_name, token)
 
@@ -506,6 +583,7 @@ __all__ = [
     "FormatMirror",
     "MirrorFormats",
     "MirrorSyncError",
+    "MirrorRecoveryError",
     "MirrorPublicationError",
     "MirrorRecoveryConfirmationRequired",
 ]

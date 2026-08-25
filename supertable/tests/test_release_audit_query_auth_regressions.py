@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 import json
+import threading
+import time
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -487,6 +489,485 @@ def test_query_sql_timestamptz_rows_and_metadata_are_session_timezone_stable(
     ] * 3
 
 
+@pytest.mark.parametrize("row_count", [200, 5_000, 10_000])
+@pytest.mark.parametrize("shape", ["narrow", "wide"])
+def test_query_sql_inline_sizes_keep_exact_wire_contract(
+    monkeypatch, row_count, shape,
+):
+    if shape == "narrow":
+        table = pa.table({
+            "id": pa.array(range(row_count), type=pa.int64()),
+            "value": pa.array(["value"] * row_count),
+        })
+    else:
+        table = pa.table({
+            f"column_{index}": pa.array(["x" * 32] * row_count)
+            for index in range(20)
+        })
+    reader = MagicMock()
+    stream = duckdb_engine.ArrowBatchStream.from_table(
+        table, max_chunksize=256,
+    )
+    reader.execute_stream.return_value = (
+        stream, data_reader.Status.OK, None,
+    )
+    monkeypatch.setattr(data_reader, "DataReader", lambda **_kwargs: reader)
+
+    columns, rows, metadata = data_reader.query_sql(
+        "org", "shop", "SELECT * FROM events", 10_000,
+        Engine.DUCKDB, "reader",
+    )
+
+    assert len(rows) == row_count
+    assert len(columns) == (2 if shape == "narrow" else 20)
+    assert all(len(row) == len(columns) for row in rows)
+    payload = {"columns": columns, "rows": rows, "columns_meta": metadata}
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert data_reader._json_wire_size(payload) == len(encoded)
+    assert len(encoded) <= 16 * 1024 * 1024
+    assert stream.closed is True
+
+
+def test_query_sql_inline_guard_serializes_bounded_batches_not_individual_rows(
+    monkeypatch,
+):
+    reader = MagicMock()
+    stream = duckdb_engine.ArrowBatchStream.from_table(pa.table({
+        "id": list(range(200)),
+        "value": ["text"] * 200,
+    }))
+    reader.execute_stream.return_value = (
+        stream, data_reader.Status.OK, None,
+    )
+    monkeypatch.setattr(data_reader, "DataReader", lambda **_kwargs: reader)
+
+    real_dumps = json.dumps
+    encoded_batches = []
+
+    def observe_bounded_json(value, *args, **kwargs):
+        encoded_batches.append(value)
+        return real_dumps(value, *args, **kwargs)
+
+    monkeypatch.setattr(data_reader.json, "dumps", observe_bounded_json)
+    columns, rows, _metadata = data_reader.query_sql(
+        "org", "shop", "SELECT * FROM events", 10_000,
+        Engine.DUCKDB, "reader",
+    )
+
+    assert columns == ["id", "value"]
+    assert len(rows) == 200
+    assert len(encoded_batches) == 1
+    assert encoded_batches[0] == rows
+
+
+def test_json_wire_size_matches_compact_encoder_for_escaped_nested_values():
+    value = {
+        "plain": [None, True, False, -0.0, 123456789],
+        "escaped": ['quote"slash\\', "\x00\b\t\n\f\r\x1f"],
+        "unicode": ["árvíztűrő", "😀", "line\u2028separator"],
+    }
+    expected = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert data_reader._json_wire_size(value) == len(expected)
+
+
+def test_vectorized_arrow_conversion_matches_scalar_public_contract(monkeypatch):
+    table = pa.table({
+        "signed": pa.array([-(1 << 63), (1 << 63) - 1], type=pa.int64()),
+        "unsigned": pa.array([0, (1 << 64) - 1], type=pa.uint64()),
+        "number": pa.array([float("nan"), 1.25], type=pa.float64()),
+        "text": pa.array(["árvíz\n😀", None], type=pa.string()),
+        "flag": pa.array([True, None], type=pa.bool_()),
+        "binary": pa.array([b"abc", None], type=pa.binary()),
+        "decimal": pa.array(
+            [Decimal("12.30"), None], type=pa.decimal128(8, 2),
+        ),
+        "day": pa.array([date(2026, 8, 24), None], type=pa.date32()),
+        "instant": pa.array(
+            [datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc), None],
+            type=pa.timestamp("us", tz="UTC"),
+        ),
+    })
+    batch = table.to_batches()[0]
+    assert data_reader._arrow_batch_preserves_values_through_pandas(batch)
+    scalar_contract = [
+        [
+            data_reader._json_safe_result_value(
+                batch.column(column_index)[row_index].as_py()
+            )
+            for column_index in range(batch.num_columns)
+        ]
+        for row_index in range(batch.num_rows)
+    ]
+    reader = MagicMock()
+    reader.execute_stream.return_value = (
+        duckdb_engine.ArrowBatchStream.from_table(table),
+        data_reader.Status.OK,
+        None,
+    )
+    monkeypatch.setattr(data_reader, "DataReader", lambda **_kwargs: reader)
+
+    _columns, rows, _metadata = data_reader.query_sql(
+        "org", "shop", "SELECT * FROM events", 10_000,
+        Engine.DUCKDB, "reader",
+    )
+
+    assert rows == scalar_contract
+
+
+def test_nullable_integer_batch_keeps_exact_arrow_scalar_path():
+    batch = pa.record_batch({
+        "value": pa.array([1, None], type=pa.int64()),
+    })
+    assert not data_reader._arrow_batch_preserves_values_through_pandas(batch)
+
+
+def test_materialized_inline_path_batches_exact_byte_accounting(monkeypatch):
+    row_count = 5_000
+    frame = pd.DataFrame({
+        "id": range(row_count),
+        "payload": ["quoted\"\\\nárvíz"] * row_count,
+    })
+    reader = MagicMock()
+    reader.execute.return_value = (
+        frame, data_reader.Status.OK, None,
+    )
+    monkeypatch.setattr(data_reader, "DataReader", lambda **_kwargs: reader)
+
+    columns, rows, metadata = data_reader.query_sql(
+        "org", "shop", "SELECT * FROM events", 10_000,
+        "custom-materialized-engine", "reader",
+    )
+
+    payload = {"columns": columns, "rows": rows, "columns_meta": metadata}
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    assert len(rows) == row_count
+    assert data_reader._json_wire_size(payload) == len(encoded)
+    assert len(encoded) <= 16 * 1024 * 1024
+
+
+def _mark_spark_result_frame(
+    frame: pd.DataFrame,
+    type_codes: tuple[str, ...],
+) -> pd.DataFrame:
+    from supertable.engine.spark_thrift import (
+        SPARK_RESULT_TYPE_CODES_ATTR,
+        SPARK_UTC_TIMESTAMP_INDEXES_ATTR,
+    )
+
+    frame.attrs[SPARK_RESULT_TYPE_CODES_ATTR] = type_codes
+    frame.attrs[SPARK_UTC_TIMESTAMP_INDEXES_ATTR] = tuple(
+        index
+        for index, code in enumerate(type_codes)
+        if code == "TIMESTAMP_TYPE"
+    )
+    return frame
+
+
+def test_spark_query_sql_uses_bounded_materialization(monkeypatch):
+    frame = _mark_spark_result_frame(
+        pd.DataFrame({"id": [1], "payload": ["ok"]}),
+        ("BIGINT_TYPE", "STRING_TYPE"),
+    )
+    reader = MagicMock()
+    reader.execute.return_value = (
+        frame, data_reader.Status.OK, None,
+    )
+    constructed: dict[str, object] = {}
+
+    def make_reader(**kwargs):
+        constructed.update(kwargs)
+        return reader
+
+    monkeypatch.setattr(data_reader, "DataReader", make_reader)
+    monkeypatch.setattr(
+        data_reader,
+        "settings",
+        SimpleNamespace(
+            SUPERTABLE_MAX_LIMIT=10_000,
+            SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES=123_456,
+            SUPERTABLE_RESULT_STREAM_BATCH_ROWS=256,
+        ),
+    )
+    cancel_event = threading.Event()
+    started = time.monotonic()
+
+    columns, rows, metadata = data_reader.query_sql(
+        "org", "shop", "SELECT * FROM events", 10_000,
+        Engine.SPARK_SQL, "reader", timeout_sec=5,
+        cancel_event=cancel_event,
+    )
+
+    assert constructed["query"] == "SELECT * FROM events\nLIMIT 10000"
+    assert columns == ["id", "payload"]
+    assert rows == [[1, "ok"]]
+    assert [item["name"] for item in metadata] == ["id", "payload"]
+    reader.execute_stream.assert_not_called()
+    kwargs = reader.execute.call_args.kwargs
+    assert kwargs["role_name"] == "reader"
+    assert kwargs["engine"] is Engine.SPARK_SQL
+    assert kwargs["with_scan"] is False
+    assert kwargs["_materialized_row_limit"] == 10_000
+    assert kwargs["_materialized_result_bytes"] == 123_456
+    assert started + 4.9 < kwargs["_deadline_monotonic"] <= time.monotonic() + 5
+    assert kwargs["_cancel_event"] is cancel_event
+
+
+def test_spark_query_sql_preserves_scalars_and_marks_ltz(monkeypatch):
+    ancient_instant = datetime(1, 1, 1, 0, 0, 0, 1)
+    future_instant = datetime(9999, 12, 31, 23, 59, 59, 999999)
+    frame = _mark_spark_result_frame(
+        pd.DataFrame(
+            [
+                (None, 9_007_199_254_740_993, ancient_instant, future_instant),
+                (1, None, datetime(2026, 1, 1), datetime(2026, 1, 1)),
+            ],
+            columns=["id", "id", "instant", "future_instant"],
+            dtype=object,
+        ),
+        (
+            "BIGINT_TYPE", "BIGINT_TYPE", "TIMESTAMP_TYPE", "TIMESTAMP_TYPE",
+        ),
+    )
+    reader = MagicMock()
+    reader.execute.return_value = frame, data_reader.Status.OK, None
+    monkeypatch.setattr(data_reader, "DataReader", lambda **_kwargs: reader)
+
+    columns, rows, metadata = data_reader.query_sql(
+        "org", "shop", "SELECT * FROM events", 10_000,
+        Engine.SPARK_SQL, "reader",
+    )
+
+    assert columns == ["id", "id", "instant", "future_instant"]
+    assert rows == [
+        [
+            None,
+            9_007_199_254_740_993,
+            "0001-01-01T00:00:00.000001Z",
+            "9999-12-31T23:59:59.999999Z",
+        ],
+        [
+            1,
+            None,
+            "2026-01-01T00:00:00.000000Z",
+            "2026-01-01T00:00:00.000000Z",
+        ],
+    ]
+    assert [item["name"] for item in metadata] == columns
+    assert [item["type"] for item in metadata] == [
+        "int64", "int64", "datetime64[ns]", "datetime64[ns]",
+    ]
+    assert type(rows[0][1]) is int
+    assert reader.execute.call_args.kwargs["_materialized_row_limit"] == 10_000
+
+
+@pytest.mark.parametrize(
+    "metadata_case",
+    [
+        "missing",
+        "list_type_codes",
+        "unknown_type_code",
+        "missing_utc_indexes",
+        "partial_timestamp_indexes",
+        "non_temporal_index",
+        "duplicate_timestamp_index",
+        "reversed_timestamp_indexes",
+    ],
+)
+def test_spark_query_sql_rejects_incoherent_result_metadata(
+    monkeypatch,
+    metadata_case,
+):
+    from supertable.engine.spark_thrift import (
+        SPARK_RESULT_TYPE_CODES_ATTR,
+        SPARK_UTC_TIMESTAMP_INDEXES_ATTR,
+    )
+
+    frame = pd.DataFrame(
+        [(datetime(2026, 1, 1), datetime(2026, 1, 2))],
+        columns=["first", "second"],
+        dtype=object,
+    )
+    if metadata_case != "missing":
+        frame.attrs[SPARK_RESULT_TYPE_CODES_ATTR] = (
+            "TIMESTAMP_TYPE", "TIMESTAMP_TYPE",
+        )
+        frame.attrs[SPARK_UTC_TIMESTAMP_INDEXES_ATTR] = (0, 1)
+    if metadata_case == "list_type_codes":
+        frame.attrs[SPARK_RESULT_TYPE_CODES_ATTR] = [
+            "TIMESTAMP_TYPE", "TIMESTAMP_TYPE",
+        ]
+    elif metadata_case == "unknown_type_code":
+        frame.attrs[SPARK_RESULT_TYPE_CODES_ATTR] = (
+            "UNKNOWN_TYPE", "TIMESTAMP_TYPE",
+        )
+    elif metadata_case == "missing_utc_indexes":
+        del frame.attrs[SPARK_UTC_TIMESTAMP_INDEXES_ATTR]
+    elif metadata_case == "partial_timestamp_indexes":
+        frame.attrs[SPARK_UTC_TIMESTAMP_INDEXES_ATTR] = (0,)
+    elif metadata_case == "non_temporal_index":
+        frame.attrs[SPARK_RESULT_TYPE_CODES_ATTR] = (
+            "BIGINT_TYPE", "TIMESTAMP_TYPE",
+        )
+    elif metadata_case == "duplicate_timestamp_index":
+        frame.attrs[SPARK_UTC_TIMESTAMP_INDEXES_ATTR] = (0, 0, 1)
+    elif metadata_case == "reversed_timestamp_indexes":
+        frame.attrs[SPARK_UTC_TIMESTAMP_INDEXES_ATTR] = (1, 0)
+
+    reader = MagicMock()
+    reader.execute.return_value = frame, data_reader.Status.OK, None
+    monkeypatch.setattr(data_reader, "DataReader", lambda **_kwargs: reader)
+
+    with pytest.raises(RuntimeError, match=r"^Query execution failed$"):
+        data_reader.query_sql(
+            "org", "shop", "SELECT * FROM events", 10_000,
+            Engine.SPARK_SQL, "reader",
+        )
+
+
+def test_spark_query_sql_normalizes_all_thrift_metadata_types(monkeypatch):
+    type_codes = (
+        "BOOLEAN_TYPE",
+        "TINYINT_TYPE",
+        "SMALLINT_TYPE",
+        "INT_TYPE",
+        "BIGINT_TYPE",
+        "FLOAT_TYPE",
+        "DOUBLE_TYPE",
+        "STRING_TYPE",
+        "TIMESTAMP_TYPE",
+        "BINARY_TYPE",
+        "ARRAY_TYPE",
+        "MAP_TYPE",
+        "STRUCT_TYPE",
+        "UNION_TYPE",
+        "USER_DEFINED_TYPE",
+        "DECIMAL_TYPE",
+        "NULL_TYPE",
+        "DATE_TYPE",
+        "VARCHAR_TYPE",
+        "CHAR_TYPE",
+        "INTERVAL_YEAR_MONTH_TYPE",
+        "INTERVAL_DAY_TIME_TYPE",
+    )
+    columns = [f"c{index}" for index in range(len(type_codes))]
+    frame = _mark_spark_result_frame(
+        pd.DataFrame([tuple(None for _ in type_codes)], columns=columns),
+        type_codes,
+    )
+    reader = MagicMock()
+    reader.execute.return_value = frame, data_reader.Status.OK, None
+    monkeypatch.setattr(data_reader, "DataReader", lambda **_kwargs: reader)
+
+    _columns, _rows, metadata = data_reader.query_sql(
+        "org", "shop", "SELECT * FROM events", 10_000,
+        Engine.SPARK_SQL, "reader",
+    )
+
+    assert [item["type"] for item in metadata] == [
+        "bool",
+        "int64", "int64", "int64", "int64",
+        "float64", "float64",
+        "object",
+        "datetime64[ns]",
+        *(["object"] * 13),
+    ]
+
+
+def test_spark_query_sql_limit_zero_fails_closed_on_injected_row(monkeypatch):
+    reader = MagicMock()
+    reader.execute.return_value = (
+        _mark_spark_result_frame(
+            pd.DataFrame({"id": [1]}), ("BIGINT_TYPE",),
+        ),
+        data_reader.Status.OK,
+        None,
+    )
+    monkeypatch.setattr(data_reader, "DataReader", lambda **_kwargs: reader)
+
+    with pytest.raises(RuntimeError, match=r"^Query execution failed$"):
+        data_reader.query_sql(
+            "org", "shop", "SELECT * FROM events", 0,
+            Engine.SPARK_SQL, "reader",
+        )
+
+    assert reader.execute.call_args.kwargs["_materialized_row_limit"] == 1
+    reader.execute_stream.assert_not_called()
+
+
+def test_spark_query_sql_keeps_final_exact_wire_cap(monkeypatch):
+    reader = MagicMock()
+    reader.execute.return_value = (
+        _mark_spark_result_frame(
+            pd.DataFrame({"payload": ["x" * 1024]}),
+            ("STRING_TYPE",),
+        ),
+        data_reader.Status.OK,
+        None,
+    )
+    monkeypatch.setattr(data_reader, "DataReader", lambda **_kwargs: reader)
+    monkeypatch.setattr(
+        data_reader,
+        "settings",
+        SimpleNamespace(
+            SUPERTABLE_MAX_LIMIT=10_000,
+            SUPERTABLE_MAX_SERIALIZED_RESULT_BYTES=128,
+            SUPERTABLE_RESULT_STREAM_BATCH_ROWS=256,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="MAX_SERIALIZED_RESULT_BYTES"):
+        data_reader.query_sql(
+            "org", "shop", "SELECT * FROM events", 10_000,
+            Engine.SPARK_SQL, "reader",
+        )
+
+    assert reader.execute.call_args.kwargs["_materialized_result_bytes"] == 128
+    reader.execute_stream.assert_not_called()
+
+
+def test_spark_query_sql_error_is_stable_and_updates_out(monkeypatch):
+    reader = MagicMock()
+    reader.execute.return_value = (
+        pd.DataFrame(), data_reader.Status.ERROR,
+        "backend secret SQL and signed URL",
+    )
+    reader.query_plan_manager = SimpleNamespace(
+        query_id="spark-query-id", query_hash="spark-query-hash",
+    )
+    reader.plan_stats = SimpleNamespace(stats=[{"ENGINE": "spark_sql"}])
+    monkeypatch.setattr(data_reader, "DataReader", lambda **_kwargs: reader)
+    out: dict[str, object] = {}
+
+    with pytest.raises(RuntimeError, match=r"^Query execution failed$") as exc_info:
+        data_reader.query_sql(
+            "org", "shop", "SELECT * FROM events", 25,
+            Engine.SPARK_SQL, "reader", out=out,
+        )
+
+    assert "backend secret" not in str(exc_info.value)
+    assert out["query_id"] == "spark-query-id"
+    assert out["query_hash"] == "spark-query-hash"
+    assert out["requested_engine"] == "spark_sql"
+    assert out["actual_engine"] == "spark_sql"
+    assert reader.execute.call_args.kwargs["_materialized_row_limit"] == 25
+    reader.execute_stream.assert_not_called()
+
+
 def test_data_reader_public_duckdb_stream_uses_normal_bounded_preflight(monkeypatch):
     parser = MagicMock()
     parser.original_query = "SELECT * FROM events\nLIMIT 10000"
@@ -840,10 +1321,13 @@ def test_duckdb_deadline_interrupts_query_cursor(monkeypatch):
             parser,
             manager,
             lambda _event: None,
-            timeout_sec=0.01,
+            # ImmediateTimer fires the query watchdog deterministically. Keep
+            # enough wall-clock headroom that a loaded full-suite worker cannot
+            # expire during setup and test the wrong (pre-query) timeout phase.
+            timeout_sec=1.0,
         )
 
     connection.interrupt.assert_called_once_with()
     assert len(timers) == 2
-    assert 0 < timers[1].seconds <= 0.01
+    assert 0 < timers[1].seconds <= 1.0
     assert all(timer.cancelled for timer in timers)

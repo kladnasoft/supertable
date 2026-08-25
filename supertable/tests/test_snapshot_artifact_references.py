@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import traceback
 
 import pytest
 
@@ -111,6 +112,61 @@ def test_gc_traversal_never_returns_an_unexpanded_v2_root():
             super_name=SUPER,
             simple_name=TABLE,
         )
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, TombstoneManifestV2Error])
+def test_custom_manifest_loader_failure_never_exposes_backend_details(failure_type):
+    secret = "signed-url-token-DO-NOT-LOG"
+
+    def fail(_path):
+        raise failure_type(f"backend-secret-{secret}")
+
+    with pytest.raises(TombstoneManifestV2Error) as caught:
+        referenced_snapshot_artifacts(
+            _v2_snapshot(_manifest()),
+            organization=ORG,
+            super_name=SUPER,
+            simple_name=TABLE,
+            manifest_loader=fail,
+        )
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value), caught.value, caught.value.__traceback__,
+        )
+    )
+    assert str(caught.value) == (
+        "cannot read tombstone manifest; "
+        f"error_type={failure_type.__name__}"
+    )
+    assert secret not in rendered
+
+
+def test_bounded_manifest_observation_failure_redacts_path_and_backend_message():
+    secret = "absolute-path-and-token-DO-NOT-LOG"
+
+    class FailingStorage:
+        def stat_object(self, _path):
+            raise RuntimeError(f"backend-secret-{secret}")
+
+        def read_range(self, *_args, **_kwargs):
+            raise AssertionError("read must not follow a failed observation")
+
+    with pytest.raises(TombstoneManifestV2Error) as caught:
+        read_bounded_tombstone_manifest_bytes(
+            FailingStorage(),
+            f"acme/lake/tables/events/tombstone/{secret}.json",
+        )
+
+    rendered = "".join(
+        traceback.format_exception(
+            type(caught.value), caught.value, caught.value.__traceback__,
+        )
+    )
+    assert str(caught.value) == (
+        "cannot observe tombstone manifest; error_type=RuntimeError"
+    )
+    assert secret not in rendered
 
 
 def test_gc_storage_loader_checks_manifest_size_before_reading():

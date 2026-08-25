@@ -32,6 +32,7 @@ from supertable.audit.events import (
     _uuid7,
     make_detail,
 )
+from supertable.tests.fork_semantics_probe import run_fork_probe
 
 
 # ---------------------------------------------------------------------------
@@ -88,21 +89,56 @@ class TestEnums:
 
 
 class TestInstanceId:
-    def test_format_is_host_dash_pid(self) -> None:
-        assert "-" in INSTANCE_ID
-        host, pid = INSTANCE_ID.rsplit("-", 1)
-        assert host
-        assert pid.isdigit()
+    def test_format_is_canonical_rk_safe_boot_identity(self) -> None:
+        from supertable import redis_keys as RK
 
-    def test_helper_returns_unknown_when_hostname_fails(
+        assert re.fullmatch(
+            r"audit-[0-9a-f]{12}-[0-9]{1,20}-[0-9a-f]{16}",
+            INSTANCE_ID,
+        )
+        assert len(INSTANCE_ID.encode("utf-8")) <= 64
+        assert INSTANCE_ID in RK.audit_chain_head("acme", INSTANCE_ID)
+
+    def test_hostile_hostname_is_never_exposed_and_remains_rk_safe(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def raising_hostname() -> str:
-            raise OSError("boom")
+        from supertable import redis_keys as RK
 
-        monkeypatch.setattr(ev.socket, "gethostname", raising_hostname)
+        hostile = "../TOKEN=secret\\host:\x00" + "x" * 1_000
+        monkeypatch.setattr(ev.socket, "gethostname", lambda: hostile)
+        monkeypatch.setattr(ev.os, "getpid", lambda: 42)
         result = ev._build_instance_id()
-        assert result.startswith("unknown-")
+        assert hostile not in result
+        assert "secret" not in result
+        assert result in RK.audit_chain_head("acme", result)
+
+    def test_pid_reuse_still_gets_distinct_boot_nonce(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        nonces = iter(["1" * 16, "2" * 16])
+        monkeypatch.setattr(ev.socket, "gethostname", lambda: "same-host")
+        monkeypatch.setattr(ev.os, "getpid", lambda: 7)
+        monkeypatch.setattr(ev.secrets, "token_hex", lambda _size: next(nonces))
+
+        first = ev._build_instance_id()
+        second = ev._build_instance_id()
+
+        assert first != second
+        assert first.rsplit("-", 1)[0] == second.rsplit("-", 1)[0]
+
+    @pytest.mark.skipif(
+        not hasattr(ev.os, "fork"), reason="requires POSIX fork semantics",
+    )
+    def test_forked_child_gets_a_distinct_process_identity(self) -> None:
+        result = run_fork_probe("audit_identity")
+
+        assert result["child_exitcode"] == 0
+        assert result["fork_warning_count"] == 0
+        assert result["child_identity"] != result["parent_identity"]
+        assert re.fullmatch(
+            r"audit-[0-9a-f]{12}-[0-9]{1,20}-[0-9a-f]{16}",
+            result["child_identity"],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -198,10 +234,7 @@ class TestAuditEvent:
         # Calling twice on the same event -> same hash
         assert event.event_hash() == event.event_hash()
 
-    def test_event_hash_excludes_chain_hash_and_instance_id(self) -> None:
-        # Two events identical except for chain_hash / instance_id should
-        # hash to the same value, because event_hash is a content fingerprint
-        # that is fed INTO the chain.
+    def test_event_hash_excludes_chain_hash_but_binds_instance_id(self) -> None:
         common_kwargs = dict(
             event_id="same-id",
             timestamp_ms=1234,
@@ -216,7 +249,10 @@ class TestAuditEvent:
         b_dict["instance_id"] = "different-host-1"
         b = AuditEvent.from_dict(b_dict)
 
-        assert a.event_hash() == b.event_hash()
+        assert a.event_hash() != b.event_hash()
+        c_dict = a.to_dict()
+        c_dict["chain_hash"] = "f" * 64
+        assert a.event_hash() == AuditEvent.from_dict(c_dict).event_hash()
 
     def test_event_hash_changes_with_content(self) -> None:
         a = AuditEvent(action="x", organization="acme", event_id="id-1", timestamp_ms=1)

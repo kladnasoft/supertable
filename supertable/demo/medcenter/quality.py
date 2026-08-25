@@ -257,7 +257,7 @@ def acceptance_test(data_dir: str) -> TestResult:
         return TestResult(
             name="acceptance__mart_matches_independent_totals",
             passed=False,
-            detail=f"fixture folder {invoices_dir!r} not found",
+            detail="fixture folder is unavailable",
         )
 
     frames = [

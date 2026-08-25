@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple, Union
 
 from supertable.storage.storage_interface import ObjectMetadata
+from supertable.utils.diagnostic_redaction import safe_exception_type
 from supertable.tombstone_manifest_v2 import (
     MAX_TOMBSTONE_MANIFEST_V2_BYTES,
     TOMBSTONE_FORMAT_V1,
@@ -103,8 +104,9 @@ def read_bounded_tombstone_manifest_bytes(
         metadata = stat_object(manifest_path)
     except Exception as exc:
         raise TombstoneManifestV2Error(
-            f"cannot observe tombstone manifest {manifest_path!r}"
-        ) from exc
+            "cannot observe tombstone manifest; "
+            f"error_type={safe_exception_type(exc)}"
+        ) from None
     if not isinstance(metadata, ObjectMetadata):
         raise TombstoneManifestV2Error(
             "tombstone manifest storage returned invalid object metadata"
@@ -126,8 +128,9 @@ def read_bounded_tombstone_manifest_bytes(
         sealed_identity = metadata.identity_token()
     except Exception as exc:
         raise TombstoneManifestV2Error(
-            "tombstone manifest returned an invalid object identity seal"
-        ) from exc
+            "tombstone manifest returned an invalid object identity seal; "
+            f"error_type={safe_exception_type(exc)}"
+        ) from None
     if not isinstance(sealed_identity, str) or not sealed_identity:
         raise TombstoneManifestV2Error(
             "tombstone manifest storage metadata has no immutable identity seal"
@@ -142,8 +145,9 @@ def read_bounded_tombstone_manifest_bytes(
         )
     except Exception as exc:
         raise TombstoneManifestV2Error(
-            f"cannot conditionally read tombstone manifest {manifest_path!r}"
-        ) from exc
+            "cannot conditionally read tombstone manifest; "
+            f"error_type={safe_exception_type(exc)}"
+        ) from None
     if not isinstance(payload, (bytes, bytearray, memoryview)):
         raise TombstoneManifestV2Error(
             "bounded tombstone manifest read did not return bytes"
@@ -157,8 +161,9 @@ def read_bounded_tombstone_manifest_bytes(
         after = stat_object(manifest_path)
     except Exception as exc:
         raise TombstoneManifestV2Error(
-            f"cannot reseal tombstone manifest {manifest_path!r}"
-        ) from exc
+            "cannot reseal tombstone manifest; "
+            f"error_type={safe_exception_type(exc)}"
+        ) from None
     if not isinstance(after, ObjectMetadata) or after != metadata:
         raise TombstoneManifestV2Error(
             "tombstone manifest object changed during the bounded read"
@@ -195,7 +200,8 @@ def referenced_snapshot_artifacts(
         raise TombstoneManifestV2Error("snapshot must be an object")
     if manifest_loader is not None and storage is not None:
         raise TypeError("provide storage or manifest_loader, not both")
-    if manifest_loader is None and storage is not None:
+    using_storage_loader = manifest_loader is None and storage is not None
+    if using_storage_loader:
         manifest_loader = lambda path: read_bounded_tombstone_manifest_bytes(
             storage, path,
         )
@@ -235,7 +241,7 @@ def referenced_snapshot_artifacts(
         previous = references.setdefault(path, normalized)
         if previous != normalized:
             raise TombstoneManifestV2Error(
-                f"snapshot artifact {path!r} has conflicting declarations"
+                "snapshot contains conflicting artifact declarations"
             )
 
     resources = snapshot.get("resources")
@@ -316,12 +322,22 @@ def referenced_snapshot_artifacts(
             )
         try:
             raw_manifest = manifest_loader(manifest_path)
-        except TombstoneManifestV2Error:
-            raise
+        except TombstoneManifestV2Error as exc:
+            if using_storage_loader:
+                # This branch can only contain this module's controlled,
+                # confidentiality-safe validation messages. Re-raise a fresh
+                # exception so the storage adapter traceback is not retained.
+                safe_message = exc.args[0] if exc.args else "manifest validation failed"
+                raise TombstoneManifestV2Error(safe_message) from None
+            raise TombstoneManifestV2Error(
+                "cannot read tombstone manifest; "
+                f"error_type={safe_exception_type(exc)}"
+            ) from None
         except Exception as exc:
             raise TombstoneManifestV2Error(
-                f"cannot read tombstone manifest {manifest_path!r}: {exc}"
-            ) from exc
+                "cannot read tombstone manifest; "
+                f"error_type={safe_exception_type(exc)}"
+            ) from None
         manifest = load_tombstone_manifest_v2(
             raw_manifest,
             expected_organization=organization,
