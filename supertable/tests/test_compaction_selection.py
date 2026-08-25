@@ -51,13 +51,13 @@ def data_dir(tmp_path):
 
 
 @pytest.fixture
-def patched_storage():
+def patched_storage(tmp_path):
     """Point processing's storage at a fresh LocalStorage (no state leak)."""
     from supertable import processing as proc_mod
     from supertable.storage.local_storage import LocalStorage
 
     proc_mod._storage = None
-    storage = LocalStorage()
+    storage = LocalStorage(str(tmp_path))
     with patch.object(proc_mod, "get_storage", return_value=storage):
         yield storage
     proc_mod._storage = None

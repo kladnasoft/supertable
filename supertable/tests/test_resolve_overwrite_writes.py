@@ -53,6 +53,13 @@ def _enable_write_probe(monkeypatch):
 def _clear_local_integrity_cache():
     st_processing._LOCAL_ROWID_INTEGRITY_CACHE.clear()
     st_processing._LOCAL_PROBE_SCHEMA_CACHE.clear()
+
+
+@pytest.fixture(autouse=True)
+def _root_storage_for_tmp_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        st_processing, "_get_storage", lambda: LocalStorage(str(tmp_path)),
+    )
     yield
     st_processing._LOCAL_ROWID_INTEGRITY_CACHE.clear()
     st_processing._LOCAL_PROBE_SCHEMA_CACHE.clear()
@@ -107,9 +114,9 @@ def _compare(incoming, files, keys, ntc):
 
 
 @pytest.fixture(autouse=True)
-def _local_storage():
+def _local_storage(tmp_path):
     """Force both probe and oracle reads through a real LocalStorage."""
-    with patch("supertable.processing._get_storage", return_value=LocalStorage()):
+    with patch("supertable.processing._get_storage", return_value=LocalStorage(str(tmp_path))):
         yield
 
 
@@ -414,7 +421,7 @@ class TestIslandNativeProbeSafety:
             incoming.select("key").unique(),
             incoming_schema=dict(incoming.schema),
             profiler=profiler,
-            storage=LocalStorage(),
+            storage=LocalStorage(os.path.dirname(candidate[0])),
         )
 
     @staticmethod
@@ -472,7 +479,7 @@ class TestIslandNativeProbeSafety:
             ),
         )
         assert st_processing._local_projected_parquet_bytes(
-            LocalStorage(),
+            LocalStorage(str(tmp_path)),
             [(candidate[0], candidate[2])],
             ["__rowid__", "key"],
         ) is not None
@@ -536,7 +543,7 @@ class TestIslandNativeProbeSafety:
             st_processing.pq, "read_metadata", count_metadata_reads,
         )
         assert st_processing._local_projected_parquet_bytes(
-            LocalStorage(),
+            LocalStorage(str(tmp_path)),
             [(changed[0], changed[2])],
             ["__rowid__", "key"],
         ) is not None
@@ -747,7 +754,7 @@ class TestIslandNativeProbeSafety:
 class TestLocalRowidIntegrityCache:
     @staticmethod
     def _probe(candidate, incoming, profiler, storage=None):
-        storage = storage or LocalStorage()
+        storage = storage or LocalStorage(os.path.dirname(candidate[0]))
         return st_processing._duckdb_probe_overlap_matches(
             [(candidate[0], candidate[2])],
             ["key"],
@@ -827,7 +834,7 @@ class TestLocalRowidIntegrityCache:
             assert profiler.emit_counts()["probe_rowid_integrity_cache_misses"] == 1
         with pytest.raises(ValueError, match="duplicate rowids"):
             resolve_overwrite_writes(
-                incoming, {corrupt}, ["key"], None, storage=LocalStorage(),
+                incoming, {corrupt}, ["key"], None, storage=LocalStorage(str(tmp_path)),
             )
 
     def test_lru_eviction_forces_a_rescan(self, tmp_path, monkeypatch):
@@ -888,12 +895,12 @@ class TestLocalRowidIntegrityCache:
             "__rowid__": [1, 2], "key": [7, 8],
         }))
         incoming = pl.DataFrame({"key": [7]})
-        expected = self._probe(candidate, incoming, Profiler(), LocalStorage())
+        expected = self._probe(candidate, incoming, Profiler(), LocalStorage(str(tmp_path)))
 
         for _attempt in range(2):
             profiler = Profiler()
             actual = self._probe(
-                candidate, incoming, profiler, AmbiguousLocalStorage(),
+                candidate, incoming, profiler, AmbiguousLocalStorage(str(tmp_path)),
             )
             assert actual.rows() == expected.rows()
             counts = profiler.emit_counts()

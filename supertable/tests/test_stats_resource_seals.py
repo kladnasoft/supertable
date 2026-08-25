@@ -349,7 +349,7 @@ def test_rowid_integrity_rejects_values_above_table_ceiling(monkeypatch):
 def test_compaction_outputs_carry_exact_resource_seals(tmp_path, monkeypatch):
     from supertable.storage.local_storage import LocalStorage
 
-    storage = LocalStorage()
+    storage = LocalStorage(str(tmp_path))
     monkeypatch.setattr(processing, "_storage", storage)
     source_dir = str(tmp_path / "source")
     compacted_dir = str(tmp_path / "compacted")

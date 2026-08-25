@@ -474,7 +474,7 @@ class TestWriteParquetAndCollectResources:
         from supertable.processing import write_parquet_and_collect_resources
         from supertable.storage.local_storage import LocalStorage
 
-        mock_gs.return_value = LocalStorage()
+        mock_gs.return_value = LocalStorage(str(tmp_path))
 
         df = _df(
             __timestamp__=[

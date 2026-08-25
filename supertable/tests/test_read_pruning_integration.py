@@ -137,7 +137,7 @@ def _wired(orders_on_disk, *, pruning: bool):
     """Run with the Redis seam mocked, a LOCAL storage for stats reads, and the
     URL-resolution settings pinned so reflection files stay as local paths
     (presign off, no endpoint -> _to_duckdb_path returns the raw key)."""
-    local = LocalStorage()
+    local = LocalStorage(os.path.dirname(orders_on_disk["files"][0]))
     _STATS_CACHE.clear()
     saved_storage = processing._storage
 

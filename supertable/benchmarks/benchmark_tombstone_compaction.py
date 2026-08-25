@@ -1033,7 +1033,12 @@ def run_benchmark(
         if tombstones.get_column(TOMBSTONE_FILE_COL).n_unique() != file_count:
             raise AssertionError("every source file must be touched by tombstones")
 
-        local_storage = LocalStorage()
+        # The local backend is root-confined; benchmark resources live under
+        # the corpus directory, so scope the backend to that directory.
+        storage_root = os.path.commonpath([
+            str(root), os.path.abspath(str(resources[0]["file"])),
+        ])
+        local_storage = LocalStorage(storage_root)
         footer_md_cache: dict = {}
         table_config = {
             "max_memory_chunk_size": int(target_bytes),

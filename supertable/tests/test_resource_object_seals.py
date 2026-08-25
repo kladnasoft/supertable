@@ -125,7 +125,7 @@ def test_malformed_or_legacy_resource_object_seal_fails_open(raw):
 def test_local_writer_does_not_add_redundant_provider_seal(tmp_path, monkeypatch):
     from supertable.storage.local_storage import LocalStorage
 
-    storage = LocalStorage()
+    storage = LocalStorage(str(tmp_path))
     monkeypatch.setattr(processing, "_storage", storage)
     resources = []
 

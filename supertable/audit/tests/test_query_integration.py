@@ -177,9 +177,10 @@ def test_successful_query_execution_emits_one_protected_event(
         "authorization_role": "reporting-role",
         "source": "api",
         "engine": "duckdb",
-        "row_count": 2,
-        "column_count": 1,
-    }
+            "row_count": 2,
+            "column_count": 1,
+            "outcome": "success",
+        }
 
 
 def test_abandoned_query_stream_does_not_emit_success(

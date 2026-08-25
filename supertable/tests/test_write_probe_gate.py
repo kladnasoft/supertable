@@ -31,10 +31,10 @@ from supertable.utils.profiler import Profiler
 
 
 @pytest.fixture(autouse=True)
-def _local_storage():
+def _local_storage(tmp_path):
     """Force both probe and fallback reads through a real LocalStorage so the
     on-disk tmp parquet files are read identically regardless of STORAGE_TYPE."""
-    with patch("supertable.processing._get_storage", return_value=LocalStorage()):
+    with patch("supertable.processing._get_storage", return_value=LocalStorage(str(tmp_path))):
         yield
 
 
@@ -66,7 +66,7 @@ def _auto_candidates(d, *, duplicate_first_rowid: bool = False):
             first_key = start
             expected_pair = (candidate[0], rowids[0])
     projected = st_processing._local_projected_parquet_bytes(
-        LocalStorage(),
+        LocalStorage(str(d)),
         [(path, size) for path, _overlap, size in files],
         ["__rowid__", "user_id", "updated_at"],
     )
@@ -281,7 +281,7 @@ def test_nonlocal_storage_is_not_auto_selected(tmp_path, monkeypatch):
     calls = _spy_probe(monkeypatch)
     with patch(
         "supertable.processing._get_storage",
-        return_value=_NonlocalReadableStorage(),
+            return_value=_NonlocalReadableStorage(str(tmp_path)),
     ):
         filt, pairs = _resolve(
             incoming, {f}, ["user_id"], None, Profiler(),

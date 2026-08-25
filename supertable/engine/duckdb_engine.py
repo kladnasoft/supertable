@@ -1423,8 +1423,6 @@ class DuckDB:
 
         self._begin_query_use()
         stream_owns_lease = False
-        if not _streaming:
-            self._runtime_config_lock.acquire()
         relay_lease = StableRelayLease()
         try:
             execution_reflection = reflection
@@ -2409,8 +2407,6 @@ class DuckDB:
             raise safe_error from None
 
         finally:
-            if not _streaming:
-                self._runtime_config_lock.release()
             if not stream_owns_cleanup:
                 cleanup_query()
 

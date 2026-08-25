@@ -982,7 +982,7 @@ def test_incomplete_same_height_stats_cannot_hide_overwrite_candidate(
     pl.DataFrame({"__rowid__": [1, 100], "key": [1, 100]}).write_parquet(
         path, row_group_size=1, statistics=True
     )
-    monkeypatch.setattr(processing, "_get_storage", lambda: LocalStorage())
+    monkeypatch.setattr(processing, "_get_storage", lambda: LocalStorage(str(tmp_path)))
     healthy = processing.extract_stats_rows([path])
     key_rows = healthy.filter(pl.col("column_name") == "key").sort("row_group_id")
     assert key_rows.height == 2

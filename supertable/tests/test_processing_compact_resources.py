@@ -62,7 +62,7 @@ def storage_dir(tmp_path):
     from supertable.storage.local_storage import LocalStorage
     data_dir = str(tmp_path / "warehouse" / "orders" / "data")
     os.makedirs(data_dir, exist_ok=True)
-    storage = LocalStorage()
+    storage = LocalStorage(str(tmp_path))
     return data_dir, storage
 
 
