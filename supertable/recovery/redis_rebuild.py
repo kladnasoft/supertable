@@ -33,6 +33,7 @@ from supertable.redis_catalog import (
 )
 from supertable.tombstone_manifest_v2 import (
     TombstoneManifestV2Error,
+    normalize_snapshot_tombstone_state,
 )
 from supertable.utils.snapshot import (
     complete_snapshot_payload,
@@ -548,6 +549,21 @@ def _validate_snapshot(
     payload = _read_bytes(storage, path, maximum=_MAX_SNAPSHOT_BYTES, label="snapshot")
     snapshot = _decode_json(payload, label=f"snapshot {path}")
     complete = complete_snapshot_payload(snapshot)
+    if complete is None:
+        # Immutable pre-DV snapshots legitimately omitted the pointer/rows/
+        # digest fields. Normalize that historical empty state for validation;
+        # active vectors without a digest remain rejected by the normalizer.
+        try:
+            normalize_snapshot_tombstone_state(snapshot)
+            normalized_snapshot = dict(snapshot)
+            normalized_snapshot.update({
+                "tombstone": None,
+                "tombstone_rows": 0,
+                "tombstone_digest": None,
+            })
+            complete = complete_snapshot_payload(normalized_snapshot)
+        except (TypeError, TombstoneManifestV2Error):
+            complete = None
     if complete is None:
         raise RecoveryError(
             f"snapshot {path!r} is incomplete or has an invalid deletion vector"
