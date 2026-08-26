@@ -957,6 +957,7 @@ def _iter_parquet_frames_safe(
         file_size: int = 0,
         columns: Optional[List[str]] = None,
         required: bool = False,
+        storage: Optional[object] = None,
 ) -> Optional[Iterator[polars.DataFrame]]:
     """Stream one Parquet source through a bounded spill/batch reader.
 
@@ -972,26 +973,39 @@ def _iter_parquet_frames_safe(
     # compatible, this avoids silently bypassing a caller's integrity wrapper
     # merely because the built-in storage object also supports streaming.
     if _read_parquet_safe is not _ORIGINAL_READ_PARQUET_SAFE:
+        read_kwargs: Dict[str, Any] = {
+            "profiler": p,
+            "file_size": file_size,
+            "columns": columns,
+            "required": required,
+        }
+        if storage is not None:
+            read_kwargs["storage"] = storage
         frame = _read_parquet_safe(
             path,
-            profiler=p,
-            file_size=file_size,
-            columns=columns,
-            required=required,
+            **read_kwargs,
         )
         return None if frame is None else iter((frame,))
-    if not _safe_exists(path, profiler=p, strict=required):
+    active_storage = cast(
+        StorageInterface,
+        storage if storage is not None else _get_storage(),
+    )
+    if not _safe_exists(
+        path,
+        profiler=p,
+        strict=required,
+        storage=active_storage,
+    ):
         if required:
             raise FileNotFoundError(
                 "Required parquet object is missing: "
                 f"{_safe_storage_path_for_log(path)}"
             )
         return None
-    storage = _get_storage()
 
     stream_capable = False
-    if isinstance(storage, StorageInterface):
-        storage_type = type(storage)
+    if isinstance(active_storage, StorageInterface):
+        storage_type = type(active_storage)
         stream_capable = (
             storage_type.iter_parquet_batches
             is not StorageInterface.iter_parquet_batches
@@ -1004,10 +1018,11 @@ def _iter_parquet_frames_safe(
     if not stream_capable:
         frame = _read_parquet_safe(
             path,
-            profiler=p,
+            profiler=cast(Profiler, p),
             file_size=file_size,
             columns=columns,
             required=required,
+            storage=active_storage,
         )
         return None if frame is None else iter((frame,))
 
@@ -1016,7 +1031,7 @@ def _iter_parquet_frames_safe(
         rows = 0
         try:
             with p.span("io.iter_parquet"):
-                for batch in storage.iter_parquet_batches(
+                for batch in active_storage.iter_parquet_batches(
                     path,
                     max_decoded_bytes=max(1, int(max_decoded_bytes)),
                     columns=columns,
@@ -1266,7 +1281,11 @@ def _prove_safe_compacted_rowids(frame: polars.DataFrame) -> None:
         ) from None
 
 
-def _cleanup_compaction_outputs(resources: List[Dict]) -> None:
+def _cleanup_compaction_outputs(
+        resources: List[Dict],
+        *,
+        storage: Optional[object] = None,
+) -> None:
     """Best-effort removal of only objects minted by one compaction attempt.
 
     This helper is called while preserving an earlier mutation failure, so no
@@ -1276,7 +1295,7 @@ def _cleanup_compaction_outputs(resources: List[Dict]) -> None:
     if not resources:
         return
     try:
-        storage = _get_storage()
+        active_storage = storage if storage is not None else _get_storage()
     except BaseException as cleanup_error:
         try:
             logging.warning(
@@ -1298,7 +1317,7 @@ def _cleanup_compaction_outputs(resources: List[Dict]) -> None:
         if not isinstance(generated, str) or not generated or generated in seen:
             continue
         seen.add(generated)
-        _cleanup_unpublished_parquet_path(storage, generated)
+        _cleanup_unpublished_parquet_path(active_storage, generated)
 
 
 def _compact_resources_with_tombstones(
@@ -1312,6 +1331,7 @@ def _compact_resources_with_tombstones(
         required_reads: bool,
         profiler: Profiler,
         footer_md_out: Optional[Dict],
+        storage: Optional[object],
 ) -> Tuple[int, int, List[Dict], Set[str], polars.DataFrame]:
     """Fuse DV draining and small-file packing into one physical pass.
 
@@ -1345,6 +1365,13 @@ def _compact_resources_with_tombstones(
         tombstone_df, source="deletion-vector passed to fused compaction",
     )
     resources = snapshot.get("resources") or []
+    active_storage = storage
+
+    def _resolve_active_storage() -> object:
+        nonlocal active_storage
+        if active_storage is None:
+            active_storage = _get_storage()
+        return active_storage
 
     by_path: Dict[str, Dict] = {}
     ordered_resources: List[Dict] = []
@@ -1483,6 +1510,7 @@ def _compact_resources_with_tombstones(
                 compression_level=compression_level,
                 profiler=sub,
                 footer_md_out=footer_cache,
+                storage=_resolve_active_storage(),
             )
             return resources, footer_cache, sub, merged.height, int(estimated)
         finally:
@@ -1678,6 +1706,7 @@ def _compact_resources_with_tombstones(
                         file_size=file_size,
                         columns=[ROWID_COL],
                         required=True,
+                        storage=_resolve_active_storage(),
                     )
                     _validate_compaction_source_rowids(
                         projected, file_path, required=True,
@@ -1715,6 +1744,7 @@ def _compact_resources_with_tombstones(
                     profiler=p,
                     file_size=file_size,
                     required=required_reads,
+                    storage=_resolve_active_storage(),
                 )
                 if frames is None:
                     continue
@@ -1759,6 +1789,7 @@ def _compact_resources_with_tombstones(
                 # A current snapshot file named by the DV is mandatory.  Clean
                 # maintenance candidates preserve the legacy best-effort read.
                 required=bool(has_tombstones or required_reads),
+                storage=_resolve_active_storage(),
             )
             if existing_df is None:
                 continue
@@ -1820,7 +1851,7 @@ def _compact_resources_with_tombstones(
                 _accept_write(future.result())
             except BaseException:
                 pass
-        _cleanup_compaction_outputs(new_resources)
+        _cleanup_compaction_outputs(new_resources, storage=active_storage)
         raise
     finally:
         if executor is not None:
@@ -1839,7 +1870,7 @@ def _compact_resources_with_tombstones(
         residual, source="residual deletion-vector after fused compaction",
     )
     if removed_rows != tombstone_df.height - residual.height:
-        _cleanup_compaction_outputs(new_resources)
+        _cleanup_compaction_outputs(new_resources, storage=active_storage)
         raise RuntimeError("Fused compaction tombstone accounting mismatch")
     try:
         p.add("compact_files_consumed_total", len(sunset_files))
@@ -1857,7 +1888,7 @@ def _compact_resources_with_tombstones(
         # Telemetry/cache publication is still pre-snapshot work. If a custom
         # profiler or mapping rejects it, none of this invocation's encoded
         # outputs may be left behind as unreferenced objects.
-        _cleanup_compaction_outputs(new_resources)
+        _cleanup_compaction_outputs(new_resources, storage=active_storage)
         raise
     return (
         len(sunset_files), total_rows, new_resources, sunset_files, residual,
@@ -1876,6 +1907,7 @@ def compact_resources(
         footer_md_out: Optional[Dict] = None,
         tombstone_df: Optional[polars.DataFrame] = None,
         return_residual: bool = False,
+        storage: Optional[object] = None,
 ) -> Tuple:
     """Compact small parquet files in a snapshot's resources list.
 
@@ -1980,6 +2012,7 @@ def compact_resources(
             required_reads=required_reads,
             profiler=p,
             footer_md_out=footer_md_out,
+            storage=storage,
         )
     if dead_rowids is None and dead_rowids_by_file is None:
         # Ordinary legacy compaction shares the fused slice packer with DV
@@ -1996,6 +2029,7 @@ def compact_resources(
             required_reads=required_reads,
             profiler=p,
             footer_md_out=footer_md_out,
+            storage=storage,
         )
         return compacted[:4]
     resources = snapshot.get("resources") or []
@@ -2020,6 +2054,7 @@ def compact_resources(
 
     if not candidates:
         return 0, 0, [], set()
+    active_storage = storage if storage is not None else _get_storage()
 
     new_resources: List[Dict] = []
     sunset_files: Set[str] = set()
@@ -2072,6 +2107,7 @@ def compact_resources(
                 profiler=p,
                 file_size=file_size,
                 required=required_reads,
+                storage=active_storage,
             )
             if existing_df is None:
                 # Race: another writer already sunset this file. Skip and
@@ -2128,6 +2164,7 @@ def compact_resources(
                     compression_level=compression_level,
                     profiler=p,
                     footer_md_out=footer_md_out,
+                    storage=active_storage,
                 )
                 chunk_df = None
                 chunk_size_bytes = 0
@@ -2144,13 +2181,14 @@ def compact_resources(
                 compression_level=compression_level,
                 profiler=p,
                 footer_md_out=footer_md_out,
+                storage=active_storage,
             )
     except BaseException:
         # No successful output from a failed invocation can be referenced by a
         # snapshot. Roll back every exact path collected by this call for both
         # strict materialisation and best-effort maintenance compaction; source
         # and pre-existing target objects never enter ``new_resources``.
-        _cleanup_compaction_outputs(new_resources)
+        _cleanup_compaction_outputs(new_resources, storage=active_storage)
         raise
 
     try:
@@ -2164,7 +2202,7 @@ def compact_resources(
             ),
         )
     except BaseException:
-        _cleanup_compaction_outputs(new_resources)
+        _cleanup_compaction_outputs(new_resources, storage=active_storage)
         raise
     return len(sunset_files), total_rows, new_resources, sunset_files
 
@@ -2177,6 +2215,7 @@ def write_parquet_and_collect_resources(
         write_df, overwrite_columns, data_dir, new_resources, compression_level=10,
         profiler: Optional[Profiler] = None,
         footer_md_out: Optional[Dict] = None,
+        storage: Optional[object] = None,
 ):
     """Write a DataFrame as a single Parquet file and append a resource dict.
 
@@ -2230,10 +2269,20 @@ def write_parquet_and_collect_resources(
         _write_single_parquet_file(
             write_df, overwrite_columns, partition_dir, new_resources, compression_level,
             profiler=profiler, footer_md_out=footer_md_out,
+            storage=storage,
         )
     else:
         # --- Flat write path (no __timestamp__) — backward compatible ---
-        _write_single_parquet_file(write_df, overwrite_columns, data_dir, new_resources, compression_level, profiler=profiler, footer_md_out=footer_md_out)
+        _write_single_parquet_file(
+            write_df,
+            overwrite_columns,
+            data_dir,
+            new_resources,
+            compression_level,
+            profiler=profiler,
+            footer_md_out=footer_md_out,
+            storage=storage,
+        )
 
 
 def _cleanup_unpublished_parquet_path(storage: object, path: str) -> None:
@@ -2266,6 +2315,7 @@ def _write_single_parquet_file(
         write_df, overwrite_columns, target_dir, new_resources, compression_level=10,
         profiler: Optional[Profiler] = None,
         footer_md_out: Optional[Dict] = None,
+        storage: Optional[object] = None,
 ):
     """Write and publish one resource, cleaning any released orphan on error."""
     publication_state: Dict[str, Any] = {}
@@ -2278,6 +2328,7 @@ def _write_single_parquet_file(
             compression_level,
             profiler=profiler,
             footer_md_out=footer_md_out,
+            storage=storage,
             publication_state=publication_state,
         )
     except BaseException:
@@ -2381,6 +2432,7 @@ def _write_single_parquet_file_attempt(
         profiler: Optional[Profiler] = None,
         footer_md_out: Optional[Dict] = None,
         *,
+        storage: Optional[object] = None,
         publication_state: Dict[str, Any],
 ):
     """Write a single Parquet file into *target_dir* and append a resource entry.
@@ -2396,7 +2448,7 @@ def _write_single_parquet_file_attempt(
     # Resolve the backend once. Apart from avoiding repeated factory/config
     # work, this is a correctness boundary: upload and metadata must describe
     # the same backend instance if a custom storage factory rotates clients.
-    storage = _get_storage()
+    storage = cast(Any, storage if storage is not None else _get_storage())
     state = publication_state
     state["storage"] = storage
 
@@ -2405,7 +2457,7 @@ def _write_single_parquet_file_attempt(
     # pointless prefix HEAD (which always 404s) on object stores.
     with p.span("write.ensure_dir"):
         try:
-            storage.makedirs(target_dir)
+            cast(Any, storage).makedirs(target_dir)
         except Exception:
             pass
 
@@ -2529,7 +2581,7 @@ def _write_single_parquet_file_attempt(
         # zero or an unrelated local path when that mandatory metadata lookup
         # fails: the snapshot's resource metadata must remain trustworthy.
         with p.span("write.size_lookup"):
-            file_size = storage.size(new_parquet_path)
+            file_size = cast(Any, storage).size(new_parquet_path)
         with p.span("write.object_seal"):
             object_seal = _uploaded_resource_object_seal(
                 storage, new_parquet_path, int(file_size),
@@ -5096,6 +5148,7 @@ def build_tombstone_file(
         persist: bool = True,
         prev_df_validated: bool = False,
         validation_out: Optional[Dict[str, Any]] = None,
+        storage: Optional[object] = None,
 ) -> Tuple[Optional[str], Optional[polars.DataFrame]]:
     """Carry forward the previous deletion-vector and append newly deleted rows.
 
@@ -5128,7 +5181,12 @@ def build_tombstone_file(
     if prev_df is None and prev_tombstone_path:
         # required=True: refuse to build a truncated deletion-vector if the
         # previous one exists but cannot be read (would resurrect dead rows).
-        prev_df = _read_parquet_safe(prev_tombstone_path, profiler=p, required=True)
+        prev_df = _read_parquet_safe(
+            prev_tombstone_path,
+            profiler=p,
+            required=True,
+            storage=storage,
+        )
     if prev_df is not None and not prev_df_validated:
         prev_df = validate_tombstone_frame(
             prev_df,
@@ -5164,8 +5222,16 @@ def build_tombstone_file(
         # mutation.  Deferring the upload avoids creating a large immutable
         # artifact that no committed snapshot can ever reference.
         return None, combined
-    new_path = _partitioned_new_path(tombstone_dir, "deleted")
-    _write_df_parquet(combined, new_path, compression_level, profiler=p)
+    new_path = _partitioned_new_path(
+        tombstone_dir, "deleted", storage=storage,
+    )
+    _write_df_parquet(
+        combined,
+        new_path,
+        compression_level,
+        profiler=p,
+        storage=storage,
+    )
     return new_path, combined
 
 
@@ -5277,7 +5343,9 @@ def build_tombstone_v3(
     if not persist:
         return None, combined, None
 
-    path = _partitioned_new_path(tombstone_dir, "deleted-v3")
+    path = _partitioned_new_path(
+        tombstone_dir, "deleted-v3", storage=storage,
+    )
     artifact_seal: Dict[str, str] = {}
     artifact_bytes = _write_df_parquet(
         combined, path, compression_level, profiler=profiler, storage=storage,
@@ -5320,6 +5388,8 @@ def persist_tombstone_frame(
         frame: polars.DataFrame,
         compression_level: int,
         profiler: Optional[Profiler] = None,
+        *,
+        storage: Optional[object] = None,
 ) -> Tuple[str, polars.DataFrame]:
     """Persist an already materialised DV without Python row expansion."""
     validated = validate_tombstone_frame(
@@ -5327,8 +5397,16 @@ def persist_tombstone_frame(
     )
     if validated.height == 0:
         raise ValueError("Cannot persist an empty deletion-vector")
-    new_path = _partitioned_new_path(tombstone_dir, "deleted")
-    _write_df_parquet(validated, new_path, compression_level, profiler=profiler)
+    new_path = _partitioned_new_path(
+        tombstone_dir, "deleted", storage=storage,
+    )
+    _write_df_parquet(
+        validated,
+        new_path,
+        compression_level,
+        profiler=profiler,
+        storage=storage,
+    )
     return new_path, validated
 
 
@@ -5354,7 +5432,9 @@ def persist_tombstone_v3_frame(
             root_digest=None,
             segments=(),
         )
-    path = _partitioned_new_path(tombstone_dir, "deleted-v3")
+    path = _partitioned_new_path(
+        tombstone_dir, "deleted-v3", storage=storage,
+    )
     artifact_seal: Dict[str, str] = {}
     artifact_bytes = _write_df_parquet(
         validated, path, compression_level,
@@ -5659,6 +5739,7 @@ def reclaim_fully_dead_files(
         profiler: Optional[Profiler] = None,
         persist: bool = True,
         assume_valid: bool = False,
+        storage: Optional[object] = None,
 ) -> Tuple[Set[str], Optional[str], Optional[polars.DataFrame]]:
     """Drop data files whose every physical row is in the deletion-vector.
 
@@ -5716,6 +5797,7 @@ def reclaim_fully_dead_files(
             file_size=int(r.get("file_size") or 0),
             columns=[ROWID_COL],
             required=False,
+            storage=storage,
         )
         if physical is None or ROWID_COL not in physical.columns:
             continue
@@ -5756,8 +5838,16 @@ def reclaim_fully_dead_files(
     if not persist:
         return fully_dead, None, survivors
 
-    new_path = _partitioned_new_path(tombstone_dir, "deleted")
-    _write_df_parquet(survivors, new_path, compression_level, profiler=p)
+    new_path = _partitioned_new_path(
+        tombstone_dir, "deleted", storage=storage,
+    )
+    _write_df_parquet(
+        survivors,
+        new_path,
+        compression_level,
+        profiler=p,
+        storage=storage,
+    )
     return fully_dead, new_path, survivors
 
 
@@ -9910,6 +10000,7 @@ def compact_tombstones(
         profiler: Optional[Profiler] = None,
         return_residual: bool = False,
         footer_md_out: Optional[Dict] = None,
+        storage: Optional[object] = None,
 ) -> Tuple:
     """Physically drop tombstoned rows from the data files that hold them.
 
@@ -9940,6 +10031,13 @@ def compact_tombstones(
     tombstone_df = validate_tombstone_frame(
         tombstone_df, source="deletion-vector passed to compaction"
     )
+    active_storage = storage
+
+    def _resolve_active_storage() -> object:
+        nonlocal active_storage
+        if active_storage is None:
+            active_storage = _get_storage()
+        return active_storage
 
     resources = snapshot.get("resources") or []
     by_path = {r.get("file"): r for r in resources if r.get("file")}
@@ -10013,6 +10111,7 @@ def compact_tombstones(
                 file_size=file_size,
                 columns=[ROWID_COL],
                 required=True,
+                storage=_resolve_active_storage(),
             )
             _validate_physical(projected, file_path)
             if projected is None:  # pragma: no cover - required read
@@ -10038,7 +10137,11 @@ def compact_tombstones(
         # treating either as an empty source would permit pointer clearing and
         # row resurrection.
         existing_df = _read_parquet_safe(
-            file_path, profiler=sub, file_size=file_size, required=True
+            file_path,
+            profiler=sub,
+            file_size=file_size,
+            required=True,
+            storage=_resolve_active_storage(),
         )
         if existing_df is None:  # defensive; required=True normally raises
             return 0, [], None, file_tombstones, local_footer_md, sub
@@ -10072,6 +10175,7 @@ def compact_tombstones(
                     compression_level=compression_level,
                     profiler=sub,
                     footer_md_out=local_footer_md,
+                    storage=_resolve_active_storage(),
                 )
         return difference, local_resources, file_path, None, local_footer_md, sub
 
@@ -10163,7 +10267,7 @@ def compact_tombstones(
                 _remember_failure(error)
 
     if first_failure is not None:
-        _cleanup_compaction_outputs(new_resources)
+        _cleanup_compaction_outputs(new_resources, storage=active_storage)
         raise first_failure.with_traceback(first_traceback)
 
     try:
@@ -10175,13 +10279,13 @@ def compact_tombstones(
             residual, source="residual deletion-vector after compaction"
         )
     except BaseException:
-        _cleanup_compaction_outputs(new_resources)
+        _cleanup_compaction_outputs(new_resources, storage=active_storage)
         raise
     if footer_md_out is not None and collected_footer_md:
         try:
             footer_md_out.update(collected_footer_md)
         except BaseException:
-            _cleanup_compaction_outputs(new_resources)
+            _cleanup_compaction_outputs(new_resources, storage=active_storage)
             raise
     if return_residual:
         return removed, new_resources, sunset_files, residual

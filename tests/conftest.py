@@ -92,6 +92,9 @@ def sealed_manifest_ok(request) -> None:
 @pytest.fixture(autouse=True)
 def hermetic_fakeredis(request):
     """Give every test a fresh, process-local fake Redis and clean engine state."""
+    import supertable.processing as processing
+
+    processing._storage = None
     fake = install_fake_redis()
     # Characterization modules that exercise write/RBAC paths declare their
     # estate as ``ORG``.  Activate only those modules here: unrelated unit
@@ -110,6 +113,7 @@ def hermetic_fakeredis(request):
             fake.flushall()
         except Exception:
             pass
+        processing._storage = None
         reset_engine_singletons()
         # fakeredis keeps its response parser alive with the pooled connection.
         # A handled EVALSHA/NOSCRIPT response can therefore retain traceback

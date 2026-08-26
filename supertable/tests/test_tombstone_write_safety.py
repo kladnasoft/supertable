@@ -216,6 +216,25 @@ def test_partial_drain_returns_entire_group_as_residual(monkeypatch):
     assert writes == []
 
 
+def test_ghost_tombstones_do_not_resolve_storage(monkeypatch):
+    monkeypatch.setattr(
+        processing,
+        "_get_storage",
+        lambda: pytest.fail("ghost-only tombstone drain resolved storage"),
+    )
+
+    removed, resources, sunset, residual = processing.compact_tombstones(
+        snapshot={"resources": []},
+        tombstone_df=_dv([("ghost.parquet", 1)]),
+        data_dir="data",
+        compression_level=1,
+        return_residual=True,
+    )
+
+    assert (removed, resources, sunset) == (0, [], set())
+    assert residual.rows() == [("ghost.parquet", 1)]
+
+
 def test_fully_dead_drain_reads_only_rowid_and_writes_nothing(monkeypatch):
     calls = []
 

@@ -341,6 +341,30 @@ class TestPruneNotOverlappingFilesByThreshold:
 
 class TestWriteParquetAndCollectResources:
 
+    @patch(f"{_MOD}.generate_filename", return_value="pinned.parquet")
+    @patch(f"{_MOD}._get_storage")
+    def test_explicit_storage_never_uses_cached_global_backend(
+        self, mock_gs, mock_gen,
+    ):
+        from supertable.processing import write_parquet_and_collect_resources
+
+        mock_gs.side_effect = AssertionError("global storage must not be used")
+        pinned_storage = MagicMock()
+        resources: list = []
+
+        write_parquet_and_collect_resources(
+            write_df=_df(id=[1], value=["safe"]),
+            overwrite_columns=["id"],
+            data_dir="tenant/data",
+            new_resources=resources,
+            storage=pinned_storage,
+        )
+
+        mock_gs.assert_not_called()
+        pinned_storage.makedirs.assert_called_once_with("tenant/data")
+        pinned_storage.write_bytes.assert_called_once()
+        assert resources[0]["file"].endswith("pinned.parquet")
+
     @patch(f"{_MOD}.generate_filename", return_value="data.parquet")
     @patch(f"{_MOD}._get_storage")
     def test_appends_resource(self, mock_gs, mock_gen):

@@ -2093,6 +2093,7 @@ class DataWriter:
                         compression_level=compression_level,
                         profiler=sub,
                         footer_md_out=footer_md_cache,
+                        storage=self.super_table.storage,
                     )
                     return sub, time.perf_counter() - t
 
@@ -2163,6 +2164,7 @@ class DataWriter:
                             tombstone_validation_out
                             if not defer_tombstone_upload else None
                         ),
+                        storage=self.super_table.storage,
                     )
                     return tp, cdf, None, sub, time.perf_counter() - t
 
@@ -2272,6 +2274,7 @@ class DataWriter:
                                 and not publish_tombstone_v3
                             ),
                             assume_valid=True,
+                            storage=self.super_table.storage,
                         )
                     )
                     if reclaimed_files:
@@ -2487,6 +2490,7 @@ class DataWriter:
                                 small_only=True,
                                 profiler=profiler,
                                 footer_md_out=footer_md_cache,
+                                storage=self.super_table.storage,
                             )
                             residual_tombstone_files = (
                                 self._tombstone_referenced_files(residual_dv)
@@ -2535,6 +2539,7 @@ class DataWriter:
                                         profiler=profiler,
                                         return_residual=True,
                                         footer_md_out=footer_md_cache,
+                                        storage=self.super_table.storage,
                                     )
                                 )
                             )
@@ -2592,6 +2597,7 @@ class DataWriter:
                                             frame=residual_dv,
                                             compression_level=compression_level,
                                             profiler=profiler,
+                                            storage=self.super_table.storage,
                                         )
                                     )
                             else:
@@ -2797,6 +2803,7 @@ class DataWriter:
                         small_only=True,
                         profiler=profiler,
                         footer_md_out=footer_md_cache,
+                        storage=self.super_table.storage,
                     )
                     if comp_new or comp_sunset:
                         _comp_considered = considered
@@ -3628,7 +3635,11 @@ class DataWriter:
             else:
                 tombstone_df = (
                     validate_tombstone_frame(
-                        _read_parquet_safe(tombstone_path, required=True),
+                        _read_parquet_safe(
+                            tombstone_path,
+                            required=True,
+                            storage=self.super_table.storage,
+                        ),
                         expected_rows=prior_tombstone_rows,
                         expected_digest=prior_tombstone_digest,
                         allowed_files=self._snapshot_resource_files(
@@ -3675,6 +3686,7 @@ class DataWriter:
                         required_reads=False,
                         profiler=compaction_profiler,
                         footer_md_out=footer_md_cache,
+                        storage=self.super_table.storage,
                     )
                     residual_tombstone_files = (
                         self._tombstone_referenced_files(residual_dv)
@@ -3704,6 +3716,7 @@ class DataWriter:
                             profiler=compaction_profiler,
                             return_residual=True,
                             footer_md_out=footer_md_cache,
+                            storage=self.super_table.storage,
                         )
                     )
                 if residual_dv.height:
@@ -3755,6 +3768,7 @@ class DataWriter:
                                 ),
                                 frame=residual_dv,
                                 compression_level=compression_level,
+                                storage=self.super_table.storage,
                             )
                 else:
                     tombstone_path = None
@@ -3825,6 +3839,7 @@ class DataWriter:
                     small_only=small_only,
                     profiler=compaction_profiler,
                     footer_md_out=footer_md_cache,
+                    storage=self.super_table.storage,
                 )
             mark("small_file_compact")
 

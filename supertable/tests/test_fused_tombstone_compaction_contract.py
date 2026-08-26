@@ -182,6 +182,11 @@ def test_fused_duplicate_resource_identity_rejects_before_any_io(monkeypatch):
     from supertable import processing
 
     _forbid_compaction_io(monkeypatch, processing)
+    monkeypatch.setattr(
+        processing,
+        "_get_storage",
+        lambda: pytest.fail("snapshot validation resolved storage"),
+    )
 
     duplicate = {"file": "same.parquet", "file_size": 1, "rows": 1}
     with pytest.raises(ValueError, match="duplicate resource path"):
@@ -192,6 +197,27 @@ def test_fused_duplicate_resource_identity_rejects_before_any_io(monkeypatch):
             tombstone_df=_dv([("same.parquet", 1)]),
             return_residual=True,
         )
+
+
+def test_fused_ghost_tombstones_do_not_resolve_storage(monkeypatch):
+    from supertable import processing
+
+    monkeypatch.setattr(
+        processing,
+        "_get_storage",
+        lambda: pytest.fail("ghost-only compaction resolved storage"),
+    )
+
+    considered, rows, resources, sunset, residual = processing.compact_resources(
+        snapshot={"resources": []},
+        data_dir="data",
+        compression_level=1,
+        tombstone_df=_dv([("ghost.parquet", 1)]),
+        return_residual=True,
+    )
+
+    assert (considered, rows, resources, sunset) == (0, 0, [], set())
+    assert residual.rows() == [("ghost.parquet", 1)]
 
 
 @pytest.mark.parametrize(
@@ -751,17 +777,21 @@ def test_fused_precommit_failure_cleans_only_outputs_minted_by_that_call(
         )
         dead_pairs.append((path, first))
 
-    monkeypatch.setattr(
-        processing,
-        "_read_parquet_safe",
-        lambda path, **_kwargs: sources[path].clone(),
-    )
+    deleted = []
+    pinned_storage = SimpleNamespace(delete=deleted.append)
+
+    def read_source(path, **kwargs):
+        assert kwargs["storage"] is pinned_storage
+        return sources[path].clone()
+
+    monkeypatch.setattr(processing, "_read_parquet_safe", read_source)
 
     write_calls = 0
     minted = []
 
     def fail_second_final_write(**kwargs):
         nonlocal write_calls
+        assert kwargs["storage"] is pinned_storage
         write_calls += 1
         if write_calls == 2:
             raise RuntimeError("injected final parquet failure")
@@ -772,13 +802,14 @@ def test_fused_precommit_failure_cleans_only_outputs_minted_by_that_call(
             {"file": path, "file_size": MIB, "rows": kwargs["write_df"].height}
         )
 
-    deleted = []
     caller_footer_cache = {"already-published.parquet": "existing-footer"}
     monkeypatch.setattr(
         processing, "write_parquet_and_collect_resources", fail_second_final_write,
     )
     monkeypatch.setattr(
-        processing, "_get_storage", lambda: SimpleNamespace(delete=deleted.append),
+        processing,
+        "_get_storage",
+        lambda: pytest.fail("ambient storage was resolved"),
     )
 
     with pytest.raises(RuntimeError, match="injected final parquet failure"):
@@ -792,6 +823,7 @@ def test_fused_precommit_failure_cleans_only_outputs_minted_by_that_call(
             tombstone_df=_dv(dead_pairs),
             return_residual=True,
             footer_md_out=caller_footer_cache,
+            storage=pinned_storage,
         )
 
     assert write_calls == 2

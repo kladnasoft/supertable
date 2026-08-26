@@ -2406,6 +2406,7 @@ class SimpleTable:
             small_only=small_only,
             dead_rowids_by_file=dead_rowids_by_file,
             required_reads=True,
+            storage=self.storage,
         )
 
         files = [r.get("file") for r in new_resources if isinstance(r, dict) and r.get("file")]
