@@ -144,3 +144,20 @@ def test_release_workflow_requires_exact_stable_semver_tag() -> None:
 
     assert '[[ "${VERSION}" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]' in workflow
     assert 'test "${GITHUB_REF_NAME}" = "v${VERSION}"' in workflow
+
+
+def test_secret_scan_checks_only_commits_introduced_by_the_event() -> None:
+    workflow = (
+        gate.ROOT / ".github" / "workflows" / "secret-scan.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "fetch-depth: 0" in workflow
+    assert 'scan_range="${PR_BASE_SHA}..${PR_HEAD_SHA}"' in workflow
+    assert 'scan_range="${PUSH_BEFORE}..${EVENT_SHA}"' in workflow
+    assert (
+        'base_sha="$(git merge-base "${EVENT_SHA}" '
+        'refs/remotes/origin/master)"'
+    ) in workflow
+    assert '--log-opts="${scan_range}"' in workflow
+    assert "Scan complete Git history" not in workflow
+    assert "allowlist" not in workflow.lower()
