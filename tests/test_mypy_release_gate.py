@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -144,6 +146,28 @@ def test_release_workflow_requires_exact_stable_semver_tag() -> None:
 
     assert '[[ "${VERSION}" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+$ ]]' in workflow
     assert 'test "${GITHUB_REF_NAME}" = "v${VERSION}"' in workflow
+
+
+def test_release_workflow_pins_and_verifies_the_ssh_signing_key() -> None:
+    expected_fingerprint = "SHA256:sc3IvJewQy3tS7edt21CrS6Cx9oZymArvXs4Fj/s6kk"
+    signer = (
+        gate.ROOT / ".github" / "release_allowed_signers"
+    ).read_text(encoding="utf-8")
+    principal, key_type, encoded_key = signer.split()
+    fingerprint = base64.b64encode(
+        hashlib.sha256(base64.b64decode(encoded_key, validate=True)).digest()
+    ).decode("ascii").rstrip("=")
+    workflow = (gate.ROOT / ".github" / "workflows" / "release.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert principal == "kladnasoft@outlook.com"
+    assert key_type == "ssh-ed25519"
+    assert f"SHA256:{fingerprint}" == expected_fingerprint
+    assert expected_fingerprint in workflow
+    assert 'gpg.ssh.allowedSignersFile="${ALLOWED_SIGNERS}"' in workflow
+    assert 'verify-tag "${GITHUB_REF}"' in workflow
+    assert "gh api" not in workflow
 
 
 def test_secret_scan_checks_only_commits_introduced_by_the_event() -> None:

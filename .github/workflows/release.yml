@@ -204,24 +204,21 @@ jobs:
           python-version: "3.12"
       - name: Verify tag identifies this versioned source
         if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           test "$(git cat-file -t "${GITHUB_REF}")" = tag
           test "$(git rev-list -n 1 "${GITHUB_REF}")" = "${GITHUB_SHA}"
           VERSION=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
           [[ "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test "${GITHUB_REF_NAME}" = "v${VERSION}"
-          # A directly pushed unsigned annotated tag must not bypass the
-          # signed-tag release helper.  GitHub verifies the tag signature
-          # against the signer's registered GPG/SSH key; tag protection below
-          # restricts those verified signers to release maintainers.
-          TAG_OBJECT=$(git rev-parse "${GITHUB_REF}^{tag}")
-          VERIFIED_OBJECT=$(
-            gh api "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT}" \
-              --jq 'select(.verification.verified == true and .verification.reason == "valid") | .sha'
-          )
-          test "${VERIFIED_OBJECT}" = "${TAG_OBJECT}"
+          # Verify the signature against the release maintainer's pinned SSH
+          # signing key. This is deterministic even when GitHub has not linked
+          # that public key to account-level signature metadata.
+          ALLOWED_SIGNERS="${GITHUB_WORKSPACE}/.github/release_allowed_signers"
+          test "$(ssh-keygen -lf "${ALLOWED_SIGNERS}" -E sha256 | awk '{print $2}')" = \
+            "SHA256:sc3IvJewQy3tS7edt21CrS6Cx9oZymArvXs4Fj/s6kk"
+          git -c gpg.format=ssh \
+            -c gpg.ssh.allowedSignersFile="${ALLOWED_SIGNERS}" \
+            verify-tag "${GITHUB_REF}"
       - run: python -m pip install 'pip==26.2.1' 'build==1.5.0' 'twine==6.2.0'
       - run: python -m build
       - run: python -m twine check dist/*
