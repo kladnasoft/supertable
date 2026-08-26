@@ -590,6 +590,12 @@ def test_blocked_duckdb_connect_is_bounded_and_late_handle_is_not_cached(
         def __init__(self, *, late=False):
             self._late = late
 
+        def execute(self, *_args, **_kwargs):
+            return self
+
+        def fetchone(self):
+            return (False,)
+
         def interrupt(self):
             pass
 

@@ -1268,7 +1268,9 @@ def test_duckdb_deadline_interrupts_query_cursor(monkeypatch):
     root.cursor.return_value = connection
     engine = duckdb_engine.DuckDB()
     monkeypatch.setattr(engine, "_get_connection", lambda **_kwargs: root)
-    monkeypatch.setattr(engine, "_ensure_httpfs", lambda *_args: None)
+    monkeypatch.setattr(
+        engine, "_ensure_httpfs", lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(duckdb_engine, "hashed_table_name", lambda *_args: "ref")
     monkeypatch.setattr(
         duckdb_engine,
