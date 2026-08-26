@@ -132,6 +132,23 @@ def test_duckdb_absolute_deadline_covers_httpfs_setup(monkeypatch):
     root.cursor.return_value = cursor
     monkeypatch.setattr(engine, "_get_connection", lambda **_kwargs: root)
 
+    class DelayedTimer:
+        """Model a deadline callback that the scheduler has not run yet."""
+
+        def __init__(self, _delay, _callback):
+            self.daemon = False
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+        def join(self, timeout=None):
+            pass
+
+    monkeypatch.setattr(duckdb_engine.threading, "Timer", DelayedTimer)
+
     def slow_setup(*_args, **_kwargs):
         time.sleep(0.03)
 

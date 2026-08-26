@@ -717,10 +717,18 @@ class _DuckDBSetupInterruptGuard:
             self._cancel_event is not None and self._cancel_event.is_set()
         ):
             raise ResourceReservationCancelled("DuckDB query was cancelled")
-        if self._timed_out.is_set() or (
+        deadline_expired = (
             self._deadline is not None
             and time.monotonic() >= self._deadline
-        ):
+        )
+        if deadline_expired and not self._timed_out.is_set():
+            # Timer callbacks can be scheduled late under CPU pressure or while
+            # native setup holds the GIL.  The request thread's absolute-clock
+            # check is equally authoritative and must interrupt the published
+            # setup handle before it raises and tears that handle down.
+            self._timed_out.set()
+            self._interrupt()
+        if self._timed_out.is_set():
             raise TimeoutError(
                 f"DuckDB query timed out after {self._timeout_value:g} seconds"
             )

@@ -109,7 +109,7 @@ class GCSStorage(StorageInterface):
         if creds_path:
             if not Path(creds_path).is_file():
                 raise FileNotFoundError(
-                    "configured GOOGLE_APPLICATION_CREDENTIALS file is unavailable"
+                    "configured Google credentials file is unavailable"
                 )
             client = storage.Client.from_service_account_json(creds_path, project=project)
         elif sa_json:

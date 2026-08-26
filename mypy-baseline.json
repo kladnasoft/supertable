@@ -126,7 +126,7 @@
       "supertable/engine/adaptive_router.py:31: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]"
     ],
     "supertable/engine/duckdb_engine.py": [
-      "supertable/engine/duckdb_engine.py:2367: error: \"SQLParser\" has no attribute \"executing_query\"  [attr-defined]"
+      "supertable/engine/duckdb_engine.py:2375: error: \"SQLParser\" has no attribute \"executing_query\"  [attr-defined]"
     ],
     "supertable/engine/engine_common.py": [
       "supertable/engine/engine_common.py:2639: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
