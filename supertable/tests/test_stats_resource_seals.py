@@ -350,7 +350,7 @@ def test_compaction_outputs_carry_exact_resource_seals(tmp_path, monkeypatch):
     from supertable.storage.local_storage import LocalStorage
 
     storage = LocalStorage(str(tmp_path))
-    monkeypatch.setattr(processing, "_storage", storage)
+    monkeypatch.setattr(processing, "_get_storage", lambda: storage)
     source_dir = str(tmp_path / "source")
     compacted_dir = str(tmp_path / "compacted")
     source_resources = []

@@ -1503,7 +1503,7 @@ def test_simple_table_export_accepts_authoritative_pre_dv_snapshot(
     ):
         snapshot.pop(field, None)
     table.get_simple_table_snapshot = lambda: (snapshot, snapshot_path)
-    monkeypatch.setattr(processing, "_storage", storage)
+    monkeypatch.setattr(processing, "_get_storage", lambda: storage)
 
     result = table.export_to("exports/pre-dv")
 
@@ -1519,7 +1519,7 @@ def test_simple_table_export_missing_v2_segment_writes_nothing(
         tmp_path, monkeypatch,
 ) -> None:
     table, storage = _local_export_table(tmp_path, missing_segment=True)
-    monkeypatch.setattr(processing, "_storage", storage)
+    monkeypatch.setattr(processing, "_get_storage", lambda: storage)
     target = tmp_path / "exports" / "missing"
 
     with pytest.raises(ValueError, match="segment size"):
@@ -1541,7 +1541,7 @@ def test_simple_table_export_rejects_manifest_root_outside_table(
     )
     snapshot["tombstone"] = foreign_manifest
     table.get_simple_table_snapshot = lambda: (snapshot, snapshot_path)
-    monkeypatch.setattr(processing, "_storage", storage)
+    monkeypatch.setattr(processing, "_get_storage", lambda: storage)
     target = tmp_path / "exports" / "foreign-root"
 
     with pytest.raises(ValueError, match="escapes the pinned simple table"):

@@ -126,7 +126,7 @@ def test_local_writer_does_not_add_redundant_provider_seal(tmp_path, monkeypatch
     from supertable.storage.local_storage import LocalStorage
 
     storage = LocalStorage(str(tmp_path))
-    monkeypatch.setattr(processing, "_storage", storage)
+    monkeypatch.setattr(processing, "_get_storage", lambda: storage)
     resources = []
 
     write_parquet_and_collect_resources(
