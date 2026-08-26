@@ -6487,7 +6487,7 @@ def _route_stats(stat) -> Tuple[Optional[str], object, object]:
     return None, None, None
 
 
-def _read_footer_metadata(path: str, profiler: Optional[Profiler] = None):
+def _read_footer_metadata(path: str, profiler: Optional[Profiler] = None, storage: Optional[object] = None):
     """Read just the parquet footer (FileMetaData) for *path*, or ``None``.
 
     Reads the file's bytes from the active storage backend and parses only the
@@ -6495,15 +6495,16 @@ def _read_footer_metadata(path: str, profiler: Optional[Profiler] = None):
     ``None`` on a race (file already sunset) or any read/parse error.
     """
     p = profiler or get_null_profiler()
-    if not _safe_exists(path, profiler=p):
-        logging.info(
-            "[stats] file already sunset before footer read: %s",
-            _safe_storage_path_for_log(path),
-        )
-        return None
+    backend = cast(StorageInterface, storage or _get_storage())
     try:
+        if not backend.exists(path):
+            logging.info(
+                "[stats] file already sunset before footer read: %s",
+                _safe_storage_path_for_log(path),
+            )
+            return None
         with p.span("stats.read_footer"):
-            data = _get_storage().read_bytes(path)
+            data = backend.read_bytes(path)
             return pq.read_metadata(io.BytesIO(data))
     except FileNotFoundError:
         logging.info(
@@ -6758,6 +6759,10 @@ def extract_stats_rows(
         file_paths: List[str],
         profiler: Optional[Profiler] = None,
         footer_md_cache: Optional[Dict] = None,
+        storage: Optional[object] = None,
+        *,
+        max_rows: Optional[int] = None,
+        max_decoded_bytes: Optional[int] = None,
 ) -> polars.DataFrame:
     """Read the footers of *file_paths* and return their stats rows.
 
@@ -6771,9 +6776,59 @@ def extract_stats_rows(
     uploaded).  When a path is present its footer is reused directly, skipping a
     full-file re-download; otherwise the footer is read back from storage.
     """
+    for name, value, hard_maximum in (
+        ("max_rows", max_rows, MAX_SHOW_STATS_ROWS),
+        (
+            "max_decoded_bytes",
+            max_decoded_bytes,
+            MAX_SHOW_STATS_DECODED_BYTES,
+        ),
+    ):
+        if value is not None and (
+            type(value) is not int
+            or value <= 0
+            or value > hard_maximum
+        ):
+            raise ValueError(f"{name} must be a positive bounded integer")
+
     p = profiler or get_null_profiler()
     cache = footer_md_cache or {}
     all_rows: List[dict] = []
+    decoded_live_upper_bound = 0
+    string_columns = sum(dtype == polars.Utf8 for dtype in STATS_SCHEMA.values())
+    fixed_columns = len(STATS_SCHEMA) - string_columns
+    # Arrow uses one value/validity buffer per fixed lane and offsets plus an
+    # optional validity buffer per UTF-8 lane. Charge a full byte per validity
+    # bit and extra offset headroom. The diagnostic reader can retain a decoded
+    # dictionary beside its normalized output, hence the final factor of two.
+    fixed_row_bytes = fixed_columns * 9 + string_columns * 8
+
+    def admit_rows(rows: List[dict]) -> None:
+        nonlocal decoded_live_upper_bound
+        if max_rows is not None and len(all_rows) + len(rows) > max_rows:
+            raise ValueError("Statistics row count exceeds its diagnostic limit")
+        if max_decoded_bytes is None:
+            return
+        logical_bytes = len(rows) * fixed_row_bytes
+        for row in rows:
+            for name in _SHOW_STATS_STRING_COLUMNS:
+                value = row.get(name)
+                if value is None:
+                    continue
+                if not isinstance(value, str):
+                    raise ValueError("Statistics string lane is invalid")
+                encoded_size = len(value.encode("utf-8"))
+                if encoded_size > MAX_SHOW_STATS_STRING_BYTES:
+                    raise ValueError(
+                        "Statistics string scalar exceeds its diagnostic limit"
+                    )
+                logical_bytes += encoded_size
+        decoded_live_upper_bound += logical_bytes * 2
+        if decoded_live_upper_bound > max_decoded_bytes:
+            raise ValueError(
+                "Statistics decoded data exceeds its diagnostic limit"
+            )
+
     for path in file_paths:
         if not path:
             continue
@@ -6789,20 +6844,75 @@ def extract_stats_rows(
             else cached_entry
         )
         if md is None:
-            md = _read_footer_metadata(path, profiler=p)
+            md = _read_footer_metadata(path, profiler=p, storage=storage)
         else:
             p.add("stats_footer_cache_hit", 1)
         if md is None:
             continue
-        all_rows.extend(
-            cached_rows
-            if cached_rows is not None
-            else _stats_rows_for_metadata(path, md)
-        )
+        if cached_rows is not None:
+            admit_rows(cached_rows)
+            all_rows.extend(cached_rows)
+            continue
+        if max_rows is None and max_decoded_bytes is None:
+            all_rows.extend(_stats_rows_for_metadata(path, md))
+            continue
+
+        # Reject unavoidable path amplification before constructing Python
+        # dictionaries. A long immutable path repeated once per column chunk
+        # must fit the same decoded-memory budget as its eventual artifact.
+        candidate_rows = 0
+        for row_group_index in range(md.num_row_groups):
+            row_group = md.row_group(row_group_index)
+            candidate_rows += sum(
+                row_group.column(column_index).path_in_schema
+                not in _STATS_SYSTEM_COLUMNS
+                for column_index in range(row_group.num_columns)
+            )
+        if max_rows is not None and len(all_rows) + candidate_rows > max_rows:
+            raise ValueError("Statistics row count exceeds its diagnostic limit")
+        if max_decoded_bytes is not None:
+            path_bytes = len(path.encode("utf-8"))
+            if path_bytes > MAX_SHOW_STATS_STRING_BYTES:
+                raise ValueError(
+                    "Statistics string scalar exceeds its diagnostic limit"
+                )
+            unavoidable = candidate_rows * (fixed_row_bytes + path_bytes)
+            if decoded_live_upper_bound + unavoidable * 2 > max_decoded_bytes:
+                raise ValueError(
+                    "Statistics decoded data exceeds its diagnostic limit"
+                )
+
+        try:
+            exact_footer_sha256 = parquet_footer_sha256(md)
+        except Exception:
+            raise ValueError(
+                "Statistics footer could not be sealed"
+            ) from None
+        for row_group_index in range(md.num_row_groups):
+            group_rows = _stats_rows_for_metadata(
+                path,
+                md,
+                footer_sha256=exact_footer_sha256,
+                row_group_indices=(row_group_index,),
+            )
+            admit_rows(group_rows)
+            all_rows.extend(group_rows)
     if not all_rows:
         return _empty_stats_df()
     p.add("stats_rows_extracted", len(all_rows))
-    return polars.DataFrame(all_rows, schema=STATS_SCHEMA)
+    frame = polars.DataFrame(all_rows, schema=STATS_SCHEMA)
+    if max_decoded_bytes is not None:
+        try:
+            frame_bytes = int(frame.estimated_size())
+        except Exception:
+            raise RuntimeError(
+                "Statistics decoded size could not be measured"
+            ) from None
+        if frame_bytes * 2 > max_decoded_bytes:
+            raise ValueError(
+                "Statistics decoded data exceeds its diagnostic limit"
+            )
+    return frame
 
 
 def build_stats_file(

@@ -3171,6 +3171,59 @@ def test_snapshot_commit_rejects_lost_fencing_lock_without_changing_catalog():
     assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
 
 
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_snapshot_commit_fences_supplied_namespace_token_in_both_lua_lanes(
+    pinned_no_mirrors,
+    monkeypatch,
+):
+    catalog, fake = _catalog()
+    _seed(fake)
+    fake.set(RK.lock_namespace("org", "lake"), "namespace-owner", ex=30)
+    general = MagicMock(wraps=catalog._snapshot_commit)
+    fast = MagicMock(wraps=catalog._snapshot_commit_no_mirrors)
+    monkeypatch.setattr(catalog, "_snapshot_commit", general)
+    monkeypatch.setattr(catalog, "_snapshot_commit_no_mirrors", fast)
+    kwargs = {"expected_mirrors": []}
+    if pinned_no_mirrors:
+        kwargs["expected_mirror_pin"] = None
+
+    assert catalog.commit_snapshot(
+        "org",
+        "lake",
+        "table",
+        _snapshot_payload(),
+        "snap/5.json",
+        expected_version=4,
+        expected_path="snap/4.json",
+        lock_token="token",
+        namespace_token="namespace-owner",
+        **kwargs,
+    ) == (5, 10)
+
+    fake.set(RK.lock_namespace("org", "lake"), "replacement-owner", ex=30)
+    before_leaf = fake.get(RK.meta_leaf("org", "lake", "table"))
+    before_root = fake.get(RK.meta_root("org", "lake"))
+    with pytest.raises(LockLostError, match="namespace fencing lock"):
+        catalog.commit_snapshot(
+            "org",
+            "lake",
+            "table",
+            _snapshot_payload(snapshot_version=6),
+            "snap/6.json",
+            expected_version=5,
+            expected_path="snap/5.json",
+            lock_token="token",
+            namespace_token="namespace-owner",
+            **kwargs,
+        )
+
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) == before_leaf
+    assert fake.get(RK.meta_root("org", "lake")) == before_root
+    selected, other = (fast, general) if pinned_no_mirrors else (general, fast)
+    assert selected.call_count == 2
+    other.assert_not_called()
+
+
 def test_ambiguous_atomic_commit_error_is_never_retried_as_path_only():
     events = []
 

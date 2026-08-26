@@ -698,6 +698,171 @@ def test_azure_delete_prefix_drains_all_batches_and_retries_partial_failure():
     )
 
 
+def test_gcs_delete_prefix_has_no_total_object_cap():
+    pytest.importorskip("google.cloud.storage")
+    from supertable.storage.gcp_storage import GCSStorage
+
+    calls = {"value": 0}
+
+    class Blob:
+        def __init__(self, name):
+            self.name = name
+
+        def delete(self):
+            return None
+
+    def list_batch(*_args, **_kwargs):
+        batch = calls["value"]
+        calls["value"] += 1
+        if batch == 33:
+            return []
+        return [Blob(f"base/table/{batch:02d}-{index:04d}") for index in range(1000)]
+
+    client = MagicMock()
+    client.bucket.return_value.get_blob.return_value = None
+    client.list_blobs.side_effect = list_batch
+    storage = GCSStorage("bucket", client=client, base_prefix="base")
+
+    storage.delete_prefix("table")
+
+    assert calls["value"] == 34
+
+
+def test_azure_delete_prefix_has_no_total_object_cap():
+    pytest.importorskip("azure.storage.blob")
+    from supertable.storage.azure_storage import AzureBlobStorage
+
+    calls = {"value": 0}
+
+    def list_batch(**_kwargs):
+        batch = calls["value"]
+        calls["value"] += 1
+        if batch == 33:
+            return []
+        return [
+            SimpleNamespace(name=f"base/table/{batch:02d}-{index:04d}")
+            for index in range(1000)
+        ]
+
+    service = MagicMock()
+    container = service.get_container_client.return_value
+    container.list_blobs.side_effect = list_batch
+    storage = AzureBlobStorage("container", service, base_prefix="base")
+    storage._blob_exists = lambda _name: False
+
+    storage.delete_prefix("table")
+
+    assert calls["value"] == 34
+    assert container.delete_blob.call_count == 33_000
+
+
+def test_minio_delete_prefix_has_no_total_object_cap():
+    pytest.importorskip("minio")
+    from supertable.storage.minio_storage import MinioStorage
+
+    calls = {"value": 0}
+
+    def list_batch(_prefix, recursive=True):
+        assert recursive is True
+        batch = calls["value"]
+        calls["value"] += 1
+        if batch == 33:
+            return []
+        return [
+            SimpleNamespace(object_name=f"base/table/{batch:02d}-{index:04d}")
+            for index in range(1000)
+        ]
+
+    client = MagicMock()
+    client.remove_objects.side_effect = lambda _bucket, stream: (
+        list(stream) and []
+    )
+    storage = MinioStorage("bucket", client, base_prefix="base")
+    storage._object_exists = lambda _name: False
+    storage._list_objects = list_batch
+
+    storage.delete_prefix("table")
+
+    assert calls["value"] == 34
+    assert client.remove_objects.call_count == 33
+
+
+def test_delete_prefix_progress_guard_bounds_unique_and_alternating_batches():
+    from supertable.storage.storage_interface import _DeletePrefixProgressGuard
+
+    times = iter((0.0, 0.0, 1.0, 4.0))
+    unique = _DeletePrefixProgressGuard(
+        deadline_seconds=3.0,
+        clock=lambda: next(times),
+    )
+    assert unique.is_stalled(("a",)) is False
+    assert unique.is_stalled(("b",)) is False
+    assert unique.is_stalled(("c",)) is True
+
+    alternating = _DeletePrefixProgressGuard()
+    for names in (("a", "b"), ("c",), ("b", "a"), ("c",), ("a", "b")):
+        assert alternating.is_stalled(names) is False
+    assert alternating.is_stalled(("c",)) is False
+    assert alternating.is_stalled(("b", "a")) is True
+
+
+def test_azure_delete_prefix_rejects_alternating_nonprogress():
+    pytest.importorskip("azure.storage.blob")
+    from supertable.storage.azure_storage import AzureBlobStorage
+
+    batches = (
+        [SimpleNamespace(name="base/table/a"), SimpleNamespace(name="base/table/b")],
+        [SimpleNamespace(name="base/table/c")],
+    )
+    calls = {"value": 0}
+
+    def list_batch(**_kwargs):
+        batch = batches[calls["value"] % 2]
+        calls["value"] += 1
+        return list(reversed(batch)) if calls["value"] % 3 == 0 else batch
+
+    service = MagicMock()
+    container = service.get_container_client.return_value
+    container.list_blobs.side_effect = list_batch
+    storage = AzureBlobStorage("container", service, base_prefix="base")
+    storage._blob_exists = lambda _name: False
+
+    with pytest.raises(OSError, match="made no progress"):
+        storage.delete_prefix("table")
+
+    assert calls["value"] == 7
+
+
+def test_minio_delete_prefix_rejects_alternating_nonprogress():
+    pytest.importorskip("minio")
+    from supertable.storage.minio_storage import MinioStorage
+
+    batches = (
+        [SimpleNamespace(object_name="base/table/a"), SimpleNamespace(object_name="base/table/b")],
+        [SimpleNamespace(object_name="base/table/c")],
+    )
+    calls = {"value": 0}
+
+    def list_batch(_prefix, recursive=True):
+        assert recursive is True
+        batch = batches[calls["value"] % 2]
+        calls["value"] += 1
+        return list(reversed(batch)) if calls["value"] % 3 == 0 else batch
+
+    client = MagicMock()
+    client.remove_objects.side_effect = lambda _bucket, stream: (
+        list(stream) and []
+    )
+    storage = MinioStorage("bucket", client, base_prefix="base")
+    storage._object_exists = lambda _name: False
+    storage._list_objects = list_batch
+
+    with pytest.raises(OSError, match="made no progress"):
+        storage.delete_prefix("table")
+
+    assert calls["value"] == 7
+
+
 def test_gcs_delete_prefix_failure_suppresses_path_and_provider_text():
     pytest.importorskip("google.cloud.storage")
     from supertable.storage.gcp_storage import GCSStorage

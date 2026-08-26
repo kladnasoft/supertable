@@ -914,7 +914,6 @@ def test_native_range_quota_and_cancel_failures_reclaim_partials(tmp_path):
             )
         assert session.used_bytes == 0
         assert list(session.directory.iterdir()) == []
-
     cancelled = threading.Event()
 
     def cancelling_batches():
@@ -941,6 +940,72 @@ def test_native_range_quota_and_cancel_failures_reclaim_partials(tmp_path):
             )
         assert session.used_bytes == 0
         assert list(session.directory.iterdir()) == []
+
+
+def test_spill_session_close_can_retry_after_cleanup_failure(tmp_path, monkeypatch):
+    session = SpillSession(tmp_path, budget_bytes=MIB, min_free_bytes=0)
+    session.__enter__()
+    directory = session.directory
+    with session.open_output("retry-cleanup.bin") as output:
+        output.write(b"payload")
+    real_rmtree = spill_module.shutil.rmtree
+    attempts = {"count": 0}
+
+    def fail_once(path, *, ignore_errors=False):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise OSError("injected cleanup failure")
+        return real_rmtree(path, ignore_errors=ignore_errors)
+
+    monkeypatch.setattr(spill_module.shutil, "rmtree", fail_once)
+
+    with pytest.raises(OSError, match="injected cleanup failure"):
+        session.close()
+
+    assert session.directory == directory
+    assert session.used_bytes == len(b"payload")
+    assert directory.exists()
+
+    session.close()
+
+    assert attempts["count"] == 2
+    assert session.used_bytes == 0
+    assert not directory.exists()
+    with pytest.raises(spill_module.IslandSpillError, match="not active"):
+        _ = session.directory
+
+
+def test_spill_session_close_retries_missing_child_failure_when_root_remains(
+    tmp_path, monkeypatch,
+):
+    session = SpillSession(tmp_path, budget_bytes=MIB, min_free_bytes=0)
+    session.__enter__()
+    directory = session.directory
+    with session.open_output("remaining.bin") as output:
+        output.write(b"payload")
+    real_rmtree = spill_module.shutil.rmtree
+    attempts = {"count": 0}
+
+    def missing_child_once(path, *, ignore_errors=False):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise FileNotFoundError("child disappeared during cleanup")
+        return real_rmtree(path, ignore_errors=ignore_errors)
+
+    monkeypatch.setattr(spill_module.shutil, "rmtree", missing_child_once)
+
+    with pytest.raises(FileNotFoundError, match="child disappeared"):
+        session.close()
+
+    assert session.directory == directory
+    assert session.used_bytes == len(b"payload")
+    assert directory.exists()
+
+    session.close()
+
+    assert attempts["count"] == 2
+    assert session.used_bytes == 0
+    assert not directory.exists()
 
 
 def test_native_range_hot_partition_falls_back_to_bounded_merge(

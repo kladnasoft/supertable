@@ -19,28 +19,28 @@
       "supertable/audit/privileged_worker.py:1172: error: Unsupported operand types for > (\"int\" and \"None\")  [operator]"
     ],
     "supertable/data_reader.py": [
-      "supertable/data_reader.py:1507: error: \"QueryPlanManager\" has no attribute \"requested_engine\"  [attr-defined]",
-      "supertable/data_reader.py:1510: error: \"QueryPlanManager\" has no attribute \"engine_forced\"  [attr-defined]",
-      "supertable/data_reader.py:1511: error: \"QueryPlanManager\" has no attribute \"requested_engine\"  [attr-defined]",
-      "supertable/data_reader.py:1515: error: \"QueryPlanManager\" has no attribute \"query_observation_store\"  [attr-defined]",
-      "supertable/data_reader.py:1518: error: \"QueryPlanManager\" has no attribute \"source_type\"  [attr-defined]",
-      "supertable/data_reader.py:2112: error: Argument \"timing\" to \"extend_execution_plan\" has incompatible type \"list[Any]\"; expected \"dict[str, float] | None\"  [arg-type]",
-      "supertable/data_reader.py:2155: error: Argument \"query_plan_manager\" to \"extend_execution_plan\" has incompatible type \"QueryPlanManager | None\"; expected \"QueryPlanManager\"  [arg-type]",
-      "supertable/data_reader.py:2157: error: Argument \"timing\" to \"extend_execution_plan\" has incompatible type \"list[Any]\"; expected \"dict[str, float] | None\"  [arg-type]"
+      "supertable/data_reader.py:1515: error: \"QueryPlanManager\" has no attribute \"requested_engine\"  [attr-defined]",
+      "supertable/data_reader.py:1518: error: \"QueryPlanManager\" has no attribute \"engine_forced\"  [attr-defined]",
+      "supertable/data_reader.py:1519: error: \"QueryPlanManager\" has no attribute \"requested_engine\"  [attr-defined]",
+      "supertable/data_reader.py:1523: error: \"QueryPlanManager\" has no attribute \"query_observation_store\"  [attr-defined]",
+      "supertable/data_reader.py:1526: error: \"QueryPlanManager\" has no attribute \"source_type\"  [attr-defined]",
+      "supertable/data_reader.py:2120: error: Argument \"timing\" to \"extend_execution_plan\" has incompatible type \"list[Any]\"; expected \"dict[str, float] | None\"  [arg-type]",
+      "supertable/data_reader.py:2163: error: Argument \"query_plan_manager\" to \"extend_execution_plan\" has incompatible type \"QueryPlanManager | None\"; expected \"QueryPlanManager\"  [arg-type]",
+      "supertable/data_reader.py:2165: error: Argument \"timing\" to \"extend_execution_plan\" has incompatible type \"list[Any]\"; expected \"dict[str, float] | None\"  [arg-type]"
     ],
     "supertable/data_writer.py": [
-      "supertable/data_writer.py:1785: error: Key expression in dictionary comprehension has incompatible type \"Any | None\"; expected type \"str\"  [misc]",
-      "supertable/data_writer.py:1790: error: Key expression in dictionary comprehension has incompatible type \"Any | None\"; expected type \"str\"  [misc]",
-      "supertable/data_writer.py:1969: error: Need type annotation for \"new_resources\" (hint: \"new_resources: list[<type>] = ...\")  [var-annotated]",
-      "supertable/data_writer.py:2042: error: Need type annotation for \"footer_md_cache\" (hint: \"footer_md_cache: dict[<type>, <type>] = ...\")  [var-annotated]",
-      "supertable/data_writer.py:268: error: Set comprehension has incompatible type Set[Any | None]; expected Set[str]  [misc]",
-      "supertable/data_writer.py:2881: error: Argument 1 to \"extract_stats_rows\" has incompatible type \"list[Any | None]\"; expected \"list[str]\"  [arg-type]",
-      "supertable/data_writer.py:2889: error: Argument \"removed_files\" to \"build_stats_file\" has incompatible type \"set[Any | None]\"; expected \"set[str] | None\"  [arg-type]",
-      "supertable/data_writer.py:3546: error: Need type annotation for \"footer_md_cache\" (hint: \"footer_md_cache: dict[<type>, <type>] = ...\")  [var-annotated]",
-      "supertable/data_writer.py:3677: error: Item \"None\" of \"Any | None\" has no attribute \"height\"  [union-attr]",
-      "supertable/data_writer.py:3966: error: Argument 1 to \"extract_stats_rows\" has incompatible type \"list[Any | None]\"; expected \"list[str]\"  [arg-type]",
-      "supertable/data_writer.py:3994: error: Argument 1 to \"_stats_cache_identity\" of \"DataWriter\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
-      "supertable/data_writer.py:4268: error: Incompatible default for parameter \"newer_than\" (default has type \"None\", parameter has type \"str\")  [assignment]"
+      "supertable/data_writer.py:1794: error: Key expression in dictionary comprehension has incompatible type \"Any | None\"; expected type \"str\"  [misc]",
+      "supertable/data_writer.py:1799: error: Key expression in dictionary comprehension has incompatible type \"Any | None\"; expected type \"str\"  [misc]",
+      "supertable/data_writer.py:1978: error: Need type annotation for \"new_resources\" (hint: \"new_resources: list[<type>] = ...\")  [var-annotated]",
+      "supertable/data_writer.py:2051: error: Need type annotation for \"footer_md_cache\" (hint: \"footer_md_cache: dict[<type>, <type>] = ...\")  [var-annotated]",
+      "supertable/data_writer.py:277: error: Set comprehension has incompatible type Set[Any | None]; expected Set[str]  [misc]",
+      "supertable/data_writer.py:2890: error: Argument 1 to \"extract_stats_rows\" has incompatible type \"list[Any | None]\"; expected \"list[str]\"  [arg-type]",
+      "supertable/data_writer.py:2898: error: Argument \"removed_files\" to \"build_stats_file\" has incompatible type \"set[Any | None]\"; expected \"set[str] | None\"  [arg-type]",
+      "supertable/data_writer.py:3557: error: Need type annotation for \"footer_md_cache\" (hint: \"footer_md_cache: dict[<type>, <type>] = ...\")  [var-annotated]",
+      "supertable/data_writer.py:3688: error: Item \"None\" of \"Any | None\" has no attribute \"height\"  [union-attr]",
+      "supertable/data_writer.py:3977: error: Argument 1 to \"extract_stats_rows\" has incompatible type \"list[Any | None]\"; expected \"list[str]\"  [arg-type]",
+      "supertable/data_writer.py:4005: error: Argument 1 to \"_stats_cache_identity\" of \"DataWriter\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
+      "supertable/data_writer.py:4281: error: Incompatible default for parameter \"newer_than\" (default has type \"None\", parameter has type \"str\")  [assignment]"
     ],
     "supertable/demo/medcenter/finance_sources.py": [
       "supertable/demo/medcenter/finance_sources.py:277: error: Argument \"booking_date\" to \"_bank_entry\" of \"FinanceSourcesGenerator\" has incompatible type \"date | None\"; expected \"date\"  [arg-type]",
@@ -126,43 +126,43 @@
       "supertable/engine/adaptive_router.py:31: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]"
     ],
     "supertable/engine/duckdb_engine.py": [
-      "supertable/engine/duckdb_engine.py:2264: error: \"SQLParser\" has no attribute \"executing_query\"  [attr-defined]"
+      "supertable/engine/duckdb_engine.py:2367: error: \"SQLParser\" has no attribute \"executing_query\"  [attr-defined]"
     ],
     "supertable/engine/engine_common.py": [
-      "supertable/engine/engine_common.py:2621: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2622: error: \"ValidatedTombstoneTable\" has no attribute \"digest\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2623: error: \"ValidatedTombstoneTable\" has no attribute \"referenced_files\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2624: error: \"ValidatedTombstoneTable\" has no attribute \"root_digest\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2625: error: \"ValidatedTombstoneTable\" has no attribute \"cache_key\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2626: error: \"ValidatedTombstoneTable\" has no attribute \"segment_fingerprint\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2818: error: \"object\" has no attribute \"cache_key\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2819: error: \"object\" has no attribute \"expected_rows\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2820: error: \"object\" has no attribute \"file_size\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2821: error: \"object\" has no attribute \"tombstone_digest\"  [attr-defined]",
-      "supertable/engine/engine_common.py:2835: error: \"object\" has no attribute \"tombstone_path\"  [attr-defined]",
-      "supertable/engine/engine_common.py:3139: error: \"object\" has no attribute \"tombstone_path\"  [attr-defined]",
-      "supertable/engine/engine_common.py:3142: error: \"object\" has no attribute \"file_size\"  [attr-defined]",
-      "supertable/engine/engine_common.py:3161: error: \"object\" has no attribute \"cache_key\"  [attr-defined]",
-      "supertable/engine/engine_common.py:3184: error: \"object\" has no attribute \"cache_key\"  [attr-defined]",
-      "supertable/engine/engine_common.py:3192: error: \"object\" has no attribute \"expected_rows\"  [attr-defined]",
-      "supertable/engine/engine_common.py:3193: error: \"object\" has no attribute \"tombstone_digest\"  [attr-defined]",
-      "supertable/engine/engine_common.py:4155: error: \"ValidatedTombstoneTable\" has no attribute \"referenced_files\"  [attr-defined]",
-      "supertable/engine/engine_common.py:4159: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
-      "supertable/engine/engine_common.py:4162: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
-      "supertable/engine/engine_common.py:4167: error: \"ValidatedTombstoneTable\" has no attribute \"digest\"  [attr-defined]",
-      "supertable/engine/engine_common.py:4167: error: \"ValidatedTombstoneTable\" has no attribute \"root_digest\"  [attr-defined]",
-      "supertable/engine/engine_common.py:4177: error: \"ValidatedTombstoneTable\" has no attribute \"segment_fingerprint\"  [attr-defined]",
-      "supertable/engine/engine_common.py:4188: error: \"ValidatedTombstoneTable\" has no attribute \"referenced_files\"  [attr-defined]",
-      "supertable/engine/engine_common.py:4546: error: Argument 1 to \"escape_parquet_path\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
-      "supertable/engine/engine_common.py:4693: error: Item \"object\" of \"object | Any\" has no attribute \"execute\"  [union-attr]"
+      "supertable/engine/engine_common.py:2639: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2640: error: \"ValidatedTombstoneTable\" has no attribute \"digest\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2641: error: \"ValidatedTombstoneTable\" has no attribute \"referenced_files\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2642: error: \"ValidatedTombstoneTable\" has no attribute \"root_digest\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2643: error: \"ValidatedTombstoneTable\" has no attribute \"cache_key\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2644: error: \"ValidatedTombstoneTable\" has no attribute \"segment_fingerprint\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2836: error: \"object\" has no attribute \"cache_key\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2837: error: \"object\" has no attribute \"expected_rows\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2838: error: \"object\" has no attribute \"file_size\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2839: error: \"object\" has no attribute \"tombstone_digest\"  [attr-defined]",
+      "supertable/engine/engine_common.py:2853: error: \"object\" has no attribute \"tombstone_path\"  [attr-defined]",
+      "supertable/engine/engine_common.py:3157: error: \"object\" has no attribute \"tombstone_path\"  [attr-defined]",
+      "supertable/engine/engine_common.py:3160: error: \"object\" has no attribute \"file_size\"  [attr-defined]",
+      "supertable/engine/engine_common.py:3179: error: \"object\" has no attribute \"cache_key\"  [attr-defined]",
+      "supertable/engine/engine_common.py:3202: error: \"object\" has no attribute \"cache_key\"  [attr-defined]",
+      "supertable/engine/engine_common.py:3210: error: \"object\" has no attribute \"expected_rows\"  [attr-defined]",
+      "supertable/engine/engine_common.py:3211: error: \"object\" has no attribute \"tombstone_digest\"  [attr-defined]",
+      "supertable/engine/engine_common.py:4173: error: \"ValidatedTombstoneTable\" has no attribute \"referenced_files\"  [attr-defined]",
+      "supertable/engine/engine_common.py:4177: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
+      "supertable/engine/engine_common.py:4180: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
+      "supertable/engine/engine_common.py:4185: error: \"ValidatedTombstoneTable\" has no attribute \"digest\"  [attr-defined]",
+      "supertable/engine/engine_common.py:4185: error: \"ValidatedTombstoneTable\" has no attribute \"root_digest\"  [attr-defined]",
+      "supertable/engine/engine_common.py:4195: error: \"ValidatedTombstoneTable\" has no attribute \"segment_fingerprint\"  [attr-defined]",
+      "supertable/engine/engine_common.py:4206: error: \"ValidatedTombstoneTable\" has no attribute \"referenced_files\"  [attr-defined]",
+      "supertable/engine/engine_common.py:4564: error: Argument 1 to \"escape_parquet_path\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
+      "supertable/engine/engine_common.py:4711: error: Item \"object\" of \"object | Any\" has no attribute \"execute\"  [union-attr]"
     ],
     "supertable/engine/engine_config.py": [
       "supertable/engine/engine_config.py:321: error: Argument 1 to \"_effective\" has incompatible type \"Any | dict[Any, Any] | None\"; expected \"dict[str, Any]\"  [arg-type]",
       "supertable/engine/engine_config.py:403: error: Argument 1 to \"_block\" has incompatible type \"Any | dict[Any, Any] | None\"; expected \"dict[str, Any]\"  [arg-type]"
     ],
     "supertable/engine/file_cache.py": [
-      "supertable/engine/file_cache.py:654: error: Incompatible types in assignment (expression has type \"_Resolution | None\", variable has type \"_Resolution\")  [assignment]",
-      "supertable/engine/file_cache.py:669: error: Incompatible types in assignment (expression has type \"_Resolution | None\", variable has type \"_Resolution\")  [assignment]"
+      "supertable/engine/file_cache.py:652: error: Incompatible types in assignment (expression has type \"_Resolution | None\", variable has type \"_Resolution\")  [assignment]",
+      "supertable/engine/file_cache.py:667: error: Incompatible types in assignment (expression has type \"_Resolution | None\", variable has type \"_Resolution\")  [assignment]"
     ],
     "supertable/engine/island_resources.py": [
       "supertable/engine/island_resources.py:200: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
@@ -170,9 +170,9 @@
       "supertable/engine/island_resources.py:736: error: \"object\" has no attribute \"free\"  [attr-defined]"
     ],
     "supertable/engine/island_spill.py": [
-      "supertable/engine/island_spill.py:1195: error: Item \"None\" of \"ThreadPoolExecutor | None\" has no attribute \"submit\"  [union-attr]",
-      "supertable/engine/island_spill.py:472: error: Argument 1 to \"append\" of \"list\" has incompatible type \"tuple[int, Any | _Descending]\"; expected \"tuple[int, None]\"  [arg-type]",
-      "supertable/engine/island_spill.py:612: error: Incompatible types in assignment (expression has type \"BufferedWriter[_BufferedWriterStream]\", variable has type \"_BudgetedFile\")  [assignment]"
+      "supertable/engine/island_spill.py:1203: error: Item \"None\" of \"ThreadPoolExecutor | None\" has no attribute \"submit\"  [union-attr]",
+      "supertable/engine/island_spill.py:480: error: Argument 1 to \"append\" of \"list\" has incompatible type \"tuple[int, Any | _Descending]\"; expected \"tuple[int, None]\"  [arg-type]",
+      "supertable/engine/island_spill.py:620: error: Incompatible types in assignment (expression has type \"BufferedWriter[_BufferedWriterStream]\", variable has type \"_BudgetedFile\")  [assignment]"
     ],
     "supertable/engine/islanddb.py": [
       "supertable/engine/islanddb.py:1167: error: \"object\" has no attribute \"cache_namespace\"  [attr-defined]",
@@ -289,32 +289,31 @@
       "supertable/processing.py:3287: error: Argument 1 to \"_record_parquet_codec\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler\"  [arg-type]",
       "supertable/processing.py:3379: error: Argument \"profiler\" to \"_read_parquet_safe\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
       "supertable/processing.py:3459: error: Argument \"profiler\" to \"_read_parquet_safe\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:4944: error: Argument \"profiler\" to \"_island_probe_overlap_matches\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:4957: error: Argument \"profiler\" to \"_duckdb_probe_overlap_matches\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:4971: error: Argument \"profiler\" to \"_derive_stale_and_deletes\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:5024: error: Argument \"profiler\" to \"filter_stale_incoming_rows\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:5034: error: Argument \"profiler\" to \"identify_deleted_rowids\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:5129: error: Argument \"profiler\" to \"_read_parquet_safe\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:5166: error: Argument \"profiler\" to \"_write_df_parquet\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:5412: error: Argument \"profiler\" to \"_write_df_parquet\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:5511: error: Argument \"profiler\" to \"persist_tombstone_segment_v2\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:5522: error: Argument \"profiler\" to \"persist_tombstone_manifest_v2\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:5627: error: Incompatible types in assignment (expression has type \"tuple[TombstoneSegment, ...]\", variable has type \"tuple[TombstoneSegment]\")  [assignment]",
-      "supertable/processing.py:5636: error: Argument \"profiler\" to \"persist_tombstone_manifest_v2\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:5713: error: Argument \"profiler\" to \"_read_parquet_safe\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:5758: error: Argument \"profiler\" to \"_write_df_parquet\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:6197: error: Argument \"footer_sha256\" to \"ResourceStatsSeal\" has incompatible type \"Any | None\"; expected \"str\"  [arg-type]",
-      "supertable/processing.py:6198: error: Argument \"stats_rows\" to \"ResourceStatsSeal\" has incompatible type \"Any | None\"; expected \"int\"  [arg-type]",
-      "supertable/processing.py:6199: error: Argument \"stats_digest\" to \"ResourceStatsSeal\" has incompatible type \"Any | None\"; expected \"str\"  [arg-type]",
-      "supertable/processing.py:6219: error: Argument \"size\" to \"ResourceObjectSeal\" has incompatible type \"Any | None\"; expected \"int\"  [arg-type]",
-      "supertable/processing.py:6496: error: Argument \"profiler\" to \"_safe_exists\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:6790: error: Argument \"profiler\" to \"_read_footer_metadata\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:6849: error: Argument \"profiler\" to \"load_stats\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:6944: error: Argument \"profiler\" to \"_write_df_parquet\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:4946: error: Argument \"profiler\" to \"_island_probe_overlap_matches\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:4959: error: Argument \"profiler\" to \"_duckdb_probe_overlap_matches\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:4973: error: Argument \"profiler\" to \"_derive_stale_and_deletes\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:5026: error: Argument \"profiler\" to \"filter_stale_incoming_rows\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:5036: error: Argument \"profiler\" to \"identify_deleted_rowids\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:5131: error: Argument \"profiler\" to \"_read_parquet_safe\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:5168: error: Argument \"profiler\" to \"_write_df_parquet\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:5414: error: Argument \"profiler\" to \"_write_df_parquet\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:5513: error: Argument \"profiler\" to \"persist_tombstone_segment_v2\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:5524: error: Argument \"profiler\" to \"persist_tombstone_manifest_v2\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:5629: error: Incompatible types in assignment (expression has type \"tuple[TombstoneSegment, ...]\", variable has type \"tuple[TombstoneSegment]\")  [assignment]",
+      "supertable/processing.py:5638: error: Argument \"profiler\" to \"persist_tombstone_manifest_v2\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:5715: error: Argument \"profiler\" to \"_read_parquet_safe\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:5760: error: Argument \"profiler\" to \"_write_df_parquet\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:6199: error: Argument \"footer_sha256\" to \"ResourceStatsSeal\" has incompatible type \"Any | None\"; expected \"str\"  [arg-type]",
+      "supertable/processing.py:6200: error: Argument \"stats_rows\" to \"ResourceStatsSeal\" has incompatible type \"Any | None\"; expected \"int\"  [arg-type]",
+      "supertable/processing.py:6201: error: Argument \"stats_digest\" to \"ResourceStatsSeal\" has incompatible type \"Any | None\"; expected \"str\"  [arg-type]",
+      "supertable/processing.py:6221: error: Argument \"size\" to \"ResourceObjectSeal\" has incompatible type \"Any | None\"; expected \"int\"  [arg-type]",
+      "supertable/processing.py:6847: error: Argument \"profiler\" to \"_read_footer_metadata\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:6961: error: Argument \"profiler\" to \"load_stats\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:7056: error: Argument \"profiler\" to \"_write_df_parquet\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
       "supertable/processing.py:740: error: Argument \"profiler\" to \"_safe_exists\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:8473: error: Argument \"profiler\" to \"_read_parquet_safe\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
-      "supertable/processing.py:9325: error: Argument \"profiler\" to \"_load_tombstone_manifest_v2_state\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler\"  [arg-type]",
-      "supertable/processing.py:9352: error: Argument \"profiler\" to \"_read_parquet_safe\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:8585: error: Argument \"profiler\" to \"_read_parquet_safe\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
+      "supertable/processing.py:9437: error: Argument \"profiler\" to \"_load_tombstone_manifest_v2_state\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler\"  [arg-type]",
+      "supertable/processing.py:9464: error: Argument \"profiler\" to \"_read_parquet_safe\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
       "supertable/processing.py:977: error: Argument \"profiler\" to \"_read_parquet_safe\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]",
       "supertable/processing.py:983: error: Argument \"profiler\" to \"_safe_exists\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler | None\"  [arg-type]"
     ],
@@ -336,10 +335,10 @@
       "supertable/quality/checker.py:808: error: Argument 1 to \"abs\" has incompatible type \"Literal['n', 'N', 'F'] | int\"; expected \"SupportsAbs[int]\"  [arg-type]"
     ],
     "supertable/quality/scheduler.py": [
-      "supertable/quality/scheduler.py:1281: error: Too many arguments for \"_process_table_job\"  [call-arg]",
-      "supertable/quality/scheduler.py:2860: error: Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
-      "supertable/quality/scheduler.py:3992: error: Name \"base_updates\" already defined on line 3812  [no-redef]",
-      "supertable/quality/scheduler.py:4307: error: Name \"base_updates\" already defined on line 4132  [no-redef]"
+      "supertable/quality/scheduler.py:1394: error: Too many arguments for \"_process_table_job\"  [call-arg]",
+      "supertable/quality/scheduler.py:2973: error: Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
+      "supertable/quality/scheduler.py:4105: error: Name \"base_updates\" already defined on line 3925  [no-redef]",
+      "supertable/quality/scheduler.py:4420: error: Name \"base_updates\" already defined on line 4245  [no-redef]"
     ],
     "supertable/rbac/role_manager.py": [
       "supertable/rbac/role_manager.py:161: error: Argument 1 to \"validate_role_name\" has incompatible type \"Any | None\"; expected \"str\"  [arg-type]",
@@ -355,13 +354,13 @@
       "supertable/redis_connector.py:413: error: Dict entry 2 has incompatible type \"str\": \"Any | None\"; expected \"str\": \"bool\"  [dict-item]"
     ],
     "supertable/redis_infra.py": [
-      "supertable/redis_infra.py:319: error: Unused \"type: ignore\" comment  [unused-ignore]"
+      "supertable/redis_infra.py:320: error: Unused \"type: ignore\" comment  [unused-ignore]"
     ],
     "supertable/storage/azure_storage.py": [
-      "supertable/storage/azure_storage.py:515: error: Need type annotation for \"root\" (hint: \"root: dict[<type>, <type>] = ...\")  [var-annotated]"
+      "supertable/storage/azure_storage.py:517: error: Need type annotation for \"root\" (hint: \"root: dict[<type>, <type>] = ...\")  [var-annotated]"
     ],
     "supertable/storage/local_storage.py": [
-      "supertable/storage/local_storage.py:1196: error: Need type annotation for \"directory_structure\" (hint: \"directory_structure: dict[<type>, <type>] = ...\")  [var-annotated]",
+      "supertable/storage/local_storage.py:1205: error: Need type annotation for \"directory_structure\" (hint: \"directory_structure: dict[<type>, <type>] = ...\")  [var-annotated]",
       "supertable/storage/local_storage.py:424: error: Incompatible types in assignment (expression has type \"Token[_DurabilityBatch | None]\", variable has type \"None\")  [assignment]",
       "supertable/storage/local_storage.py:525: error: Argument 1 to \"_fsync_logical_publications\" of \"LocalStorage\" has incompatible type \"set[str]\"; expected \"Sequence[str]\"  [arg-type]",
       "supertable/storage/local_storage.py:585: error: Argument 1 to \"_fsync_logical_publications\" of \"LocalStorage\" has incompatible type \"set[str]\"; expected \"Sequence[str]\"  [arg-type]",
@@ -374,8 +373,8 @@
       "supertable/storage/storage_factory.py:26: error: Module has no attribute \"util\"  [attr-defined]"
     ],
     "supertable/tombstone_manifest_v2.py": [
-      "supertable/tombstone_manifest_v2.py:251: error: Unsupported operand types for >= (\"int\" and \"object\")  [operator]",
-      "supertable/tombstone_manifest_v2.py:321: error: Incompatible types in assignment (expression has type \"Any | None\", variable has type \"int\")  [assignment]"
+      "supertable/tombstone_manifest_v2.py:255: error: Unsupported operand types for >= (\"int\" and \"object\")  [operator]",
+      "supertable/tombstone_manifest_v2.py:335: error: Incompatible types in assignment (expression has type \"Any | None\", variable has type \"int\")  [assignment]"
     ],
     "supertable/utils/sql_parser.py": [
       "supertable/utils/sql_parser.py:1025: error: \"object\" has no attribute \"selected_sources\"  [attr-defined]",
@@ -422,11 +421,11 @@
       "supertable/monitoring_writer.py:57:fcntl = None  # type: ignore[assignment]"
     ],
     "supertable/redis_infra.py": [
-      "supertable/redis_infra.py:319:from supertable.redis_catalog import RedisCatalog as _RC  # type: ignore",
-      "supertable/redis_infra.py:322:from redis_catalog import RedisCatalog as _RC  # type: ignore"
+      "supertable/redis_infra.py:320:from supertable.redis_catalog import RedisCatalog as _RC  # type: ignore",
+      "supertable/redis_infra.py:323:from redis_catalog import RedisCatalog as _RC  # type: ignore"
     ]
   },
-  "known_error_count": 305,
+  "known_error_count": 304,
   "known_suppression_count": 10,
   "mypy_version": "2.3.0",
   "production_file_count": 161,

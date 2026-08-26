@@ -5491,8 +5491,9 @@ local one_shot_initial = ARGV[15]
 local authority_fence = ARGV[16]
 local expected_role_generation = ARGV[17]
 local expected_user_generation = ARGV[18]
-local expected_root_generation = ARGV[19]
-local expected_root_timestamp = ARGV[20]
+  local expected_root_generation = ARGV[19]
+  local expected_root_timestamp = ARGV[20]
+  local expected_namespace_token = ARGV[21]
 
 if not snapshot_metadata_size_ok(payload_json, schema_json)
     or not snapshot_identity_ok(new_path, expected_path, commit_id) then
@@ -5602,9 +5603,14 @@ end
 -- this writer's leaf lease.  It must not wound the current flagged one-shot
 -- publisher.  A real delete linearizes by persisting namespace_delete before
 -- draining this lease; that durable intent remains an unconditional fence.
-if one_shot_initial ~= '1'
-    and redis.call('EXISTS', namespace_lock) == 1 then
-  return {-7, 0, 0}
+  local namespace_holder = redis.call('GET', namespace_lock)
+  if expected_namespace_token ~= '' then
+    if not namespace_holder
+        or namespace_holder ~= expected_namespace_token then
+      return {-21, 0, 0}
+    end
+  elseif one_shot_initial ~= '1' and namespace_holder then
+    return {-7, 0, 0}
 end
 if redis.call('EXISTS', namespace_delete) == 1 then
   return {-8, 0, 0}
@@ -5806,8 +5812,9 @@ local one_shot_initial = ARGV[15]
 local authority_fence = ARGV[16]
 local expected_role_generation = ARGV[17]
 local expected_user_generation = ARGV[18]
-local expected_root_generation = ARGV[19]
-local expected_root_timestamp = ARGV[20]
+  local expected_root_generation = ARGV[19]
+  local expected_root_timestamp = ARGV[20]
+  local expected_namespace_token = ARGV[21]
 
 if not snapshot_metadata_size_ok(payload_json, schema_json)
     or not snapshot_identity_ok(new_path, expected_path, commit_id) then
@@ -5868,9 +5875,14 @@ if not held_token or held_token ~= lock_token then
 end
 -- Do not let a waiting creator's namespace lock wound the current first
 -- publisher.  Namespace deletion is still fenced by its durable intent below.
-if one_shot_initial ~= '1'
-    and redis.call('EXISTS', namespace_lock) == 1 then
-  return {-7, 0, 0}
+  local namespace_holder = redis.call('GET', namespace_lock)
+  if expected_namespace_token ~= '' then
+    if not namespace_holder
+        or namespace_holder ~= expected_namespace_token then
+      return {-21, 0, 0}
+    end
+  elseif one_shot_initial ~= '1' and namespace_holder then
+    return {-7, 0, 0}
 end
 if redis.call('EXISTS', namespace_delete) == 1 then
   return {-8, 0, 0}
@@ -10484,6 +10496,7 @@ return 1
             now_ms: Optional[int] = None,
             one_shot_initial: bool = False,
             expected_write_authority_generation: Optional[Sequence[int]] = None,
+            namespace_token: Optional[str] = None,
     ) -> tuple[int, int]:
         """Atomically publish one fenced table snapshot and bump its root.
 
@@ -10498,6 +10511,9 @@ return 1
         script executes.  The comparison, fencing check, leaf update, and root
         invalidation happen in one Redis transaction, so readers can never
         combine a new leaf with an old root generation (or vice versa).
+        ``namespace_token``, when supplied, must still own the namespace lock
+        in that same transaction.  Maintenance operations can therefore hold
+        the namespace fence without being rejected as an unrelated deletion.
 
         An ambiguous flagged one-shot creation is reconciled once against its
         exact immutable leaf ``commit_id``, version, path, and payload digest;
@@ -10526,6 +10542,14 @@ return 1
         """
         if not lock_token:
             raise LockLostError("snapshot publication requires a fencing lock token")
+        if namespace_token is None:
+            expected_namespace_token = ""
+        else:
+            expected_namespace_token = _bounded_snapshot_text(
+                namespace_token,
+                field="namespace lock token",
+                maximum_bytes=_MAX_SNAPSHOT_COMMIT_ID_BYTES,
+            )
         path = _validated_snapshot_path(path, field="snapshot path")
         if type(one_shot_initial) is not bool:
             raise TypeError("one_shot_initial must be a boolean")
@@ -10776,6 +10800,7 @@ return 1
                         "1" if one_shot_initial else "0",
                         authority_fence,
                         *authority_values,
+                        expected_namespace_token,
                     ],
                 )
             else:
@@ -10815,6 +10840,7 @@ return 1
                         "1" if one_shot_initial else "0",
                         authority_fence,
                         *authority_values,
+                        expected_namespace_token,
                     ],
                 )
         except redis.RedisError as exc:
@@ -10950,6 +10976,11 @@ return 1
             raise ValueError(
                 "Redis rejected snapshot metadata that exceeds its byte/count "
                 f"safety limits for {org}/{sup}/{simple}"
+            )
+        if code == -21:
+            raise LockLostError(
+                f"Lost namespace fencing lock before publishing "
+                f"{org}/{sup}/{simple}"
             )
         raise RuntimeError(f"Unknown snapshot commit status {code}")
 
@@ -15866,12 +15897,28 @@ return 1
             *,
             allowed: Optional[frozenset[str]],
             count: int,
+            max_scan_calls: Optional[int] = None,
     ) -> Iterator[str]:
         """Enumerate one physical namespace without resolving it again."""
+        if (
+            max_scan_calls is not None
+            and (
+                type(max_scan_calls) is not int
+                or max_scan_calls <= 0
+            )
+        ):
+            raise ValueError("Leaf SCAN call bound must be a positive integer")
         pattern = RK.meta_leaf_pattern(org, sup)
         cursor = 0
+        scan_calls = 0
         try:
             while True:
+                if (
+                    max_scan_calls is not None
+                    and scan_calls >= max_scan_calls
+                ):
+                    raise RuntimeError("Leaf SCAN exceeded its call safety bound")
+                scan_calls += 1
                 cursor, keys = self.r.scan(
                     cursor=cursor, match=pattern, count=count,
                 )
@@ -16046,15 +16093,31 @@ return 1
             org, effective_sup, allowed=allowed, count=batch_size,
         )
 
-    def scan_leaf_items(self, org: str, sup: str, count: int = 1000) -> Iterator[Dict]:
+    def scan_leaf_items(
+            self,
+            org: str,
+            sup: str,
+            count: int = 1000,
+            *,
+            batch_size: Optional[int] = None,
+            max_scan_calls: Optional[int] = None,
+    ) -> Iterator[Dict]:
         """Iterate one root-generation-consistent set of leaf documents.
 
         Redis SCAN is incremental and may otherwise return a successful partial
         table set when a page/pipeline fails or a writer changes the catalog
         mid-enumeration.  Reads must fail/retry instead of silently omitting
-        physical tables (and their deletion vectors).
+        physical tables (and their deletion vectors).  ``batch_size`` can
+        independently bound pipelined payload memory without reducing SCAN's
+        keyspace page hint; ``max_scan_calls`` optionally fails a caller closed
+        before an unexpectedly large shared keyspace is traversed forever.
         """
-        batch_size = max(1, int(count))
+        scan_count = max(1, int(count))
+        fetch_batch_size = (
+            scan_count
+            if batch_size is None
+            else max(1, int(batch_size))
+        )
         info = self._resolve_replica_info(org, sup)
         pin = self._pin_leaf_scan(org, sup, info)
         effective_sup = str(pin["effective_sup"])
@@ -16063,10 +16126,11 @@ return 1
                 org,
                 effective_sup,
                 allowed=pin["allowed"],
-                count=batch_size,
+                count=scan_count,
+                max_scan_calls=max_scan_calls,
         ):
             batch.append(key)
-            if len(batch) >= batch_size:
+            if len(batch) >= fetch_batch_size:
                 yield from self._fetch_batch(batch)
                 batch = []
         if batch:

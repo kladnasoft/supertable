@@ -180,19 +180,20 @@ class TestResolveAppHome:
         assert target.is_dir()
 
     def test_expands_tilde(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         # Use a synthetic HOME so we never touch the real user dir.
-        fake_home = Path(os.path.expanduser("~"))
+        fake_home = tmp_path / "synthetic-user-home"
+        monkeypatch.setenv("HOME", str(fake_home))
         monkeypatch.setattr(
             homedir_mod, "settings",
-            SimpleNamespace(SUPERTABLE_HOME="~/.does-not-matter"),
+            SimpleNamespace(SUPERTABLE_HOME="~/supertable-runtime"),
             raising=True,
         )
         # _resolve_app_home expands and absolutises, so the result must be absolute
         resolved = homedir_mod._resolve_app_home()
-        assert os.path.isabs(resolved)
-        assert resolved.startswith(str(fake_home))
+        assert Path(resolved) == fake_home / "supertable-runtime"
+        assert Path(resolved).is_dir()
 
     def test_caches_after_first_call(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

@@ -214,13 +214,13 @@ class TestStatsNullAndSystemColumns:
 class TestExtractStatsRows:
 
     @patch(f"{_MOD}._get_storage")
-    @patch(f"{_MOD}._safe_exists", return_value=True)
-    def test_reads_footer_of_each_file(self, _mock_exists, mock_gs):
+    def test_reads_footer_of_each_file(self, mock_gs):
         df = pl.DataFrame({"a": [1, 2], "b": ["x", "y"]})
         tbl = df.to_arrow()
         buf = io.BytesIO()
         pq.write_table(tbl, buf, write_statistics=True)
         stor = MagicMock()
+        stor.exists.return_value = True
         stor.read_bytes.return_value = buf.getvalue()
         mock_gs.return_value = stor
 
@@ -235,8 +235,7 @@ class TestExtractStatsRows:
         assert list(out.columns) == list(STATS_SCHEMA.keys())
 
     @patch(f"{_MOD}._get_storage")
-    @patch(f"{_MOD}._safe_exists", return_value=True)
-    def test_footer_md_cache_skips_readback(self, _mock_exists, mock_gs):
+    def test_footer_md_cache_skips_readback(self, mock_gs):
         """R1: a cached footer is consumed in place — no storage round-trip."""
         df = pl.DataFrame({"a": [1, 2], "b": ["x", "y"]})
         buf = io.BytesIO()
@@ -251,9 +250,50 @@ class TestExtractStatsRows:
         assert set(out["column_name"].to_list()) == {"a", "b"}
         stor.read_bytes.assert_not_called()  # the whole point: no re-download
 
+    def test_bounded_extraction_rejects_path_amplification_before_rows(self):
+        md = _md_from_df(pl.DataFrame({"a": [1, 2]}))
+        long_path = "x" * 200
+
+        with patch(
+            f"{_MOD}._stats_rows_for_metadata",
+            side_effect=AssertionError("rows were materialized"),
+        ):
+            with pytest.raises(ValueError, match="decoded data"):
+                extract_stats_rows(
+                    [long_path],
+                    footer_md_cache={long_path: md},
+                    max_rows=100,
+                    max_decoded_bytes=512,
+                )
+
+    def test_bounded_extraction_hashes_multi_group_footer_once(self):
+        buf = io.BytesIO()
+        pq.write_table(
+            pl.DataFrame({"a": [1, 2, 3]}).to_arrow(),
+            buf,
+            row_group_size=1,
+            write_statistics=True,
+        )
+        md = pq.read_metadata(io.BytesIO(buf.getvalue()))
+        from supertable import processing as processing_module
+
+        with patch.object(
+            processing_module,
+            "parquet_footer_sha256",
+            wraps=processing_module.parquet_footer_sha256,
+        ) as footer_hash:
+            out = extract_stats_rows(
+                ["one.parquet"],
+                footer_md_cache={"one.parquet": md},
+                max_rows=100,
+                max_decoded_bytes=1024 * 1024,
+            )
+
+        assert out.height == 3
+        footer_hash.assert_called_once_with(md)
+
     @patch(f"{_MOD}._get_storage")
-    @patch(f"{_MOD}._safe_exists", return_value=True)
-    def test_cached_footer_matches_readback(self, _mock_exists, mock_gs):
+    def test_cached_footer_matches_readback(self, mock_gs):
         """R1 correctness invariant: for the SAME bytes, the cached-footer path
         and the readback path yield IDENTICAL stats rows.  In production the
         cached footer is parsed from the exact bytes uploaded via write_bytes, so
@@ -264,6 +304,7 @@ class TestExtractStatsRows:
         raw = buf.getvalue()
 
         stor = MagicMock()
+        stor.exists.return_value = True
         stor.read_bytes.return_value = raw
         mock_gs.return_value = stor
 
@@ -274,8 +315,7 @@ class TestExtractStatsRows:
         assert readback.equals(cached)
 
     @patch(f"{_MOD}._get_storage")
-    @patch(f"{_MOD}._safe_exists", return_value=True)
-    def test_partial_cache_falls_back_for_uncached_path(self, _mock_exists, mock_gs):
+    def test_partial_cache_falls_back_for_uncached_path(self, mock_gs):
         """A path absent from the cache must still be read back (mixed write_bytes
         / re-encode batches), while the cached one skips the read."""
         df = pl.DataFrame({"a": [1, 2]})
@@ -285,6 +325,7 @@ class TestExtractStatsRows:
         md = pq.read_metadata(io.BytesIO(raw))
 
         stor = MagicMock()
+        stor.exists.return_value = True
         stor.read_bytes.return_value = raw
         mock_gs.return_value = stor
 
@@ -293,6 +334,16 @@ class TestExtractStatsRows:
         )
         assert set(out["file_path"].to_list()) == {"cached.parquet", "uncached.parquet"}
         stor.read_bytes.assert_called_once()  # only the uncached path hit storage
+
+    def test_exists_failure_is_contained_as_unavailable_stats(self):
+        stor = MagicMock()
+        stor.exists.side_effect = OSError("provider lookup failed")
+
+        out = extract_stats_rows(["one.parquet"], storage=stor)
+
+        assert out.height == 0
+        assert list(out.columns) == list(STATS_SCHEMA.keys())
+        stor.read_bytes.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

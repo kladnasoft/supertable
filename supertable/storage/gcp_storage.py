@@ -15,6 +15,7 @@ from google.cloud import storage
 from google.api_core.exceptions import NotFound, PreconditionFailed
 
 from supertable.storage.storage_interface import (
+    _DeletePrefixProgressGuard,
     ObjectIdentityMismatch,
     ObjectMetadata,
     StorageInterface,
@@ -400,14 +401,9 @@ class GCSStorage(StorageInterface):
         if exact is not None:
             exact.delete()
         prefix = self._normalize_dir_prefix(physical) if physical else physical
-        previous_batch = None
-        stagnant = 0
+        progress = _DeletePrefixProgressGuard()
         prior_errors: List[Exception] = []
-        attempts = 0
         while True:
-            attempts += 1
-            if attempts > 32:
-                raise OSError("GCS prefix deletion exceeded retry bound")
             blobs = list(itertools.islice(
                 self.client.list_blobs(self.bucket_name, prefix=prefix), 1000,
             ))
@@ -426,9 +422,7 @@ class GCSStorage(StorageInterface):
                 except Exception as exc:
                     errors.append(exc)
             prior_errors = errors
-            stagnant = stagnant + 1 if names == previous_batch else 0
-            previous_batch = names
-            if stagnant >= 3:
+            if progress.is_stalled(names):
                 if prior_errors:
                     raise OSError(
                         "GCS prefix deletion failed; "

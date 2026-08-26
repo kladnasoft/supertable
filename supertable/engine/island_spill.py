@@ -307,10 +307,18 @@ class SpillSession:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
-        directory, self._directory = self._directory, None
+        directory = self._directory
         if directory is not None:
-            shutil.rmtree(directory, ignore_errors=False)
+            try:
+                shutil.rmtree(directory, ignore_errors=False)
+            except FileNotFoundError:
+                # A prior partial cleanup may have removed the directory before
+                # reporting failure. A missing child is not success while the
+                # owned root still exists: retain retryable session state.
+                if os.path.lexists(directory):
+                    raise
+        self._directory = None
+        self._closed = True
         with self._lock:
             self._used_bytes = 0
 

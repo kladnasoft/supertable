@@ -351,7 +351,7 @@ class _LazyRedisClient:
 
 class _LazyCatalog:
     def __init__(self) -> None:
-        self._catalog = None
+        self._catalog: Optional[object] = None
         self._lock = threading.Lock()
 
     def _get(self):

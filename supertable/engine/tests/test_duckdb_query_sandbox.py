@@ -355,12 +355,58 @@ def test_s3_secret_uses_injected_storage_auth_not_ambient_settings(monkeypatch):
         con.close()
 
 
+def test_repeated_s3_secret_rebind_does_not_apply_process_runtime_defaults(
+    monkeypatch,
+):
+    safe_settings = replace(
+        engine_common.settings,
+        STORAGE_ACCESS_KEY="sandbox-access-id",
+        STORAGE_SECRET_KEY="sandbox-secret-value",
+        STORAGE_SESSION_TOKEN="sandbox-session-value",
+        STORAGE_ENDPOINT_URL="http://127.0.0.1:9000",
+        STORAGE_REGION="us-east-1",
+        STORAGE_FORCE_PATH_STYLE=True,
+        STORAGE_USE_SSL=False,
+        SUPERTABLE_DUCKDB_HTTP_TIMEOUT="99",
+    )
+    monkeypatch.setattr(engine_common, "settings", safe_settings)
+    con = duckdb.connect()
+    try:
+        configure_httpfs_and_s3(
+            con,
+            ["s3://sandbox-bucket/first.parquet"],
+            apply_process_runtime_defaults=False,
+        )
+        con.execute("SET http_timeout=17;")
+        configure_httpfs_and_s3(
+            con,
+            ["s3://sandbox-bucket/second.parquet"],
+            apply_process_runtime_defaults=False,
+        )
+        assert con.execute(
+            "SELECT current_setting('http_timeout')"
+        ).fetchone()[0] == 17
+    finally:
+        con.close()
+
+
 def test_executor_threads_selected_storage_into_s3_provisioning(monkeypatch):
     storage = object()
     captured = []
 
-    def configure(con, paths, *, storage=None):
-        captured.append((con, list(paths), storage))
+    def configure(
+        con,
+        paths,
+        *,
+        storage=None,
+        apply_process_runtime_defaults=True,
+    ):
+        captured.append((
+            con,
+            list(paths),
+            storage,
+            apply_process_runtime_defaults,
+        ))
 
     monkeypatch.setattr(
         duckdb_engine_module, "configure_httpfs_and_s3", configure,
@@ -369,7 +415,7 @@ def test_executor_threads_selected_storage_into_s3_provisioning(monkeypatch):
     engine = DuckDB(storage=storage)
     engine._ensure_httpfs(con, ["s3://tenant-bucket/object.parquet"])
     assert captured == [
-        (con, ["s3://tenant-bucket/object.parquet"], storage),
+        (con, ["s3://tenant-bucket/object.parquet"], storage, True),
     ]
 
 
@@ -743,7 +789,11 @@ def test_direct_duckdb_executor_redacts_backend_url_and_secret_causes(
         column_types={"id": "Int64"},
     )
     engine = DuckDB()
-    monkeypatch.setattr(engine, "_ensure_httpfs", lambda _con, _paths: None)
+    monkeypatch.setattr(
+        engine,
+        "_ensure_httpfs",
+        lambda _con, _paths, engine_config=None: None,
+    )
 
     def fail_scan(*_args, **_kwargs):
         try:

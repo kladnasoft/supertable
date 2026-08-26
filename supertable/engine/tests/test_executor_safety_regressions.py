@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 from concurrent.futures import ThreadPoolExecutor
 import threading
+import time
 import base64
 import hashlib
 import gc
@@ -531,6 +532,93 @@ def test_duckdb_concurrent_same_snapshot_views_are_request_isolated(
     finally:
         engine._reset_connection()
     assert results == [[11], [22]]
+
+
+def test_duckdb_short_query_overlaps_active_sibling_without_global_pragmas(
+    tmp_path, monkeypatch,
+):
+    setup = duckdb.connect()
+    source = tmp_path / "concurrent-runtime-config.parquet"
+    setup.execute(
+        "COPY (SELECT i::BIGINT AS id, i::BIGINT AS __rowid__, "
+        "1::BIGINT AS __timestamp__ FROM range(700) t(i)) "
+        "TO ? (FORMAT PARQUET)",
+        [str(source)],
+    )
+    setup.close()
+    engine = DuckDB()
+    manager = MagicMock(
+        temp_dir=str(tmp_path),
+        query_plan_path=str(tmp_path / "concurrent-plan.json"),
+    )
+
+    def run(sql, reflection):
+        return engine.execute(
+            reflection,
+            SQLParser("s", sql, "duckdb"),
+            manager,
+            lambda _event: None,
+        )
+
+    long_reflection = Reflection(
+        "local",
+        1,
+        1,
+        [SuperSnapshot(
+            "s",
+            "t",
+            1,
+            [str(source)],
+            {"id", "__rowid__", "__timestamp__"},
+            ["raw/concurrent-runtime-config"],
+            column_types={
+                "id": "Int64",
+                "__rowid__": "Int64",
+                "__timestamp__": "Int64",
+            },
+        )],
+    )
+    # Warm connection creation, security hardening, and the unchanged runtime
+    # signature before measuring only concurrent query execution.
+    run("SELECT count(*) AS value FROM t", long_reflection)
+    long_sql = (
+        "SELECT sum(sqrt(a.id + b.id + c.id)) AS value "
+        "FROM t a CROSS JOIN t b CROSS JOIN t c"
+    )
+    about_to_execute = threading.Event()
+    original_diagnostic = duckdb_engine_module.safe_sql_diagnostic
+
+    def signal_long_query(sql):
+        if "sqrt" in sql.lower():
+            about_to_execute.set()
+        return original_diagnostic(sql)
+
+    monkeypatch.setattr(
+        duckdb_engine_module.logger,
+        "isEnabledFor",
+        lambda _level: True,
+    )
+    monkeypatch.setattr(
+        duckdb_engine_module,
+        "safe_sql_diagnostic",
+        signal_long_query,
+    )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            long_result = pool.submit(run, long_sql, long_reflection)
+            assert about_to_execute.wait(timeout=10)
+            time.sleep(0.02)
+            short_result = pool.submit(
+                run,
+                "SELECT min(id) AS value FROM t",
+                long_reflection,
+            )
+            assert short_result.result(timeout=3)["value"].tolist() == [0]
+            assert not long_result.done()
+            long_result.result(timeout=20)
+    finally:
+        engine._reset_connection()
 
 
 def test_duckdb_request_names_use_full_uuid_for_concurrent_active_dv_isolation(

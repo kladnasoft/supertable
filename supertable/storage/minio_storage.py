@@ -19,6 +19,7 @@ from minio.deleteobjects import DeleteObject
 from minio.error import S3Error
 
 from supertable.storage.storage_interface import (
+    _DeletePrefixProgressGuard,
     ObjectIdentityMismatch,
     ObjectMetadata,
     StorageInterface,
@@ -460,14 +461,9 @@ class MinioStorage(StorageInterface):
         if self._object_exists(physical):
             self.client.remove_object(self.bucket_name, physical)
         prefix = physical if physical.endswith("/") else f"{physical}/"
-        previous_batch = None
-        stagnant = 0
+        progress = _DeletePrefixProgressGuard()
         prior_errors = []
-        attempts = 0
         while True:
-            attempts += 1
-            if attempts > 32:
-                raise OSError("MinIO prefix deletion exceeded retry bound")
             objects = list(itertools.islice(
                 self._list_objects(prefix, recursive=True), 1000,
             ))
@@ -491,9 +487,7 @@ class MinioStorage(StorageInterface):
                 prior_errors = errors
             else:
                 prior_errors = []
-            stagnant = stagnant + 1 if names == previous_batch else 0
-            previous_batch = names
-            if stagnant >= 3:
+            if progress.is_stalled(names):
                 if prior_errors:
                     raise RuntimeError(
                         "MinIO prefix deletion failed; "

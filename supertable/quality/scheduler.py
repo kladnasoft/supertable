@@ -33,6 +33,7 @@ Redis keys used:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -81,6 +82,10 @@ DEFAULT_JOB_DEADLINE_SECONDS = max(
     1, int(os.environ.get("SUPERTABLE_DQ_JOB_DEADLINE_SECONDS", "300"))
 )
 _MAX_SCHEDULER_JOBS_PER_TICK = 10_000
+_MAX_DISCOVERY_SCAN_CALLS = 1_000
+_MAX_DISCOVERED_DQ_PAIRS = _MAX_SCHEDULER_JOBS_PER_TICK
+_MAX_DISCOVERED_TABLES = _MAX_SCHEDULER_JOBS_PER_TICK
+_DISCOVERY_CURSOR_STATE_TTL_SECONDS = 15 * 60
 DEFAULT_PREPARED_HISTORY_TTL_SECONDS = max(
     86_400,
     DEFAULT_JOB_DEADLINE_SECONDS + DEFAULT_RUNNING_TTL_SECONDS,
@@ -315,6 +320,17 @@ _active_jobs_condition = threading.Condition(_active_jobs_lock)
 _active_jobs: Dict[str, Any] = {}
 _scheduler_slots: Optional[threading.BoundedSemaphore] = None
 _scheduler_fair_cursor = 0
+_scheduler_pair_cursor = 0
+# Per-discovery-window scheduler position.  A window digest, rather than one
+# positional cursor shared by changing SCAN windows, preserves tenant turns
+# when discovery resumes on a disjoint page.
+_scheduler_pair_window_cursors: Dict[str, int] = {}
+_scheduler_pair_window_touches: Dict[str, float] = {}
+_pair_discovery_offset = 0
+_pair_discovery_scan_cursor = 0
+_table_discovery_offsets: Dict[Tuple[str, str], int] = {}
+_table_discovery_scan_cursors: Dict[Tuple[str, str], int] = {}
+_table_discovery_cursor_touches: Dict[Tuple[str, str], float] = {}
 _scheduler_stats_lock = threading.Lock()
 _scheduler_stats: Dict[str, Any] = {
     "running": False,
@@ -332,6 +348,24 @@ _scheduler_stats: Dict[str, Any] = {
     "last_tick_started_at": None,
     "last_tick_completed_at": None,
 }
+
+
+@dataclass
+class _TickDiscoveryBudget:
+    remaining_scan_calls: int
+    remaining_table_actions: int
+
+    def take_scan_call(self) -> bool:
+        if self.remaining_scan_calls <= 0:
+            return False
+        self.remaining_scan_calls -= 1
+        return True
+
+    def take_table_action(self) -> bool:
+        if self.remaining_table_actions <= 0:
+            return False
+        self.remaining_table_actions -= 1
+        return True
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1212,9 +1246,54 @@ def _scheduler_tick(
     if not pairs:
         return
 
+    global _scheduler_fair_cursor, _scheduler_pair_cursor
+    global _scheduler_pair_window_cursors, _scheduler_pair_window_touches
+    pairs = sorted(pairs)
+    pair_window_key = hashlib.sha256(
+        json.dumps(pairs, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    pair_window_now = time.monotonic()
+    if pair_window_key not in _scheduler_pair_window_cursors and (
+        len(_scheduler_pair_window_cursors) >= _MAX_DISCOVERED_DQ_PAIRS
+    ):
+        stale_windows = [
+            key for key in _scheduler_pair_window_cursors
+            if pair_window_now
+            - _scheduler_pair_window_touches.get(key, pair_window_now)
+            >= _DISCOVERY_CURSOR_STATE_TTL_SECONDS
+        ]
+        if not stale_windows:
+            logger.warning(
+                "[dq-scheduler] pair-window cursor capacity reached; "
+                "new window deferred"
+            )
+            return
+        evicted_window = min(
+            stale_windows,
+            key=lambda key: _scheduler_pair_window_touches.get(key, 0.0),
+        )
+        _scheduler_pair_window_cursors.pop(evicted_window, None)
+        _scheduler_pair_window_touches.pop(evicted_window, None)
+    pair_offset = (
+        _scheduler_pair_window_cursors.get(pair_window_key, 0) % len(pairs)
+    )
+    pairs = pairs[pair_offset:] + pairs[:pair_offset]
+
     now = time.time()
     jobs: List[Tuple[Any, ...]] = []
-    for org, sup in sorted(pairs):
+    discovery_budget = _TickDiscoveryBudget(
+        remaining_scan_calls=_MAX_DISCOVERY_SCAN_CALLS,
+        remaining_table_actions=_MAX_SCHEDULER_JOBS_PER_TICK,
+    )
+    pairs_processed = 0
+    for org, sup in pairs:
+        if (
+            len(jobs) >= _MAX_SCHEDULER_JOBS_PER_TICK
+            or discovery_budget.remaining_scan_calls <= 0
+            or discovery_budget.remaining_table_actions <= 0
+        ):
+            break
+        pairs_processed += 1
         dqc = DQConfig(r, org, sup)
         _drain_history_outbox(r, org, sup)
         try:
@@ -1228,7 +1307,9 @@ def _scheduler_tick(
             message = _safe_failure_message(
                 "Global quality schedule could not be read safely", exc,
             )
-            for table_name in _list_tables(r, org, sup):
+            for table_name in _list_tables(r, org, sup, discovery_budget):
+                if not discovery_budget.take_table_action():
+                    break
                 _record_tick_config_failure(
                     r,
                     org,
@@ -1239,15 +1320,22 @@ def _scheduler_tick(
                     DEFAULT_COOLDOWN_SECONDS,
                     message,
                 )
+            if (
+                discovery_budget.remaining_scan_calls <= 0
+                or discovery_budget.remaining_table_actions <= 0
+            ):
+                break
             continue
 
         quick_cron = schedule.get("quick_cron", "0 */4 * * *")
         deep_cron = schedule.get("deep_cron", "0 2 * * *")
         custom_cron = schedule.get("custom_cron", "0 */6 * * *")
-        tables = _list_tables(r, org, sup)
+        tables = _list_tables(r, org, sup, discovery_budget)
 
         if not schedule.get("enabled", True):
             for table_name in tables:
+                if not discovery_budget.take_table_action():
+                    break
                 lifecycle_admission = _snapshot_pending_lifecycle_admission(
                     r, org, sup, table_name,
                 )
@@ -1260,9 +1348,17 @@ def _scheduler_tick(
                         (),
                         lifecycle_admission,
                     )
+            if (
+                discovery_budget.remaining_scan_calls <= 0
+                or discovery_budget.remaining_table_actions <= 0
+            ):
+                break
             continue
         for table_name in tables:
-            if len(jobs) >= _MAX_SCHEDULER_JOBS_PER_TICK:
+            if (
+                len(jobs) >= _MAX_SCHEDULER_JOBS_PER_TICK
+                or not discovery_budget.take_table_action()
+            ):
                 logger.warning(
                     "[dq-scheduler] job materialization cap reached; "
                     "remaining tables deferred to the next tick"
@@ -1274,9 +1370,19 @@ def _scheduler_tick(
                 last_quick_run, last_deep_run, last_custom_run,
             ))
 
+    next_pair_offset = (
+        pair_offset + pairs_processed
+    ) % len(pairs)
+    _scheduler_pair_cursor = next_pair_offset
+    if next_pair_offset == 0:
+        _scheduler_pair_window_cursors.pop(pair_window_key, None)
+        _scheduler_pair_window_touches.pop(pair_window_key, None)
+    else:
+        _scheduler_pair_window_cursors[pair_window_key] = next_pair_offset
+        _scheduler_pair_window_touches[pair_window_key] = pair_window_now
+
     # Rotate the already pair/table-sorted list every tick. Under sustained
     # capacity pressure, no tenant/table remains permanently at the tail.
-    global _scheduler_fair_cursor
     if jobs:
         offset = _scheduler_fair_cursor % len(jobs)
         jobs = jobs[offset:] + jobs[:offset]
@@ -6050,51 +6156,185 @@ def _now_iso() -> str:
 
 
 def _discover_dq_pairs(r) -> List[Tuple[str, str]]:
-    """Find all org:sup pairs that have root meta keys."""
+    """Return a bounded resumable page of org:sup roots."""
     from supertable import redis_keys as RK
-    pairs = []
+    global _pair_discovery_offset, _pair_discovery_scan_cursor
+    limit = _MAX_DISCOVERED_DQ_PAIRS
+    if limit <= 0:
+        return []
+    request_cursor = _pair_discovery_scan_cursor
+    page_offset = max(0, _pair_discovery_offset)
+    selected: List[Tuple[str, str]] = []
+    selected_set: set[Tuple[str, str]] = set()
     try:
-        cursor = 0
-        while True:
-            cursor, keys = r.scan(
-                cursor=cursor,
+        scan_calls = 0
+        while len(selected) < limit:
+            if scan_calls >= _MAX_DISCOVERY_SCAN_CALLS:
+                logger.warning(
+                    "[dq-scheduler] pair discovery scan bound reached; "
+                    "returning a bounded partial window"
+                )
+                break
+            scan_calls += 1
+            current_cursor = request_cursor
+            next_cursor, keys = r.scan(
+                cursor=current_cursor,
                 match=RK.meta_root_pattern_all_orgs(),
                 count=500,
             )
+            parsed_page: List[Tuple[str, str]] = []
+            parsed_page_set: set[Tuple[str, str]] = set()
             for key in keys:
                 k = key if isinstance(key, str) else key.decode("utf-8")
                 parsed = RK.parse_lake_key(k)
-                if parsed is not None:
-                    pairs.append(parsed)
-            if cursor == 0:
+                if parsed is not None and parsed not in parsed_page_set:
+                    parsed_page.append(parsed)
+                    parsed_page_set.add(parsed)
+            next_cursor = int(next_cursor)
+            if next_cursor < 0:
+                raise RuntimeError("quality pair discovery returned an invalid cursor")
+
+            consumed = min(page_offset, len(parsed_page))
+            for parsed in parsed_page[consumed:]:
+                consumed += 1
+                if parsed not in selected_set:
+                    selected.append(parsed)
+                    selected_set.add(parsed)
+                if len(selected) >= limit:
+                    break
+            if consumed < len(parsed_page):
+                request_cursor = current_cursor
+                page_offset = consumed
+                break
+            request_cursor = next_cursor
+            page_offset = 0
+            if request_cursor == 0:
                 break
     except Exception as e:
         logger.warning(
             "[dq-scheduler] discover pairs failed; error_type=%s",
             _safe_error_type(e),
         )
-    return list(set(pairs))
+        return []
+    _pair_discovery_scan_cursor = request_cursor
+    _pair_discovery_offset = page_offset
+    return sorted(selected)
 
 
-def _list_tables(r, org: str, sup: str) -> List[str]:
-    """List all table names for an org:sup."""
+def _list_tables(
+    r,
+    org: str,
+    sup: str,
+    budget: Optional[_TickDiscoveryBudget] = None,
+) -> List[str]:
+    """Return a bounded resumable page of tables for an org:sup."""
     from supertable import redis_keys as RK
-    tables = []
+    scope = (org, sup)
+    limit = _MAX_DISCOVERED_TABLES
+    if budget is not None:
+        # Discovery consumption must not outrun downstream admission. If the
+        # tick can materialize only part of a Redis page, retain that exact
+        # within-page offset for the next tick instead of repeatedly dropping
+        # its sorted tail after the action cap is reached.
+        limit = min(limit, max(0, budget.remaining_table_actions))
+    if limit <= 0:
+        return []
+    state_now = time.monotonic()
+    if scope not in _table_discovery_scan_cursors and (
+        len(_table_discovery_scan_cursors) >= _MAX_DISCOVERED_DQ_PAIRS
+    ):
+        stale_scopes = [
+            candidate for candidate in _table_discovery_scan_cursors
+            if state_now
+            - _table_discovery_cursor_touches.get(candidate, state_now)
+            >= _DISCOVERY_CURSOR_STATE_TTL_SECONDS
+        ]
+        if not stale_scopes:
+            logger.warning(
+                "[dq-scheduler] table cursor capacity reached; "
+                "new namespace deferred"
+            )
+            return []
+        evicted_scope = min(
+            stale_scopes,
+            key=lambda candidate: _table_discovery_cursor_touches.get(
+                candidate, 0.0,
+            ),
+        )
+        _table_discovery_scan_cursors.pop(evicted_scope, None)
+        _table_discovery_offsets.pop(evicted_scope, None)
+        _table_discovery_cursor_touches.pop(evicted_scope, None)
+    request_cursor = _table_discovery_scan_cursors.get(scope, 0)
+    page_offset = max(0, _table_discovery_offsets.get(scope, 0))
+    selected: List[str] = []
+    selected_set: set[str] = set()
     try:
         pattern = RK.meta_leaf_pattern(org, sup)
-        cursor = 0
-        while True:
-            cursor, keys = r.scan(cursor=cursor, match=pattern, count=1000)
+        scan_calls = 0
+        while len(selected) < limit:
+            if scan_calls >= _MAX_DISCOVERY_SCAN_CALLS:
+                logger.warning(
+                    "[dq-scheduler] table discovery scan bound reached; "
+                    "returning a bounded partial window"
+                )
+                break
+            if budget is not None and not budget.take_scan_call():
+                logger.warning(
+                    "[dq-scheduler] global table discovery scan budget reached; "
+                    "remaining namespaces deferred"
+                )
+                break
+            scan_calls += 1
+            current_cursor = request_cursor
+            next_cursor, keys = r.scan(
+                cursor=current_cursor,
+                match=pattern,
+                count=1000,
+            )
+            parsed_page: List[str] = []
+            parsed_page_set: set[str] = set()
             for key in keys:
                 k = key if isinstance(key, str) else key.decode("utf-8")
                 simple = k.rsplit("meta:leaf:doc:", 1)[-1]
-                if simple and not simple.startswith("__"):
-                    tables.append(simple)
-            if cursor == 0:
+                if (
+                    simple
+                    and not simple.startswith("__")
+                    and simple not in parsed_page_set
+                ):
+                    parsed_page.append(simple)
+                    parsed_page_set.add(simple)
+            next_cursor = int(next_cursor)
+            if next_cursor < 0:
+                raise RuntimeError("quality table discovery returned an invalid cursor")
+
+            consumed = min(page_offset, len(parsed_page))
+            for simple in parsed_page[consumed:]:
+                consumed += 1
+                if simple not in selected_set:
+                    selected.append(simple)
+                    selected_set.add(simple)
+                if len(selected) >= limit:
+                    break
+            if consumed < len(parsed_page):
+                request_cursor = current_cursor
+                page_offset = consumed
+                break
+            request_cursor = next_cursor
+            page_offset = 0
+            if request_cursor == 0:
                 break
     except Exception as e:
         logger.warning(
             "[dq-scheduler] list_tables failed; error_type=%s",
             _safe_error_type(e),
         )
-    return sorted(set(tables))
+        return []
+    if request_cursor == 0 and page_offset == 0:
+        _table_discovery_scan_cursors.pop(scope, None)
+        _table_discovery_offsets.pop(scope, None)
+        _table_discovery_cursor_touches.pop(scope, None)
+    else:
+        _table_discovery_scan_cursors[scope] = request_cursor
+        _table_discovery_offsets[scope] = page_offset
+        _table_discovery_cursor_touches[scope] = state_now
+    return sorted(selected)

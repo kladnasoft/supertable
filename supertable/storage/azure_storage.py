@@ -20,6 +20,7 @@ from azure.core.exceptions import (
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
 from supertable.storage.storage_interface import (
+    _DeletePrefixProgressGuard,
     ObjectIdentityMismatch,
     ObjectMetadata,
     StorageInterface,
@@ -479,14 +480,9 @@ class AzureBlobStorage(StorageInterface):
         if self._blob_exists(physical):
             self.container.delete_blob(physical)
         prefix = physical if physical.endswith("/") else f"{physical}/"
-        previous_batch = None
-        stagnant = 0
+        progress = _DeletePrefixProgressGuard()
         prior_errors: List[Exception] = []
-        attempts = 0
         while True:
-            attempts += 1
-            if attempts > 32:
-                raise OSError("Azure prefix deletion exceeded retry bound")
             blobs = list(itertools.islice(
                 self.container.list_blobs(name_starts_with=prefix), 1000,
             ))
@@ -505,9 +501,7 @@ class AzureBlobStorage(StorageInterface):
                 except Exception as exc:
                     errors.append(exc)
             prior_errors = errors
-            stagnant = stagnant + 1 if names == previous_batch else 0
-            previous_batch = names
-            if stagnant >= 3:
+            if progress.is_stalled(names):
                 if prior_errors:
                     raise OSError(
                         "Azure prefix deletion failed; "

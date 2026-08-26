@@ -1988,6 +1988,7 @@ def test_scheduler_rotates_submission_order_under_capacity_pressure(monkeypatch)
         lambda *args: order.append((args[3], args[-1])),
     )
     monkeypatch.setattr(scheduler, "_scheduler_fair_cursor", 0)
+    monkeypatch.setattr(scheduler, "_scheduler_pair_cursor", 0)
     slots = threading.BoundedSemaphore(10)
     executor = InlineExecutor()
 
@@ -1998,6 +1999,161 @@ def test_scheduler_rotates_submission_order_under_capacity_pressure(monkeypatch)
 
     assert first == [("a", True), ("b", True), ("c", True)]
     assert order == [("b", True), ("c", True), ("a", True)]
+
+
+def test_scheduler_rotates_tenants_before_job_capacity_is_exhausted(monkeypatch):
+    class Config:
+        def __init__(self, *_args):
+            pass
+
+        def get_schedule(self):
+            return {
+                "enabled": True,
+                "cooldown_seconds": 30,
+                "timezone": "UTC",
+                "quick_cron": "0 * * * *",
+                "deep_cron": "0 2 * * *",
+                "custom_cron": "0 * * * *",
+            }
+
+    order = []
+    monkeypatch.setattr(
+        "supertable.redis_connector.create_redis_client", lambda: object(),
+    )
+    monkeypatch.setattr("supertable.quality.config.DQConfig", Config)
+    monkeypatch.setattr(
+        scheduler,
+        "_discover_dq_pairs",
+        lambda _r: [(ORG, "lake-a"), (ORG, "lake-b")],
+    )
+    monkeypatch.setattr(scheduler, "_list_tables", lambda *_args: ["one", "two"])
+    monkeypatch.setattr(scheduler, "_drain_history_outbox", lambda *_args: 0)
+    monkeypatch.setattr(
+        scheduler,
+        "_process_table_job",
+        lambda *args: order.append((args[2], args[3])),
+    )
+    monkeypatch.setattr(scheduler, "_scheduler_fair_cursor", 0)
+    monkeypatch.setattr(scheduler, "_scheduler_pair_cursor", 0)
+    monkeypatch.setattr(scheduler, "_MAX_SCHEDULER_JOBS_PER_TICK", 2)
+
+    scheduler._scheduler_tick({}, {}, {})
+    first = list(order)
+    order.clear()
+    scheduler._scheduler_tick({}, {}, {})
+
+    assert {sup for sup, _table in first} == {"lake-a"}
+    assert {sup for sup, _table in order} == {"lake-b"}
+
+
+def test_scheduler_retains_later_namespace_tail_at_global_action_cap(
+    monkeypatch,
+):
+    class Config:
+        def __init__(self, *_args):
+            pass
+
+        def get_schedule(self):
+            return {
+                "enabled": True,
+                "cooldown_seconds": 30,
+                "timezone": "UTC",
+                "quick_cron": "0 * * * *",
+                "deep_cron": "0 2 * * *",
+                "custom_cron": "0 * * * *",
+            }
+
+    class CompletePages:
+        def scan(self, *, match, **_kwargs):
+            sup = "lake-a" if "lake-a" in match else "lake-b"
+            tables = ["a0", "a1"] if sup == "lake-a" else ["b0", "b1", "b2"]
+            return 0, [RK.meta_leaf(ORG, sup, table) for table in tables]
+
+    order = []
+    redis = CompletePages()
+    monkeypatch.setattr(
+        "supertable.redis_connector.create_redis_client", lambda: redis,
+    )
+    monkeypatch.setattr("supertable.quality.config.DQConfig", Config)
+    monkeypatch.setattr(
+        scheduler,
+        "_discover_dq_pairs",
+        lambda _r: [(ORG, "lake-a"), (ORG, "lake-b")],
+    )
+    monkeypatch.setattr(scheduler, "_drain_history_outbox", lambda *_args: 0)
+    monkeypatch.setattr(
+        scheduler,
+        "_process_table_job",
+        lambda *args: order.append((args[2], args[3])),
+    )
+    monkeypatch.setattr(scheduler, "_scheduler_fair_cursor", 0)
+    monkeypatch.setattr(scheduler, "_scheduler_pair_cursor", 0)
+    monkeypatch.setattr(scheduler, "_scheduler_pair_window_cursors", {})
+    monkeypatch.setattr(scheduler, "_scheduler_pair_window_touches", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_offsets", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_scan_cursors", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_cursor_touches", {})
+    monkeypatch.setattr(scheduler, "_MAX_SCHEDULER_JOBS_PER_TICK", 3)
+
+    for _ in range(3):
+        scheduler._scheduler_tick({}, {}, {})
+
+    assert {
+        table
+        for sup, table in order
+        if sup == "lake-b"
+    } == {"b0", "b1", "b2"}
+
+
+def test_scheduler_tracks_turns_per_changing_pair_window(monkeypatch):
+    class Config:
+        def __init__(self, *_args):
+            pass
+
+        def get_schedule(self):
+            return {
+                "enabled": True,
+                "cooldown_seconds": 30,
+                "timezone": "UTC",
+                "quick_cron": "0 * * * *",
+                "deep_cron": "0 2 * * *",
+                "custom_cron": "0 * * * *",
+            }
+
+    windows = [
+        [(ORG, "lake-a"), (ORG, "lake-b")],
+        [(ORG, "lake-c"), (ORG, "lake-d")],
+    ]
+    discovery_calls = 0
+    order = []
+
+    def discover(_redis):
+        nonlocal discovery_calls
+        window = windows[discovery_calls % len(windows)]
+        discovery_calls += 1
+        return window
+
+    monkeypatch.setattr(
+        "supertable.redis_connector.create_redis_client", lambda: object(),
+    )
+    monkeypatch.setattr("supertable.quality.config.DQConfig", Config)
+    monkeypatch.setattr(scheduler, "_discover_dq_pairs", discover)
+    monkeypatch.setattr(scheduler, "_list_tables", lambda *_args: ["one"])
+    monkeypatch.setattr(scheduler, "_drain_history_outbox", lambda *_args: 0)
+    monkeypatch.setattr(
+        scheduler,
+        "_process_table_job",
+        lambda *args: order.append(args[2]),
+    )
+    monkeypatch.setattr(scheduler, "_scheduler_fair_cursor", 0)
+    monkeypatch.setattr(scheduler, "_scheduler_pair_cursor", 0)
+    monkeypatch.setattr(scheduler, "_scheduler_pair_window_cursors", {})
+    monkeypatch.setattr(scheduler, "_MAX_SCHEDULER_JOBS_PER_TICK", 1)
+
+    for _ in range(4):
+        scheduler._scheduler_tick({}, {}, {})
+
+    assert order == ["lake-a", "lake-c", "lake-b", "lake-d"]
 
 
 def test_start_stop_health_api_has_bounded_graceful_join():

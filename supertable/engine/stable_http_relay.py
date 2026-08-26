@@ -670,7 +670,9 @@ def _connect_upstream_socket(
     raise OSError("stable relay upstream connection failed") from last_error
 
 
-def _is_public_upstream_address(address: ipaddress._BaseAddress) -> bool:
+def _is_public_upstream_address(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> bool:
     return bool(address.is_global)
 
 

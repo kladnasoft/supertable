@@ -6,6 +6,7 @@ import hashlib
 import os
 import posixpath
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Dict, List, Optional
@@ -22,6 +23,40 @@ from supertable.utils.diagnostic_redaction import safe_exception_type
 # if the decoder batch size is increased in the future.
 PARQUET_DECODE_MAX_PENDING_BATCHES = 4_096
 PARQUET_DECODE_MAX_PENDING_ROWS = 65_536
+
+
+class _DeletePrefixProgressGuard:
+    """Bound delete-prefix retries without imposing a small object-count cap."""
+
+    def __init__(
+        self,
+        *,
+        max_identical_batches: int = 4,
+        deadline_seconds: float = 15 * 60,
+        clock=time.monotonic,
+    ) -> None:
+        self._max_identical_batches = max_identical_batches
+        self._clock = clock
+        self._deadline = clock() + deadline_seconds
+        self._fingerprint_counts: Dict[bytes, int] = {}
+
+    def is_stalled(self, names: tuple[str, ...]) -> bool:
+        if self._clock() >= self._deadline:
+            return True
+        digest = hashlib.sha256()
+        for name in sorted(names):
+            encoded = name.encode("utf-8", errors="surrogatepass")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        fingerprint = digest.digest()
+        if (
+            fingerprint not in self._fingerprint_counts
+            and len(self._fingerprint_counts) >= 10_000
+        ):
+            self._fingerprint_counts.pop(next(iter(self._fingerprint_counts)))
+        count = self._fingerprint_counts.get(fingerprint, 0) + 1
+        self._fingerprint_counts[fingerprint] = count
+        return count >= self._max_identical_batches
 
 
 def storage_error_type(error: BaseException) -> str:

@@ -21,6 +21,7 @@ import json
 import os
 import threading
 import time
+from types import SimpleNamespace
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
@@ -2785,6 +2786,213 @@ class TestDuckDB:
             DuckDB().execute(Reflection("m", 0, 0, []), parser, MagicMock(), lambda e: None)
         # init_connection raises before self._con is assigned, so _reset_connection
         # is a no-op (self._con is None) and close() is not called on the raw con object.
+
+    def test_concurrent_user_queries_do_not_hold_runtime_config_lock(self):
+        query_barrier = threading.Barrier(2, timeout=3)
+
+        class QueryConnection:
+            def execute(self, sql, *_args, **_kwargs):
+                if sql == "SELECT 1":
+                    query_barrier.wait()
+                return self
+
+            def fetchdf(self):
+                return pd.DataFrame({"value": [1]})
+
+            def close(self):
+                return None
+
+            def interrupt(self):
+                return None
+
+        class RootConnection:
+            def cursor(self):
+                return QueryConnection()
+
+        def validated_parser():
+            parser = MagicMock()
+            parser._parsed = object()
+            parser.original_query = "SELECT 1"
+            parser.default_super_name = ""
+            parser.get_table_tuples.return_value = []
+            parser.get_physical_tables.return_value = []
+            parser.get_group_alias_ambiguities.return_value = {}
+            return parser
+
+        engine = DuckDB(storage=MagicMock())
+        engine._con = RootConnection()
+        reflection = Reflection("mock", 0, 0, [])
+        manager = MagicMock(temp_dir="/tmp", query_plan_path="/tmp/plan.json")
+        results = []
+        errors = []
+
+        def run_query():
+            try:
+                results.append(engine._execute_unleased(
+                    reflection,
+                    MagicMock(),
+                    manager,
+                    lambda _event: None,
+                ))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch(
+            "supertable.engine.duckdb_engine._fresh_validated_duckdb_parser",
+            side_effect=lambda _parser: validated_parser(),
+        ), patch(
+            "supertable.engine.duckdb_engine.validate_rbac_binding_stability",
+        ), patch(
+            "supertable.engine.duckdb_engine.rewrite_query_with_hashed_tables",
+            return_value="SELECT 1",
+        ), patch(
+            "supertable.engine.duckdb_engine.apply_runtime_pragmas",
+        ), patch(
+            "supertable.engine.duckdb_engine._harden_user_query_connection",
+        ):
+            threads = [threading.Thread(target=run_query) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert len(results) == 2
+
+    def test_runtime_config_change_fails_closed_and_failed_apply_retries(self):
+        engine = DuckDB(storage=MagicMock())
+        connection = MagicMock()
+        first = SimpleNamespace(
+            duckdb_memory_limit="1GB",
+            duckdb_io_multiplier=1.0,
+            duckdb_threads=1,
+            duckdb_http_timeout=None,
+            duckdb_external_cache_size="",
+        )
+        changed = SimpleNamespace(
+            duckdb_memory_limit="2GB",
+            duckdb_io_multiplier=1.0,
+            duckdb_threads=2,
+            duckdb_http_timeout=None,
+            duckdb_external_cache_size="",
+        )
+        check_deadline = MagicMock()
+
+        with patch(
+            "supertable.engine.duckdb_engine.apply_runtime_pragmas",
+            side_effect=[True, False, True],
+        ) as apply:
+            engine._active_queries = 1
+            engine._apply_runtime_config_if_idle(
+                connection, first, check_deadline,
+            )
+            engine._active_queries = 2
+            with pytest.raises(RuntimeError, match="configuration changed"):
+                engine._apply_runtime_config_if_idle(
+                    connection, changed, check_deadline,
+                )
+            assert apply.call_count == 1
+
+            engine._active_queries = 1
+            with pytest.raises(RuntimeError, match="could not be applied"):
+                engine._apply_runtime_config_if_idle(
+                    connection, changed, check_deadline,
+                )
+            engine._apply_runtime_config_if_idle(
+                connection, changed, check_deadline,
+            )
+            engine._apply_runtime_config_if_idle(
+                connection, changed, check_deadline,
+            )
+
+        assert apply.call_count == 3
+
+    def test_first_remote_setup_fails_closed_with_sibling_then_retries(self):
+        engine = DuckDB(storage=MagicMock())
+        connection = MagicMock()
+        config = SimpleNamespace(
+            duckdb_memory_limit="1GB",
+            duckdb_io_multiplier=1.0,
+            duckdb_threads=1,
+            duckdb_http_timeout=30,
+            duckdb_external_cache_size="",
+        )
+        engine._active_queries = 2
+
+        with patch(
+            "supertable.engine.duckdb_engine.configure_httpfs_and_s3",
+        ) as configure, patch(
+            "supertable.engine.duckdb_engine.apply_runtime_pragmas",
+            return_value=True,
+        ) as apply:
+            with pytest.raises(RuntimeError, match="idle connection"):
+                engine._ensure_httpfs(
+                    connection,
+                    ["https://storage.invalid/object.parquet"],
+                    engine_config=config,
+                )
+            apply.assert_not_called()
+            engine._active_queries = 1
+            engine._ensure_httpfs(
+                connection,
+                ["https://storage.invalid/object.parquet"],
+                engine_config=config,
+            )
+            engine._apply_runtime_config_if_idle(
+                connection,
+                config,
+                MagicMock(),
+            )
+
+        apply.assert_called_once_with(connection, config)
+        assert configure.call_count == 2
+
+    def test_repeated_s3_rebind_preserves_request_runtime_config(self):
+        engine = DuckDB(storage=MagicMock())
+        connection = MagicMock()
+        config = SimpleNamespace(
+            duckdb_memory_limit="1GB",
+            duckdb_io_multiplier=1.0,
+            duckdb_threads=1,
+            duckdb_http_timeout=30,
+            duckdb_external_cache_size="",
+        )
+        engine._httpfs_configured = True
+        engine._applied_runtime_config_signature = (
+            "1GB", 1.0, 1, 30, "",
+        )
+        engine._active_queries = 2
+        with patch(
+            "supertable.engine.duckdb_engine.configure_httpfs_and_s3",
+        ) as configure, patch(
+            "supertable.engine.duckdb_engine.apply_runtime_pragmas",
+            return_value=True,
+        ) as apply:
+            engine._ensure_httpfs(
+                connection,
+                ["s3://bucket/first.parquet"],
+                engine_config=config,
+            )
+            engine._ensure_httpfs(
+                connection,
+                ["s3://bucket/second.parquet"],
+                engine_config=config,
+            )
+            engine._apply_runtime_config_if_idle(
+                connection,
+                config,
+                MagicMock(),
+            )
+
+        assert configure.call_count == 2
+        assert configure.call_args_list[0].kwargs[
+            "apply_process_runtime_defaults"
+        ] is False
+        assert configure.call_args_list[1].kwargs[
+            "apply_process_runtime_defaults"
+        ] is False
+        apply.assert_not_called()
 
 
 # ═══════════════════════════════════════════════════════════

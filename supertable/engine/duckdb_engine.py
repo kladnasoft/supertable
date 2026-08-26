@@ -342,6 +342,22 @@ def _harden_user_query_connection(con: duckdb.DuckDBPyConnection) -> None:
         ) from None
 
 
+_UNAPPLIED_RUNTIME_CONFIG = object()
+
+
+def _runtime_config_signature(cfg: object) -> object:
+    """Return the immutable DuckDB settings controlled by live config."""
+    if cfg is None:
+        return None
+    return (
+        getattr(cfg, "duckdb_memory_limit"),
+        getattr(cfg, "duckdb_io_multiplier"),
+        getattr(cfg, "duckdb_threads"),
+        getattr(cfg, "duckdb_http_timeout"),
+        getattr(cfg, "duckdb_external_cache_size"),
+    )
+
+
 def _path_contains_bearer_credentials(path: object) -> bool:
     """Conservatively identify signed URLs or URL user-info credentials."""
     text = str(path or "").strip()
@@ -793,6 +809,13 @@ def _bounded_duckdb_connect(
                 published = True
                 setup_target_callback(connection)
             init_connection(connection, temp_dir=temp_dir)
+            _harden_user_query_connection(connection)
+            try:
+                connection.execute("PRAGMA disable_profiling;")
+            except Exception:
+                raise RuntimeError(
+                    "DuckDB user-query profiling could not be disabled"
+                ) from None
             with state_lock:
                 if bool(state["abandoned"]):
                     abandoned = True
@@ -1188,6 +1211,9 @@ class DuckDB:
         self.organization = str(organization or "")
         self._lock = threading.Lock()
         self._runtime_config_lock = threading.RLock()
+        self._applied_runtime_config_signature: object = (
+            _UNAPPLIED_RUNTIME_CONFIG
+        )
         self._con: Optional[duckdb.DuckDBPyConnection] = None
         self._httpfs_configured = False
         self._s3_secret_configured = False
@@ -1222,6 +1248,7 @@ class DuckDB:
         temp_dir: str,
         setup_target_callback=None,
         setup_check_callback=None,
+        engine_config=None,
     ) -> duckdb.DuckDBPyConnection:
         """Return the persistent connection, creating and configuring it once."""
         if self._con is not None:
@@ -1245,6 +1272,10 @@ class DuckDB:
                     except BaseException:
                         pass
             raise
+        if apply_runtime_pragmas(con, engine_config):
+            self._applied_runtime_config_signature = (
+                _runtime_config_signature(engine_config)
+            )
         # Only the request thread may publish a fully initialized, still-live
         # connection into the persistent cache. A late orphan worker never
         # reaches this assignment.
@@ -1275,6 +1306,7 @@ class DuckDB:
         self,
         con: duckdb.DuckDBPyConnection,
         paths: List[str],
+        engine_config=None,
     ) -> None:
         """Configure every query-private cursor under the setup lock.
 
@@ -1298,13 +1330,43 @@ class DuckDB:
             # connection remains alive; retaining an earlier secret would no
             # longer match the selected storage authorization context.
             if not self._httpfs_configured or needs_s3:
+                first_httpfs_configuration = not self._httpfs_configured
                 configure_httpfs_and_s3(
-                    con, paths, storage=self.storage,
+                    con,
+                    paths,
+                    storage=self.storage,
+                    apply_process_runtime_defaults=first_httpfs_configuration,
                 )
                 self._httpfs_configured = True
                 self._s3_secret_configured = (
                     self._s3_secret_configured or needs_s3
                 )
+                if first_httpfs_configuration:
+                    with self._runtime_config_lock:
+                        # Core memory/thread SET statements serialize behind a
+                        # running DuckDB query. Query admission takes this same
+                        # lock, so the count cannot grow after this check.
+                        if self._active_queries > 1:
+                            self._httpfs_configured = False
+                            self._applied_runtime_config_signature = (
+                                _UNAPPLIED_RUNTIME_CONFIG
+                            )
+                            raise RuntimeError(
+                                "DuckDB remote runtime configuration requires "
+                                "an idle connection; retry the query"
+                            )
+                        if not apply_runtime_pragmas(con, engine_config):
+                            self._httpfs_configured = False
+                            self._applied_runtime_config_signature = (
+                                _UNAPPLIED_RUNTIME_CONFIG
+                            )
+                            raise RuntimeError(
+                                "DuckDB runtime configuration could not be "
+                                "applied; retry the query"
+                            )
+                        self._applied_runtime_config_signature = (
+                            _runtime_config_signature(engine_config)
+                        )
             if callable(setup_check):
                 setup_check()
         finally:
@@ -1320,14 +1382,53 @@ class DuckDB:
             self._con = None
             self._httpfs_configured = False
             self._s3_secret_configured = False
+            self._applied_runtime_config_signature = (
+                _UNAPPLIED_RUNTIME_CONFIG
+            )
             # Tables died with the connection — just forget the registry.
             self._tombstone_cache.clear_registry()
             logger.warning("[duckdb] connection reset")
 
     def _begin_query_use(self) -> None:
         """Pin this engine while setup, execution, or stream delivery is live."""
-        with self._lifecycle_lock:
-            self._active_queries += 1
+        # Runtime reconfiguration holds this admission gate while checking the
+        # active count. No new query can enter between the idle check and its
+        # database-global SET statements.
+        with self._runtime_config_lock:
+            with self._lifecycle_lock:
+                self._active_queries += 1
+
+    def _apply_runtime_config_if_idle(
+        self,
+        con: duckdb.DuckDBPyConnection,
+        engine_config: object,
+        check_deadline,
+    ) -> None:
+        """Apply changed database-global settings without blocking a sibling.
+
+        DuckDB serializes SET/PRAGMA statements behind active queries even on
+        separate cursor handles.  Security settings and profiling are fixed at
+        connection creation; live resource settings are therefore applied only
+        when this request is the sole lifecycle user.  A request that requires
+        a changed setting while a sibling is active fails closed and can be
+        retried, rather than silently running under stale resource policy.
+        """
+        signature = _runtime_config_signature(engine_config)
+        with self._runtime_config_lock:
+            if signature == self._applied_runtime_config_signature:
+                return
+            if self._active_queries > 1:
+                raise RuntimeError(
+                    "DuckDB runtime configuration changed during "
+                    "concurrent query execution; retry the query"
+                )
+            check_deadline()
+            if not apply_runtime_pragmas(con, engine_config):
+                raise RuntimeError(
+                    "DuckDB runtime configuration could not be applied; "
+                    "retry the query"
+                )
+            self._applied_runtime_config_signature = signature
 
     def _finish_query_use(self) -> None:
         with self._lifecycle_lock:
@@ -1706,6 +1807,7 @@ class DuckDB:
                         setup_check_callback=(
                             connection_setup_guard.raise_if_stopped
                         ),
+                        engine_config=engine_config,
                     )
                 except Exception as initial_error:
                     connection_setup_guard.raise_if_stopped()
@@ -1717,6 +1819,7 @@ class DuckDB:
                             setup_check_callback=(
                                 connection_setup_guard.raise_if_stopped
                             ),
+                            engine_config=engine_config,
                         )
                     except BaseException as retry_error:
                         if not isinstance(retry_error, Exception):
@@ -1857,7 +1960,11 @@ class DuckDB:
                 self._setup_context.check = (
                     storage_setup_guard.raise_if_stopped
                 )
-            self._ensure_httpfs(con, setup_paths)
+            self._ensure_httpfs(
+                con,
+                setup_paths,
+                engine_config=engine_config,
+            )
             if storage_setup_guard is not None:
                 storage_setup_guard.raise_if_stopped()
             else:
@@ -1982,11 +2089,6 @@ class DuckDB:
                 and cancel_watcher is not threading.current_thread()
             ):
                 cancel_watcher.join(timeout=1.0)
-            # Disable profiling so cleanup DDL is not captured.
-            try:
-                con.execute("PRAGMA disable_profiling;")
-            except Exception:
-                pass
             # Drop all per-query VIEWs in reverse creation order.
             for view in reversed(created_views):
                 try:
@@ -2268,60 +2370,41 @@ class DuckDB:
             except Exception:
                 pass
 
-            # Profiling PRAGMAs are connection-level state.  Under concurrent
-            # queries the last SET wins — one query's profile may land in the
-            # wrong file.  This is acceptable: profiling is best-effort
-            # diagnostics, and query_plan_path is already unique per query
-            # (contains query_id) so profiles never overwrite on disk.
-            # A lock here would serialise execution on a shared connection
-            # and destroy DuckDB's concurrent-read capability.
-            # Raw DuckDB profiles contain physical Filename(s). Because profile
-            # settings are database-global across cursor handles, enabling them
-            # for a sibling local query can race with a presigned query and write
-            # its bearer URL to disk. User-query profiling is therefore disabled
-            # unconditionally; bounded plan/timing stats remain available.
-            try:
-                con.execute("PRAGMA disable_profiling;")
-            except Exception:
-                raise RuntimeError(
-                    "DuckDB user-query profiling could not be disabled"
-                ) from None
+            # SET/PRAGMA state is database-global across cursor handles. Apply
+            # only a changed live resource configuration at an idle boundary;
+            # executing it for every request serializes otherwise independent
+            # reads behind the longest active sibling query.
+            self._apply_runtime_config_if_idle(
+                con,
+                engine_config,
+                check_deadline,
+            )
 
-            # Re-apply live engine config (memory/threads/http/cache) so UI
-            # changes take effect on this persistent connection per query.
-            self._runtime_config_lock.acquire()
-            try:
+            if nonfinite_guard_query is not None:
                 check_deadline()
-                apply_runtime_pragmas(con, engine_config)
-                _harden_user_query_connection(con)
-
-                if nonfinite_guard_query is not None:
-                    check_deadline()
-                    backend_phase = "protected OData order validation"
-                    if con.execute(nonfinite_guard_query).fetchone() is not None:
-                        raise RuntimeError(
-                            "Protected OData ordering contains a non-finite value"
-                        )
-                    check_deadline()
-
-                if logger.isEnabledFor(10):
-                    sql_digest, sql_bytes = safe_sql_diagnostic(executing_query)
-                    logger.debug(
-                        "%s[duckdb] executing sql_sha256=%s sql_bytes=%d",
-                        log_prefix,
-                        sql_digest,
-                        sql_bytes,
+                backend_phase = "protected OData order validation"
+                if con.execute(nonfinite_guard_query).fetchone() is not None:
+                    raise RuntimeError(
+                        "Protected OData ordering contains a non-finite value"
                     )
                 check_deadline()
-                backend_phase = "query execution"
-                query_result = (
-                    con.execute(executing_query, executing_parameters)
-                    if executing_parameters
-                    else con.execute(executing_query)
+
+            if logger.isEnabledFor(10):
+                sql_digest, sql_bytes = safe_sql_diagnostic(executing_query)
+                logger.debug(
+                    "%s[duckdb] executing sql_sha256=%s sql_bytes=%d",
+                    log_prefix,
+                    sql_digest,
+                    sql_bytes,
                 )
-                check_deadline()
-            finally:
-                self._runtime_config_lock.release()
+            check_deadline()
+            backend_phase = "query execution"
+            query_result = (
+                con.execute(executing_query, executing_parameters)
+                if executing_parameters
+                else con.execute(executing_query)
+            )
+            check_deadline()
 
             if _streaming:
                 assert resolved_stream_batch_rows is not None

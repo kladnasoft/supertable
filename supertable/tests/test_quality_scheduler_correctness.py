@@ -102,6 +102,359 @@ class SelectiveReadFaultRedis:
         return self.inner.smembers(key)
 
 
+def test_quality_pair_discovery_fails_closed_at_scan_call_bound(monkeypatch):
+    class EndlessScan:
+        def __init__(self):
+            self.calls = 0
+
+        def scan(self, **_kwargs):
+            self.calls += 1
+            return 1, []
+
+    redis = EndlessScan()
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERY_SCAN_CALLS", 3)
+    monkeypatch.setattr(scheduler, "_pair_discovery_scan_cursor", 0)
+
+    assert scheduler._discover_dq_pairs(redis) == []
+    assert redis.calls == 3
+
+
+def test_quality_pair_discovery_resumes_after_scan_call_bound(monkeypatch):
+    class TwoPageScan:
+        def __init__(self):
+            self.cursors = []
+
+        def scan(self, *, cursor, **_kwargs):
+            self.cursors.append(cursor)
+            if cursor == 0:
+                return 7, [RK.meta_root("org-one", "lake")]
+            return 0, [RK.meta_root("org-two", "lake")]
+
+    redis = TwoPageScan()
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERY_SCAN_CALLS", 1)
+    monkeypatch.setattr(scheduler, "_pair_discovery_offset", 0)
+    monkeypatch.setattr(scheduler, "_pair_discovery_scan_cursor", 0)
+
+    assert scheduler._discover_dq_pairs(redis) == [("org-one", "lake")]
+    assert scheduler._discover_dq_pairs(redis) == [("org-two", "lake")]
+    assert redis.cursors == [0, 7]
+
+
+def test_quality_table_discovery_returns_resumable_bounded_pages(monkeypatch):
+    class OnePageScan:
+        def scan(self, **_kwargs):
+            return 0, [
+                RK.meta_leaf(ORG, SUPER, "one"),
+                RK.meta_leaf(ORG, SUPER, "two"),
+                RK.meta_leaf(ORG, SUPER, "three"),
+            ]
+
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERED_TABLES", 2)
+    monkeypatch.setattr(scheduler, "_table_discovery_offsets", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_scan_cursors", {})
+
+    first = scheduler._list_tables(OnePageScan(), ORG, SUPER)
+    second = scheduler._list_tables(OnePageScan(), ORG, SUPER)
+
+    assert len(first) == 2
+    assert len(second) == 1
+    assert set(first) | set(second) == {"one", "two", "three"}
+
+
+def test_quality_pair_discovery_returns_resumable_bounded_pages(monkeypatch):
+    class OnePageScan:
+        def scan(self, **_kwargs):
+            return 0, [
+                RK.meta_root("org-one", "lake"),
+                RK.meta_root("org-two", "lake"),
+                RK.meta_root("org-three", "lake"),
+            ]
+
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERED_DQ_PAIRS", 2)
+    monkeypatch.setattr(scheduler, "_pair_discovery_offset", 0)
+    monkeypatch.setattr(scheduler, "_pair_discovery_scan_cursor", 0)
+
+    first = scheduler._discover_dq_pairs(OnePageScan())
+    second = scheduler._discover_dq_pairs(OnePageScan())
+
+    assert len(first) == 2
+    assert len(second) == 1
+    assert set(first) | set(second) == {
+        ("org-one", "lake"),
+        ("org-two", "lake"),
+        ("org-three", "lake"),
+    }
+
+
+def test_quality_table_discovery_resumes_after_scan_call_bound(monkeypatch):
+    class TwoPageScan:
+        def __init__(self):
+            self.cursors = []
+
+        def scan(self, *, cursor, **_kwargs):
+            self.cursors.append(cursor)
+            if cursor == 0:
+                return 7, [RK.meta_leaf(ORG, SUPER, "one")]
+            return 0, [RK.meta_leaf(ORG, SUPER, "two")]
+
+    redis = TwoPageScan()
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERY_SCAN_CALLS", 1)
+    monkeypatch.setattr(scheduler, "_table_discovery_offsets", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_scan_cursors", {})
+
+    assert scheduler._list_tables(redis, ORG, SUPER) == ["one"]
+    assert scheduler._list_tables(redis, ORG, SUPER) == ["two"]
+    assert redis.cursors == [0, 7]
+
+
+def test_quality_partial_scan_rotation_does_not_starve_page_entries(monkeypatch):
+    pair_pages = {
+        0: (1, ["a", "b", "c"]),
+        1: (2, ["d", "e", "f"]),
+        2: (0, ["g", "h", "i"]),
+    }
+
+    class PairPages:
+        def scan(self, *, cursor, **_kwargs):
+            next_cursor, organizations = pair_pages[cursor]
+            return next_cursor, [
+                RK.meta_root(organization, "lake")
+                for organization in organizations
+            ]
+
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERED_DQ_PAIRS", 2)
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERY_SCAN_CALLS", 1)
+    monkeypatch.setattr(scheduler, "_pair_discovery_offset", 0)
+    monkeypatch.setattr(scheduler, "_pair_discovery_scan_cursor", 0)
+
+    observed = set()
+    redis = PairPages()
+    for _ in range(6):
+        observed.update(scheduler._discover_dq_pairs(redis))
+
+    assert observed == {
+        (organization, "lake")
+        for organization in "abcdefghi"
+    }
+
+
+def test_quality_partial_table_scan_does_not_starve_page_entries(monkeypatch):
+    table_pages = {
+        0: (1, ["a", "b", "c"]),
+        1: (2, ["d", "e", "f"]),
+        2: (0, ["g", "h", "i"]),
+    }
+
+    class TablePages:
+        def scan(self, *, cursor, **_kwargs):
+            next_cursor, tables = table_pages[cursor]
+            return next_cursor, [
+                RK.meta_leaf(ORG, SUPER, table)
+                for table in tables
+            ]
+
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERED_TABLES", 2)
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERY_SCAN_CALLS", 1)
+    monkeypatch.setattr(scheduler, "_table_discovery_offsets", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_scan_cursors", {})
+
+    observed = set()
+    redis = TablePages()
+    for _ in range(6):
+        observed.update(scheduler._list_tables(redis, ORG, SUPER))
+
+    assert observed == set("abcdefghi")
+
+
+def test_quality_pair_discovery_drains_large_page_before_advancing(monkeypatch):
+    class UnevenPages:
+        def scan(self, *, cursor, **_kwargs):
+            if cursor == 0:
+                return 7, [
+                    RK.meta_root(organization, "lake")
+                    for organization in "abcd"
+                ]
+            return 0, [RK.meta_root("e", "lake")]
+
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERED_DQ_PAIRS", 2)
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERY_SCAN_CALLS", 1)
+    monkeypatch.setattr(scheduler, "_pair_discovery_offset", 0)
+    monkeypatch.setattr(scheduler, "_pair_discovery_scan_cursor", 0)
+    redis = UnevenPages()
+
+    pages = [scheduler._discover_dq_pairs(redis) for _ in range(3)]
+
+    assert pages == [
+        [("a", "lake"), ("b", "lake")],
+        [("c", "lake"), ("d", "lake")],
+        [("e", "lake")],
+    ]
+
+
+def test_quality_table_discovery_drains_large_page_before_advancing(monkeypatch):
+    class UnevenPages:
+        def scan(self, *, cursor, **_kwargs):
+            if cursor == 0:
+                return 7, [
+                    RK.meta_leaf(ORG, SUPER, table)
+                    for table in "abcd"
+                ]
+            return 0, [RK.meta_leaf(ORG, SUPER, "e")]
+
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERED_TABLES", 2)
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERY_SCAN_CALLS", 1)
+    monkeypatch.setattr(scheduler, "_table_discovery_offsets", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_scan_cursors", {})
+    redis = UnevenPages()
+
+    pages = [scheduler._list_tables(redis, ORG, SUPER) for _ in range(3)]
+
+    assert pages == [["a", "b"], ["c", "d"], ["e"]]
+
+
+def test_quality_table_cursor_admission_avoids_n_plus_one_thrashing(monkeypatch):
+    class TwoPageScopes:
+        def __init__(self):
+            self.cursors = []
+
+        def scan(self, *, cursor, **_kwargs):
+            self.cursors.append(cursor)
+            if cursor == 0:
+                return 7, [RK.meta_leaf("org", "lake", "head")]
+            return 0, [RK.meta_leaf("org", "lake", "tail")]
+
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERED_DQ_PAIRS", 2)
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERY_SCAN_CALLS", 1)
+    monkeypatch.setattr(scheduler, "_table_discovery_offsets", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_scan_cursors", {})
+    redis = TwoPageScopes()
+
+    assert scheduler._list_tables(redis, "a", SUPER) == ["head"]
+    assert scheduler._list_tables(redis, "b", SUPER) == ["head"]
+    assert scheduler._list_tables(redis, "c", SUPER) == []
+    assert scheduler._list_tables(redis, "a", SUPER) == ["tail"]
+    assert redis.cursors == [0, 0, 7]
+
+
+def test_quality_table_cursor_admission_expires_stale_progress(monkeypatch):
+    class TwoPageScopes:
+        def __init__(self):
+            self.cursors = []
+
+        def scan(self, *, cursor, **_kwargs):
+            self.cursors.append(cursor)
+            if cursor == 0:
+                return 7, [RK.meta_leaf("org", "lake", "head")]
+            return 0, [RK.meta_leaf("org", "lake", "tail")]
+
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERED_DQ_PAIRS", 2)
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERY_SCAN_CALLS", 1)
+    monkeypatch.setattr(scheduler, "_table_discovery_offsets", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_scan_cursors", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_cursor_touches", {})
+    now = [0.0]
+    monkeypatch.setattr(scheduler.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(scheduler, "_DISCOVERY_CURSOR_STATE_TTL_SECONDS", 10)
+    redis = TwoPageScopes()
+
+    assert scheduler._list_tables(redis, "a", SUPER) == ["head"]
+    now[0] = 1.0
+    assert scheduler._list_tables(redis, "b", SUPER) == ["head"]
+    now[0] = 20.0
+    assert scheduler._list_tables(redis, "c", SUPER) == ["head"]
+    now[0] = 21.0
+    assert scheduler._list_tables(redis, "d", SUPER) == ["head"]
+    assert scheduler._list_tables(redis, "c", SUPER) == ["tail"]
+    assert scheduler._list_tables(redis, "d", SUPER) == ["tail"]
+    assert redis.cursors == [0, 0, 0, 0, 7, 7]
+
+
+def test_quality_table_cursor_admission_eventually_serves_cap_plus_two_scopes(
+    monkeypatch,
+):
+    class TwoPageScopes:
+        def __init__(self):
+            self.cursors = []
+
+        def scan(self, *, cursor, **_kwargs):
+            self.cursors.append(cursor)
+            if cursor == 0:
+                return 7, [RK.meta_leaf("org", "lake", "head")]
+            return 0, [RK.meta_leaf("org", "lake", "tail")]
+
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERED_DQ_PAIRS", 2)
+    monkeypatch.setattr(scheduler, "_MAX_DISCOVERY_SCAN_CALLS", 1)
+    monkeypatch.setattr(scheduler, "_table_discovery_offsets", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_scan_cursors", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_cursor_touches", {})
+    redis = TwoPageScopes()
+    observed = {scope: set() for scope in "abcd"}
+
+    for _ in range(3):
+        for scope in observed:
+            observed[scope].update(
+                scheduler._list_tables(redis, scope, SUPER)
+            )
+
+    assert observed == {
+        scope: {"head", "tail"}
+        for scope in "abcd"
+    }
+    assert redis.cursors == [0, 0, 7, 7, 0, 0, 7, 7]
+
+
+def test_quality_discovery_budget_is_shared_across_namespaces(monkeypatch):
+    class EndlessScan:
+        def __init__(self):
+            self.calls = 0
+
+        def scan(self, **_kwargs):
+            self.calls += 1
+            return self.calls, []
+
+    redis = EndlessScan()
+    budget = scheduler._TickDiscoveryBudget(
+        remaining_scan_calls=2,
+        remaining_table_actions=10,
+    )
+    monkeypatch.setattr(scheduler, "_table_discovery_offsets", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_scan_cursors", {})
+
+    assert scheduler._list_tables(redis, "org-one", SUPER, budget) == []
+    assert scheduler._list_tables(redis, "org-two", SUPER, budget) == []
+    assert redis.calls == 2
+    assert budget.remaining_scan_calls == 0
+
+
+def test_quality_table_action_budget_retains_unconsumed_page_tail(monkeypatch):
+    class CompletePage:
+        def scan(self, **_kwargs):
+            return 0, [
+                RK.meta_leaf(ORG, SUPER, table)
+                for table in ("a", "b", "c")
+            ]
+
+    monkeypatch.setattr(scheduler, "_table_discovery_offsets", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_scan_cursors", {})
+    monkeypatch.setattr(scheduler, "_table_discovery_cursor_touches", {})
+    first_budget = scheduler._TickDiscoveryBudget(
+        remaining_scan_calls=1,
+        remaining_table_actions=2,
+    )
+    second_budget = scheduler._TickDiscoveryBudget(
+        remaining_scan_calls=1,
+        remaining_table_actions=2,
+    )
+    redis = CompletePage()
+
+    assert scheduler._list_tables(
+        redis, ORG, SUPER, first_budget,
+    ) == ["a", "b"]
+    assert scheduler._list_tables(
+        redis, ORG, SUPER, second_budget,
+    ) == ["c"]
+
+
 class RejectFirstAtomicSuccessCommitRedis:
     """Fail before the scheduler's all-or-nothing success script executes."""
 

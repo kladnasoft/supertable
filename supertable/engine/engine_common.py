@@ -861,6 +861,7 @@ def configure_httpfs_and_s3(
         for_paths: List[str],
         *,
         storage: Optional[object] = None,
+        apply_process_runtime_defaults: bool = True,
 ) -> None:
     """Load httpfs and configure an in-memory S3 secret plus HTTP caches.
 
@@ -1006,6 +1007,14 @@ def configure_httpfs_and_s3(
             raise RuntimeError(
                 "DuckDB could not configure protected in-memory S3 access"
             ) from None
+
+    # A persistent executor rebinds rotating S3 credentials on later queries.
+    # Its org-scoped runtime policy is already installed, so reapplying these
+    # process defaults would silently overwrite that policy and force global
+    # SET statements through an active sibling query. The default remains on
+    # for standalone/probe connections and the executor's first httpfs load.
+    if not apply_process_runtime_defaults:
+        return
 
     http_timeout_env = settings.SUPERTABLE_DUCKDB_HTTP_TIMEOUT
     if http_timeout_env:
@@ -2009,14 +2018,13 @@ def reset_pooled_duckdb_connections() -> None:
             pass
 
 
-def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
+def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> bool:
     """Re-apply the session-settable DuckDB pragmas from a live engine config.
 
     DuckDB/IslandDB reuse a persistent connection, so settings applied once at
     ``init_connection`` time would otherwise freeze for the connection's life.
-    Calling this immediately before each query makes the org's engine config
-    (memory limit, thread count, HTTP timeout, external file cache) take effect
-    live — the connection adopts the latest values without being torn down.
+    The caller applies a changed configuration at a safe connection boundary;
+    returning ``False`` keeps it eligible for a later retry.
 
     ``cfg`` is an ``EngineRuntimeConfig``.  When None the connection keeps
     whatever ``init_connection`` applied (settings-based), so callers without a
@@ -2024,7 +2032,8 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
     settings silently no-op on connections that have not loaded httpfs.
     """
     if cfg is None:
-        return
+        return True
+    applied = True
 
     # normalize_memory_size guarantees a unit (UI sends a bare "2" -> "2GB");
     # a rejected value is logged rather than silently swallowed so a bad
@@ -2033,6 +2042,7 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
     try:
         con.execute(f"PRAGMA memory_limit='{memory_limit}';")
     except Exception as e:
+        applied = False
         logger.warning(
             "[duckdb.pragma] memory_limit rejected; error_type=%s",
             _diagnostic_error_type(e),
@@ -2047,13 +2057,16 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
     try:
         con.execute(f"SET threads={thread_count};")
     except Exception:
-        pass
+        applied = False
 
     # httpfs settings — only effective once httpfs is loaded (remote reads).
     if cfg.duckdb_http_timeout is not None:
         try:
             con.execute(f"SET http_timeout={int(cfg.duckdb_http_timeout)};")
         except Exception:
+            # httpfs may not be loaded yet. _ensure_httpfs invalidates the
+            # applied signature before the first remote query so this lane is
+            # retried after extension setup.
             pass
 
     # External file cache: enable whenever the org configures a cache size.
@@ -2070,6 +2083,7 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
                     f"SET external_file_cache_max_size='{sanitize_sql_string(cache_size)}';"
                 )
         except Exception as e:
+            applied = False
             logger.warning(
                 "[duckdb.pragma] external file cache config failed; "
                 "error_type=%s",
@@ -2079,7 +2093,8 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
         try:
             con.execute("SET enable_external_file_cache=false;")
         except Exception:
-            pass
+            applied = False
+    return applied
 
 
 # =========================================================
