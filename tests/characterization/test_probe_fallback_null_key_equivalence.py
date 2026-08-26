@@ -90,21 +90,22 @@ def _overlapping_files() -> set:
     }
 
 
-def _resolve(incoming, overlapping, newer_than):
+def _resolve(incoming, overlapping, newer_than, storage):
     return st_processing.resolve_overwrite_writes(
         incoming_df=incoming,
         overlapping_files=overlapping,
         overwrite_columns=[KEY],
         newer_than_col=newer_than,
+        storage=storage,
     )
 
 
-def _resolve_forced_fallback(incoming, overlapping, newer_than):
+def _resolve_forced_fallback(incoming, overlapping, newer_than, storage):
     """Drive the SAME call with the DuckDB probe disabled -> polars oracle path."""
     saved = st_processing._duckdb_probe_overlap_matches
     st_processing._duckdb_probe_overlap_matches = lambda *a, **k: None
     try:
-        return _resolve(incoming, overlapping, newer_than)
+        return _resolve(incoming, overlapping, newer_than, storage)
     finally:
         st_processing._duckdb_probe_overlap_matches = saved
 
@@ -114,13 +115,13 @@ def _rowset(df) -> collections.Counter:
     return collections.Counter(tuple(r) for r in df.select([KEY, VER]).iter_rows())
 
 
-def _assert_probe_engages(incoming, overlapping, newer_than):
+def _assert_probe_engages(incoming, overlapping, newer_than, storage):
     """Guard: confirm the DuckDB probe really matches in-harness, so the equivalence
     below is probe-vs-fallback and not a vacuous fallback-vs-fallback."""
     overlap_true = [(f, sz) for f, ov, sz in overlapping if ov]
     incoming_keys = incoming.select([KEY]).unique()
     matched = st_processing._duckdb_probe_overlap_matches(
-        overlap_true, [KEY], newer_than, incoming_keys,
+        overlap_true, [KEY], newer_than, incoming_keys, storage=storage,
     )
     assert matched is not None and matched.height > 0, (
         "the DuckDB probe did not engage for this input in-harness; the equivalence "
@@ -142,10 +143,13 @@ def test_probe_and_fallback_agree_on_null_key_under_newer_than():
     # exact input that would expose the divergence Finding #4 alleged.
     incoming = pl.DataFrame({KEY: ["x", None], VER: [5, 5]})
 
-    _assert_probe_engages(incoming, overlapping, VER)
+    storage = dw.super_table.storage
+    _assert_probe_engages(incoming, overlapping, VER, storage)
 
-    filt_probe, pairs_probe = _resolve(incoming, overlapping, VER)
-    filt_fb, pairs_fb = _resolve_forced_fallback(incoming, overlapping, VER)
+    filt_probe, pairs_probe = _resolve(incoming, overlapping, VER, storage)
+    filt_fb, pairs_fb = _resolve_forced_fallback(
+        incoming, overlapping, VER, storage,
+    )
 
     # PRIMARY -- the two paths are equivalent => Finding #4 (divergence) is NOT real.
     assert _rowset(filt_probe) == _rowset(filt_fb), (
@@ -186,10 +190,13 @@ def test_probe_and_fallback_agree_on_null_key_overwrite_without_newer_than():
 
     incoming = pl.DataFrame({KEY: ["x", None], VER: [1, 1]})
 
-    _assert_probe_engages(incoming, overlapping, None)
+    storage = dw.super_table.storage
+    _assert_probe_engages(incoming, overlapping, None, storage)
 
-    filt_probe, pairs_probe = _resolve(incoming, overlapping, None)
-    filt_fb, pairs_fb = _resolve_forced_fallback(incoming, overlapping, None)
+    filt_probe, pairs_probe = _resolve(incoming, overlapping, None, storage)
+    filt_fb, pairs_fb = _resolve_forced_fallback(
+        incoming, overlapping, None, storage,
+    )
 
     # No newer_than => no stale filter => every incoming row survives on both paths.
     assert _rowset(filt_probe) == _rowset(filt_fb) == _rowset(incoming)

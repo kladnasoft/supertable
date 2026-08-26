@@ -115,8 +115,12 @@ def test_probe_failure_pools_connection_no_leak():
     saved = engine_common.new_duckdb_connection
     engine_common.new_duckdb_connection = lambda *a, **k: (builds.append(1), fake)[1]
     try:
-        r1 = st_processing._duckdb_probe_overlap_matches(overlap, [KEY], None, incoming_keys)
-        r2 = st_processing._duckdb_probe_overlap_matches(overlap, [KEY], None, incoming_keys)
+        r1 = st_processing._duckdb_probe_overlap_matches(
+            overlap, [KEY], None, incoming_keys, storage=dw.super_table.storage,
+        )
+        r2 = st_processing._duckdb_probe_overlap_matches(
+            overlap, [KEY], None, incoming_keys, storage=dw.super_table.storage,
+        )
     finally:
         engine_common.new_duckdb_connection = saved
 
@@ -153,8 +157,12 @@ def test_probe_success_pools_and_reuses_connection_no_leak():
 
     engine_common.new_duckdb_connection = _spying_factory
     try:
-        r1 = st_processing._duckdb_probe_overlap_matches(overlap, [KEY], None, incoming_keys)
-        r2 = st_processing._duckdb_probe_overlap_matches(overlap, [KEY], None, incoming_keys)
+        r1 = st_processing._duckdb_probe_overlap_matches(
+            overlap, [KEY], None, incoming_keys, storage=dw.super_table.storage,
+        )
+        r2 = st_processing._duckdb_probe_overlap_matches(
+            overlap, [KEY], None, incoming_keys, storage=dw.super_table.storage,
+        )
     finally:
         engine_common.new_duckdb_connection = saved
 

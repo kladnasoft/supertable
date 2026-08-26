@@ -140,7 +140,9 @@ def test_compaction_does_not_bake_or_leak_partition_columns():
     # through the storage layer -- a baked int32 ``year`` beside a ``year=`` path
     # would raise the int32-vs-dictionary merge error here.
     for r in snap2.get("resources") or []:
-        df = st_processing._read_parquet_safe(r["file"], required=True)
+        df = st_processing._read_parquet_safe(
+            r["file"], required=True, storage=st2.storage,
+        )
         assert df is not None, f"compacted file vanished: {r['file']}"
         assert not (set(_PARTITION_COLS) & set(df.columns)), (
             f"compacted body leaked partition cols on read: {df.columns}"

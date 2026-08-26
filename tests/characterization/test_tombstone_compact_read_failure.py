@@ -66,7 +66,6 @@ import os
 import polars as pl
 import pyarrow as pa
 
-import supertable.processing as st_processing
 from supertable.data_writer import DataWriter
 from supertable.simple_table import SimpleTable
 from supertable.super_table import SuperTable
@@ -135,7 +134,7 @@ def test_compact_dv_read_failure_preserves_deletion_vector():
     files_before = len((_snapshot()[1].get("resources")) or [])
 
     # --- compact while the tombstone read fails ----------------------------
-    storage = st_processing._get_storage()
+    storage = dw.super_table.storage
     delegate = storage.read_parquet
     sentinel = object()
     saved = storage.__dict__.get("read_parquet", sentinel)
@@ -153,7 +152,7 @@ def test_compact_dv_read_failure_preserves_deletion_vector():
             storage.read_parquet = saved
 
     # Guard: injection fully removed, so the inspection below reads the real vector.
-    assert "read_parquet" not in st_processing._get_storage().__dict__, (
+    assert "read_parquet" not in storage.__dict__, (
         "injection leaked past the finally block"
     )
 
