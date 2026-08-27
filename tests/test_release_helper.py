@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -72,12 +73,38 @@ def _invoke_release_helper(checkout: Path) -> subprocess.CompletedProcess[str]:
 
 
 def _write_publish_python_wrapper(path: Path) -> None:
+    project_interpreter = _ROOT / ".venv" / "bin" / "python"
+    interpreter_path = (
+        project_interpreter
+        if project_interpreter.is_file()
+        else Path(sys.executable)
+    )
+    # Preserve a venv launcher path instead of resolving its Python symlink;
+    # resolving it would bypass pyvenv.cfg and silently use the base runtime.
+    interpreter = shlex.quote(str(interpreter_path.absolute()))
     path.write_text(
         "#!/usr/bin/env bash\n"
-        f'exec "{_ROOT / ".venv" / "bin" / "python"}" "$@"\n',
+        f'exec {interpreter} "$@"\n',
         encoding="utf-8",
     )
     path.chmod(0o700)
+
+
+def test_publish_python_wrapper_falls_back_without_project_venv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys.modules[__name__], "_ROOT", tmp_path / "source")
+    wrapper = tmp_path / "python"
+
+    _write_publish_python_wrapper(wrapper)
+    result = _run(
+        str(wrapper), "-I", "-c", "import sys; print(sys.version_info[:2])",
+        cwd=tmp_path,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
 
 
 def _uploader_block() -> str:
