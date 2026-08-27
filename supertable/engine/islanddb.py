@@ -840,11 +840,19 @@ def _process_rss_bytes() -> Optional[int]:
 class _IslandTelemetry:
     """Low-overhead, explicitly process-scoped execution measurements."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        rss_limit_bytes: Optional[int] = None,
+        limit_event: Optional[threading.Event] = None,
+    ) -> None:
         self.cpu_started = time.process_time()
         self.read_started = _proc_counter("read_bytes")
         self.rss_started = _process_rss_bytes()
         self.rss_peak = self.rss_started
+        self.rss_limit_bytes = rss_limit_bytes if rss_limit_bytes and rss_limit_bytes > 0 else None
+        self.limit_event = limit_event
+        self._check_limit(self.rss_started)
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._sample_rss, name="islanddb-telemetry", daemon=True,
@@ -856,6 +864,17 @@ class _IslandTelemetry:
             value = _process_rss_bytes()
             if value is not None:
                 self.rss_peak = max(self.rss_peak or 0, value)
+                self._check_limit(value)
+
+    def _check_limit(self, value: Optional[int]) -> None:
+        if (
+            value is not None
+            and self.rss_started is not None
+            and self.rss_limit_bytes is not None
+            and value - self.rss_started > self.rss_limit_bytes
+            and self.limit_event is not None
+        ):
+            self.limit_event.set()
 
     def finish(self) -> Dict[str, object]:
         self._stop.set()
@@ -6096,7 +6115,20 @@ class IslandDB:
             if deadline_monotonic is not None else None
         )
 
+        memory_limit_event = threading.Event()
+        configured_memory_limit = getattr(runtime_config, "memory_max_bytes", None)
+        memory_limit_bytes = (
+            int(configured_memory_limit)
+            if configured_memory_limit and int(configured_memory_limit) > 0
+            else int(plan.memory_budget_bytes)
+        )
+
         def check_execution_deadline() -> None:
+            if memory_limit_event.is_set():
+                raise ResultMemoryLimitExceeded(
+                    f"IslandDB query {query_id!r} exceeded memory budget "
+                    f"of {memory_limit_bytes} bytes"
+                )
             if (
                 deadline_monotonic is not None
                 and _monotonic() >= deadline_monotonic
@@ -6123,7 +6155,10 @@ class IslandDB:
 
         telemetry: Optional[_IslandTelemetry] = None
         try:
-            telemetry = _IslandTelemetry()
+            telemetry = _IslandTelemetry(
+                rss_limit_bytes=memory_limit_bytes,
+                limit_event=memory_limit_event,
+            )
         except BaseException as exc:
             # Diagnostics are fail-open even under thread/resource exhaustion.
             # The query already owns its reservation and global slots here, so

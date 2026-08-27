@@ -26,7 +26,10 @@ from .runner import (
 
 
 CONTAINER_MEMORY_BYTES = 2 * GIB
-ENGINE_MEMORY_BYTES = GIB
+# Leave headroom for the process-wide allocator while staying below the
+# benchmark container's 2 GiB cgroup limit.  The IslandDB guard uses this as
+# its cooperative runtime budget.
+ENGINE_MEMORY_BYTES = (7 * GIB) // 4
 CONTAINER_CPUS = 4
 
 

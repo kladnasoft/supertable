@@ -22,6 +22,12 @@ from typing import Callable, Iterable, Iterator, Optional, Sequence
 
 import pyarrow as pa
 
+from supertable.engine.disk_admission import (
+    DiskAdmissionUnavailable,
+    DiskReservation,
+    reserve_disk,
+)
+
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
@@ -1061,15 +1067,24 @@ class ResourcePlanner:
 class ResourceReservation:
     """Idempotent context-managed reservation returned by ResourceGovernor."""
 
-    def __init__(self, governor: "ResourceGovernor", query_id: str, plan: QueryResourcePlan):
+    def __init__(
+        self,
+        governor: "ResourceGovernor",
+        query_id: str,
+        plan: QueryResourcePlan,
+        disk_reservation: DiskReservation | None = None,
+    ):
         self._governor = governor
         self.query_id = query_id
         self.plan = plan
+        self._disk_reservation = disk_reservation
         self._released = False
 
     def release(self) -> None:
         if not self._released:
             self._released = True
+            if self._disk_reservation is not None:
+                self._disk_reservation.release()
             self._governor._release(self.query_id)
 
     def __enter__(self) -> "ResourceReservation":
@@ -1199,8 +1214,24 @@ class ResourceGovernor:
                     and used_memory + memory <= self._memory_capacity
                     and disk_ok
                 ):
+                    disk_reservation = None
+                    if spill:
+                        try:
+                            disk_reservation = reserve_disk(
+                                self.spill_root,
+                                spill,
+                                min_free_bytes=self.policy.min_spill_free_bytes,
+                            )
+                        except DiskAdmissionUnavailable:
+                            # Another process may have won the shared disk
+                            # reservation between the cheap free-space check
+                            # above and this atomic admission.
+                            self._condition.wait(0.1)
+                            continue
                     self._active[query_id] = (cpu, memory, spill)
-                    return ResourceReservation(self, query_id, plan)
+                    return ResourceReservation(
+                        self, query_id, plan, disk_reservation,
+                    )
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:

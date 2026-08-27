@@ -41,6 +41,10 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from supertable.config.homedir import get_app_home
 from supertable.config.settings import settings
+from supertable.engine.disk_admission import (
+    DiskAdmissionUnavailable,
+    reserve_disk,
+)
 from supertable.engine.file_cache import (
     FileCache,
     RANGE_CACHE_SUBDIR,
@@ -1253,14 +1257,26 @@ class RangeCache:
         # Publish the reservation before examining capacity. Other processes
         # can now account both its actual filesystem allocation and the
         # conservatively estimated bytes that this fill has not created yet.
-        self._atomic_json(reservation, {
-            "accounting_version": _RESERVATION_ACCOUNTING_VERSION,
-            "size": incoming,
-            "future_bytes": future_bytes,
-            "entry_count": entry_count,
-            "created_ns": time.time_ns(),
-            "pid": os.getpid(),
-        })
+        shared = None
+        try:
+            shared = reserve_disk(self.cache_root, future_bytes)
+            self._atomic_json(reservation, {
+                "accounting_version": _RESERVATION_ACCOUNTING_VERSION,
+                "size": incoming,
+                "future_bytes": future_bytes,
+                "entry_count": entry_count,
+                "created_ns": time.time_ns(),
+                "pid": os.getpid(),
+                "shared_token": None if shared is None else str(shared.path),
+            })
+        except DiskAdmissionUnavailable as exc:
+            if shared is not None:
+                shared.release()
+            raise RangeCacheUnavailable(str(exc)) from None
+        except Exception:
+            if shared is not None:
+                shared.release()
+            raise
         try:
             with self._global_lock():
                 self._clean_stale_reservations()
@@ -2186,6 +2202,9 @@ class RangeCache:
 
     @staticmethod
     def _safe_unlink(path: str) -> None:
+        from supertable.engine.disk_admission import release_local_reservation
+
+        release_local_reservation(path)
         try:
             os.unlink(path)
         except OSError:

@@ -37,6 +37,11 @@ import pyarrow.parquet as pq
 
 from supertable.config.homedir import get_app_home
 from supertable.config.settings import settings
+from supertable.engine.disk_admission import (
+    DiskAdmissionUnavailable,
+    release_local_reservation,
+    reserve_disk,
+)
 from supertable.storage.storage_interface import StorageInterface
 from supertable.tombstone_manifest_v2 import (
     TOMBSTONE_FORMAT_V2,
@@ -1410,11 +1415,23 @@ class FileCache:
                 reservation_dir,
                 f"{os.getpid()}-{threading.get_ident()}-{uuid.uuid4().hex}.json",
             )
-            self._atomic_json(reservation, {
-                "size": incoming_size,
-                "created_ns": time.time_ns(),
-                "pid": os.getpid(),
-            })
+            shared = None
+            try:
+                shared = reserve_disk(self.cache_root, incoming_size)
+                self._atomic_json(reservation, {
+                    "size": incoming_size,
+                    "created_ns": time.time_ns(),
+                    "pid": os.getpid(),
+                    "shared_token": None if shared is None else str(shared.path),
+                })
+            except DiskAdmissionUnavailable as exc:
+                if shared is not None:
+                    shared.release()
+                raise FileCacheUnavailable(str(exc)) from None
+            except Exception:
+                if shared is not None:
+                    shared.release()
+                raise
             return reservation, metrics
 
     def _version_directories(self) -> List[str]:
@@ -1748,6 +1765,7 @@ class FileCache:
 
     @staticmethod
     def _safe_unlink(path: str) -> None:
+        release_local_reservation(path)
         try:
             os.unlink(path)
         except OSError:

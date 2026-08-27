@@ -25,6 +25,17 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import supertable.engine.islanddb as islanddb_module
 
+
+def test_island_telemetry_rss_limit_signals_event(monkeypatch):
+    values = iter((100, 102))
+    monkeypatch.setattr(islanddb_module, "_process_rss_bytes", lambda: next(values, 102))
+    event = threading.Event()
+    telemetry = islanddb_module._IslandTelemetry(rss_limit_bytes=1, limit_event=event)
+    try:
+        assert event.wait(1.0)
+    finally:
+        telemetry.finish()
+
 from supertable.data_classes import (
     IntegerDomainBound,
     RbacViewDef,
