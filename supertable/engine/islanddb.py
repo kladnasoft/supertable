@@ -2594,12 +2594,10 @@ class IslandDB:
             if engine_config is None
             else self._detect_resources(engine_config)
         )
-        if int(pl.thread_pool_size()) > int(runtime_resources.cpu_count):
-            reasons.append(
-                "configured IslandDB CPU maximum is below the initialized "
-                "Polars worker pool; set SUPERTABLE_ISLAND_CPU_MAX before "
-                "process start or use a worker tier initialized at that cap"
-            )
+        # The immutable Rayon pool is a process-wide upper bound.  A smaller
+        # runtime cap is enforced by the resource planner/governor (which
+        # limits concurrent CPU work); it must not make an otherwise supported
+        # query fall back to DuckDB merely because Polars was imported earlier.
         if getattr(reflection, "rbac_views", None):
             reasons.append("RBAC views are not yet native in IslandDB")
         if any(not s.files for s in reflection.supers):

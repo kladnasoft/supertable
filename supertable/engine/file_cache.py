@@ -56,6 +56,7 @@ _DEFAULT_MAX_BYTES = 5 * 1024 * 1024 * 1024
 _DEFAULT_TTL_SECONDS = 24 * 60 * 60
 _DEFAULT_CHUNK_BYTES = 8 * 1024 * 1024
 _STALE_RESERVATION_SECONDS = 24 * 60 * 60
+_ALLOCATED_TREE_CACHE: Dict[Tuple[str, int], int] = {}
 WHOLE_CACHE_SUBDIR = _CACHE_DIR_NAME
 RANGE_CACHE_SUBDIR = "ranges-v1"
 
@@ -96,6 +97,13 @@ def automatic_cache_max_bytes(
         return str(candidate)
 
     def allocated_tree(path: str) -> int:
+        try:
+            key = (os.path.realpath(path), int(os.stat(path).st_mtime_ns))
+            cached = _ALLOCATED_TREE_CACHE.get(key)
+            if cached is not None:
+                return cached
+        except OSError:
+            key = None
         total = 0
         pending = [path]
         while pending:
@@ -121,6 +129,10 @@ def automatic_cache_max_bytes(
                             pending.append(entry.path)
             except OSError:
                 continue
+        if key is not None:
+            _ALLOCATED_TREE_CACHE[key] = total
+            if len(_ALLOCATED_TREE_CACHE) > 256:
+                del _ALLOCATED_TREE_CACHE[next(iter(_ALLOCATED_TREE_CACHE))]
         return total
 
     allocation = allocated_bytes or allocated_tree

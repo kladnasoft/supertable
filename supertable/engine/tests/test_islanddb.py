@@ -4264,7 +4264,7 @@ def test_static_island_cpu_limit_bootstraps_polars_pool_before_import():
     assert observed == "1"
 
 
-def test_initialized_polars_pool_wider_than_cpu_cap_fails_capability_closed(
+def test_initialized_polars_pool_wider_than_cpu_cap_remains_supported(
     numeric_reflection, monkeypatch,
 ):
     monkeypatch.setattr(
@@ -4284,12 +4284,7 @@ def test_initialized_polars_pool_wider_than_cpu_cap_fails_capability_closed(
         streaming_result=True,
     )
 
-    assert not capability.supported
-    assert any("Polars worker pool" in reason for reason in capability.reasons)
-    assert any(
-        "SUPERTABLE_ISLAND_CPU_MAX" in reason
-        for reason in capability.reasons
-    )
+    assert capability.supported
 
 
 def test_live_island_cpu_and_memory_config_are_pinned_in_prepared_query(
