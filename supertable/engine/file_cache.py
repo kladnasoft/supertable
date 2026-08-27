@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import tempfile
 import threading
@@ -30,7 +31,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import Any, BinaryIO, Dict, Iterator, List, Optional, Tuple
+from typing import Any, BinaryIO, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import pyarrow.parquet as pq
 
@@ -50,6 +51,138 @@ _DEFAULT_MAX_BYTES = 5 * 1024 * 1024 * 1024
 _DEFAULT_TTL_SECONDS = 24 * 60 * 60
 _DEFAULT_CHUNK_BYTES = 8 * 1024 * 1024
 _STALE_RESERVATION_SECONDS = 24 * 60 * 60
+WHOLE_CACHE_SUBDIR = _CACHE_DIR_NAME
+RANGE_CACHE_SUBDIR = "ranges-v1"
+
+
+def resolved_cache_root(root: Optional[str] = None) -> str:
+    """Return the canonical base directory used by both Island caches."""
+    configured_root = root or settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR
+    if not configured_root:
+        configured_root = os.path.join(get_app_home(), "duckdb_cache")
+    return os.path.realpath(
+        os.path.abspath(os.path.expanduser(str(configured_root)))
+    )
+
+
+def automatic_cache_max_bytes(
+    root: Optional[str],
+    *,
+    owned_subdir: str = WHOLE_CACHE_SUBDIR,
+    peer_limits: Iterable[
+        Tuple[Optional[str], Optional[int], str]
+    ] = (),
+    reserve_bytes: int = 0,
+    disk_usage=shutil.disk_usage,
+    allocated_bytes=None,
+) -> int:
+    """Allocate an automatic cache a non-overcommitted filesystem share.
+
+    Existing bytes owned by these exact cache namespaces are reclaimable and
+    are added back to current free space. Positive peers then reserve their
+    configured capacity; automatic peers on the same filesystem split what
+    remains. A mandatory free-space reserve is removed once before the split.
+    """
+
+    def existing_ancestor(path: str) -> str:
+        candidate = Path(path)
+        while not candidate.exists() and candidate != candidate.parent:
+            candidate = candidate.parent
+        return str(candidate)
+
+    def allocated_tree(path: str) -> int:
+        total = 0
+        pending = [path]
+        while pending:
+            current = pending.pop()
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        try:
+                            info = entry.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if stat.S_ISLNK(info.st_mode):
+                            continue
+                        total += max(
+                            0,
+                            int(
+                                info.st_blocks * 512
+                                if hasattr(info, "st_blocks")
+                                else info.st_size
+                            ),
+                        )
+                        if stat.S_ISDIR(info.st_mode):
+                            pending.append(entry.path)
+            except OSError:
+                continue
+        return total
+
+    allocation = allocated_bytes or allocated_tree
+
+    def namespace_path(cache_root: Optional[str], subdir: str) -> str:
+        return os.path.realpath(os.path.join(
+            resolved_cache_root(cache_root), str(subdir),
+        ))
+
+    reclaimable_namespaces: list[str] = []
+
+    def add_reclaimable_namespace(path: str) -> None:
+        candidate = Path(path)
+        for existing in reclaimable_namespaces:
+            try:
+                candidate.relative_to(existing)
+            except ValueError:
+                continue
+            # Equal or nested namespaces are already included in the existing
+            # allocated tree and must not be counted a second time.
+            return
+        reclaimable_namespaces[:] = [
+            existing for existing in reclaimable_namespaces
+            if not _is_relative_to(Path(existing), candidate)
+        ]
+        reclaimable_namespaces.append(str(candidate))
+
+    def _is_relative_to(path: Path, parent: Path) -> bool:
+        try:
+            path.relative_to(parent)
+        except ValueError:
+            return False
+        return True
+
+    probe = existing_ancestor(resolved_cache_root(root))
+    try:
+        free_bytes = max(0, int(disk_usage(probe).free))
+        device = os.stat(probe).st_dev
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0
+
+    add_reclaimable_namespace(namespace_path(root, owned_subdir))
+    automatic_slots = 1
+    explicit_reservations = 0
+    for peer_root, peer_limit, peer_subdir in peer_limits:
+        peer_probe = existing_ancestor(resolved_cache_root(peer_root))
+        try:
+            if os.stat(peer_probe).st_dev != device:
+                continue
+        except OSError:
+            continue
+        add_reclaimable_namespace(namespace_path(peer_root, peer_subdir))
+        limit = int(peer_limit or 0)
+        if limit > 0:
+            explicit_reservations += limit
+        else:
+            automatic_slots += 1
+    reclaimable = sum(
+        max(0, int(allocation(namespace)))
+        for namespace in reclaimable_namespaces
+    )
+    usable = max(
+        0,
+        free_bytes + reclaimable
+        - max(0, int(reserve_bytes)) - explicit_reservations,
+    )
+    return usable // automatic_slots
 
 
 class FileCacheError(RuntimeError):
@@ -281,12 +414,7 @@ class FileCache:
     ) -> None:
         self.storage = storage
         self.organization = str(organization or "")
-        configured_root = root or settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR
-        if not configured_root:
-            configured_root = os.path.join(get_app_home(), "duckdb_cache")
-        self.root = os.path.realpath(
-            os.path.abspath(os.path.expanduser(str(configured_root)))
-        )
+        self.root = resolved_cache_root(root)
         self.cache_root = os.path.join(self.root, _CACHE_DIR_NAME)
         self.max_bytes = max(0, int(max_bytes))
         self.ttl = max(0.0, float(ttl))

@@ -159,6 +159,21 @@ def test_profile_sanitizer_is_depth_item_and_byte_bounded():
     assert len(encoded) <= 2_000
 
 
+@pytest.mark.parametrize("evaluated", [False, True])
+def test_profile_sanitizer_retains_island_plan_evaluation(evaluated):
+    clean = sanitize_profile({
+        "auto_routing": {
+            "features": {"island_plan_evaluated": evaluated},
+        },
+    })
+
+    assert clean == {
+        "auto_routing": {
+            "features": {"island_plan_evaluated": evaluated},
+        },
+    }
+
+
 def test_sql_shape_erases_literals_and_never_uses_raw_parse_fallback():
     shaped = canonical_sql_shape(
         "SELECT * FROM orders WHERE email='private@example.com' AND id=42"

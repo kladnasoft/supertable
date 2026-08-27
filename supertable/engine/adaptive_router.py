@@ -138,6 +138,7 @@ class RoutingFeatures:
     freshness_age_seconds: int = -1
     has_active_tombstone: bool = False
     streaming_result: bool = False
+    island_plan_evaluated: bool = False
     island_advice: str = ""
     island_cpu_workers: int = 0
     island_io_workers: int = 0
@@ -193,6 +194,7 @@ class RoutingFeatures:
             "stream" if self.streaming_result else "materialized",
             "tombstone" if self.has_active_tombstone else "clean",
             "fresh" if self.data_is_fresh else "stable",
+            "island_plan" if self.island_plan_evaluated else "no_island_plan",
             str(self.island_advice or "none"),
             str(self._magnitude_bucket(self.island_cpu_workers)),
             str(self._magnitude_bucket(self.island_io_workers)),
@@ -502,9 +504,22 @@ class AdaptiveEngineRouter:
             )
         if not features.source_bytes_complete:
             rejections[Engine.ISLANDDB].append("source byte estimate incomplete")
-        if features.island_advice not in {"island_in_memory", "island_spill"}:
+        if (
+            features.island_plan_evaluated
+            and features.island_advice not in {
+                "island_in_memory", "island_spill",
+            }
+        ):
             rejections[Engine.ISLANDDB].append(
                 "IslandDB resource plan is not executable"
+            )
+        elif (
+            availability.island_enabled
+            and availability.island_supported
+            and not features.island_plan_evaluated
+        ):
+            rejections[Engine.ISLANDDB].append(
+                "IslandDB resource plan is unavailable"
             )
 
         if not availability.spark_available:

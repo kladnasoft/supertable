@@ -1341,7 +1341,7 @@ class SuperTable:
                 ") WITHOUT ROWID"
             )
             facts: dict[str, Dict[str, Any]] = {}
-            binary_value_bounds: dict[str, Dict[str, int]] = {}
+            variable_value_bounds: dict[str, Dict[str, int]] = {}
             high_watermark = 0
             expected_timestamp_type = pa.timestamp("us", tz="UTC")
             digest_domain = b"supertable-rowid-integrity-v1\0"
@@ -1490,13 +1490,15 @@ class SuperTable:
                     raise ValueError(
                         f"Table {simple} v2.4 resource has invalid system column types"
                     )
-                resource_binary_bounds = {
+                resource_variable_bounds = {
                     str(field.name): 0
                     for field in arrow_schema
                     if (
                         pa.types.is_binary(field.type)
                         or pa.types.is_large_binary(field.type)
                         or pa.types.is_fixed_size_binary(field.type)
+                        or pa.types.is_string(field.type)
+                        or pa.types.is_large_string(field.type)
                     )
                 }
                 footer_proofs_by_group: list[
@@ -2765,18 +2767,18 @@ except BaseException:
                         raise ValueError(
                             f"Table {simple} v2.4 data pages have invalid system values"
                         )
-                    for column_name in resource_binary_bounds:
+                    for column_name in resource_variable_bounds:
                         try:
                             observed_maximum = pc.max(
                                 pc.binary_length(table.column(column_name)),
                             ).as_py()
                         except Exception:
                             raise ValueError(
-                                f"Table {simple} cannot seal v2.4 Binary values"
+                                f"Table {simple} cannot seal v2.4 variable-width values"
                             ) from None
                         if observed_maximum is not None:
-                            resource_binary_bounds[column_name] = max(
-                                resource_binary_bounds[column_name],
+                            resource_variable_bounds[column_name] = max(
+                                resource_variable_bounds[column_name],
                                 int(observed_maximum),
                             )
                     scanned_rows += int(table.num_rows)
@@ -2885,13 +2887,13 @@ except BaseException:
                     "digest": digest.hexdigest(),
                     "footer_sha256": resource["footer_sha256"],
                 }
-                binary_value_bounds[path] = resource_binary_bounds
+                variable_value_bounds[path] = resource_variable_bounds
             return (
                 directory,
                 connection,
                 facts,
                 high_watermark,
-                binary_value_bounds,
+                variable_value_bounds,
             )
         except BaseException:
             close_batches = getattr(active_batches, "close", None)

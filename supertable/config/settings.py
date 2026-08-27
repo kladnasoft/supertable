@@ -263,7 +263,8 @@ class Settings:
     # Parquet files; selective remote Island scans use the range cache below.
     SUPERTABLE_ISLAND_CACHE_ENABLED: bool = True       # SUPERTABLE_ISLAND_CACHE_ENABLED
     SUPERTABLE_ISLAND_CACHE_DIR: str = ""              # SUPERTABLE_ISLAND_CACHE_DIR
-    SUPERTABLE_ISLAND_CACHE_MAX_BYTES: int = 20 * 1024 * 1024 * 1024  # SUPERTABLE_ISLAND_CACHE_MAX_BYTES
+    # Zero derives a safe share of currently free cache-filesystem capacity.
+    SUPERTABLE_ISLAND_CACHE_MAX_BYTES: int = 0  # SUPERTABLE_ISLAND_CACHE_MAX_BYTES
     # Published Parquet objects are immutable/version-addressed.  Capacity and
     # integrity, rather than age, rotate the local object cache by default.
     # Operators may still opt into an idle TTL with an explicitly positive
@@ -277,7 +278,7 @@ class Settings:
     # for. Every cached interval is sealed to the provider version/ETag.
     SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED: bool = True   # SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED
     SUPERTABLE_ISLAND_RANGE_CACHE_DIR: str = ""          # SUPERTABLE_ISLAND_RANGE_CACHE_DIR
-    SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES: int = 20 * 1024 * 1024 * 1024  # SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES
+    SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES: int = 0  # SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES
     # Immutable, version-sealed ranges rotate on capacity/corruption by default.
     # A positive value explicitly restores idle-TTL eviction.
     SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC: int = 0  # SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC
@@ -287,10 +288,11 @@ class Settings:
     # quotas are hard; Polars/Arrow scan pools are process-global, so decoded
     # scan-memory estimates are conservative routing/admission guards rather
     # than an in-process per-query allocator cap.
-    SUPERTABLE_ISLAND_MEMORY_FRACTION: float = 0.60       # SUPERTABLE_ISLAND_MEMORY_FRACTION
-    SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION: float = 0.80  # SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION
+    SUPERTABLE_ISLAND_MEMORY_FRACTION: float = 1.0        # SUPERTABLE_ISLAND_MEMORY_FRACTION
+    SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION: float = 1.0  # SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION
     SUPERTABLE_ISLAND_MAX_MEMORY_BYTES: int = 0           # SUPERTABLE_ISLAND_MAX_MEMORY_BYTES
-    SUPERTABLE_ISLAND_MAX_RESULT_BYTES: int = 512 * 1024 * 1024  # SUPERTABLE_ISLAND_MAX_RESULT_BYTES
+    # Zero derives the effective container memory available to this process.
+    SUPERTABLE_ISLAND_MAX_RESULT_BYTES: int = 0  # SUPERTABLE_ISLAND_MAX_RESULT_BYTES
     SUPERTABLE_ISLAND_CPU_MAX: int = 0                    # SUPERTABLE_ISLAND_CPU_MAX
     SUPERTABLE_ISLAND_IO_WORKERS_MAX: int = 16            # SUPERTABLE_ISLAND_IO_WORKERS_MAX
     # Hard wall-clock bound for one admitted IslandDB execution.  The bound is
@@ -637,7 +639,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_ISLAND_CACHE_ENABLED=_env_bool("SUPERTABLE_ISLAND_CACHE_ENABLED", True),
         SUPERTABLE_ISLAND_CACHE_DIR=_env_str("SUPERTABLE_ISLAND_CACHE_DIR"),
         SUPERTABLE_ISLAND_CACHE_MAX_BYTES=_env_int(
-            "SUPERTABLE_ISLAND_CACHE_MAX_BYTES", 20 * 1024 * 1024 * 1024,
+            "SUPERTABLE_ISLAND_CACHE_MAX_BYTES", 0,
         ),
         SUPERTABLE_ISLAND_CACHE_TTL_SEC=_env_int(
             "SUPERTABLE_ISLAND_CACHE_TTL_SEC", 0,
@@ -655,22 +657,22 @@ def _build_settings() -> Settings:
             "SUPERTABLE_ISLAND_RANGE_CACHE_DIR",
         ),
         SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES=_env_int(
-            "SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES", 20 * 1024 * 1024 * 1024,
+            "SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES", 0,
         ),
         SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC=_env_int(
             "SUPERTABLE_ISLAND_RANGE_CACHE_TTL_SEC", 0,
         ),
         SUPERTABLE_ISLAND_MEMORY_FRACTION=_env_float(
-            "SUPERTABLE_ISLAND_MEMORY_FRACTION", 0.60,
+            "SUPERTABLE_ISLAND_MEMORY_FRACTION", 1.0,
         ),
         SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION=_env_float(
-            "SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION", 0.80,
+            "SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION", 1.0,
         ),
         SUPERTABLE_ISLAND_MAX_MEMORY_BYTES=_env_int(
             "SUPERTABLE_ISLAND_MAX_MEMORY_BYTES", 0,
         ),
         SUPERTABLE_ISLAND_MAX_RESULT_BYTES=_env_int(
-            "SUPERTABLE_ISLAND_MAX_RESULT_BYTES", 512 * 1024 * 1024,
+            "SUPERTABLE_ISLAND_MAX_RESULT_BYTES", 0,
         ),
         SUPERTABLE_ISLAND_CPU_MAX=_env_int(
             "SUPERTABLE_ISLAND_CPU_MAX", 0,

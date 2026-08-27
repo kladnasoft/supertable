@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -79,6 +80,37 @@ def test_request_paths_are_copied_mapped_and_confined(tmp_path):
         _containerize_request_paths(_request(outside), corpus)
 
 
+def test_request_containerization_preserves_logical_deletion_vector_keys(
+    tmp_path,
+):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    source = corpus / "nested" / "part.parquet"
+    tombstone = corpus / "nested" / "tombstone.parquet"
+    source.parent.mkdir()
+    source.write_bytes(b"PAR1")
+    tombstone.write_bytes(b"PAR1")
+    request = _request(source)
+    logical_source = "benchmark/corpus/part.parquet"
+    logical_tombstone = "benchmark/corpus/tombstone.parquet"
+    request["plan"]["resource_keys"] = [logical_source]
+    request["plan"]["original_resource_keys"] = [logical_source]
+    request["plan"]["tombstone"] = {
+        "path": str(tombstone),
+        "cache_key": logical_tombstone,
+    }
+
+    converted = _containerize_request_paths(request, corpus)
+
+    assert converted["plan"]["files"] == ["/corpus/nested/part.parquet"]
+    assert converted["plan"]["resource_keys"] == [logical_source]
+    assert converted["plan"]["original_resource_keys"] == [logical_source]
+    assert converted["plan"]["tombstone"] == {
+        "path": "/corpus/nested/tombstone.parquet",
+        "cache_key": logical_tombstone,
+    }
+
+
 def test_extended_cgroup_snapshot_includes_cpu_pressure_io_and_pids(tmp_path):
     proc = tmp_path / "proc.cgroup"
     proc.write_text("0::/bench\n", encoding="ascii")
@@ -131,6 +163,112 @@ def test_extended_cgroup_snapshot_includes_cpu_pressure_io_and_pids(tmp_path):
     assert snapshot["pids_max_count"] == 1024
     assert snapshot["cpuset_cpus_effective"] == "0-3"
     assert snapshot["cpu_max"] == "400000 100000"
+
+
+def test_git_identity_binds_untracked_file_contents(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "benchmark@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Benchmark Test"],
+        cwd=repo,
+        check=True,
+    )
+    tracked = repo / "tracked.py"
+    tracked.write_text("tracked = True\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.py"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "fixture"], cwd=repo, check=True,
+    )
+    untracked = repo / "harness.py"
+    untracked.write_text("version = 1\n", encoding="utf-8")
+
+    first = container_runner._git_identity(repo)
+    untracked.write_text("version = 2\n", encoding="utf-8")
+    second = container_runner._git_identity(repo)
+
+    assert first["tracked_diff_sha256"] == second["tracked_diff_sha256"]
+    assert first["untracked_file_count"] == 1
+    assert second["untracked_file_count"] == 1
+    assert first["untracked_files_sha256"] != second["untracked_files_sha256"]
+    assert first["workspace_state_sha256"] != second["workspace_state_sha256"]
+
+
+def test_docker_inspect_redacts_environment_and_label_values():
+    raw = {
+        "Config": {
+            "Env": ["ACCESS_TOKEN=secret-value", "PLAIN=value"],
+            "Labels": {"private.label": "secret-label"},
+        },
+        "HostConfig": {"Memory": 123},
+    }
+
+    redacted = container_runner._redact_docker_inspect(raw)
+
+    assert redacted["Config"]["Env"] == [
+        "ACCESS_TOKEN=<redacted>", "PLAIN=<redacted>",
+    ]
+    assert redacted["Config"]["Labels"] == {
+        "private.label": "<redacted>",
+    }
+    assert redacted["HostConfig"] == {"Memory": 123}
+    assert "secret" not in json.dumps(redacted)
+    assert raw["Config"]["Env"][0] == "ACCESS_TOKEN=secret-value"
+
+
+def test_host_sampler_uses_first_and_last_usable_cgroup_counters(tmp_path):
+    sampler = container_runner._ContainerSampler(
+        docker="docker",
+        container_name="counter-boundary",
+        spill_root=tmp_path,
+        started=0.0,
+        interval_seconds=0.1,
+        expected_cpuset="0-3",
+    )
+    sampler.samples = [
+        {
+            "cgroup": {
+                "available": True,
+                "cpuset_cpus_effective": "0-3",
+                "cpu_stat": None,
+                "io_totals": {},
+            },
+        },
+        {
+            "cgroup": {
+                "available": True,
+                "cpuset_cpus_effective": "0-3",
+                "cpu_stat": {"usage_usec": 100},
+                "io_totals": {"rbytes": 10},
+            },
+        },
+        {
+            "cgroup": {
+                "available": True,
+                "cpuset_cpus_effective": "0-3",
+                "cpu_stat": {"usage_usec": 250},
+                "io_totals": {"rbytes": 40},
+            },
+        },
+        {
+            "cgroup": {
+                "available": True,
+                "cpuset_cpus_effective": "0-3",
+                "cpu_stat": None,
+                "io_totals": {},
+            },
+        },
+    ]
+
+    summary = sampler.summary()
+
+    assert summary["cgroup_cpu_stat_delta"] == {"usage_usec": 150}
+    assert summary["cgroup_io_delta"] == {"rbytes": 30}
 
 
 def test_docker_command_enforces_quota_cpuset_memory_swap_and_read_only_mounts(
@@ -212,6 +350,20 @@ def test_drop_in_runner_preserves_response_and_embeds_complete_provenance(
                 "engine_value": "duckdb",
                 "execution_context": {
                     "configured_threads": 4,
+                    "configured_memory_limit_bytes": 2 * 1024**3,
+                    "island_memory_limit_bytes": 2 * 1024**3,
+                    "island_memory_available_bytes": 2 * 1024**3,
+                    "island_max_memory_bytes_env": str(2 * 1024**3),
+                    "polars_thread_pool_size": 4,
+                    "duckdb_threads_override": "4",
+                    "duckdb_threads": 4,
+                    "duckdb_memory_limit": "2.0 GiB",
+                    "duckdb_enable_external_file_cache": False,
+                    "duckdb_enable_http_metadata_cache": False,
+                    "island_whole_cache_enabled_setting": False,
+                    "island_range_cache_enabled_setting": False,
+                    "island_whole_cache_active": False,
+                    "island_range_cache_active": False,
                     "cgroup_v2": {
                         "memory_max_bytes": CONTAINER_MEMORY_BYTES,
                         "swap_max_bytes": 0,
@@ -264,6 +416,7 @@ def test_drop_in_runner_preserves_response_and_embeds_complete_provenance(
                 "cgroup_io_pressure_total_delta_usec": {"some": 5},
                 "pids_peak_high_water": 8,
                 "effective_cpuset_verified": True,
+                "cgroup_memory_peak_bytes": 256 * 1024**2,
                 "samples": [],
             }
 
@@ -339,6 +492,43 @@ def test_config_requires_an_exact_four_cpu_cpuset(tmp_path):
             image="benchmark:test",
             cpuset_cpus="0-2",
         )
+
+
+def test_docker_command_accepts_exact_two_gib_memory_boundary(tmp_path):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    source = corpus / "part.parquet"
+    source.write_bytes(b"PAR1")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    attempt = tmp_path / "attempt"
+    cache = tmp_path / "cache"
+    home = tmp_path / "home"
+    for path in (attempt, cache, home):
+        path.mkdir()
+    two_gib = 2 * 1024**3
+    config = ContainerRunnerConfig(
+        repo_root=repo,
+        corpus_root=corpus,
+        artifact_root=tmp_path / "artifacts",
+        image="benchmark:test",
+        container_memory_bytes=two_gib,
+        engine_memory_bytes=1024**3,
+    )
+    request = _request(source)
+    request["memory_limit_bytes"] = 1024**3
+
+    command = _docker_command(
+        config=config,
+        request=request,
+        container_name="two-gib-test",
+        attempt_root=attempt,
+        cache_dir=cache,
+        home_dir=home,
+    )
+
+    assert command[command.index("--memory") + 1] == str(two_gib)
+    assert command[command.index("--memory-swap") + 1] == str(two_gib)
 
 
 def test_cli_container_mode_injects_drop_in_runner_and_effective_limits(

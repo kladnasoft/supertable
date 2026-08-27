@@ -664,6 +664,16 @@ class Workload:
     # to collect. This keeps benchmark result handling independent of pandas.
     island_streaming_result: bool = False
     independent_oracle_kind: str | None = None
+    arrow_stream_result: bool = False
+    prune_percent: float | None = None
+    selected_percent: float | None = None
+    selection_basis: str | None = None
+    selected_live_rows: int | None = None
+    selected_live_percent: float | None = None
+    pruned_live_percent: float | None = None
+    matched_update_rows: int | None = None
+    matched_delete_rows: int | None = None
+    independent_oracle: Mapping[str, Any] | None = None
 
 
 WORKLOAD_NAMES = (
@@ -943,10 +953,18 @@ def plan_workload(
     row_group_selections: dict[str, dict[str, Any]] = {}
     resolved_files: list[str] = []
     original_paths = [str((base / str(entry["path"])).resolve()) for entry in original_files]
+    original_resource_keys = [
+        str(entry.get("resource_key") or path)
+        for entry, path in zip(original_files, original_paths)
+    ]
+    resolved_resource_keys: list[str] = []
 
     for entry in retained:
         path = (base / str(entry["path"])).resolve()
         resolved_files.append(str(path))
+        resolved_resource_keys.append(
+            str(entry.get("resource_key") or path)
+        )
         metadata = pq.ParquetFile(path).metadata
         row_groups_total += metadata.num_row_groups
         schema_names = [metadata.schema.column(i).name for i in range(metadata.num_columns)]
@@ -1007,23 +1025,47 @@ def plan_workload(
     )
     estimated_decoded_bytes = candidate_rows * decoded_row_width
     independent_oracle = None
-    if workload.independent_oracle_kind == "generated_metric_formula_v1":
+    if workload.independent_oracle is not None:
+        independent_oracle = dict(workload.independent_oracle)
+    elif workload.independent_oracle_kind == "generated_metric_formula_v1":
         independent_oracle = generated_metric_statistics(
             int(manifest["total_rows"]),
             source_repeat=source_repeat,
+        )
+    tombstone_plan = None
+    raw_tombstone = manifest.get("tombstone")
+    if isinstance(raw_tombstone, Mapping) and raw_tombstone.get("path"):
+        tombstone_plan = dict(raw_tombstone)
+        tombstone_plan["path"] = str(
+            (base / str(raw_tombstone["path"])).resolve()
+        )
+        tombstone_plan["cache_key"] = str(
+            raw_tombstone.get("cache_key")
+            or tombstone_plan["path"]
         )
     return {
         "name": workload.name,
         "sql": workload.sql,
         "required_columns": list(workload.required_columns),
         "island_streaming_result": bool(workload.island_streaming_result),
+        "arrow_stream_result": bool(workload.arrow_stream_result),
+        "prune_percent": workload.prune_percent,
+        "selected_percent": workload.selected_percent,
+        "selection_basis": workload.selection_basis,
+        "selected_live_rows": workload.selected_live_rows,
+        "selected_live_percent": workload.selected_live_percent,
+        "pruned_live_percent": workload.pruned_live_percent,
+        "matched_update_rows": workload.matched_update_rows,
+        "matched_delete_rows": workload.matched_delete_rows,
         "result_postprocess": workload.independent_oracle_kind,
         "payload_width": int(manifest["spec"]["payload_width"]),
         "lower_id": workload.lower_id,
         "upper_id": workload.upper_id,
         "original_files": original_paths,
+        "original_resource_keys": original_resource_keys,
         "files": resolved_files,
-        "resource_keys": resolved_files,
+        "resource_keys": resolved_resource_keys,
+        "tombstone": tombstone_plan,
         "source_bytes": source_bytes,
         "unique_source_bytes": unique_source_bytes,
         "source_repeat": source_repeat,
@@ -1054,7 +1096,9 @@ def plan_workload(
         "integer_domain_bounds": {
             "id": {
                 "minimum": 0,
-                "maximum": int(manifest["total_rows"]) - 1,
+                "maximum": int(
+                    manifest.get("id_domain_rows") or manifest["total_rows"]
+                ) - 1,
                 "has_null": False,
             },
             "metric": {

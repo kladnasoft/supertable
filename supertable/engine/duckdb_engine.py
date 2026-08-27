@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 import duckdb
 import pandas as pd
+import pyarrow as pa
 import sqlglot
 from sqlglot import exp
 
@@ -45,6 +46,7 @@ from supertable.engine.island_resources import (
     ArrowBatchStream,
     ByteBoundedArrowBatchIterator,
     ResourceReservationCancelled,
+    ResultMemoryLimitExceeded,
 )
 from supertable.engine.stable_http_relay import (
     StableRelayLease,
@@ -914,6 +916,9 @@ class _DuckDBResultLifecycleStream:
         self._timed_out = threading.Event()
         self._cancelled = threading.Event()
         self._stop = threading.Event()
+        self._state_lock = threading.Lock()
+        self._terminal_kind: Optional[str] = None
+        self._terminal_callbacks = []
         self._watcher: Optional[threading.Thread] = None
         self._start_monitors()
 
@@ -923,6 +928,44 @@ class _DuckDBResultLifecycleStream:
     @property
     def closed(self) -> bool:
         return bool(getattr(self._inner, "closed", False))
+
+    @property
+    def cancel_event(self) -> threading.Event:
+        """Expose the cooperative signal promised by ArrowBatchStream."""
+        return self._inner.cancel_event
+
+    @property
+    def terminal_kind(self) -> Optional[str]:
+        with self._state_lock:
+            return self._terminal_kind
+
+    def add_terminal_callback(self, callback) -> None:
+        invoke_now = False
+        terminal_kind = None
+        with self._state_lock:
+            if self._terminal_kind is None:
+                self._terminal_callbacks.append(callback)
+            else:
+                invoke_now = True
+                terminal_kind = self._terminal_kind
+        if invoke_now:
+            callback(terminal_kind)
+
+    def _record_terminal(self, kind: str) -> None:
+        callbacks = []
+        with self._state_lock:
+            if self._terminal_kind is not None:
+                return
+            self._terminal_kind = str(kind)
+            callbacks, self._terminal_callbacks = self._terminal_callbacks, []
+        for callback in callbacks:
+            try:
+                callback(self._terminal_kind)
+            except Exception as exc:
+                logger.debug(
+                    "[duckdb] result lifecycle callback failed; error_type=%s",
+                    safe_exception_type(exc),
+                )
 
     def _start_monitors(self) -> None:
         if self._deadline is None and self._cancel_event is None:
@@ -941,6 +984,7 @@ class _DuckDBResultLifecycleStream:
                         self._inner.cancel()
                     finally:
                         self._stop.set()
+                        self._record_terminal("cancelled")
                     return
 
                 if (
@@ -955,6 +999,7 @@ class _DuckDBResultLifecycleStream:
                         self._inner.close()
                     finally:
                         self._stop.set()
+                        self._record_terminal("timed_out")
                     return
 
                 if self._deadline is None:
@@ -991,6 +1036,7 @@ class _DuckDBResultLifecycleStream:
             # polling race when a consumer arrives immediately after set().
             self._inner.cancel()
             self._stop_monitors()
+            self._record_terminal("cancelled")
             raise ResourceReservationCancelled(
                 "DuckDB Arrow result stream was cancelled"
             )
@@ -1001,6 +1047,7 @@ class _DuckDBResultLifecycleStream:
             self._timed_out.set()
             self._inner.close()
             self._stop_monitors()
+            self._record_terminal("timed_out")
             raise TimeoutError(
                 f"DuckDB query timed out after {self._timeout_value:g} seconds"
             )
@@ -1012,10 +1059,12 @@ class _DuckDBResultLifecycleStream:
         except StopIteration:
             self._stop_monitors()
             self._raise_if_stopped()
+            self._record_terminal("completed")
             raise
         except BaseException:
             self._stop_monitors()
             self._raise_if_stopped()
+            self._record_terminal("failed")
             raise
         try:
             self._raise_if_stopped()
@@ -1030,10 +1079,40 @@ class _DuckDBResultLifecycleStream:
             self._inner.cancel()
         finally:
             self._stop_monitors()
+            self._record_terminal("cancelled")
 
     def close(self) -> None:
         self._stop_monitors()
         self._inner.close()
+        self._record_terminal("closed")
+
+    def collect_table(self, *, max_bytes: int) -> pa.Table:
+        """Preserve the bounded Arrow facade through lifecycle wrapping."""
+        if max_bytes < 0:
+            raise ValueError("max_bytes cannot be negative")
+        batches = []
+        total = 0
+        try:
+            for batch in self:
+                if total + batch.nbytes > max_bytes:
+                    raise ResultMemoryLimitExceeded(
+                        "result exceeds bounded collection limit of "
+                        f"{max_bytes} bytes"
+                    )
+                batches.append(batch)
+                total += batch.nbytes
+            return pa.Table.from_batches(batches, schema=self.schema)
+        finally:
+            self.close()
+
+    def to_reader(self):
+        """Return an Arrow reader which retains this lifecycle owner."""
+        return ArrowBatchStream(
+            self.schema,
+            self,
+            close_callback=self.close,
+            cancel_event=self._cancel_event,
+        ).to_reader()
 
     def __enter__(self):
         return self

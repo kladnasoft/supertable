@@ -1832,6 +1832,7 @@ def test_migration_accepts_authentic_v2_4_system_schema_pair(tmp_path):
     storage.write_parquet(pa.table({
         "id": pa.array([1, 2], type=pa.int32()),
         "payload": pa.array([b"a", b"x" * 257], type=pa.binary()),
+        "label": pa.array(["é", "𐍈𐍈"], type=pa.string()),
         "__rowid__": pa.array([10, 11], type=pa.int64()),
         "__timestamp__": pa.array(
             [
@@ -1854,6 +1855,7 @@ def test_migration_accepts_authentic_v2_4_system_schema_pair(tmp_path):
             # cannot be used to infer that this schema came from data files.
             "id": "Int64",
             "payload": "Binary",
+            "label": "String",
             "__rowid__": "Int64",
             "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
         },
@@ -1862,6 +1864,7 @@ def test_migration_accepts_authentic_v2_4_system_schema_pair(tmp_path):
             "fields": {
                 "id": "Int64",
                 "payload": "Binary",
+                "label": "String",
                 "__rowid__": "Int64",
                 "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
             },
@@ -1870,7 +1873,7 @@ def test_migration_accepts_authentic_v2_4_system_schema_pair(tmp_path):
             "file": data_path,
             "file_size": storage.size(data_path),
             "rows": 2,
-            "columns": 4,
+            "columns": 5,
         }],
         # This is the exact empty deletion-vector state written by v2.4.
         "tombstone": None,
@@ -1901,10 +1904,13 @@ def test_migration_accepts_authentic_v2_4_system_schema_pair(tmp_path):
     assert leaf["payload"]["schema"] == {
         "id": "Int64",
         "payload": "Binary",
+        "label": "String",
     }
     assert leaf["payload"]["schemaString"] == json.dumps({
         "type": "struct",
-        "fields": {"id": "Int64", "payload": "Binary"},
+        "fields": {
+            "id": "Int64", "payload": "Binary", "label": "String",
+        },
     }, separators=(",", ":"))
     migrated = leaf["payload"]
     assert migrated["rowid_high_watermark"] == 99
@@ -1925,6 +1931,7 @@ def test_migration_accepts_authentic_v2_4_system_schema_pair(tmp_path):
     }
     assert migrated["resources"][0]["column_max_value_bytes"] == {
         "payload": 257,
+        "label": 8,
     }
     assert "object_seal" not in migrated["resources"][0]
     persisted = storage.read_json(leaf["path"])

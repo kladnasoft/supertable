@@ -2,8 +2,8 @@
 """
 Engine runtime configuration — single source of truth for resolution.
 
-Engine config is stored once per organization at **system scope**
-(``supertable:{org}:system:engine:duckdb``).  It is global to the org, not
+Engine config is stored once per organization at **system scope** in the
+historically named ``supertable:{org}:system:engine:duckdb`` document. It is global to the org, not
 per-supertable, and is resolved **live on every query** (no caching) so that
 changes made in the UI take effect on the next query without a restart or a
 connection reset.
@@ -17,7 +17,9 @@ Two kinds of settings live in that document:
   * **DuckDB runtime pragmas**:
     ``duckdb_memory_limit``, ``duckdb_io_multiplier``, ``duckdb_threads``,
     ``duckdb_http_timeout``, ``duckdb_external_cache_size``.  Each DuckDB engine
-    are stored under the single ``"duckdb"`` section.
+    are stored under the ``"duckdb"`` section.
+  * **IslandDB resource ceilings**: CPU, memory, whole-object cache, and range
+    cache limits stored under ``"islanddb"``. Empty/zero means automatic.
 
 Stored document shape::
 
@@ -26,6 +28,7 @@ Stored document shape::
       "engine_spark_min_bytes": "10737418240",
       "engine_freshness_sec":   "300",
       "duckdb": {"duckdb_memory_limit": "1GB", ...},
+      "islanddb": {"island_cpu_max": "4", ...},
       "modified_ms": 1750000000000
     }
 
@@ -38,12 +41,12 @@ Redis via the UI.
 
 Entry points (all share that precedence so engine and UI never disagree):
 
-  * :func:`resolve_engine_configs`           → ``{"duckdb": cfg}`` in a
+  * :func:`resolve_engine_configs`           → DuckDB and IslandDB configs in a
                                                 single Redis read; used by the
                                                 executor.
-  * :func:`resolve_engine_config`            → typed :class:`EngineRuntimeConfig`
-                                                for one engine (convenience).
-  * :func:`resolve_engine_config_provenance` → ``{shared, duckdb,
+  * :func:`resolve_engine_config`            → typed runtime config for one
+                                                engine (convenience).
+  * :func:`resolve_engine_config_provenance` → ``{shared, duckdb, islanddb,
                                                 modified_ms}`` per-field
                                                 ``{value, source, env_var,
                                                 default}`` for the API / UI.
@@ -121,10 +124,25 @@ _DUCKDB_SPEC: Dict[str, Tuple[str, str]] = {
     "duckdb_external_cache_size": ("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE", "5GB"),
 }
 
+# IslandDB process/admission/cache ceilings. Empty/zero means automatic: CPU
+# and memory use the effective container limits; caches derive a filesystem
+# budget at construction time.
+_ISLAND_SPEC: Dict[str, Tuple[str, str]] = {
+    "island_cpu_max": ("SUPERTABLE_ISLAND_CPU_MAX", ""),
+    "island_memory_max_bytes": ("SUPERTABLE_ISLAND_MAX_MEMORY_BYTES", ""),
+    "island_cache_max_bytes": ("SUPERTABLE_ISLAND_CACHE_MAX_BYTES", ""),
+    "island_range_cache_max_bytes": (
+        "SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES", "",
+    ),
+}
+
 # Public whitelists (for callers / catalog / tests).
 SHARED_CONFIG_FIELDS: Tuple[str, ...] = tuple(_SHARED_SPEC.keys())
 DUCKDB_CONFIG_FIELDS: Tuple[str, ...] = tuple(_DUCKDB_SPEC.keys())
-ENGINE_CONFIG_FIELDS: Tuple[str, ...] = SHARED_CONFIG_FIELDS + DUCKDB_CONFIG_FIELDS
+ISLAND_CONFIG_FIELDS: Tuple[str, ...] = tuple(_ISLAND_SPEC.keys())
+ENGINE_CONFIG_FIELDS: Tuple[str, ...] = (
+    SHARED_CONFIG_FIELDS + DUCKDB_CONFIG_FIELDS + ISLAND_CONFIG_FIELDS
+)
 
 
 @dataclass(frozen=True)
@@ -214,6 +232,16 @@ class EngineRuntimeConfig:
     duckdb_threads: Optional[int]        # None → auto-derive from memory limit
     duckdb_http_timeout: Optional[int]   # seconds; None → leave DuckDB default
     duckdb_external_cache_size: str      # "" → external file cache disabled
+
+
+@dataclass(frozen=True)
+class IslandRuntimeConfig:
+    """Effective per-query Island resource ceilings; None means automatic."""
+
+    cpu_max: Optional[int]
+    memory_max_bytes: Optional[int]
+    cache_max_bytes: Optional[int]
+    range_cache_max_bytes: Optional[int]
 
 
 def _redis_cfg(org: str, catalog: Optional[Any]) -> Dict[str, Any]:
@@ -310,13 +338,39 @@ def _to_float(s: Any, fallback: float) -> float:
         return fallback
 
 
+def normalize_island_limit(value: Any) -> Optional[int]:
+    """Parse a non-negative Island ceiling; zero/empty selects automatic."""
+    if value is None or str(value).strip() == "":
+        return None
+    text = str(value).strip()
+    if text.casefold() in {"true", "false"}:
+        raise ValueError("Island resource limits must be non-negative integers")
+    try:
+        parsed = int(text)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            "Island resource limits must be non-negative integers"
+        ) from None
+    if parsed < 0:
+        raise ValueError("Island resource limits must be non-negative integers")
+    return parsed or None
+
+
+def _island_section(redis_cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    if "islanddb" not in redis_cfg:
+        return {}
+    section = redis_cfg.get("islanddb")
+    if not isinstance(section, Mapping):
+        raise ValueError("islanddb engine configuration must be an object")
+    return dict(section)
+
+
 def _build_runtime(redis_cfg: Dict[str, Any]) -> EngineRuntimeConfig:
     """Build the typed DuckDB config from the stored document."""
     section = (
         redis_cfg.get("duckdb")
         if isinstance(redis_cfg.get("duckdb"), dict) else {}
     )
-
     sv = {k: _effective(redis_cfg, k, _SHARED_SPEC)[0] for k in _SHARED_SPEC}
     dv = {k: _effective(section, k, _DUCKDB_SPEC)[0] for k in _DUCKDB_SPEC}
 
@@ -335,9 +389,29 @@ def _build_runtime(redis_cfg: Dict[str, Any]) -> EngineRuntimeConfig:
     )
 
 
-def resolve_engine_configs(org: str, catalog: Optional[Any] = None) -> Dict[str, EngineRuntimeConfig]:
-    """Compatibility-shaped resolver containing the sole DuckDB config."""
-    return {"duckdb": _build_runtime(_redis_cfg(org, catalog))}
+def _build_island_runtime(redis_cfg: Dict[str, Any]) -> IslandRuntimeConfig:
+    section = _island_section(redis_cfg)
+    values = {
+        key: normalize_island_limit(
+            _effective(section, key, _ISLAND_SPEC)[0]
+        )
+        for key in _ISLAND_SPEC
+    }
+    return IslandRuntimeConfig(
+        cpu_max=values["island_cpu_max"],
+        memory_max_bytes=values["island_memory_max_bytes"],
+        cache_max_bytes=values["island_cache_max_bytes"],
+        range_cache_max_bytes=values["island_range_cache_max_bytes"],
+    )
+
+
+def resolve_engine_configs(org: str, catalog: Optional[Any] = None) -> Dict[str, object]:
+    """Resolve DuckDB and IslandDB from one stored engine document."""
+    cfg = _redis_cfg(org, catalog)
+    return {
+        "duckdb": _build_runtime(cfg),
+        "islanddb": _build_island_runtime(cfg),
+    }
 
 
 def resolve_auto_routing_policy(
@@ -353,10 +427,13 @@ def resolve_auto_routing_policy(
 
 def resolve_engine_bundle(
     org: str, catalog: Optional[Any] = None,
-) -> Tuple[Dict[str, EngineRuntimeConfig], Tuple[AutoRoutingRule, ...]]:
+) -> Tuple[Dict[str, object], Tuple[AutoRoutingRule, ...]]:
     """Resolve runtime configs and manual AUTO policy with one Redis GET."""
     cfg = _redis_cfg(org, catalog)
-    configs = {"duckdb": _build_runtime(cfg)}
+    configs = {
+        "duckdb": _build_runtime(cfg),
+        "islanddb": _build_island_runtime(cfg),
+    }
     try:
         policy = normalize_auto_routing_policy(cfg.get("auto_policy"))
     except ValueError:
@@ -364,8 +441,8 @@ def resolve_engine_bundle(
     return configs, policy
 
 
-def resolve_engine_config(org: str, catalog: Optional[Any] = None, engine: str = "duckdb") -> EngineRuntimeConfig:
-    """Resolve effective DuckDB config (Redis → env → default).
+def resolve_engine_config(org: str, catalog: Optional[Any] = None, engine: str = "duckdb"):
+    """Resolve one effective engine config (Redis → env → default).
 
     ``catalog`` is optional for standalone/unit-test use.  With no catalog (or
     with a genuinely absent Redis document), environment variables and built-in
@@ -373,7 +450,10 @@ def resolve_engine_config(org: str, catalog: Optional[Any] = None, engine: str =
     control state propagate instead of silently changing routing or resource
     policy.
     """
-    return _build_runtime(_redis_cfg(org, catalog))
+    cfg = _redis_cfg(org, catalog)
+    if str(engine).strip().casefold() in {"island", "islanddb"}:
+        return _build_island_runtime(cfg)
+    return _build_runtime(cfg)
 
 
 def resolve_engine_config_provenance(org: str, catalog: Optional[Any] = None) -> Dict[str, Any]:
@@ -401,6 +481,8 @@ def resolve_engine_config_provenance(org: str, catalog: Optional[Any] = None) ->
     result: Dict[str, Any] = {"shared": _block(cfg, _SHARED_SPEC)}
     section = cfg.get("duckdb") if isinstance(cfg.get("duckdb"), dict) else {}
     result["duckdb"] = _block(section, _DUCKDB_SPEC)
+    island_section = _island_section(cfg)
+    result["islanddb"] = _block(island_section, _ISLAND_SPEC)
     result["modified_ms"] = cfg.get("modified_ms")
     try:
         result["auto_policy"] = [

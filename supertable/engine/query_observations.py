@@ -86,6 +86,7 @@ _PROFILE_BOOLEAN_KEYS = frozenset({
     "candidate_row_groups_complete", "candidate_rows_complete",
     "cpu_time_measured", "decoded_bytes_complete", "duration_measured",
     "fallback", "forced", "logical_scan_bytes_complete",
+    "island_plan_evaluated",
     "physical_read_bytes_measured", "planned_files_complete",
     "planned_row_groups_complete", "planned_rows_complete",
     "result_bytes_measured", "result_complete", "result_rows_measured",

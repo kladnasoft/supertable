@@ -18,6 +18,7 @@ from supertable.audit import crypto
 from supertable.audit.events import Actions, AuditEvent, Outcome
 from supertable.data_classes import Reflection, SuperSnapshot
 from supertable.engine.engine_enum import Engine
+from supertable.engine.plan_stats import PlanStats
 
 
 class _CollectingAuditLogger:
@@ -45,6 +46,18 @@ class _OneBatchStream:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _FailAfterOneBatchStream(_OneBatchStream):
+    def __init__(self) -> None:
+        super().__init__()
+        self._delivered = False
+
+    def __next__(self):
+        if not self._delivered:
+            self._delivered = True
+            return self._batch
+        raise RuntimeError("native stream failed")
 
 
 def _install_successful_execution(
@@ -183,7 +196,7 @@ def test_successful_query_execution_emits_one_protected_event(
         }
 
 
-def test_abandoned_query_stream_does_not_emit_success(
+def test_abandoned_query_stream_emits_protected_failure_not_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     collector = _install_successful_execution(monkeypatch, streaming=True)
@@ -197,7 +210,127 @@ def test_abandoned_query_stream_does_not_emit_success(
     assert status is data_reader.Status.OK
     stream.close()
 
-    assert collector.events == []
+    assert len(collector.events) == 1
+    event = collector.events[0]
+    assert event.outcome == Outcome.FAILURE
+    detail = json.loads(event.detail)
+    assert detail["outcome"] == "failure"
+    assert detail["row_count"] == 0
+    assert "SELECT secret" not in event.detail
+
+
+def test_island_stream_delivery_failure_emits_one_protected_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collector = _install_successful_execution(monkeypatch, streaming=True)
+    data_reader.Executor.return_value.execute_stream.return_value = (
+        _FailAfterOneBatchStream(),
+        "islanddb",
+    )
+    plaintext = "SELECT secret FROM events"
+    reader = data_reader.DataReader(
+        "shop", "acme", plaintext, source="api",
+    )
+
+    stream, status, _message = reader.execute_stream(
+        "reporting-role", engine=Engine.ISLANDDB,
+    )
+    assert status is data_reader.Status.OK
+    assert next(stream).num_rows == 2
+    with pytest.raises(RuntimeError, match="Query result stream failed"):
+        next(stream)
+
+    assert len(collector.events) == 1
+    event = collector.events[0]
+    assert event.outcome == Outcome.FAILURE
+    assert plaintext not in event.detail
+    detail = json.loads(event.detail)
+    assert detail["engine"] == "islanddb"
+    assert detail["row_count"] == 2
+    assert detail["column_count"] == 1
+    assert detail["outcome"] == "failure"
+
+
+def test_deferred_auto_fallback_audit_uses_final_duckdb_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collector = _install_successful_execution(monkeypatch, streaming=True)
+    monkeypatch.setattr(data_reader, "PlanStats", PlanStats)
+
+    def execute_stream(**kwargs):
+        plan_stats = kwargs["plan_stats"]
+        inner = _OneBatchStream()
+
+        class DeferredFallbackStream:
+            schema = inner.schema
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                batch = next(inner)
+                plan_stats.add_stat({
+                    "AUTO_ROUTING_OUTCOME": {
+                        "selected_engine": "islanddb",
+                        "actual_engine": "duckdb",
+                        "fallback": True,
+                    },
+                })
+                plan_stats.add_stat({"ENGINE": "duckdb"})
+                return batch
+
+            def close(self):
+                inner.close()
+
+        # Before the first batch, IslandDB is still the only possible answer.
+        return DeferredFallbackStream(), "islanddb"
+
+    data_reader.Executor.return_value.execute_stream.side_effect = execute_stream
+    reader = data_reader.DataReader(
+        "shop", "acme", "SELECT secret FROM events", source="api",
+    )
+
+    stream, status, _message = reader.execute_stream(
+        "reporting-role", engine=Engine.AUTO,
+    )
+    assert status is data_reader.Status.OK
+    assert [batch.num_rows for batch in stream] == [2]
+
+    assert len(collector.events) == 1
+    detail = json.loads(collector.events[0].detail)
+    assert detail["engine"] == "duckdb"
+    assert detail["outcome"] == "success"
+
+
+def test_stream_monitoring_failure_cannot_suppress_protected_failure_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collector = _install_successful_execution(monkeypatch, streaming=True)
+    data_reader.Executor.return_value.execute_stream.return_value = (
+        _FailAfterOneBatchStream(),
+        "islanddb",
+    )
+    data_reader.extend_execution_plan.side_effect = (
+        data_reader.MonitoringDurabilityError("monitoring sink unavailable")
+    )
+    reader = data_reader.DataReader(
+        "shop", "acme", "SELECT secret FROM events", source="api",
+    )
+
+    stream, status, _message = reader.execute_stream(
+        "reporting-role", engine=Engine.ISLANDDB,
+    )
+    assert status is data_reader.Status.OK
+    assert next(stream).num_rows == 2
+    with pytest.raises(data_reader.MonitoringPostExecutionError):
+        next(stream)
+
+    assert len(collector.events) == 1
+    event = collector.events[0]
+    assert event.outcome == Outcome.FAILURE
+    detail = json.loads(event.detail)
+    assert detail["engine"] == "islanddb"
+    assert detail["outcome"] == "failure"
 
 
 def test_disabled_query_lane_skips_protection_on_data_reader_success(

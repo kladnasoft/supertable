@@ -15,6 +15,7 @@ from supertable.engine.file_cache import (
     FileCache,
     FileCacheIntegrityError,
     FileCacheUnavailable,
+    automatic_cache_max_bytes,
 )
 from supertable.storage.local_storage import LocalStorage
 from supertable.storage.storage_interface import (
@@ -26,6 +27,67 @@ from supertable.tombstone_manifest_v2 import (
     TOMBSTONE_FORMAT_V3,
     tombstone_v3_artifact_digest,
 )
+
+
+def test_automatic_cache_capacity_splits_free_space_and_preserves_reserve(
+    tmp_path,
+):
+    class Usage:
+        free = 1000
+
+    assert automatic_cache_max_bytes(
+        str(tmp_path),
+        peer_limits=((str(tmp_path / "ranges"), None, "ranges-v1"),),
+        reserve_bytes=100,
+        disk_usage=lambda _path: Usage(),
+        allocated_bytes=lambda path: (
+            100 if path.endswith("objects-v1") else 200
+        ),
+    ) == 600
+
+
+def test_automatic_cache_capacity_reserves_explicit_peer_limit(tmp_path):
+    class Usage:
+        free = 1000
+
+    assert automatic_cache_max_bytes(
+        str(tmp_path),
+        peer_limits=((str(tmp_path / "ranges"), 300, "ranges-v1"),),
+        reserve_bytes=100,
+        disk_usage=lambda _path: Usage(),
+        allocated_bytes=lambda path: (
+            100 if path.endswith("objects-v1") else 200
+        ),
+    ) == 900
+
+
+def test_automatic_cache_capacity_counts_nested_namespaces_once(tmp_path):
+    class Usage:
+        free = 1000
+
+    allocated_paths = []
+
+    def allocated(path):
+        allocated_paths.append(path)
+        return 300
+
+    assert automatic_cache_max_bytes(
+        str(tmp_path),
+        peer_limits=((str(tmp_path / "objects-v1"), None, "ranges-v1"),),
+        reserve_bytes=100,
+        disk_usage=lambda _path: Usage(),
+        allocated_bytes=allocated,
+    ) == 600
+    assert allocated_paths == [str(tmp_path / "objects-v1")]
+
+
+def test_automatic_cache_capacity_fails_closed_when_disk_is_unknown(tmp_path):
+    def unavailable(_path):
+        raise OSError("filesystem unavailable")
+
+    assert automatic_cache_max_bytes(
+        str(tmp_path), disk_usage=unavailable,
+    ) == 0
 
 
 def _parquet_bytes(seed: int = 1, rows: int = 8) -> bytes:

@@ -27,8 +27,45 @@ project documentation for the full API surface.
 
 __version__ = "2.5.4"
 
+import os
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
+
+
+def _bootstrap_island_polars_cpu_limit() -> None:
+    """Apply an explicit Island CPU ceiling before Polars creates Rayon."""
+    raw = os.environ.get("SUPERTABLE_ISLAND_CPU_MAX")
+    if raw is None or not raw.strip():
+        return
+    try:
+        limit = int(raw.strip())
+    except ValueError:
+        raise RuntimeError(
+            "SUPERTABLE_ISLAND_CPU_MAX must be a non-negative integer"
+        ) from None
+    if limit < 0:
+        raise RuntimeError(
+            "SUPERTABLE_ISLAND_CPU_MAX must be a non-negative integer"
+        )
+    if limit == 0:
+        return
+    existing_raw = os.environ.get("POLARS_MAX_THREADS")
+    if existing_raw is not None and existing_raw.strip():
+        try:
+            existing = int(existing_raw.strip())
+        except ValueError:
+            raise RuntimeError(
+                "POLARS_MAX_THREADS must be a positive integer"
+            ) from None
+        if existing <= 0:
+            raise RuntimeError(
+                "POLARS_MAX_THREADS must be a positive integer"
+            )
+        limit = min(limit, existing)
+    os.environ["POLARS_MAX_THREADS"] = str(limit)
+
+
+_bootstrap_island_polars_cpu_limit()
 
 # This public alias predates the ``supertable.engine`` implementation package.
 # Importing the tiny enum after the now-lazy package is initialized ensures
@@ -37,7 +74,9 @@ from typing import TYPE_CHECKING, Any
 from supertable.engine.engine_enum import Engine as engine
 
 
-# Importing the package is intentionally cheap and side-effect-free.  The
+# Importing the package is intentionally cheap and does not import native data
+# engines. The only bootstrap side effect is the explicit Polars CPU ceiling
+# above, which must exist before Rayon is initialized. The
 # public convenience exports are loaded on first use (PEP 562) so importing
 # ``supertable`` does not import PyArrow/Polars, connect to Redis, probe the
 # filesystem, or initialise an application home.

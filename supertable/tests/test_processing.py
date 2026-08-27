@@ -420,6 +420,56 @@ class TestWriteParquetAndCollectResources:
 
         assert resources[0]["column_max_value_bytes"] == {"payload": 257}
 
+    @patch(f"{_MOD}.generate_filename", return_value="string.parquet")
+    @patch(f"{_MOD}._get_storage")
+    def test_string_resource_records_exact_utf8_width_on_arrow_codec(
+        self, mock_gs, mock_gen,
+    ):
+        from supertable.processing import write_parquet_and_collect_resources
+
+        storage = MagicMock()
+        storage.exists.return_value = True
+        mock_gs.return_value = storage
+        # The 80-byte value also forces the compatibility Arrow writer, while
+        # proving the seal counts UTF-8 bytes rather than code points.
+        values = [None, "", "é", "𐍈" * 20]
+        resources: list = []
+
+        write_parquet_and_collect_resources(
+            write_df=pl.DataFrame({"id": [1, 2, 3, 4], "label": values}),
+            overwrite_columns=["id"],
+            data_dir="/data",
+            new_resources=resources,
+            compression_level=1,
+        )
+
+        assert resources[0]["column_max_value_bytes"] == {"label": 80}
+
+    @patch(f"{_MOD}.generate_filename", return_value="empty-string.parquet")
+    @patch(f"{_MOD}._get_storage")
+    def test_string_resource_records_zero_for_null_and_empty_values(
+        self, mock_gs, mock_gen,
+    ):
+        from supertable.processing import write_parquet_and_collect_resources
+
+        storage = MagicMock()
+        storage.exists.return_value = True
+        mock_gs.return_value = storage
+        resources: list = []
+
+        write_parquet_and_collect_resources(
+            write_df=pl.DataFrame({
+                "id": [1, 2],
+                "label": pl.Series([None, ""], dtype=pl.String),
+            }),
+            overwrite_columns=["id"],
+            data_dir="/data",
+            new_resources=resources,
+            compression_level=1,
+        )
+
+        assert resources[0]["column_max_value_bytes"] == {"label": 0}
+
     @patch(f"{_MOD}.generate_filename", return_value="data.parquet")
     @patch(f"{_MOD}._get_storage")
     def test_creates_dir_if_missing(self, mock_gs, mock_gen):

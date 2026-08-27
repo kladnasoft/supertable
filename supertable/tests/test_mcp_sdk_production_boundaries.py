@@ -323,6 +323,8 @@ def test_idle_duckdb_stream_self_finalizes_at_deadline(monkeypatch):
         deadline_monotonic=time.monotonic() + 0.05,
         _streaming=True,
     )
+    terminal = []
+    stream.add_terminal_callback(terminal.append)
     assert engine.cache_state()["active_queries"] == 1
 
     wait_until = time.monotonic() + 1.0
@@ -335,6 +337,7 @@ def test_idle_duckdb_stream_self_finalizes_at_deadline(monkeypatch):
     assert stream.closed is True
     assert inner.closed is True
     assert engine.cache_state()["active_queries"] == 0
+    assert terminal == ["timed_out"]
     with pytest.raises(TimeoutError, match="timed out"):
         next(stream)
 
@@ -374,6 +377,34 @@ def test_idle_duckdb_stream_self_finalizes_on_external_cancel(monkeypatch):
         next(stream)
 
 
+def test_duckdb_lifecycle_stream_preserves_bounded_arrow_facade():
+    collected_inner = ArrowBatchStream.from_table(pa.table({"id": [1, 2]}))
+    collected_stream = duckdb_engine._DuckDBResultLifecycleStream(
+        collected_inner,
+        deadline_monotonic=None,
+        timeout_value=0,
+        cancel_event=None,
+    )
+    assert collected_stream.cancel_event is collected_inner.cancel_event
+    assert collected_stream.collect_table(max_bytes=1024).to_pylist() == [
+        {"id": 1}, {"id": 2},
+    ]
+    assert collected_stream.closed is True
+
+    reader_stream = duckdb_engine._DuckDBResultLifecycleStream(
+        ArrowBatchStream.from_table(pa.table({"id": [3, 4]})),
+        deadline_monotonic=None,
+        timeout_value=0,
+        cancel_event=None,
+    )
+    reader = reader_stream.to_reader()
+    try:
+        assert reader.read_all().to_pylist() == [{"id": 3}, {"id": 4}]
+    finally:
+        reader.close()
+    assert reader_stream.closed is True
+
+
 @pytest.mark.parametrize(
     ("stop_kind", "expected_error"),
     [
@@ -404,7 +435,10 @@ def test_idle_executor_duckdb_stream_releases_outer_cache_lease(
     monkeypatch.setattr(duck, "_execute_unleased", lambda **_kwargs: raw)
     executor = executor_module.Executor()
     executor.duckdb_exec = duck
-    monkeypatch.setattr(executor, "_get_file_cache", lambda: cache)
+    monkeypatch.setattr(executor, "_get_file_cache", lambda *_args: cache)
+    monkeypatch.setattr(
+        executor_module, "_reflection_has_remote_paths", lambda _reflection: True,
+    )
     monkeypatch.setattr(
         executor_module,
         "resolve_engine_bundle",
@@ -412,7 +446,7 @@ def test_idle_executor_duckdb_stream_releases_outer_cache_lease(
     )
     monkeypatch.setattr(executor, "_get_catalog", lambda: None)
     cancelled = threading.Event()
-    deadline = time.monotonic() + (10.0 if stop_kind == "cancel" else 0.05)
+    deadline = time.monotonic() + (10.0 if stop_kind == "cancel" else 0.25)
 
     stream, used = executor.execute_stream(
         Engine.DUCKDB,
@@ -750,7 +784,10 @@ def test_auto_materialized_stop_is_not_replayed_on_duckdb(
             (_reflection("/tmp/events.parquet"), warm_metrics)
         ),
     )
-    monkeypatch.setattr(executor, "_get_file_cache", lambda: warm_cache)
+    monkeypatch.setattr(executor, "_get_file_cache", lambda *_args: warm_cache)
+    monkeypatch.setattr(
+        executor_module, "_reflection_has_remote_paths", lambda _reflection: True,
+    )
     plan_stats = PlanStats()
 
     with pytest.raises(type(stop_error)):

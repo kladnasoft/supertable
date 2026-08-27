@@ -47,6 +47,8 @@ ENGINE_NAMES = (ENGINE_DUCKDB, ENGINE_ISLAND)
 # assume one output row per input row.  Keep the benchmark escape hatch bounded
 # independently of that conservative estimate.
 ISLAND_STREAM_RESULT_MAX_BYTES = 64 * 1024**2
+BENCHMARK_STREAM_BATCH_ROWS = 4096
+BENCHMARK_STREAM_BATCH_BYTES = 4 * 1024**2
 
 
 def _duckdb_memory_limit_text(limit_bytes: int) -> str:
@@ -234,6 +236,48 @@ def result_digest(canonical: Mapping[str, Any]) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _arrow_schema_evidence(schema) -> dict[str, str]:
+    """Return an exact IPC fingerprint plus a readable schema rendering."""
+    serialized = schema.serialize().to_pybytes()
+    return {
+        "ipc_sha256": hashlib.sha256(serialized).hexdigest(),
+        "canonical": schema.to_string(
+            show_field_metadata=True,
+            show_schema_metadata=True,
+        ),
+    }
+
+
+def assert_arrow_schema_parity(
+    duckdb_result: Mapping[str, Any],
+    island_result: Mapping[str, Any],
+    *,
+    label: str,
+) -> str:
+    """Require the public Arrow schema to match before timing is accepted."""
+    evidence = []
+    for engine_name, result in (
+        (ENGINE_DUCKDB, duckdb_result),
+        (ENGINE_ISLAND, island_result),
+    ):
+        samples = result.get("samples")
+        sample = samples[0] if isinstance(samples, list) and samples else None
+        delivery = sample.get("stream_delivery") if isinstance(sample, Mapping) else None
+        schema = delivery.get("arrow_schema") if isinstance(delivery, Mapping) else None
+        fingerprint = schema.get("ipc_sha256") if isinstance(schema, Mapping) else None
+        if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+            raise BenchmarkParityError(
+                f"{engine_name} omitted Arrow schema evidence for {label}"
+            )
+        evidence.append((fingerprint, schema))
+    if evidence[0][1] != evidence[1][1]:
+        raise BenchmarkParityError(
+            f"IslandDB Arrow schema differs from DuckDB for {label}: "
+            f"duckdb={evidence[0][1]!r}; islanddb={evidence[1][1]!r}"
+        )
+    return evidence[0][0]
+
+
 def assert_exact_parity(
     duckdb_result: Mapping[str, Any], island_result: Mapping[str, Any], *, label: str
 ) -> str:
@@ -275,7 +319,9 @@ def assert_independent_oracle(
     if not isinstance(oracle, Mapping):
         raise BenchmarkParityError(f"invalid independent oracle for {label}")
     kind = str(oracle.get("kind") or "")
-    if kind != "generated_metric_formula_v1":
+    if kind not in {
+        "generated_metric_formula_v1", "mutation_metric_formula_v1",
+    }:
         raise BenchmarkParityError(
             f"unsupported independent oracle {kind!r} for {label}"
         )
@@ -318,6 +364,93 @@ def assert_independent_oracle(
     }
 
 
+def _validate_series_evidence(
+    result: Mapping[str, Any],
+    request: Mapping[str, Any],
+    *,
+    label: str,
+    expected_arrow_schema_fingerprint: str | None = None,
+) -> None:
+    """Reject incomplete worker output before it can enter a comparison."""
+    expected_samples = 1 + int(request.get("warm_repeats", 0) or 0)
+    samples = result.get("samples")
+    if not isinstance(samples, list) or len(samples) != expected_samples:
+        observed = len(samples) if isinstance(samples, list) else None
+        raise BenchmarkWorkerError(
+            f"{label} returned {observed!r} samples; expected {expected_samples}"
+        )
+    expected_engine = str(request["engine"])
+    if str(result.get("engine")) != expected_engine:
+        raise BenchmarkWorkerError(
+            f"{label} reported engine {result.get('engine')!r}; "
+            f"expected {expected_engine!r}"
+        )
+    expected_digest = result.get("result_digest")
+    for index, sample in enumerate(samples):
+        if not isinstance(sample, Mapping):
+            raise BenchmarkWorkerError(f"{label} sample {index} is malformed")
+        expected_temperature = "cold" if index == 0 else "warm"
+        if sample.get("temperature") != expected_temperature:
+            raise BenchmarkWorkerError(
+                f"{label} sample {index} lacks {expected_temperature} evidence"
+            )
+        if sample.get("result_digest") != expected_digest:
+            raise BenchmarkWorkerError(
+                f"{label} sample {index} digest differs from its series result"
+            )
+        if request.get("plan", {}).get("arrow_stream_result"):
+            delivery = sample.get("stream_delivery")
+            if sample.get("result_mode") != "arrow_stream" or not isinstance(
+                delivery, Mapping
+            ):
+                raise BenchmarkWorkerError(
+                    f"{label} sample {index} lacks matched Arrow delivery evidence"
+                )
+            if (
+                delivery.get("configured_max_batch_rows")
+                != BENCHMARK_STREAM_BATCH_ROWS
+                or delivery.get("configured_max_batch_bytes")
+                != BENCHMARK_STREAM_BATCH_BYTES
+            ):
+                raise BenchmarkWorkerError(
+                    f"{label} sample {index} used different Arrow batch limits"
+                )
+            observed_rows = delivery.get("observed_max_batch_rows")
+            observed_bytes = delivery.get("observed_max_batch_bytes")
+            if (
+                not isinstance(observed_rows, int)
+                or isinstance(observed_rows, bool)
+                or not 0 <= observed_rows <= BENCHMARK_STREAM_BATCH_ROWS
+                or not isinstance(observed_bytes, int)
+                or isinstance(observed_bytes, bool)
+                or not 0 <= observed_bytes <= BENCHMARK_STREAM_BATCH_BYTES
+            ):
+                raise BenchmarkWorkerError(
+                    f"{label} sample {index} exceeded an Arrow batch bound"
+                )
+            for counter in ("batch_count", "row_count", "arrow_bytes"):
+                value = delivery.get(counter)
+                if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                    raise BenchmarkWorkerError(
+                        f"{label} sample {index} has invalid {counter} telemetry"
+                    )
+            schema = delivery.get("arrow_schema")
+            fingerprint = (
+                schema.get("ipc_sha256") if isinstance(schema, Mapping) else None
+            )
+            if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+                raise BenchmarkWorkerError(
+                    f"{label} sample {index} lacks Arrow schema telemetry"
+                )
+            if (
+                expected_arrow_schema_fingerprint is not None
+                and fingerprint != expected_arrow_schema_fingerprint
+            ):
+                raise BenchmarkWorkerError(
+                    f"{label} sample {index} Arrow schema differs from parity"
+                )
+
+
 def _resolve_engine(engine_name: str):
     from supertable.engine.engine_enum import Engine
 
@@ -348,19 +481,27 @@ def islanddb_available() -> bool:
 def _build_reflection(plan: Mapping[str, Any]):
     from supertable.data_classes import (
         IntegerDomainBound, Reflection, RowGroupSelection, SuperSnapshot,
+        TombstoneDef,
     )
 
     files = [str(path) for path in plan["files"]]
     original_files = [str(path) for path in plan.get("original_files") or files]
+    resource_keys = [
+        str(path) for path in plan.get("resource_keys") or files
+    ]
+    original_resource_keys = [
+        str(path)
+        for path in plan.get("original_resource_keys") or resource_keys
+    ]
     snapshot = SuperSnapshot(
         super_name=str(plan["super_name"]),
         simple_name=str(plan["table"]),
         simple_version=1,
         files=files,
         columns=set(str(name) for name in plan["schema"]),
-        resource_keys=list(files),
+        resource_keys=resource_keys,
         column_types=dict(plan["schema"]),
-        snapshot_resource_keys=original_files,
+        snapshot_resource_keys=original_resource_keys,
         resource_sizes=[os.path.getsize(path) for path in files],
         row_group_selections={
             str(path): RowGroupSelection(
@@ -398,12 +539,25 @@ def _build_reflection(plan: Mapping[str, Any]):
             if isinstance(values, Mapping)
         },
     )
+    tombstone_views = {}
+    raw_tombstone = plan.get("tombstone")
+    if isinstance(raw_tombstone, Mapping):
+        tombstone_views[str(plan["table"])] = TombstoneDef(
+            tombstone_path=str(raw_tombstone["path"]),
+            cache_key=str(raw_tombstone["cache_key"]),
+            expected_rows=int(raw_tombstone["rows"]),
+            tombstone_digest=str(raw_tombstone["sha256"]),
+            resource_keys=tuple(resource_keys),
+            snapshot_resource_keys=tuple(original_resource_keys),
+            tombstone_format=int(raw_tombstone.get("format") or 1),
+        )
     return Reflection(
         storage_type="LocalBenchmarkCorpus",
         reflection_bytes=int(plan["estimated_reflection_bytes"]),
         total_reflections=len(files),
         supers=[snapshot],
         freshness_ms=0,
+        tombstone_views=tombstone_views,
         source_bytes=int(plan["candidate_source_bytes"]),
         row_group_scan_bytes=int(plan.get("eligible_pushdown_bytes") or 0),
         row_group_scan_bytes_complete=True,
@@ -831,8 +985,11 @@ def _execute_one(executor, engine, plan: Mapping[str, Any], sample_index: int) -
     island_streaming_result = bool(plan.get("island_streaming_result")) and (
         str(engine.value) == ENGINE_ISLAND
     )
+    matched_arrow_stream = bool(plan.get("arrow_stream_result"))
+    stream_delivery: dict[str, Any] | None = None
     with _PeakRSS() as rss:
-        if island_streaming_result:
+        if island_streaming_result or matched_arrow_stream:
+            stream_setup_started = time.perf_counter()
             stream, used = executor.execute_stream(
                 engine=engine,
                 reflection=reflection,
@@ -841,12 +998,117 @@ def _execute_one(executor, engine, plan: Mapping[str, Any], sample_index: int) -
                 timer=timer,
                 plan_stats=plan_stats,
                 log_prefix="[islanddb.benchmark] ",
+                max_batch_rows=BENCHMARK_STREAM_BATCH_ROWS,
+                max_batch_bytes=BENCHMARK_STREAM_BATCH_BYTES,
             )
-            with stream:
-                table = stream.collect_table(
-                    max_bytes=ISLAND_STREAM_RESULT_MAX_BYTES,
+            stream_setup_seconds = time.perf_counter() - stream_setup_started
+            if not matched_arrow_stream:
+                # Preserve the established spill benchmark consumer. The
+                # matched comparison below opts into richer batch telemetry.
+                with stream:
+                    table = stream.collect_table(
+                        max_bytes=ISLAND_STREAM_RESULT_MAX_BYTES,
+                    )
+                frame = table.to_pandas()
+            else:
+                batches = []
+                delivered_rows = 0
+                delivered_bytes = 0
+                observed_max_batch_rows = 0
+                observed_max_batch_bytes = 0
+                first_batch_wait_seconds = None
+                time_to_first_batch_seconds = None
+                stream_completion_started = time.perf_counter()
+                with stream:
+                    iterator = iter(stream)
+                    first_started = time.perf_counter()
+                    try:
+                        first = next(iterator)
+                    except StopIteration:
+                        pass
+                    else:
+                        first_batch_wait_seconds = (
+                            time.perf_counter() - first_started
+                        )
+                        time_to_first_batch_seconds = (
+                            time.perf_counter() - wall_start
+                        )
+                        first_rows = int(first.num_rows)
+                        first_bytes = int(first.nbytes)
+                        if (
+                            first_rows > BENCHMARK_STREAM_BATCH_ROWS
+                            or first_bytes > BENCHMARK_STREAM_BATCH_BYTES
+                        ):
+                            raise RuntimeError(
+                                "benchmark Arrow batch exceeded its configured bound"
+                            )
+                        observed_max_batch_rows = max(
+                            observed_max_batch_rows, first_rows,
+                        )
+                        observed_max_batch_bytes = max(
+                            observed_max_batch_bytes, first_bytes,
+                        )
+                        batches.append(first)
+                        delivered_rows += first_rows
+                        delivered_bytes += first_bytes
+                        if delivered_bytes > ISLAND_STREAM_RESULT_MAX_BYTES:
+                            raise RuntimeError(
+                                "benchmark Arrow result exceeded its bounded "
+                                "collection limit"
+                            )
+                        for batch in iterator:
+                            batch_rows = int(batch.num_rows)
+                            batch_bytes = int(batch.nbytes)
+                            if (
+                                batch_rows > BENCHMARK_STREAM_BATCH_ROWS
+                                or batch_bytes > BENCHMARK_STREAM_BATCH_BYTES
+                            ):
+                                raise RuntimeError(
+                                    "benchmark Arrow batch exceeded its configured bound"
+                                )
+                            observed_max_batch_rows = max(
+                                observed_max_batch_rows, batch_rows,
+                            )
+                            observed_max_batch_bytes = max(
+                                observed_max_batch_bytes, batch_bytes,
+                            )
+                            batches.append(batch)
+                            delivered_rows += batch_rows
+                            delivered_bytes += batch_bytes
+                            if delivered_bytes > ISLAND_STREAM_RESULT_MAX_BYTES:
+                                raise RuntimeError(
+                                    "benchmark Arrow result exceeded its bounded "
+                                    "collection limit"
+                                )
+                stream_completion_seconds = (
+                    time.perf_counter() - stream_completion_started
                 )
-            frame = table.to_pandas()
+                table_build_started = time.perf_counter()
+                table = pa.Table.from_batches(batches, schema=stream.schema)
+                table_build_seconds = time.perf_counter() - table_build_started
+                conversion_started = time.perf_counter()
+                frame = table.to_pandas()
+                conversion_seconds = time.perf_counter() - conversion_started
+                stream_delivery = {
+                    "stream_setup_seconds": stream_setup_seconds,
+                    "time_to_first_batch_seconds": time_to_first_batch_seconds,
+                    "first_batch_wait_seconds": first_batch_wait_seconds,
+                    # Retain the historical key, but scope it only to stream
+                    # iteration/close. Arrow table construction is measured
+                    # independently below.
+                    "drain_seconds": stream_completion_seconds,
+                    "stream_completion_seconds": stream_completion_seconds,
+                    "arrow_table_build_seconds": table_build_seconds,
+                    "arrow_to_pandas_seconds": conversion_seconds,
+                    "batch_count": len(batches),
+                    "row_count": delivered_rows,
+                    "arrow_bytes": delivered_bytes,
+                    "configured_max_batch_rows": BENCHMARK_STREAM_BATCH_ROWS,
+                    "configured_max_batch_bytes": BENCHMARK_STREAM_BATCH_BYTES,
+                    "observed_max_batch_rows": observed_max_batch_rows,
+                    "observed_max_batch_bytes": observed_max_batch_bytes,
+                    "arrow_schema": _arrow_schema_evidence(table.schema),
+                }
             result_mode = "arrow_stream"
         else:
             frame, used = executor.execute(
@@ -901,6 +1163,7 @@ def _execute_one(executor, engine, plan: Mapping[str, Any], sample_index: int) -
         "cache_metrics": _cache_metrics_from_plan(flattened),
         "plan_stats": flattened,
         "engine_profile": profile,
+        "stream_delivery": stream_delivery,
         "result": canonical,
         "result_digest": result_digest(canonical),
     }
@@ -1043,7 +1306,11 @@ def run_engine_series_in_process(request: Mapping[str, Any]) -> dict[str, Any]:
             )
         except Exception:
             execution_context["duckdb_memory_limit"] = None
-        for setting in ("enable_external_file_cache", "temp_directory"):
+        for setting in (
+            "enable_external_file_cache",
+            "enable_http_metadata_cache",
+            "temp_directory",
+        ):
             try:
                 execution_context[f"duckdb_{setting}"] = _json_value(
                     duckdb_connection.execute(
@@ -1052,7 +1319,21 @@ def run_engine_series_in_process(request: Mapping[str, Any]) -> dict[str, Any]:
                 )
             except Exception:
                 execution_context[f"duckdb_{setting}"] = None
+    from supertable.config.settings import settings as runtime_settings
+
+    execution_context["island_whole_cache_enabled_setting"] = bool(
+        runtime_settings.SUPERTABLE_ISLAND_CACHE_ENABLED
+    )
+    execution_context["island_range_cache_enabled_setting"] = bool(
+        runtime_settings.SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED
+    )
+    execution_context["island_whole_cache_active"] = (
+        getattr(executor, "_file_cache", None) is not None
+    )
     island_executor = getattr(executor, "island_exec", None)
+    execution_context["island_range_cache_active"] = getattr(
+        island_executor, "range_cache", None,
+    ) not in (None, False)
     island_resources = getattr(island_executor, "_resources", None)
     island_policy = getattr(island_executor, "_policy", None)
     execution_context["island_memory_limit_bytes"] = getattr(
@@ -1313,6 +1594,21 @@ def summarize_series(series: Mapping[str, Any]) -> dict[str, Any]:
         ])
         for key in process_io_keys
     }
+    stream_metrics = (
+        "time_to_first_batch_seconds",
+        "stream_completion_seconds",
+        "arrow_table_build_seconds",
+        "arrow_to_pandas_seconds",
+    )
+    warm_stream_values = {
+        metric: [
+            float(sample["stream_delivery"][metric])
+            for sample in warm
+            if isinstance(sample.get("stream_delivery"), Mapping)
+            and sample["stream_delivery"].get(metric) is not None
+        ]
+        for metric in stream_metrics
+    }
     result: dict[str, Any] = {
         "cold_wall_seconds": cold.get("wall_seconds") if cold else None,
         "cold_cpu_seconds": cold.get("cpu_seconds") if cold else None,
@@ -1328,6 +1624,9 @@ def summarize_series(series: Mapping[str, Any]) -> dict[str, Any]:
             cold.get("rss_peak_delta_bytes") if cold else None
         ),
         "cold_process_io_delta": cold.get("process_io_delta") if cold else None,
+        "cold_stream_delivery": (
+            cold.get("stream_delivery") if cold else None
+        ),
         "warm_samples": len(wall_values),
         "warm_wall_seconds_p25": _percentile(wall_values, 0.25),
         "warm_wall_seconds_p75": _percentile(wall_values, 0.75),
@@ -1354,6 +1653,8 @@ def summarize_series(series: Mapping[str, Any]) -> dict[str, Any]:
     _add_flat_distribution(result, "warm_mean_cpu_cores", mean_core_values)
     _add_flat_distribution(result, "warm_rss_peak_bytes", rss_peak_values)
     _add_flat_distribution(result, "warm_rss_peak_delta_bytes", rss_delta_values)
+    for metric, values in warm_stream_values.items():
+        _add_flat_distribution(result, f"warm_{metric}", values)
     return result
 
 
@@ -1426,11 +1727,20 @@ def compare_manifest(
         raise ValueError(
             "execution manifest source_repeat does not match comparison config"
         )
-    selected_names = normalize_workloads(config.workloads)
-    workloads = build_workloads(
-        int(manifest["total_rows"]),
-        payload_columns=int(manifest["spec"].get("payload_columns", 8)),
-    )
+    if manifest.get("workload_kind") == "mutation-pruning-v1":
+        from .mutation_corpus import (
+            build_mutation_workloads,
+            normalize_mutation_workloads,
+        )
+
+        selected_names = normalize_mutation_workloads(config.workloads)
+        workloads = build_mutation_workloads(manifest)
+    else:
+        selected_names = normalize_workloads(config.workloads)
+        workloads = build_workloads(
+            int(manifest["total_rows"]),
+            payload_columns=int(manifest["spec"].get("payload_columns", 8)),
+        )
     tier = str(manifest["spec"]["tier"])
     cache_base = Path(cache_root).expanduser().resolve()
     home_base = Path(home_root).expanduser().resolve()
@@ -1476,6 +1786,24 @@ def compare_manifest(
             parity_results[ENGINE_ISLAND],
             label=label,
         )
+        for engine_name in ENGINE_NAMES:
+            _validate_series_evidence(
+                parity_results[engine_name],
+                {
+                    "engine": engine_name,
+                    "warm_repeats": 0,
+                    "plan": plan,
+                },
+                label=f"{label}/parity/{engine_name}",
+            )
+        arrow_schema_fingerprint = (
+            assert_arrow_schema_parity(
+                parity_results[ENGINE_DUCKDB],
+                parity_results[ENGINE_ISLAND],
+                label=label,
+            )
+            if plan.get("arrow_stream_result") else None
+        )
 
         # Alternate timing order across workloads to reduce a stable order bias.
         order = list(ENGINE_NAMES)
@@ -1501,6 +1829,12 @@ def compare_manifest(
                 home_dir=home_base / run_id / "timing" / engine_name / name,
                 timeout_seconds=config.timeout_seconds,
             )
+            _validate_series_evidence(
+                result,
+                request,
+                label=f"{label}/timing/{engine_name}",
+                expected_arrow_schema_fingerprint=arrow_schema_fingerprint,
+            )
             for sample in result.get("samples") or []:
                 if sample.get("result_digest") != digest:
                     raise BenchmarkParityError(
@@ -1516,41 +1850,52 @@ def compare_manifest(
             if duck_median is not None and island_median not in (None, 0)
             else None
         )
+        input_record = {
+            key: plan[key]
+            for key in (
+                "source_bytes",
+                "unique_source_bytes",
+                "source_repeat",
+                "source_repeat_mode",
+                "candidate_source_bytes",
+                "estimated_reflection_bytes",
+                "estimated_pushdown_bytes",
+                "unique_estimated_reflection_bytes",
+                "unique_estimated_pushdown_bytes",
+                "estimated_decoded_bytes",
+                "decoded_row_width",
+                "decoded_estimate_complete",
+                "projected_source_fraction",
+                "files_before_prune",
+                "unique_files_before_prune",
+                "files_after_prune",
+                "files_pruned",
+                "row_groups_after_file_prune",
+                "row_groups_pushdown_eligible",
+                "required_columns",
+                "island_streaming_result",
+                "arrow_stream_result",
+                "independent_oracle",
+            )
+        }
+        for optional_key in (
+            "prune_percent", "selected_percent", "selection_basis",
+            "selected_live_rows", "selected_live_percent",
+            "pruned_live_percent", "matched_update_rows",
+            "matched_delete_rows", "tombstone",
+        ):
+            if plan.get(optional_key) is not None:
+                input_record[optional_key] = plan[optional_key]
         records.append(
             {
                 "workload": name,
                 "query": plan["sql"],
-                "input": {
-                    key: plan[key]
-                    for key in (
-                        "source_bytes",
-                        "unique_source_bytes",
-                        "source_repeat",
-                        "source_repeat_mode",
-                        "candidate_source_bytes",
-                        "estimated_reflection_bytes",
-                        "estimated_pushdown_bytes",
-                        "unique_estimated_reflection_bytes",
-                        "unique_estimated_pushdown_bytes",
-                        "estimated_decoded_bytes",
-                        "decoded_row_width",
-                        "decoded_estimate_complete",
-                        "projected_source_fraction",
-                        "files_before_prune",
-                        "unique_files_before_prune",
-                        "files_after_prune",
-                        "files_pruned",
-                        "row_groups_after_file_prune",
-                        "row_groups_pushdown_eligible",
-                        "required_columns",
-                        "island_streaming_result",
-                        "independent_oracle",
-                    )
-                },
+                "input": input_record,
                 "parity": {
                     "matched": True,
                     "oracle": ENGINE_DUCKDB,
                     "result_digest": digest,
+                    "arrow_schema_ipc_sha256": arrow_schema_fingerprint,
                     "checked_before_timing": True,
                     "independent_oracle": independent_oracle,
                 },
@@ -1561,7 +1906,7 @@ def compare_manifest(
             }
         )
 
-    return {
+    comparison = {
         "tier": tier,
         "target_source_bytes": int(manifest["target_source_bytes"]),
         "actual_source_bytes": int(manifest["actual_source_bytes"]),
@@ -1574,6 +1919,13 @@ def compare_manifest(
         "run_id": run_id,
         "workloads": records,
     }
+    for optional_key in (
+        "physical_rows", "live_rows", "tombstone_rows", "tombstone_threshold",
+        "snapshot_version",
+    ):
+        if manifest.get(optional_key) is not None:
+            comparison[optional_key] = int(manifest[optional_key])
+    return comparison
 
 
 def environment_metadata() -> dict[str, Any]:

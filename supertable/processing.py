@@ -2609,7 +2609,7 @@ def _write_single_parquet_file_attempt(
         "rows": rows,
         "columns": columns,
     }
-    binary_value_bounds: Dict[str, int] = {}
+    variable_value_bounds: Dict[str, int] = {}
     if arrow_tbl is not None:
         # Preserve the established Arrow calculation on compatibility writes.
         binary_columns = (
@@ -2629,7 +2629,7 @@ def _write_single_parquet_file_attempt(
                 raise RuntimeError(
                     f"Could not compute Binary value-width seal for {name!r}"
                 ) from None
-            binary_value_bounds[str(name)] = max(0, int(maximum or 0))
+            variable_value_bounds[str(name)] = max(0, int(maximum or 0))
     else:
         # Do not materialise a full Arrow table solely for this seal on the fast
         # path. Polars reports the same byte width (not character count).
@@ -2644,9 +2644,23 @@ def _write_single_parquet_file_attempt(
                 raise RuntimeError(
                     f"Could not compute Binary value-width seal for {name!r}"
                 ) from None
-            binary_value_bounds[str(name)] = max(0, int(maximum or 0))
-    if binary_value_bounds:
-        resource["column_max_value_bytes"] = binary_value_bounds
+            variable_value_bounds[str(name)] = max(0, int(maximum or 0))
+    # String memory is governed by UTF-8 payload bytes, not character count.
+    # Compute it from the already-materialized Polars frame for both codecs so
+    # Arrow String/LargeString/StringView representation differences cannot
+    # weaken the persisted seal.
+    for name, dtype in write_df.schema.items():
+        if dtype != polars.String:
+            continue
+        try:
+            maximum = write_df.get_column(name).str.len_bytes().max()
+        except Exception:
+            raise RuntimeError(
+                f"Could not compute String value-width seal for {name!r}"
+            ) from None
+        variable_value_bounds[str(name)] = max(0, int(maximum or 0))
+    if variable_value_bounds:
+        resource["column_max_value_bytes"] = variable_value_bounds
     if object_seal is not None:
         resource["object_seal"] = {
             "size": object_seal.size,

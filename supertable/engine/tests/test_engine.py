@@ -2665,9 +2665,21 @@ class TestExecutor:
         }
 
     @patch.object(DuckDB, "execute", return_value=pd.DataFrame())
-    def test_auto_picks_duckdb_for_medium_stable_data(self, mock_exec):
+    def test_auto_picks_duckdb_for_medium_stable_data(
+        self, mock_exec, monkeypatch,
+    ):
         import supertable.engine.executor as mod
         mod._duckdb_singleton = None
+        # This legacy cost-tier assertion deliberately excludes the now-live
+        # IslandDB AUTO candidate; Island routing has dedicated capability and
+        # end-to-end stream coverage.
+        monkeypatch.setattr(
+            mod,
+            "settings",
+            _dc_replace(
+                mod.settings, SUPERTABLE_ISLAND_AUTO_ENABLED=False,
+            ),
+        )
         r, p, qm, t, ps = _exec_fixtures()
         # 500 MB, stable (freshness_ms=0 means unknown → treated as stable)
         r.reflection_bytes = 500 * 1024 * 1024
@@ -2686,10 +2698,19 @@ class TestExecutor:
         assert used == "duckdb"
 
     @patch.object(DuckDB, "execute", return_value=pd.DataFrame())
-    def test_auto_picks_duckdb_for_medium_old_data(self, mock_exec):
+    def test_auto_picks_duckdb_for_medium_old_data(
+        self, mock_exec, monkeypatch,
+    ):
         import time
         import supertable.engine.executor as mod
         mod._duckdb_singleton = None
+        monkeypatch.setattr(
+            mod,
+            "settings",
+            _dc_replace(
+                mod.settings, SUPERTABLE_ISLAND_AUTO_ENABLED=False,
+            ),
+        )
         r, p, qm, t, ps = _exec_fixtures()
         # 500 MB, updated 10 minutes ago (stable → cache pays off)
         r.reflection_bytes = 500 * 1024 * 1024

@@ -42,6 +42,7 @@ from supertable.engine.adaptive_router import (
 from supertable.engine.islanddb import (
     IslandCapability,
     IslandDB,
+    _IslandResultLifecycleStream,
     IslandUnsupportedError,
 )
 from supertable.engine.island_resources import (
@@ -301,7 +302,7 @@ def _resolve_engine_bundle_with_boundary(
     *,
     deadline_monotonic: Optional[float],
     cancel_event: Optional[threading.Event],
-) -> tuple[dict[str, EngineRuntimeConfig], tuple[AutoRoutingRule, ...]]:
+) -> tuple[dict[str, object], tuple[AutoRoutingRule, ...]]:
     result = _bounded_query_control_call(
         lambda: resolve_engine_bundle(organization, catalog_provider()),
         deadline_monotonic=deadline_monotonic,
@@ -495,6 +496,28 @@ def _reflection_has_linked_remote_paths(reflection: Reflection) -> bool:
             for path in (getattr(snapshot, "files", ()) or ())
         )
         for snapshot in tuple(getattr(reflection, "supers", ()) or ())
+    )
+
+
+def _reflection_has_remote_paths(reflection: Reflection) -> bool:
+    if any(
+        _is_remote_scan_path(path)
+        for snapshot in tuple(getattr(reflection, "supers", ()) or ())
+        for path in (getattr(snapshot, "files", ()) or ())
+    ):
+        return True
+    return any(
+        _is_remote_scan_path(path)
+        for tombstone in (
+            getattr(reflection, "tombstone_views", None) or {}
+        ).values()
+        for path in (
+            getattr(tombstone, "tombstone_path", ""),
+            *(
+                getattr(segment, "tombstone_path", "")
+                for segment in (getattr(tombstone, "segments", ()) or ())
+            ),
+        )
     )
 
 
@@ -937,10 +960,12 @@ class _AutoIslandFallbackStream:
         *,
         fallback_factory,
         island_success,
+        replacement_ready=None,
     ) -> None:
         self._inner = inner
         self._fallback_factory = fallback_factory
         self._island_success = island_success
+        self._replacement_ready = replacement_ready
         self._replaced = False
         self._island_committed = False
         self._emitted_batches = 0
@@ -978,6 +1003,9 @@ class _AutoIslandFallbackStream:
         self._inner = replacement
         self._replaced = True
         self._fallback_factory = None
+        if callable(self._replacement_ready):
+            self._replacement_ready(replacement)
+        self._replacement_ready = None
 
     def __next__(self):
         if self._closed:
@@ -1614,7 +1642,7 @@ class Executor:
         except Exception:
             return
 
-    def _get_file_cache(self):
+    def _get_file_cache(self, island_config=None):
         """Return the org/storage-scoped shared Parquet cache, lazily.
 
         Cache construction is an optimisation boundary.  If the directory is
@@ -1624,6 +1652,80 @@ class Executor:
         """
         if not settings.SUPERTABLE_ISLAND_CACHE_ENABLED:
             return None
+        configured_max_bytes = int(
+            (
+                settings.SUPERTABLE_ISLAND_CACHE_MAX_BYTES
+                if island_config is None else (
+                    getattr(island_config, "cache_max_bytes", None) or 0
+                )
+            ) or 0
+        )
+        automatic_capacity = configured_max_bytes <= 0
+        current_automatic = bool(getattr(
+            self._file_cache, "_supertable_automatic_capacity", False,
+        ))
+        automatic_fingerprint = None
+        if automatic_capacity:
+            from supertable.engine.file_cache import (
+                RANGE_CACHE_SUBDIR,
+                WHOLE_CACHE_SUBDIR,
+                automatic_cache_max_bytes,
+            )
+
+            whole_root = settings.SUPERTABLE_ISLAND_CACHE_DIR or None
+            range_root = (
+                settings.SUPERTABLE_ISLAND_RANGE_CACHE_DIR
+                or settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR
+                or None
+            )
+            range_limit = int((
+                settings.SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES
+                if island_config is None else (
+                    getattr(island_config, "range_cache_max_bytes", None) or 0
+                )
+            ) or 0)
+            reserve_bytes = (
+                settings.SUPERTABLE_ISLAND_SPILL_MIN_FREE_BYTES
+                if settings.SUPERTABLE_ISLAND_SPILL_ENABLED else 0
+            )
+            automatic_fingerprint = (
+                str(whole_root or ""),
+                bool(settings.SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED),
+                str(range_root or ""),
+                range_limit,
+                int(reserve_bytes),
+            )
+            if (
+                self._file_cache not in (None, False)
+                and current_automatic
+                and getattr(
+                    self._file_cache,
+                    "_supertable_automatic_fingerprint",
+                    None,
+                ) == automatic_fingerprint
+            ):
+                return self._file_cache
+            configured_max_bytes = automatic_cache_max_bytes(
+                whole_root,
+                owned_subdir=WHOLE_CACHE_SUBDIR,
+                peer_limits=(
+                    ((range_root, range_limit, RANGE_CACHE_SUBDIR),)
+                    if settings.SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED else ()
+                ),
+                reserve_bytes=reserve_bytes,
+            )
+        if (
+            self._file_cache not in (None, False)
+            and getattr(self._file_cache, "max_bytes", None) is not None
+            and (
+                current_automatic != automatic_capacity
+                or int(getattr(self._file_cache, "max_bytes"))
+                != configured_max_bytes
+            )
+        ):
+            # Existing streams retain their cache object and leases. A later
+            # query observes the newly resolved immutable capacity.
+            self._file_cache = None
         if self._file_cache is False:
             return None
         if self._file_cache is None:
@@ -1633,9 +1735,15 @@ class Executor:
                     self.storage,
                     self.organization,
                     root=(settings.SUPERTABLE_ISLAND_CACHE_DIR or None),
-                    max_bytes=settings.SUPERTABLE_ISLAND_CACHE_MAX_BYTES,
+                    max_bytes=configured_max_bytes,
                     ttl=settings.SUPERTABLE_ISLAND_CACHE_TTL_SEC,
                     workers=settings.SUPERTABLE_ISLAND_CACHE_WORKERS,
+                )
+                self._file_cache._supertable_automatic_capacity = (
+                    automatic_capacity
+                )
+                self._file_cache._supertable_automatic_fingerprint = (
+                    automatic_fingerprint
                 )
             except Exception as exc:
                 logger.warning(
@@ -1644,6 +1752,10 @@ class Executor:
                 )
                 self._file_cache = False
                 return None
+        elif automatic_capacity and current_automatic:
+            self._file_cache._supertable_automatic_fingerprint = (
+                automatic_fingerprint
+            )
         return self._file_cache
 
     def _get_catalog(self):
@@ -1733,6 +1845,7 @@ class Executor:
         cfg: EngineRuntimeConfig,
         parser=None,
         *,
+        island_config=None,
         streaming_result: bool = False,
         plan_stats: Optional[PlanStats] = None,
         routing_policy: Tuple[AutoRoutingRule, ...] = (),
@@ -1821,16 +1934,38 @@ class Executor:
             and not linked_share_reflection
         ):
             try:
-                native = self.island_exec.can_execute(
-                    reflection,
-                    parser,
-                    streaming_result=streaming_result,
-                )
+                if island_config is None:
+                    # Keep the established extension/test-double call shape
+                    # when no Island section was supplied by an older config
+                    # resolver. Production live config takes the explicit
+                    # branch below.
+                    native = self.island_exec.can_execute(
+                        reflection,
+                        parser,
+                        streaming_result=streaming_result,
+                    )
+                else:
+                    native = self.island_exec.can_execute(
+                        reflection,
+                        parser,
+                        streaming_result=streaming_result,
+                        engine_config=island_config,
+                    )
                 self._publish_engine_capability(plan_stats, native)
                 native_supported = (
                     getattr(native, "supported", False) is True
                 )
-                spark_semantics_supported = native_supported
+                # IslandDB can implement native compatibility bridges (for
+                # example DuckDB NOCASE grouping) which Spark does not share.
+                # A native pass must therefore never certify Spark implicitly.
+                # The fallback preserves compatibility with narrow test/plugin
+                # capability objects predating the explicit field; production
+                # IslandCapability always supplies it.
+                spark_semantics_supported = bool(getattr(
+                    native,
+                    "spark_supported",
+                    native_supported,
+                ))
                 policy_enables_island = any(
                     rule.engine is Engine.ISLANDDB for rule in routing_policy
                 )
@@ -1838,11 +1973,19 @@ class Executor:
                     settings.SUPERTABLE_ISLAND_AUTO_ENABLED
                     or policy_enables_island
                 ):
-                    island_plan = self.island_exec.resource_plan(
-                        reflection,
-                        parser,
-                        streaming_result=streaming_result,
-                    )
+                    if island_config is None:
+                        island_plan = self.island_exec.resource_plan(
+                            reflection,
+                            parser,
+                            streaming_result=streaming_result,
+                        )
+                    else:
+                        island_plan = self.island_exec.resource_plan(
+                            reflection,
+                            parser,
+                            streaming_result=streaming_result,
+                            engine_config=island_config,
+                        )
             except Exception as exc:
                 if native is None:
                     self._publish_engine_capability(
@@ -1981,6 +2124,7 @@ class Executor:
             freshness_age_seconds=(int(age_s) if age_s >= 0 else -1),
             has_active_tombstone=has_active_tombstone,
             streaming_result=streaming_result,
+            island_plan_evaluated=island_plan is not None,
             island_advice=island_advice,
             island_cpu_workers=max(
                 0, int(getattr(island_plan, "cpu_workers", 0) or 0),
@@ -2161,6 +2305,7 @@ class Executor:
         _raise_if_query_cancelled(cancel_event)
         _remaining_query_timeout(query_deadline)
         duckdb_cfg = cfgs["duckdb"]
+        island_cfg = cfgs.get("islanddb")
 
         chosen = (
             engine if engine != Engine.AUTO
@@ -2168,6 +2313,7 @@ class Executor:
                 reflection,
                 duckdb_cfg,
                 parser=parser,
+                island_config=island_cfg,
                 plan_stats=plan_stats,
                 routing_policy=routing_policy,
                 deadline_monotonic=query_deadline,
@@ -2204,7 +2350,10 @@ class Executor:
             # visibly without downloading anything.
             try:
                 island_prepared = self.island_exec.prepare_execution(
-                    reflection, parser, streaming_result=False,
+                    reflection,
+                    parser,
+                    streaming_result=False,
+                    engine_config=island_cfg,
                 )
             except IslandUnsupportedError as exc:
                 safe_failure = _safe_island_failure_message(
@@ -2221,7 +2370,10 @@ class Executor:
         def timer_capture(evt: str):
             timer.capture_and_reset_timing(evt)
 
-        cache = self._get_file_cache()
+        cache = (
+            self._get_file_cache(island_cfg)
+            if _reflection_has_remote_paths(reflection) else None
+        )
         island_uses_ranges = bool(
             chosen == Engine.ISLANDDB
             and settings.SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED
@@ -2334,15 +2486,31 @@ class Executor:
                         "to be localized; cache coverage was incomplete"
                     )
                 try:
+                    execution_prepared = island_prepared
+                    rebind_localized = getattr(
+                        type(self.island_exec),
+                        "_rebind_cache_localized_prepared",
+                        None,
+                    )
+                    if (
+                        callable(rebind_localized)
+                        and execution_reflection is not reflection
+                    ):
+                        execution_prepared = rebind_localized(
+                            self.island_exec,
+                            island_prepared,
+                            reflection,
+                            execution_reflection,
+                        )
                     df = self.island_exec.execute(
                         reflection=execution_reflection,
                         parser=parser,
                         query_manager=query_manager,
                         timer_capture=timer_capture,
                         log_prefix=log_prefix,
-                        engine_config=duckdb_cfg,
+                        engine_config=island_cfg,
                         cache_metrics=cache_metrics,
-                        _prepared=island_prepared,
+                        _prepared=execution_prepared,
                         deadline_monotonic=query_deadline,
                         cancel_event=cancel_event,
                     )
@@ -2475,6 +2643,11 @@ class Executor:
         close. Spark remains explicit-only and materialized; the streaming API
         fails instead of silently changing its result-lifetime contract.
         """
+        if cancel_event is None:
+            # Every wrapper and the selected backend must expose the same
+            # cooperative signal. Otherwise the default public facade creates
+            # an event which an idle backend watchdog never observes.
+            cancel_event = threading.Event()
         # Fail before routing/cache work when a caller-provided end-to-end
         # deadline has already elapsed.  Engine-specific defaults remain in
         # force when no caller deadline is supplied.
@@ -2527,6 +2700,7 @@ class Executor:
         )
         _raise_if_query_cancelled(cancel_event)
         _remaining_query_timeout(deadline_monotonic)
+        island_cfg = cfgs.get("islanddb")
         chosen = (
             engine
             if engine != Engine.AUTO
@@ -2534,6 +2708,7 @@ class Executor:
                 reflection,
                 cfgs["duckdb"],
                 parser=parser,
+                island_config=island_cfg,
                 streaming_result=True,
                 plan_stats=plan_stats,
                 routing_policy=routing_policy,
@@ -2628,7 +2803,10 @@ class Executor:
             self._publish_duckdb_connection_cache(plan_stats)
             # Match materialized DuckDB's hit-only whole-object cache behavior,
             # but retain every lease for the complete stream lifetime.
-            cache = self._get_file_cache()
+            cache = (
+                self._get_file_cache(island_cfg)
+                if _reflection_has_remote_paths(reflection) else None
+            )
             cache_is_useful = bool(
                 cache is not None and not cache.source_is_local
             )
@@ -2809,7 +2987,10 @@ class Executor:
 
         try:
             island_prepared = self.island_exec.prepare_execution(
-                reflection, parser, streaming_result=True,
+                reflection,
+                parser,
+                streaming_result=True,
+                engine_config=island_cfg,
             )
         except IslandUnsupportedError as exc:
             safe_failure = _safe_island_failure_message(
@@ -2846,7 +3027,10 @@ class Executor:
         # reader; this path covers an explicitly disabled/unavailable range
         # layer and makes streaming obey the same localization contract as the
         # materialized facade.
-        cache = self._get_file_cache()
+        cache = (
+            self._get_file_cache(island_cfg)
+            if _reflection_has_remote_paths(reflection) else None
+        )
         island_uses_ranges = bool(
             settings.SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED
             and self.storage is not None
@@ -2906,15 +3090,31 @@ class Executor:
                 )
             if cache_metrics is not None:
                 plan_stats.add_stat(cache_metrics.to_plan_stats())
+            execution_prepared = island_prepared
+            rebind_localized = getattr(
+                type(self.island_exec),
+                "_rebind_cache_localized_prepared",
+                None,
+            )
+            if (
+                callable(rebind_localized)
+                and execution_reflection is not reflection
+            ):
+                execution_prepared = rebind_localized(
+                    self.island_exec,
+                    island_prepared,
+                    reflection,
+                    execution_reflection,
+                )
             island_inner = self.island_exec.execute_stream(
                 reflection=execution_reflection,
                 parser=parser,
                 query_manager=query_manager,
                 timer_capture=timer_capture,
                 log_prefix=log_prefix,
-                engine_config=cfgs["duckdb"],
+                engine_config=island_cfg,
                 cache_metrics=cache_metrics,
-                _prepared=island_prepared,
+                _prepared=execution_prepared,
                 deadline_monotonic=deadline_monotonic,
                 cancel_event=cancel_event,
                 max_batch_rows=max_batch_rows,
@@ -2975,6 +3175,9 @@ class Executor:
                 island_stream,
                 fallback_factory=start_auto_island_fallback,
                 island_success=commit_island_success,
+                replacement_ready=lambda replacement: (
+                    subscribe_terminal_owner(replacement)
+                ),
             )
             result_stream = ArrowBatchStream(
                 auto_inner.schema,
@@ -2984,5 +3187,38 @@ class Executor:
         else:
             plan_stats.add_stat({"ENGINE": "islanddb"})
             result_stream = island_stream
+        add_terminal_callback = getattr(
+            island_inner, "add_terminal_callback", None,
+        )
+        engine_owns_lifecycle = callable(add_terminal_callback)
+        # Production IslandDB already owns the authoritative deadline/cancel
+        # watcher and publishes its profile before firing terminal callbacks.
+        # Keep this outer facade passive in that case: a second watcher can win
+        # the same-deadline race, close the engine normally, and persist
+        # ``closed_early`` while the caller observes a timeout.
+        lifecycle_stream = _IslandResultLifecycleStream(
+            result_stream,
+            deadline_monotonic=(
+                None if engine_owns_lifecycle else deadline_monotonic
+            ),
+            timeout_value=max(
+                0.0, float(deadline_monotonic) - time.monotonic(),
+            ),
+            cancel_event=(None if engine_owns_lifecycle else cancel_event),
+        )
+
+        def propagate_island_terminal(kind: str) -> None:
+            if kind == "timed_out":
+                lifecycle_stream.timeout()
+            elif kind == "cancelled":
+                lifecycle_stream.cancel()
+
+        def subscribe_terminal_owner(owner) -> None:
+            add_callback = getattr(owner, "add_terminal_callback", None)
+            if callable(add_callback):
+                add_callback(propagate_island_terminal)
+
+        if engine_owns_lifecycle:
+            subscribe_terminal_owner(island_inner)
         plan_stats.add_stat({"RESULT_MODE": "arrow_stream"})
-        return result_stream, "islanddb"
+        return lifecycle_stream, "islanddb"

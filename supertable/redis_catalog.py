@@ -18484,19 +18484,25 @@ return 1
         return validated
 
     # ========================================================================= #
-    # Engine runtime configuration (DuckDB memory, threads, caches, thresholds)
+    # Engine runtime configuration (DuckDB pragmas, Island resources, routing)
     # ========================================================================= #
 
     # Canonical field names and their env-var counterparts.  Used by the
     # resolver in engine_common to fall back to os.getenv when a field
     # is absent from Redis.
-    # Runtime pragmas for the sole DuckDB engine.
+    # Runtime fields for both local engines.
     DUCKDB_CONFIG_FIELDS = (
         "duckdb_memory_limit",
         "duckdb_io_multiplier",
         "duckdb_threads",
         "duckdb_http_timeout",
         "duckdb_external_cache_size",
+    )
+    ISLAND_CONFIG_FIELDS = (
+        "island_cpu_max",
+        "island_memory_max_bytes",
+        "island_cache_max_bytes",
+        "island_range_cache_max_bytes",
     )
 
     def _set_engine_document_section(
@@ -18514,7 +18520,7 @@ return 1
         transaction. Malformed or unavailable state fails closed and is never
         interpreted as an empty document.
         """
-        if section_name not in {"duckdb", "auto_policy"}:
+        if section_name not in {"duckdb", "islanddb", "auto_policy"}:
             raise ValueError("Unsupported engine configuration section")
         key = RK.engine_duckdb(org)
         pipe = None
@@ -18632,6 +18638,31 @@ return 1
                 "[redis-catalog] set_engine_config error; error_type=%s",
                 mirror_error_type(e),
             )
+            return False
+
+    def set_island_engine_config(
+            self,
+            org: str,
+            config: Dict[str, Any],
+    ) -> bool:
+        """Atomically replace the organization-wide Island resource section."""
+        if not org:
+            return False
+        try:
+            from supertable.engine.engine_config import normalize_island_limit
+
+            section: Dict[str, str] = {}
+            for key in self.ISLAND_CONFIG_FIELDS:
+                if key not in config or config[key] is None:
+                    continue
+                parsed = normalize_island_limit(config[key])
+                # Persist explicit zero as the canonical automatic value; an
+                # omitted field also resolves to automatic.
+                section[key] = str(parsed or 0)
+            return self._set_engine_document_section(
+                org, "islanddb", section,
+            )
+        except (TypeError, ValueError):
             return False
 
     def get_engine_config(

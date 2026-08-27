@@ -1684,11 +1684,13 @@ class DataEstimator:
             return 0, False
         widths: List[int] = []
         for name in requested:
-            width = self._decoded_fixed_width(normalized_types.get(name))
+            normalized_type = str(
+                normalized_types.get(name) or ""
+            ).strip().casefold()
+            width = self._decoded_fixed_width(normalized_type)
             if (
                 width is None
-                and str(normalized_types.get(name) or "").strip().casefold()
-                == "binary"
+                and normalized_type in {"binary", "string", "utf8"}
             ):
                 bound = (max_value_bytes or {}).get(name)
                 if (
@@ -1696,9 +1698,12 @@ class DataEstimator:
                     and not isinstance(bound, bool)
                     and bound >= 0
                 ):
-                    # Variable Binary owns a 32-bit offset per value in
-                    # addition to its exactly sealed maximum payload width.
-                    width = int(bound) + 4
+                    # Binary owns a 32-bit offset; Polars' native UTF-8 value
+                    # representation can retain a 16-byte string view.  The
+                    # caller adds validity/alignment slack below.
+                    width = int(bound) + (
+                        4 if normalized_type == "binary" else 16
+                    )
             if width is None:
                 return 0, False
             widths.append(width)
@@ -2511,7 +2516,9 @@ class DataEstimator:
                     for file_key in survivors
                 )
                 for column_name, type_name in schema_types.items()
-                if str(type_name).strip().casefold() == "binary"
+                if str(type_name).strip().casefold() in {
+                    "binary", "string", "utf8",
+                }
                 and survivors
                 and all(
                     isinstance(resource_value_bounds.get(file_key), dict)

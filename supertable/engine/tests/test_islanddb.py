@@ -3,8 +3,13 @@ from __future__ import annotations
 import dataclasses
 import gc
 import json
+import math
 import os
 import re
+import shutil
+import struct
+import subprocess
+import sys
 import threading
 import time
 import types
@@ -16,6 +21,7 @@ import pandas as pd
 import polars as pl
 import pytest
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import supertable.engine.islanddb as islanddb_module
 
@@ -30,7 +36,7 @@ from supertable.data_classes import (
 )
 from supertable.engine.duckdb_engine import DuckDB
 from supertable.engine.engine_common import SOURCE_FILE_COL
-from supertable.engine.engine_config import resolve_engine_config
+from supertable.engine.engine_config import IslandRuntimeConfig, resolve_engine_config
 from supertable.engine.engine_enum import Engine
 from supertable.engine.executor import Executor
 from supertable.engine.islanddb import (
@@ -621,6 +627,27 @@ def test_same_count_stale_footer_seal_scans_all(tmp_path):
     assert IslandDB()._footer_working_set(reflection)[2] == 2
 
 
+def test_local_string_footer_working_set_uses_exact_utf8_seal(tmp_path):
+    values = ["é", "𐍈𐍈", None]
+    reflection, maximum = _string_reflection(tmp_path, values)
+    snapshot = reflection.supers[0]
+
+    compressed, decoded, groups = IslandDB()._footer_working_set(
+        reflection,
+        required_columns={id(snapshot): {"label"}},
+    )
+
+    assert compressed > 0
+    assert groups == 1
+    assert decoded == len(values) * (maximum + 16 + 1)
+
+    snapshot.column_max_value_bytes = {}
+    assert IslandDB()._footer_working_set(
+        reflection,
+        required_columns={id(snapshot): {"label"}},
+    ) is None
+
+
 def test_malformed_row_group_mapping_fails_open_to_all_groups(tmp_path):
     path = tmp_path / "malformed-hint.parquet"
     pl.DataFrame({
@@ -671,6 +698,7 @@ def numeric_reflection(tmp_path):
             "__rowid__": "Int64", "__timestamp__": "Int64",
         },
     )
+    snap.column_max_value_bytes = {"label": 3}
     return _reflection(snap, projected=1024)
 
 
@@ -1119,7 +1147,7 @@ def test_materialized_deadline_is_rechecked_immediately_before_return(
             deadline_monotonic=100.0,
         )
 
-    assert engine.last_profile.execution_outcome == "cancelled"
+    assert engine.last_profile.execution_outcome == "timed_out"
     assert engine.last_profile.result_complete is False
 
 
@@ -1323,9 +1351,12 @@ def test_range_cache_initialization_failure_releases_all_admission_slots(
     manager.query_plan_path = str(tmp_path / "cache-failure-plan.json")
     engine = IslandDB()
     before = engine._governor.snapshot()["active_queries"]
+    numeric_reflection.supers[0].files[0] = "s3://benchmark/remote.parquet"
     monkeypatch.setattr(
         engine, "_get_range_cache",
-        lambda: (_ for _ in ()).throw(OSError("cache directory unavailable")),
+        lambda *_args: (_ for _ in ()).throw(
+            OSError("cache directory unavailable")
+        ),
     )
 
     with pytest.raises(OSError, match="cache directory unavailable"):
@@ -1338,6 +1369,232 @@ def test_range_cache_initialization_failure_releases_all_admission_slots(
     island_module._ISLAND_EXECUTION_SLOT.release()
     assert island_module._ARROW_POOL_LOCK.acquire(blocking=False)
     island_module._ARROW_POOL_LOCK.release()
+
+
+def test_island_constructor_never_waits_for_an_open_arrow_stream_gate():
+    import supertable.engine.islanddb as island_module
+
+    finished = threading.Event()
+    failures = []
+
+    def construct():
+        try:
+            IslandDB(range_cache=False)
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    assert island_module._ARROW_POOL_LOCK.acquire(timeout=1)
+    worker = threading.Thread(target=construct, daemon=True)
+    try:
+        worker.start()
+        assert finished.wait(timeout=2)
+    finally:
+        island_module._ARROW_POOL_LOCK.release()
+        worker.join(timeout=2)
+
+    assert not failures
+    assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("stop_kind", ["deadline", "cancel"])
+def test_idle_island_stream_self_finalizes_and_releases_resources(
+    tmp_path,
+    numeric_reflection,
+    stop_kind,
+):
+    query = "SELECT id FROM s.t ORDER BY id"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / f"idle-{stop_kind}.json")
+    engine = IslandDB()
+    cancelled = threading.Event()
+    active_before = engine._governor.snapshot()["active_queries"]
+    stream = engine.execute_stream(
+        numeric_reflection,
+        parser,
+        manager,
+        lambda _: None,
+        deadline_monotonic=time.monotonic() + (
+            10.0 if stop_kind == "cancel" else 0.5
+        ),
+        cancel_event=cancelled,
+    )
+    assert engine._governor.snapshot()["active_queries"] == active_before + 1
+    if stop_kind == "cancel":
+        cancelled.set()
+
+    wait_until = time.monotonic() + 2.0
+    while (
+        (
+            not stream.closed
+            or engine._governor.snapshot()["active_queries"] != active_before
+        )
+        and time.monotonic() < wait_until
+    ):
+        time.sleep(0.01)
+
+    assert stream.closed is True
+    assert engine._governor.snapshot()["active_queries"] == active_before
+    assert manager._island_profile.execution_outcome == (
+        "cancelled" if stop_kind == "cancel" else "timed_out"
+    )
+    expected_error = (
+        ResourceReservationCancelled
+        if stop_kind == "cancel" else IslandExecutionTimeout
+    )
+    with pytest.raises(expected_error):
+        next(stream)
+    assert islanddb_module._ISLAND_EXECUTION_SLOT.acquire(blocking=False)
+    islanddb_module._ISLAND_EXECUTION_SLOT.release()
+    assert islanddb_module._ARROW_POOL_LOCK.acquire(blocking=False)
+    islanddb_module._ARROW_POOL_LOCK.release()
+    assert not any(
+        thread.name == "supertable-island-result-lifecycle"
+        and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
+def test_active_island_timeout_is_not_reclassified_as_cancellation():
+    cancelled = threading.Event()
+    timeout_started = threading.Event()
+    timeout_callbacks = []
+    terminal_callbacks = []
+    schema = pa.schema([pa.field("id", pa.int64())])
+
+    def producer():
+        timeout_started.set()
+        cancelled.set()
+        # Give the lifecycle watcher a deterministic opportunity to observe
+        # the shared cancel event while the active producer unwinds.
+        time.sleep(0.1)
+        raise IslandExecutionTimeout("active producer deadline")
+        yield  # pragma: no cover - retain generator shape
+
+    inner = islanddb_module.ArrowBatchStream(
+        schema,
+        producer(),
+        cancel_event=cancelled,
+    )
+    stream = islanddb_module._IslandResultLifecycleStream(
+        inner,
+        deadline_monotonic=None,
+        timeout_value=1.0,
+        cancel_event=cancelled,
+        timeout_event=timeout_started,
+        on_timeout=lambda: timeout_callbacks.append(True),
+    )
+    stream.add_terminal_callback(terminal_callbacks.append)
+    assert stream.cancel_event is cancelled
+
+    with pytest.raises(IslandExecutionTimeout, match="active producer"):
+        next(stream)
+
+    assert stream.terminal_kind == "timed_out"
+    assert terminal_callbacks == ["timed_out"]
+    assert timeout_callbacks == [True]
+
+
+def test_active_island_cancellation_records_cancelled_terminal_once():
+    terminal_callbacks = []
+    schema = pa.schema([pa.field("id", pa.int64())])
+
+    def producer():
+        raise ResourceReservationCancelled("producer cancelled")
+        yield  # pragma: no cover - retain generator shape
+
+    inner = islanddb_module.ArrowBatchStream(schema, producer())
+    stream = islanddb_module._IslandResultLifecycleStream(
+        inner,
+        deadline_monotonic=None,
+        timeout_value=None,
+        cancel_event=None,
+    )
+    stream.add_terminal_callback(terminal_callbacks.append)
+
+    with pytest.raises(ResourceReservationCancelled, match="producer cancelled"):
+        next(stream)
+
+    assert stream.terminal_kind == "cancelled"
+    assert terminal_callbacks == ["cancelled"]
+
+
+@pytest.mark.parametrize("stop_kind", ["deadline", "facade_cancel"])
+def test_idle_executor_island_stream_releases_outer_cache_lease(
+    tmp_path,
+    numeric_reflection,
+    monkeypatch,
+    stop_kind,
+):
+    import supertable.engine.executor as executor_module
+
+    class TrackingCache:
+        source_is_local = True
+
+        def __init__(self):
+            self.active = 0
+
+        @contextmanager
+        def localized(self, reflection, **_kwargs):
+            self.active += 1
+            try:
+                yield reflection, None
+            finally:
+                self.active -= 1
+
+    monkeypatch.setattr(
+        executor_module,
+        "settings",
+        dataclasses.replace(
+            executor_module.settings,
+            SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED=False,
+        ),
+    )
+    cache = TrackingCache()
+    executor = Executor(storage=LocalStorage(), organization="island-tests")
+    monkeypatch.setattr(
+        executor_module, "_reflection_has_remote_paths", lambda _reflection: True,
+    )
+    monkeypatch.setattr(executor, "_get_file_cache", lambda *_args: cache)
+    query = "SELECT id FROM s.t ORDER BY id"
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "idle-executor-island.json")
+    deadline = time.monotonic() + (
+        10.0 if stop_kind == "facade_cancel" else 0.5
+    )
+
+    stream, used = executor.execute_stream(
+        Engine.ISLANDDB,
+        numeric_reflection,
+        SQLParser("s", query, "duckdb"),
+        manager,
+        Timer(),
+        PlanStats(),
+        "",
+        deadline_monotonic=deadline,
+    )
+    assert used == "islanddb"
+    assert cache.active == 1
+    if stop_kind == "facade_cancel":
+        stream.cancel_event.set()
+
+    wait_until = time.monotonic() + 2.0
+    while cache.active and time.monotonic() < wait_until:
+        time.sleep(0.01)
+
+    assert cache.active == 0
+    assert stream.closed is True
+    assert manager._island_profile.execution_outcome == (
+        "cancelled" if stop_kind == "facade_cancel" else "timed_out"
+    )
+    expected_error = (
+        ResourceReservationCancelled
+        if stop_kind == "facade_cancel" else IslandExecutionTimeout
+    )
+    with pytest.raises(expected_error):
+        next(stream)
 
 
 def test_integer_sum_widens_like_duckdb_hugeint(tmp_path):
@@ -1381,6 +1638,53 @@ def test_integer_sum_arrow_stream_is_decimal128_and_exact(tmp_path):
     assert int(table["total"][0].as_py()) == sum(values)
 
 
+def test_implicit_aggregate_names_match_duckdb_in_arrow_and_pandas(
+    tmp_path, numeric_reflection,
+):
+    query = (
+        "SELECT count(*), count(v), sum(t.v), min(id), max(v) FROM s.t AS t"
+    )
+    capability = IslandDB().can_execute(
+        numeric_reflection,
+        SQLParser("s", query, "duckdb"),
+        streaming_result=True,
+    )
+    assert capability.supported
+    assert not capability.spark_supported
+
+    def collect(engine, label, *, config=None):
+        parser = SQLParser("s", query, "duckdb")
+        manager = QueryPlanManager("s", "island-tests", "", query)
+        manager.query_plan_path = str(
+            tmp_path / f"{label}-implicit-aggregate-plan.json"
+        )
+        stream = engine.execute_stream(
+            numeric_reflection,
+            parser,
+            manager,
+            lambda _: None,
+            engine_config=config,
+        )
+        with stream:
+            return pa.Table.from_batches(list(stream), schema=stream.schema)
+
+    duck_table = collect(
+        DuckDB(),
+        "duckdb",
+        config=resolve_engine_config("", None, "lite"),
+    )
+    island_table = collect(IslandDB(), "island")
+    assert island_table.schema == duck_table.schema
+    assert island_table.to_pylist() == duck_table.to_pylist()
+    assert island_table.column_names == [
+        "count_star()", "count(v)", "sum(t.v)", "min(id)", "max(v)",
+    ]
+
+    expected = _run_duckdb(tmp_path, numeric_reflection, query)
+    actual, _ = _run_island(tmp_path, numeric_reflection, query)
+    pd.testing.assert_frame_equal(actual, expected)
+
+
 def _binary_reflection(tmp_path, chunks, *, arrow_types=None):
     paths = []
     keys = []
@@ -1413,6 +1717,32 @@ def _binary_reflection(tmp_path, chunks, *, arrow_types=None):
     )
     snapshot.column_max_value_bytes = {"payload": maximum}
     return _reflection(snapshot)
+
+
+def _string_reflection(tmp_path, values):
+    path = tmp_path / "strings.parquet"
+    maximum = max(
+        (len(value.encode("utf-8")) for value in values if value is not None),
+        default=0,
+    )
+    pq.write_table(pa.table({
+        "label": pa.array(values, type=pa.string()),
+        "__rowid__": pa.array(
+            list(range(1, len(values) + 1)), type=pa.int64(),
+        ),
+        "__timestamp__": pa.array([1] * len(values), type=pa.int64()),
+    }), path)
+    snapshot = _snapshot(
+        "strings",
+        [path],
+        ["raw/strings.parquet"],
+        types={
+            "label": "String", "__rowid__": "Int64",
+            "__timestamp__": "Int64",
+        },
+    )
+    snapshot.column_max_value_bytes = {"label": maximum}
+    return _reflection(snapshot), maximum
 
 
 def test_fixed_size_binary_public_normalization_is_zero_copy_and_slice_safe():
@@ -1580,6 +1910,522 @@ def test_empty_lazy_batches_preserve_schema_at_supported_polars_floor():
     assert list(batches) == []
 
 
+@pytest.mark.parametrize("projection", ["*", "t.*"])
+def test_arrow_stream_star_accepts_binary_when_materialized_facade_does_not(
+    tmp_path, projection,
+):
+    reflection = _binary_reflection(tmp_path, [[b"a", None, b"\xff"]])
+    query = f"SELECT {projection} FROM s.t AS t"
+    parser = SQLParser("s", query, "duckdb")
+    engine = IslandDB()
+
+    stream_capability = engine.can_execute(
+        reflection, parser, streaming_result=True,
+    )
+    materialized_capability = engine.can_execute(
+        reflection, parser, streaming_result=False,
+    )
+
+    assert stream_capability.supported
+    assert stream_capability.spark_supported is False
+    assert not materialized_capability.supported
+    assert any(
+        "pandas parity" in reason
+        for reason in materialized_capability.reasons
+    )
+
+
+@pytest.mark.parametrize("values", [["alpha", None, "İ"], []])
+def test_string_lazy_batches_use_duckdb_arrow_schema(values):
+    frame = pl.DataFrame(
+        {"label": values},
+        schema={"label": pl.String},
+    )
+
+    schema, batches = IslandDB._lazy_batches(
+        frame.lazy(), batch_rows=2,
+    )
+    island_table = pa.Table.from_batches(list(batches), schema=schema)
+    with duckdb.connect() as connection:
+        connection.register("strings", frame.to_arrow())
+        duck_table = connection.execute(
+            "SELECT label FROM strings"
+        ).to_arrow_table()
+
+    assert schema == duck_table.schema
+    assert schema.field("label").type == pa.string()
+    assert island_table.to_pylist() == duck_table.to_pylist()
+
+
+def test_string_group_by_uses_duckdb_nocase_equivalence_classes(
+    tmp_path,
+):
+    values = [
+        "A", "a", "İ", "i", "I", "ı", "É", "é", "ß", "ẞ",
+        "Σ", "σ", "ς", None,
+    ]
+    reflection, _ = _string_reflection(tmp_path, values)
+    query = (
+        "SELECT label, count(*) AS n FROM s.strings "
+        "GROUP BY label ORDER BY label"
+    )
+    parser = SQLParser("s", query, "duckdb")
+    engine = IslandDB()
+    capability = engine.can_execute(
+        reflection, parser, streaming_result=True,
+    )
+    assert capability.supported
+    assert not capability.spark_supported
+
+    class CapturePlanner:
+        def plan(self, estimate, *, streaming_result):
+            return estimate
+
+    engine._planner = CapturePlanner()
+    estimate = engine.resource_plan(
+        reflection, parser, streaming_result=True,
+    )
+    assert estimate.estimates_complete is True
+    assert estimate.spillable is False
+
+    def collect(active_engine, label, *, config=None):
+        active_parser = SQLParser("s", query, "duckdb")
+        manager = QueryPlanManager("s", "island-tests", "", query)
+        manager.query_plan_path = str(tmp_path / f"{label}-nocase-plan.json")
+        stream = active_engine.execute_stream(
+            reflection,
+            active_parser,
+            manager,
+            lambda _: None,
+            engine_config=config,
+        )
+        with stream:
+            return pa.Table.from_batches(list(stream), schema=stream.schema)
+
+    expected = collect(
+        DuckDB(),
+        "duckdb",
+        config=resolve_engine_config("", None, "lite"),
+    )
+    actual = collect(IslandDB(), "island")
+
+    def canonical(rows):
+        result = []
+        for row in rows:
+            label = pc.utf8_lower(
+                pa.array([row["label"]], type=pa.string()),
+            )[0].as_py()
+            result.append({"label": label, "n": row["n"]})
+        return result
+
+    assert actual.schema == expected.schema
+    assert canonical(actual.to_pylist()) == canonical(expected.to_pylist())
+    assert canonical(actual.to_pylist()) == [
+        {"label": "a", "n": 2},
+        {"label": "i", "n": 3},
+        {"label": "ß", "n": 2},
+        {"label": "é", "n": 2},
+        {"label": "ı", "n": 1},
+        {"label": "ς", "n": 1},
+        {"label": "σ", "n": 2},
+        {"label": None, "n": 1},
+    ]
+
+
+def test_nocase_group_plan_budgets_expanding_hidden_string_key(tmp_path):
+    # U+023A is two UTF-8 bytes while its lowercase U+2C65 is three. Model a
+    # high-cardinality snapshot so the non-spillable normalized group/sort
+    # state, rather than this tiny physical fixture, drives admission.
+    value = "Ⱥ" * 256
+    reflection, source_bound = _string_reflection(tmp_path, [value])
+    selected_rows = 10_000
+    reflection.supers[0].candidate_rows = selected_rows
+    query = (
+        "SELECT label, count(*) AS n FROM s.strings "
+        "GROUP BY label ORDER BY label"
+    )
+
+    class CapturePlanner:
+        def plan(self, estimate, *, streaming_result):
+            return estimate
+
+    engine = IslandDB()
+    engine._planner = CapturePlanner()
+    estimate = engine.resource_plan(
+        reflection,
+        SQLParser("s", query, "duckdb"),
+        streaming_result=True,
+    )
+
+    actual_lower_bytes = len(value.lower().encode("utf-8"))
+    source_storage = max(24, source_bound + 17)
+    lower_storage = max(
+        24,
+        source_bound
+        * islanddb_module._UTF8_LOWER_ADMISSION_EXPANSION
+        + 17,
+    )
+    group_state_per_key = (
+        512 + 128 + 128 + source_storage + lower_storage
+    )
+    result_per_row = source_storage + 24
+    expected_state = selected_rows * (
+        group_state_per_key + result_per_row + lower_storage
+    )
+
+    assert actual_lower_bytes > source_bound
+    assert estimate.estimates_complete is True
+    assert estimate.spillable is False
+    assert estimate.operator_state_bytes == expected_state
+    assert estimate.result_bytes == selected_rows * result_per_row
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT id, x FROM s.t ORDER BY x, id",
+        "SELECT x AS x, count(*) AS n FROM s.t GROUP BY x ORDER BY x",
+    ],
+)
+def test_float_arrow_output_canonicalizes_negative_zero_like_duckdb(
+    tmp_path, query,
+):
+    path = tmp_path / "signed-zero.parquet"
+    pq.write_table(
+        pa.table({
+            "id": pa.array([1, 2, 3], type=pa.int64()),
+            "x": pa.array([-0.0, 0.0, 1.0], type=pa.float64()),
+            "__rowid__": pa.array([1, 2, 3], type=pa.int64()),
+            "__timestamp__": pa.array([1, 1, 1], type=pa.int64()),
+        }),
+        path,
+        row_group_size=1,
+    )
+    reflection = _reflection(_snapshot(
+        "t",
+        [path],
+        ["raw/signed-zero.parquet"],
+        types={
+            "id": "Int64", "x": "Float64", "__rowid__": "Int64",
+            "__timestamp__": "Int64",
+        },
+    ))
+
+    def collect(engine, label, *, config=None):
+        parser = SQLParser("s", query, "duckdb")
+        manager = QueryPlanManager("s", "island-tests", "", query)
+        manager.query_plan_path = str(tmp_path / f"{label}-zero-plan.json")
+        stream = engine.execute_stream(
+            reflection,
+            parser,
+            manager,
+            lambda _: None,
+            engine_config=config,
+        )
+        with stream:
+            return pa.Table.from_batches(list(stream), schema=stream.schema)
+
+    expected = collect(
+        DuckDB(),
+        "duckdb",
+        config=resolve_engine_config("", None, "lite"),
+    )
+    actual = collect(IslandDB(), "island")
+
+    capability = IslandDB().can_execute(
+        reflection,
+        SQLParser("s", query, "duckdb"),
+        streaming_result=True,
+    )
+
+    assert actual.schema == expected.schema
+    assert actual.to_pylist() == expected.to_pylist()
+    assert capability.supported is True
+    assert capability.spark_supported is False
+    island_zeros = [
+        value.as_py() for value in actual["x"]
+        if value.as_py() == 0.0
+    ]
+    duckdb_zeros = [
+        value.as_py() for value in expected["x"]
+        if value.as_py() == 0.0
+    ]
+    assert island_zeros
+    assert duckdb_zeros
+    assert all(math.copysign(1.0, value) == 1.0 for value in island_zeros)
+    assert all(math.copysign(1.0, value) == 1.0 for value in duckdb_zeros)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT id, x FROM s.t ORDER BY id",
+        "SELECT id, x FROM s.t ORDER BY x, id",
+    ],
+)
+def test_float_arrow_output_matches_duckdb_nan_payload_contract(
+    tmp_path, query,
+):
+    def float_from_bits(bits: int) -> float:
+        return struct.unpack("<d", struct.pack("<Q", bits))[0]
+
+    path = tmp_path / "nan-payloads.parquet"
+    pq.write_table(pa.table({
+        "id": pa.array([1, 2, 3, 4], type=pa.int64()),
+        "x": pa.array([
+            float_from_bits(0x7FF8000000000001),
+            float_from_bits(0xFFF8000000000002),
+            -0.0,
+            1.0,
+        ], type=pa.float64()),
+        "__rowid__": pa.array([1, 2, 3, 4], type=pa.int64()),
+        "__timestamp__": pa.array([1, 1, 1, 1], type=pa.int64()),
+    }), path, row_group_size=1)
+    reflection = _reflection(_snapshot(
+        "t", [path], ["raw/nan-payloads.parquet"],
+        types={
+            "id": "Int64", "x": "Float64", "__rowid__": "Int64",
+            "__timestamp__": "Int64",
+        },
+    ))
+    def collect(engine, label, *, config=None):
+        manager = QueryPlanManager("s", "island-tests", "", query)
+        manager.query_plan_path = str(tmp_path / f"{label}-nan-plan.json")
+        stream = engine.execute_stream(
+            reflection,
+            SQLParser("s", query, "duckdb"),
+            manager,
+            lambda _: None,
+            engine_config=config,
+        )
+        with stream:
+            return stream.collect_table(max_bytes=1024 * 1024)
+
+    expected = collect(
+        DuckDB(), "duckdb", config=resolve_engine_config("", None, "lite"),
+    )
+    actual = collect(IslandDB(), "island")
+
+    expected_values = expected["x"].combine_chunks().buffers()[1].to_pybytes()
+    actual_values = actual["x"].combine_chunks().buffers()[1].to_pybytes()
+    assert actual.schema == expected.schema
+    assert actual_values == expected_values
+
+
+def test_float_sum_with_string_group_matches_duckdb_arrow_contract(
+    tmp_path, monkeypatch,
+):
+    path = tmp_path / "billed.parquet"
+    systems = ["A", "a", "İ", "i", "I", None, None]
+    pq.write_table(pa.table({
+        "system": pa.array(systems, type=pa.string()),
+        "billed_total": pa.array(
+            [1.25, 2.5, 1e16, 1.0, -1e16, None, None],
+            type=pa.float64(),
+        ),
+        "tax": pa.array(
+            [0.5, 1.25, 2.0, 3.0, 4.0, None, None],
+            type=pa.float32(),
+        ),
+        "__rowid__": pa.array(list(range(1, 8)), type=pa.int64()),
+        "__timestamp__": pa.array([1] * 7, type=pa.int64()),
+    }), path, row_group_size=2)
+    snapshot = _snapshot(
+        "billing",
+        [path],
+        ["raw/billed.parquet"],
+        types={
+            "system": "String", "billed_total": "Float64",
+            "tax": "Float32", "__rowid__": "Int64",
+            "__timestamp__": "Int64",
+        },
+    )
+    snapshot.column_max_value_bytes = {
+        "system": max(len(value.encode("utf-8")) for value in systems if value),
+    }
+    reflection = _reflection(snapshot)
+    query = (
+        "SELECT system, sum(billed_total), sum(tax) AS tax_sum "
+        "FROM s.billing GROUP BY system ORDER BY system"
+    )
+    capability = IslandDB().can_execute(
+        reflection,
+        SQLParser("s", query, "duckdb"),
+        streaming_result=True,
+    )
+    assert capability.supported
+    assert not capability.spark_supported
+
+    def collect(active_engine, label, *, config=None):
+        parser = SQLParser("s", query, "duckdb")
+        manager = QueryPlanManager("s", "island-tests", "", query)
+        manager.query_plan_path = str(tmp_path / f"{label}-billing-plan.json")
+        stream = active_engine.execute_stream(
+            reflection,
+            parser,
+            manager,
+            lambda _: None,
+            engine_config=config,
+        )
+        with stream:
+            return pa.Table.from_batches(list(stream), schema=stream.schema)
+
+    expected = collect(
+        DuckDB(),
+        "duckdb",
+        config=resolve_engine_config("", None, "lite"),
+    )
+    actual = collect(IslandDB(), "island")
+
+    assert actual.schema == expected.schema
+    assert actual.schema.field("sum(billed_total)").type == pa.float64()
+    assert actual.schema.field("tax_sum").type == pa.float64()
+    def canonical(rows):
+        result = []
+        for row in rows:
+            system = pc.utf8_lower(
+                pa.array([row["system"]], type=pa.string()),
+            )[0].as_py()
+            result.append({**row, "system": system})
+        return result
+
+    # DuckDB's parallel NOCASE hash aggregation may return either spelling
+    # from one collation-equivalent group (for example I or İ). Compare the
+    # defined SQL value: equivalence class plus aggregate payload.
+    assert canonical(actual.to_pylist()) == canonical(expected.to_pylist())
+
+    import supertable.engine.executor as executor_module
+
+    monkeypatch.setattr(
+        executor_module,
+        "settings",
+        dataclasses.replace(
+            executor_module.settings,
+            SUPERTABLE_ISLAND_AUTO_ENABLED=True,
+        ),
+    )
+    reflection.reflection_bytes = 512 * 1024**2
+    reflection.row_group_scan_bytes = 512 * 1024**2
+    stats = PlanStats()
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "auto-billing-plan.json")
+    stream, used = Executor(
+        storage=LocalStorage(), organization="island-tests",
+    ).execute_stream(
+        Engine.AUTO,
+        reflection,
+        SQLParser("s", query, "duckdb"),
+        manager,
+        Timer(),
+        stats,
+        "",
+    )
+    with stream:
+        auto_result = pa.Table.from_batches(list(stream), schema=stream.schema)
+
+    assert used == "islanddb"
+    assert auto_result.schema == expected.schema
+    assert canonical(auto_result.to_pylist()) == canonical(expected.to_pylist())
+    assert any(
+        item.get("ENGINE_CAPABILITY", {}).get("supported") is True
+        for item in stats.stats
+    )
+    assert any("ISLAND_RESOURCES" in item for item in stats.stats)
+    assert any(
+        item.get("AUTO_ROUTING_OUTCOME", {}).get("actual_engine")
+        == "islanddb"
+        for item in stats.stats
+    )
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_float32_sum_widens_before_reduction(tmp_path, grouped):
+    path = tmp_path / f"float32-cancellation-{grouped}.parquet"
+    values = [1e8] + [1.0] * 10_000 + [-1e8]
+    pq.write_table(pa.table({
+        "bucket": pa.array([1] * len(values), type=pa.int32()),
+        "value": pa.array(values, type=pa.float32()),
+        "__rowid__": pa.array(
+            list(range(1, len(values) + 1)), type=pa.int64(),
+        ),
+        "__timestamp__": pa.array([1] * len(values), type=pa.int64()),
+    }), path)
+    reflection = _reflection(_snapshot(
+        "floats", [path], [f"raw/{path.name}"],
+        types={
+            "bucket": "Int32", "value": "Float32",
+            "__rowid__": "Int64", "__timestamp__": "Int64",
+        },
+    ))
+    query = (
+        "SELECT bucket, sum(value) AS total FROM s.floats "
+        "GROUP BY bucket ORDER BY bucket"
+        if grouped else
+        "SELECT sum(value) AS total FROM s.floats"
+    )
+
+    expected = _run_duckdb(tmp_path, reflection, query)
+    actual, _ = _run_island(tmp_path, reflection, query)
+
+    pd.testing.assert_frame_equal(actual, expected)
+    assert actual["total"].iloc[0] == 10_000.0
+
+
+def test_float_sum_null_and_nonfinite_semantics_match_duckdb(tmp_path):
+    path = tmp_path / "float-sum-edge.parquet"
+    rows = 3_000
+    pattern = [1e16, 1.0, -1e16] * (rows // 3)
+    pq.write_table(pa.table({
+        "unstable": pa.array(pattern, type=pa.float64()),
+        "all_null": pa.array([None] * rows, type=pa.float64()),
+        "nan_total": pa.array(
+            [float("nan"), 1.0] + [None] * (rows - 2),
+            type=pa.float64(),
+        ),
+        "infinite": pa.array(
+            [float("inf"), 1.0] + [None] * (rows - 2),
+            type=pa.float64(),
+        ),
+        "__rowid__": pa.array(list(range(1, rows + 1)), type=pa.int64()),
+        "__timestamp__": pa.array([1] * rows, type=pa.int64()),
+    }), path, row_group_size=17)
+    snapshot = _snapshot(
+        "floats",
+        [path],
+        ["raw/float-sum-edge.parquet"],
+        types={
+            "unstable": "Float64", "all_null": "Float64",
+            "nan_total": "Float64", "infinite": "Float64",
+            "__rowid__": "Int64", "__timestamp__": "Int64",
+        },
+    )
+    reflection = _reflection(snapshot)
+    query = (
+        "SELECT sum(unstable) AS unstable, sum(all_null) AS all_null, "
+        "sum(nan_total) AS nan_total, sum(infinite) AS infinite "
+        "FROM s.floats"
+    )
+
+    expected = _run_duckdb(tmp_path, reflection, query)
+    actual, _ = _run_island(tmp_path, reflection, query)
+
+    # Parallel floating SUM is order-dependent in both engines. The two values
+    # need not be bit-identical, but both must remain inside the standard
+    # forward-error bound for an IEEE-754 reduction of the same inputs.
+    exact = math.fsum(pattern)
+    forward_error = rows * math.ulp(1.0) * math.fsum(
+        abs(value) for value in pattern
+    )
+    assert abs(actual["unstable"].iloc[0] - exact) <= forward_error
+    assert abs(expected["unstable"].iloc[0] - exact) <= forward_error
+    assert pd.isna(actual["all_null"].iloc[0])
+    assert pd.isna(expected["all_null"].iloc[0])
+    assert math.isnan(actual["nan_total"].iloc[0])
+    assert math.isnan(expected["nan_total"].iloc[0])
+    assert actual["infinite"].iloc[0] == float("inf")
+    assert expected["infinite"].iloc[0] == float("inf")
+
+
 def test_binary_scalar_extrema_empty_arrow_stream_retains_canonical_binary(
     tmp_path,
 ):
@@ -1660,7 +2506,7 @@ def test_binary_and_datetime_raw_projection_is_arrow_stream_only(tmp_path):
         "__rowid__": pa.array([2, 1], type=pa.int64()),
         "__timestamp__": pa.array([1, 1], type=pa.int64()),
     }), path)
-    reflection = _reflection(_snapshot(
+    snapshot = _snapshot(
         "t", [path], ["raw/rich-stream.parquet"],
         types={
             "id": "Int64",
@@ -1669,7 +2515,11 @@ def test_binary_and_datetime_raw_projection_is_arrow_stream_only(tmp_path):
             "__rowid__": "Int64",
             "__timestamp__": "Int64",
         },
-    ))
+    )
+    snapshot.column_max_value_bytes = {"payload": 4}
+    reflection = _reflection(snapshot)
+    reflection.selected_decoded_bytes = reflection.decoded_bytes
+    reflection.selected_decoded_bytes_complete = True
     query = "SELECT id, event_ts, payload FROM s.t ORDER BY id"
     parser = SQLParser("s", query, "duckdb")
     engine = IslandDB(range_cache=False)
@@ -1682,6 +2532,29 @@ def test_binary_and_datetime_raw_projection_is_arrow_stream_only(tmp_path):
     assert materialized.supported is False
     assert any("pandas parity" in reason for reason in materialized.reasons)
     assert streaming.supported is True, streaming.reasons
+    assert streaming.spark_supported is False
+
+    def collect(active_engine, label, *, config=None):
+        manager = QueryPlanManager("s", "island-tests", "", query)
+        manager.query_plan_path = str(tmp_path / f"{label}-rich-stream.json")
+        stream = active_engine.execute_stream(
+            reflection,
+            SQLParser("s", query, "duckdb"),
+            manager,
+            lambda _: None,
+            engine_config=config,
+        )
+        with stream:
+            return pa.Table.from_batches(list(stream), schema=stream.schema)
+
+    expected = collect(
+        DuckDB(),
+        "duckdb",
+        config=resolve_engine_config("", None, "lite"),
+    )
+    actual = collect(engine, "island")
+    assert actual.schema == expected.schema
+    assert actual.to_pylist() == expected.to_pylist()
 
     binary_order = engine.can_execute(
         reflection,
@@ -1773,6 +2646,63 @@ def test_group_by_physical_column_shadowing_select_alias_matches_duckdb(tmp_path
     actual, _ = _run_island(tmp_path, reflection, query)
 
     pd.testing.assert_frame_equal(actual, expected)
+
+
+def test_nocase_group_order_uses_aggregate_alias_that_shadows_group_key(tmp_path):
+    path = tmp_path / "group-string-alias-shadow.parquet"
+    pl.DataFrame({
+        "x": ["a", "A", "b"],
+        "y": [10, 10, 10],
+        "__rowid__": [1, 2, 3],
+        "__timestamp__": [1, 1, 1],
+    }).write_parquet(path)
+    reflection = _reflection(_snapshot(
+        "t", [path], ["raw/group-string-alias-shadow"],
+        types={
+            "x": "String", "y": "Int64", "__rowid__": "Int64",
+            "__timestamp__": "Int64",
+        },
+    ))
+    reflection.supers[0].column_max_value_bytes = {"x": 1}
+    query = (
+        "SELECT y, count(*) AS x FROM s.t "
+        "GROUP BY y, x ORDER BY x"
+    )
+
+    capability = IslandDB().can_execute(reflection, SQLParser(
+        "s", query, "duckdb",
+    ))
+    expected = _run_duckdb(tmp_path, reflection, query)
+    actual, _ = _run_island(tmp_path, reflection, query)
+
+    assert capability.supported is True
+    pd.testing.assert_frame_equal(actual, expected)
+
+
+def test_order_alias_shadowing_physical_column_uses_projected_type_in_gate(tmp_path):
+    path = tmp_path / "order-alias-shadow.parquet"
+    pl.DataFrame({
+        "id": [1, 2],
+        "label": ["a", "B"],
+        "__rowid__": [1, 2],
+        "__timestamp__": [1, 1],
+    }).write_parquet(path)
+    reflection = _reflection(_snapshot(
+        "t", [path], ["raw/order-alias-shadow"],
+        types={
+            "id": "Int64", "label": "String", "__rowid__": "Int64",
+            "__timestamp__": "Int64",
+        },
+    ))
+    query = "SELECT label AS id FROM s.t ORDER BY id"
+    parser = SQLParser("s", query, "duckdb")
+
+    capability = IslandDB().can_execute(reflection, parser)
+
+    assert capability.supported is False
+    assert "column id type String has unproven DuckDB semantics" in capability.reasons
+    with pytest.raises(IslandUnsupportedError, match="column id type String"):
+        _run_island(tmp_path, reflection, query)
 
 
 def test_schema_evolution_union_by_name_matches_duckdb(tmp_path):
@@ -1931,6 +2861,42 @@ def test_composite_tombstone_matches_duckdb(tmp_path, numeric_reflection):
     assert actual["id"].tolist() == [76, 78]
 
 
+def test_pruned_snapshot_ignores_tombstones_for_unselected_resources(
+    tmp_path, numeric_reflection,
+):
+    original = numeric_reflection.supers[0]
+    selected = dataclasses.replace(
+        original,
+        files=[original.files[1]],
+        resource_keys=[original.resource_keys[1]],
+        resource_sizes=[original.resource_sizes[1]],
+        snapshot_resource_keys=list(original.resource_keys),
+    )
+    numeric_reflection.supers = [selected]
+    dv_path = tmp_path / "pruned-dv.parquet"
+    dv = pl.DataFrame({
+        TOMBSTONE_FILE_COL: [original.resource_keys[0]],
+        "__rowid__": [1],
+    }, schema={TOMBSTONE_FILE_COL: pl.String, "__rowid__": pl.Int64})
+    dv.write_parquet(dv_path)
+    numeric_reflection.tombstone_views["t"] = TombstoneDef(
+        tombstone_path=str(dv_path), cache_key="raw/pruned-dv",
+        expected_rows=1, tombstone_digest=tombstone_digest(dv),
+        resource_keys=tuple(selected.resource_keys),
+        snapshot_resource_keys=tuple(original.resource_keys),
+    )
+
+    actual, engine = _run_island(
+        tmp_path, numeric_reflection,
+        "SELECT count(*) AS n FROM s.t",
+    )
+
+    assert actual["n"].tolist() == [
+        pq.ParquetFile(original.files[1]).metadata.num_rows
+    ]
+    assert "ANTI JOIN" not in engine.last_profile.optimized_plan
+
+
 def test_tombstone_cache_reuses_digest_sealed_frame_without_reread(
     tmp_path, numeric_reflection, monkeypatch,
 ):
@@ -2058,6 +3024,45 @@ def test_scalar_aggregate_plan_charges_every_output_and_reduction(tmp_path):
     assert estimate.estimated_result_rows == 1
 
 
+def test_scalar_aggregate_redundant_order_does_not_request_spill(tmp_path):
+    path = tmp_path / "ordered-scalar-plan.parquet"
+    pl.DataFrame({
+        "id": [1, 2], "__rowid__": [1, 2], "__timestamp__": [1, 1],
+    }).write_parquet(path)
+    reflection = _reflection(_snapshot(
+        "t", [path], ["raw/ordered-scalar-plan"],
+        types={
+            "id": "Int64", "__rowid__": "Int64", "__timestamp__": "Int64",
+        },
+    ))
+    reflection.decoded_bytes = 420 * 1024**2
+    reflection.selected_decoded_bytes = reflection.decoded_bytes
+    reflection.selected_decoded_bytes_complete = True
+    resources = ContainerResources(
+        cpu_count=4,
+        cpu_capacity=4.0,
+        affinity_cpus=(0, 1, 2, 3),
+        cpuset_cpus=(0, 1, 2, 3),
+        memory_limit_bytes=1024**3,
+        memory_available_bytes=1024**3,
+    )
+    engine = IslandDB()
+    engine._resources = resources
+    engine._planner = ResourcePlanner(
+        resources,
+        spill_root=tmp_path,
+        disk_usage=lambda _: types.SimpleNamespace(free=16 * 1024**3),
+    )
+    parser = SQLParser(
+        "s", "SELECT count(*) AS n FROM s.t ORDER BY n", "duckdb",
+    )
+
+    plan = engine.resource_plan(reflection, parser, streaming_result=True)
+
+    assert plan.advice is ExecutionAdvice.ISLAND_IN_MEMORY
+    assert plan.estimated_spill_bytes == 0
+
+
 def test_sealed_low_cardinality_group_uses_compact_bounded_operator_plan(tmp_path):
     path = tmp_path / "bounded-group-plan.parquet"
     pl.DataFrame({
@@ -2179,6 +3184,56 @@ def test_sealed_high_cardinality_id_group_remains_external(tmp_path):
     assert plan.spill_budget_bytes == plan.estimated_spill_bytes
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT v FROM s.t ORDER BY v",
+        "SELECT v, count(*) AS n FROM s.t GROUP BY v",
+    ],
+)
+def test_float_blocking_key_routes_away_when_it_requires_spill(
+    tmp_path, query,
+):
+    path = tmp_path / "float-blocking-plan.parquet"
+    pl.DataFrame({
+        "v": [1.0, 2.0],
+        "__rowid__": [1, 2],
+        "__timestamp__": [1, 1],
+    }).write_parquet(path)
+    reflection = _reflection(_snapshot(
+        "t", [path], ["raw/float-blocking-plan"],
+        types={
+            "v": "Float64", "__rowid__": "Int64",
+            "__timestamp__": "Int64",
+        },
+    ))
+    reflection.decoded_bytes = 420 * 1024**2
+    reflection.selected_decoded_bytes = reflection.decoded_bytes
+    reflection.selected_decoded_bytes_complete = True
+    resources = ContainerResources(
+        cpu_count=4,
+        cpu_capacity=4.0,
+        affinity_cpus=(0, 1, 2, 3),
+        cpuset_cpus=(0, 1, 2, 3),
+        memory_limit_bytes=1024**3,
+        memory_available_bytes=1024**3,
+    )
+    engine = IslandDB()
+    engine._resources = resources
+    engine._planner = ResourcePlanner(
+        resources,
+        spill_root=tmp_path,
+        disk_usage=lambda _: types.SimpleNamespace(free=16 * 1024**3),
+    )
+
+    plan = engine.resource_plan(
+        reflection, SQLParser("s", query, "duckdb"), streaming_result=True,
+    )
+
+    assert plan.advice is ExecutionAdvice.ROUTE_DUCKDB
+    assert "no bounded spill implementation" in plan.reason
+
+
 def test_binary_scalar_plan_charges_exact_value_per_reduction_and_worker(
     tmp_path,
 ):
@@ -2201,6 +3256,51 @@ def test_binary_scalar_plan_charges_exact_value_per_reduction_and_worker(
     assert estimate.operator_state_bytes == 2 * 4096 + 3 * 2 * per_extremum
     assert estimate.result_bytes == 2 * 4096 + 2 * per_extremum
     assert estimate.estimated_result_rows == 1
+
+
+def test_wide_binary_extrema_with_tombstones_routes_before_memory_exhaustion(
+    tmp_path,
+):
+    reflection = _binary_reflection(tmp_path, [[b"x" * 257, b"small"]])
+    selected_decoded = 420 * 1024**2
+    reflection.decoded_bytes = selected_decoded
+    reflection.selected_decoded_bytes = selected_decoded
+    reflection.selected_decoded_bytes_complete = True
+    resource_key = reflection.supers[0].resource_keys[0]
+    reflection.tombstone_views = {
+        "t": TombstoneDef(
+            tombstone_path=str(tmp_path / "sealed-dv.parquet"),
+            cache_key="raw/sealed-dv.parquet",
+            expected_rows=1,
+            tombstone_digest="0" * 64,
+            resource_keys=(resource_key,),
+            snapshot_resource_keys=(resource_key,),
+        ),
+    }
+    parser = SQLParser(
+        "s", "SELECT max(payload) AS hi FROM s.t", "duckdb",
+    )
+    resources = ContainerResources(
+        cpu_count=4,
+        cpu_capacity=4.0,
+        affinity_cpus=(0, 1, 2, 3),
+        cpuset_cpus=(0, 1, 2, 3),
+        memory_limit_bytes=1024**3,
+        memory_available_bytes=1024**3,
+    )
+    engine = IslandDB()
+    engine._resources = resources
+    engine._planner = ResourcePlanner(
+        resources,
+        spill_root=tmp_path,
+        disk_usage=lambda _: types.SimpleNamespace(free=16 * 1024**3),
+    )
+
+    plan = engine.resource_plan(reflection, parser, streaming_result=True)
+
+    assert plan.advice is ExecutionAdvice.ROUTE_DUCKDB
+    assert plan.operator_memory_bytes < selected_decoded
+    assert "operator state exceeds memory" in plan.reason
 
 
 def test_binary_projection_plan_uses_sealed_width_for_result_and_batch_rows(
@@ -2244,6 +3344,95 @@ def test_binary_projection_plan_uses_sealed_width_for_result_and_batch_rows(
     assert estimate.result_bytes == 2 * row_width
     assert estimate.estimated_result_rows == 2
     assert estimate.estimates_complete is True
+
+
+def test_single_binary_result_row_over_stream_cap_is_rejected_before_scan(
+    tmp_path, monkeypatch,
+):
+    maximum = 5 * 1024**2
+    reflection = _binary_reflection(tmp_path, [[b"x" * maximum]])
+    reflection.selected_decoded_bytes = reflection.decoded_bytes
+    reflection.selected_decoded_bytes_complete = True
+    query = "SELECT payload FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "oversized-row-plan.json")
+    engine = IslandDB()
+    monkeypatch.setattr(
+        engine,
+        "_prepare_lazy_query",
+        lambda *_args, **_kwargs: pytest.fail(
+            "oversized row must be rejected before relation execution"
+        ),
+    )
+
+    with pytest.raises(IslandUnsupportedError, match="one sealed result row"):
+        engine.execute_stream(
+            reflection,
+            parser,
+            manager,
+            lambda _: None,
+            max_batch_bytes=4 * 1024**2,
+        )
+
+
+def test_string_projection_plan_uses_sealed_width_for_result_and_batch_rows(
+    tmp_path,
+):
+    reflection, maximum = _string_reflection(
+        tmp_path, ["é" * 10_000, "𐍈" * 5_000],
+    )
+    reflection.selected_decoded_bytes = reflection.decoded_bytes
+    reflection.selected_decoded_bytes_complete = True
+    parser = SQLParser("s", "SELECT label FROM s.strings", "duckdb")
+    resources = ContainerResources(
+        cpu_count=2,
+        cpu_capacity=2.0,
+        affinity_cpus=(0, 1),
+        cpuset_cpus=(0, 1),
+        memory_limit_bytes=512 * 1024**2,
+        memory_available_bytes=512 * 1024**2,
+    )
+    engine = IslandDB()
+    engine._resources = resources
+    engine._planner = ResourcePlanner(
+        resources,
+        spill_root=tmp_path,
+        disk_usage=lambda _: types.SimpleNamespace(free=16 * 1024**3),
+    )
+
+    plan = engine.resource_plan(reflection, parser, streaming_result=True)
+    row_width = maximum + 17
+    assert plan.advice is ExecutionAdvice.ISLAND_IN_MEMORY
+    assert plan.batch_rows <= plan.batch_bytes // row_width
+
+    class CapturePlanner:
+        def plan(self, estimate, *, streaming_result):
+            return estimate
+
+    engine._planner = CapturePlanner()
+    estimate = engine.resource_plan(reflection, parser, streaming_result=True)
+    assert estimate.result_bytes == 2 * row_width
+    assert estimate.estimated_result_rows == 2
+    assert estimate.estimates_complete is True
+
+
+@pytest.mark.parametrize("bound", [None, -1, True, "20000"])
+def test_string_projection_malformed_or_missing_width_routes_to_duckdb(
+    tmp_path, bound,
+):
+    reflection, _ = _string_reflection(tmp_path, ["payload"])
+    reflection.supers[0].column_max_value_bytes = (
+        {} if bound is None else {"label": bound}
+    )
+    parser = SQLParser("s", "SELECT label FROM s.strings", "duckdb")
+
+    plan = IslandDB().resource_plan(
+        reflection, parser, streaming_result=True,
+    )
+
+    assert plan.advice is ExecutionAdvice.ROUTE_DUCKDB
+    assert "incomplete" in plan.reason
 
 
 def test_binary_join_result_width_sums_each_physical_snapshot_seal(tmp_path):
@@ -2400,12 +3589,8 @@ def test_island_instances_share_governor_across_live_memory_limit_change(
         resources(2 * 1024**3, 2 * 1024**3),
         resources(1024**3, 256 * 1024**2),
     ])
-    policy = ResourcePolicy()
     monkeypatch.setattr(
         IslandDB, "_detect_resources", staticmethod(lambda: next(samples)),
-    )
-    monkeypatch.setattr(
-        IslandDB, "_resource_policy", staticmethod(lambda: policy),
     )
     monkeypatch.setattr(
         islanddb_module,
@@ -2413,6 +3598,7 @@ def test_island_instances_share_governor_across_live_memory_limit_change(
         dataclasses.replace(
             islanddb_module.settings,
             SUPERTABLE_ISLAND_SPILL_DIR=str(tmp_path / "shared-governor-spill"),
+            SUPERTABLE_ISLAND_MAX_RESULT_BYTES=0,
         ),
     )
 
@@ -2420,8 +3606,9 @@ def test_island_instances_share_governor_across_live_memory_limit_change(
     second = IslandDB()
 
     assert first._governor is second._governor
+    assert first._policy != second._policy
     assert second._governor.snapshot()["memory_capacity"] == int(
-        256 * 1024**2 * policy.global_memory_fraction
+        256 * 1024**2 * second._policy.global_memory_fraction
     )
 
 
@@ -2602,6 +3789,7 @@ def test_one_arrow_dataset_handles_128_files_with_composite_tombstones(tmp_path)
     pd.testing.assert_frame_equal(actual, expected)
     assert engine.last_profile.files == 128
     assert "Parquet SCAN" in engine.last_profile.optimized_plan
+    assert "strict_cast(Enum" in engine.last_profile.optimized_plan
 
 
 def test_duplicate_source_rowid_fails_closed(tmp_path):
@@ -2628,6 +3816,7 @@ def test_duplicate_source_rowid_fails_closed(tmp_path):
 
 @pytest.mark.parametrize("query, reason", [
     ("SELECT id FROM s.t WHERE label='r1'", "NOCASE"),
+    ("SELECT label FROM s.t ORDER BY label", "unproven DuckDB semantics"),
     ("SELECT label=label AS same FROM s.t", "non-numeric semantics"),
     ("SELECT id FROM s.t LIMIT 1", "LIMIT/OFFSET"),
     ("SELECT id FROM s.t ORDER BY id LIMIT 1", "LIMIT/OFFSET"),
@@ -2636,7 +3825,8 @@ def test_duplicate_source_rowid_fails_closed(tmp_path):
     ("SELECT avg(v) FROM s.t", "AVG reduction"),
     ("SELECT sum(-v) AS total FROM s.t", "signed expression"),
     ("SELECT sum(1) AS total FROM s.t", "one direct column"),
-    ("SELECT count(*) FROM s.t", "explicit alias"),
+    ("SELECT sum(\"v\") FROM s.t", "explicit alias"),
+    ("SELECT count(t.*) AS n FROM s.t AS t", "qualified aggregate star"),
     ("SELECT date_trunc('day', id) FROM s.t", "unsupported SQL nodes"),
     ("SELECT id AND v AS x FROM s.t", "Boolean coercion"),
     ("SELECT id OR v AS x FROM s.t", "Boolean coercion"),
@@ -2655,6 +3845,190 @@ def test_unproven_semantics_are_rejected_before_execution(
     manager = QueryPlanManager("s", "island-tests", "", query)
     with pytest.raises(IslandUnsupportedError, match=reason):
         engine.execute(numeric_reflection, parser, manager, lambda _: None)
+
+
+def test_prepare_execution_revalidates_mutated_original_sql(
+    numeric_reflection,
+):
+    parser = SQLParser(
+        "s", "SELECT count(*) AS n FROM s.t", "duckdb",
+    )
+    parser.original_query = "SELECT * FROM read_parquet('/unauthorized')"
+
+    with pytest.raises(
+        IslandUnsupportedError,
+        match="backend SQL validation failed",
+    ):
+        IslandDB().prepare_execution(
+            numeric_reflection,
+            parser,
+            streaming_result=True,
+        )
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_prepared_execution_pins_validated_sql_against_later_mutation(
+    tmp_path,
+    numeric_reflection,
+    streaming,
+):
+    query = "SELECT count(*) AS n FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / f"pinned-{streaming}.json")
+    engine = IslandDB()
+    prepared = engine.prepare_execution(
+        numeric_reflection,
+        parser,
+        streaming_result=streaming,
+    )
+    parser.original_query = "SELECT sum(v) AS n FROM s.t"
+
+    if streaming:
+        table = engine.execute_stream(
+            numeric_reflection,
+            parser,
+            manager,
+            lambda _: None,
+            _prepared=prepared,
+        ).collect_table(max_bytes=1024 * 1024)
+        assert table["n"].to_pylist() == [100]
+    else:
+        result = engine.execute(
+            numeric_reflection,
+            parser,
+            manager,
+            lambda _: None,
+            _prepared=prepared,
+        )
+        assert result["n"].tolist() == [100]
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_prepared_execution_rejects_changed_semantic_reflection(
+    tmp_path,
+    numeric_reflection,
+    streaming,
+):
+    query = "SELECT count(*) AS n FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / f"reflection-{streaming}.json")
+    engine = IslandDB()
+    prepared = engine.prepare_execution(
+        numeric_reflection,
+        parser,
+        streaming_result=streaming,
+    )
+    changed = dataclasses.replace(
+        numeric_reflection,
+        decoded_bytes=numeric_reflection.decoded_bytes + 1,
+    )
+
+    with pytest.raises(
+        IslandIntegrityError,
+        match="prepared IslandDB plan does not match execution reflection",
+    ):
+        if streaming:
+            engine.execute_stream(
+                changed,
+                parser,
+                manager,
+                lambda _: None,
+                _prepared=prepared,
+            )
+        else:
+            engine.execute(
+                changed,
+                parser,
+                manager,
+                lambda _: None,
+                _prepared=prepared,
+            )
+
+
+def test_prepared_execution_requires_explicit_cache_localization_rebind(
+    tmp_path,
+    numeric_reflection,
+):
+    query = "SELECT count(*) AS n FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "localized-reflection.json")
+    engine = IslandDB()
+    prepared = engine.prepare_execution(
+        numeric_reflection,
+        parser,
+        streaming_result=True,
+    )
+    original_snapshot = numeric_reflection.supers[0]
+    localized_paths = []
+    for index, original_path in enumerate(original_snapshot.files):
+        localized_path = tmp_path / f"cache-localized-{index}.parquet"
+        shutil.copyfile(original_path, localized_path)
+        localized_paths.append(str(localized_path))
+    localized_snapshot = dataclasses.replace(
+        original_snapshot,
+        files=localized_paths,
+    )
+    localized_reflection = dataclasses.replace(
+        numeric_reflection,
+        supers=[localized_snapshot],
+    )
+
+    with pytest.raises(
+        IslandIntegrityError,
+        match="prepared IslandDB plan does not match execution reflection",
+    ):
+        engine.execute_stream(
+            localized_reflection,
+            parser,
+            manager,
+            lambda _: None,
+            _prepared=prepared,
+        )
+
+    localized_prepared = engine._rebind_cache_localized_prepared(
+        prepared,
+        numeric_reflection,
+        localized_reflection,
+    )
+    table = engine.execute_stream(
+        localized_reflection,
+        parser,
+        manager,
+        lambda _: None,
+        _prepared=localized_prepared,
+    ).collect_table(max_bytes=1024 * 1024)
+
+    assert table["n"].to_pylist() == [100]
+
+
+def test_stream_prepared_plan_cannot_bypass_materialized_capability_gate(
+    tmp_path,
+):
+    reflection = _binary_reflection(tmp_path, [[b"payload"]])
+    query = "SELECT payload FROM s.t"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    engine = IslandDB()
+    prepared = engine.prepare_execution(
+        reflection,
+        parser,
+        streaming_result=True,
+    )
+
+    with pytest.raises(
+        IslandIntegrityError,
+        match="prepared IslandDB plan has the wrong result mode",
+    ):
+        engine.execute(
+            reflection,
+            parser,
+            manager,
+            lambda _: None,
+            _prepared=prepared,
+        )
 
 
 def test_response_limit_is_native_when_candidate_count_proves_it_redundant(
@@ -2783,6 +4157,22 @@ def test_unproven_join_forms_and_output_names_are_rejected(
     assert reason in "; ".join(capability.reasons)
 
 
+@pytest.mark.parametrize(
+    "projection", ["*, id", "id, t.*"],
+)
+def test_star_expansion_duplicate_output_is_rejected(
+    numeric_reflection, projection,
+):
+    parser = SQLParser(
+        "s", f"SELECT {projection} FROM s.t AS t", "duckdb",
+    )
+
+    capability = IslandDB().can_execute(numeric_reflection, parser)
+
+    assert capability.supported is False
+    assert "duplicate output name 'id'" in "; ".join(capability.reasons)
+
+
 def test_natural_join_is_rejected_at_shared_parser_boundary():
     with pytest.raises(ValueError, match="NATURAL JOIN is not supported"):
         SQLParser(
@@ -2842,6 +4232,335 @@ def test_rbac_never_silently_bypasses_native_engine(tmp_path, numeric_reflection
     assert any("RBAC" in reason for reason in capability.reasons)
 
 
+def test_static_island_cpu_limit_bootstraps_polars_pool_before_import():
+    env = os.environ.copy()
+    env["SUPERTABLE_ISLAND_CPU_MAX"] = "1"
+    env.pop("POLARS_MAX_THREADS", None)
+    observed = subprocess.check_output(
+        [
+            sys.executable,
+            "-c",
+            "import supertable; import polars as pl; "
+            "print(pl.thread_pool_size())",
+        ],
+        cwd=str(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(__file__),
+        )))),
+        env=env,
+        text=True,
+    ).strip()
+
+    assert observed == "1"
+
+
+def test_initialized_polars_pool_wider_than_cpu_cap_fails_capability_closed(
+    numeric_reflection, monkeypatch,
+):
+    monkeypatch.setattr(
+        islanddb_module,
+        "settings",
+        dataclasses.replace(
+            islanddb_module.settings,
+            SUPERTABLE_ISLAND_CPU_MAX=1,
+        ),
+    )
+    monkeypatch.setattr(islanddb_module.pl, "thread_pool_size", lambda: 8)
+    engine = IslandDB()
+
+    capability = engine.can_execute(
+        numeric_reflection,
+        SQLParser("s", "SELECT id FROM s.t", "duckdb"),
+        streaming_result=True,
+    )
+
+    assert not capability.supported
+    assert any("Polars worker pool" in reason for reason in capability.reasons)
+    assert any(
+        "SUPERTABLE_ISLAND_CPU_MAX" in reason
+        for reason in capability.reasons
+    )
+
+
+def test_live_island_cpu_and_memory_config_are_pinned_in_prepared_query(
+    numeric_reflection, monkeypatch,
+):
+    detected = ContainerResources(
+        cpu_count=8,
+        cpu_capacity=8.0,
+        affinity_cpus=tuple(range(8)),
+        cpuset_cpus=tuple(range(8)),
+        memory_limit_bytes=2 * 1024**3,
+        memory_available_bytes=2 * 1024**3,
+    )
+    monkeypatch.setattr(
+        islanddb_module.ContainerResources,
+        "detect",
+        classmethod(lambda cls: detected),
+    )
+    monkeypatch.setattr(islanddb_module.pl, "thread_pool_size", lambda: 4)
+    engine = IslandDB(range_cache=False)
+    parser = SQLParser("s", "SELECT id FROM s.t", "duckdb")
+    first_config = IslandRuntimeConfig(
+        cpu_max=4,
+        memory_max_bytes=256 * 1024**2,
+        cache_max_bytes=111,
+        range_cache_max_bytes=222,
+    )
+
+    prepared = engine.prepare_execution(
+        numeric_reflection,
+        parser,
+        streaming_result=True,
+        engine_config=first_config,
+    )
+
+    assert prepared.runtime_config is first_config
+    assert prepared.resources.cpu_count == 4
+    assert prepared.resources.cpu_capacity == 4.0
+    assert prepared.resources.memory_limit_bytes == 256 * 1024**2
+    assert prepared.resources.memory_available_bytes == 256 * 1024**2
+    assert prepared.policy.max_query_memory_bytes == 256 * 1024**2
+    assert prepared.resource_plan.cpu_workers == 4
+    assert prepared.resource_plan.memory_budget_bytes <= 256 * 1024**2
+
+    # A later query gets the newly resolved immutable policy while the already
+    # prepared query retains its original resources and governor.
+    second_config = dataclasses.replace(
+        first_config,
+        memory_max_bytes=512 * 1024**2,
+    )
+    second = engine.prepare_execution(
+        numeric_reflection,
+        parser,
+        streaming_result=True,
+        engine_config=second_config,
+    )
+    assert second.resources.memory_limit_bytes == 512 * 1024**2
+    assert second.policy.max_query_memory_bytes == 512 * 1024**2
+    assert prepared.resources.memory_limit_bytes == 256 * 1024**2
+
+
+def test_prepared_query_uses_one_live_container_resource_sample(
+    numeric_reflection, monkeypatch,
+):
+    constrained = ContainerResources(
+        cpu_count=4,
+        cpu_capacity=4.0,
+        affinity_cpus=tuple(range(4)),
+        cpuset_cpus=tuple(range(4)),
+        memory_limit_bytes=256 * 1024**2,
+        memory_available_bytes=256 * 1024**2,
+    )
+    wider_later_sample = dataclasses.replace(
+        constrained,
+        memory_limit_bytes=2 * 1024**3,
+        memory_available_bytes=2 * 1024**3,
+    )
+    monkeypatch.setattr(islanddb_module.pl, "thread_pool_size", lambda: 4)
+    engine = IslandDB(range_cache=False)
+    samples = iter((constrained, wider_later_sample))
+    calls = []
+
+    def detect(config=None):
+        calls.append(config)
+        return next(samples)
+
+    monkeypatch.setattr(engine, "_detect_resources", detect)
+    config = IslandRuntimeConfig(
+        cpu_max=None,
+        memory_max_bytes=None,
+        cache_max_bytes=None,
+        range_cache_max_bytes=None,
+    )
+    prepared = engine.prepare_execution(
+        numeric_reflection,
+        SQLParser("s", "SELECT id FROM s.t", "duckdb"),
+        streaming_result=True,
+        engine_config=config,
+    )
+
+    assert calls == [config]
+    assert prepared.resources is constrained
+    assert (
+        prepared.resource_plan.memory_budget_bytes
+        <= prepared.governor.snapshot()["memory_capacity"]
+    )
+
+
+def test_unconfigured_island_memory_policy_uses_all_container_availability(
+    monkeypatch,
+):
+    resources = ContainerResources(
+        cpu_count=4,
+        cpu_capacity=4.0,
+        affinity_cpus=(0, 1, 2, 3),
+        cpuset_cpus=(0, 1, 2, 3),
+        memory_limit_bytes=2 * 1024**3,
+        memory_available_bytes=1536 * 1024**2,
+    )
+    monkeypatch.setattr(
+        islanddb_module,
+        "settings",
+        dataclasses.replace(
+            islanddb_module.settings,
+            SUPERTABLE_ISLAND_MEMORY_FRACTION=1.0,
+            SUPERTABLE_ISLAND_GLOBAL_MEMORY_FRACTION=1.0,
+            SUPERTABLE_ISLAND_MAX_MEMORY_BYTES=0,
+            SUPERTABLE_ISLAND_MAX_RESULT_BYTES=0,
+        ),
+    )
+
+    policy = IslandDB._resource_policy(resources)
+
+    assert policy.query_memory_fraction == 1.0
+    assert policy.global_memory_fraction == 1.0
+    assert policy.max_query_memory_bytes == 0
+    assert policy.max_result_memory_bytes == 1536 * 1024**2
+
+
+def test_live_island_whole_file_cache_capacity_rebuilds_for_next_query(
+    tmp_path, monkeypatch,
+):
+    import supertable.engine.executor as executor_module
+
+    monkeypatch.setattr(
+        executor_module,
+        "settings",
+        dataclasses.replace(
+            executor_module.settings,
+            SUPERTABLE_ISLAND_CACHE_ENABLED=True,
+            SUPERTABLE_ISLAND_CACHE_DIR=str(tmp_path / "whole-cache"),
+        ),
+    )
+    executor = Executor.__new__(Executor)
+    executor.storage = LocalStorage()
+    executor.organization = "live-config"
+    executor._file_cache = None
+    first_config = IslandRuntimeConfig(None, None, 1024, None)
+    second_config = dataclasses.replace(first_config, cache_max_bytes=2048)
+
+    first = executor._get_file_cache(first_config)
+    second = executor._get_file_cache(second_config)
+
+    assert first.max_bytes == 1024
+    assert second.max_bytes == 2048
+    assert second is not first
+
+
+def test_unconfigured_whole_file_cache_uses_stable_filesystem_budget(
+    tmp_path, monkeypatch,
+):
+    import supertable.engine.executor as executor_module
+    import supertable.engine.file_cache as file_cache_module
+
+    budgets = iter((1234, 5678))
+    monkeypatch.setattr(
+        file_cache_module,
+        "automatic_cache_max_bytes",
+        lambda *_args, **_kwargs: next(budgets),
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "settings",
+        dataclasses.replace(
+            executor_module.settings,
+            SUPERTABLE_ISLAND_CACHE_ENABLED=True,
+            SUPERTABLE_ISLAND_CACHE_DIR=str(tmp_path / "whole-auto"),
+            SUPERTABLE_ISLAND_CACHE_MAX_BYTES=0,
+        ),
+    )
+    executor = Executor.__new__(Executor)
+    executor.storage = LocalStorage()
+    executor.organization = "auto-cache"
+    executor._file_cache = None
+
+    first = executor._get_file_cache()
+    second = executor._get_file_cache()
+
+    assert first is second
+    assert first.max_bytes == 1234
+    assert first._supertable_automatic_capacity is True
+
+
+def test_live_automatic_whole_cache_overrides_positive_process_fallback(
+    tmp_path, monkeypatch,
+):
+    import supertable.engine.executor as executor_module
+    import supertable.engine.file_cache as file_cache_module
+
+    monkeypatch.setattr(
+        file_cache_module,
+        "automatic_cache_max_bytes",
+        lambda *_args, **_kwargs: 4321,
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "settings",
+        dataclasses.replace(
+            executor_module.settings,
+            SUPERTABLE_ISLAND_CACHE_ENABLED=True,
+            SUPERTABLE_ISLAND_CACHE_DIR=str(tmp_path / "whole-live-auto"),
+            SUPERTABLE_ISLAND_CACHE_MAX_BYTES=12345,
+        ),
+    )
+    executor = Executor.__new__(Executor)
+    executor.storage = LocalStorage()
+    executor.organization = "live-auto-cache"
+    executor._file_cache = None
+
+    cache = executor._get_file_cache(
+        IslandRuntimeConfig(None, None, None, None),
+    )
+
+    assert cache.max_bytes == 4321
+    assert cache._supertable_automatic_capacity is True
+
+
+def test_automatic_whole_cache_rebuilds_when_peer_live_limit_changes(
+    tmp_path, monkeypatch,
+):
+    import supertable.engine.executor as executor_module
+    import supertable.engine.file_cache as file_cache_module
+
+    peer_limits = []
+    budgets = iter((4096, 1024))
+
+    def automatic_budget(*_args, **kwargs):
+        peer_limits.append(tuple(kwargs["peer_limits"]))
+        return next(budgets)
+
+    monkeypatch.setattr(
+        file_cache_module, "automatic_cache_max_bytes", automatic_budget,
+    )
+    monkeypatch.setattr(
+        executor_module,
+        "settings",
+        dataclasses.replace(
+            executor_module.settings,
+            SUPERTABLE_ISLAND_CACHE_ENABLED=True,
+            SUPERTABLE_ISLAND_CACHE_DIR=str(tmp_path / "whole-peer-live"),
+            SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED=True,
+            SUPERTABLE_ISLAND_RANGE_CACHE_DIR=str(tmp_path / "range-peer-live"),
+        ),
+    )
+    executor = Executor.__new__(Executor)
+    executor.storage = LocalStorage()
+    executor.organization = "peer-live"
+    executor._file_cache = None
+    automatic = IslandRuntimeConfig(None, None, None, None)
+
+    first = executor._get_file_cache(automatic)
+    second = executor._get_file_cache(dataclasses.replace(
+        automatic, range_cache_max_bytes=2048,
+    ))
+
+    assert first.max_bytes == 4096
+    assert second.max_bytes == 1024
+    assert second is not first
+    assert peer_limits[0][0][1] == 0
+    assert peer_limits[1][0][1] == 2048
+
+
 def test_public_executor_dispatches_explicit_islanddb(
     tmp_path, numeric_reflection,
 ):
@@ -2886,6 +4605,162 @@ def test_public_executor_dispatches_explicit_islanddb(
     )
 
 
+def test_auto_materialized_query_pins_one_live_island_config_snapshot(
+    tmp_path, numeric_reflection, monkeypatch,
+):
+    import supertable.engine.executor as executor_module
+
+    snap = numeric_reflection.supers[0]
+    snap.resource_keys = list(snap.files)
+    snap.snapshot_resource_keys = list(snap.files)
+    runtime = IslandRuntimeConfig(
+        cpu_max=int(pl.thread_pool_size()),
+        memory_max_bytes=None,
+        cache_max_bytes=None,
+        range_cache_max_bytes=None,
+    )
+    duck_config = resolve_engine_config("", None, "duckdb")
+    monkeypatch.setattr(
+        executor_module,
+        "resolve_engine_bundle",
+        lambda *_args: ({"duckdb": duck_config, "islanddb": runtime}, ()),
+    )
+    executor = Executor(storage=LocalStorage(), organization="live-config")
+    monkeypatch.setattr(executor, "_get_catalog", lambda: None)
+    seen = {}
+
+    def pick(*_args, island_config=None, **_kwargs):
+        seen["route"] = island_config
+        return Engine.ISLANDDB
+
+    original_prepare = executor.island_exec.prepare_execution
+    original_execute = executor.island_exec.execute
+    original_get_file_cache = executor._get_file_cache
+
+    def get_file_cache(config=None):
+        seen["file_cache"] = config
+        return original_get_file_cache(config)
+
+    def prepare(*args, **kwargs):
+        seen["prepare"] = kwargs.get("engine_config")
+        prepared = original_prepare(*args, **kwargs)
+        seen["prepared"] = prepared.runtime_config
+        return prepared
+
+    def execute(**kwargs):
+        seen["execute"] = kwargs.get("engine_config")
+        seen["execute_prepared"] = kwargs["_prepared"].runtime_config
+        return original_execute(**kwargs)
+
+    monkeypatch.setattr(executor, "_auto_pick", pick)
+    monkeypatch.setattr(executor, "_get_file_cache", get_file_cache)
+    monkeypatch.setattr(executor.island_exec, "prepare_execution", prepare)
+    monkeypatch.setattr(executor.island_exec, "execute", execute)
+    query = "SELECT id, v FROM s.t WHERE id >= 98 ORDER BY id"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "live-config", "", query)
+    manager.query_plan_path = str(tmp_path / "materialized-live-config.json")
+
+    result, used = executor.execute(
+        Engine.AUTO,
+        numeric_reflection,
+        parser,
+        manager,
+        Timer(),
+        PlanStats(),
+        "",
+    )
+
+    assert used == "islanddb"
+    assert result["id"].tolist() == [98, 99]
+    assert set(seen.values()) == {runtime}
+
+
+def test_auto_arrow_stream_pins_one_live_island_config_snapshot(
+    tmp_path, numeric_reflection, monkeypatch,
+):
+    import supertable.engine.executor as executor_module
+
+    snap = numeric_reflection.supers[0]
+    snap.resource_keys = list(snap.files)
+    snap.snapshot_resource_keys = list(snap.files)
+    runtime = IslandRuntimeConfig(
+        cpu_max=int(pl.thread_pool_size()),
+        memory_max_bytes=None,
+        cache_max_bytes=None,
+        range_cache_max_bytes=None,
+    )
+    duck_config = resolve_engine_config("", None, "duckdb")
+    monkeypatch.setattr(
+        executor_module,
+        "resolve_engine_bundle",
+        lambda *_args: ({"duckdb": duck_config, "islanddb": runtime}, ()),
+    )
+    executor = Executor(storage=LocalStorage(), organization="live-config")
+    monkeypatch.setattr(executor, "_get_catalog", lambda: None)
+    seen = {}
+
+    def pick(*_args, island_config=None, **_kwargs):
+        seen["route"] = island_config
+        return Engine.ISLANDDB
+
+    original_prepare = executor.island_exec.prepare_execution
+    original_execute_stream = executor.island_exec.execute_stream
+    original_get_file_cache = executor._get_file_cache
+    original_get_range_cache = executor.island_exec._get_range_cache
+
+    def get_file_cache(config=None):
+        seen["file_cache"] = config
+        return original_get_file_cache(config)
+
+    def get_range_cache(config=None):
+        seen["range_cache"] = config
+        return original_get_range_cache(config)
+
+    def prepare(*args, **kwargs):
+        seen["prepare"] = kwargs.get("engine_config")
+        prepared = original_prepare(*args, **kwargs)
+        seen["prepared"] = prepared.runtime_config
+        return prepared
+
+    def execute_stream(**kwargs):
+        seen["execute"] = kwargs.get("engine_config")
+        seen["execute_prepared"] = kwargs["_prepared"].runtime_config
+        return original_execute_stream(**kwargs)
+
+    monkeypatch.setattr(executor, "_auto_pick", pick)
+    monkeypatch.setattr(executor, "_get_file_cache", get_file_cache)
+    monkeypatch.setattr(
+        executor.island_exec, "_get_range_cache", get_range_cache,
+    )
+    monkeypatch.setattr(executor.island_exec, "prepare_execution", prepare)
+    monkeypatch.setattr(
+        executor.island_exec, "execute_stream", execute_stream,
+    )
+    query = "SELECT id, v FROM s.t WHERE id >= 98 ORDER BY id"
+    parser = SQLParser("s", query, "duckdb")
+    manager = QueryPlanManager("s", "live-config", "", query)
+    manager.query_plan_path = str(tmp_path / "stream-live-config.json")
+
+    stream, used = executor.execute_stream(
+        Engine.AUTO,
+        numeric_reflection,
+        parser,
+        manager,
+        Timer(),
+        PlanStats(),
+        "",
+    )
+    with stream:
+        rows = stream.collect_table(
+            max_bytes=1024 * 1024,
+        ).column("id").to_pylist()
+
+    assert used == "islanddb"
+    assert rows == [98, 99]
+    assert set(seen.values()) == {runtime}
+
+
 def test_public_executor_arrow_stream_is_batched_and_exact(
     tmp_path, numeric_reflection,
 ):
@@ -2922,7 +4797,46 @@ def test_public_executor_arrow_stream_is_batched_and_exact(
     assert telemetry["result_rows"] == 5
 
 
-def test_public_island_stream_bounds_arbitrary_width_at_native_producer(tmp_path):
+def test_local_arrow_query_does_not_construct_unused_disk_caches(
+    tmp_path, numeric_reflection, monkeypatch,
+):
+    snap = numeric_reflection.supers[0]
+    snap.resource_keys = list(snap.files)
+    snap.snapshot_resource_keys = list(snap.files)
+    executor = Executor(
+        storage=LocalStorage(), organization="local-cache-bypass",
+    )
+
+    def unexpected_cache(*_args, **_kwargs):
+        pytest.fail("a fully local query must not size or construct disk caches")
+
+    monkeypatch.setattr(executor, "_get_file_cache", unexpected_cache)
+    monkeypatch.setattr(
+        executor.island_exec, "_get_range_cache", unexpected_cache,
+    )
+    query = "SELECT id FROM s.t WHERE id >= 98 ORDER BY id"
+    manager = QueryPlanManager("s", "island-tests", "", query)
+    manager.query_plan_path = str(tmp_path / "local-cache-bypass.json")
+
+    stream, used = executor.execute_stream(
+        Engine.ISLANDDB,
+        numeric_reflection,
+        SQLParser("s", query, "duckdb"),
+        manager,
+        Timer(),
+        PlanStats(),
+        "",
+    )
+    with stream:
+        rows = stream.collect_table(max_bytes=1024**2)["id"].to_pylist()
+
+    assert used == "islanddb"
+    assert rows == [98, 99]
+
+
+def test_public_island_stream_bounds_arbitrary_width_at_native_producer(
+    tmp_path, monkeypatch,
+):
     path = tmp_path / "wide-result.parquet"
     payload = "x" * (3 * 1024 * 1024)
     pl.DataFrame({
@@ -2940,21 +4854,31 @@ def test_public_island_stream_bounds_arbitrary_width_at_native_producer(tmp_path
             "__timestamp__": "Int64",
         },
     )
+    snapshot.column_max_value_bytes = {"payload": len(payload.encode("utf-8"))}
     reflection = _reflection(snapshot)
     query = "SELECT payload FROM s.wide"
     parser = SQLParser("s", query, "duckdb")
     manager = QueryPlanManager("s", "island-tests", "", query)
     manager.query_plan_path = str(tmp_path / "wide-result-plan.json")
 
-    stream = IslandDB().execute_stream(
+    engine = IslandDB()
+    observed_batch_rows = []
+    original_lazy_batches = engine._lazy_batches
+
+    def capture_lazy_batches(lazy_result, *, batch_rows):
+        observed_batch_rows.append(batch_rows)
+        return original_lazy_batches(lazy_result, batch_rows=batch_rows)
+
+    monkeypatch.setattr(engine, "_lazy_batches", capture_lazy_batches)
+    stream = engine.execute_stream(
         reflection,
         parser,
         manager,
         lambda _event: None,
-        max_batch_rows=1,
     )
     try:
         first = next(stream)
+        assert observed_batch_rows == [1]
         assert first.num_rows == 1
         assert 3 * 1024 * 1024 <= first.nbytes < 4 * 1024 * 1024
     finally:
@@ -3088,6 +5012,9 @@ def test_stream_holds_whole_file_cache_lease_until_closed(
             SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED=False,
         ),
     )
+    monkeypatch.setattr(
+        executor_module, "_reflection_has_remote_paths", lambda _reflection: True,
+    )
     cache = Cache()
     executor = Executor(storage=LocalStorage(), organization="island-tests")
     executor._file_cache = cache
@@ -3110,11 +5037,12 @@ def test_stream_holds_whole_file_cache_lease_until_closed(
     assert cache.active == 0
 
 
+@pytest.mark.parametrize("count_projection", ["count(*) AS n", "count(*)"])
 def test_forced_external_group_and_sort_spill_matches_duckdb(
-    tmp_path, numeric_reflection, monkeypatch,
+    tmp_path, numeric_reflection, monkeypatch, count_projection,
 ):
     query = (
-        "SELECT id, count(*) AS n FROM s.t "
+        f"SELECT id, {count_projection} FROM s.t "
         "GROUP BY id ORDER BY id"
     )
     parser = SQLParser("s", query, "duckdb")
@@ -3477,8 +5405,10 @@ def test_explicit_unsupported_query_rejects_before_cache_io(
 
 
 def test_explicit_range_island_uses_whole_file_cache_hit_only_without_admission(
-    tmp_path, numeric_reflection,
+    tmp_path, numeric_reflection, monkeypatch,
 ):
+    import supertable.engine.executor as executor_module
+
     class Metrics:
         coverage_ratio = 0.0
 
@@ -3503,6 +5433,9 @@ def test_explicit_range_island_uses_whole_file_cache_hit_only_without_admission(
     executor = Executor(storage=LocalStorage(), organization="island-tests")
     cache = HitOnlyCache(can_populate=False)
     executor._file_cache = cache
+    monkeypatch.setattr(
+        executor_module, "_reflection_has_remote_paths", lambda _reflection: True,
+    )
 
     result, used = executor.execute(
         Engine.ISLANDDB, numeric_reflection, parser, manager, Timer(),
@@ -3518,8 +5451,10 @@ def test_explicit_range_island_uses_whole_file_cache_hit_only_without_admission(
 
 
 def test_streaming_range_island_uses_whole_file_cache_hit_only_for_stream_lifetime(
-    tmp_path, numeric_reflection,
+    tmp_path, numeric_reflection, monkeypatch,
 ):
+    import supertable.engine.executor as executor_module
+
     class Metrics:
         coverage_ratio = 0.0
 
@@ -3557,6 +5492,9 @@ def test_streaming_range_island_uses_whole_file_cache_hit_only_for_stream_lifeti
     executor = Executor(storage=LocalStorage(), organization="island-tests")
     cache = HitOnlyCache()
     executor._file_cache = cache
+    monkeypatch.setattr(
+        executor_module, "_reflection_has_remote_paths", lambda _reflection: True,
+    )
 
     stream, used = executor.execute_stream(
         Engine.ISLANDDB, numeric_reflection, parser, manager, Timer(),
@@ -3802,3 +5740,148 @@ def test_range_cache_registry_reuses_process_indexes_and_is_bounded(
     # Registry eviction only drops the shared index reference; an engine/live
     # reader that already owns the old cache remains valid.
     assert first._get_range_cache() is first.range_cache
+
+
+def test_live_island_range_cache_capacity_rebuilds_for_next_query(
+    tmp_path, monkeypatch,
+):
+    import supertable.engine.islanddb as island_module
+
+    storage = _RemoteParquet("raw/source.parquet", b"parquet-placeholder")
+    monkeypatch.setattr(
+        island_module,
+        "settings",
+        dataclasses.replace(
+            island_module.settings,
+            SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED=True,
+            SUPERTABLE_ISLAND_RANGE_CACHE_DIR=str(tmp_path / "ranges"),
+        ),
+    )
+    island_module._clear_range_cache_registry()
+    engine = IslandDB(storage=storage, organization="live-config")
+    first_config = IslandRuntimeConfig(None, None, None, 1024)
+    second_config = dataclasses.replace(
+        first_config, range_cache_max_bytes=2048,
+    )
+
+    first = engine._get_range_cache(first_config)
+    second = engine._get_range_cache(second_config)
+
+    assert first.max_bytes == 1024
+    assert second.max_bytes == 2048
+    assert second is not first
+
+
+def test_unconfigured_range_cache_uses_stable_filesystem_budget(
+    tmp_path, monkeypatch,
+):
+    import supertable.engine.file_cache as file_cache_module
+    import supertable.engine.islanddb as island_module
+
+    budgets = iter((2345, 6789))
+    monkeypatch.setattr(
+        file_cache_module,
+        "automatic_cache_max_bytes",
+        lambda *_args, **_kwargs: next(budgets),
+    )
+    monkeypatch.setattr(
+        island_module,
+        "settings",
+        dataclasses.replace(
+            island_module.settings,
+            SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED=True,
+            SUPERTABLE_ISLAND_RANGE_CACHE_DIR=str(tmp_path / "ranges-auto"),
+            SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES=0,
+        ),
+    )
+    island_module._clear_range_cache_registry()
+    storage = _RemoteParquet("raw/source.parquet", b"parquet-placeholder")
+    engine = IslandDB(storage=storage, organization="auto-cache")
+
+    first = engine._get_range_cache()
+    second = engine._get_range_cache()
+
+    assert first is second
+    assert first.max_bytes == 2345
+    assert first._supertable_automatic_capacity is True
+
+
+def test_live_automatic_range_cache_overrides_positive_process_fallback(
+    tmp_path, monkeypatch,
+):
+    import supertable.engine.file_cache as file_cache_module
+    import supertable.engine.islanddb as island_module
+
+    monkeypatch.setattr(
+        file_cache_module,
+        "automatic_cache_max_bytes",
+        lambda *_args, **_kwargs: 5432,
+    )
+    monkeypatch.setattr(
+        island_module,
+        "settings",
+        dataclasses.replace(
+            island_module.settings,
+            SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED=True,
+            SUPERTABLE_ISLAND_RANGE_CACHE_DIR=str(tmp_path / "range-live-auto"),
+            SUPERTABLE_ISLAND_RANGE_CACHE_MAX_BYTES=23456,
+        ),
+    )
+    island_module._clear_range_cache_registry()
+    engine = IslandDB(
+        storage=_RemoteParquet("raw/source.parquet", b"placeholder"),
+        organization="live-auto-cache",
+    )
+
+    cache = engine._get_range_cache(
+        IslandRuntimeConfig(None, None, None, None),
+    )
+
+    assert cache.max_bytes == 5432
+    assert cache._supertable_automatic_capacity is True
+
+
+def test_automatic_range_cache_rebuilds_when_peer_live_limit_changes(
+    tmp_path, monkeypatch,
+):
+    import supertable.engine.file_cache as file_cache_module
+    import supertable.engine.islanddb as island_module
+
+    peer_limits = []
+    budgets = iter((8192, 2048))
+
+    def automatic_budget(*_args, **kwargs):
+        peer_limits.append(tuple(kwargs["peer_limits"]))
+        return next(budgets)
+
+    monkeypatch.setattr(
+        file_cache_module, "automatic_cache_max_bytes", automatic_budget,
+    )
+    monkeypatch.setattr(
+        island_module,
+        "settings",
+        dataclasses.replace(
+            island_module.settings,
+            SUPERTABLE_ISLAND_RANGE_CACHE_ENABLED=True,
+            SUPERTABLE_ISLAND_RANGE_CACHE_DIR=str(tmp_path / "range-peer-live"),
+            SUPERTABLE_ISLAND_CACHE_ENABLED=True,
+            SUPERTABLE_ISLAND_CACHE_DIR=str(tmp_path / "whole-peer-live"),
+        ),
+    )
+    island_module._clear_range_cache_registry()
+    engine = IslandDB(
+        storage=_RemoteParquet("raw/source.parquet", b"placeholder"),
+        organization="peer-live",
+    )
+    automatic = IslandRuntimeConfig(None, None, None, None)
+
+    first = engine._get_range_cache(automatic)
+    second = engine._get_range_cache(dataclasses.replace(
+        automatic, cache_max_bytes=4096,
+    ))
+
+    assert first.max_bytes == 8192
+    assert second.max_bytes == 2048
+    assert second is not first
+    assert peer_limits[0][0][1] == 0
+    assert peer_limits[1][0][1] == 4096

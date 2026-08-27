@@ -216,6 +216,28 @@ def test_auto_routes_supported_bounded_query_to_islanddb(monkeypatch):
     assert chosen is Engine.ISLANDDB
 
 
+def test_island_only_semantics_never_certify_spark(monkeypatch):
+    executor = _executor(_Catalog([_active(1)]))
+    executor.island_exec = SimpleNamespace(
+        can_execute=lambda reflection, parser, streaming_result=False: (
+            SimpleNamespace(supported=True, spark_supported=False)
+        ),
+    )
+    disabled = dataclasses.replace(
+        executor_module.settings,
+        SUPERTABLE_ISLAND_AUTO_ENABLED=False,
+    )
+    monkeypatch.setattr(executor_module, "settings", disabled)
+
+    chosen = executor._auto_pick(
+        _reflection(2 * GIB),
+        _cfg(0),
+        parser=object(),
+    )
+
+    assert chosen is Engine.DUCKDB
+
+
 def test_auto_rejects_island_when_storage_has_no_bounded_range_reader(
     monkeypatch,
 ):

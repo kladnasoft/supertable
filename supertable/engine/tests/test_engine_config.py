@@ -19,9 +19,14 @@ import redis
 
 from supertable import redis_keys as RK
 from supertable.engine.engine_config import (
+    IslandRuntimeConfig,
     match_auto_routing_policy,
     normalize_auto_routing_policy,
+    normalize_island_limit,
     normalize_memory_size,
+    resolve_engine_bundle,
+    resolve_engine_config,
+    resolve_engine_config_provenance,
     resolve_engine_configs,
 )
 from supertable.engine.engine_enum import Engine
@@ -99,6 +104,83 @@ class TestResolverNormalizes:
         with pytest.raises(redis.TimeoutError, match="policy read timed out"):
             resolve_engine_configs("kladna-soft", _Catalog())
 
+    def test_island_limits_resolve_live_from_one_org_document(self, monkeypatch):
+        monkeypatch.setenv("SUPERTABLE_ISLAND_CPU_MAX", "7")
+        stored = {
+            "duckdb": {"duckdb_threads": "2"},
+            "islanddb": {
+                "island_cpu_max": "3",
+                "island_memory_max_bytes": str(512 * 1024 * 1024),
+                "island_cache_max_bytes": "1048576",
+                "island_range_cache_max_bytes": "2097152",
+            },
+        }
+
+        class _Catalog:
+            calls = 0
+
+            def get_engine_config(self, org):
+                assert org == "kladna-soft"
+                self.calls += 1
+                return stored
+
+        catalog = _Catalog()
+        cfgs, policy = resolve_engine_bundle("kladna-soft", catalog)
+
+        assert catalog.calls == 1
+        assert policy == ()
+        assert cfgs["islanddb"] == IslandRuntimeConfig(
+            cpu_max=3,
+            memory_max_bytes=512 * 1024 * 1024,
+            cache_max_bytes=1048576,
+            range_cache_max_bytes=2097152,
+        )
+        assert cfgs["duckdb"].duckdb_threads == 2
+        assert resolve_engine_config(
+            "kladna-soft", _Catalog(), "islanddb",
+        ) == cfgs["islanddb"]
+        assert resolve_engine_configs(
+            "kladna-soft", _Catalog(),
+        )["islanddb"] == cfgs["islanddb"]
+
+        provenance = resolve_engine_config_provenance(
+            "kladna-soft", _Catalog(),
+        )
+        assert provenance["islanddb"]["island_cpu_max"] == {
+            "value": "3",
+            "source": "redis",
+            "env_var": "SUPERTABLE_ISLAND_CPU_MAX",
+            "default": "",
+        }
+
+    @pytest.mark.parametrize("value", [True, False, "-1", "1.5", "bad"])
+    def test_invalid_island_limits_fail_closed(self, value):
+        with pytest.raises(ValueError, match="non-negative integers"):
+            normalize_island_limit(value)
+
+    @pytest.mark.parametrize("value", [None, "", "0", 0])
+    def test_empty_or_zero_island_limits_select_automatic(self, value):
+        assert normalize_island_limit(value) is None
+
+    def test_invalid_stored_island_limit_rejects_the_query_config(self):
+        class _Catalog:
+            @staticmethod
+            def get_engine_config(_org):
+                return {"islanddb": {"island_memory_max_bytes": "unbounded"}}
+
+        with pytest.raises(ValueError, match="non-negative integers"):
+            resolve_engine_configs("kladna-soft", _Catalog())
+
+    @pytest.mark.parametrize("section", [None, [], "automatic"])
+    def test_wrong_shaped_stored_island_section_fails_closed(self, section):
+        class _Catalog:
+            @staticmethod
+            def get_engine_config(_org):
+                return {"islanddb": section}
+
+        with pytest.raises(ValueError, match="must be an object"):
+            resolve_engine_bundle("kladna-soft", _Catalog())
+
     @pytest.mark.parametrize("raw", ["[]", "null", "not-json"])
     def test_catalog_rejects_corrupt_engine_document(self, raw):
         redis_client = fakeredis.FakeStrictRedis(decode_responses=True)
@@ -159,3 +241,41 @@ class TestAutoRoutingPolicy:
                 {"min_bytes": 10, "max_bytes": 5, "engine": "islanddb"},
             ])
         catalog.r.set.assert_not_called()
+
+
+def test_catalog_persists_island_config_without_replacing_duckdb_or_policy():
+    redis_client = fakeredis.FakeStrictRedis(decode_responses=True)
+    catalog = RedisCatalog(redis_client=redis_client)
+    redis_client.set(
+        RK.engine_duckdb("acme"),
+        json.dumps({
+            "duckdb": {"duckdb_threads": "2"},
+            "auto_policy": [
+                {"min_bytes": 0, "max_bytes": None, "engine": "islanddb"},
+            ],
+        }),
+    )
+
+    assert catalog.set_island_engine_config("acme", {
+        "island_cpu_max": 4,
+        "island_memory_max_bytes": 0,
+        "island_cache_max_bytes": "1048576",
+        "unknown_setting": "discarded",
+    })
+
+    stored = catalog.get_engine_config("acme")
+    assert stored["duckdb"] == {"duckdb_threads": "2"}
+    assert stored["auto_policy"] == [
+        {"min_bytes": 0, "max_bytes": None, "engine": "islanddb"},
+    ]
+    assert stored["islanddb"] == {
+        "island_cpu_max": "4",
+        "island_memory_max_bytes": "0",
+        "island_cache_max_bytes": "1048576",
+    }
+
+    original = redis_client.get(RK.engine_duckdb("acme"))
+    assert not catalog.set_island_engine_config(
+        "acme", {"island_cpu_max": "1.5"},
+    )
+    assert redis_client.get(RK.engine_duckdb("acme")) == original

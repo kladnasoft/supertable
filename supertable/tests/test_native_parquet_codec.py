@@ -105,7 +105,11 @@ def test_native_codec_preserves_values_schema_binary_width_and_resource_seal():
     expected_seal = stats_seal_for_metadata(resource["file"], metadata)
     assert resource_stats_seal(resource) == expected_seal
     assert footer_cache[resource["file"]].metadata.num_rows == frame.height
-    assert resource["column_max_value_bytes"] == {"binary": 257}
+    # String is sealed in UTF-8 bytes ("xyz" is the widest value here).
+    assert resource["column_max_value_bytes"] == {
+        "string": 3,
+        "binary": 257,
+    }
     assert resource["file_size"] == len(payload)
     assert profiler.emit_counts().get("parquet_codec_polars") == 1
     assert profiler.emit_counts().get("parquet_codec_pyarrow", 0) == 0

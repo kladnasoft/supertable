@@ -43,6 +43,7 @@ from supertable.config.homedir import get_app_home
 from supertable.config.settings import settings
 from supertable.engine.file_cache import (
     FileCache,
+    RANGE_CACHE_SUBDIR,
     _canonical_json,
     _metadata_identity_token,
     _metadata_size,
@@ -57,7 +58,7 @@ from supertable.storage.storage_interface import (
 
 
 _FORMAT_VERSION = 1
-_RANGE_DIR = "ranges-v1"
+_RANGE_DIR = RANGE_CACHE_SUBDIR
 _CHUNK_NAME = re.compile(r"^[0-9a-f]{16}-[0-9a-f]{16}$")
 _DEFAULT_MAX_BYTES = 5 * 1024 * 1024 * 1024
 # Data objects addressed by this cache are immutable and version-sealed.  Keep

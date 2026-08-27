@@ -248,6 +248,37 @@ def test_stream_monitoring_finalizes_on_exhaustion_with_measured_rows_bytes():
     )]
 
 
+def test_stream_monitoring_finalizes_from_idle_backend_terminal_callback():
+    from supertable.data_reader import _MonitoredResultStream, Status
+
+    class Inner:
+        schema = pa.schema([("id", pa.int64())])
+        closed = False
+
+        def add_terminal_callback(self, callback):
+            self.callback = callback
+
+        def finish(self, kind):
+            self.closed = True
+            self.callback(kind)
+
+    outcomes = []
+    inner = Inner()
+    stream = _MonitoredResultStream(
+        inner,
+        lambda status, message, rows, size: outcomes.append(
+            (status, message, rows, size)
+        ),
+    )
+
+    inner.finish("timed_out")
+
+    assert stream.closed is True
+    assert outcomes == [(
+        Status.ERROR.value, "result stream timed out", 0, 0,
+    )]
+
+
 def test_stream_monitoring_records_close_failure_as_error():
     from supertable.data_reader import _MonitoredResultStream, Status
 

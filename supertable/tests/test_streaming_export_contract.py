@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import threading
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -464,6 +465,21 @@ class _IslandDeliveryFailure:
         self.closed = True
 
 
+class _LifecycleIslandDeliveryFailure(_IslandDeliveryFailure):
+    def __init__(self):
+        super().__init__()
+        self._terminal_callbacks = []
+
+    def add_terminal_callback(self, callback):
+        self._terminal_callbacks.append(callback)
+
+    def close(self):
+        super().close()
+        callbacks, self._terminal_callbacks = self._terminal_callbacks, []
+        for callback in callbacks:
+            callback("closed")
+
+
 def _auto_stream_executor(monkeypatch, cache, island):
     # These tests exercise AUTO's cache/fallback state machine, not the
     # separately covered presigned-path mode. Keep ambient .env settings from
@@ -583,6 +599,31 @@ def test_auto_stream_safe_first_batch_failure_releases_island_then_falls_back(
     )
     assert outcome["actual_engine"] == "duckdb"
     assert outcome["stage"] == "first_batch"
+
+
+def test_auto_stream_fallback_forwards_idle_duckdb_timeout(monkeypatch):
+    cache = _AutoStreamCache(coverage_ratio=1.0)
+    failed = _LifecycleIslandDeliveryFailure()
+    island = _AutoStreamIsland(failed)
+    executor, _duck, reflection, _bundle_calls = _auto_stream_executor(
+        monkeypatch, cache, island,
+    )
+    stats = PlanStats()
+    stream, used = executor.execute_stream(
+        Engine.AUTO, reflection, MagicMock(), SimpleNamespace(), Timer(),
+        stats, "", deadline_monotonic=time.monotonic() + 0.5,
+    )
+
+    assert used == "islanddb"
+    assert next(stream).column(0).to_pylist() == [7, 8]
+    wait_until = time.monotonic() + 2.0
+    while stream.terminal_kind is None and time.monotonic() < wait_until:
+        time.sleep(0.01)
+
+    assert stream.terminal_kind == "timed_out"
+    assert cache.active == 0
+    with pytest.raises(TimeoutError, match="timed out"):
+        next(stream)
 
 
 def test_auto_stream_never_falls_back_after_an_observable_batch(monkeypatch):

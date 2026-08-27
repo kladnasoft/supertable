@@ -25,11 +25,13 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import threading
 import time
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -44,6 +46,33 @@ DEFAULT_ENGINE_MEMORY_BYTES = 2 * GIB
 DEFAULT_PIDS_LIMIT = 1024
 DEFAULT_SPILL_MAX_BYTES = 28 * GIB
 ARTIFACT_FORMAT_VERSION = 1
+
+
+def _duckdb_setting_bytes(value: object) -> int | None:
+    match = re.fullmatch(
+        r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?i?B)\s*",
+        str(value or ""),
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    units = {
+        "b": 1,
+        "kb": 1000,
+        "mb": 1000**2,
+        "gb": 1000**3,
+        "tb": 1000**4,
+        "kib": 1024,
+        "mib": 1024**2,
+        "gib": 1024**3,
+        "tib": 1024**4,
+    }
+    try:
+        parsed = Decimal(match.group(1)) * units[match.group(2).casefold()]
+    except (InvalidOperation, KeyError):
+        return None
+    integral = int(parsed)
+    return integral if parsed == integral and integral > 0 else None
 
 
 class ContainerBenchmarkError(RuntimeError):
@@ -109,6 +138,7 @@ class ContainerRunnerConfig:
     pids_limit: int = DEFAULT_PIDS_LIMIT
     spill_max_bytes: int = DEFAULT_SPILL_MAX_BYTES
     engine_memory_bytes: int = DEFAULT_ENGINE_MEMORY_BYTES
+    container_memory_bytes: int = CONTAINER_MEMORY_BYTES
 
     def __post_init__(self) -> None:
         if not str(self.image).strip():
@@ -125,9 +155,15 @@ class ContainerRunnerConfig:
             raise ContainerConfigurationError("pids_limit must be positive")
         if int(self.spill_max_bytes) <= 0:
             raise ContainerConfigurationError("spill_max_bytes must be positive")
-        if not 0 < int(self.engine_memory_bytes) < CONTAINER_MEMORY_BYTES:
+        if int(self.container_memory_bytes) <= 0:
             raise ContainerConfigurationError(
-                "engine_memory_bytes must be positive and below the 4-GiB cgroup"
+                "container_memory_bytes must be positive"
+            )
+        if not 0 < int(self.engine_memory_bytes) < int(
+            self.container_memory_bytes
+        ):
+            raise ContainerConfigurationError(
+                "engine_memory_bytes must be positive and below the cgroup limit"
             )
 
 
@@ -514,6 +550,18 @@ class _ContainerSampler:
         ]
         first = cgroups[0] if cgroups else {}
         last = cgroups[-1] if cgroups else {}
+
+        def counter_bounds(key: str) -> tuple[Mapping[str, Any] | None, Mapping[str, Any] | None]:
+            values = [
+                value
+                for cgroup in cgroups
+                if isinstance((value := cgroup.get(key)), Mapping) and value
+            ]
+            return (
+                values[0] if values else None,
+                values[-1] if values else None,
+            )
+
         observed_cpusets = sorted(
             {
                 str(cgroup["cpuset_cpus_effective"])
@@ -521,8 +569,20 @@ class _ContainerSampler:
                 if cgroup.get("cpuset_cpus_effective")
             }
         )
-        first_io = first.get("io_totals")
-        last_io = last.get("io_totals")
+        first_cpu, last_cpu = counter_bounds("cpu_stat")
+        first_io, last_io = counter_bounds("io_totals")
+        first_cpu_pressure, last_cpu_pressure = counter_bounds(
+            "cpu_pressure_parsed"
+        )
+        first_io_pressure, last_io_pressure = counter_bounds(
+            "io_pressure_parsed"
+        )
+        first_memory_pressure, last_memory_pressure = counter_bounds(
+            "memory_pressure_parsed"
+        )
+        first_memory_events, last_memory_events = counter_bounds(
+            "memory_events"
+        )
         return {
             "sample_interval_seconds": self.interval_seconds,
             "sample_count": len(self.samples),
@@ -537,23 +597,23 @@ class _ContainerSampler:
             ),
             "cgroup_memory_peak_bytes": max(memory_peak, default=None),
             "cgroup_cpu_stat_delta": _counter_delta(
-                first.get("cpu_stat"), last.get("cpu_stat")
+                first_cpu, last_cpu
             ),
             "cgroup_io_delta": _counter_delta(first_io, last_io),
             "cgroup_cpu_pressure_total_delta_usec": _pressure_total_delta(
-                first.get("cpu_pressure_parsed"),
-                last.get("cpu_pressure_parsed"),
+                first_cpu_pressure,
+                last_cpu_pressure,
             ),
             "cgroup_io_pressure_total_delta_usec": _pressure_total_delta(
-                first.get("io_pressure_parsed"),
-                last.get("io_pressure_parsed"),
+                first_io_pressure,
+                last_io_pressure,
             ),
             "cgroup_memory_pressure_total_delta_usec": _pressure_total_delta(
-                first.get("memory_pressure_parsed"),
-                last.get("memory_pressure_parsed"),
+                first_memory_pressure,
+                last_memory_pressure,
             ),
             "cgroup_memory_event_delta": _counter_delta(
-                first.get("memory_events"), last.get("memory_events")
+                first_memory_events, last_memory_events
             ),
             "pids_current_high_water": max(pids_current, default=None),
             "pids_peak_high_water": max(pids_peak, default=None),
@@ -596,7 +656,7 @@ def _containerize_request_paths(
     if not isinstance(plan, dict):
         raise ContainerConfigurationError("benchmark request has no mutable plan")
     replacements: dict[str, str] = {}
-    for field in ("files", "original_files", "resource_keys"):
+    for field in ("files", "original_files"):
         values = plan.get(field)
         if values is None:
             continue
@@ -610,6 +670,25 @@ def _containerize_request_paths(
             replacements[value] = replacement
             mapped.append(replacement)
         plan[field] = mapped
+    for field in ("resource_keys", "original_resource_keys"):
+        values = plan.get(field)
+        if values is None:
+            continue
+        if not isinstance(values, list) or not all(
+            isinstance(value, str) for value in values
+        ):
+            raise ContainerConfigurationError(f"plan.{field} must be a string list")
+        # Historical benchmark manifests used resolved paths as resource keys;
+        # map those exact values for compatibility.  Real logical object keys
+        # must remain stable because deletion-vector ``__file__`` values are
+        # joined against them inside both engines.
+        plan[field] = [replacements.get(value, value) for value in values]
+    tombstone = plan.get("tombstone")
+    if isinstance(tombstone, dict) and isinstance(tombstone.get("path"), str):
+        original_tombstone_path = tombstone["path"]
+        mapped_tombstone_path = _container_path(original_tombstone_path, root)
+        replacements[original_tombstone_path] = mapped_tombstone_path
+        tombstone["path"] = mapped_tombstone_path
     if not plan.get("files"):
         raise ContainerConfigurationError("benchmark plan has no source files")
 
@@ -647,9 +726,9 @@ def _normalize_request(
         normalized["memory_limit_bytes"] = int(config.engine_memory_bytes)
     else:
         configured_memory = int(configured_memory)
-        if not 0 < configured_memory < CONTAINER_MEMORY_BYTES:
+        if not 0 < configured_memory < int(config.container_memory_bytes):
             raise ContainerConfigurationError(
-                "engine memory limit must be positive and below the 4-GiB cgroup"
+                "engine memory limit must be positive and below the cgroup limit"
             )
         normalized["memory_limit_bytes"] = configured_memory
     return normalized
@@ -721,9 +800,9 @@ def _docker_command(
         "--cpuset-cpus",
         config.cpuset_cpus,
         "--memory",
-        str(CONTAINER_MEMORY_BYTES),
+        str(config.container_memory_bytes),
         "--memory-swap",
-        str(CONTAINER_MEMORY_BYTES),
+        str(config.container_memory_bytes),
         "--memory-swappiness",
         "0",
         "--pids-limit",
@@ -799,6 +878,28 @@ def _json_command(arguments: Sequence[str], *, timeout: float = 30) -> Any:
         ) from None
 
 
+def _redact_docker_inspect(inspect: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if inspect is None:
+        return None
+    redacted = copy.deepcopy(dict(inspect))
+    for field in ("Config", "ContainerConfig"):
+        config = redacted.get(field)
+        if not isinstance(config, dict):
+            continue
+        environment = config.get("Env")
+        if isinstance(environment, list):
+            config["Env"] = [
+                f"{str(item).partition('=')[0]}=<redacted>"
+                for item in environment
+            ]
+        labels = config.get("Labels")
+        if isinstance(labels, Mapping):
+            config["Labels"] = {
+                str(name): "<redacted>" for name in labels
+            }
+    return redacted
+
+
 def _image_provenance(docker: str, image: str) -> dict[str, Any]:
     raw = _json_command([docker, "image", "inspect", image])
     if not isinstance(raw, list) or not raw or not isinstance(raw[0], Mapping):
@@ -815,6 +916,7 @@ def _image_provenance(docker: str, image: str) -> dict[str, Any]:
             else None
         )
     )
+    labels = (inspect.get("Config") or {}).get("Labels")
     return {
         "reference": image,
         "id": inspect.get("Id"),
@@ -823,8 +925,8 @@ def _image_provenance(docker: str, image: str) -> dict[str, Any]:
         "created": inspect.get("Created"),
         "architecture": inspect.get("Architecture"),
         "os": inspect.get("Os"),
-        "labels": ((inspect.get("Config") or {}).get("Labels")),
-        "inspect": inspect,
+        "label_keys": sorted(str(name) for name in (labels or {})),
+        "inspect": _redact_docker_inspect(inspect),
     }
 
 
@@ -859,6 +961,61 @@ def _git_identity(repo_root: Path) -> dict[str, Any]:
     describe = _run_git(repo_root, "describe", "--always", "--dirty", "--tags")
     status = _run_git(repo_root, "status", "--short", "--untracked-files=all")
     diff = _run_git(repo_root, "diff", "--binary", "HEAD", "--", ".")
+    try:
+        untracked_result = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=repo_root,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        untracked_paths = (
+            sorted(
+                value for value in untracked_result.stdout.split(b"\0")
+                if value
+            )
+            if untracked_result.returncode == 0 else None
+        )
+    except (OSError, subprocess.SubprocessError):
+        untracked_paths = None
+
+    workspace_hash = None
+    untracked_hash = None
+    if diff is not None and untracked_paths is not None:
+        workspace_digest = hashlib.sha256()
+        untracked_digest = hashlib.sha256()
+        workspace_digest.update(b"tracked-diff\0")
+        workspace_digest.update(diff.encode("utf-8"))
+        for raw_path in untracked_paths:
+            relative = Path(os.fsdecode(raw_path))
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ContainerConfigurationError(
+                    "Git returned an unsafe untracked path"
+                )
+            path = repo_root / relative
+            metadata = path.lstat()
+            entry = hashlib.sha256()
+            entry.update(raw_path)
+            entry.update(b"\0")
+            if stat.S_ISLNK(metadata.st_mode):
+                entry.update(b"symlink\0")
+                entry.update(os.fsencode(os.readlink(path)))
+            elif stat.S_ISREG(metadata.st_mode):
+                entry.update(b"file\0")
+                with path.open("rb") as handle:
+                    while True:
+                        chunk = handle.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        entry.update(chunk)
+            else:
+                entry.update(f"special:{metadata.st_mode}".encode("ascii"))
+            sealed_entry = entry.digest()
+            untracked_digest.update(sealed_entry)
+            workspace_digest.update(b"untracked\0")
+            workspace_digest.update(sealed_entry)
+        untracked_hash = untracked_digest.hexdigest()
+        workspace_hash = workspace_digest.hexdigest()
     return {
         "head": head.strip() if head else None,
         "branch": branch.strip() if branch else None,
@@ -870,6 +1027,11 @@ def _git_identity(repo_root: Path) -> dict[str, Any]:
             if diff is not None
             else None
         ),
+        "untracked_file_count": (
+            len(untracked_paths) if untracked_paths is not None else None
+        ),
+        "untracked_files_sha256": untracked_hash,
+        "workspace_state_sha256": workspace_hash,
     }
 
 
@@ -919,13 +1081,17 @@ def _validate_success_boundary(
     response: Mapping[str, Any],
     inspect: Mapping[str, Any] | None,
     config: ContainerRunnerConfig,
+    request: Mapping[str, Any],
+    host_sampler: Mapping[str, Any],
 ) -> None:
     errors: list[str] = []
     host_config = dict((inspect or {}).get("HostConfig") or {})
     state = dict((inspect or {}).get("State") or {})
-    if int(host_config.get("Memory") or 0) != CONTAINER_MEMORY_BYTES:
-        errors.append("Docker inspect did not retain the 4-GiB memory limit")
-    if int(host_config.get("MemorySwap") or 0) != CONTAINER_MEMORY_BYTES:
+    if int(host_config.get("Memory") or 0) != int(config.container_memory_bytes):
+        errors.append("Docker inspect did not retain the configured memory limit")
+    if int(host_config.get("MemorySwap") or 0) != int(
+        config.container_memory_bytes
+    ):
         errors.append("Docker inspect did not retain zero additional swap")
     if int(host_config.get("NanoCpus") or 0) != CONTAINER_CPUS * 1_000_000_000:
         errors.append("Docker inspect did not retain the four-CPU quota")
@@ -940,8 +1106,8 @@ def _validate_success_boundary(
 
     context = dict(result.get("execution_context") or {})
     cgroup = dict(context.get("cgroup_v2") or {})
-    if cgroup.get("memory_max_bytes") != CONTAINER_MEMORY_BYTES:
-        errors.append("worker did not observe the 4-GiB cgroup")
+    if cgroup.get("memory_max_bytes") != int(config.container_memory_bytes):
+        errors.append("worker did not observe the configured memory cgroup")
     if cgroup.get("swap_max_bytes") != 0:
         errors.append("worker observed usable cgroup swap")
     memory_events = dict(context.get("cgroup_memory_event_delta") or {})
@@ -952,6 +1118,58 @@ def _validate_success_boundary(
         errors.append(f"worker observed OOM events: {memory_events}")
     if int(context.get("configured_threads") or 0) != CONTAINER_CPUS:
         errors.append("worker did not retain four configured threads")
+    configured_memory = int(request.get("memory_limit_bytes") or 0)
+    if int(context.get("configured_memory_limit_bytes") or 0) != configured_memory:
+        errors.append("worker did not retain the configured engine memory limit")
+    if context.get("island_memory_limit_bytes") != configured_memory:
+        errors.append("IslandDB did not resolve the configured engine memory limit")
+    if context.get("island_memory_available_bytes") != configured_memory:
+        errors.append("IslandDB did not expose the configured memory workspace")
+    if int(context.get("polars_thread_pool_size") or 0) != CONTAINER_CPUS:
+        errors.append("Polars did not initialize with exactly four workers")
+    if str(context.get("duckdb_threads_override") or "") != str(CONTAINER_CPUS):
+        errors.append("DuckDB did not retain the four-thread override")
+    if str(context.get("island_max_memory_bytes_env") or "") != str(
+        configured_memory
+    ):
+        errors.append("IslandDB memory environment does not match the request")
+    if str(request.get("engine")) == "duckdb":
+        if int(context.get("duckdb_threads") or 0) != CONTAINER_CPUS:
+            errors.append("DuckDB did not use exactly four effective threads")
+        if _duckdb_setting_bytes(
+            context.get("duckdb_memory_limit")
+        ) != configured_memory:
+            errors.append("DuckDB effective memory limit differs from the request")
+        if bool(request.get("disable_caches", False)):
+            if context.get("duckdb_enable_external_file_cache") is not False:
+                errors.append("DuckDB external file cache remained enabled")
+            if context.get("duckdb_enable_http_metadata_cache") is not False:
+                errors.append("DuckDB HTTP metadata cache remained enabled")
+    if bool(request.get("disable_caches", False)):
+        if context.get("island_whole_cache_enabled_setting") is not False:
+            errors.append("IslandDB whole-object cache setting remained enabled")
+        if context.get("island_range_cache_enabled_setting") is not False:
+            errors.append("IslandDB range-cache setting remained enabled")
+        if context.get("island_whole_cache_active") is not False:
+            errors.append("IslandDB whole-object cache became active")
+        if context.get("island_range_cache_active") is not False:
+            errors.append("IslandDB range cache became active")
+
+    if int(host_sampler.get("sample_count") or 0) < 2:
+        errors.append("host sampler captured fewer than two observations")
+    if host_sampler.get("effective_cpuset_verified") is not True:
+        errors.append("host sampler did not verify the effective CPU set")
+    cpu_delta = host_sampler.get("cgroup_cpu_stat_delta")
+    if not isinstance(cpu_delta, Mapping) or int(cpu_delta.get("usage_usec") or 0) <= 0:
+        errors.append("host sampler captured no usable cgroup CPU counter")
+    memory_peak = host_sampler.get("cgroup_memory_peak_bytes")
+    if (
+        not isinstance(memory_peak, int)
+        or isinstance(memory_peak, bool)
+        or memory_peak <= 0
+        or memory_peak > int(config.container_memory_bytes)
+    ):
+        errors.append("host sampler captured no valid bounded memory peak")
 
     provenance = response.get("worker_provenance")
     after = (
@@ -1109,6 +1327,7 @@ def run_container_series(
                 f"error_type={safe_exception_type(exc)}"
             )
 
+    sampler_summary = sampler.summary()
     status = "worker_failed"
     validation_error: str | None = None
     result: dict[str, Any] | None = None
@@ -1141,6 +1360,8 @@ def run_container_series(
                 response=response,
                 inspect=inspect,
                 config=config,
+                request=normalized,
+                host_sampler=sampler_summary,
             )
             status = "passed"
         except ContainerBenchmarkError as exc:
@@ -1150,7 +1371,7 @@ def run_container_series(
                 f"error_type={safe_exception_type(exc)}"
             )
 
-    sampler_summary = sampler.summary()
+    redacted_inspect = _redact_docker_inspect(inspect)
     artifact = {
         "format_version": ARTIFACT_FORMAT_VERSION,
         "benchmark": "fresh_container_engine_series",
@@ -1165,7 +1386,7 @@ def run_container_series(
         "limits": {
             "cpus": CONTAINER_CPUS,
             "cpuset_cpus": config.cpuset_cpus,
-            "memory_bytes": CONTAINER_MEMORY_BYTES,
+            "memory_bytes": int(config.container_memory_bytes),
             "swap_bytes": 0,
             "pids": config.pids_limit,
             "engine_memory_bytes": normalized["memory_limit_bytes"],
@@ -1178,7 +1399,7 @@ def run_container_series(
         "validation_error": validation_error,
         "launch_error": launch_error,
         "command": command,
-        "docker_inspect": inspect,
+        "docker_inspect": redacted_inspect,
         "host_sampler": sampler_summary,
         "provenance": {
             "git": git,
@@ -1215,7 +1436,7 @@ def run_container_series(
         "artifact": str(attempt_root / "attempt.json"),
         "limits": artifact["limits"],
         "request_sha256": request_digest,
-        "docker_inspect": inspect,
+        "docker_inspect": redacted_inspect,
         "host_sampler": sampler_summary,
         "provenance": artifact["provenance"],
         "spill_after_worker": artifact["spill_after_worker"],

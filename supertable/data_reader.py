@@ -191,6 +191,9 @@ class _MonitoredResultStream:
         self._finalize_complete = False
         self._finalizing_thread: Optional[int] = None
         self._finalize_error: BaseException | None = None
+        add_terminal_callback = getattr(inner, "add_terminal_callback", None)
+        if callable(add_terminal_callback):
+            add_terminal_callback(self._inner_terminal)
 
     def __iter__(self):
         return self
@@ -250,6 +253,29 @@ class _MonitoredResultStream:
     def _is_finalized(self) -> bool:
         with self._finalize_condition:
             return self._finalized
+
+    def _inner_terminal(self, kind: str) -> None:
+        if kind == "completed":
+            status, message = Status.OK.value, None
+        elif kind == "timed_out":
+            status, message = Status.ERROR.value, "result stream timed out"
+        elif kind == "cancelled":
+            status, message = Status.ERROR.value, "result stream cancelled"
+        elif kind == "failed":
+            status, message = Status.ERROR.value, _QUERY_STREAM_ERROR
+        else:
+            status = Status.ERROR.value
+            message = "result stream closed before exhaustion"
+        try:
+            self._finish(status, message)
+        except BaseException as exc:
+            # A watcher-thread callback cannot raise into the request thread.
+            # _finish retains the error so any later stream operation observes
+            # it; protected failure audit emission has already been attempted.
+            logger.error(
+                "stream terminal monitoring failed; error_type=%s",
+                safe_exception_type(exc),
+            )
 
     def __next__(self):
         try:
@@ -909,6 +935,9 @@ class DataReader:
         actual_engine = str(
             getattr(engine_used, "value", engine_used) or ""
         )[:64]
+        audit_outcome = (
+            Outcome.SUCCESS if outcome == "success" else Outcome.FAILURE
+        )
         emit(
             category=EventCategory.DATA_ACCESS,
             action=Actions.QUERY_EXECUTE,
@@ -930,7 +959,7 @@ class DataReader:
                 "column_count": max(0, int(result_columns)),
                 "outcome": outcome,
             },
-            outcome=Outcome.SUCCESS,
+            outcome=audit_outcome,
         )
 
     def _assert_targets_exist(self, physical_tables) -> None:
@@ -2113,6 +2142,7 @@ class DataReader:
                 })
                 stream_timer.capture_and_reset_timing(event="EXECUTING_QUERY")
                 stream_timer.capture_duration(event="TOTAL_EXECUTE")
+                monitoring_error: Optional[MonitoringPostExecutionError] = None
                 try:
                     extend_execution_plan(
                         query_plan_manager=stream_qpm,
@@ -2130,22 +2160,46 @@ class DataReader:
                     safe_cause = MonitoringDurabilityError(
                         "monitoring durability failure"
                     )
-                    raise MonitoringPostExecutionError(
+                    monitoring_error = MonitoringPostExecutionError(
                         organization=stream_qpm.organization,
                         super_name=stream_qpm.super_name,
                         query_id=str(getattr(stream_qpm, "query_id", "")),
                         status=final_status,
                         cause=safe_cause,
-                    ) from None
+                    )
                 finally:
                     stream_timer.capture_and_reset_timing(event="EXTENDING_PLAN")
-                if final_status == Status.OK.value:
-                    self._emit_successful_query_audit(
-                        role_name=role_name,
-                        engine_used=_engine_used,
-                        result_rows=result_rows,
-                        result_columns=result_columns,
+                audit_engine = _actual_engine_from_plan_stats(
+                    stream_plan_stats,
+                    fallback=_engine_used,
+                )
+                try:
+                    if final_status == Status.OK.value:
+                        self._emit_successful_query_audit(
+                            role_name=role_name,
+                            engine_used=audit_engine,
+                            result_rows=result_rows,
+                            result_columns=result_columns,
+                        )
+                    else:
+                        self._emit_successful_query_audit(
+                            role_name=role_name,
+                            engine_used=audit_engine,
+                            result_rows=result_rows,
+                            result_columns=result_columns,
+                            outcome="failure",
+                        )
+                except Exception:
+                    if final_status == Status.OK.value and monitoring_error is None:
+                        raise
+                    # Preserve the producer/cancellation or monitoring error
+                    # just as the materialized failure path does.
+                    logger.debug(
+                        self._lp("failed to emit query failure audit"),
+                        exc_info=True,
                     )
+                if monitoring_error is not None:
+                    raise monitoring_error
 
             return (
                 _MonitoredResultStream(result_value, _finalize_stream_monitoring),
@@ -2771,6 +2825,32 @@ def _engine_name(value: Any) -> str:
     return str(raw or "").strip().casefold()
 
 
+def _actual_engine_from_plan_stats(plan_stats: Any, *, fallback: Any) -> str:
+    """Resolve a stream's engine only after deferred delivery has finished."""
+    try:
+        stats = tuple(
+            entry for entry in (getattr(plan_stats, "stats", ()) or ())
+            if isinstance(entry, dict)
+        )
+        outcome = _latest_plan_stat(stats, "AUTO_ROUTING_OUTCOME")
+        if isinstance(outcome, dict):
+            actual = _engine_name(outcome.get("actual_engine"))
+            if actual:
+                return actual
+        recorded = _engine_name(_latest_plan_stat(stats, "ENGINE"))
+        if recorded:
+            return recorded
+        for entry in reversed(stats):
+            attempt = entry.get("ENGINE_ATTEMPT")
+            if isinstance(attempt, dict):
+                attempted = _engine_name(attempt.get("engine"))
+                if attempted:
+                    return attempted
+    except Exception:
+        pass
+    return _engine_name(fallback)
+
+
 def _update_query_out(
     reader: DataReader,
     out: Optional[Dict[str, Any]],
@@ -2837,14 +2917,10 @@ def _update_query_out(
     if not selected and isinstance(outcome, dict):
         selected = _engine_name(outcome.get("selected_engine"))
 
-    actual = ""
+    actual = _actual_engine_from_plan_stats(plan_stats, fallback="")
     fallback = False
     if isinstance(outcome, dict):
-        actual = _engine_name(outcome.get("actual_engine"))
         fallback = bool(outcome.get("fallback", False))
-    actual = actual or _engine_name(recorded_engine)
-    if not actual and engine_attempts:
-        actual = _engine_name(engine_attempts[-1].get("engine"))
     selected = selected or actual or requested
     if actual and selected and not isinstance(outcome, dict):
         fallback = actual != selected

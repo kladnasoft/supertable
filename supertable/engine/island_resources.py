@@ -17,7 +17,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Iterator, Optional, Sequence
 
 import pyarrow as pa
@@ -117,14 +117,201 @@ def _default_cgroup_dir(cgroup_root: Path, proc_root: Path) -> Path:
     if text:
         for line in text.splitlines():
             if line.startswith("0::"):
-                relative = line[3:].lstrip("/")
-                return cgroup_root / relative
+                return _contained_cgroup_path(cgroup_root, line[3:])
     return cgroup_root
+
+
+def _contained_cgroup_path(root: Path, relative: str) -> Path:
+    """Resolve one proc-reported cgroup path without escaping its mount."""
+    resolved_root = root.resolve()
+    candidate = (resolved_root / str(relative or "").lstrip("/")).resolve()
+    try:
+        candidate.relative_to(resolved_root)
+    except ValueError:
+        return resolved_root
+    return candidate
+
+
+def _ancestor_cgroups(leaf: Path, root: Path) -> tuple[Path, ...]:
+    """Return leaf-to-root hierarchy entries contained by one mount."""
+    resolved_root = root.resolve()
+    current = leaf.resolve()
+    try:
+        current.relative_to(resolved_root)
+    except ValueError:
+        return (current,)
+    result = []
+    while True:
+        result.append(current)
+        if current == resolved_root:
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return tuple(result)
+
+
+def _proc_cgroup_paths(
+    proc_root: Path,
+) -> tuple[Optional[str], dict[str, str], bool]:
+    """Return cgroup paths plus whether present process metadata was invalid."""
+    unified: Optional[str] = None
+    controllers: dict[str, str] = {}
+    metadata_path = proc_root / "self" / "cgroup"
+    try:
+        metadata_path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        metadata_present = False
+    except OSError:
+        return None, {}, True
+    else:
+        metadata_present = True
+    raw_text = _read_text(metadata_path)
+    text = raw_text or ""
+    malformed = bool(metadata_present and not text)
+    for line in text.splitlines():
+        fields = line.split(":", 2)
+        if len(fields) != 3:
+            malformed = True
+            continue
+        hierarchy, names, relative = fields
+        if not hierarchy.isdigit() or not relative.startswith("/"):
+            malformed = True
+            continue
+        if ".." in PurePosixPath(relative).parts:
+            # A proc-reported path may never select data outside its controller
+            # mount.  Falling back to the mount root remains conservative: its
+            # limits are ancestors of every legitimate process leaf.
+            relative = "/"
+        if hierarchy == "0" and names == "":
+            if unified is not None:
+                malformed = True
+            unified = relative
+            continue
+        if hierarchy == "0" or not names:
+            malformed = True
+            continue
+        for name in names.split(","):
+            name = name.strip()
+            if name:
+                controllers[name] = relative
+            else:
+                malformed = True
+    return unified, controllers, malformed
+
+
+def _v1_controller_mount(cgroup_root: Path, controller: str) -> Optional[Path]:
+    """Find one conventional cgroup-v1 controller mount below the root."""
+    root = cgroup_root.resolve()
+    direct = root / controller
+    if direct.is_dir():
+        resolved = direct.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            return None
+        return resolved
+    try:
+        children = tuple(root.iterdir())
+    except OSError:
+        return None
+    for child in children:
+        if child.is_dir() and controller in child.name.split(","):
+            resolved = child.resolve()
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                continue
+            return resolved
+    return None
+
+
+def _mountinfo_cgroup_mounts(
+    proc_root: Path,
+    cgroup_root: Path,
+) -> tuple[tuple[tuple[Path, str], ...], dict[str, tuple[tuple[Path, str], ...]]]:
+    """Return contained cgroup mounts as ``(mountpoint, hierarchy_root)``."""
+
+    def unescape(value: str) -> str:
+        for encoded, decoded in (
+            ("\\040", " "), ("\\011", "\t"),
+            ("\\012", "\n"), ("\\134", "\\"),
+        ):
+            value = value.replace(encoded, decoded)
+        return value
+
+    allowed_root = cgroup_root.resolve()
+    unified: list[tuple[Path, str]] = []
+    legacy: dict[str, list[tuple[Path, str]]] = {}
+    text = _read_text(proc_root / "self" / "mountinfo") or ""
+    for line in text.splitlines():
+        fields = line.split()
+        try:
+            separator = fields.index("-")
+            mount_root = unescape(fields[3])
+            mountpoint = Path(unescape(fields[4])).resolve()
+            filesystem = fields[separator + 1]
+            source = fields[separator + 2]
+            super_options = fields[separator + 3]
+        except (ValueError, IndexError):
+            continue
+        try:
+            mountpoint.relative_to(allowed_root)
+        except ValueError:
+            continue
+        item = (mountpoint, mount_root)
+        if filesystem == "cgroup2":
+            unified.append(item)
+            continue
+        if filesystem != "cgroup":
+            continue
+        controller_tokens = set()
+        for value in (source, super_options, mountpoint.name):
+            controller_tokens.update(
+                token.strip() for token in value.split(",") if token.strip()
+            )
+        for controller in ("cpu", "cpuacct", "cpuset", "memory"):
+            if controller in controller_tokens:
+                legacy.setdefault(controller, []).append(item)
+    return (
+        tuple(unified),
+        {name: tuple(items) for name, items in legacy.items()},
+    )
+
+
+def _mounted_cgroup_leaf(
+    mounts: Sequence[tuple[Path, str]],
+    process_path: str,
+) -> Optional[tuple[Path, Path]]:
+    """Map a proc hierarchy path through its most-specific mount root."""
+    process = PurePosixPath("/" + str(process_path or "").lstrip("/"))
+    if ".." in process.parts:
+        return None
+    candidates = []
+    for mountpoint, raw_mount_root in mounts:
+        mount_root = PurePosixPath(
+            "/" + str(raw_mount_root or "").lstrip("/")
+        )
+        if ".." in mount_root.parts:
+            continue
+        try:
+            relative = process.relative_to(mount_root)
+        except ValueError:
+            continue
+        candidates.append((len(mount_root.parts), mountpoint, relative))
+    if not candidates:
+        return None
+    _specificity, mountpoint, relative = max(
+        candidates, key=lambda item: item[0],
+    )
+    leaf = _contained_cgroup_path(mountpoint, str(relative))
+    return leaf, mountpoint.resolve()
 
 
 @dataclass(frozen=True)
 class ContainerResources:
-    """Effective limits after intersecting host, affinity, and cgroup v2."""
+    """Effective limits after intersecting host, affinity, and cgroup state."""
 
     cpu_count: int
     cpu_capacity: float
@@ -146,7 +333,61 @@ class ContainerResources:
     ) -> "ContainerResources":
         cgroup_root = Path(cgroup_root)
         proc_root = Path(proc_root)
-        cg = Path(cgroup_dir) if cgroup_dir is not None else _default_cgroup_dir(cgroup_root, proc_root)
+        unified_path, v1_paths, controller_metadata_malformed = (
+            _proc_cgroup_paths(proc_root)
+        )
+        resolved_root = cgroup_root.resolve()
+        v2_mounts, v1_mounts = _mountinfo_cgroup_mounts(
+            proc_root, resolved_root,
+        )
+        if cgroup_dir is not None:
+            cg = Path(cgroup_dir).resolve()
+            try:
+                cg.relative_to(resolved_root)
+                hierarchy_root = resolved_root
+            except ValueError:
+                # Explicit test/embedded controller directories are their own
+                # hierarchy boundary; never walk arbitrary filesystem parents.
+                hierarchy_root = cg
+            v2_entries = _ancestor_cgroups(cg, hierarchy_root)
+            use_v2 = True
+        else:
+            mounted_v2 = (
+                _mounted_cgroup_leaf(v2_mounts, unified_path)
+                if unified_path is not None else None
+            )
+            if mounted_v2 is not None:
+                cg, hierarchy_root = mounted_v2
+            else:
+                hierarchy_root = resolved_root
+                cg = (
+                    _contained_cgroup_path(resolved_root, unified_path)
+                    if unified_path is not None else resolved_root
+                )
+                conventional_entries = _ancestor_cgroups(cg, hierarchy_root)
+                if unified_path is not None and not any(
+                    (directory / marker).exists()
+                    for directory in conventional_entries
+                    for marker in (
+                        "cgroup.controllers", "cgroup.procs", "cgroup.type",
+                        "cpu.max", "memory.max",
+                    )
+                ):
+                    # /proc declared a unified hierarchy, but neither
+                    # mountinfo nor the configured conventional root proves a
+                    # usable controller boundary. Treat it as untrusted rather
+                    # than silently reverting to host resources.
+                    controller_metadata_malformed = True
+            use_v2 = bool(
+                unified_path is not None
+                or v2_mounts
+                or (resolved_root / "cgroup.controllers").exists()
+                or (resolved_root / "cpu.max").exists()
+                or (resolved_root / "memory.max").exists()
+            )
+            v2_entries = (
+                _ancestor_cgroups(cg, hierarchy_root) if use_v2 else ()
+            )
 
         if affinity is None:
             try:
@@ -158,34 +399,199 @@ class ContainerResources:
         if not affinity_tuple:
             affinity_tuple = (0,)
 
-        cpuset_text = _read_text(cg / "cpuset.cpus.effective")
-        if cpuset_text is None:
-            cpuset_text = _read_text(cg / "cpuset.cpus")
-        try:
-            cpuset = parse_cpuset(cpuset_text or "")
-        except (TypeError, ValueError):
-            # A malformed kernel/control-plane file must reduce optimization,
-            # not make query execution unavailable.
+        cpuset_sets: list[set[int]] = []
+        quota_capacities: list[float] = []
+        cgroup_memory: list[tuple[int, int]] = []
+        cpu_control_malformed = controller_metadata_malformed
+        memory_control_malformed = controller_metadata_malformed
+
+        if use_v2:
+            for directory in v2_entries:
+                cpuset_text = _read_text(directory / "cpuset.cpus.effective")
+                if cpuset_text is None:
+                    cpuset_text = _read_text(directory / "cpuset.cpus")
+                try:
+                    parsed_cpuset = parse_cpuset(cpuset_text or "")
+                except (TypeError, ValueError):
+                    parsed_cpuset = ()
+                    if cpuset_text not in (None, ""):
+                        cpu_control_malformed = True
+                if parsed_cpuset:
+                    cpuset_sets.append(set(parsed_cpuset))
+
+                cpu_max = _read_text(directory / "cpu.max")
+                if cpu_max is not None:
+                    fields = cpu_max.split()
+                    valid_cpu_max = False
+                    if len(fields) == 2:
+                        try:
+                            period = int(fields[1])
+                            if fields[0] == "max" and period > 0:
+                                valid_cpu_max = True
+                            else:
+                                quota = int(fields[0])
+                                if quota > 0 and period > 0:
+                                    valid_cpu_max = True
+                                    quota_capacities.append(quota / period)
+                        except ValueError:
+                            pass
+                    if not valid_cpu_max:
+                        cpu_control_malformed = True
+
+                memory_max_text = _read_text(directory / "memory.max")
+                if memory_max_text is not None and memory_max_text != "max":
+                    try:
+                        limit = int(memory_max_text)
+                    except ValueError:
+                        cgroup_memory.append((0, 0))
+                        continue
+                    if limit < 0:
+                        cgroup_memory.append((0, 0))
+                        continue
+                    current_text = _read_text(directory / "memory.current")
+                    if current_text is None:
+                        available = 0
+                    else:
+                        try:
+                            current = int(current_text)
+                            available = (
+                                max(0, limit - current)
+                                if current >= 0 else 0
+                            )
+                        except ValueError:
+                            available = 0
+                    cgroup_memory.append((
+                        limit, available,
+                    ))
+        def v1_hierarchy(controller: str) -> Optional[tuple[Path, Path]]:
+            relative = v1_paths.get(controller)
+            if relative is None:
+                return None
+            mounted = _mounted_cgroup_leaf(
+                v1_mounts.get(controller, ()), relative,
+            )
+            if mounted is not None:
+                return mounted
+            mount = _v1_controller_mount(resolved_root, controller)
+            if mount is None:
+                return None
+            return _contained_cgroup_path(mount, relative), mount
+
+        if v1_paths:
+            cpuset_hierarchy = v1_hierarchy("cpuset")
+            if cpuset_hierarchy is not None:
+                leaf, cpuset_mount = cpuset_hierarchy
+                for directory in _ancestor_cgroups(leaf, cpuset_mount):
+                    try:
+                        parsed_cpuset = parse_cpuset(
+                            _read_text(directory / "cpuset.cpus") or ""
+                        )
+                    except (TypeError, ValueError):
+                        parsed_cpuset = ()
+                        cpuset_text = _read_text(directory / "cpuset.cpus")
+                        if cpuset_text not in (None, ""):
+                            cpu_control_malformed = True
+                    if parsed_cpuset:
+                        cpuset_sets.append(set(parsed_cpuset))
+            elif "cpuset" in v1_paths:
+                cpu_control_malformed = True
+
+            cpu_hierarchy = v1_hierarchy("cpu")
+            if cpu_hierarchy is not None:
+                leaf, cpu_mount = cpu_hierarchy
+                for directory in _ancestor_cgroups(leaf, cpu_mount):
+                    quota_text = _read_text(
+                        directory / "cpu.cfs_quota_us"
+                    )
+                    period_text = _read_text(
+                        directory / "cpu.cfs_period_us"
+                    )
+                    if quota_text is None and period_text is None:
+                        continue
+                    try:
+                        quota = int(quota_text) if quota_text is not None else 0
+                        period = int(period_text) if period_text is not None else 0
+                    except ValueError:
+                        cpu_control_malformed = True
+                        continue
+                    if period <= 0 or quota == 0 or quota < -1:
+                        cpu_control_malformed = True
+                    elif quota > 0:
+                        quota_capacities.append(quota / period)
+            elif "cpu" in v1_paths:
+                cpu_control_malformed = True
+
+            memory_hierarchy = v1_hierarchy("memory")
+            if memory_hierarchy is not None:
+                leaf, memory_mount = memory_hierarchy
+                for directory in _ancestor_cgroups(leaf, memory_mount):
+                    limit_text = _read_text(
+                        directory / "memory.limit_in_bytes"
+                    )
+                    if limit_text is None:
+                        continue
+                    try:
+                        limit = int(limit_text)
+                    except ValueError:
+                        cgroup_memory.append((0, 0))
+                        continue
+                    if limit < 0:
+                        cgroup_memory.append((0, 0))
+                        continue
+                    usage_text = _read_text(
+                        directory / "memory.usage_in_bytes"
+                    )
+                    if usage_text is None:
+                        available = 0
+                    else:
+                        try:
+                            current = int(usage_text)
+                            available = (
+                                max(0, limit - current)
+                                if current >= 0 else 0
+                            )
+                        except ValueError:
+                            available = 0
+                    cgroup_memory.append((
+                        limit, available,
+                    ))
+            elif "memory" in v1_paths:
+                memory_control_malformed = True
+
+        if memory_control_malformed:
+            cgroup_memory.append((0, 0))
+
+        if cpuset_sets:
+            effective_cpuset = set(cpuset_sets[0])
+            for item in cpuset_sets[1:]:
+                effective_cpuset.intersection_update(item)
+            cpuset = tuple(sorted(effective_cpuset))
+            if not cpuset:
+                # Individually valid but contradictory ancestor controls are
+                # a racing/corrupt controller state, not an absent constraint.
+                cpu_control_malformed = True
+        else:
             cpuset = ()
 
         cpu_ceiling = len(affinity_tuple)
         if cpuset:
             intersection = set(affinity_tuple).intersection(cpuset)
-            cpu_ceiling = len(intersection) if intersection else min(cpu_ceiling, len(cpuset))
+            if intersection:
+                cpu_ceiling = len(intersection)
+            else:
+                # sched affinity and the effective cgroup cpuset must overlap
+                # for a healthy process. Fail closed while their snapshots are
+                # inconsistent instead of treating either set as authoritative.
+                cpu_control_malformed = True
+        if cpu_control_malformed:
+            # A present but unreadable controller must not silently widen the
+            # native worker pool to host affinity. One worker is the smallest
+            # executable Polars configuration; valid tighter fractional quota
+            # information below is still retained in ``cpu_capacity``.
+            cpu_ceiling = min(cpu_ceiling, 1)
         cpu_ceiling = max(1, cpu_ceiling)
 
-        quota_capacity: Optional[float] = None
-        cpu_max = _read_text(cg / "cpu.max")
-        if cpu_max:
-            fields = cpu_max.split()
-            if len(fields) >= 2 and fields[0] != "max":
-                try:
-                    quota = int(fields[0])
-                    period = int(fields[1])
-                    if quota > 0 and period > 0:
-                        quota_capacity = quota / period
-                except ValueError:
-                    quota_capacity = None
+        quota_capacity = min(quota_capacities) if quota_capacities else None
         cpu_capacity = min(float(cpu_ceiling), quota_capacity) if quota_capacity else float(cpu_ceiling)
         cpu_capacity = max(0.01, cpu_capacity)
         cpu_count = max(1, min(cpu_ceiling, int(math.floor(cpu_capacity))))
@@ -202,28 +608,14 @@ class ContainerResources:
             host_available_bytes is not None or detected_available is not None
         ) else host_total
 
-        memory_max_text = _read_text(cg / "memory.max")
-        cgroup_limit: Optional[int] = None
-        if memory_max_text and memory_max_text != "max":
-            try:
-                parsed = int(memory_max_text)
-                if parsed > 0:
-                    cgroup_limit = parsed
-            except ValueError:
-                pass
-        memory_limit = _positive_min((host_total, cgroup_limit), host_total)
-
-        cgroup_available: Optional[int] = None
-        if cgroup_limit is not None:
-            current_text = _read_text(cg / "memory.current")
-            try:
-                current = max(0, int(current_text)) if current_text is not None else 0
-                cgroup_available = max(0, cgroup_limit - current)
-            except ValueError:
-                cgroup_available = cgroup_limit
+        memory_limit = min(
+            max(0, host_total),
+            *(limit for limit, _available in cgroup_memory),
+        ) if cgroup_memory else max(0, host_total)
         available_candidates = [max(0, host_available)]
-        if cgroup_available is not None:
-            available_candidates.append(max(0, cgroup_available))
+        available_candidates.extend(
+            max(0, available) for _limit, available in cgroup_memory
+        )
         memory_available = min(available_candidates) if available_candidates else memory_limit
         memory_available = min(memory_available, memory_limit)
 
@@ -356,6 +748,7 @@ class QueryResourcePlan:
     spill_budget_bytes: int
     estimated_spill_bytes: int
     reason: str
+    max_result_row_bytes: int = 0
 
     @property
     def runs_on_island(self) -> bool:
@@ -389,6 +782,14 @@ class ResourcePlanner:
 
     def plan(self, estimate: QueryResourceEstimate, *, streaming_result: bool = False) -> QueryResourcePlan:
         policy = self.policy
+        max_result_row_bytes = (
+            (
+                estimate.result_bytes
+                + estimate.estimated_result_rows
+                - 1
+            ) // estimate.estimated_result_rows
+            if estimate.estimated_result_rows > 0 else 0
+        )
         available = min(self.resources.memory_available_bytes, self.resources.memory_limit_bytes)
         # A plan that is larger than the shared governor can never be admitted.
         # Keep unusual-but-valid configuration (query fraction > global
@@ -414,6 +815,7 @@ class ResourcePlanner:
                 spill_budget_bytes=0,
                 estimated_spill_bytes=0,
                 reason="available memory is below IslandDB's minimum bounded workspace",
+                max_result_row_bytes=max_result_row_bytes,
             )
 
         result_memory = min(
@@ -484,6 +886,7 @@ class ResourcePlanner:
                 spill_budget_bytes=0,
                 estimated_spill_bytes=0,
                 reason="decoded/result estimates are incomplete",
+                max_result_row_bytes=max_result_row_bytes,
             )
 
         oversized_result = estimate.result_bytes > result_memory
@@ -560,6 +963,7 @@ class ResourcePlanner:
                 spill_budget_bytes=0,
                 estimated_spill_bytes=estimated_spill,
                 reason="estimated result exceeds bounded collection memory; use streaming output",
+                max_result_row_bytes=max_result_row_bytes,
             )
 
         if state_excess == 0 and not estimate.requires_bounded_group_operator:
@@ -581,6 +985,7 @@ class ResourcePlanner:
                     if oversized_result
                     else "working state fits the bounded in-memory plan"
                 ),
+                max_result_row_bytes=max_result_row_bytes,
             )
 
         if not estimate.spillable:
@@ -598,6 +1003,7 @@ class ResourcePlanner:
                 spill_budget_bytes=0,
                 estimated_spill_bytes=estimated_spill,
                 reason="operator state exceeds memory and the plan has no bounded spill implementation",
+                max_result_row_bytes=max_result_row_bytes,
             )
 
         free_for_spill = max(0, self._disk_free() - policy.min_spill_free_bytes)
@@ -622,6 +1028,7 @@ class ResourcePlanner:
                 spill_budget_bytes=spill_budget,
                 estimated_spill_bytes=estimated_spill,
                 reason="the bounded spill estimate exceeds configured/free disk capacity",
+                max_result_row_bytes=max_result_row_bytes,
             )
 
         return QueryResourcePlan(
@@ -647,6 +1054,7 @@ class ResourcePlanner:
                     else "operator state requires and fits a bounded spill plan"
                 )
             ),
+            max_result_row_bytes=max_result_row_bytes,
         )
 
 

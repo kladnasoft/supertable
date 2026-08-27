@@ -3,11 +3,16 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import importlib
 import json
 import math
 from pathlib import Path
 
 import pytest
+
+benchmark_runner = importlib.import_module(
+    "supertable.engine.benchmarks.runner"
+)
 
 from supertable.engine.benchmarks.corpus import (
     CorpusSpec,
@@ -31,6 +36,8 @@ from supertable.engine.benchmarks.runner import (
     _profile_metrics,
     _proc_io_counters,
     _validate_cold_physical_read,
+    _validate_series_evidence,
+    assert_arrow_schema_parity,
     assert_exact_parity,
     assert_independent_oracle,
     canonical_frame,
@@ -40,6 +47,77 @@ from supertable.engine.benchmarks.runner import (
     run_isolated_worker,
     summarize_series,
 )
+
+
+def test_arrow_schema_parity_rejects_equal_values_with_different_contracts():
+    def result(fingerprint, canonical):
+        return {
+            "samples": [{
+                "stream_delivery": {
+                    "arrow_schema": {
+                        "ipc_sha256": fingerprint,
+                        "canonical": canonical,
+                    },
+                },
+            }],
+        }
+
+    with pytest.raises(BenchmarkParityError, match="Arrow schema differs"):
+        assert_arrow_schema_parity(
+            result("a" * 64, "value: int64"),
+            result("b" * 64, "value: int64 not null"),
+            label="schema-regression",
+        )
+
+
+def test_series_evidence_rejects_vacuous_arrow_success():
+    with pytest.raises(BenchmarkWorkerError, match="expected 1"):
+        _validate_series_evidence(
+            {"engine": "duckdb", "samples": []},
+            {
+                "engine": "duckdb",
+                "warm_repeats": 0,
+                "plan": {"arrow_stream_result": True},
+            },
+            label="empty-series",
+        )
+
+
+def test_series_evidence_rejects_timed_schema_drift_from_parity():
+    result = {
+        "engine": "duckdb",
+        "result_digest": "d" * 64,
+        "samples": [{
+            "temperature": "cold",
+            "result_digest": "d" * 64,
+            "result_mode": "arrow_stream",
+            "stream_delivery": {
+                "configured_max_batch_rows": 4096,
+                "configured_max_batch_bytes": 4 * 1024**2,
+                "observed_max_batch_rows": 1,
+                "observed_max_batch_bytes": 8,
+                "batch_count": 1,
+                "row_count": 1,
+                "arrow_bytes": 8,
+                "arrow_schema": {
+                    "ipc_sha256": "b" * 64,
+                    "canonical": "value: int64",
+                },
+            },
+        }],
+    }
+
+    with pytest.raises(BenchmarkWorkerError, match="differs from parity"):
+        _validate_series_evidence(
+            result,
+            {
+                "engine": "duckdb",
+                "warm_repeats": 0,
+                "plan": {"arrow_stream_result": True},
+            },
+            label="schema-drift",
+            expected_arrow_schema_fingerprint="a" * 64,
+        )
 
 
 def test_profile_metrics_preserves_corrected_island_telemetry(tmp_path):
@@ -285,6 +363,169 @@ def test_spill_group_dispatches_only_island_through_bounded_stream(
     assert duck_executor.streaming_calls == 0
     assert duck_executor.materialized_calls == 1
     assert duck["result_mode"] == "pandas"
+
+
+@pytest.mark.parametrize("engine_name", ["duckdb", "islanddb"])
+def test_matched_arrow_mode_streams_both_engines_with_delivery_telemetry(
+    tiny_manifest, engine_name,
+):
+    pa = pytest.importorskip("pyarrow")
+    from supertable.engine.engine_enum import Engine
+
+    plan = plan_workload(
+        tiny_manifest,
+        build_workloads(tiny_manifest["total_rows"], payload_columns=2)[
+            "range_1pct"
+        ],
+    )
+    plan["arrow_stream_result"] = True
+
+    class Stream:
+        schema = pa.schema([pa.field("value", pa.int64())])
+        closed = False
+
+        def __iter__(self):
+            return iter([
+                pa.record_batch([pa.array([1])], schema=self.schema),
+            ])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed = True
+
+    class FakeExecutor:
+        def __init__(self):
+            self.stream = Stream()
+            self.stream_kwargs = None
+            self.materialized_calls = 0
+
+        def execute_stream(self, **kwargs):
+            self.stream_kwargs = kwargs
+            return self.stream, engine_name
+
+        def execute(self, **_kwargs):
+            self.materialized_calls += 1
+            raise AssertionError("matched Arrow mode must not materialize")
+
+    executor = FakeExecutor()
+    engine = Engine.DUCKDB if engine_name == "duckdb" else Engine.ISLANDDB
+    sample = _execute_one(executor, engine, plan, 0)
+
+    assert executor.materialized_calls == 0
+    assert executor.stream.closed is True
+    assert sample["result_mode"] == "arrow_stream"
+    assert sample["stream_delivery"]["batch_count"] == 1
+    assert sample["stream_delivery"]["row_count"] == 1
+    assert sample["stream_delivery"]["arrow_bytes"] > 0
+    assert sample["stream_delivery"]["observed_max_batch_rows"] == 1
+    assert sample["stream_delivery"]["observed_max_batch_bytes"] > 0
+    assert sample["stream_delivery"]["stream_completion_seconds"] >= 0
+    assert sample["stream_delivery"]["arrow_table_build_seconds"] >= 0
+    assert len(
+        sample["stream_delivery"]["arrow_schema"]["ipc_sha256"]
+    ) == 64
+    assert "value: int64" in sample["stream_delivery"]["arrow_schema"][
+        "canonical"
+    ]
+    assert executor.stream_kwargs["max_batch_rows"] > 0
+    assert executor.stream_kwargs["max_batch_bytes"] > 0
+
+
+def test_matched_arrow_mode_rejects_an_observed_oversized_batch(tiny_manifest):
+    pa = pytest.importorskip("pyarrow")
+    from supertable.engine.engine_enum import Engine
+
+    plan = plan_workload(
+        tiny_manifest,
+        build_workloads(tiny_manifest["total_rows"], payload_columns=2)[
+            "range_1pct"
+        ],
+    )
+    plan["arrow_stream_result"] = True
+
+    class Stream:
+        schema = pa.schema([pa.field("value", pa.int64())])
+        closed = False
+
+        def __iter__(self):
+            return iter([pa.record_batch([
+                pa.array(range(4097), type=pa.int64()),
+            ], schema=self.schema)])
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed = True
+
+    class FakeExecutor:
+        def __init__(self):
+            self.stream = Stream()
+
+        def execute_stream(self, **_kwargs):
+            return self.stream, "duckdb"
+
+    executor = FakeExecutor()
+
+    with pytest.raises(RuntimeError, match="batch exceeded"):
+        _execute_one(executor, Engine.DUCKDB, plan, 0)
+
+    assert executor.stream.closed is True
+
+
+@pytest.mark.parametrize("failure", ["iterator", "collection_limit"])
+def test_matched_arrow_mode_closes_stream_on_consumer_failure(
+    tiny_manifest, monkeypatch, failure,
+):
+    pa = pytest.importorskip("pyarrow")
+    from supertable.engine.engine_enum import Engine
+
+    plan = plan_workload(
+        tiny_manifest,
+        build_workloads(tiny_manifest["total_rows"], payload_columns=2)[
+            "range_1pct"
+        ],
+    )
+    plan["arrow_stream_result"] = True
+
+    class Stream:
+        schema = pa.schema([pa.field("value", pa.int64())])
+
+        def __init__(self):
+            self.closed = 0
+
+        def __iter__(self):
+            batch = pa.record_batch([pa.array([1])], schema=self.schema)
+            yield batch
+            if failure == "iterator":
+                raise RuntimeError("consumer iteration failed")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed += 1
+
+    class Executor:
+        def __init__(self):
+            self.stream = Stream()
+
+        def execute_stream(self, **_kwargs):
+            return self.stream, "duckdb"
+
+    executor = Executor()
+    if failure == "collection_limit":
+        monkeypatch.setattr(
+            benchmark_runner, "ISLAND_STREAM_RESULT_MAX_BYTES", 1,
+        )
+    expected = "consumer iteration failed" if failure == "iterator" else "exceeded"
+
+    with pytest.raises(RuntimeError, match=expected):
+        _execute_one(executor, Engine.DUCKDB, plan, 0)
+
+    assert executor.stream.closed == 1
 
 
 def test_source_repeat_is_explicit_and_preserves_unique_backing_metrics(tiny_manifest):
@@ -543,6 +784,7 @@ def test_summarize_series_reports_warm_resource_distributions():
                 "rss_peak_bytes": 90,
                 "rss_peak_delta_bytes": 9,
                 "process_io_delta": {"read_bytes": 50},
+                "stream_delivery": {"stream_completion_seconds": 0.4},
             },
             {
                 "temperature": "warm",
@@ -551,6 +793,7 @@ def test_summarize_series_reports_warm_resource_distributions():
                 "rss_peak_bytes": 100,
                 "rss_peak_delta_bytes": 10,
                 "process_io_delta": {"read_bytes": 100, "write_bytes": 5},
+                "stream_delivery": {"stream_completion_seconds": 0.1},
             },
             {
                 "temperature": "warm",
@@ -559,6 +802,7 @@ def test_summarize_series_reports_warm_resource_distributions():
                 "rss_peak_bytes": 120,
                 "rss_peak_delta_bytes": 20,
                 "process_io_delta": {"read_bytes": 200},
+                "stream_delivery": {"stream_completion_seconds": 0.2},
             },
             {
                 "temperature": "warm",
@@ -567,6 +811,7 @@ def test_summarize_series_reports_warm_resource_distributions():
                 "rss_peak_bytes": 140,
                 "rss_peak_delta_bytes": 30,
                 "process_io_delta": {"read_bytes": 400, "write_bytes": 15},
+                "stream_delivery": {"stream_completion_seconds": 0.3},
             },
         ]
     }
@@ -574,11 +819,13 @@ def test_summarize_series_reports_warm_resource_distributions():
     summary = summarize_series(series)
 
     assert summary["cold_cpu_seconds"] == 2.0
+    assert summary["cold_stream_delivery"]["stream_completion_seconds"] == 0.4
     assert summary["cold_mean_cpu_cores"] == 0.5
     assert summary["warm_samples"] == 3
     assert summary["warm_wall_seconds_min"] == 1.0
     assert summary["warm_wall_seconds_mean"] == 2.0
     assert summary["warm_wall_seconds_median"] == 2.0
+    assert summary["warm_stream_completion_seconds_median"] == 0.2
     assert summary["warm_wall_seconds_max"] == 3.0
     assert summary["warm_wall_seconds_p95"] == pytest.approx(2.9)
     assert summary["warm_wall_seconds_stddev"] == pytest.approx(math.sqrt(2 / 3))

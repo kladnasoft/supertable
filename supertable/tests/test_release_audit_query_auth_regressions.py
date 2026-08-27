@@ -302,7 +302,7 @@ def test_engine_config_reads_24_sections_without_restoring_public_modes(
 
     configs, policy = resolve_engine_bundle("org", catalog)
 
-    assert set(configs) == {"duckdb"}
+    assert set(configs) == {"duckdb", "islanddb"}
     assert configs["duckdb"].duckdb_memory_limit == "3GB"
     assert configs["duckdb"].duckdb_threads == 2
     assert configs["duckdb"].engine_island_min_bytes == 1234

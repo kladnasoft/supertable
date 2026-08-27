@@ -1464,6 +1464,42 @@ def test_concurrent_engine_and_policy_updates_preserve_both_sections(monkeypatch
     ]
 
 
+def test_concurrent_duckdb_and_island_updates_preserve_both_sections(
+    monkeypatch,
+):
+    catalog, client = _catalog()
+    key = RK.engine_duckdb("acme")
+    client.set(
+        key,
+        json.dumps({
+            "duckdb": {"duckdb_threads": 1},
+            "islanddb": {"island_cpu_max": "1"},
+            "auto_policy": [
+                {"min_bytes": 0, "max_bytes": None, "engine": "islanddb"},
+            ],
+        }),
+    )
+    _coordinate_first_reads(monkeypatch, client, key)
+
+    results = _run_concurrently(
+        lambda: catalog.set_engine_config("acme", {"duckdb_threads": 8}),
+        lambda: catalog.set_island_engine_config(
+            "acme", {"island_cpu_max": 4, "island_cache_max_bytes": 4096},
+        ),
+    )
+
+    assert results == [True, True]
+    stored = catalog.get_engine_config("acme")
+    assert stored["duckdb"] == {"duckdb_threads": 8}
+    assert stored["islanddb"] == {
+        "island_cpu_max": "4",
+        "island_cache_max_bytes": "4096",
+    }
+    assert stored["auto_policy"] == [
+        {"min_bytes": 0, "max_bytes": None, "engine": "islanddb"},
+    ]
+
+
 def test_engine_update_does_not_replace_document_after_ambiguous_read(monkeypatch):
     catalog, client = _catalog()
     key = RK.engine_duckdb("acme")

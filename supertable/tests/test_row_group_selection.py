@@ -356,10 +356,18 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
             "raw/f.parquet", 0, "payload", 0, 9, rows=5_000_000,
             compressed=100, uncompressed=500,
         ),
+        _stat_row(
+            "raw/f.parquet", 0, "label", 0, 9, rows=5_000_000,
+            compressed=103, uncompressed=503,
+        ),
         _stat_row("raw/f.parquet", 1, "id", 10, 19),
         _stat_row(
             "raw/f.parquet", 1, "payload", 10, 19,
             compressed=101, uncompressed=501,
+        ),
+        _stat_row(
+            "raw/f.parquet", 1, "label", 10, 19,
+            compressed=104, uncompressed=504,
         ),
         _stat_row(
             "raw/f.parquet", 2, "id", 20, 29, rows=5_000_000,
@@ -367,6 +375,10 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
         _stat_row(
             "raw/f.parquet", 2, "payload", 20, 29, rows=5_000_000,
             compressed=102, uncompressed=502,
+        ),
+        _stat_row(
+            "raw/f.parquet", 2, "label", 20, 29, rows=5_000_000,
+            compressed=105, uncompressed=505,
         ),
     ])
     snapshot = {
@@ -378,14 +390,16 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
             "snapshot_version": 1,
             # Complete cached snapshots publish policy state explicitly.
             "_row_filter": None,
-            "schema": {"id": "BIGINT", "payload": "Binary"},
+            "schema": {
+                "id": "BIGINT", "payload": "Binary", "label": "String",
+            },
             "stats_file": "stats.parquet",
-            "stats_rows": 6,
+            "stats_rows": 9,
             "resources": [{
                 "file": "raw/f.parquet",
                 "file_size": 1_000,
                 "rows": 10_000_004,
-                "column_max_value_bytes": {"payload": 257},
+                "column_max_value_bytes": {"payload": 257, "label": 17},
             }],
             "tombstone": None,
             "tombstone_rows": 0,
@@ -445,7 +459,10 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
     assert super_snapshot.resource_stats_seals == {
         "raw/f.parquet": resource_seal,
     }
-    assert super_snapshot.column_max_value_bytes == {"payload": 257}
+    assert super_snapshot.column_max_value_bytes == {
+        "payload": 257,
+        "label": 17,
+    }
     assert super_snapshot.integer_domain_bounds["id"].minimum == 10
     assert super_snapshot.integer_domain_bounds["id"].maximum == 19
     assert (
@@ -577,6 +594,28 @@ def test_binary_decoded_memory_uses_exact_snapshot_value_width_bound():
     assert decoded == 1_000_000 * (511 + 4 + 1)
 
 
+def test_string_decoded_memory_uses_exact_utf8_value_width_bound():
+    frame = _stats([
+        _stat_row(
+            "f", 0, "label", 1, 1,
+            rows=1_000_000, compressed=128, uncompressed=256,
+        ),
+    ])
+    estimator = DataEstimator.__new__(DataEstimator)
+
+    decoded, complete = estimator._decoded_row_group_estimate(
+        frame,
+        ["f"],
+        {"label"},
+        {},
+        {"label": "String"},
+        {"label": 511},
+    )
+
+    assert complete is True
+    assert decoded == 1_000_000 * (511 + 16 + 1)
+
+
 @pytest.mark.parametrize("bound", [None, -1, True, "511"])
 def test_binary_decoded_memory_rejects_missing_or_malformed_bound(bound):
     frame = _stats([_stat_row("f", 0, "payload", 1, 1)])
@@ -585,4 +624,15 @@ def test_binary_decoded_memory_rejects_missing_or_malformed_bound(bound):
 
     assert estimator._decoded_row_group_estimate(
         frame, ["f"], {"payload"}, {}, {"payload": "Binary"}, bounds,
+    ) == (0, False)
+
+
+@pytest.mark.parametrize("bound", [None, -1, True, "511"])
+def test_string_decoded_memory_rejects_missing_or_malformed_bound(bound):
+    frame = _stats([_stat_row("f", 0, "label", 1, 1)])
+    estimator = DataEstimator.__new__(DataEstimator)
+    bounds = {} if bound is None else {"label": bound}
+
+    assert estimator._decoded_row_group_estimate(
+        frame, ["f"], {"label"}, {}, {"label": "String"}, bounds,
     ) == (0, False)

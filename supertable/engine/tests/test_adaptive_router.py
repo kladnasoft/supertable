@@ -25,6 +25,8 @@ def _features(scan: int, **changes) -> RoutingFeatures:
         "row_group_bytes_complete": True,
         "decoded_bytes_complete": True,
     }
+    if changes.get("island_advice") and "island_plan_evaluated" not in changes:
+        changes["island_plan_evaluated"] = True
     values.update(changes)
     return RoutingFeatures(**values)
 
@@ -46,6 +48,43 @@ def test_small_query_prefers_lite_after_cost_race():
 
     assert decision.engine is Engine.DUCKDB
     assert "lowest predicted latency" in decision.reason
+
+
+def test_unsupported_island_query_does_not_claim_resource_plan_failure():
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
+        _features(512 * MIB),
+        _availability(island_enabled=True, island_supported=False),
+    )
+
+    island = next(
+        candidate
+        for candidate in decision.candidates
+        if candidate.engine is Engine.ISLANDDB
+    )
+    assert "query outside IslandDB capability subset" in island.rejection_reasons
+    assert not any(
+        "resource plan" in reason for reason in island.rejection_reasons
+    )
+
+
+def test_evaluated_non_executable_island_plan_is_reported_separately():
+    decision = AdaptiveEngineRouter(island_min_bytes=100 * MIB).decide(
+        _features(
+            512 * MIB,
+            island_plan_evaluated=True,
+            island_advice="route_duckdb",
+        ),
+        _availability(island_enabled=True, island_supported=True),
+    )
+
+    island = next(
+        candidate
+        for candidate in decision.candidates
+        if candidate.engine is Engine.ISLANDDB
+    )
+    assert "IslandDB resource plan is not executable" in (
+        island.rejection_reasons
+    )
 
 
 def test_stable_medium_projection_prefers_bounded_island():

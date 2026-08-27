@@ -264,7 +264,7 @@ def test_deep_string_output_bounds_huge_values_with_exact_identity(quality_table
     assert second.encode("utf-8") not in payload
 
 
-def test_auto_keeps_certified_sql_on_duckdb_when_resource_proof_is_incomplete(
+def test_auto_uses_island_when_certified_sql_resource_proof_is_complete(
     quality_table,
 ):
     sql = build_custom_rule_sql({
@@ -291,8 +291,9 @@ def test_auto_keeps_certified_sql_on_duckdb_when_resource_proof_is_incomplete(
     assert oracle.ok, oracle.message
     assert automatic.ok, automatic.message
     assert automatic.island_supported is True
-    assert automatic.selected_engine == "duckdb"
-    assert automatic.actual_engine == "duckdb"
+    assert automatic.selected_engine == "islanddb"
+    assert automatic.actual_engine == "islanddb"
+    assert automatic.fallback is False
     assert_frame_equal(oracle.frame, automatic.frame, check_dtype=False)
 
 

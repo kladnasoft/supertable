@@ -110,6 +110,471 @@ def test_detect_intersects_affinity_cpuset_quota_and_memory(tmp_path):
     assert resources.memory_available_bytes == 1536 * MIB
 
 
+@pytest.mark.parametrize(
+    ("controller_file", "malformed"),
+    [
+        ("cpu.max", "not-a-quota"),
+        ("cpuset.cpus.effective", "0-bad"),
+    ],
+)
+def test_detect_malformed_v2_cpu_control_fails_to_one_worker(
+    tmp_path, controller_file, malformed,
+):
+    cg = tmp_path / "cg"
+    cg.mkdir()
+    (cg / controller_file).write_text(malformed)
+
+    resources = ContainerResources.detect(
+        cgroup_dir=cg,
+        proc_root=tmp_path / "missing-proc",
+        affinity=tuple(range(8)),
+        host_memory_bytes=8 * GIB,
+        host_available_bytes=8 * GIB,
+    )
+
+    assert resources.cpu_count == 1
+    assert resources.cpu_capacity == 1.0
+
+
+def test_detect_intersects_every_cgroup_v2_ancestor(tmp_path):
+    root = tmp_path / "cgroup"
+    parent = root / "parent.slice"
+    leaf = parent / "worker.scope"
+    proc = tmp_path / "proc"
+    leaf.mkdir(parents=True)
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text(
+        "0::/parent.slice/worker.scope\n",
+    )
+    (root / "cgroup.controllers").write_text("cpu cpuset memory\n")
+    (root / "cpuset.cpus.effective").write_text("0-7\n")
+    (parent / "cpuset.cpus.effective").write_text("0-3\n")
+    (leaf / "cpuset.cpus.effective").write_text("0-5\n")
+    (root / "cpu.max").write_text("max 100000\n")
+    (parent / "cpu.max").write_text("200000 100000\n")
+    (leaf / "cpu.max").write_text("400000 100000\n")
+    (root / "memory.max").write_text("max\n")
+    (parent / "memory.max").write_text(str(512 * MIB))
+    (parent / "memory.current").write_text(str(128 * MIB))
+    (leaf / "memory.max").write_text(str(GIB))
+    (leaf / "memory.current").write_text(str(64 * MIB))
+
+    resources = ContainerResources.detect(
+        cgroup_root=root,
+        proc_root=proc,
+        affinity=tuple(range(8)),
+        host_memory_bytes=8 * GIB,
+        host_available_bytes=3 * GIB,
+    )
+
+    assert resources.cpuset_cpus == (0, 1, 2, 3)
+    assert resources.cpu_capacity == 2.0
+    assert resources.cpu_count == 2
+    assert resources.memory_limit_bytes == 512 * MIB
+    assert resources.memory_available_bytes == 384 * MIB
+
+
+@pytest.mark.parametrize(
+    ("root_cpuset", "leaf_cpuset", "affinity"),
+    [
+        ("0-1", "2-3", (0, 1, 2, 3)),
+        ("4-5", "4-5", (0, 1)),
+    ],
+)
+def test_detect_contradictory_cpuset_state_fails_to_one_worker(
+    tmp_path, root_cpuset, leaf_cpuset, affinity,
+):
+    root = tmp_path / "cgroup"
+    leaf = root / "worker.scope"
+    proc = tmp_path / "proc"
+    leaf.mkdir(parents=True)
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text("0::/worker.scope\n")
+    (root / "cgroup.controllers").write_text("cpuset\n")
+    (root / "cpuset.cpus.effective").write_text(root_cpuset)
+    (leaf / "cpuset.cpus.effective").write_text(leaf_cpuset)
+
+    resources = ContainerResources.detect(
+        cgroup_root=root,
+        proc_root=proc,
+        affinity=affinity,
+        host_memory_bytes=GIB,
+        host_available_bytes=GIB,
+    )
+
+    assert resources.cpu_count == 1
+    assert resources.cpu_capacity == 1.0
+
+
+def test_detect_supports_cgroup_v1_controller_hierarchies(tmp_path):
+    root = tmp_path / "cgroup"
+    proc = tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text(
+        "2:cpu,cpuacct:/parent/worker\n"
+        "3:cpuset:/parent/worker\n"
+        "4:memory:/parent/worker\n",
+    )
+    cpu_parent = root / "cpu,cpuacct" / "parent"
+    cpu_leaf = cpu_parent / "worker"
+    cpuset_parent = root / "cpuset" / "parent"
+    cpuset_leaf = cpuset_parent / "worker"
+    memory_parent = root / "memory" / "parent"
+    memory_leaf = memory_parent / "worker"
+    for directory in (cpu_leaf, cpuset_leaf, memory_leaf):
+        directory.mkdir(parents=True)
+    (cpu_parent / "cpu.cfs_quota_us").write_text("200000\n")
+    (cpu_parent / "cpu.cfs_period_us").write_text("100000\n")
+    (cpu_leaf / "cpu.cfs_quota_us").write_text("400000\n")
+    (cpu_leaf / "cpu.cfs_period_us").write_text("100000\n")
+    (cpuset_parent / "cpuset.cpus").write_text("0-3\n")
+    (cpuset_leaf / "cpuset.cpus").write_text("0-5\n")
+    (memory_parent / "memory.limit_in_bytes").write_text(str(512 * MIB))
+    (memory_parent / "memory.usage_in_bytes").write_text(str(256 * MIB))
+    (memory_leaf / "memory.limit_in_bytes").write_text(str(GIB))
+    (memory_leaf / "memory.usage_in_bytes").write_text(str(128 * MIB))
+
+    resources = ContainerResources.detect(
+        cgroup_root=root,
+        proc_root=proc,
+        affinity=tuple(range(8)),
+        host_memory_bytes=8 * GIB,
+        host_available_bytes=3 * GIB,
+    )
+
+    assert resources.cpuset_cpus == (0, 1, 2, 3)
+    assert resources.cpu_capacity == 2.0
+    assert resources.cpu_count == 2
+    assert resources.memory_limit_bytes == 512 * MIB
+    assert resources.memory_available_bytes == 256 * MIB
+
+
+@pytest.mark.parametrize("controller", ["cpu", "cpuset"])
+def test_detect_malformed_v1_cpu_control_fails_to_one_worker(
+    tmp_path, controller,
+):
+    root = tmp_path / "cgroup"
+    proc = tmp_path / "proc"
+    leaf = root / controller / "worker"
+    leaf.mkdir(parents=True)
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text(
+        f"2:{controller}:/worker\n",
+    )
+    if controller == "cpu":
+        (leaf / "cpu.cfs_quota_us").write_text("not-a-quota")
+        (leaf / "cpu.cfs_period_us").write_text("100000")
+    else:
+        (leaf / "cpuset.cpus").write_text("0-bad")
+
+    resources = ContainerResources.detect(
+        cgroup_root=root,
+        proc_root=proc,
+        affinity=tuple(range(8)),
+        host_memory_bytes=8 * GIB,
+        host_available_bytes=8 * GIB,
+    )
+
+    assert resources.cpu_count == 1
+    assert resources.cpu_capacity == 1.0
+
+
+def test_detect_intersects_hybrid_v2_and_v1_controller_limits(tmp_path):
+    root = tmp_path / "cgroup"
+    proc = tmp_path / "proc"
+    unified = root / "unified"
+    memory = root / "memory" / "legacy"
+    unified.mkdir(parents=True)
+    memory.mkdir(parents=True)
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text(
+        "0::/unified\n4:memory:/legacy\n",
+    )
+    (unified / "memory.max").write_text(str(GIB))
+    (unified / "memory.current").write_text(str(128 * MIB))
+    (memory / "memory.limit_in_bytes").write_text(str(512 * MIB))
+    (memory / "memory.usage_in_bytes").write_text(str(256 * MIB))
+
+    resources = ContainerResources.detect(
+        cgroup_root=root,
+        proc_root=proc,
+        affinity=(0,),
+        host_memory_bytes=8 * GIB,
+        host_available_bytes=3 * GIB,
+    )
+
+    assert resources.memory_limit_bytes == 512 * MIB
+    assert resources.memory_available_bytes == 256 * MIB
+
+
+def test_detect_translates_mountinfo_roots_and_arbitrary_mountpoints(tmp_path):
+    root = tmp_path / "cgroup"
+    unified_mount = root / "unified-mount"
+    unified_leaf = unified_mount / "worker"
+    legacy_mount = root / "legacy-memory-mount"
+    legacy_leaf = legacy_mount / "worker"
+    proc = tmp_path / "proc"
+    unified_leaf.mkdir(parents=True)
+    legacy_leaf.mkdir(parents=True)
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text(
+        "0::/parent/worker\n4:memory:/legacy-root/worker\n",
+    )
+    (proc / "self" / "mountinfo").write_text(
+        f"29 23 0:26 /parent {unified_mount} rw - cgroup2 cgroup rw\n"
+        f"30 23 0:27 /legacy-root {legacy_mount} rw - "
+        "cgroup cgroup rw,memory\n",
+    )
+    (unified_mount / "memory.max").write_text(str(GIB))
+    (unified_mount / "memory.current").write_text(str(128 * MIB))
+    (unified_leaf / "memory.max").write_text(str(768 * MIB))
+    (unified_leaf / "memory.current").write_text(str(128 * MIB))
+    (legacy_mount / "memory.limit_in_bytes").write_text(str(512 * MIB))
+    (legacy_mount / "memory.usage_in_bytes").write_text(str(128 * MIB))
+    (legacy_leaf / "memory.limit_in_bytes").write_text(str(256 * MIB))
+    (legacy_leaf / "memory.usage_in_bytes").write_text(str(128 * MIB))
+
+    resources = ContainerResources.detect(
+        cgroup_root=root,
+        proc_root=proc,
+        affinity=(0,),
+        host_memory_bytes=8 * GIB,
+        host_available_bytes=3 * GIB,
+    )
+
+    assert resources.memory_limit_bytes == 256 * MIB
+    assert resources.memory_available_bytes == 128 * MIB
+
+
+def test_detect_honours_zero_cgroup_v2_memory_limit(tmp_path):
+    cg = tmp_path / "cg"
+    cg.mkdir()
+    (cg / "memory.max").write_text("0\n")
+    (cg / "memory.current").write_text("0\n")
+
+    resources = ContainerResources.detect(
+        cgroup_dir=cg,
+        proc_root=tmp_path / "missing-proc",
+        affinity=(0,),
+        host_memory_bytes=8 * GIB,
+        host_available_bytes=8 * GIB,
+    )
+
+    assert resources.memory_limit_bytes == 0
+    assert resources.memory_available_bytes == 0
+
+
+@pytest.mark.parametrize("current", [None, "malformed", "-1"])
+def test_detect_missing_or_malformed_memory_usage_fails_availability_closed(
+    tmp_path, current,
+):
+    cg = tmp_path / "cg"
+    cg.mkdir()
+    (cg / "memory.max").write_text(str(512 * MIB))
+    if current is not None:
+        (cg / "memory.current").write_text(current)
+
+    resources = ContainerResources.detect(
+        cgroup_dir=cg,
+        proc_root=tmp_path / "missing-proc",
+        affinity=(0,),
+        host_memory_bytes=8 * GIB,
+        host_available_bytes=8 * GIB,
+    )
+
+    assert resources.memory_limit_bytes == 512 * MIB
+    assert resources.memory_available_bytes == 0
+
+
+@pytest.mark.parametrize("limit", ["", "malformed", "-1"])
+def test_detect_empty_or_malformed_v2_memory_limit_fails_closed(
+    tmp_path, limit,
+):
+    cg = tmp_path / "cg"
+    cg.mkdir()
+    (cg / "memory.max").write_text(limit)
+
+    resources = ContainerResources.detect(
+        cgroup_dir=cg,
+        proc_root=tmp_path / "missing-proc",
+        affinity=(0,),
+        host_memory_bytes=8 * GIB,
+        host_available_bytes=8 * GIB,
+    )
+
+    assert resources.memory_limit_bytes == 0
+    assert resources.memory_available_bytes == 0
+
+
+@pytest.mark.parametrize(
+    ("limit", "usage", "expected_limit"),
+    [
+        ("-1", "0", 0),
+        (str(512 * MIB), "-1", 512 * MIB),
+    ],
+)
+def test_detect_negative_v1_memory_controls_fail_closed(
+    tmp_path, limit, usage, expected_limit,
+):
+    root = tmp_path / "cgroup"
+    proc = tmp_path / "proc"
+    leaf = root / "memory" / "worker"
+    leaf.mkdir(parents=True)
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text("4:memory:/worker\n")
+    (leaf / "memory.limit_in_bytes").write_text(limit)
+    (leaf / "memory.usage_in_bytes").write_text(usage)
+
+    resources = ContainerResources.detect(
+        cgroup_root=root,
+        proc_root=proc,
+        affinity=(0,),
+        host_memory_bytes=8 * GIB,
+        host_available_bytes=8 * GIB,
+    )
+
+    assert resources.memory_limit_bytes == expected_limit
+    assert resources.memory_available_bytes == 0
+
+
+def test_detect_rejects_v1_controller_mount_symlink_escape(tmp_path):
+    root = tmp_path / "cgroup"
+    outside = tmp_path / "outside"
+    proc = tmp_path / "proc"
+    root.mkdir()
+    outside.mkdir()
+    (root / "memory").symlink_to(outside, target_is_directory=True)
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text("4:memory:/\n")
+    (outside / "memory.limit_in_bytes").write_text(str(16 * MIB))
+    (outside / "memory.usage_in_bytes").write_text("0\n")
+
+    resources = ContainerResources.detect(
+        cgroup_root=root,
+        proc_root=proc,
+        affinity=(0,),
+        host_memory_bytes=GIB,
+        host_available_bytes=GIB,
+    )
+
+    assert resources.memory_limit_bytes == 0
+    assert resources.memory_available_bytes == 0
+
+
+def test_detect_declared_unresolved_v1_cpu_controller_fails_closed(tmp_path):
+    root = tmp_path / "cgroup"
+    proc = tmp_path / "proc"
+    root.mkdir()
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text("2:cpu:/worker\n")
+
+    resources = ContainerResources.detect(
+        cgroup_root=root,
+        proc_root=proc,
+        affinity=tuple(range(8)),
+        host_memory_bytes=GIB,
+        host_available_bytes=GIB,
+    )
+
+    assert resources.cpu_count == 1
+    assert resources.cpu_capacity == 1.0
+
+
+def test_detect_malformed_present_proc_cgroup_metadata_fails_closed(tmp_path):
+    root = tmp_path / "cgroup"
+    proc = tmp_path / "proc"
+    root.mkdir()
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text("not:a:valid:entry\n")
+
+    resources = ContainerResources.detect(
+        cgroup_root=root,
+        proc_root=proc,
+        affinity=tuple(range(8)),
+        host_memory_bytes=GIB,
+        host_available_bytes=GIB,
+    )
+
+    assert resources.cpu_count == 1
+    assert resources.cpu_capacity == 1.0
+    assert resources.memory_limit_bytes == 0
+    assert resources.memory_available_bytes == 0
+
+
+@pytest.mark.parametrize("metadata_kind", ["empty", "unreadable"])
+def test_detect_present_unusable_proc_cgroup_metadata_fails_closed(
+    tmp_path, metadata_kind,
+):
+    root = tmp_path / "cgroup"
+    proc_entry = tmp_path / "proc" / "self" / "cgroup"
+    root.mkdir()
+    proc_entry.parent.mkdir(parents=True)
+    if metadata_kind == "empty":
+        proc_entry.write_text("")
+    else:
+        proc_entry.mkdir()
+
+    resources = ContainerResources.detect(
+        cgroup_root=root,
+        proc_root=tmp_path / "proc",
+        affinity=tuple(range(8)),
+        host_memory_bytes=GIB,
+        host_available_bytes=GIB,
+    )
+
+    assert resources.cpu_count == 1
+    assert resources.cpu_capacity == 1.0
+    assert resources.memory_limit_bytes == 0
+    assert resources.memory_available_bytes == 0
+
+
+def test_detect_declared_unresolved_v2_hierarchy_fails_closed(tmp_path):
+    root = tmp_path / "cgroup"
+    proc = tmp_path / "proc"
+    root.mkdir()
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text("0::/worker.scope\n")
+
+    resources = ContainerResources.detect(
+        cgroup_root=root,
+        proc_root=proc,
+        affinity=tuple(range(8)),
+        host_memory_bytes=GIB,
+        host_available_bytes=GIB,
+    )
+
+    assert resources.cpu_count == 1
+    assert resources.cpu_capacity == 1.0
+    assert resources.memory_limit_bytes == 0
+    assert resources.memory_available_bytes == 0
+
+
+def test_detect_rejects_proc_cgroup_path_escape(tmp_path):
+    root = tmp_path / "cgroup"
+    outside = tmp_path / "outside"
+    proc = tmp_path / "proc"
+    root.mkdir()
+    outside.mkdir()
+    (proc / "self").mkdir(parents=True)
+    (proc / "self" / "cgroup").write_text("0::/../../outside\n")
+    (root / "cgroup.controllers").write_text("memory\n")
+    (root / "memory.max").write_text(str(512 * MIB))
+    (root / "memory.current").write_text(str(128 * MIB))
+    (outside / "memory.max").write_text(str(16 * MIB))
+    (outside / "memory.current").write_text("0\n")
+
+    resources = ContainerResources.detect(
+        cgroup_root=root,
+        proc_root=proc,
+        affinity=(0,),
+        host_memory_bytes=8 * GIB,
+        host_available_bytes=3 * GIB,
+    )
+
+    assert resources.memory_limit_bytes == 512 * MIB
+    assert resources.memory_available_bytes == 384 * MIB
+
+
 def test_detect_preserves_zero_cgroup_memory_available(tmp_path):
     cg = tmp_path / "cg"
     cg.mkdir()
