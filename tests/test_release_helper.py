@@ -34,7 +34,7 @@ def _run(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProce
     )
 
 
-def _release_checkout(tmp_path: Path, *, init_version: str = "2.5.3") -> Path:
+def _release_checkout(tmp_path: Path, *, init_version: str = "2.5.4") -> Path:
     checkout = tmp_path / "checkout"
     (checkout / "supertable").mkdir(parents=True)
     for name in ("push-pypi.sh", "pyproject.toml", "setup.py"):
@@ -132,7 +132,7 @@ def test_release_helper_accepts_metadata_free_setup_shim(tmp_path: Path) -> None
     result = _invoke_release_helper(checkout)
 
     assert result.returncode == 6
-    assert "--push requires the existing signed local tag v2.5.3" in result.stderr
+    assert "--push requires the existing signed local tag v2.5.4" in result.stderr
     assert "version mismatch" not in result.stderr
     assert "setup.py" not in result.stderr
 
@@ -144,7 +144,7 @@ def test_release_helper_rejects_init_version_mismatch(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "version mismatch" in result.stderr
-    assert "pyproject=2.5.3" in result.stderr
+    assert "pyproject=2.5.4" in result.stderr
     assert "__init__=['9.9.9']" in result.stderr
 
 
