@@ -148,6 +148,62 @@ class TestPlanExtenderSinkGuard:
         mock_mw.log_metric.assert_called_once()
 
     @patch("supertable.plan_extender.MonitoringWriter")
+    def test_typed_telemetry_survives_monitoring_payload_without_secrets(
+        self, MockMW,
+    ):
+        from supertable.engine.plan_stats import PlanStats
+        from supertable.plan_extender import extend_execution_plan
+
+        mock_mw = MagicMock()
+        MockMW.return_value.__enter__.return_value = mock_mw
+        MockMW.return_value.__exit__.return_value = False
+        qpm = self._build_qpm("orders")
+        qpm.source_type = "api"
+        plan_stats = PlanStats()
+        plan_stats.add_stat({"ENGINE": "duckdb"})
+        plan_stats.add_stat({"FILES_BEFORE_PRUNE": 10})
+        plan_stats.add_stat({"FILES_PRUNED": 7})
+        plan_stats.add_stat({"FILES_KEPT": 3})
+        plan_stats.add_stat({"PRUNE_DURATION_MS": 2.5})
+
+        extend_execution_plan(
+            query_plan_manager=qpm,
+            role_name="r",
+            timing=[
+                {"QUERY_PREPARATION": 0.01},
+                {"CONNECTION_SETUP": 0.005},
+                {"EXECUTING_QUERY": 0.2},
+                {"TOTAL_EXECUTE": 0.25},
+                {"REMOTE_PHASE": "https://private.invalid/x?token=secret"},
+            ],
+            plan_stats=plan_stats,
+            status="ok",
+            message="",
+            result_shape=(3, 2),
+        )
+
+        payload = mock_mw.log_metric.call_args.args[0]
+        timings = json.loads(payload["execution_timings"])
+        normalized = json.loads(payload["normalized_profile"])
+        assert timings == [
+            {"QUERY_PREPARATION": 0.01},
+            {"CONNECTION_SETUP": 0.005},
+            {"EXECUTING_QUERY": 0.2},
+            {"TOTAL_EXECUTE": 0.25},
+        ]
+        assert normalized["schema_version"] == 3
+        assert normalized["pruning"]["files_pruned"] == 7
+        assert any(
+            phase["phase"] == "engine_connect"
+            and phase["duration_us"] == 5000
+            for phase in normalized["pipeline_phases"]
+        )
+        rendered = json.dumps(payload, sort_keys=True)
+        assert "private.invalid" not in rendered
+        assert "REMOTE_PHASE" not in rendered
+        assert "token=secret" not in rendered
+
+    @patch("supertable.plan_extender.MonitoringWriter")
     def test_remote_path_tokens_never_reach_monitoring_payload(
         self, MockMW, tmp_path,
     ):

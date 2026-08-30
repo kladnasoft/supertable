@@ -20,7 +20,7 @@ from supertable.data_classes import (
     TombstoneDef,
     TombstoneSegmentDef,
 )
-from supertable.engine import duckdb_engine
+from supertable.engine import duckdb_engine, islanddb
 from supertable.engine.adaptive_router import (
     AdaptiveEngineRouter,
     RoutingAvailability,
@@ -376,6 +376,343 @@ def test_bounded_completion_is_monitored_as_success_without_n_plus_one(
     status, message, rows, result_bytes = outcomes[0]
     assert (status, message, rows) == (data_reader.Status.OK.value, None, 3)
     assert result_bytes > 0
+
+
+def test_row_budget_falls_back_when_inner_declines_terminal_callbacks():
+    class Inner:
+        schema = pa.schema([("id", pa.int64())])
+
+        def add_terminal_callback(self, _callback):
+            return False
+
+        def cancel(self):
+            return None
+
+        def close(self):
+            return None
+
+    outcomes = []
+    stream = data_reader._MonitoredResultStream(
+        data_reader._RowBudgetResultStream(Inner(), 3),
+        lambda *outcome: outcomes.append(outcome),
+    )
+
+    stream.cancel()
+
+    assert outcomes == [(
+        data_reader.Status.ERROR.value,
+        "result stream cancelled",
+        0,
+        0,
+    )]
+
+
+def test_exact_budget_cleanup_failure_is_not_monitored_as_success():
+    batch = pa.record_batch({"id": [1, 2, 3]})
+
+    class Inner:
+        schema = batch.schema
+
+        def __init__(self):
+            self._done = False
+            self._callbacks = []
+
+        def add_terminal_callback(self, callback):
+            self._callbacks.append(callback)
+
+        def __next__(self):
+            if self._done:
+                raise StopIteration
+            self._done = True
+            return batch
+
+        def close(self):
+            for callback in self._callbacks:
+                callback("closed")
+            raise RuntimeError("cleanup failed")
+
+    outcomes = []
+    stream = data_reader._MonitoredResultStream(
+        data_reader._RowBudgetResultStream(Inner(), 3),
+        lambda *outcome: outcomes.append(outcome),
+    )
+
+    with pytest.raises(RuntimeError, match="Query result stream failed"):
+        next(stream)
+    assert outcomes == [(
+        data_reader.Status.ERROR.value,
+        "Query result stream failed",
+        0,
+        0,
+    )]
+
+
+def test_exact_budget_timeout_during_close_outranks_success():
+    batch = pa.record_batch({"id": [1, 2, 3]})
+
+    class Inner:
+        schema = batch.schema
+
+        def __init__(self):
+            self._done = False
+            self._callbacks = []
+
+        def add_terminal_callback(self, callback):
+            self._callbacks.append(callback)
+
+        def __next__(self):
+            if self._done:
+                raise StopIteration
+            self._done = True
+            return batch
+
+        def close(self):
+            for callback in self._callbacks:
+                callback("timed_out")
+
+    outcomes = []
+    stream = data_reader._MonitoredResultStream(
+        data_reader._RowBudgetResultStream(Inner(), 3),
+        lambda *outcome: outcomes.append(outcome),
+    )
+
+    assert next(stream).num_rows == 3
+    assert outcomes == [(
+        data_reader.Status.ERROR.value,
+        "result stream timed out",
+        3,
+        batch.nbytes,
+    )]
+
+
+def test_exact_budget_terminal_surfaces_monitoring_failure():
+    batch = pa.record_batch({"id": [1, 2, 3]})
+
+    class Inner:
+        schema = batch.schema
+
+        def __init__(self):
+            self._done = False
+            self._callbacks = []
+
+        def add_terminal_callback(self, callback):
+            self._callbacks.append(callback)
+
+        def __next__(self):
+            if self._done:
+                raise StopIteration
+            self._done = True
+            return batch
+
+        def close(self):
+            for callback in self._callbacks:
+                callback("closed")
+
+    monitoring_error = RuntimeError("monitor persistence failed")
+    stream = data_reader._MonitoredResultStream(
+        data_reader._RowBudgetResultStream(Inner(), 3),
+        lambda *_outcome: (_ for _ in ()).throw(monitoring_error),
+    )
+
+    with pytest.raises(RuntimeError, match="monitor persistence failed") as raised:
+        next(stream)
+    assert raised.value is monitoring_error
+
+
+def test_exact_budget_waits_for_concurrent_terminal_monitoring_failure():
+    batch = pa.record_batch({"id": [1, 2, 3]})
+    after_error_snapshot = threading.Event()
+    monitoring_entered = threading.Event()
+    release_monitoring = threading.Event()
+
+    class Inner:
+        schema = batch.schema
+
+        def __init__(self):
+            self._done = False
+            self._callbacks = []
+            self.terminal_thread = None
+
+        def add_terminal_callback(self, callback):
+            self._callbacks.append(callback)
+
+        def __next__(self):
+            if self._done:
+                raise StopIteration
+            self._done = True
+            return batch
+
+        def close(self):
+            def publish_terminal():
+                assert after_error_snapshot.wait(2)
+                for callback in self._callbacks:
+                    callback("closed")
+
+            self.terminal_thread = threading.Thread(target=publish_terminal)
+            self.terminal_thread.start()
+
+    monitoring_error = RuntimeError("monitor persistence failed")
+
+    def finalize(*_outcome):
+        monitoring_entered.set()
+        assert release_monitoring.wait(2)
+        raise monitoring_error
+
+    inner = Inner()
+    stream = data_reader._MonitoredResultStream(
+        data_reader._RowBudgetResultStream(inner, 3),
+        finalize,
+    )
+    original_error_snapshot = stream._raise_completed_finalize_error
+
+    def release_terminal_after_snapshot():
+        original_error_snapshot()
+        after_error_snapshot.set()
+        assert monitoring_entered.wait(2)
+
+    stream._raise_completed_finalize_error = release_terminal_after_snapshot
+    observed = []
+    errors = []
+
+    def consume():
+        try:
+            observed.append(next(stream))
+        except BaseException as exc:
+            errors.append(exc)
+
+    consumer = threading.Thread(target=consume)
+    consumer.start()
+    assert monitoring_entered.wait(1)
+    consumer.join(0.05)
+    assert consumer.is_alive(), "batch returned before monitoring completed"
+    release_monitoring.set()
+    consumer.join(2)
+    inner.terminal_thread.join(2)
+
+    assert not consumer.is_alive()
+    assert observed == []
+    assert errors == [monitoring_error]
+
+
+def test_row_budget_does_not_yield_batch_returned_after_concurrent_cancel():
+    batch = pa.record_batch({"id": [1, 2, 3]})
+    entered = threading.Event()
+    released = threading.Event()
+
+    class Inner:
+        schema = batch.schema
+
+        def __init__(self):
+            self._callbacks = []
+
+        def add_terminal_callback(self, callback):
+            self._callbacks.append(callback)
+
+        def __next__(self):
+            entered.set()
+            assert released.wait(2), "cancel did not release test producer"
+            return batch
+
+        def cancel(self):
+            for callback in self._callbacks:
+                callback("cancelled")
+            released.set()
+
+        def close(self):
+            self.cancel()
+
+    outcomes = []
+    observed = []
+    errors = []
+    stream = data_reader._MonitoredResultStream(
+        data_reader._RowBudgetResultStream(Inner(), 3),
+        lambda *outcome: outcomes.append(outcome),
+    )
+
+    def consume():
+        try:
+            observed.append(next(stream))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    assert entered.wait(1)
+    stream.cancel()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert observed == []
+    assert errors
+    assert outcomes == [(
+        data_reader.Status.ERROR.value,
+        "result stream cancelled",
+        0,
+        0,
+    )]
+
+
+def test_row_budget_cancel_wins_while_exact_budget_cleanup_is_blocked():
+    batch = pa.record_batch({"id": [1, 2, 3]})
+    close_entered = threading.Event()
+    release_close = threading.Event()
+
+    class Inner:
+        schema = batch.schema
+
+        def __init__(self):
+            self._callbacks = []
+            self._done = False
+
+        def add_terminal_callback(self, callback):
+            self._callbacks.append(callback)
+
+        def __next__(self):
+            if self._done:
+                raise StopIteration
+            self._done = True
+            return batch
+
+        def close(self):
+            close_entered.set()
+            assert release_close.wait(2), "cancel did not release cleanup"
+            for callback in self._callbacks:
+                callback("closed")
+
+        def cancel(self):
+            for callback in self._callbacks:
+                callback("cancelled")
+            release_close.set()
+
+    outcomes = []
+    observed = []
+    errors = []
+    stream = data_reader._MonitoredResultStream(
+        data_reader._RowBudgetResultStream(Inner(), 3),
+        lambda *outcome: outcomes.append(outcome),
+    )
+
+    def consume():
+        try:
+            observed.append(next(stream))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    assert close_entered.wait(1)
+    stream.cancel()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert observed == []
+    assert errors
+    assert outcomes == [(
+        data_reader.Status.ERROR.value,
+        "result stream cancelled",
+        0,
+        0,
+    )]
 
 
 class _AutoStreamCache:
@@ -1104,3 +1441,544 @@ def test_duckdb_iterator_honors_external_cancellation_before_fetch():
     with pytest.raises(Exception, match="cancelled"):
         next(iterator)
     reader.__iter__.return_value.__next__.assert_not_called()
+
+
+def test_duckdb_iterator_records_actual_fetch_without_affecting_delivery():
+    batch = pa.record_batch({"id": [1]})
+    durations = []
+    iterator = duckdb_engine._DuckDBArrowBatchIterator(
+        iter([batch]), MagicMock(),
+        timed_out=threading.Event(), timeout_value=60,
+        duration_recorder=(
+            lambda event, elapsed: durations.append((event, elapsed))
+        ),
+    )
+
+    assert next(iterator).column(0).to_pylist() == [1]
+    assert durations[0][0] == "RESULT_FETCH"
+    assert durations[0][1] >= 0
+
+    failing_iterator = duckdb_engine._DuckDBArrowBatchIterator(
+        iter([batch]), MagicMock(),
+        timed_out=threading.Event(), timeout_value=60,
+        duration_recorder=lambda _event, _elapsed: (_ for _ in ()).throw(
+            RuntimeError("telemetry unavailable")
+        ),
+    )
+    assert next(failing_iterator).column(0).to_pylist() == [1]
+
+
+def test_duckdb_cancel_callback_waits_for_fetch_and_cleanup_telemetry():
+    batch = pa.record_batch({"id": [1]})
+    entered = threading.Event()
+    released = threading.Event()
+    durations = []
+
+    class BlockingReader:
+        schema = batch.schema
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            entered.set()
+            assert released.wait(2), "cancel did not interrupt active fetch"
+            return batch
+
+        def close(self):
+            return None
+
+    connection = MagicMock()
+    connection.interrupt.side_effect = released.set
+    producer = duckdb_engine._DuckDBArrowBatchIterator(
+        BlockingReader(), connection,
+        timed_out=threading.Event(), timeout_value=60,
+        duration_recorder=(
+            lambda event, elapsed: durations.append((event, elapsed))
+        ),
+    )
+    inner = ArrowBatchStream(
+        batch.schema,
+        producer,
+        close_callback=lambda: durations.append(("CLEANUP", 0.0)),
+    )
+    lifecycle = duckdb_engine._DuckDBResultLifecycleStream(
+        inner,
+        deadline_monotonic=None,
+        timeout_value=60,
+        cancel_event=None,
+    )
+    callback_snapshots = []
+    lifecycle.add_terminal_callback(
+        lambda kind: callback_snapshots.append(
+            (kind, [event for event, _elapsed in durations])
+        )
+    )
+    worker_errors = []
+
+    def consume():
+        try:
+            next(lifecycle)
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    assert entered.wait(1)
+    lifecycle.cancel()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert worker_errors
+    assert callback_snapshots == [
+        ("cancelled", ["RESULT_FETCH", "CLEANUP"]),
+    ]
+
+
+def test_nested_arrow_finalization_orders_engine_cleanup_before_publication():
+    batch = pa.record_batch({"id": [1]})
+    inner_cleanup_started = threading.Event()
+    release_inner_cleanup = threading.Event()
+    events = []
+
+    def finish_inner():
+        inner_cleanup_started.set()
+        assert release_inner_cleanup.wait(2)
+        events.append("engine cleanup")
+
+    inner = ArrowBatchStream(
+        batch.schema,
+        iter([batch]),
+        close_callback=finish_inner,
+    )
+    retry = _RetryBeforeFirstBatchStream(inner)
+    guarded = executor_module._FailureTelemetryIterator(
+        retry,
+        plan_stats=PlanStats(),
+        engine=Engine.DUCKDB,
+        stage="stream_delivery",
+    )
+    routed = _AutoIslandFallbackStream(
+        guarded,
+        fallback_factory=lambda *_args: None,
+        island_success=lambda: None,
+    )
+    outer = ArrowBatchStream(
+        batch.schema,
+        routed,
+        close_callback=lambda: events.append("profile published"),
+    )
+    outer.add_finalization_callback(lambda: events.append("public terminal"))
+
+    inner_closer = threading.Thread(target=inner.close)
+    inner_closer.start()
+    assert inner_cleanup_started.wait(1)
+
+    started = time.monotonic()
+    outer.close()
+    assert time.monotonic() - started < 0.5
+    assert events == []
+    assert outer.wait_closed(0) is False
+
+    release_inner_cleanup.set()
+    inner_closer.join(2)
+    assert outer.wait_closed(1)
+    assert events == [
+        "engine cleanup",
+        "profile published",
+        "public terminal",
+    ]
+
+
+@pytest.mark.parametrize(
+    "lifecycle_factory",
+    [
+        lambda inner: duckdb_engine._DuckDBResultLifecycleStream(
+            inner,
+            deadline_monotonic=None,
+            timeout_value=60,
+            cancel_event=None,
+        ),
+        lambda inner: islanddb._IslandResultLifecycleStream(
+            inner,
+            deadline_monotonic=None,
+            timeout_value=60,
+            cancel_event=None,
+        ),
+    ],
+)
+def test_nested_cleanup_failure_is_preserved_as_failed_terminal(
+    lifecycle_factory,
+):
+    batch = pa.record_batch({"id": [1]})
+    inner_cleanup_started = threading.Event()
+    release_inner_cleanup = threading.Event()
+    cleanup_error = RuntimeError("cache lease cleanup failed")
+
+    def finish_inner():
+        inner_cleanup_started.set()
+        assert release_inner_cleanup.wait(2)
+
+    inner = ArrowBatchStream(
+        batch.schema,
+        iter([batch]),
+        close_callback=finish_inner,
+    )
+    outer = ArrowBatchStream(
+        batch.schema,
+        inner,
+        close_callback=lambda: (_ for _ in ()).throw(cleanup_error),
+    )
+    lifecycle = lifecycle_factory(outer)
+    terminal = []
+    lifecycle.add_terminal_callback(terminal.append)
+
+    inner_closer = threading.Thread(target=inner.close)
+    inner_closer.start()
+    assert inner_cleanup_started.wait(1)
+
+    lifecycle.close()
+    assert terminal == []
+    release_inner_cleanup.set()
+    inner_closer.join(2)
+    assert outer.wait_closed(1)
+
+    assert outer.finalization_error is cleanup_error
+    assert terminal == ["failed"]
+    with pytest.raises(RuntimeError, match="cache lease cleanup failed") as raised:
+        outer.close()
+    assert raised.value is cleanup_error
+
+
+def test_synchronous_nested_cleanup_failure_raises_on_first_close():
+    batch = pa.record_batch({"id": [1]})
+    cleanup_error = RuntimeError("cache lease cleanup failed")
+    inner = ArrowBatchStream(batch.schema, iter([batch]))
+    outer = ArrowBatchStream(
+        batch.schema,
+        inner,
+        close_callback=lambda: (_ for _ in ()).throw(cleanup_error),
+    )
+
+    with pytest.raises(RuntimeError, match="cache lease cleanup failed") as raised:
+        outer.close()
+
+    assert raised.value is cleanup_error
+    assert outer.finalization_error is cleanup_error
+
+
+@pytest.mark.parametrize(
+    ("lifecycle_factory", "outcome", "expected_kind"),
+    [
+        (
+            lambda inner: duckdb_engine._DuckDBResultLifecycleStream(
+                inner,
+                deadline_monotonic=None,
+                timeout_value=60,
+                cancel_event=None,
+            ),
+            "completed",
+            "completed",
+        ),
+        (
+            lambda inner: duckdb_engine._DuckDBResultLifecycleStream(
+                inner,
+                deadline_monotonic=None,
+                timeout_value=60,
+                cancel_event=None,
+            ),
+            "failed",
+            "failed",
+        ),
+        (
+            lambda inner: islanddb._IslandResultLifecycleStream(
+                inner,
+                deadline_monotonic=None,
+                timeout_value=60,
+                cancel_event=None,
+            ),
+            "completed",
+            "completed",
+        ),
+        (
+            lambda inner: islanddb._IslandResultLifecycleStream(
+                inner,
+                deadline_monotonic=None,
+                timeout_value=60,
+                cancel_event=None,
+            ),
+            "failed",
+            "failed",
+        ),
+    ],
+)
+def test_engine_lifecycle_terminal_waits_for_inner_finalization(
+    lifecycle_factory, outcome, expected_kind,
+):
+    batch = pa.record_batch({"id": [1]})
+
+    class DeferredFinalization:
+        schema = batch.schema
+
+        def __init__(self):
+            self.callbacks = []
+
+        def add_finalization_callback(self, callback):
+            self.callbacks.append(callback)
+            return True
+
+        def __next__(self):
+            if outcome == "completed":
+                raise StopIteration
+            raise RuntimeError("engine failed")
+
+        def close(self):
+            return None
+
+    inner = DeferredFinalization()
+    lifecycle = lifecycle_factory(inner)
+    terminal = []
+    finalized = []
+    lifecycle.add_terminal_callback(terminal.append)
+    assert lifecycle.add_finalization_callback(
+        lambda: finalized.append(True)
+    ) is True
+
+    if outcome == "completed":
+        with pytest.raises(StopIteration):
+            next(lifecycle)
+    else:
+        with pytest.raises(RuntimeError, match="engine failed"):
+            next(lifecycle)
+
+    assert terminal == []
+    assert finalized == []
+    for callback in list(inner.callbacks):
+        callback()
+    assert terminal == [expected_kind]
+    assert finalized == [True]
+
+
+@pytest.mark.parametrize(
+    "lifecycle_factory",
+    [
+        lambda inner: duckdb_engine._DuckDBResultLifecycleStream(
+            inner,
+            deadline_monotonic=None,
+            timeout_value=60,
+            cancel_event=None,
+        ),
+        lambda inner: islanddb._IslandResultLifecycleStream(
+            inner,
+            deadline_monotonic=None,
+            timeout_value=60,
+            cancel_event=None,
+        ),
+    ],
+)
+def test_engine_lifecycle_falls_back_when_finalization_is_declined(
+    lifecycle_factory,
+):
+    batch = pa.record_batch({"id": [1]})
+
+    class UnsupportedFinalization:
+        schema = batch.schema
+
+        def add_finalization_callback(self, _callback):
+            return False
+
+        def __next__(self):
+            raise StopIteration
+
+        def close(self):
+            return None
+
+    lifecycle = lifecycle_factory(UnsupportedFinalization())
+    terminal = []
+    lifecycle.add_terminal_callback(terminal.append)
+
+    with pytest.raises(StopIteration):
+        next(lifecycle)
+
+    assert terminal == ["completed"]
+
+
+def test_duckdb_cancel_does_not_block_on_uncooperative_active_fetch():
+    batch = pa.record_batch({"id": [1]})
+    entered = threading.Event()
+    released = threading.Event()
+    durations = []
+
+    class BlockingReader:
+        schema = batch.schema
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            entered.set()
+            assert released.wait(2), "test did not release active fetch"
+            return batch
+
+        def close(self):
+            return None
+
+    producer = duckdb_engine._DuckDBArrowBatchIterator(
+        BlockingReader(), MagicMock(),
+        timed_out=threading.Event(), timeout_value=60,
+        duration_recorder=(
+            lambda event, elapsed: durations.append((event, elapsed))
+        ),
+    )
+    inner = ArrowBatchStream(
+        batch.schema,
+        producer,
+        close_callback=lambda: durations.append(("CLEANUP", 0.0)),
+    )
+    lifecycle = duckdb_engine._DuckDBResultLifecycleStream(
+        inner,
+        deadline_monotonic=None,
+        timeout_value=60,
+        cancel_event=None,
+    )
+    callback_snapshots = []
+    lifecycle.add_terminal_callback(
+        lambda kind: callback_snapshots.append(
+            (kind, [event for event, _elapsed in durations])
+        )
+    )
+    worker_errors = []
+
+    def consume():
+        try:
+            next(lifecycle)
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    assert entered.wait(1)
+
+    started = time.monotonic()
+    lifecycle.cancel()
+    assert time.monotonic() - started < 0.5
+    assert callback_snapshots == []
+
+    released.set()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert worker_errors
+    assert callback_snapshots == [
+        ("cancelled", ["RESULT_FETCH", "CLEANUP"]),
+    ]
+
+
+def test_monitored_row_budget_waits_for_duckdb_cleanup_before_cancel_record():
+    batch = pa.record_batch({"id": [1]})
+    entered = threading.Event()
+    released = threading.Event()
+    durations = []
+
+    class BlockingReader:
+        schema = batch.schema
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            entered.set()
+            assert released.wait(2), "test did not release active fetch"
+            return batch
+
+        def close(self):
+            return None
+
+    producer = duckdb_engine._DuckDBArrowBatchIterator(
+        BlockingReader(), MagicMock(),
+        timed_out=threading.Event(), timeout_value=60,
+        duration_recorder=(
+            lambda event, elapsed: durations.append((event, elapsed))
+        ),
+    )
+    inner = ArrowBatchStream(
+        batch.schema,
+        producer,
+        close_callback=lambda: durations.append(("CLEANUP", 0.0)),
+    )
+    lifecycle = duckdb_engine._DuckDBResultLifecycleStream(
+        inner,
+        deadline_monotonic=None,
+        timeout_value=60,
+        cancel_event=None,
+    )
+    bounded = data_reader._RowBudgetResultStream(lifecycle, 10)
+    outcomes = []
+    monitored = data_reader._MonitoredResultStream(
+        bounded,
+        lambda status, message, rows, size: outcomes.append(
+            (status, message, rows, size, [event for event, _ in durations])
+        ),
+    )
+    worker_errors = []
+
+    def consume():
+        try:
+            next(monitored)
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    assert entered.wait(1)
+
+    started = time.monotonic()
+    monitored.cancel()
+    assert time.monotonic() - started < 0.5
+    assert outcomes == []
+
+    released.set()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert worker_errors
+    assert outcomes == [(
+        data_reader.Status.ERROR.value,
+        "result stream cancelled",
+        0,
+        0,
+        ["RESULT_FETCH", "CLEANUP"],
+    )]
+
+
+def test_monitored_row_budget_records_idle_backend_cancel_without_consumer():
+    batch = pa.record_batch({"id": [1]})
+    cancel_event = threading.Event()
+    cleanup_complete = threading.Event()
+    outcome_complete = threading.Event()
+    inner = ArrowBatchStream(
+        batch.schema,
+        iter([batch]),
+        close_callback=cleanup_complete.set,
+    )
+    lifecycle = duckdb_engine._DuckDBResultLifecycleStream(
+        inner,
+        deadline_monotonic=None,
+        timeout_value=60,
+        cancel_event=cancel_event,
+    )
+    bounded = data_reader._RowBudgetResultStream(lifecycle, 10)
+    outcomes = []
+    monitored = data_reader._MonitoredResultStream(
+        bounded,
+        lambda *outcome: (outcomes.append(outcome), outcome_complete.set()),
+    )
+
+    cancel_event.set()
+    assert outcome_complete.wait(1)
+    assert cleanup_complete.is_set()
+    assert outcomes == [(
+        data_reader.Status.ERROR.value,
+        "result stream cancelled",
+        0,
+        0,
+    )]
+    assert monitored.closed is True

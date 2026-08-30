@@ -390,6 +390,33 @@ def test_stream_monitoring_backpressure_closes_and_surfaces_completed_outcome():
     assert second_inner.closed is True
 
 
+@pytest.mark.parametrize("terminal", ["cancel", "close"])
+def test_callback_aware_idle_terminal_surfaces_monitoring_failure(terminal):
+    from supertable.data_reader import _MonitoredResultStream
+
+    class Inner:
+        schema = pa.schema([("id", pa.int64())])
+
+        def add_terminal_callback(self, callback):
+            self.callback = callback
+
+        def cancel(self):
+            self.callback("cancelled")
+
+        def close(self):
+            self.callback("closed")
+
+    monitoring_error = RuntimeError("monitoring finalization failed")
+
+    def fail_monitor(*_outcome):
+        raise monitoring_error
+
+    stream = _MonitoredResultStream(Inner(), fail_monitor)
+    with pytest.raises(RuntimeError, match="monitoring finalization failed") as raised:
+        getattr(stream, terminal)()
+    assert raised.value is monitoring_error
+
+
 def test_stream_terminal_callers_wait_for_one_completed_monitor_outcome():
     import threading
 
@@ -449,6 +476,70 @@ def test_stream_terminal_callers_wait_for_one_completed_monitor_outcome():
 
     assert not first.is_alive() and not second.is_alive()
     assert len(callback_calls) == 1
+    assert terminal_errors == [monitoring_error, monitoring_error]
+
+
+@pytest.mark.parametrize("terminal", ["cancel", "close"])
+def test_callback_aware_terminal_joins_started_monitoring(terminal):
+    import threading
+
+    from supertable.data_reader import _MonitoredResultStream
+
+    class Inner:
+        schema = pa.schema([("id", pa.int64())])
+
+        def __init__(self):
+            self._callback = None
+            self._published = False
+            self._lock = threading.Lock()
+
+        def add_terminal_callback(self, callback):
+            self._callback = callback
+
+        def _terminate(self, kind):
+            with self._lock:
+                if self._published:
+                    return
+                self._published = True
+            self._callback(kind)
+
+        def cancel(self):
+            self._terminate("cancelled")
+
+        def close(self):
+            self._terminate("closed")
+
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    monitoring_error = RuntimeError("monitoring finalization failed")
+    terminal_errors = []
+
+    def finalize(*_outcome):
+        callback_started.set()
+        assert release_callback.wait(2)
+        raise monitoring_error
+
+    stream = _MonitoredResultStream(Inner(), finalize)
+
+    def terminate_stream():
+        try:
+            getattr(stream, terminal)()
+        except BaseException as exc:
+            terminal_errors.append(exc)
+
+    first = threading.Thread(target=terminate_stream)
+    first.start()
+    assert callback_started.wait(2)
+    second = threading.Thread(target=terminate_stream)
+    second.start()
+    second.join(0.05)
+
+    assert second.is_alive()
+    release_callback.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive() and not second.is_alive()
     assert terminal_errors == [monitoring_error, monitoring_error]
 
 

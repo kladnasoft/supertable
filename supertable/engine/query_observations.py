@@ -29,7 +29,7 @@ from supertable.utils.diagnostic_redaction import (
 )
 
 
-PROFILE_SCHEMA_VERSION = 2
+PROFILE_SCHEMA_VERSION = 3
 OBSERVATION_SCHEMA_VERSION = 1
 MAX_SANITIZED_PROFILE_BYTES = 64 * 1024
 MAX_PROFILE_DEPTH = 8
@@ -80,6 +80,14 @@ _PROFILE_NUMERIC_KEYS = frozenset({
     "selected_row_groups", "spill_bytes", "system_peak_buffer_memory",
     "system_peak_temp_dir_size", "total_bytes_read", "total_bytes_written",
     "total_files", "total_wall_us", "work_bytes",
+    "files_before_prune", "files_pruned", "files_kept",
+    "stats_load_duration_ms", "stats_filter_duration_ms",
+    "prune_duration_ms", "row_group_prune_duration_ms",
+    "join_edges", "join_files_pruned", "join_prune_iterations",
+    "join_prune_duration_ms", "stats_load_occurrences",
+    "stats_filter_occurrences", "predicate_prune_occurrences",
+    "row_group_prune_occurrences", "join_prune_occurrences",
+    "result_fetch_occurrences",
 })
 _PROFILE_BOOLEAN_KEYS = frozenset({
     "actual_scan_bytes_measured", "candidate_files_complete",
@@ -107,6 +115,124 @@ _PROFILE_ALLOWED_KEYS = frozenset().union(
     _PROFILE_BOOLEAN_KEYS,
     _PROFILE_ENUM_VALUES,
 )
+
+# The legacy timing/profile blobs remain diagnostic compatibility fields.  The
+# normalized v3 document below is the typed cross-engine contract consumed by
+# UIs and monitoring integrations.  Phase names and scopes are deliberately
+# closed: arbitrary mapping keys can contain identifiers and create unbounded
+# telemetry cardinality even when their values happen to be numeric.
+MAX_PHASE_DURATION_US = 24 * 60 * 60 * 1_000_000
+_PIPELINE_TIMER_PHASES = {
+    "QUERY_PREPARATION": ("request_prepare", "request", "exclusive"),
+    "ESTIMATE": ("estimate", "planning", "exclusive"),
+    "TOMBSTONE_RESOLUTION": ("tombstone_prepare", "planning", "exclusive"),
+    "CONNECTION_SETUP": ("engine_connect", "engine", "exclusive"),
+    "REFLECTION_PREPARE": ("reflection_prepare", "engine", "exclusive"),
+    "TOMBSTONE_PREPARE": ("tombstone_prepare", "engine", "exclusive"),
+    "RBAC_PREPARE": ("rbac_prepare", "engine", "exclusive"),
+    "ENGINE_PREPARE": ("engine_prepare", "engine", "exclusive"),
+    "QUERY_EXECUTE": ("query_execute", "engine", "exclusive"),
+    "RESULT_STREAM_SETUP": ("result_stream_setup", "delivery", "exclusive"),
+    "RESULT_FETCH": ("result_fetch", "delivery", "exclusive"),
+    "RESULT_MATERIALIZE": ("result_materialize", "facade", "exclusive"),
+    "CLEANUP": ("cleanup", "delivery", "exclusive"),
+    # These two legacy boundaries remain useful, but overlap the detailed
+    # phases and therefore must never be summed with them.
+    "EXECUTING_QUERY": ("engine_total", "engine", "cumulative"),
+    "TOTAL_EXECUTE": ("total", "request", "cumulative"),
+}
+_ISLAND_PIPELINE_PHASES = {
+    "prepare_execution_inside_call_ms": ("engine_prepare", "engine", "nested"),
+    "admission_wait_ms": ("admission_wait", "engine", "exclusive"),
+    "range_cache_setup_ms": ("range_cache_setup", "engine", "nested"),
+    "spill_pipeline_prepare_or_eager_execution_ms": (
+        "spill_prepare_or_eager_execute", "engine", "nested",
+    ),
+    "relation_prepare_and_eager_integrity_ms": (
+        "relation_prepare_and_integrity", "engine", "nested",
+    ),
+    "first_batch_acquire_ms": ("first_batch_acquire", "delivery", "nested"),
+    "producer_active_ms": ("producer_active", "engine", "nested"),
+    "producer_cleanup_ms": ("producer_cleanup", "delivery", "nested"),
+    "engine_setup_to_stream_ready_ms": (
+        "engine_setup_to_stream", "engine", "cumulative",
+    ),
+    "stream_lifetime_ms": ("stream_lifetime", "delivery", "cumulative"),
+    "engine_elapsed_excluding_profile_persist_ms": (
+        "engine_total", "engine", "cumulative",
+    ),
+    "total_execution_and_facade_excluding_profile_persist_ms": (
+        "request_execution_facade_total", "facade", "cumulative",
+    ),
+    "facade_collect_arrow_table_ms": ("facade_collect_arrow", "facade", "nested"),
+    "facade_arrow_to_polars_ms": ("facade_arrow_to_polars", "facade", "nested"),
+    "facade_dtype_normalize_ms": ("facade_dtype_normalize", "facade", "nested"),
+    "facade_polars_to_pandas_ms": ("facade_polars_to_pandas", "facade", "nested"),
+    "facade_total_ms": ("facade_total", "facade", "cumulative"),
+}
+_SAFE_EXECUTION_TIMING_KEYS = frozenset({
+    *_PIPELINE_TIMER_PHASES,
+    # Retain the historical fields for older monitoring consumers.  V3 never
+    # relabels CONNECTING as an exact connection span.
+    "CONNECTING", "CREATING_REFLECTION",
+})
+
+
+def _duration_us(value: object, *, unit_us: int) -> Optional[int]:
+    number = _finite_number(value)
+    if number is None or number < 0:
+        return None
+    if number > MAX_PHASE_DURATION_US / unit_us:
+        return None
+    duration = int(round(number * unit_us))
+    if duration < 0 or duration > MAX_PHASE_DURATION_US:
+        return None
+    return duration
+
+
+def sanitize_execution_timings(
+    value: object, *, max_bytes: int = 8 * 1024,
+) -> list[Dict[str, float]]:
+    """Keep only fixed SDK timer events with finite nonnegative seconds.
+
+    Unlike :func:`sanitize_profile`, this shape has no free-form fields, SQL,
+    paths, or strings.  Unknown events are omitted rather than represented by
+    numeric redaction counters which a profiler could mistake for durations.
+    """
+
+    entries: Iterable[object]
+    if isinstance(value, Mapping):
+        entries = (value,)
+    elif isinstance(value, (list, tuple)):
+        entries = value
+    else:
+        return []
+    result: list[Dict[str, float]] = []
+    capped = min(8 * 1024, max(256, int(max_bytes)))
+    for entry in entries:
+        if len(result) >= MAX_PROFILE_ITEMS:
+            break
+        if not isinstance(entry, Mapping):
+            continue
+        for raw_key, raw_value in entry.items():
+            if not isinstance(raw_key, str):
+                continue
+            key = raw_key.strip().upper()
+            if key not in _SAFE_EXECUTION_TIMING_KEYS:
+                continue
+            duration = _duration_us(raw_value, unit_us=1_000_000)
+            if duration is None:
+                continue
+            result.append({key: duration / 1_000_000.0})
+            encoded = json.dumps(
+                result, separators=(",", ":"),
+            ).encode("utf-8")
+            if len(encoded) > capped:
+                result.pop()
+                return result
+            if len(result) >= MAX_PROFILE_ITEMS:
+                break
+    return result
 
 
 def _finite_number(value: object) -> Optional[float]:
@@ -307,6 +433,393 @@ def flatten_plan_stats(plan_stats: object) -> Dict[str, object]:
             for key, value in entry.items():
                 flattened[str(key)] = value
     return flattened
+
+
+def _append_pipeline_phase(
+    phases: list[Dict[str, object]],
+    indexes: Dict[tuple[str, str, str], int],
+    *,
+    phase: str,
+    duration_us: Optional[int],
+    scope: str,
+    aggregation: str,
+    occurrences: int = 1,
+) -> None:
+    if duration_us is None or len(phases) >= 48:
+        return
+    occurrences = min(65_535, max(1, int(occurrences)))
+    identity = (phase, scope, aggregation)
+    existing_index = indexes.get(identity)
+    if existing_index is None:
+        indexes[identity] = len(phases)
+        phases.append({
+            "phase": phase,
+            "duration_us": duration_us,
+            "occurrences": occurrences,
+            "scope": scope,
+            "aggregation": aggregation,
+        })
+        return
+    existing = phases[existing_index]
+    previous = _integer(existing.get("duration_us"), maximum=MAX_PHASE_DURATION_US)
+    if aggregation == "cumulative":
+        existing["duration_us"] = max(previous, duration_us)
+    else:
+        existing["duration_us"] = min(
+            MAX_PHASE_DURATION_US, previous + duration_us,
+        )
+    existing["occurrences"] = min(
+        65_535,
+        _integer(existing.get("occurrences"), maximum=65_535) + occurrences,
+    )
+
+
+def _pipeline_phases(
+    timing: object, stats: Mapping[str, object], profile: Mapping[str, object],
+) -> list[Dict[str, object]]:
+    phases: list[Dict[str, object]] = []
+    indexes: Dict[tuple[str, str, str], int] = {}
+    entries: Iterable[object]
+    if isinstance(timing, Mapping):
+        entries = (timing,)
+    elif isinstance(timing, (list, tuple)):
+        entries = timing
+    else:
+        entries = ()
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        for raw_name, raw_duration in entry.items():
+            if not isinstance(raw_name, str):
+                continue
+            definition = _PIPELINE_TIMER_PHASES.get(raw_name.strip().upper())
+            if definition is None:
+                continue
+            phase, scope, aggregation = definition
+            _append_pipeline_phase(
+                phases, indexes,
+                phase=phase,
+                duration_us=_duration_us(raw_duration, unit_us=1_000_000),
+                scope=scope,
+                aggregation=aggregation,
+            )
+
+    result_fetch_occurrences = _integer(
+        stats.get("RESULT_FETCH_OCCURRENCES"), maximum=65_535,
+    )
+    result_fetch_index = indexes.get(("result_fetch", "delivery", "exclusive"))
+    if result_fetch_occurrences and result_fetch_index is not None:
+        phases[result_fetch_index]["occurrences"] = result_fetch_occurrences
+
+    for stat_name, occurrence_name, phase_name in (
+        ("STATS_LOAD_DURATION_MS", "STATS_LOAD_OCCURRENCES", "stats_load"),
+        (
+            "STATS_FILTER_DURATION_MS", "STATS_FILTER_OCCURRENCES",
+            "stats_filter",
+        ),
+        (
+            "PRUNE_DURATION_MS", "PREDICATE_PRUNE_OCCURRENCES",
+            "predicate_prune",
+        ),
+        (
+            "ROW_GROUP_PRUNE_DURATION_MS", "ROW_GROUP_PRUNE_OCCURRENCES",
+            "row_group_prune",
+        ),
+        (
+            "JOIN_PRUNE_DURATION_MS", "JOIN_PRUNE_OCCURRENCES",
+            "join_prune",
+        ),
+    ):
+        if stat_name in stats:
+            _append_pipeline_phase(
+                phases, indexes,
+                phase=phase_name,
+                duration_us=_duration_us(stats.get(stat_name), unit_us=1_000),
+                scope="planning",
+                aggregation="nested",
+                occurrences=_integer(
+                    stats.get(occurrence_name), maximum=65_535,
+                ) or 1,
+            )
+
+    island_phases = profile.get("phase_timings_ms")
+    if isinstance(island_phases, Mapping):
+        for raw_name, raw_duration in island_phases.items():
+            if not isinstance(raw_name, str):
+                continue
+            definition = _ISLAND_PIPELINE_PHASES.get(raw_name)
+            if definition is None:
+                continue
+            phase, scope, _aggregation = definition
+            _append_pipeline_phase(
+                phases, indexes,
+                phase=phase,
+                duration_us=_duration_us(raw_duration, unit_us=1_000),
+                scope=scope,
+                # Island's published scope is explicitly nested and
+                # non-additive, including its apparent subtotal fields.
+                aggregation="nested",
+            )
+    if (
+        profile.get("profile_persist_ms_measured") is True
+        and "profile_persist_ms" in profile
+    ):
+        _append_pipeline_phase(
+            phases, indexes,
+            phase="profile_persist",
+            duration_us=_duration_us(
+                profile.get("profile_persist_ms"), unit_us=1_000,
+            ),
+            scope="delivery",
+            aggregation="exclusive",
+        )
+    return phases
+
+
+def _optional_uint(
+    source: Mapping[str, object], key: str, *, maximum: int = (1 << 63) - 1,
+) -> Optional[int]:
+    if key not in source:
+        return None
+    value = source.get(key)
+    if isinstance(value, bool):
+        return None
+    number = _finite_number(value)
+    if number is None or number < 0:
+        return None
+    return min(maximum, int(number))
+
+
+def _pruning_detail(stats: Mapping[str, object]) -> Dict[str, object]:
+    result: Dict[str, object] = {}
+    mappings = {
+        "FILES_BEFORE_PRUNE": "files_before_prune",
+        "FILES_PRUNED": "files_pruned",
+        "FILES_KEPT": "files_kept",
+        "JOIN_EDGES": "join_edges",
+        "JOIN_FILES_PRUNED": "join_files_pruned",
+        "JOIN_PRUNE_ITERATIONS": "join_iterations",
+    }
+    for source_key, target_key in mappings.items():
+        value = _optional_uint(stats, source_key)
+        if value is not None:
+            result[target_key] = value
+    counts = stats.get("PRUNE_COUNTS")
+    if isinstance(counts, Mapping):
+        for source_key, target_key in (
+            ("stats_cache_hit", "stats_cache_hits"),
+            ("stats_cache_miss", "stats_cache_misses"),
+        ):
+            value = _optional_uint(counts, source_key)
+            if value is not None:
+                result[target_key] = value
+    if result or "FILES_BEFORE_PRUNE" in stats:
+        result["enabled"] = "FILES_BEFORE_PRUNE" in stats
+    return result
+
+
+def _cache_detail(
+    stats: Mapping[str, object], profile: Mapping[str, object],
+) -> Dict[str, object]:
+    result: Dict[str, object] = {}
+    whole: Dict[str, object] = {}
+    whole_mappings = {
+        "FILE_CACHE_REQUESTED_FILES": "requested_files",
+        "FILE_CACHE_LOCALIZED_FILES": "localized_files",
+        "FILE_CACHE_LOCALIZED_BYTES": "localized_bytes",
+        "FILE_CACHE_FALLBACK_FILES": "fallback_files",
+        "FILE_CACHE_HITS": "hits",
+        "FILE_CACHE_MISSES": "misses",
+        "FILE_CACHE_DOWNLOADS": "downloads",
+        "FILE_CACHE_DOWNLOADED_BYTES": "downloaded_bytes",
+        "FILE_CACHE_BYPASSES": "bypasses",
+        "FILE_CACHE_LOCAL_NO_COPY": "local_no_copy",
+        "FILE_CACHE_EVICTIONS": "evictions",
+        "FILE_CACHE_EVICTED_BYTES": "evicted_bytes",
+        "FILE_CACHE_INTEGRITY_FAILURES": "integrity_failures",
+        "FILE_CACHE_ERRORS": "errors",
+    }
+    for source_key, target_key in whole_mappings.items():
+        value = _optional_uint(stats, source_key)
+        if value is not None:
+            whole[target_key] = value
+    ratio = _finite_number(stats.get("FILE_CACHE_COVERAGE_RATIO"))
+    if ratio is not None and 0 <= ratio <= 1:
+        whole["coverage_ratio_ppm"] = int(round(ratio * 1_000_000))
+    if whole:
+        result["whole_object"] = whole
+
+    range_values: Dict[str, object] = {}
+    for candidate in (stats.get("ISLAND_CACHE"), profile.get("cache")):
+        if isinstance(candidate, Mapping):
+            range_values.update(candidate)
+    range_detail: Dict[str, object] = {}
+    range_mappings = {
+        "range_logical_requests": "logical_requests",
+        "range_requested_bytes": "requested_bytes",
+        "range_served_bytes": "served_bytes",
+        "range_cache_hit_chunks": "cache_hit_chunks",
+        "range_cache_hit_bytes": "cache_hit_bytes",
+        "range_validated_hits": "validated_hits",
+        "range_hash_validation_skips": "hash_validation_skips",
+        "range_hash_validations": "hash_validations",
+        "range_cache_miss_chunks": "cache_miss_chunks",
+        "range_remote_requests": "remote_requests",
+        "range_remote_bytes": "remote_bytes",
+        "range_fills": "fills",
+        "range_bypass_requests": "bypass_requests",
+        "range_bypass_bytes": "bypass_bytes",
+        "range_corruption_repairs": "corruption_repairs",
+        "range_evictions": "evictions",
+        "range_evicted_bytes": "evicted_bytes",
+        "range_errors": "errors",
+    }
+    for source_key, target_key in range_mappings.items():
+        value = _optional_uint(range_values, source_key)
+        if value is not None:
+            range_detail[target_key] = value
+    if range_detail:
+        result["range"] = range_detail
+    return result
+
+
+_DUCKDB_IDENTITY_MODES = frozenset({
+    "none", "local_root", "explicit_credential_fingerprint",
+    "provider_credential_fingerprint", "opaque_client_identity",
+    "opaque_credential_identity", "azure_account_route",
+    "azure_url_auth_fingerprint", "endpoint_auth_fingerprint",
+})
+_ISLAND_ADVICE = frozenset({
+    "island_in_memory", "island_spill", "stream_result",
+    "route_duckdb", "route_spark",
+})
+
+
+def _engine_detail(
+    actual_engine: str, stats: Mapping[str, object], profile: Mapping[str, object],
+) -> Dict[str, object]:
+    result: Dict[str, object] = {"kind": actual_engine}
+    if actual_engine.startswith("duckdb"):
+        connection = stats.get("DUCKDB_CONNECTION_CACHE")
+        if isinstance(connection, Mapping):
+            typed: Dict[str, object] = {}
+            for key in ("engine_reused", "connection_warm", "eviction_pending"):
+                if isinstance(connection.get(key), bool):
+                    typed[key] = connection[key]
+            capacity = _optional_uint(connection, "capacity", maximum=256)
+            if capacity is not None:
+                typed["capacity"] = capacity
+            identity_mode = connection.get("identity_mode")
+            if isinstance(identity_mode, str) and identity_mode in _DUCKDB_IDENTITY_MODES:
+                typed["identity_mode"] = identity_mode
+            if typed:
+                result["connection_cache"] = typed
+        children = profile.get("children")
+        result["operator_profile_captured"] = bool(
+            isinstance(children, (list, tuple)) and children
+        )
+        for source_key, target_key in (
+            ("total_bytes_written", "bytes_written"),
+            ("cumulative_cardinality", "rows_processed"),
+            ("total_memory_allocated", "total_memory_allocated_bytes"),
+        ):
+            value = _optional_uint(profile, source_key)
+            if value is not None:
+                result[target_key] = value
+        blocked = _duration_us(profile.get("blocked_thread_time"), unit_us=1_000_000)
+        if "blocked_thread_time" in profile and blocked is not None:
+            result["blocked_thread_us"] = blocked
+        return result
+
+    if actual_engine == Engine.ISLANDDB.value:
+        for key in (
+            "native", "estimated_candidate_files_complete",
+            "estimated_candidate_row_groups_complete", "planned_files_complete",
+            "planned_rows_complete", "observed_files_measured",
+            "observed_row_groups_measured", "profile_persist_succeeded",
+        ):
+            if isinstance(profile.get(key), bool):
+                result[key] = profile[key]
+        for key in (
+            "estimated_candidate_files", "estimated_candidate_row_groups",
+            "planned_files", "planned_rows", "observed_files",
+            "observed_row_groups", "result_batches",
+        ):
+            value = _optional_uint(profile, key)
+            if value is not None:
+                result[key] = value
+        sample_us = _duration_us(profile.get("rss_sample_interval_ms"), unit_us=1_000)
+        if "rss_sample_interval_ms" in profile and sample_us is not None:
+            result["rss_sample_interval_us"] = sample_us
+
+        resources = profile.get("resources")
+        if not isinstance(resources, Mapping):
+            resources = stats.get("ISLAND_RESOURCES")
+        if isinstance(resources, Mapping):
+            resource_plan: Dict[str, object] = {}
+            for key in (
+                "cpu_workers", "io_workers", "batch_bytes", "batch_rows",
+                "memory_budget_bytes", "scan_memory_bytes",
+                "operator_memory_bytes", "result_memory_bytes",
+                "spill_budget_bytes", "estimated_spill_bytes",
+                "max_result_row_bytes", "container_cpus",
+                "container_memory_bytes",
+            ):
+                value = _optional_uint(resources, key)
+                if value is not None:
+                    resource_plan[key] = value
+            advice = resources.get("advice")
+            if isinstance(advice, str) and advice in _ISLAND_ADVICE:
+                resource_plan["advice"] = advice
+            if resource_plan:
+                result["resource_plan"] = resource_plan
+        spill = profile.get("spill")
+        if not isinstance(spill, Mapping):
+            spill = stats.get("ISLAND_SPILL")
+        if isinstance(spill, Mapping):
+            spill_plan: Dict[str, object] = {}
+            if isinstance(spill.get("triggered"), bool):
+                spill_plan["triggered"] = spill["triggered"]
+            for key in ("budget_bytes", "estimated_bytes"):
+                value = _optional_uint(spill, key)
+                if value is not None:
+                    spill_plan[key] = value
+            if spill_plan:
+                result["spill_plan"] = spill_plan
+        return result
+
+    # Spark currently provides structural plan markers but not comparable
+    # operator resource telemetry.  Persist booleans only, never plan text.
+    if actual_engine == Engine.SPARK_SQL.value:
+        for source_key, target_key in (
+            ("parsed_plan", "parsed_plan_present"),
+            ("analyzed_plan", "analyzed_plan_present"),
+            ("optimized_plan", "optimized_plan_present"),
+            ("physical_plan", "physical_plan_present"),
+        ):
+            if source_key in profile:
+                result[target_key] = bool(profile.get(source_key))
+    return result
+
+
+def _result_delivery_detail(
+    stats: Mapping[str, object],
+) -> tuple[str, Optional[int], Optional[int]]:
+    raw_mode = stats.get("RESULT_MODE")
+    if raw_mode in {"arrow_stream", "arrow_stream_final"}:
+        mode = "arrow_stream"
+    elif raw_mode == "materialized":
+        mode = "materialized"
+    else:
+        mode = "unknown"
+    limits = stats.get("RESULT_BATCH_LIMIT")
+    if not isinstance(limits, Mapping):
+        return mode, None, None
+    return (
+        mode,
+        _optional_uint(limits, "max_rows", maximum=1_000_000),
+        _optional_uint(limits, "max_bytes"),
+    )
 
 
 def _timing_seconds(timing: object, name: str) -> Optional[float]:
@@ -586,6 +1099,7 @@ class NormalizedQueryProfile:
     decoded_bytes_complete: bool
     work_bytes: int
     total_files: int
+    total_files_complete: bool
     selected_row_groups: int
     selected_row_groups_complete: bool
     planned_row_groups: int
@@ -617,6 +1131,13 @@ class NormalizedQueryProfile:
     rows_scanned_measured: bool
     execution_outcome: str
     result_complete: Optional[bool]
+    result_mode: str
+    result_batch_max_rows: Optional[int]
+    result_batch_max_bytes: Optional[int]
+    pipeline_phases: object
+    pruning: object
+    cache_detail: object
+    engine_detail: object
     routing_decision: object
 
     def as_dict(self) -> Dict[str, object]:
@@ -672,11 +1193,41 @@ def normalize_query_profile(
     )
     if isinstance(engine_profile, Mapping):
         profile.update(engine_profile)
+    if actual == Engine.ISLANDDB.value and telemetry_fallback:
+        # The atomic profile file intentionally cannot contain the duration or
+        # outcome of the write persisting that same file. Executor publishes a
+        # query-tokenized in-memory profile after the write completes; preserve
+        # those later fields while keeping the persisted artifact primary for
+        # every non-self-referential measurement.
+        persisted_phases = profile.get("phase_timings_ms")
+        current_phases = telemetry_fallback.get("phase_timings_ms")
+        if isinstance(current_phases, Mapping):
+            merged_phases = (
+                dict(persisted_phases)
+                if isinstance(persisted_phases, Mapping) else {}
+            )
+            merged_phases.update(current_phases)
+            profile["phase_timings_ms"] = merged_phases
+        for key in (
+            "profile_persist_ms",
+            "profile_persist_ms_measured",
+            "profile_persist_succeeded",
+        ):
+            if key in telemetry_fallback:
+                profile[key] = telemetry_fallback[key]
+    result_mode, result_batch_max_rows, result_batch_max_bytes = (
+        _result_delivery_detail(stats)
+    )
+    is_arrow_stream = result_mode == "arrow_stream"
     metrics = _profile_metrics(profile, actual)
     if _finite_number(stats.get("RESULT_BYTES")) is not None:
         metrics["result_bytes"] = _integer(stats.get("RESULT_BYTES"))
         metrics["result_bytes_measured"] = True
-        metrics["result_bytes_scope"] = "materialized_pandas_deep_memory_usage"
+        metrics["result_bytes_scope"] = (
+            "arrow_output_batch_logical_nbytes"
+            if is_arrow_stream
+            else "materialized_pandas_deep_memory_usage"
+        )
     executing_s = _timing_seconds(timing, "EXECUTING_QUERY")
     total_s = _timing_seconds(timing, "TOTAL_EXECUTE")
     if not metrics["engine_wall_us"] and executing_s is not None:
@@ -759,14 +1310,32 @@ def normalize_query_profile(
         rows, columns = _integer(result_shape[0]), _integer(result_shape[1])
         metrics["result_rows"] = rows
         metrics["result_rows_measured"] = True
-        metrics["result_rows_scope"] = "materialized_result_shape"
+        metrics["result_rows_scope"] = (
+            "arrow_output_rows"
+            if is_arrow_stream
+            else "materialized_result_shape"
+        )
     elif bool(metrics["result_rows_measured"]):
         rows = _integer(metrics["result_rows"])
     raw_result_complete = metrics["result_complete"]
     result_complete = (
         raw_result_complete if isinstance(raw_result_complete, bool) else None
     )
-
+    candidate_files_complete = bool(metrics["candidate_files_complete"])
+    feature_total_files = _optional_uint(features, "total_files")
+    stats_total_files = _optional_uint(stats, "REFLECTIONS")
+    if candidate_files_complete:
+        total_files = _integer(metrics["candidate_files"])
+        total_files_complete = True
+    elif feature_total_files is not None:
+        total_files = feature_total_files
+        total_files_complete = True
+    elif stats_total_files is not None:
+        total_files = stats_total_files
+        total_files_complete = True
+    else:
+        total_files = 0
+        total_files_complete = False
     return NormalizedQueryProfile(
         schema_version=PROFILE_SCHEMA_VERSION,
         query_shape_hash=shape_hash,
@@ -798,14 +1367,8 @@ def normalize_query_profile(
         decoded_bytes=decoded,
         decoded_bytes_complete=decoded_complete,
         work_bytes=work_bytes,
-        total_files=(
-            _integer(metrics["candidate_files"])
-            if bool(metrics["candidate_files_complete"])
-            else _integer(
-                features.get("total_files")
-                if features else stats.get("REFLECTIONS")
-            )
-        ),
+        total_files=total_files,
+        total_files_complete=total_files_complete,
         selected_row_groups=(
             _integer(metrics["candidate_row_groups"])
             if bool(metrics["candidate_row_groups_complete"])
@@ -850,6 +1413,13 @@ def normalize_query_profile(
         rows_scanned_measured=bool(metrics["rows_scanned_measured"]),
         execution_outcome=str(metrics["execution_outcome"]),
         result_complete=result_complete,
+        result_mode=result_mode,
+        result_batch_max_rows=result_batch_max_rows,
+        result_batch_max_bytes=result_batch_max_bytes,
+        pipeline_phases=_pipeline_phases(timing, stats, profile),
+        pruning=_pruning_detail(stats),
+        cache_detail=_cache_detail(stats, profile),
+        engine_detail=_engine_detail(actual, stats, profile),
         routing_decision=sanitize_profile(routing, max_bytes=16 * 1024),
     )
 
@@ -1204,5 +1774,6 @@ class QueryObservationStore:
 __all__ = [
     "NormalizedQueryProfile", "QueryObservation", "QueryObservationStore",
     "canonical_sql_shape", "diagnostic_text_identity", "flatten_plan_stats",
-    "normalize_query_profile", "redact_text", "sanitize_profile",
+    "normalize_query_profile", "redact_text", "sanitize_execution_timings",
+    "sanitize_profile",
 ]

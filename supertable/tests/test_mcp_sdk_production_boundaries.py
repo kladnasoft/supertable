@@ -53,7 +53,7 @@ def test_top_level_exports_bounded_query_stream_and_release_version():
     )
     assert "query_sql_stream" in supertable.__all__
     assert "query_sql_policy_fingerprint" in supertable.__all__
-    assert supertable.__version__ == "2.5.6"
+    assert supertable.__version__ == "2.5.7"
 
 
 def test_export_computes_one_deadline_and_guards_size_before_parse(monkeypatch):

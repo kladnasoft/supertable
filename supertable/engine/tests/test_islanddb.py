@@ -1532,6 +1532,73 @@ def test_active_island_cancellation_records_cancelled_terminal_once():
     assert terminal_callbacks == ["cancelled"]
 
 
+def test_active_island_cancel_publishes_terminal_after_arrow_finalization():
+    batch = pa.record_batch({"id": [1]})
+    entered = threading.Event()
+    producer_released = threading.Event()
+    finalization_started = threading.Event()
+    finalization_released = threading.Event()
+    finalized = []
+
+    class Producer:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            entered.set()
+            assert producer_released.wait(2), "cancel did not release producer"
+            return batch
+
+        def cancel(self):
+            producer_released.set()
+
+        def close(self):
+            return None
+
+    def finalize_profile():
+        finalization_started.set()
+        assert finalization_released.wait(2), "test did not release finalization"
+        finalized.append("profile persisted")
+
+    inner = islanddb_module.ArrowBatchStream(
+        batch.schema,
+        Producer(),
+        close_callback=finalize_profile,
+    )
+    stream = islanddb_module._IslandResultLifecycleStream(
+        inner,
+        deadline_monotonic=None,
+        timeout_value=None,
+        cancel_event=None,
+    )
+    terminal_snapshots = []
+    stream.add_terminal_callback(
+        lambda kind: terminal_snapshots.append((kind, list(finalized)))
+    )
+    worker_errors = []
+
+    def consume():
+        try:
+            next(stream)
+        except BaseException as exc:
+            worker_errors.append(exc)
+
+    worker = threading.Thread(target=consume)
+    worker.start()
+    assert entered.wait(1)
+    stream.cancel()
+    assert finalization_started.wait(1)
+    assert terminal_snapshots == []
+
+    finalization_released.set()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert worker_errors
+    assert terminal_snapshots == [
+        ("cancelled", ["profile persisted"]),
+    ]
+
+
 @pytest.mark.parametrize("stop_kind", ["deadline", "facade_cancel"])
 def test_idle_executor_island_stream_releases_outer_cache_lease(
     tmp_path,

@@ -1398,6 +1398,10 @@ class ArrowBatchStream(Iterator[pa.RecordBatch]):
         self._close_requested = False
         self._active_next = 0
         self._state_lock = threading.RLock()
+        self._closed_event = threading.Event()
+        self._completion_started = False
+        self._finalization_error: BaseException | None = None
+        self._finalization_callbacks: list[Callable[[], None]] = []
 
     @classmethod
     def from_table(
@@ -1418,12 +1422,26 @@ class ArrowBatchStream(Iterator[pa.RecordBatch]):
         """Shared cooperative-cancellation signal for nested operators."""
         return self._cancel_event
 
+    @property
+    def finalization_error(self) -> BaseException | None:
+        """Return a completed cleanup failure without exposing partial state."""
+
+        with self._state_lock:
+            if not self._closed_event.is_set():
+                return None
+            return self._finalization_error
+
     def __iter__(self) -> "ArrowBatchStream":
         return self
 
     def __next__(self) -> pa.RecordBatch:
         with self._state_lock:
             if self._closed:
+                if (
+                    self._closed_event.is_set()
+                    and self._finalization_error is not None
+                ):
+                    raise self._finalization_error
                 raise StopIteration
             if self._cancel_event.is_set():
                 cancelled_before_next = True
@@ -1499,22 +1517,119 @@ class ArrowBatchStream(Iterator[pa.RecordBatch]):
         return close_requested
 
     def _finalize(self) -> None:
+        deferred = False
+        add_finalization_callback = getattr(
+            self._iterator, "add_finalization_callback", None,
+        )
+        if callable(add_finalization_callback):
+            try:
+                deferred = (
+                    add_finalization_callback(self._complete_finalization)
+                    is not False
+                )
+            except Exception:
+                deferred = False
         close = getattr(self._iterator, "close", None)
         try:
             if callable(close):
                 close()
         finally:
-            callback = None
-            with self._state_lock:
-                if self._close_callback is not None:
-                    callback, self._close_callback = self._close_callback, None
+            if not deferred:
+                self._complete_finalization()
+        # Registration may have completed synchronously (for example, when a
+        # nested stream finalizes during ``close``). Surface that cleanup
+        # failure to the initiating caller without waiting on async cleanup.
+        completion_error = self.finalization_error
+        if completion_error is not None:
+            raise completion_error
+
+    def _complete_finalization(self) -> None:
+        """Finish this layer only after its iterator has fully finalized."""
+
+        callback = None
+        with self._state_lock:
+            if self._closed_event.is_set() or self._completion_started:
+                return
+            self._completion_started = True
+            if self._close_callback is not None:
+                callback, self._close_callback = self._close_callback, None
+        completion_error: BaseException | None = None
+        try:
             if callback is not None:
                 callback()
+        except BaseException as exc:
+            completion_error = exc
+        finally:
+            # A nested Arrow layer may have completed asynchronously. Preserve
+            # its cleanup failure on this layer even when intermediary
+            # diagnostic observers intentionally isolate callback exceptions.
+            current: object | None = self._iterator
+            seen: set[int] = set()
+            while completion_error is None and current is not None:
+                identity = id(current)
+                if identity in seen:
+                    break
+                seen.add(identity)
+                try:
+                    nested_error = getattr(
+                        current, "finalization_error", None,
+                    )
+                except Exception:
+                    nested_error = None
+                if isinstance(nested_error, BaseException):
+                    completion_error = nested_error
+                    break
+                current = getattr(current, "_inner", None)
+            # ``closed`` becomes true before producer/callback cleanup is
+            # complete. Lifecycle observers use this event when terminal
+            # telemetry must include cleanup-finalized measurements.
+            with self._state_lock:
+                self._finalization_error = completion_error
+                callbacks, self._finalization_callbacks = (
+                    self._finalization_callbacks,
+                    [],
+                )
+                self._closed_event.set()
+            for finalization_callback in callbacks:
+                try:
+                    finalization_callback()
+                except Exception:
+                    # Finalization observers are diagnostic only. They must
+                    # never change the result-stream cleanup contract.
+                    pass
+        if completion_error is not None:
+            raise completion_error
+
+    def add_finalization_callback(self, callback: Callable[[], None]) -> bool:
+        """Invoke ``callback`` after producer and close cleanup has finished."""
+
+        invoke_now = False
+        with self._state_lock:
+            if self._closed_event.is_set():
+                invoke_now = True
+            else:
+                self._finalization_callbacks.append(callback)
+        if invoke_now:
+            try:
+                callback()
+            except Exception:
+                pass
+        return True
+
+    def wait_closed(self, timeout: float | None = None) -> bool:
+        """Wait until producer and close-callback finalization has completed."""
+
+        return self._closed_event.wait(timeout)
 
     def close(self) -> None:
         should_finalize = False
         with self._state_lock:
             if self._closed:
+                if (
+                    self._closed_event.is_set()
+                    and self._finalization_error is not None
+                ):
+                    raise self._finalization_error
                 return
             self._close_requested = True
             if self._active_next == 0:

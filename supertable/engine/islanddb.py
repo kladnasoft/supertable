@@ -347,6 +347,7 @@ class _IslandResultLifecycleStream:
         self._stop = threading.Event()
         self._state_lock = threading.Lock()
         self._terminal_kind: Optional[str] = None
+        self._pending_terminal_kind: Optional[str] = None
         self._terminal_callbacks = []
         self._watcher: Optional[threading.Thread] = None
         self._start_monitor()
@@ -385,6 +386,14 @@ class _IslandResultLifecycleStream:
         if invoke_now:
             callback(terminal_kind)
 
+    def add_finalization_callback(self, callback) -> bool:
+        add_callback = getattr(
+            self._inner, "add_finalization_callback", None,
+        )
+        if not callable(add_callback):
+            return False
+        return add_callback(callback) is not False
+
     def _record_terminal(self, kind: str) -> None:
         callbacks = []
         with self._state_lock:
@@ -400,6 +409,58 @@ class _IslandResultLifecycleStream:
                     "[islanddb] result lifecycle callback failed; error_type=%s",
                     safe_exception_type(exc),
                 )
+
+    def _record_pending_terminal(self) -> None:
+        with self._state_lock:
+            kind = self._pending_terminal_kind
+        if kind is not None:
+            finalization_error = getattr(
+                self._inner, "finalization_error", None,
+            )
+            self._record_terminal(
+                "failed" if finalization_error is not None else kind
+            )
+
+    def _record_terminal_after_finalization(self, kind: str) -> bool:
+        add_finalization_callback = getattr(
+            self._inner, "add_finalization_callback", None,
+        )
+        if not callable(add_finalization_callback):
+            return False
+        register_callback = False
+        with self._state_lock:
+            if (
+                self._terminal_kind is None
+                and self._pending_terminal_kind is None
+            ):
+                self._pending_terminal_kind = str(kind)
+                register_callback = True
+        if register_callback:
+            accepted = add_finalization_callback(
+                self._record_pending_terminal
+            )
+            if accepted is False:
+                with self._state_lock:
+                    if (
+                        self._terminal_kind is None
+                        and self._pending_terminal_kind == str(kind)
+                    ):
+                        self._pending_terminal_kind = None
+                return False
+        return True
+
+    def _cancel_inner_and_record(self, kind: str) -> None:
+        deferred = self._record_terminal_after_finalization(kind)
+        try:
+            cancel = getattr(self._inner, "cancel", None)
+            if callable(cancel):
+                cancel()
+            else:
+                self._inner.close()
+        finally:
+            self._stop_monitor()
+            if not deferred:
+                self._record_terminal(kind)
 
     def _start_monitor(self) -> None:
         if self._deadline is None and self._cancel_event is None:
@@ -480,72 +541,69 @@ class _IslandResultLifecycleStream:
             self._raise_if_stopped()
         except ResourceReservationCancelled:
             self._cancelled.set()
-            self._stop_monitor()
-            self._record_terminal("cancelled")
+            self._cancel_inner_and_record("cancelled")
             raise
         try:
             batch = next(self._inner)
         except StopIteration:
             self._stop_monitor()
             self._raise_if_stopped()
-            self._record_terminal("completed")
+            if not self._record_terminal_after_finalization("completed"):
+                self._record_terminal("completed")
             raise
         except IslandExecutionTimeout:
             # The active producer sets the shared cooperative-cancel event
             # while unwinding its deadline. Preserve the more specific cause
             # before the generic event check can reclassify it as cancellation.
             self._mark_timed_out()
+            deferred = self._record_terminal_after_finalization("timed_out")
             self._stop_monitor()
-            self._record_terminal("timed_out")
+            if not deferred:
+                self._record_terminal("timed_out")
             raise
         except ResourceReservationCancelled:
             self._cancelled.set()
-            self._stop_monitor()
-            self._record_terminal("cancelled")
+            self._cancel_inner_and_record("cancelled")
             raise
         except BaseException:
             self._stop_monitor()
             self._raise_if_stopped()
-            self._record_terminal("failed")
+            if not self._record_terminal_after_finalization("failed"):
+                self._record_terminal("failed")
             raise
         try:
             self._raise_if_stopped()
         except ResourceReservationCancelled:
             self._cancelled.set()
-            self._stop_monitor()
-            self._record_terminal("cancelled")
+            self._cancel_inner_and_record("cancelled")
             raise
         return batch
 
     def timeout(self) -> None:
         if not self._mark_timed_out():
             return
+        deferred = self._record_terminal_after_finalization("timed_out")
         try:
             self._inner.close()
         finally:
             self._stop_monitor()
-            self._record_terminal("timed_out")
+            if not deferred:
+                self._record_terminal("timed_out")
 
     def cancel(self) -> None:
         if self._cancelled.is_set():
             return
         self._cancelled.set()
-        try:
-            cancel = getattr(self._inner, "cancel", None)
-            if callable(cancel):
-                cancel()
-            else:
-                self._inner.close()
-        finally:
-            self._stop_monitor()
-            self._record_terminal("cancelled")
+        self._cancel_inner_and_record("cancelled")
 
     def close(self) -> None:
+        deferred = self._record_terminal_after_finalization("closed")
         try:
             self._inner.close()
         finally:
             self._stop_monitor()
-            self._record_terminal("closed")
+            if not deferred:
+                self._record_terminal("closed")
 
     def collect_table(self, *, max_bytes: int) -> pa.Table:
         if max_bytes < 0:

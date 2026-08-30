@@ -2248,40 +2248,41 @@ class DataEstimator:
                         self, "require_bounded_resource_estimates", False,
                     ))
                 ):
-                    try:
-                        if bool(getattr(
-                            self, "require_bounded_resource_estimates", False,
-                        )):
-                            if expected_stats_rows is None:
-                                raise ValueError(
-                                    "Statistics row count is unavailable"
+                    with prune_profiler.span("read.stats_load"):
+                        try:
+                            if bool(getattr(
+                                self, "require_bounded_resource_estimates", False,
+                            )):
+                                if expected_stats_rows is None:
+                                    raise ValueError(
+                                        "Statistics row count is unavailable"
+                                    )
+                                stats_df = load_bounded_stats_for_planning(
+                                    stats_file,
+                                    expected_rows=expected_stats_rows,
+                                    cache_identity=stats_identity,
+                                    profiler=prune_profiler,
+                                    storage=self.storage,
                                 )
-                            stats_df = load_bounded_stats_for_planning(
-                                stats_file,
-                                expected_rows=expected_stats_rows,
-                                cache_identity=stats_identity,
-                                profiler=prune_profiler,
-                                storage=self.storage,
+                            else:
+                                stats_df = load_stats(
+                                    stats_file,
+                                    allow_cache=True,
+                                    cache_identity=stats_identity,
+                                    profiler=prune_profiler,
+                                    storage=self.storage,
+                                )
+                        except Exception as stats_err:
+                            # Stats are an optional optimisation artifact.  A stale,
+                            # corrupt, unavailable, or malformed pointer must never
+                            # turn a valid SELECT into an error or a narrower scan.
+                            logger.warning(
+                                f"[estimate.stats] stats unavailable for "
+                                f"{super_name}.{simple_name}; pruning and precise "
+                                f"projection sizing skipped; "
+                                f"error_type={safe_exception_type(stats_err)}"
                             )
-                        else:
-                            stats_df = load_stats(
-                                stats_file,
-                                allow_cache=True,
-                                cache_identity=stats_identity,
-                                profiler=prune_profiler,
-                                storage=self.storage,
-                            )
-                    except Exception as stats_err:
-                        # Stats are an optional optimisation artifact.  A stale,
-                        # corrupt, unavailable, or malformed pointer must never
-                        # turn a valid SELECT into an error or a narrower scan.
-                        logger.warning(
-                            f"[estimate.stats] stats unavailable for "
-                            f"{super_name}.{simple_name}; pruning and precise "
-                            f"projection sizing skipped; "
-                            f"error_type={safe_exception_type(stats_err)}"
-                        )
-                        stats_df = None
+                            stats_df = None
 
                 if stats_df is not None and expected_stats_rows is not None:
                     try:
@@ -2308,12 +2309,13 @@ class DataEstimator:
                     # replaced by a duplicate elsewhere.  Remove every file
                     # whose stats do not form a complete per-resource manifest;
                     # absent stats always retain the data file.
-                    stats_df = self._stats_for_complete_files(
-                        stats_df,
-                        resource_rows,
-                        resource_seals,
-                        stats_path=stats_identity,
-                    )
+                    with prune_profiler.span("read.stats_filter"):
+                        stats_df = self._stats_for_complete_files(
+                            stats_df,
+                            resource_rows,
+                            resource_seals,
+                            stats_path=stats_identity,
+                        )
 
                 # Read-path pruning: drop raw keys whose stats prove they cannot
                 # satisfy this table's own WHERE before any cross-table step.
@@ -2353,11 +2355,12 @@ class DataEstimator:
                         literal_row_groups = {}
                     else:
                         try:
-                            literal_row_groups = select_row_groups_by_predicates(
-                                raw_keys,
-                                stats_df,
-                                self.predicate_constraints.get(key) or [],
-                            )
+                            with prune_profiler.span("read.row_group_prune"):
+                                literal_row_groups = select_row_groups_by_predicates(
+                                    raw_keys,
+                                    stats_df,
+                                    self.predicate_constraints.get(key) or [],
+                                )
                         except Exception as row_group_err:
                             logger.warning(
                                 f"[estimate.row_groups] selection skipped for "
@@ -3006,6 +3009,36 @@ class DataEstimator:
             "CANDIDATE_ROW_GROUPS_COMPLETE": candidate_row_groups_complete,
         })
 
+        # Statistics may be loaded for projection and bounded resource planning
+        # even when predicate pruning is disabled. Keep these exact spans
+        # independent from the pruning switch so the profiler does not lose
+        # real planning work.
+        for timing_name, stat_name, occurrences_name in (
+            (
+                "read.stats_load", "STATS_LOAD_DURATION_MS",
+                "STATS_LOAD_OCCURRENCES",
+            ),
+            (
+                "read.stats_filter", "STATS_FILTER_DURATION_MS",
+                "STATS_FILTER_OCCURRENCES",
+            ),
+            (
+                "read.row_group_prune", "ROW_GROUP_PRUNE_DURATION_MS",
+                "ROW_GROUP_PRUNE_OCCURRENCES",
+            ),
+        ):
+            if timing_name in prune_profiler.timings:
+                self.plan_stats.add_stat({
+                    stat_name: round(
+                        prune_profiler.timings[timing_name] * 1000, 3,
+                    )
+                })
+                self.plan_stats.add_stat({
+                    occurrences_name: max(
+                        1, int(prune_profiler.counts.get(timing_name + ".n", 1)),
+                    )
+                })
+
         # Read-path pruning observability — only when pruning is engaged, so a
         # disabled-pruning read doesn't litter the payload with noise. Mirrors
         # the write path: surface the count effect plus the profiler's IO/cache
@@ -3019,6 +3052,11 @@ class DataEstimator:
                     prune_profiler.timings.get("read.prune", 0.0) * 1000, 3
                 )
             })
+            self.plan_stats.add_stat({
+                "PREDICATE_PRUNE_OCCURRENCES": max(
+                    1, int(prune_profiler.counts.get("read.prune.n", 1)),
+                )
+            })
             # Cross-table join pruning observability — only when the query
             # carried join edges, so single-table reads don't emit empty stats.
             if runnable_join_edges:
@@ -3028,6 +3066,12 @@ class DataEstimator:
                 self.plan_stats.add_stat({
                     "JOIN_PRUNE_DURATION_MS": round(
                         prune_profiler.timings.get("read.join_prune", 0.0) * 1000, 3
+                    )
+                })
+                self.plan_stats.add_stat({
+                    "JOIN_PRUNE_OCCURRENCES": max(
+                        1,
+                        int(prune_profiler.counts.get("read.join_prune.n", 1)),
                     )
                 })
             prune_counts = prune_profiler.emit_counts()

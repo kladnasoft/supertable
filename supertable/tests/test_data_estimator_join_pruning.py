@@ -251,6 +251,18 @@ def test_estimate_join_pruning_collapses_all_four_tables():
     assert stats["JOIN_EDGES"] == 3
     assert stats["JOIN_FILES_PRUNED"] == 57
     assert stats["JOIN_PRUNE_ITERATIONS"] >= 1
+    for timing_name in (
+        "STATS_LOAD_DURATION_MS",
+        "STATS_FILTER_DURATION_MS",
+        "ROW_GROUP_PRUNE_DURATION_MS",
+    ):
+        assert isinstance(stats[timing_name], float)
+        assert stats[timing_name] >= 0.0
+    assert stats["STATS_LOAD_OCCURRENCES"] == 4
+    assert stats["STATS_FILTER_OCCURRENCES"] == 4
+    assert stats["ROW_GROUP_PRUNE_OCCURRENCES"] == 4
+    assert stats["PREDICATE_PRUNE_OCCURRENCES"] == 4
+    assert stats["JOIN_PRUNE_OCCURRENCES"] == 1
 
 
 def test_estimate_without_join_edges_keeps_partners_wide():

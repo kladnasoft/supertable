@@ -9,7 +9,7 @@ import secrets
 import time
 import uuid as _uuid
 from collections.abc import Mapping
-from typing import Any, Optional, List
+from typing import Any, Callable, Optional, List
 from urllib.parse import urlsplit
 
 import duckdb
@@ -538,6 +538,7 @@ class _DuckDBArrowBatchIterator:
         timed_out: threading.Event,
         timeout_value: float,
         cancel_event: Optional[threading.Event] = None,
+        duration_recorder: Optional[Callable[[str, float], None]] = None,
     ):
         self._reader = reader
         self._iterator = iter(reader)
@@ -545,6 +546,7 @@ class _DuckDBArrowBatchIterator:
         self._timed_out = timed_out
         self._timeout_value = timeout_value
         self._external_cancel_event = cancel_event
+        self._duration_recorder = duration_recorder
         self._cancelled = threading.Event()
         self._closed = False
         self._close_lock = threading.Lock()
@@ -572,6 +574,7 @@ class _DuckDBArrowBatchIterator:
 
     def __next__(self):
         self._raise_if_stopped()
+        fetch_started = time.perf_counter()
         try:
             batch = next(self._iterator)
         except StopIteration:
@@ -611,6 +614,16 @@ class _DuckDBArrowBatchIterator:
                 exc, phase="result stream",
             )
             raise safe_error from None
+        finally:
+            if callable(self._duration_recorder):
+                try:
+                    self._duration_recorder(
+                        "RESULT_FETCH",
+                        max(0.0, time.perf_counter() - fetch_started),
+                    )
+                except Exception:
+                    # Telemetry must never change result-delivery semantics.
+                    pass
         self._raise_if_stopped()
         self._batches_emitted += 1
         return batch
@@ -918,6 +931,7 @@ class _DuckDBResultLifecycleStream:
         self._stop = threading.Event()
         self._state_lock = threading.Lock()
         self._terminal_kind: Optional[str] = None
+        self._pending_terminal_kind: Optional[str] = None
         self._terminal_callbacks = []
         self._watcher: Optional[threading.Thread] = None
         self._start_monitors()
@@ -951,6 +965,14 @@ class _DuckDBResultLifecycleStream:
         if invoke_now:
             callback(terminal_kind)
 
+    def add_finalization_callback(self, callback) -> bool:
+        add_callback = getattr(
+            self._inner, "add_finalization_callback", None,
+        )
+        if not callable(add_callback):
+            return False
+        return add_callback(callback) is not False
+
     def _record_terminal(self, kind: str) -> None:
         callbacks = []
         with self._state_lock:
@@ -967,6 +989,45 @@ class _DuckDBResultLifecycleStream:
                     safe_exception_type(exc),
                 )
 
+    def _record_pending_terminal(self) -> None:
+        with self._state_lock:
+            kind = self._pending_terminal_kind
+        if kind is not None:
+            finalization_error = getattr(
+                self._inner, "finalization_error", None,
+            )
+            self._record_terminal(
+                "failed" if finalization_error is not None else kind
+            )
+
+    def _record_terminal_after_finalization(self, kind: str) -> bool:
+        add_finalization_callback = getattr(
+            self._inner, "add_finalization_callback", None,
+        )
+        if not callable(add_finalization_callback):
+            return False
+        register_callback = False
+        with self._state_lock:
+            if (
+                self._terminal_kind is None
+                and self._pending_terminal_kind is None
+            ):
+                self._pending_terminal_kind = str(kind)
+                register_callback = True
+        if register_callback:
+            accepted = add_finalization_callback(
+                self._record_pending_terminal
+            )
+            if accepted is False:
+                with self._state_lock:
+                    if (
+                        self._terminal_kind is None
+                        and self._pending_terminal_kind == str(kind)
+                    ):
+                        self._pending_terminal_kind = None
+                return False
+        return True
+
     def _start_monitors(self) -> None:
         if self._deadline is None and self._cancel_event is None:
             return
@@ -978,13 +1039,13 @@ class _DuckDBResultLifecycleStream:
                     and self._cancel_event.is_set()
                 ):
                     self._cancelled.set()
+                    self._record_terminal_after_finalization("cancelled")
                     try:
                         # cancel() uses DuckDB interrupt for an active fetch
                         # and the same deferred-close path for its resources.
                         self._inner.cancel()
                     finally:
                         self._stop.set()
-                        self._record_terminal("cancelled")
                     return
 
                 if (
@@ -992,6 +1053,7 @@ class _DuckDBResultLifecycleStream:
                     and time.monotonic() >= self._deadline
                 ):
                     self._timed_out.set()
+                    self._record_terminal_after_finalization("timed_out")
                     try:
                         # Safe for both states: idle streams finalize now; an
                         # active next() only records close_requested and
@@ -999,7 +1061,6 @@ class _DuckDBResultLifecycleStream:
                         self._inner.close()
                     finally:
                         self._stop.set()
-                        self._record_terminal("timed_out")
                     return
 
                 if self._deadline is None:
@@ -1034,9 +1095,9 @@ class _DuckDBResultLifecycleStream:
             self._cancelled.set()
             # The watcher normally owns this call.  Calling it here closes the
             # polling race when a consumer arrives immediately after set().
+            self._record_terminal_after_finalization("cancelled")
             self._inner.cancel()
             self._stop_monitors()
-            self._record_terminal("cancelled")
             raise ResourceReservationCancelled(
                 "DuckDB Arrow result stream was cancelled"
             )
@@ -1045,9 +1106,9 @@ class _DuckDBResultLifecycleStream:
             and time.monotonic() >= self._deadline
         ):
             self._timed_out.set()
+            self._record_terminal_after_finalization("timed_out")
             self._inner.close()
             self._stop_monitors()
-            self._record_terminal("timed_out")
             raise TimeoutError(
                 f"DuckDB query timed out after {self._timeout_value:g} seconds"
             )
@@ -1059,12 +1120,14 @@ class _DuckDBResultLifecycleStream:
         except StopIteration:
             self._stop_monitors()
             self._raise_if_stopped()
-            self._record_terminal("completed")
+            if not self._record_terminal_after_finalization("completed"):
+                self._record_terminal("completed")
             raise
         except BaseException:
             self._stop_monitors()
             self._raise_if_stopped()
-            self._record_terminal("failed")
+            if not self._record_terminal_after_finalization("failed"):
+                self._record_terminal("failed")
             raise
         try:
             self._raise_if_stopped()
@@ -1075,16 +1138,16 @@ class _DuckDBResultLifecycleStream:
 
     def cancel(self) -> None:
         self._cancelled.set()
+        self._record_terminal_after_finalization("cancelled")
         try:
             self._inner.cancel()
         finally:
             self._stop_monitors()
-            self._record_terminal("cancelled")
 
     def close(self) -> None:
         self._stop_monitors()
+        self._record_terminal_after_finalization("closed")
         self._inner.close()
-        self._record_terminal("closed")
 
     def collect_table(self, *, max_bytes: int) -> pa.Table:
         """Preserve the bounded Arrow facade through lifecycle wrapping."""
@@ -1704,6 +1767,32 @@ class DuckDB:
             _stream_batch_bytes: Optional[int] = None,
     ) -> Any:
         started_monotonic = time.monotonic()
+        duration_recorder = getattr(timer_capture, "record_duration", None)
+
+        def capture_exact_duration(event: str, started: float) -> None:
+            if callable(duration_recorder):
+                try:
+                    duration_recorder(
+                        event,
+                        max(0.0, time.perf_counter() - started),
+                    )
+                except Exception:
+                    # An optional profiler callback cannot fail a query.
+                    pass
+
+        exact_phase_inflight: Optional[tuple[str, float]] = None
+
+        def begin_exact_phase(event: str) -> None:
+            nonlocal exact_phase_inflight
+            exact_phase_inflight = (event, time.perf_counter())
+
+        def finish_exact_phase() -> None:
+            nonlocal exact_phase_inflight
+            current = exact_phase_inflight
+            exact_phase_inflight = None
+            if current is not None:
+                capture_exact_duration(current[0], current[1])
+
         try:
             timeout_value = float(timeout_sec) if timeout_sec is not None else 0.0
         except (TypeError, ValueError, OverflowError):
@@ -1870,6 +1959,7 @@ class DuckDB:
             )
         tried_presign = False
 
+        connection_setup_started = time.perf_counter()
         connection_setup_guard = _DuckDBSetupInterruptGuard(
             deadline_monotonic=deadline_value,
             timeout_value=timeout_value,
@@ -1935,6 +2025,7 @@ class DuckDB:
             connection_setup_guard.raise_if_stopped()
         finally:
             connection_setup_guard.close()
+            capture_exact_duration("CONNECTION_SETUP", connection_setup_started)
 
         check_request_boundary()
 
@@ -2159,6 +2250,7 @@ class DuckDB:
                 if cleanup_complete:
                     return
                 cleanup_complete = True
+            cleanup_started = time.perf_counter()
             if watchdog is not None:
                 watchdog.cancel()
                 join_watchdog = getattr(watchdog, "join", None)
@@ -2194,10 +2286,12 @@ class DuckDB:
                 con.close()
             except Exception:
                 pass
+            capture_exact_duration("CLEANUP", cleanup_started)
 
         stream_owns_cleanup = False
         backend_phase = "managed query setup"
         try:
+            begin_exact_phase("REFLECTION_PREPARE")
             check_deadline()
             for alias, table_name in alias_to_table_name.items():
                 check_deadline()
@@ -2232,6 +2326,7 @@ class DuckDB:
                     "EXPLAIN is unavailable for credential-bearing remote sources"
                 )
 
+            finish_exact_phase()
             timer_capture("CREATING_REFLECTION")
 
             # Per-query suffix so concurrent requests on the same table do not
@@ -2243,6 +2338,7 @@ class DuckDB:
             # system columns (__rowid__, __timestamp__) are always stripped and
             # the deletion-vector (when present) is anti-joined out.  Sits on
             # the reflection table directly, before RBAC.
+            begin_exact_phase("TOMBSTONE_PREPARE")
             tombstone_views = getattr(reflection, "tombstone_views", None) or {}
             for alias in list(query_alias_to_name.keys()):
                 check_deadline()
@@ -2397,8 +2493,10 @@ class DuckDB:
                 )
                 created_views.append(view)
                 query_alias_to_name[alias] = view
+            finish_exact_phase()
 
             # RBAC views (column + row filtering) on top of stripped data.
+            begin_exact_phase("RBAC_PREPARE")
             rbac_views = getattr(reflection, "rbac_views", None) or {}
             if rbac_views:
                 for alias in list(query_alias_to_name.keys()):
@@ -2419,7 +2517,9 @@ class DuckDB:
                         )
                         created_views.append(view)
                         query_alias_to_name[alias] = view
+            finish_exact_phase()
 
+            begin_exact_phase("ENGINE_PREPARE")
             executing_query = rewrite_query_with_hashed_tables(
                 parser.original_query,
                 query_alias_to_name,
@@ -2475,6 +2575,7 @@ class DuckDB:
                         "Protected OData ordering contains a non-finite value"
                     )
                 check_deadline()
+            finish_exact_phase()
 
             if logger.isEnabledFor(10):
                 sql_digest, sql_bytes = safe_sql_diagnostic(executing_query)
@@ -2486,14 +2587,17 @@ class DuckDB:
                 )
             check_deadline()
             backend_phase = "query execution"
+            begin_exact_phase("QUERY_EXECUTE")
             query_result = (
                 con.execute(executing_query, executing_parameters)
                 if executing_parameters
                 else con.execute(executing_query)
             )
+            finish_exact_phase()
             check_deadline()
 
             if _streaming:
+                begin_exact_phase("RESULT_STREAM_SETUP")
                 assert resolved_stream_batch_rows is not None
                 assert resolved_stream_batch_bytes is not None
                 producer_fetch_rows = _duckdb_stream_fetch_rows(
@@ -2519,6 +2623,7 @@ class DuckDB:
                     timed_out=timed_out,
                     timeout_value=timeout_value,
                     cancel_event=cancel_event,
+                    duration_recorder=duration_recorder,
                 )
                 producer = ByteBoundedArrowBatchIterator(
                     duckdb_producer,
@@ -2532,12 +2637,15 @@ class DuckDB:
                     close_callback=cleanup_query,
                     cancel_event=cancel_event,
                 )
+                finish_exact_phase()
                 # From this point the stream owns the cursor, views, watchdog,
                 # and DV references. The finally block must not invalidate them
                 # before the caller consumes or closes the first batch.
                 stream_owns_cleanup = True
             else:
+                begin_exact_phase("RESULT_MATERIALIZE")
                 result = query_result.fetchdf()
+                finish_exact_phase()
                 check_deadline()
 
             if tried_presign:
@@ -2577,6 +2685,7 @@ class DuckDB:
             raise safe_error from None
 
         finally:
+            finish_exact_phase()
             if not stream_owns_cleanup:
                 cleanup_query()
 

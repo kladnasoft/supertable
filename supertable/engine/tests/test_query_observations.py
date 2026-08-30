@@ -15,6 +15,7 @@ from supertable.engine.query_observations import (
     canonical_sql_shape,
     normalize_query_profile,
     redact_text,
+    sanitize_execution_timings,
     sanitize_profile,
 )
 from supertable.engine.plan_stats import PlanStats
@@ -157,6 +158,271 @@ def test_profile_sanitizer_is_depth_item_and_byte_bounded():
     clean = sanitize_profile(oversized, max_bytes=2_000)
     encoded = json.dumps(clean, separators=(",", ":")).encode()
     assert len(encoded) <= 2_000
+
+
+def test_execution_timing_sanitizer_keeps_only_bounded_fixed_numeric_events():
+    clean = sanitize_execution_timings([
+        {"CONNECTION_SETUP": 0.0125},
+        {"EXECUTING_QUERY": 0},
+        {"TOTAL_EXECUTE": 1.5},
+        {"REMOTE_PHASE": "https://storage.invalid/private?token=secret"},
+        {"QUERY_EXECUTE": True},
+        {"RESULT_FETCH": -1},
+        {"RESULT_MATERIALIZE": float("nan")},
+        {"CLEANUP": float("inf")},
+    ])
+
+    assert clean == [
+        {"CONNECTION_SETUP": 0.0125},
+        {"EXECUTING_QUERY": 0.0},
+        {"TOTAL_EXECUTE": 1.5},
+    ]
+    rendered = json.dumps(clean)
+    assert "REMOTE_PHASE" not in rendered
+    assert "storage.invalid" not in rendered
+    assert "secret" not in rendered
+
+
+def test_execution_timing_sanitizer_drops_huge_finite_durations():
+    assert sanitize_execution_timings([
+        {"RESULT_FETCH": 1e308},
+        {"QUERY_EXECUTE": 0.25},
+    ]) == [{"QUERY_EXECUTE": 0.25}]
+
+
+def test_execution_timing_sanitizer_honors_byte_cap_for_one_mapping():
+    timings = {
+        event: 1.234567
+        for event in (
+            "QUERY_PREPARATION", "ESTIMATE", "TOMBSTONE_RESOLUTION",
+            "CONNECTION_SETUP", "REFLECTION_PREPARE", "TOMBSTONE_PREPARE",
+            "RBAC_PREPARE", "ENGINE_PREPARE", "QUERY_EXECUTE",
+            "RESULT_STREAM_SETUP", "RESULT_FETCH", "RESULT_MATERIALIZE",
+            "CLEANUP", "EXECUTING_QUERY", "TOTAL_EXECUTE",
+        )
+    }
+
+    clean = sanitize_execution_timings(timings, max_bytes=256)
+
+    assert len(json.dumps(clean, separators=(",", ":")).encode()) <= 256
+    assert len(clean) < len(timings)
+
+
+def test_normalized_fetch_phase_uses_aggregated_occurrence_count():
+    stats = PlanStats()
+    stats.add_stat({"RESULT_FETCH_OCCURRENCES": 12})
+
+    profile = normalize_query_profile(
+        query="SELECT 1",
+        requested_engine="duckdb",
+        timing=[{"RESULT_FETCH": 0.125}],
+        plan_stats=stats,
+        status="ok",
+        result_shape=(1, 1),
+        engine_profile=None,
+    ).as_dict()
+
+    fetch = next(
+        phase for phase in profile["pipeline_phases"]
+        if phase["phase"] == "result_fetch"
+    )
+    assert fetch["duration_us"] == 125_000
+    assert fetch["occurrences"] == 12
+
+
+def test_normalized_v3_retains_typed_phases_pruning_cache_and_engine_detail():
+    stats = PlanStats()
+    for item in (
+        {"FILES_BEFORE_PRUNE": 10},
+        {"FILES_PRUNED": 7},
+        {"FILES_KEPT": 3},
+        {"STATS_LOAD_DURATION_MS": 1.25},
+        {"STATS_LOAD_OCCURRENCES": 3},
+        {"STATS_FILTER_DURATION_MS": 0.5},
+        {"STATS_FILTER_OCCURRENCES": 2},
+        {"PRUNE_DURATION_MS": 2.5},
+        {"PREDICATE_PRUNE_OCCURRENCES": 4},
+        {"ROW_GROUP_PRUNE_DURATION_MS": 0.25},
+        {"ROW_GROUP_PRUNE_OCCURRENCES": 2},
+        {"JOIN_EDGES": 1},
+        {"JOIN_FILES_PRUNED": 2},
+        {"JOIN_PRUNE_ITERATIONS": 3},
+        {"JOIN_PRUNE_DURATION_MS": 0.75},
+        {"JOIN_PRUNE_OCCURRENCES": 1},
+        {"PRUNE_COUNTS": {"stats_cache_hit": 4, "stats_cache_miss": 1}},
+        {"FILE_CACHE_REQUESTED_FILES": 3},
+        {"FILE_CACHE_HITS": 2},
+        {"FILE_CACHE_COVERAGE_RATIO": 2 / 3},
+        # The last PlanStats value wins, so completed streams reach the
+        # normalizer with the finalizer's marker.
+        {"RESULT_MODE": "arrow_stream_final"},
+        {"RESULT_BYTES": 512},
+        {"RESULT_BATCH_LIMIT": {"max_rows": 256, "max_bytes": 4096}},
+        {"ENGINE": "islanddb"},
+    ):
+        stats.add_stat(item)
+    profile = normalize_query_profile(
+        query="SELECT * FROM orders",
+        requested_engine="islanddb",
+        timing=[
+            {"QUERY_PREPARATION": 0.01},
+            {"ESTIMATE": 0.02},
+            {"CONNECTION_SETUP": 0.003},
+            {"EXECUTING_QUERY": 0.2},
+            {"TOTAL_EXECUTE": 0.25},
+        ],
+        plan_stats=stats,
+        status="ok",
+        result_shape=(3, 2),
+        engine_profile={
+            "engine": "islanddb",
+            "elapsed_ms": 200,
+            "elapsed_scope": (
+                "engine_after_admission_through_stream_close_"
+                "excludes_facade_and_profile_persist"
+            ),
+            "execution_outcome": "completed",
+            "result_complete": True,
+            "cache": {
+                "range_cache_hit_chunks": 5,
+                "range_cache_hit_bytes": 2048,
+                "range_remote_bytes": 0,
+            },
+            "phase_timings_ms": {
+                "range_cache_setup_ms": 1.25,
+                "relation_prepare_and_eager_integrity_ms": 8.5,
+                "unknown_secret_phase": 99,
+            },
+            "profile_persist_ms": 0.5,
+            "profile_persist_ms_measured": True,
+            "profile_persist_succeeded": True,
+            "planned_files": 3,
+            "planned_files_complete": True,
+            "planned_rows": 500,
+            "planned_rows_complete": True,
+            "result_batches": 2,
+            "rss_sample_interval_ms": 10,
+            "resources": {
+                "advice": "island_in_memory",
+                "cpu_workers": 2,
+                "io_workers": 4,
+                "batch_bytes": 4096,
+                "reason": "must not be persisted",
+            },
+            "spill": {
+                "triggered": False,
+                "directory_metadata": "/private/spill/path",
+            },
+        },
+    ).as_dict()
+
+    assert profile["schema_version"] == 3
+    assert profile["result_mode"] == "arrow_stream"
+    assert profile["result_batch_max_rows"] == 256
+    assert profile["result_batch_max_bytes"] == 4096
+    assert profile["result_rows"] == 3
+    assert profile["result_rows_scope"] == "arrow_output_rows"
+    assert profile["result_bytes"] == 512
+    assert profile["result_bytes_scope"] == (
+        "arrow_output_batch_logical_nbytes"
+    )
+    assert profile["pruning"] == {
+        "files_before_prune": 10,
+        "files_pruned": 7,
+        "files_kept": 3,
+        "join_edges": 1,
+        "join_files_pruned": 2,
+        "join_iterations": 3,
+        "stats_cache_hits": 4,
+        "stats_cache_misses": 1,
+        "enabled": True,
+    }
+    assert profile["cache_detail"]["whole_object"] == {
+        "requested_files": 3,
+        "hits": 2,
+        "coverage_ratio_ppm": 666667,
+    }
+    assert profile["cache_detail"]["range"]["cache_hit_chunks"] == 5
+    assert profile["engine_detail"]["kind"] == "islanddb"
+    assert profile["engine_detail"]["planned_files"] == 3
+    assert profile["engine_detail"]["resource_plan"] == {
+        "cpu_workers": 2,
+        "io_workers": 4,
+        "batch_bytes": 4096,
+        "advice": "island_in_memory",
+    }
+    rendered = json.dumps(profile, sort_keys=True)
+    assert "unknown_secret_phase" not in rendered
+    assert "must not be persisted" not in rendered
+    assert "/private/spill/path" not in rendered
+    phase_map = {
+        (item["phase"], item["scope"], item["aggregation"]): item
+        for item in profile["pipeline_phases"]
+    }
+    assert phase_map[("engine_connect", "engine", "exclusive")]["duration_us"] == 3000
+    assert phase_map[("stats_load", "planning", "nested")]["duration_us"] == 1250
+    assert phase_map[("stats_load", "planning", "nested")]["occurrences"] == 3
+    assert phase_map[("stats_filter", "planning", "nested")]["duration_us"] == 500
+    assert phase_map[("predicate_prune", "planning", "nested")]["duration_us"] == 2500
+    assert phase_map[("predicate_prune", "planning", "nested")]["occurrences"] == 4
+    assert phase_map[("row_group_prune", "planning", "nested")]["duration_us"] == 250
+    assert phase_map[("range_cache_setup", "engine", "nested")]["duration_us"] == 1250
+    assert phase_map[("profile_persist", "delivery", "exclusive")]["duration_us"] == 500
+
+
+def test_result_mode_is_unknown_until_execution_records_delivery_mode():
+    stats = _stats(fallback=True)
+    unknown = normalize_query_profile(
+        query="SELECT * FROM orders",
+        requested_engine="duckdb",
+        timing=[],
+        plan_stats=stats,
+        status="error",
+        result_shape=None,
+        engine_profile=None,
+    )
+    assert unknown.result_mode == "unknown"
+
+    stats.add_stat({"RESULT_MODE": "materialized"})
+    materialized = normalize_query_profile(
+        query="SELECT * FROM orders",
+        requested_engine="duckdb",
+        timing=[],
+        plan_stats=stats,
+        status="ok",
+        result_shape=(0, 1),
+        engine_profile=None,
+    )
+    assert materialized.result_mode == "materialized"
+
+
+def test_total_files_distinguishes_unknown_from_complete_empty_inventory():
+    stats = PlanStats()
+    stats.add_stat({"ENGINE": "duckdb"})
+    unknown = normalize_query_profile(
+        query="SELECT * FROM orders",
+        requested_engine="duckdb",
+        timing=[],
+        plan_stats=stats,
+        status="error",
+        result_shape=None,
+        engine_profile=None,
+    )
+    assert unknown.total_files == 0
+    assert unknown.total_files_complete is False
+
+    stats.add_stat({"REFLECTIONS": 0})
+    complete_empty = normalize_query_profile(
+        query="SELECT * FROM orders",
+        requested_engine="duckdb",
+        timing=[],
+        plan_stats=stats,
+        status="ok",
+        result_shape=None,
+        engine_profile=None,
+    )
+    assert complete_empty.total_files == 0
+    assert complete_empty.total_files_complete is True
 
 
 @pytest.mark.parametrize("evaluated", [False, True])
@@ -358,6 +624,21 @@ def test_island_plan_stats_profile_is_lossless_fallback_with_provenance():
             "range_cache_hit_bytes": 1_024,
         },
     })
+    stats.add_stat({
+        "ISLAND_RESOURCES": {
+            "advice": "island_spill",
+            "cpu_workers": 2,
+            "memory_budget_bytes": 65_536,
+            "reason": "private planner explanation",
+        },
+    })
+    stats.add_stat({
+        "ISLAND_SPILL": {
+            "triggered": True,
+            "budget_bytes": 32_768,
+            "directory": "/private/spill",
+        },
+    })
     profile = normalize_query_profile(
         query="SELECT value FROM orders",
         requested_engine="auto",
@@ -381,6 +662,58 @@ def test_island_plan_stats_profile_is_lossless_fallback_with_provenance():
     assert profile.result_rows_scope == "arrow_output_rows"
     assert profile.result_bytes == 512
     assert profile.result_bytes_scope == "arrow_output_batch_logical_nbytes"
+    assert profile.engine_detail["resource_plan"] == {
+        "cpu_workers": 2,
+        "memory_budget_bytes": 65_536,
+        "advice": "island_spill",
+    }
+    assert profile.engine_detail["spill_plan"] == {
+        "triggered": True,
+        "budget_bytes": 32_768,
+    }
+    assert "private planner explanation" not in json.dumps(profile.engine_detail)
+    assert "/private/spill" not in json.dumps(profile.engine_detail)
+
+
+def test_island_current_profile_preserves_post_persistence_telemetry():
+    stats = _stats()
+    stats.add_stat({
+        "ISLAND_TELEMETRY": {
+            "engine": "islanddb",
+            "phase_timings_ms": {
+                "engine_elapsed_excluding_profile_persist_ms": 12.0,
+                "profile_persist_ms": 0.75,
+            },
+            "profile_persist_ms": 0.75,
+            "profile_persist_ms_measured": True,
+            "profile_persist_succeeded": True,
+        },
+    })
+
+    profile = normalize_query_profile(
+        query="SELECT value FROM orders",
+        requested_engine="islanddb",
+        timing=[],
+        plan_stats=stats,
+        status="ok",
+        result_shape=(1, 1),
+        engine_profile={
+            "engine": "islanddb",
+            "phase_timings_ms": {
+                "engine_elapsed_excluding_profile_persist_ms": 12.0,
+            },
+            "profile_persist_ms": None,
+            "profile_persist_ms_measured": False,
+            "profile_persist_succeeded": None,
+        },
+    ).as_dict()
+
+    persisted = next(
+        phase for phase in profile["pipeline_phases"]
+        if phase["phase"] == "profile_persist"
+    )
+    assert persisted["duration_us"] == 750
+    assert profile["engine_detail"]["profile_persist_succeeded"] is True
 
 
 def test_legacy_island_candidate_rows_are_not_runtime_measurements():

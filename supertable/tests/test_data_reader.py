@@ -950,7 +950,7 @@ class TestExecuteTimerPlanStats:
         mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
         MockExecutor.return_value = mock_exec
 
-        from supertable.data_reader import DataReader, engine
+        from supertable.data_reader import DataReader, Status, engine
         dr = DataReader("s", "o", "Q")
         dr.execute("admin", engine=engine.AUTO)
 
@@ -964,6 +964,49 @@ class TestExecuteTimerPlanStats:
         dur_calls = [c for c in mock_timer.capture_duration.call_args_list]
         dur_events = [c[1].get("event") or c[0][0] if c[0] else c[1].get("event") for c in dur_calls]
         assert "TOTAL_EXECUTE" in dur_events
+
+        measured_events = [
+            call.args[0] for call in mock_timer.capture_timing.call_args_list
+        ]
+        assert measured_events == [
+            "QUERY_PREPARATION", "ESTIMATE", "TOMBSTONE_RESOLUTION",
+        ]
+        assert any(
+            call.args
+            and call.args[0].get("RESULT_MODE") == "materialized"
+            for call in MockPlanStats.return_value.add_stat.call_args_list
+        )
+
+        mock_timer.capture_timing.reset_mock()
+        mock_est.estimate.side_effect = RuntimeError("estimate failed")
+        failed_reader = DataReader("s", "o", "Q")
+        _result, failed_status, _message = failed_reader.execute(
+            "admin", engine=engine.AUTO,
+        )
+        assert failed_status is Status.ERROR
+        assert [
+            call.args[0]
+            for call in mock_timer.capture_timing.call_args_list
+        ] == ["QUERY_PREPARATION", "ESTIMATE"]
+
+        class FailingSupers:
+            def __iter__(self):
+                raise RuntimeError("tombstone snapshot failed")
+
+        mock_timer.capture_timing.reset_mock()
+        mock_est.estimate.side_effect = None
+        mock_est.estimate.return_value = _make_reflection(
+            supers=FailingSupers(),
+        )
+        tombstone_reader = DataReader("s", "o", "Q")
+        _result, failed_status, _message = tombstone_reader.execute(
+            "admin", engine=engine.AUTO,
+        )
+        assert failed_status is Status.ERROR
+        assert [
+            call.args[0]
+            for call in mock_timer.capture_timing.call_args_list
+        ] == ["QUERY_PREPARATION", "ESTIMATE", "TOMBSTONE_RESOLUTION"]
 
     @patch(_PATCH_EXTEND_PLAN)
     @patch(_PATCH_EXECUTOR)

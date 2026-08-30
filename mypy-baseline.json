@@ -19,14 +19,14 @@
       "supertable/audit/privileged_worker.py:1172: error: Unsupported operand types for > (\"int\" and \"None\")  [operator]"
     ],
     "supertable/data_reader.py": [
-      "supertable/data_reader.py:1544: error: \"QueryPlanManager\" has no attribute \"requested_engine\"  [attr-defined]",
-      "supertable/data_reader.py:1547: error: \"QueryPlanManager\" has no attribute \"engine_forced\"  [attr-defined]",
-      "supertable/data_reader.py:1548: error: \"QueryPlanManager\" has no attribute \"requested_engine\"  [attr-defined]",
-      "supertable/data_reader.py:1552: error: \"QueryPlanManager\" has no attribute \"query_observation_store\"  [attr-defined]",
-      "supertable/data_reader.py:1555: error: \"QueryPlanManager\" has no attribute \"source_type\"  [attr-defined]",
-      "supertable/data_reader.py:2153: error: Argument \"timing\" to \"extend_execution_plan\" has incompatible type \"list[Any]\"; expected \"dict[str, float] | None\"  [arg-type]",
-      "supertable/data_reader.py:2220: error: Argument \"query_plan_manager\" to \"extend_execution_plan\" has incompatible type \"QueryPlanManager | None\"; expected \"QueryPlanManager\"  [arg-type]",
-      "supertable/data_reader.py:2222: error: Argument \"timing\" to \"extend_execution_plan\" has incompatible type \"list[Any]\"; expected \"dict[str, float] | None\"  [arg-type]"
+      "supertable/data_reader.py:1734: error: \"QueryPlanManager\" has no attribute \"requested_engine\"  [attr-defined]",
+      "supertable/data_reader.py:1737: error: \"QueryPlanManager\" has no attribute \"engine_forced\"  [attr-defined]",
+      "supertable/data_reader.py:1738: error: \"QueryPlanManager\" has no attribute \"requested_engine\"  [attr-defined]",
+      "supertable/data_reader.py:1742: error: \"QueryPlanManager\" has no attribute \"query_observation_store\"  [attr-defined]",
+      "supertable/data_reader.py:1745: error: \"QueryPlanManager\" has no attribute \"source_type\"  [attr-defined]",
+      "supertable/data_reader.py:2372: error: Argument \"timing\" to \"extend_execution_plan\" has incompatible type \"list[dict[str, float]]\"; expected \"dict[str, float] | None\"  [arg-type]",
+      "supertable/data_reader.py:2448: error: Argument \"query_plan_manager\" to \"extend_execution_plan\" has incompatible type \"QueryPlanManager | None\"; expected \"QueryPlanManager\"  [arg-type]",
+      "supertable/data_reader.py:2450: error: Argument \"timing\" to \"extend_execution_plan\" has incompatible type \"list[dict[str, float]]\"; expected \"dict[str, float] | None\"  [arg-type]"
     ],
     "supertable/data_writer.py": [
       "supertable/data_writer.py:1794: error: Key expression in dictionary comprehension has incompatible type \"Any | None\"; expected type \"str\"  [misc]",
@@ -126,8 +126,8 @@
       "supertable/engine/adaptive_router.py:31: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]"
     ],
     "supertable/engine/duckdb_engine.py": [
-      "supertable/engine/duckdb_engine.py:2454: error: \"SQLParser\" has no attribute \"executing_query\"  [attr-defined]",
-      "supertable/engine/duckdb_engine.py:921: error: Need type annotation for \"_terminal_callbacks\" (hint: \"_terminal_callbacks: list[<type>] = ...\")  [var-annotated]"
+      "supertable/engine/duckdb_engine.py:2554: error: \"SQLParser\" has no attribute \"executing_query\"  [attr-defined]",
+      "supertable/engine/duckdb_engine.py:935: error: Need type annotation for \"_terminal_callbacks\" (hint: \"_terminal_callbacks: list[<type>] = ...\")  [var-annotated]"
     ],
     "supertable/engine/engine_common.py": [
       "supertable/engine/engine_common.py:2684: error: \"ValidatedTombstoneTable\" has no attribute \"row_count\"  [attr-defined]",
@@ -162,15 +162,15 @@
       "supertable/engine/engine_config.py:485: error: Argument 1 to \"_block\" has incompatible type \"Any | dict[Any, Any] | None\"; expected \"dict[str, Any]\"  [arg-type]"
     ],
     "supertable/engine/executor.py": [
-      "supertable/engine/executor.py:2314: error: Argument 2 to \"_auto_pick\" of \"Executor\" has incompatible type \"object\"; expected \"EngineRuntimeConfig\"  [arg-type]",
-      "supertable/engine/executor.py:2419: error: Item \"None\" of \"Any | None\" has no attribute \"localized\"  [union-attr]",
-      "supertable/engine/executor.py:2709: error: Argument 2 to \"_auto_pick\" of \"Executor\" has incompatible type \"Any | object\"; expected \"EngineRuntimeConfig\"  [arg-type]",
-      "supertable/engine/executor.py:2814: error: Item \"None\" of \"Any | None\" has no attribute \"localized\"  [union-attr]",
-      "supertable/engine/executor.py:3052: error: Item \"None\" of \"Any | None\" has no attribute \"source_is_local\"  [union-attr]",
-      "supertable/engine/executor.py:3053: error: Item \"None\" of \"Any | None\" has no attribute \"can_populate_all\"  [union-attr]",
-      "supertable/engine/executor.py:3060: error: Item \"None\" of \"Any | None\" has no attribute \"localized\"  [union-attr]",
-      "supertable/engine/executor.py:3199: error: Incompatible types in assignment (expression has type \"_IslandResultLifecycleStream\", variable has type \"_DuckDBResultLifecycleStream\")  [assignment]",
-      "supertable/engine/executor.py:3212: error: \"_DuckDBResultLifecycleStream\" has no attribute \"timeout\"; maybe \"_timed_out\"?  [attr-defined]"
+      "supertable/engine/executor.py:2342: error: Argument 2 to \"_auto_pick\" of \"Executor\" has incompatible type \"object\"; expected \"EngineRuntimeConfig\"  [arg-type]",
+      "supertable/engine/executor.py:2458: error: Item \"None\" of \"Any | None\" has no attribute \"localized\"  [union-attr]",
+      "supertable/engine/executor.py:2748: error: Argument 2 to \"_auto_pick\" of \"Executor\" has incompatible type \"Any | object\"; expected \"EngineRuntimeConfig\"  [arg-type]",
+      "supertable/engine/executor.py:2864: error: Item \"None\" of \"Any | None\" has no attribute \"localized\"  [union-attr]",
+      "supertable/engine/executor.py:3102: error: Item \"None\" of \"Any | None\" has no attribute \"source_is_local\"  [union-attr]",
+      "supertable/engine/executor.py:3103: error: Item \"None\" of \"Any | None\" has no attribute \"can_populate_all\"  [union-attr]",
+      "supertable/engine/executor.py:3110: error: Item \"None\" of \"Any | None\" has no attribute \"localized\"  [union-attr]",
+      "supertable/engine/executor.py:3249: error: Incompatible types in assignment (expression has type \"_IslandResultLifecycleStream\", variable has type \"_DuckDBResultLifecycleStream\")  [assignment]",
+      "supertable/engine/executor.py:3262: error: \"_DuckDBResultLifecycleStream\" has no attribute \"timeout\"; maybe \"_timed_out\"?  [attr-defined]"
     ],
     "supertable/engine/file_cache.py": [
       "supertable/engine/file_cache.py:797: error: Incompatible types in assignment (expression has type \"_Resolution | None\", variable has type \"_Resolution\")  [assignment]",
@@ -188,54 +188,54 @@
       "supertable/engine/island_spill.py:620: error: Incompatible types in assignment (expression has type \"BufferedWriter[_BufferedWriterStream]\", variable has type \"_BudgetedFile\")  [assignment]"
     ],
     "supertable/engine/islanddb.py": [
-      "supertable/engine/islanddb.py:1036: error: \"object\" has no attribute \"as_dict\"  [attr-defined]",
-      "supertable/engine/islanddb.py:1316: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:1334: error: \"object\" has no attribute \"open\"  [attr-defined]",
-      "supertable/engine/islanddb.py:1578: error: \"object\" has no attribute \"cache_namespace\"  [attr-defined]",
-      "supertable/engine/islanddb.py:1854: error: \"object\" has no attribute \"_supertable_automatic_fingerprint\"  [attr-defined]",
-      "supertable/engine/islanddb.py:1866: error: \"RangeCache\" has no attribute \"_supertable_automatic_capacity\"  [attr-defined]",
-      "supertable/engine/islanddb.py:1867: error: \"RangeCache\" has no attribute \"_supertable_automatic_fingerprint\"  [attr-defined]",
-      "supertable/engine/islanddb.py:1882: error: \"object\" has no attribute \"_supertable_automatic_fingerprint\"  [attr-defined]",
-      "supertable/engine/islanddb.py:1891: error: \"object\" has no attribute \"_supertable_automatic_fingerprint\"  [attr-defined]",
-      "supertable/engine/islanddb.py:1958: error: \"object\" has no attribute \"get_table_tuples\"  [attr-defined]",
-      "supertable/engine/islanddb.py:2221: error: Item \"None\" of \"set[str] | None\" has no attribute \"update\"  [union-attr]",
-      "supertable/engine/islanddb.py:2293: error: Name \"matches\" already defined on line 2287  [no-redef]",
-      "supertable/engine/islanddb.py:2323: error: Name \"matches\" already defined on line 2317  [no-redef]",
-      "supertable/engine/islanddb.py:2334: error: Argument 1 to \"append\" of \"list\" has incompatible type \"SuperSnapshot\"; expected \"str\"  [arg-type]",
-      "supertable/engine/islanddb.py:2335: error: Incompatible return value type (got \"str | None\", expected \"SuperSnapshot | None\")  [return-value]",
-      "supertable/engine/islanddb.py:2566: error: Name \"matches\" already defined on line 2560  [no-redef]",
-      "supertable/engine/islanddb.py:350: error: Need type annotation for \"_terminal_callbacks\" (hint: \"_terminal_callbacks: list[<type>] = ...\")  [var-annotated]",
-      "supertable/engine/islanddb.py:3514: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
-      "supertable/engine/islanddb.py:3608: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
-      "supertable/engine/islanddb.py:3609: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
-      "supertable/engine/islanddb.py:4103: error: Incompatible types in assignment (expression has type \"dict[str, ObjectMetadata]\", variable has type \"dict[str, object] | None\")  [assignment]",
-      "supertable/engine/islanddb.py:4230: error: Item \"object\" of \"Any | object\" has no attribute \"open\"  [union-attr]",
-      "supertable/engine/islanddb.py:4508: error: Argument \"storage\" to \"load_tombstone_segments\" has incompatible type \"object\"; expected \"StorageInterface\"  [arg-type]",
-      "supertable/engine/islanddb.py:4513: error: Argument \"expected_rows\" to \"load_tombstone_segments\" has incompatible type \"Any | None\"; expected \"int\"  [arg-type]",
-      "supertable/engine/islanddb.py:4514: error: Argument 1 to \"set\" has incompatible type \"Any | None\"; expected \"Iterable[str]\"  [arg-type]",
-      "supertable/engine/islanddb.py:4553: error: Item \"None\" of \"object | None\" has no attribute \"read_parquet\"  [union-attr]",
-      "supertable/engine/islanddb.py:4564: error: Argument 1 to \"set\" has incompatible type \"Any | None\"; expected \"Iterable[str]\"  [arg-type]",
-      "supertable/engine/islanddb.py:6326: error: Incompatible types in assignment (expression has type \"Iterable[Any]\", variable has type \"ArrowBatchStream\")  [assignment]",
-      "supertable/engine/islanddb.py:6553: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:6555: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:6559: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:6564: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:6567: error: Argument 1 to \"float\" has incompatible type \"object\"; expected \"str | Buffer | SupportsFloat | SupportsIndex\"  [arg-type]",
-      "supertable/engine/islanddb.py:6584: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:6611: error: Argument \"rss_baseline_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
-      "supertable/engine/islanddb.py:6612: error: Argument \"rss_peak_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
-      "supertable/engine/islanddb.py:6613: error: Argument \"rss_final_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
-      "supertable/engine/islanddb.py:6614: error: Argument \"rss_peak_delta_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
-      "supertable/engine/islanddb.py:6617: error: Argument \"rss_retained_delta_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
+      "supertable/engine/islanddb.py:1094: error: \"object\" has no attribute \"as_dict\"  [attr-defined]",
+      "supertable/engine/islanddb.py:1374: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/islanddb.py:1392: error: \"object\" has no attribute \"open\"  [attr-defined]",
+      "supertable/engine/islanddb.py:1636: error: \"object\" has no attribute \"cache_namespace\"  [attr-defined]",
+      "supertable/engine/islanddb.py:1912: error: \"object\" has no attribute \"_supertable_automatic_fingerprint\"  [attr-defined]",
+      "supertable/engine/islanddb.py:1924: error: \"RangeCache\" has no attribute \"_supertable_automatic_capacity\"  [attr-defined]",
+      "supertable/engine/islanddb.py:1925: error: \"RangeCache\" has no attribute \"_supertable_automatic_fingerprint\"  [attr-defined]",
+      "supertable/engine/islanddb.py:1940: error: \"object\" has no attribute \"_supertable_automatic_fingerprint\"  [attr-defined]",
+      "supertable/engine/islanddb.py:1949: error: \"object\" has no attribute \"_supertable_automatic_fingerprint\"  [attr-defined]",
+      "supertable/engine/islanddb.py:2016: error: \"object\" has no attribute \"get_table_tuples\"  [attr-defined]",
+      "supertable/engine/islanddb.py:2279: error: Item \"None\" of \"set[str] | None\" has no attribute \"update\"  [union-attr]",
+      "supertable/engine/islanddb.py:2351: error: Name \"matches\" already defined on line 2345  [no-redef]",
+      "supertable/engine/islanddb.py:2381: error: Name \"matches\" already defined on line 2375  [no-redef]",
+      "supertable/engine/islanddb.py:2392: error: Argument 1 to \"append\" of \"list\" has incompatible type \"SuperSnapshot\"; expected \"str\"  [arg-type]",
+      "supertable/engine/islanddb.py:2393: error: Incompatible return value type (got \"str | None\", expected \"SuperSnapshot | None\")  [return-value]",
+      "supertable/engine/islanddb.py:2624: error: Name \"matches\" already defined on line 2618  [no-redef]",
+      "supertable/engine/islanddb.py:351: error: Need type annotation for \"_terminal_callbacks\" (hint: \"_terminal_callbacks: list[<type>] = ...\")  [var-annotated]",
+      "supertable/engine/islanddb.py:3572: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
+      "supertable/engine/islanddb.py:3666: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
+      "supertable/engine/islanddb.py:3667: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
+      "supertable/engine/islanddb.py:4161: error: Incompatible types in assignment (expression has type \"dict[str, ObjectMetadata]\", variable has type \"dict[str, object] | None\")  [assignment]",
+      "supertable/engine/islanddb.py:4288: error: Item \"object\" of \"Any | object\" has no attribute \"open\"  [union-attr]",
+      "supertable/engine/islanddb.py:4566: error: Argument \"storage\" to \"load_tombstone_segments\" has incompatible type \"object\"; expected \"StorageInterface\"  [arg-type]",
+      "supertable/engine/islanddb.py:4571: error: Argument \"expected_rows\" to \"load_tombstone_segments\" has incompatible type \"Any | None\"; expected \"int\"  [arg-type]",
+      "supertable/engine/islanddb.py:4572: error: Argument 1 to \"set\" has incompatible type \"Any | None\"; expected \"Iterable[str]\"  [arg-type]",
+      "supertable/engine/islanddb.py:4611: error: Item \"None\" of \"object | None\" has no attribute \"read_parquet\"  [union-attr]",
+      "supertable/engine/islanddb.py:4622: error: Argument 1 to \"set\" has incompatible type \"Any | None\"; expected \"Iterable[str]\"  [arg-type]",
+      "supertable/engine/islanddb.py:6384: error: Incompatible types in assignment (expression has type \"Iterable[Any]\", variable has type \"ArrowBatchStream\")  [assignment]",
+      "supertable/engine/islanddb.py:6611: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/islanddb.py:6613: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/islanddb.py:6617: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
       "supertable/engine/islanddb.py:6622: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:6632: error: No overload variant of \"dict\" matches argument type \"object\"  [call-overload]",
-      "supertable/engine/islanddb.py:6752: error: \"ArrowBatchStream\" has no attribute \"_island_release_reservation\"  [attr-defined]",
-      "supertable/engine/islanddb.py:6753: error: \"ArrowBatchStream\" has no attribute \"_island_finish_profile\"  [attr-defined]",
-      "supertable/engine/islanddb.py:6754: error: \"ArrowBatchStream\" has no attribute \"_island_execution_metrics\"  [attr-defined]",
-      "supertable/engine/islanddb.py:6761: error: Incompatible return value type (got \"_IslandResultLifecycleStream\", expected \"ArrowBatchStream\")  [return-value]",
-      "supertable/engine/islanddb.py:897: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
-      "supertable/engine/islanddb.py:901: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
-      "supertable/engine/islanddb.py:907: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]"
+      "supertable/engine/islanddb.py:6625: error: Argument 1 to \"float\" has incompatible type \"object\"; expected \"str | Buffer | SupportsFloat | SupportsIndex\"  [arg-type]",
+      "supertable/engine/islanddb.py:6642: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/islanddb.py:6669: error: Argument \"rss_baseline_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
+      "supertable/engine/islanddb.py:6670: error: Argument \"rss_peak_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
+      "supertable/engine/islanddb.py:6671: error: Argument \"rss_final_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
+      "supertable/engine/islanddb.py:6672: error: Argument \"rss_peak_delta_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
+      "supertable/engine/islanddb.py:6675: error: Argument \"rss_retained_delta_bytes\" to \"IslandProfile\" has incompatible type \"object\"; expected \"int | None\"  [arg-type]",
+      "supertable/engine/islanddb.py:6680: error: No overload variant of \"int\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/islanddb.py:6690: error: No overload variant of \"dict\" matches argument type \"object\"  [call-overload]",
+      "supertable/engine/islanddb.py:6810: error: \"ArrowBatchStream\" has no attribute \"_island_release_reservation\"  [attr-defined]",
+      "supertable/engine/islanddb.py:6811: error: \"ArrowBatchStream\" has no attribute \"_island_finish_profile\"  [attr-defined]",
+      "supertable/engine/islanddb.py:6812: error: \"ArrowBatchStream\" has no attribute \"_island_execution_metrics\"  [attr-defined]",
+      "supertable/engine/islanddb.py:6819: error: Incompatible return value type (got \"_IslandResultLifecycleStream\", expected \"ArrowBatchStream\")  [return-value]",
+      "supertable/engine/islanddb.py:955: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
+      "supertable/engine/islanddb.py:959: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
+      "supertable/engine/islanddb.py:965: error: Argument 1 to \"int\" has incompatible type \"int | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]"
     ],
     "supertable/engine/join_pruner.py": [
       "supertable/engine/join_pruner.py:1021: error: Name \"new\" already defined on line 860  [no-redef]",
@@ -258,11 +258,11 @@
       "supertable/engine/join_pruner.py:757: error: Unsupported left operand type for > (\"object\")  [operator]"
     ],
     "supertable/engine/query_observations.py": [
-      "supertable/engine/query_observations.py:1091: error: \"object\" has no attribute \"zcard\"  [attr-defined]",
-      "supertable/engine/query_observations.py:1095: error: \"object\" has no attribute \"zrange\"  [attr-defined]",
-      "supertable/engine/query_observations.py:1110: error: \"object\" has no attribute \"pipeline\"  [attr-defined]",
-      "supertable/engine/query_observations.py:116: error: Argument 1 to \"float\" has incompatible type \"object\"; expected \"str | Buffer | SupportsFloat | SupportsIndex\"  [arg-type]",
-      "supertable/engine/query_observations.py:1198: error: \"object\" has no attribute \"feature_signature\"  [attr-defined]"
+      "supertable/engine/query_observations.py:1661: error: \"object\" has no attribute \"zcard\"  [attr-defined]",
+      "supertable/engine/query_observations.py:1665: error: \"object\" has no attribute \"zrange\"  [attr-defined]",
+      "supertable/engine/query_observations.py:1680: error: \"object\" has no attribute \"pipeline\"  [attr-defined]",
+      "supertable/engine/query_observations.py:1768: error: \"object\" has no attribute \"feature_signature\"  [attr-defined]",
+      "supertable/engine/query_observations.py:242: error: Argument 1 to \"float\" has incompatible type \"object\"; expected \"str | Buffer | SupportsFloat | SupportsIndex\"  [arg-type]"
     ],
     "supertable/logging.py": [
       "supertable/logging.py:332: error: Incompatible types in assignment (expression has type \"JSONFormatter\", variable has type \"TextFormatter\")  [assignment]"
@@ -292,8 +292,8 @@
       "supertable/monitoring_writer.py:75: error: Incompatible types in assignment (expression has type \"None\", variable has type \"type[RedisConnector]\")  [assignment]"
     ],
     "supertable/plan_extender.py": [
-      "supertable/plan_extender.py:162: error: \"QueryPlanManager\" has no attribute \"query_profile\"  [attr-defined]",
-      "supertable/plan_extender.py:230: error: Argument 1 to \"_query_targets_sink_table\" has incompatible type \"int | Any | str\"; expected \"str\"  [arg-type]"
+      "supertable/plan_extender.py:163: error: \"QueryPlanManager\" has no attribute \"query_profile\"  [attr-defined]",
+      "supertable/plan_extender.py:231: error: Argument 1 to \"_query_targets_sink_table\" has incompatible type \"int | Any | str\"; expected \"str\"  [arg-type]"
     ],
     "supertable/processing.py": [
       "supertable/processing.py:2013: error: Argument \"profiler\" to \"_compact_resources_with_tombstones\" has incompatible type \"Profiler | NullProfiler\"; expected \"Profiler\"  [arg-type]",
@@ -417,9 +417,8 @@
       "supertable/utils/sql_parser.py:670: error: \"object\" has no attribute \"strip\"  [attr-defined]"
     ],
     "supertable/utils/timer.py": [
-      "supertable/utils/timer.py:38: error: Incompatible default for parameter \"show_timing\" (default has type \"None\", parameter has type \"bool\")  [assignment]",
-      "supertable/utils/timer.py:43: error: Need type annotation for \"timings\" (hint: \"timings: list[<type>] = ...\")  [var-annotated]",
-      "supertable/utils/timer.py:94: error: Incompatible types in assignment (expression has type \"float\", variable has type \"None\")  [assignment]"
+      "supertable/utils/timer.py:104: error: Incompatible types in assignment (expression has type \"float\", variable has type \"None\")  [assignment]",
+      "supertable/utils/timer.py:40: error: Incompatible default for parameter \"show_timing\" (default has type \"None\", parameter has type \"bool\")  [assignment]"
     ]
   },
   "inline_suppressions": {
@@ -444,7 +443,7 @@
       "supertable/redis_infra.py:323:from redis_catalog import RedisCatalog as _RC  # type: ignore"
     ]
   },
-  "known_error_count": 321,
+  "known_error_count": 320,
   "known_suppression_count": 10,
   "mypy_version": "2.3.0",
   "production_file_count": 162,

@@ -805,6 +805,16 @@ class _RetryBeforeFirstBatchStream:
     def __iter__(self):
         return self
 
+    def add_finalization_callback(self, callback) -> bool:
+        """Bind finalization to the active stream after any first-row retry."""
+
+        add_callback = getattr(
+            self._inner, "add_finalization_callback", None,
+        )
+        if not callable(add_callback):
+            return False
+        return add_callback(callback) is not False
+
     def _replace_inner(self) -> None:
         close = getattr(self._inner, "close", None)
         if callable(close):
@@ -913,6 +923,14 @@ class _FailureTelemetryIterator:
     def __iter__(self):
         return self
 
+    def add_finalization_callback(self, callback) -> bool:
+        add_callback = getattr(
+            self._inner, "add_finalization_callback", None,
+        )
+        if not callable(add_callback):
+            return False
+        return add_callback(callback) is not False
+
     def __next__(self):
         try:
             return next(self._inner)
@@ -974,6 +992,16 @@ class _AutoIslandFallbackStream:
 
     def __iter__(self):
         return self
+
+    def add_finalization_callback(self, callback) -> bool:
+        """Bind finalization to the engine that survived AUTO fallback."""
+
+        add_callback = getattr(
+            self._inner, "add_finalization_callback", None,
+        )
+        if not callable(add_callback):
+            return False
+        return add_callback(callback) is not False
 
     def _commit_island(self) -> None:
         if not self._island_committed:
@@ -2370,6 +2398,17 @@ class Executor:
         def timer_capture(evt: str):
             timer.capture_and_reset_timing(evt)
 
+        def record_duration(evt: str, elapsed: float) -> None:
+            if evt == "RESULT_FETCH":
+                timer.capture_aggregated_timing(evt, elapsed)
+            else:
+                timer.capture_timing(evt, elapsed)
+        setattr(
+            timer_capture,
+            "record_duration",
+            record_duration,
+        )
+
         cache = (
             self._get_file_cache(island_cfg)
             if _reflection_has_remote_paths(reflection) else None
@@ -2740,6 +2779,17 @@ class Executor:
 
         def timer_capture(evt: str):
             timer.capture_and_reset_timing(evt)
+
+        def record_duration(evt: str, elapsed: float) -> None:
+            if evt == "RESULT_FETCH":
+                timer.capture_aggregated_timing(evt, elapsed)
+            else:
+                timer.capture_timing(evt, elapsed)
+        setattr(
+            timer_capture,
+            "record_duration",
+            record_duration,
+        )
 
         def start_auto_island_fallback(
             exc: BaseException,

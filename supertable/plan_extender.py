@@ -18,6 +18,7 @@ from supertable.engine.query_observations import (
     canonical_sql_shape,
     diagnostic_text_identity,
     normalize_query_profile,
+    sanitize_execution_timings,
     sanitize_profile,
 )
 
@@ -152,7 +153,7 @@ def extend_execution_plan(
         plan_stats.summary() if hasattr(plan_stats, "summary") else plan_stats.stats,
         max_bytes=32 * 1024,
     )
-    safe_timing = sanitize_profile(timing, max_bytes=8 * 1024)
+    safe_timing = sanitize_execution_timings(timing, max_bytes=8 * 1024)
 
     # Stash only the credential-safe, bounded plan onto the manager so API
     # callers cannot accidentally return signed object-store URLs.

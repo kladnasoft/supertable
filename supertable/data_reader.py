@@ -191,9 +191,13 @@ class _MonitoredResultStream:
         self._finalize_complete = False
         self._finalizing_thread: Optional[int] = None
         self._finalize_error: BaseException | None = None
+        self._active_inner_next = 0
+        self._pending_inner_terminal: Optional[str] = None
+        self._inner_reports_terminal = False
         add_terminal_callback = getattr(inner, "add_terminal_callback", None)
         if callable(add_terminal_callback):
-            add_terminal_callback(self._inner_terminal)
+            registered = add_terminal_callback(self._inner_terminal)
+            self._inner_reports_terminal = registered is not False
 
     def __iter__(self):
         return self
@@ -254,7 +258,28 @@ class _MonitoredResultStream:
         with self._finalize_condition:
             return self._finalized
 
-    def _inner_terminal(self, kind: str) -> None:
+    def _raise_completed_finalize_error(self) -> None:
+        """Join an already-started terminal publication and surface its error.
+
+        A callback-aware backend may start finalization on another thread.
+        Waiting only after ``_finalized`` becomes true preserves nonblocking
+        cancellation while an active producer is still unwinding, but prevents
+        a concurrent terminal caller from falsely reporting durable success.
+        """
+
+        with self._finalize_condition:
+            owner = threading.get_ident()
+            while (
+                self._finalized
+                and not self._finalize_complete
+                and self._finalizing_thread != owner
+            ):
+                self._finalize_condition.wait()
+            error = self._finalize_error if self._finalize_complete else None
+        if error is not None:
+            raise error
+
+    def _finish_inner_terminal(self, kind: str) -> None:
         if kind == "completed":
             status, message = Status.OK.value, None
         elif kind == "timed_out":
@@ -277,10 +302,36 @@ class _MonitoredResultStream:
                 safe_exception_type(exc),
             )
 
+    def _inner_terminal(self, kind: str) -> None:
+        with self._finalize_condition:
+            if self._active_inner_next:
+                if self._pending_inner_terminal is None:
+                    self._pending_inner_terminal = str(kind)
+                return
+        self._finish_inner_terminal(kind)
+
+    def _begin_inner_next(self) -> None:
+        with self._finalize_condition:
+            self._active_inner_next += 1
+
+    def _end_inner_next(self) -> None:
+        pending = None
+        with self._finalize_condition:
+            self._active_inner_next = max(0, self._active_inner_next - 1)
+            if self._active_inner_next == 0:
+                pending, self._pending_inner_terminal = (
+                    self._pending_inner_terminal,
+                    None,
+                )
+        if pending is not None:
+            self._finish_inner_terminal(pending)
+
     def __next__(self):
+        self._begin_inner_next()
         try:
             batch = next(self._inner)
         except StopIteration:
+            self._end_inner_next()
             close = getattr(self._inner, "close", None)
             try:
                 if callable(close):
@@ -299,6 +350,7 @@ class _MonitoredResultStream:
             self._finish(Status.OK.value, None)
             raise
         except BaseException as exc:
+            self._end_inner_next()
             try:
                 self._finish(Status.ERROR.value, _QUERY_STREAM_ERROR)
             except BaseException as monitoring_exc:
@@ -309,7 +361,14 @@ class _MonitoredResultStream:
             if isinstance(exc, Exception):
                 raise RuntimeError(_QUERY_STREAM_ERROR) from None
             raise
-        self._record_batch(batch)
+        try:
+            self._record_batch(batch)
+        finally:
+            # Drain a terminal produced during the inner next() before a
+            # row-budget success can commit the exactly-once monitoring result.
+            # Timeout/failure must outrank the provisional budget completion.
+            self._end_inner_next()
+        self._raise_completed_finalize_error()
         if bool(getattr(self._inner, "successful_completion", False)):
             # A bounded export reaching its exact authorized row budget is a
             # completed query, not an abandoned stream. Finalize now so a
@@ -343,7 +402,10 @@ class _MonitoredResultStream:
             if isinstance(backend_error, Exception):
                 raise RuntimeError(_QUERY_STREAM_ERROR) from None
             raise backend_error
-        self._finish(Status.ERROR.value, "result stream cancelled")
+        if not self._inner_reports_terminal:
+            self._finish(Status.ERROR.value, "result stream cancelled")
+        else:
+            self._raise_completed_finalize_error()
 
     def close(self) -> None:
         close = getattr(self._inner, "close", None)
@@ -366,10 +428,13 @@ class _MonitoredResultStream:
             if isinstance(backend_error, Exception):
                 raise RuntimeError(_QUERY_STREAM_ERROR) from None
             raise backend_error
-        self._finish(
-            Status.ERROR.value,
-            "result stream closed before exhaustion",
-        )
+        if not self._inner_reports_terminal:
+            self._finish(
+                Status.ERROR.value,
+                "result stream closed before exhaustion",
+            )
+        else:
+            self._raise_completed_finalize_error()
 
     @property
     def closed(self) -> bool:
@@ -410,42 +475,139 @@ class _RowBudgetResultStream:
         self._remaining = max_total_rows
         self._closed = False
         self._successful_completion = False
+        self._state_lock = threading.RLock()
+        self._termination_inflight = False
+        self._external_termination: Optional[str] = None
+        self._pending_inner_terminal: Optional[str] = None
+        self._terminal_kind: Optional[str] = None
+        self._terminal_callbacks: list[Callable[[str], None]] = []
         self.schema = inner.schema
+        add_terminal_callback = getattr(
+            inner, "add_terminal_callback", None,
+        )
+        if callable(add_terminal_callback):
+            self._inner_reports_terminal = (
+                add_terminal_callback(self._inner_terminal) is not False
+            )
+        else:
+            self._inner_reports_terminal = False
 
     def __iter__(self):
         return self
 
+    def add_terminal_callback(self, callback) -> bool:
+        """Forward lifecycle outcomes while preserving budget completion."""
+
+        if not self._inner_reports_terminal:
+            return False
+        terminal_kind = None
+        with self._state_lock:
+            if self._terminal_kind is None:
+                self._terminal_callbacks.append(callback)
+            else:
+                terminal_kind = self._terminal_kind
+        if terminal_kind is not None:
+            callback(terminal_kind)
+        return True
+
+    def _record_terminal(self, kind: str) -> None:
+        callbacks = []
+        with self._state_lock:
+            if self._terminal_kind is not None:
+                return
+            self._terminal_kind = str(kind)
+            callbacks, self._terminal_callbacks = self._terminal_callbacks, []
+        for callback in callbacks:
+            callback(self._terminal_kind)
+
+    def _inner_terminal(self, kind: str) -> None:
+        with self._state_lock:
+            if self._termination_inflight:
+                if self._pending_inner_terminal is None:
+                    self._pending_inner_terminal = str(kind)
+                return
+            successful = self._successful_completion
+        if successful and kind in {"cancelled", "closed"}:
+            kind = "completed"
+        self._record_terminal(kind)
+
+    def _finish_budget_termination(self, *, succeeded: bool) -> bool:
+        with self._state_lock:
+            self._termination_inflight = False
+            external = self._external_termination
+            self._successful_completion = bool(succeeded and external is None)
+            pending, self._pending_inner_terminal = (
+                self._pending_inner_terminal,
+                None,
+            )
+        if not succeeded:
+            self._record_terminal("failed")
+        elif pending not in {None, "cancelled", "closed"}:
+            self._record_terminal(pending)
+        elif external is not None:
+            self._record_terminal(external)
+        elif pending is not None:
+            self._record_terminal("completed")
+        return external is None
+
     def __next__(self):
-        if self._closed or self._remaining <= 0:
-            raise StopIteration
+        with self._state_lock:
+            if self._closed or self._remaining <= 0:
+                raise StopIteration
         batch = next(self._inner)
         rows = max(0, int(getattr(batch, "num_rows", 0)))
-        if rows <= self._remaining:
-            self._remaining -= rows
-            if self._remaining == 0:
-                self._inner.close()
+        with self._state_lock:
+            if self._closed:
+                raise ResourceReservationCancelled(
+                    "Arrow result stream terminated during batch fetch"
+                )
+            remaining = self._remaining
+            if rows <= remaining:
+                self._remaining -= rows
+                budget_reached = self._remaining == 0
+                overrun = False
+                allowed_rows = rows
+            else:
+                self._remaining = 0
+                budget_reached = True
+                overrun = True
+                allowed_rows = remaining
+            if budget_reached:
                 self._closed = True
-                self._successful_completion = True
+                self._termination_inflight = True
+
+        if not budget_reached:
             return batch
 
-        # The outer SQL LIMIT should make this unreachable.  If a backend ever
-        # violates it, expose only the authorized budget and stop the producer
-        # before another batch can be fetched.
-        bounded = batch.slice(0, self._remaining)
-        self._remaining = 0
-        cancel = getattr(self._inner, "cancel", None)
-        if callable(cancel):
-            cancel()
-        else:
-            self._inner.close()
-        self._closed = True
-        self._successful_completion = True
-        return bounded
+        result = batch.slice(0, allowed_rows) if overrun else batch
+        try:
+            if overrun:
+                # The outer SQL LIMIT should make this unreachable. If a
+                # backend violates it, stop before another batch is fetched.
+                cancel = getattr(self._inner, "cancel", None)
+                if callable(cancel):
+                    cancel()
+                else:
+                    self._inner.close()
+            else:
+                self._inner.close()
+        except BaseException:
+            self._finish_budget_termination(succeeded=False)
+            raise
+        if not self._finish_budget_termination(succeeded=True):
+            raise ResourceReservationCancelled(
+                "Arrow result stream terminated during budget cleanup"
+            )
+        return result
 
     def cancel(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._state_lock:
+            if self._successful_completion or (
+                self._closed and not self._termination_inflight
+            ):
+                return
+            self._closed = True
+            self._external_termination = "cancelled"
         cancel = getattr(self._inner, "cancel", None)
         if callable(cancel):
             cancel()
@@ -453,9 +615,20 @@ class _RowBudgetResultStream:
             self._inner.close()
 
     def close(self) -> None:
-        if self._closed:
+        with self._state_lock:
+            if self._successful_completion or (
+                self._closed and not self._termination_inflight
+            ):
+                return
+            self._closed = True
+            if self._external_termination is None:
+                self._external_termination = "closed"
+            termination_inflight = self._termination_inflight
+        if termination_inflight:
+            # The exact-budget path already owns close().  Mark this external
+            # close as the winning outcome without invoking a non-reentrant
+            # backend close concurrently.
             return
-        self._closed = True
         self._inner.close()
 
     @property
@@ -472,7 +645,8 @@ class _RowBudgetResultStream:
 
     @property
     def successful_completion(self) -> bool:
-        return self._successful_completion
+        with self._state_lock:
+            return self._successful_completion
 
     def __enter__(self):
         return self
@@ -1373,6 +1547,7 @@ class DataReader:
         message: Optional[str] = None
         typed_failure: Optional[BaseException] = None
         self.timer = Timer()
+        request_prepare_started = time.perf_counter()
         self.plan_stats = PlanStats()
         _ensure_request_active(_deadline_monotonic, _cancel_event)
 
@@ -1517,6 +1692,21 @@ class DataReader:
         )
         validate_rbac_binding_stability(parser, rbac_views)
 
+        tombstone_resolution_started: Optional[float] = None
+
+        def _finish_tombstone_resolution_timing() -> None:
+            nonlocal tombstone_resolution_started
+            if tombstone_resolution_started is None:
+                return
+            request_timer = self.timer
+            if request_timer is None:
+                raise RuntimeError("query timer is unavailable")
+            request_timer.capture_timing(
+                "TOMBSTONE_RESOLUTION",
+                time.perf_counter() - tombstone_resolution_started,
+            )
+            tombstone_resolution_started = None
+
         try:
             observation_store = None
             history_provider = None
@@ -1579,7 +1769,13 @@ class DataReader:
                         "[prune] join-edge extraction failed; "
                         f"error_type={safe_exception_type(je_err)}"))
 
+            self.timer.capture_timing(
+                "QUERY_PREPARATION",
+                time.perf_counter() - request_prepare_started,
+            )
+
             # 1) ESTIMATE — use physical_tables so CTE aliases are excluded
+            estimate_started = time.perf_counter()
             estimator_kwargs = dict(
                 organization=self.organization,
                 storage=self.storage,
@@ -1595,8 +1791,13 @@ class DataReader:
             )
             if aggregate_children:
                 estimator_kwargs["aggregate_children"] = aggregate_children
-            estimator = DataEstimator(**estimator_kwargs)
-            reflection = estimator.estimate()
+            try:
+                estimator = DataEstimator(**estimator_kwargs)
+                reflection = estimator.estimate()
+            finally:
+                self.timer.capture_timing(
+                    "ESTIMATE", time.perf_counter() - estimate_started,
+                )
             # Retain the data-free, snapshot-pinned estimate for public
             # preflight callers. It contains executor paths internally, so the
             # public helper below allowlists aggregate fields rather than
@@ -1611,6 +1812,7 @@ class DataReader:
             reflection.rbac_views = rbac_views
 
             # --- Tombstone/share policy from the estimator-pinned snapshot ---
+            tombstone_resolution_started = time.perf_counter()
             # Never re-read the Redis leaf here.  A writer can commit between
             # estimation and execution; combining old files with a new DV would
             # hide the old row while omitting its replacement file.
@@ -1945,6 +2147,8 @@ class DataReader:
                             where_clause=share_row_filter,
                         )
 
+            _finish_tombstone_resolution_timing()
+
             if _odata_identity:
                 if (
                     odata_identity_alias is None
@@ -2085,14 +2289,17 @@ class DataReader:
                     "RESULT_BYTES": max(0, result_bytes),
                     "RESULT_ROWS": max(0, int(result_shape[0])),
                     "RESULT_COLUMNS": max(0, int(result_shape[1])),
+                    "RESULT_MODE": "materialized",
                 })
             status = Status.OK
         except PermissionError:
             # Authorization pins and linked-share policy validation are security
             # decisions, not ordinary backend failures. Preserve their type for
             # service layers and never turn them into an empty successful result.
+            _finish_tombstone_resolution_timing()
             raise
         except (ResourceReservationCancelled, TimeoutError) as e:
+            _finish_tombstone_resolution_timing()
             message = (
                 "Query was cancelled"
                 if isinstance(e, ResourceReservationCancelled)
@@ -2103,6 +2310,7 @@ class DataReader:
             result_value = pd.DataFrame()
             result_shape = result_value.shape
         except Exception as e:
+            _finish_tombstone_resolution_timing()
             message = _QUERY_EXECUTION_ERROR
             logger.error(
                 self._lp(
@@ -2137,6 +2345,17 @@ class DataReader:
                 result_rows: int,
                 result_bytes: int,
             ) -> None:
+                result_fetch_occurrences = stream_timer.timing_occurrences(
+                    "RESULT_FETCH"
+                )
+                if (
+                    isinstance(result_fetch_occurrences, int)
+                    and not isinstance(result_fetch_occurrences, bool)
+                    and result_fetch_occurrences > 0
+                ):
+                    stream_plan_stats.add_stat({
+                        "RESULT_FETCH_OCCURRENCES": result_fetch_occurrences,
+                    })
                 stream_plan_stats.add_stat({
                     "RESULT_BYTES": max(0, int(result_bytes)),
                     "RESULT_ROWS": max(0, int(result_rows)),
@@ -2213,6 +2432,15 @@ class DataReader:
         # Materialized/error outcomes are final here. Capture end-to-end query
         # latency before monitoring itself so Redis/WAL latency does not distort
         # engine feedback.
+        result_fetch_occurrences = self.timer.timing_occurrences("RESULT_FETCH")
+        if (
+            isinstance(result_fetch_occurrences, int)
+            and not isinstance(result_fetch_occurrences, bool)
+            and result_fetch_occurrences > 0
+        ):
+            self.plan_stats.add_stat({
+                "RESULT_FETCH_OCCURRENCES": result_fetch_occurrences,
+            })
         self.timer.capture_and_reset_timing(event="EXECUTING_QUERY")
         self.timer.capture_duration(event="TOTAL_EXECUTE")
         try:

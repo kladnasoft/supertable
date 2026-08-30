@@ -356,6 +356,11 @@ class TestReadPruningObservability:
         _, ps = _estimate(_PRUNE_Q, orders_on_disk, pruning=False)
         assert _stat(ps, "FILES_KEPT") is None
         assert _stat(ps, "PRUNE_DURATION_MS") is None
+        assert _stat(ps, "STATS_LOAD_DURATION_MS") >= 0.0
+        assert _stat(ps, "STATS_LOAD_OCCURRENCES") == 1
+        assert _stat(ps, "STATS_FILTER_DURATION_MS") >= 0.0
+        assert _stat(ps, "STATS_FILTER_OCCURRENCES") == 1
+        assert _stat(ps, "ROW_GROUP_PRUNE_DURATION_MS") is None
 
 
 # ---------------------------------------------------------------------------

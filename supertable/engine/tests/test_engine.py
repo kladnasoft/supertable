@@ -2836,16 +2836,95 @@ class TestDuckDB:
         qm.query_plan_path = "/tmp/plan.json"
 
         captures = []
+        exact_durations = []
+
+        def capture(event):
+            captures.append(event)
+
+        capture.record_duration = (
+            lambda event, elapsed: exact_durations.append((event, elapsed))
+        )
         DuckDB(storage=MagicMock()).execute(
-            reflection, parser, qm, lambda e: captures.append(e)
+            reflection, parser, qm, capture,
         )
         assert "CONNECTING" in captures
         assert "CREATING_REFLECTION" in captures
+        assert {
+            "CONNECTION_SETUP",
+            "REFLECTION_PREPARE",
+            "TOMBSTONE_PREPARE",
+            "RBAC_PREPARE",
+            "ENGINE_PREPARE",
+            "QUERY_EXECUTE",
+            "RESULT_MATERIALIZE",
+            "CLEANUP",
+        } <= {event for event, _elapsed in exact_durations}
+        assert all(elapsed >= 0 for _event, elapsed in exact_durations)
         mock_init.assert_called_once()
         mock_create.assert_called_once()
         assert secret not in caplog.text
         assert "[duckdb] executing sql_sha256=" in caplog.text
         # The lite executor reuses a persistent connection; it is NOT closed per query.
+
+    @patch("supertable.engine.duckdb_engine.duckdb")
+    @patch("supertable.engine.duckdb_engine.init_connection")
+    @patch("supertable.engine.duckdb_engine.hashed_table_name", return_value="st_abc")
+    @patch("supertable.engine.duckdb_engine.create_reflection_view_with_presign_retry", return_value=False)
+    @patch("supertable.engine.duckdb_engine.rewrite_query_with_hashed_tables", return_value="SELECT 1")
+    @patch("supertable.engine.duckdb_engine._harden_user_query_connection")
+    def test_failed_query_and_materialization_record_active_phase(
+        self, mock_harden, mock_rewrite, mock_create, mock_hash, mock_init,
+        mock_duckdb,
+    ):
+        parser = MagicMock()
+        parser.original_query = "SELECT * FROM t"
+        parser.get_table_tuples.return_value = [
+            TableDefinition("s", "t", "t_alias", columns=["x"])
+        ]
+        reflection = Reflection(
+            storage_type="mock", reflection_bytes=100, total_reflections=1,
+            supers=[SuperSnapshot("s", "t", 1, ["f.parquet"], {"x"})],
+        )
+        manager = MagicMock(temp_dir="/tmp", query_plan_path="/tmp/plan.json")
+
+        for failure_stage in ("query", "materialize"):
+            exact_durations = []
+
+            def capture(_event):
+                return None
+
+            capture.record_duration = (
+                lambda event, elapsed: exact_durations.append((event, elapsed))
+            )
+            connection = MagicMock()
+            connection.cursor.return_value = connection
+            query_result = MagicMock()
+
+            def execute(sql, *_args, **_kwargs):
+                if sql == "SELECT 1":
+                    if failure_stage == "query":
+                        raise RuntimeError("query failed")
+                    return query_result
+                return MagicMock()
+
+            connection.execute.side_effect = execute
+            query_result.fetchdf.side_effect = RuntimeError(
+                "materialization failed"
+            )
+            mock_duckdb.connect.return_value = connection
+
+            with pytest.raises(RuntimeError):
+                DuckDB(storage=MagicMock()).execute(
+                    reflection, parser, manager, capture,
+                )
+
+            events = [event for event, _elapsed in exact_durations]
+            expected = (
+                "QUERY_EXECUTE"
+                if failure_stage == "query" else "RESULT_MATERIALIZE"
+            )
+            assert expected in events
+            assert "CLEANUP" in events
 
     @patch("supertable.engine.duckdb_engine.duckdb")
     @patch("supertable.engine.duckdb_engine.init_connection")
