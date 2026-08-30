@@ -79,6 +79,8 @@ class _FakeConn:
     def register(self, name, obj) -> None:  # noqa: D401 - probe registers incoming keys
         pass
     def execute(self, sql):
+        if str(sql).strip().casefold().startswith(("pragma ", "set ", "reset ")):
+            return self
         # A non-presign message so the probe re-raises straight to its outer
         # handler (return None) instead of attempting the presign retry branch.
         raise RuntimeError("injected probe failure: forced DuckDB execute error")

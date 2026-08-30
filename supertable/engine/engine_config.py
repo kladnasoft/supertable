@@ -231,7 +231,9 @@ class EngineRuntimeConfig:
     duckdb_io_multiplier: float
     duckdb_threads: Optional[int]        # None → auto-derive from memory limit
     duckdb_http_timeout: Optional[int]   # seconds; None → leave DuckDB default
-    duckdb_external_cache_size: str      # "" → external file cache disabled
+    # Non-empty is the legacy enable sentinel; "" disables. DuckDB's released
+    # builds do not expose a dedicated cache-size cap, so memory_limit bounds it.
+    duckdb_external_cache_size: str
 
 
 @dataclass(frozen=True)

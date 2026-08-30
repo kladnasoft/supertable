@@ -1915,6 +1915,8 @@ class TestWriteOverwriteResolution:
         assert "incoming_df" in kwargs
         assert kwargs["overwrite_columns"] == ["id"]
         assert kwargs["newer_than_col"] == "ts"
+        assert kwargs["organization"] == "o"
+        assert kwargs["catalog"] is mock_cat
         # The single returned delete pair drives the deleted count.
         assert result[3] == 1
 

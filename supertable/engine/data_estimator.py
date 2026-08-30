@@ -47,6 +47,7 @@ from supertable.utils.sql_parser import TableDefinition
 from supertable.engine.join_pruner import prune_files_across_joins
 from supertable.processing import (
     integer_domains_from_complete_stats,
+    load_bounded_stats_for_planning,
     load_stats,
     prune_files_by_predicates,
     resource_object_seal,
@@ -557,6 +558,7 @@ class DataEstimator:
             Dict[Tuple[str, str], Iterable[str]]
         ] = None,
         require_odata_identity: bool = False,
+        require_bounded_resource_estimates: bool = False,
     ):
         self.organization = organization
         self.storage = storage
@@ -577,6 +579,13 @@ class DataEstimator:
         if type(require_odata_identity) is not bool:
             raise TypeError("require_odata_identity must be a bool")
         self.require_odata_identity = require_odata_identity
+        if type(require_bounded_resource_estimates) is not bool:
+            raise TypeError(
+                "require_bounded_resource_estimates must be a bool"
+            )
+        self.require_bounded_resource_estimates = (
+            require_bounded_resource_estimates
+        )
         # Aggregate relations (``super_name == simple_name``) are resolved and
         # authorized by DataReader before estimation.  Pin that exact child set
         # here so a table created between authorization and Redis SCAN cannot be
@@ -2216,11 +2225,12 @@ class DataEstimator:
                     self.predicate_constraints.get(key)
                 )
 
-                # Load the stats artifact ONCE per table and reuse it for predicate
-                # pruning, projection sizing AND cross-table join propagation
-                # (cache-backed: a repeated read of the same table is a memory
-                # hit). Only load when at least one consumer needs it, so a
-                # SELECT * that neither filters nor joins stays free.
+                # Load the stats artifact ONCE per table and reuse it for
+                # predicate pruning, projection sizing, cross-table join
+                # propagation, and bounded engine resource planning. The
+                # AUTO/IslandDB lane performs pre-decode admission; a normal
+                # cache miss would otherwise whole-decode the artifact before
+                # the cache byte cap can reject it.
                 stats_df: Optional["polars.DataFrame"] = None
                 stats_identity = (
                     stats_cache_identity(
@@ -2230,15 +2240,37 @@ class DataEstimator:
                     )
                     if stats_file else None
                 )
-                if stats_file and (need_projection or has_predicate or key in join_table_keys):
+                if stats_file and (
+                    need_projection
+                    or has_predicate
+                    or key in join_table_keys
+                    or bool(getattr(
+                        self, "require_bounded_resource_estimates", False,
+                    ))
+                ):
                     try:
-                        stats_df = load_stats(
-                            stats_file,
-                            allow_cache=True,
-                            cache_identity=stats_identity,
-                            profiler=prune_profiler,
-                            storage=self.storage,
-                        )
+                        if bool(getattr(
+                            self, "require_bounded_resource_estimates", False,
+                        )):
+                            if expected_stats_rows is None:
+                                raise ValueError(
+                                    "Statistics row count is unavailable"
+                                )
+                            stats_df = load_bounded_stats_for_planning(
+                                stats_file,
+                                expected_rows=expected_stats_rows,
+                                cache_identity=stats_identity,
+                                profiler=prune_profiler,
+                                storage=self.storage,
+                            )
+                        else:
+                            stats_df = load_stats(
+                                stats_file,
+                                allow_cache=True,
+                                cache_identity=stats_identity,
+                                profiler=prune_profiler,
+                                storage=self.storage,
+                            )
                     except Exception as stats_err:
                         # Stats are an optional optimisation artifact.  A stale,
                         # corrupt, unavailable, or malformed pointer must never
@@ -2707,11 +2739,11 @@ class DataEstimator:
                 # selected-RG anti join and a full-file uniqueness proof for
                 # every referenced immutable resource. Stats deliberately omit
                 # system columns, so use manifest row counts for decoded Int64
-                # buffers and the entire file size as a conservative compressed
-                # upper bound for the proof scan. This is deliberately looser
-                # than the actual range read, but complete: active tombstones on
-                # 100+ files remain eligible for bounded Island planning without
-                # pretending ``8 * rows`` covers Parquet page overhead.
+                # buffers. Conservatively charge one entire file for each rowid
+                # consumer as compressed work: the candidate anti join and the
+                # full identity proof. This is deliberately looser than the
+                # actual range reads, but complete even when rowid chunks
+                # dominate tiny user columns.
                 full_rows_complete = all(
                     isinstance(resource_rows.get(file_key), int)
                     and not isinstance(resource_rows.get(file_key), bool)
@@ -2741,7 +2773,9 @@ class DataEstimator:
                 else:
                     table_proof_decoded_complete = False
                 if full_sizes_complete:
-                    table_rg_bytes += sum(key_size[file_key] for file_key in survivors)
+                    table_rg_bytes += 2 * sum(
+                        key_size[file_key] for file_key in survivors
+                    )
                 else:
                     table_rg_complete = False
             table_decoded_bytes = (

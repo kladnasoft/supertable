@@ -501,8 +501,8 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
 
     # Active deletion vectors require a selected-group rowid anti join plus a
     # full-resource rowid identity proof. System chunks are omitted from stats,
-    # so the estimator charges the whole file as a compressed upper bound and
-    # manifest rows as the decoded Int64+validity bound for both scans.
+    # so the estimator charges one whole-file compressed upper bound for each
+    # rowid consumer and manifest rows as the decoded Int64+validity bound.
     snapshot["payload"].update({
         "tombstone": "dv.parquet",
         "tombstone_rows": 1,
@@ -523,7 +523,7 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
     }
     assert with_tombstone.supers[0].candidate_row_groups == 1
     assert with_tombstone.supers[0].candidate_row_groups_complete is True
-    assert with_tombstone.row_group_scan_bytes == 10 + 1_000
+    assert with_tombstone.row_group_scan_bytes == 10 + (2 * 1_000)
     assert with_tombstone.row_group_scan_bytes_complete is True
     # The selected scan remains four rows wide even though first use must stream
     # a ten-million-row full-file rowid proof. Both stay in the conservative
@@ -537,6 +537,104 @@ def test_estimate_wires_raw_key_selection_and_separate_byte_estimates(monkeypatc
         + with_tombstone.proof_decoded_bytes
     )
     assert with_tombstone.decoded_bytes_complete is True
+
+
+def test_select_star_uses_bounded_stats_for_resource_estimates(monkeypatch):
+    frame = _stats([
+        _stat_row(
+            "raw/f.parquet", 0, "id", 1, 4,
+            rows=4, compressed=10, uncompressed=40,
+        ),
+        _stat_row(
+            "raw/f.parquet", 0, "amount", 10, 40,
+            rows=4, compressed=20, uncompressed=40,
+        ),
+    ])
+    resource_seal = stats_resource_seals(frame)["raw/f.parquet"]
+    snapshot = {
+        "table_name": "t",
+        "last_updated_ms": 123,
+        "path": "snapshot.json",
+        "version": 1,
+        "payload": {
+            "snapshot_version": 1,
+            "_row_filter": None,
+            "schema": {"id": "BIGINT", "amount": "BIGINT"},
+            "stats_file": "stats.parquet",
+            "stats_rows": frame.height,
+            "resources": [{
+                "file": "raw/f.parquet",
+                "file_size": 1_000,
+                "rows": 4,
+                "footer_sha256": resource_seal.footer_sha256,
+                "stats_rows": resource_seal.stats_rows,
+                "stats_digest": resource_seal.stats_digest,
+            }],
+            "tombstone": None,
+            "tombstone_rows": 0,
+            "tombstone_digest": None,
+        },
+    }
+    estimator = DataEstimator.__new__(DataEstimator)
+    estimator.organization = "org"
+    estimator.storage = types.SimpleNamespace()
+    estimator.tables = [types.SimpleNamespace(
+        super_name="s", simple_name="t", columns=[],
+    )]
+    estimator.predicate_constraints = {}
+    estimator.join_edges = []
+    estimator.join_pruning_lanes = None
+    estimator.require_bounded_resource_estimates = True
+    estimator.plan_stats = PlanStats()
+    estimator.timer = None
+    estimator.catalog = None
+    estimator._collect_snapshots_from_redis = (
+        lambda organization, super_name: [snapshot]
+    )
+    estimator._to_duckdb_path = lambda key: f"resolved://{key}"
+
+    class _DummySuper:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    loaded = []
+
+    def _load_stats(path, **kwargs):
+        loaded.append((path, kwargs))
+        return frame
+
+    def _unbounded_load_must_not_run(*_args, **_kwargs):
+        raise AssertionError("bounded planning used the ordinary stats loader")
+
+    monkeypatch.setattr(estimator_module, "SuperTable", _DummySuper)
+    monkeypatch.setattr(
+        estimator_module, "load_bounded_stats_for_planning", _load_stats,
+    )
+    monkeypatch.setattr(
+        estimator_module, "load_stats", _unbounded_load_must_not_run,
+    )
+    monkeypatch.setattr(
+        estimator_module,
+        "settings",
+        dataclasses.replace(
+            settings,
+            SUPERTABLE_READ_PRUNING_ENABLED=True,
+            SUPERTABLE_READ_PROJECTION_SIZING_ENABLED=True,
+        ),
+    )
+
+    reflection = estimator.estimate()
+
+    assert len(loaded) == 1
+    assert loaded[0][0] == "stats.parquet"
+    assert loaded[0][1]["expected_rows"] == frame.height
+    assert loaded[0][1]["storage"] is estimator.storage
+    assert reflection.row_group_scan_bytes == 30
+    assert reflection.row_group_scan_bytes_complete is True
+    assert reflection.decoded_bytes == 80
+    assert reflection.decoded_bytes_complete is True
+    assert reflection.supers[0].candidate_row_groups == 1
+    assert reflection.supers[0].candidate_row_groups_complete is True
 
 
 def test_rle_page_size_does_not_underestimate_fixed_width_decoded_memory():

@@ -99,11 +99,12 @@ def _spy_probe(monkeypatch):
 
 
 def _spy_remote_duckdb(monkeypatch):
-    calls = {"n": 0}
+    calls = {"n": 0, "kwargs": []}
     real = st_processing._duckdb_probe_overlap_matches
 
     def _counting(*a, **k):
         calls["n"] += 1
+        calls["kwargs"].append(k)
         return real(*a, **k)
 
     monkeypatch.setattr(st_processing, "_duckdb_probe_overlap_matches", _counting)
@@ -257,13 +258,31 @@ def test_explicit_nonlocal_compatibility_uses_duckdb(tmp_path, monkeypatch):
     _set_probe(monkeypatch, True, local_auto=False)
     native_calls = _spy_probe(monkeypatch)
     duckdb_calls = _spy_remote_duckdb(monkeypatch)
+    catalog = type("Catalog", (), {
+        "get_engine_config": lambda self, org: {
+            "duckdb": {"duckdb_threads": "1", "duckdb_memory_limit": "512MB"}
+        }
+    })()
 
-    filtered, pairs = resolve_overwrite_writes(
-        incoming, {candidate}, ["user_id"], "updated_at", storage=storage,
-    )
+    from supertable.engine import engine_common
+    engine_common.reset_pooled_duckdb_connections()
+
+    try:
+        filtered, pairs = resolve_overwrite_writes(
+            incoming, {candidate}, ["user_id"], "updated_at", storage=storage,
+            organization="org-1", catalog=catalog,
+        )
+
+        assert engine_common._probe_pool.con.execute(
+            "SELECT current_setting('threads')"
+        ).fetchone()[0] == 1
+    finally:
+        engine_common.reset_pooled_duckdb_connections()
 
     assert native_calls["n"] == 0
     assert duckdb_calls["n"] == 1
+    assert duckdb_calls["kwargs"][0]["organization"] == "org-1"
+    assert duckdb_calls["kwargs"][0]["catalog"] is catalog
     assert filtered.rows() == [(5, 9)]
     assert pairs == [(candidate[0], 1)]
 

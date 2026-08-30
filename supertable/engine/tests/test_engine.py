@@ -87,6 +87,7 @@ from supertable.engine.data_estimator import DataEstimator, get_missing_columns
 from supertable.engine.engine_enum import Engine
 from supertable.engine.executor import Executor
 from supertable.engine.duckdb_engine import DuckDB
+from supertable.engine.engine_config import EngineRuntimeConfig
 
 from supertable.engine.islanddb import IslandUnsupportedError
 from supertable.engine.spark_thrift import (
@@ -1584,6 +1585,58 @@ class TestReadWriteDuckDBParity:
         assert _probe() is not None
         assert _probe() is not None
         assert len(calls) == 1  # built on the cold probe, reused on the warm one
+
+    def test_pooled_probe_reapplies_live_runtime_config(self, tmp_path):
+        def _config(memory_limit, threads, http_timeout=None):
+            return EngineRuntimeConfig(
+                engine_island_min_bytes=100 * 1024 * 1024,
+                engine_spark_min_bytes=0,
+                engine_freshness_sec=300,
+                duckdb_memory_limit=memory_limit,
+                duckdb_io_multiplier=3.0,
+                duckdb_threads=threads,
+                duckdb_http_timeout=http_timeout,
+                duckdb_external_cache_size="",
+            )
+
+        _engine_common.reset_pooled_duckdb_connections()
+        fresh = duckdb.connect()
+        try:
+            default_http_timeout = fresh.execute(
+                "SELECT current_setting('http_timeout')"
+            ).fetchone()[0]
+        finally:
+            fresh.close()
+        try:
+            first = _engine_common.get_pooled_duckdb_connection(
+                temp_dir=str(tmp_path),
+                engine_config=_config("512MB", 1, http_timeout=17),
+            )
+            first_memory = first.execute(
+                "SELECT current_setting('memory_limit')"
+            ).fetchone()[0]
+            assert first.execute(
+                "SELECT current_setting('threads')"
+            ).fetchone()[0] == 1
+            assert first.execute(
+                "SELECT current_setting('http_timeout')"
+            ).fetchone()[0] == 17
+
+            second = _engine_common.get_pooled_duckdb_connection(
+                temp_dir=str(tmp_path), engine_config=_config("1GB", 2),
+            )
+            assert second is first
+            assert second.execute(
+                "SELECT current_setting('threads')"
+            ).fetchone()[0] == 2
+            assert second.execute(
+                "SELECT current_setting('memory_limit')"
+            ).fetchone()[0] != first_memory
+            assert second.execute(
+                "SELECT current_setting('http_timeout')"
+            ).fetchone()[0] == default_http_timeout
+        finally:
+            _engine_common.reset_pooled_duckdb_connections()
 
     def test_probe_matches_rows_on_local_parquet(self, tmp_path, monkeypatch):
         import polars

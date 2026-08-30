@@ -104,6 +104,23 @@ class TestResolverNormalizes:
         with pytest.raises(redis.TimeoutError, match="policy read timed out"):
             resolve_engine_configs("kladna-soft", _Catalog())
 
+    def test_catalog_persists_explicit_external_cache_disable(self):
+        redis_client = fakeredis.FakeStrictRedis(decode_responses=True)
+        catalog = RedisCatalog(redis_client=redis_client)
+
+        assert catalog.set_engine_config(
+            "acme", {"duckdb_external_cache_size": "0"},
+        )
+
+        stored = catalog.get_engine_config("acme")
+        assert stored["duckdb"]["duckdb_external_cache_size"] == "0"
+        assert resolve_engine_config(
+            "acme", catalog,
+        ).duckdb_external_cache_size == ""
+        provenance = resolve_engine_config_provenance("acme", catalog)
+        assert provenance["duckdb"]["duckdb_external_cache_size"]["source"] == "redis"
+        assert provenance["duckdb"]["duckdb_external_cache_size"]["value"] == "0"
+
     def test_island_limits_resolve_live_from_one_org_document(self, monkeypatch):
         monkeypatch.setenv("SUPERTABLE_ISLAND_CPU_MAX", "7")
         stored = {

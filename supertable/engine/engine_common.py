@@ -1980,6 +1980,7 @@ def get_pooled_duckdb_connection(
         for_paths: Optional[List[str]] = None,
         memory_limit: str = "1GB",
         storage: Optional[object] = None,
+        engine_config: Optional[object] = None,
 ) -> duckdb.DuckDBPyConnection:
     """Return this thread's pooled probe connection, building it on first use.
 
@@ -1989,6 +1990,9 @@ def get_pooled_duckdb_connection(
     remote paths so a connection first built for local paths can still serve a
     later remote probe and credentials always reflect the current environment
     (``configure_httpfs_and_s3`` re-reads env each call and is idempotent).
+    The caller's resolved organization config is re-applied at every checkout,
+    including warm pooled connections that may previously have served another
+    organization on the same worker thread.
     """
     con = getattr(_probe_pool, "con", None)
     if con is None:
@@ -1999,6 +2003,9 @@ def get_pooled_duckdb_connection(
         _probe_pool.con = con
     elif for_paths and any("://" in str(p) for p in for_paths):
         configure_httpfs_and_s3(con, for_paths, storage=storage)
+    if not apply_runtime_pragmas(con, engine_config):
+        reset_pooled_duckdb_connections()
+        raise RuntimeError("DuckDB write-probe runtime configuration was rejected")
     return con
 
 
@@ -2060,14 +2067,52 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> bool:
         applied = False
 
     # httpfs settings — only effective once httpfs is loaded (remote reads).
-    if cfg.duckdb_http_timeout is not None:
+    # RESET is essential for pooled connections: ``None`` means the DuckDB
+    # default, not "retain the previous organization's live override".  A
+    # hardened local-only connection deliberately disables extension autoload,
+    # though, so DuckDB rejects RESET while httpfs is absent.  In that case the
+    # settings catalog proves that no timeout exists (and therefore no prior
+    # organization's value can exist) on this connection.
+    timeout_error: Optional[BaseException] = None
+    if cfg.duckdb_http_timeout is None:
+        try:
+            con.execute("RESET http_timeout;")
+        except Exception as e:
+            try:
+                timeout_is_registered = bool(con.execute(
+                    "SELECT 1 FROM duckdb_settings() "
+                    "WHERE name = 'http_timeout'"
+                ).fetchone())
+            except Exception:
+                timeout_is_registered = True
+            if timeout_is_registered:
+                timeout_error = e
+    else:
         try:
             con.execute(f"SET http_timeout={int(cfg.duckdb_http_timeout)};")
-        except Exception:
+        except Exception as e:
             # httpfs may not be loaded yet. _ensure_httpfs invalidates the
             # applied signature before the first remote query so this lane is
-            # retried after extension setup.
-            pass
+            # retried after extension setup. A configured value cannot leak
+            # from another organization while the setting is unavailable.
+            try:
+                timeout_is_registered = bool(con.execute(
+                    "SELECT 1 FROM duckdb_settings() "
+                    "WHERE name = 'http_timeout'"
+                ).fetchone())
+            except Exception:
+                timeout_is_registered = True
+            if timeout_is_registered:
+                timeout_error = e
+    if timeout_error is not None:
+        # A pooled connection must never be returned with another
+        # organization's live value still in force. Callers evict/retry a
+        # connection when any available setting rejects its reset or override.
+        applied = False
+        logger.warning(
+            "[duckdb.pragma] http_timeout config failed; error_type=%s",
+            _diagnostic_error_type(timeout_error),
+        )
 
     # External file cache: enable whenever the org configures a cache size.
     # The cache is in-memory and bounded by memory_limit (DuckDB enforces that

@@ -18625,13 +18625,20 @@ return 1
                     section["duckdb_memory_limit"], default="1GB"
                 )
             if "duckdb_external_cache_size" in section:
-                normalized_cache = normalize_memory_size(
-                    section["duckdb_external_cache_size"], default=""
-                )
-                if normalized_cache:
-                    section["duckdb_external_cache_size"] = normalized_cache
+                raw_cache = str(section["duckdb_external_cache_size"]).strip()
+                if raw_cache == "0":
+                    # Explicit zero is the persisted off switch.  Omitting the
+                    # field means inherit the environment/default, which may
+                    # enable DuckDB's external file cache.
+                    section["duckdb_external_cache_size"] = "0"
                 else:
-                    section.pop("duckdb_external_cache_size")
+                    normalized_cache = normalize_memory_size(
+                        raw_cache, default=""
+                    )
+                    if normalized_cache:
+                        section["duckdb_external_cache_size"] = normalized_cache
+                    else:
+                        section.pop("duckdb_external_cache_size")
             return self._set_engine_document_section(org, "duckdb", section)
         except redis.RedisError as e:
             logger.error(

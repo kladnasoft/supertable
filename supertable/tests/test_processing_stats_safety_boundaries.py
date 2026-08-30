@@ -13,6 +13,7 @@ import pytest
 from supertable import processing as processing_mod
 from supertable.data_classes import PredInterval
 from supertable.processing import (
+    MAX_PLANNING_STATS_ROWS,
     MAX_SHOW_STATS_STRING_BYTES,
     STATS_SCHEMA,
     _STATS_CACHE,
@@ -22,6 +23,7 @@ from supertable.processing import (
     _stored_select_lane,
     _stored_select_lane_values,
     load_bounded_stats_diagnostic,
+    load_bounded_stats_for_planning,
     load_stats,
     probe_ranges_from_df,
     prune_files_by_predicates,
@@ -419,6 +421,72 @@ def test_bounded_stats_diagnostic_seals_and_projects_canonical_columns(tmp_path)
     assert loaded.height == 1
     assert loaded["file_path"].item() == "data/f.parquet"
     assert "untrusted_extra" not in loaded.columns
+
+
+def test_bounded_planning_stats_reuses_only_an_exact_admitted_cache(
+    monkeypatch,
+):
+    frame = polars.DataFrame([_row("data/f.parquet", 1, 9)], schema=STATS_SCHEMA)
+    identity = "bounded-planning-cache"
+    _STATS_CACHE.put(identity, frame)
+    monkeypatch.setattr(
+        processing_mod,
+        "load_bounded_stats_diagnostic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an admitted cache hit reached storage")
+        ),
+    )
+
+    loaded = load_bounded_stats_for_planning(
+        "lake/table/stats/stats-v1.parquet",
+        expected_rows=1,
+        cache_identity=identity,
+    )
+
+    assert loaded is frame
+
+
+@pytest.mark.parametrize(
+    ("expected_rows", "max_decoded_bytes"),
+    [(2, 16 * 1024 * 1024), (1, 1)],
+)
+def test_bounded_planning_stats_rejects_an_invalid_cache_without_decode(
+    monkeypatch, expected_rows, max_decoded_bytes,
+):
+    frame = polars.DataFrame([_row("data/f.parquet", 1, 9)], schema=STATS_SCHEMA)
+    identity = "invalid-bounded-planning-cache"
+    _STATS_CACHE.put(identity, frame)
+    monkeypatch.setattr(
+        processing_mod,
+        "load_bounded_stats_diagnostic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("an invalid cache fell through to storage")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="planning seal"):
+        load_bounded_stats_for_planning(
+            "lake/table/stats/stats-v1.parquet",
+            expected_rows=expected_rows,
+            cache_identity=identity,
+            max_decoded_bytes=max_decoded_bytes,
+        )
+
+
+def test_bounded_planning_stats_rejects_declared_rows_before_decode(monkeypatch):
+    monkeypatch.setattr(
+        processing_mod,
+        "load_bounded_stats_diagnostic",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("oversized declared rows reached storage")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="row count exceeds"):
+        load_bounded_stats_for_planning(
+            "lake/table/stats/stats-v1.parquet",
+            expected_rows=MAX_PLANNING_STATS_ROWS + 1,
+        )
 
 
 def test_bounded_stats_diagnostic_rejects_footer_size_before_decode(

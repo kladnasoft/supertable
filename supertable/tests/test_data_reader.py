@@ -1862,6 +1862,7 @@ class TestExecuteExecutorArgs:
             join_pruning_lanes=frozenset({"numeric"}),
             plan_stats=MockPlanStats.return_value,
             require_odata_identity=False,
+            require_bounded_resource_estimates=True,
         )
 
 

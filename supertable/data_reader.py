@@ -1589,6 +1589,9 @@ class DataReader:
                 join_pruning_lanes=_engine_safe_join_pruning_lanes(engine),
                 plan_stats=self.plan_stats,
                 require_odata_identity=(_odata_identity is True),
+                require_bounded_resource_estimates=(
+                    getattr(engine, "value", None) in {"auto", "islanddb"}
+                ),
             )
             if aggregate_children:
                 estimator_kwargs["aggregate_children"] = aggregate_children

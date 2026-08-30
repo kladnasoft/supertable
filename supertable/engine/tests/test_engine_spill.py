@@ -51,6 +51,28 @@ def _human_to_bytes(s: str) -> float:
 # --------------------------------------------------------------------------- #
 
 class TestConfigAdopted:
+    def test_missing_httpfs_timeout_setting_is_a_safe_noop(self):
+        class LocalOnlyConnection:
+            def __init__(self):
+                self.statements = []
+                self._row = None
+
+            def execute(self, statement):
+                self.statements.append(statement)
+                if statement == "RESET http_timeout;":
+                    raise duckdb.CatalogException("httpfs is not loaded")
+                self._row = None
+                return self
+
+            def fetchone(self):
+                return self._row
+
+        con = LocalOnlyConnection()
+
+        assert apply_runtime_pragmas(con, _cfg("1GB", threads=1)) is True
+        assert "RESET http_timeout;" in con.statements
+        assert any("duckdb_settings()" in sql for sql in con.statements)
+
     def test_resolved_memory_limit_lands_on_connection(self, tmp_path):
         con = duckdb.connect()
         init_connection(con, temp_dir=str(tmp_path))           # init default

@@ -25,7 +25,7 @@ See the ``supertable.demo`` package for runnable end-to-end demos and the
 project documentation for the full API surface.
 """
 
-__version__ = "2.5.5"
+__version__ = "2.5.6"
 
 import os
 from importlib import import_module

@@ -1902,6 +1902,8 @@ class DataWriter:
                     profiler=profiler,
                     existing_tombstones=prev_dv_df,
                     storage=self.super_table.storage,
+                    organization=self.super_table.organization,
+                    catalog=self.catalog,
                     require_global_tombstone_disjoint_proof=(
                         tombstone_v3_transition_enabled
                     ),

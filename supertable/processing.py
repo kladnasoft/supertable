@@ -4485,6 +4485,8 @@ def _duckdb_probe_overlap_matches(
         incoming_schema: Optional[Dict[str, polars.DataType]] = None,
         profiler: Optional[Profiler] = None,
         storage: Optional[object] = None,
+        organization: str = "",
+        catalog: Optional[object] = None,
 ) -> Optional[polars.DataFrame]:
     """Column-projected pushdown probe over the overlapping data files.
 
@@ -4543,6 +4545,7 @@ def _duckdb_probe_overlap_matches(
             escape_parquet_path,
             quote_if_needed,
         )
+        from supertable.engine.engine_config import resolve_engine_config
     except Exception as e:
         logging.info(
             "[write-probe] duckdb unavailable, using polars path; error_type=%s",
@@ -4766,8 +4769,14 @@ def _duckdb_probe_overlap_matches(
         # falls back to the OS home, which is absent under a restricted service
         # user).  The pool re-applies httpfs/S3 for remote paths, so a warm
         # connection is configured for the current probe's object store.
+        # Resolve even for compatibility callers without an organization. The
+        # resolver returns the environment/default baseline in that case, so a
+        # warm pooled connection cannot retain the previous organization's
+        # memory, thread, timeout, or cache settings.
+        engine_config = resolve_engine_config(organization, catalog)
         con = get_pooled_duckdb_connection(
             temp_dir="write_probe", for_paths=duck_paths, storage=storage,
+            engine_config=engine_config,
         )
         con.register(ik_name, incoming_keys.to_arrow())
         try:
@@ -4937,6 +4946,8 @@ def resolve_overwrite_writes(
         existing_tombstones: Optional[polars.DataFrame] = None,
         storage: Optional[object] = None,
         require_global_tombstone_disjoint_proof: bool = False,
+        organization: str = "",
+        catalog: Optional[object] = None,
 ) -> Tuple[polars.DataFrame, List[Tuple[str, int]]]:
     """Single-pass overwrite resolution: stale filtering + delete-vector pairs.
 
@@ -5024,6 +5035,8 @@ def resolve_overwrite_writes(
                 incoming_schema=dict(incoming_df.schema),
                 profiler=p,
                 storage=probe_storage,
+                organization=organization,
+                catalog=catalog,
             )
     if matched is not None:
         try:
@@ -5932,6 +5945,15 @@ MAX_SHOW_STATS_ROW_GROUPS = 100_000
 MAX_SHOW_STATS_COLUMN_CHUNKS = 1_000_000
 MAX_SHOW_STATS_STRING_BYTES = 64 * 1024
 MAX_SHOW_STATS_DICTIONARY_VALUES = MAX_SHOW_STATS_ROWS
+
+# Resource planning may run for every AUTO/IslandDB query and performs further
+# seal/group validation after loading. Keep its admitted frame materially below
+# the interactive diagnostic ceiling so those downstream transformations stay
+# bounded too. Larger artifacts simply leave estimates incomplete and route to
+# an external-memory engine.
+MAX_PLANNING_STATS_OBJECT_BYTES = 16 * 1024 * 1024
+MAX_PLANNING_STATS_ROWS = 25_000
+MAX_PLANNING_STATS_DECODED_BYTES = 16 * 1024 * 1024
 
 _SHOW_STATS_STRING_COLUMNS = frozenset(
     name for name, dtype in STATS_SCHEMA.items() if dtype == polars.Utf8
@@ -8942,6 +8964,79 @@ def load_bounded_stats_diagnostic(
         if final_bytes > max_decoded_bytes:
             raise ValueError("Statistics decoded data exceeds its diagnostic limit")
         return frame
+
+
+def load_bounded_stats_for_planning(
+    stats_path: str,
+    *,
+    expected_rows: int,
+    cache_identity: Optional[str] = None,
+    profiler: Optional[Profiler] = None,
+    storage: Optional[object] = None,
+    max_object_bytes: int = MAX_PLANNING_STATS_OBJECT_BYTES,
+    max_rows: int = MAX_PLANNING_STATS_ROWS,
+    max_decoded_bytes: int = MAX_PLANNING_STATS_DECODED_BYTES,
+) -> polars.DataFrame:
+    """Load an exact stats frame without an unbounded pre-admission decode.
+
+    AUTO/IslandDB resource planning needs complete row-group and decoded-memory
+    estimates, including for ``SELECT *``. A normal :func:`load_stats` miss
+    decodes the whole artifact before the cache byte cap is evaluated, so this
+    lane admits the immutable object/footer/pages first. Exact cached frames are
+    reused only after their row count, canonical schema, and live size are
+    re-admitted under the tighter planning limits.
+    """
+    if not isinstance(stats_path, str) or not stats_path or "\x00" in stats_path:
+        raise ValueError("Statistics artifact path is invalid")
+    for name, value, hard_maximum in (
+        ("max_object_bytes", max_object_bytes, MAX_PLANNING_STATS_OBJECT_BYTES),
+        ("max_rows", max_rows, MAX_PLANNING_STATS_ROWS),
+        ("max_decoded_bytes", max_decoded_bytes, MAX_PLANNING_STATS_DECODED_BYTES),
+    ):
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        if value > hard_maximum:
+            raise ValueError(f"{name} may only tighten its planning limit")
+    if (
+        type(expected_rows) is not int
+        or expected_rows < 0
+        or expected_rows > max_rows
+    ):
+        raise ValueError("Statistics row count exceeds its planning limit")
+
+    p = profiler or get_null_profiler()
+    identity = cache_identity or stats_cache_identity(
+        stats_path, storage=storage,
+    )
+    cached = _STATS_CACHE.get(identity)
+    if cached is not None:
+        p.add("stats_cache_hit", 1)
+        try:
+            cached_bytes = int(cached.estimated_size())
+        except Exception:
+            raise RuntimeError(
+                "Cached statistics size could not be measured"
+            ) from None
+        if (
+            cached.schema != STATS_SCHEMA
+            or cached.height != expected_rows
+            or cached_bytes < 0
+            or cached_bytes > max_decoded_bytes
+        ):
+            raise ValueError("Cached statistics exceed their planning seal")
+        return cached
+
+    p.add("stats_cache_miss", 1)
+    frame = load_bounded_stats_diagnostic(
+        stats_path,
+        expected_rows=expected_rows,
+        storage=storage,
+        max_object_bytes=max_object_bytes,
+        max_rows=max_rows,
+        max_decoded_bytes=max_decoded_bytes,
+    )
+    _STATS_CACHE.put(identity, frame)
+    return frame
 
 
 def cache_stats(
