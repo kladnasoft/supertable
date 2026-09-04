@@ -3058,6 +3058,57 @@ def test_v2_4_migration_bounds_stats_materialization_before_build(
     assert leaf["path"] == old_path
 
 
+def test_v2_4_wide_table_migration_rerun_preserves_completed_publication(tmp_path):
+    storage = LocalStorage(str(tmp_path))
+    client = fakeredis.FakeStrictRedis(decode_responses=True)
+    catalog = RedisCatalog(redis_client=client)
+    columns = {
+        f"column_{index:03d}": pa.array([index, index + 1], type=pa.int64())
+        for index in range(156)
+    }
+    columns["__rowid__"] = pa.array([10, 11], type=pa.int64())
+    columns["__timestamp__"] = pa.array(
+        [datetime(2026, 1, 1, tzinfo=timezone.utc)] * 2,
+        type=pa.timestamp("us", tz="UTC"),
+    )
+    table = pa.table(columns)
+    schema = {name: str(dtype) for name, dtype in pl.from_arrow(table).schema.items()}
+    source = _seed_v2_4_arrow_table(storage, client, catalog, table, schema)
+    old_leaf = catalog.get_leaf("org", "lake", "facts")
+    data_path = source["resources"][0]["file"]
+    original_data = (tmp_path / data_path).read_bytes()
+    original_snapshot = (tmp_path / old_leaf["path"]).read_bytes()
+    st = SuperTable.__new__(SuperTable)
+    st.organization = "org"
+    st.super_name = "lake"
+    st.storage = storage
+    st.catalog = catalog
+
+    migrated = st.migrate_legacy_metadata(
+        confirm_system_offline=True, expected_tables={"facts"},
+    )
+
+    assert migrated["migrated_tables"] == ["facts"]
+    completed_leaf = catalog.get_leaf("org", "lake", "facts")
+    completed_root = catalog.get_root("org", "lake")
+    completed_snapshot = completed_leaf["payload"]
+    assert completed_leaf["version"] == 5
+    assert completed_snapshot["previous_snapshot"] == old_leaf["path"]
+    assert completed_snapshot["stats_rows"] == 156
+    assert completed_snapshot["resources"][0]["file"] == data_path
+    assert snapshot_proves_stable_rowids(completed_snapshot)
+
+    repeated = st.migrate_legacy_metadata(
+        confirm_system_offline=True, expected_tables={"facts"},
+    )
+
+    assert repeated["migrated_tables"] == []
+    assert catalog.get_leaf("org", "lake", "facts") == completed_leaf
+    assert catalog.get_root("org", "lake") == completed_root
+    assert (tmp_path / data_path).read_bytes() == original_data
+    assert (tmp_path / old_leaf["path"]).read_bytes() == original_snapshot
+
+
 def test_v2_4_migration_reads_generated_stats_in_bounded_batches(
     tmp_path,
     monkeypatch,

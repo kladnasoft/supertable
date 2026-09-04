@@ -6124,6 +6124,7 @@ def _normalize_show_stats_batch(
     logical_bytes = 0
     cast_output_bytes = 0
     newly_retained_dictionary_bytes = 0
+    normalization_allowance = 0
     for name, array in zip(batch.schema.names, batch.columns):
         if name in _SHOW_STATS_STRING_COLUMNS:
             string_bytes, retained_now = _show_stats_string_logical_bytes(
@@ -6134,6 +6135,11 @@ def _normalize_show_stats_batch(
             newly_retained_dictionary_bytes += retained_now
             if array.type != pa.string():
                 cast_output_bytes += string_bytes
+            # Arrow may retain a validity bitmap after dictionary expansion
+            # even when null_count is zero, plus a small alignment buffer.
+            # Admit that bounded overhead before casting (at most 40 bytes
+            # per string column in a 256-row diagnostic batch).
+            normalization_allowance += (batch.num_rows + 7) // 8 + 8
         else:
             logical_bytes += max(0, int(array.nbytes))
     decoder_bytes = max(0, int(batch.nbytes))
@@ -6143,7 +6149,7 @@ def _normalize_show_stats_batch(
         retained_bytes + retained_dictionary_bytes + decoder_bytes
         > max_decoded_bytes
         or retained_bytes + retained_dictionary_bytes + decoder_bytes
-        + cast_output_bytes > max_decoded_bytes
+        + cast_output_bytes + normalization_allowance > max_decoded_bytes
     ):
         raise ValueError("Statistics decoded data exceeds its diagnostic limit")
 
@@ -6158,7 +6164,7 @@ def _normalize_show_stats_batch(
     normalized = pa.RecordBatch.from_arrays(columns, schema=pa.schema(fields))
     normalized_bytes = max(0, int(normalized.nbytes))
     if (
-        normalized_bytes > logical_bytes
+        normalized_bytes > logical_bytes + normalization_allowance
         or retained_bytes + normalized_bytes + retained_dictionary_bytes
         + newly_retained_dictionary_bytes > max_decoded_bytes
     ):

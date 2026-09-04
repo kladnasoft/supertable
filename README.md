@@ -2,7 +2,7 @@
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-FSL--1.1--ALv2-orange)
-![Version](https://img.shields.io/badge/version-2.5.7-brightgreen)
+![Version](https://img.shields.io/badge/version-2.5.8-brightgreen)
 
 **SuperTable — versioned data lake library for SQL analytics.**
 

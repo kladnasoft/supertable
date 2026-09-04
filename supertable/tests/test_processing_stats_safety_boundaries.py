@@ -423,6 +423,80 @@ def test_bounded_stats_diagnostic_seals_and_projects_canonical_columns(tmp_path)
     assert "untrusted_extra" not in loaded.columns
 
 
+@pytest.mark.parametrize("row_count", [156, 513])
+def test_bounded_stats_diagnostic_accepts_nonnull_dictionary_bitmap_overhead(
+    tmp_path, row_count,
+):
+    rows = []
+    for index in range(row_count):
+        row = _row("data/f.parquet", 1, 9)
+        row["column_name"] = f"column_{index}"
+        # Keep every UTF-8 lane non-null: Arrow may still allocate a validity
+        # bitmap when expanding a dictionary whose indices have no nulls.
+        row.update(
+            footer_sha256="a" * 64,
+            min_string="minimum",
+            max_string="maximum",
+        )
+        rows.append(row)
+    frame = polars.DataFrame(rows, schema=STATS_SCHEMA)
+    storage = LocalStorage(root=str(tmp_path))
+    path = "lake/table/stats/nonnull-dictionaries.parquet"
+    storage.write_parquet(frame.to_arrow(), path)
+    parsed = pq.ParquetFile(
+        tmp_path / path,
+        read_dictionary=sorted(processing_mod._SHOW_STATS_STRING_COLUMNS),
+    )
+    first_batch = next(parsed.iter_batches(batch_size=256, use_threads=False))
+    string_arrays = [
+        first_batch.column(first_batch.schema.get_field_index(name))
+        for name in processing_mod._SHOW_STATS_STRING_COLUMNS
+    ]
+    assert all(pa.types.is_dictionary(array.type) for array in string_arrays)
+    assert all(array.null_count == 0 for array in string_arrays)
+    assert frame.estimated_size() < 64 * 1024 * 1024
+
+    loaded = load_bounded_stats_diagnostic(
+        path,
+        expected_rows=row_count,
+        storage=storage,
+        max_decoded_bytes=64 * 1024 * 1024,
+    )
+
+    assert loaded.equals(frame)
+
+
+def test_stats_dictionary_normalization_preserves_retained_memory_limit():
+    array = pa.array(["same-value"] * 156).dictionary_encode()
+    batch = pa.RecordBatch.from_arrays([array], names=["file_path"])
+    retained_batch_bytes = 4096
+    retained_dictionary_bytes = 2048
+    normalized, normalized_bytes, new_dictionary_bytes = (
+        processing_mod._normalize_show_stats_batch(
+            batch,
+            max_decoded_bytes=64 * 1024 * 1024,
+            retained_bytes=retained_batch_bytes,
+            retained_dictionary_bytes=retained_dictionary_bytes,
+            validated_dictionaries={},
+        )
+    )
+    assert normalized.column(0).to_pylist() == array.to_pylist()
+    assert normalized_bytes == normalized.nbytes
+    actual_retained_bytes = (
+        retained_batch_bytes + retained_dictionary_bytes
+        + new_dictionary_bytes + normalized_bytes
+    )
+
+    with pytest.raises(ValueError, match="decoded data exceeds"):
+        processing_mod._normalize_show_stats_batch(
+            batch,
+            max_decoded_bytes=actual_retained_bytes - 1,
+            retained_bytes=retained_batch_bytes,
+            retained_dictionary_bytes=retained_dictionary_bytes,
+            validated_dictionaries={},
+        )
+
+
 def test_bounded_planning_stats_reuses_only_an_exact_admitted_cache(
     monkeypatch,
 ):
