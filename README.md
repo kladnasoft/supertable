@@ -2,7 +2,7 @@
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-FSL--1.1--ALv2-orange)
-![Version](https://img.shields.io/badge/version-2.5.8-brightgreen)
+![Version](https://img.shields.io/badge/version-2.5.9-brightgreen)
 
 **SuperTable — versioned data lake library for SQL analytics.**
 
@@ -28,6 +28,10 @@ Requirements: Python 3.10+, a POSIX host (the durable monitoring spool uses
 local disk for development). See
 [docs/02_configuration.md](docs/02_configuration.md) for environment
 variables.
+
+Upgrading an existing 2.4.0 estate? See the
+[offline metadata migration guide](docs/19_legacy_migration.md). Migration
+retains the original data Parquet files; it does not compact or rewrite them.
 
 ---
 

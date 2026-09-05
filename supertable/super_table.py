@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import copy
+import hashlib
 import json
 import time
 import uuid
@@ -41,6 +42,58 @@ _MAX_MIGRATION_ARRAY_WORKER_STALL_SECONDS = 10 * 60
 # whose working-set envelope that same recovery path cannot reopen.
 _MAX_MIGRATION_STATS_DECODED_BYTES = 64 * 1024 * 1024
 _MAX_REDIS_ROOT_VERSION = (1 << 53) - 1
+
+
+class _MigrationScanResult:
+    """Invocation-local proof cache; deliberately not a durable checkpoint.
+
+    Keep the exact row-ID index on private scratch disk, with its connection
+    closed between passes. Proof documents live there too, so a namespace of
+    many tables does not retain all resource metadata or open SQLite handles.
+    The source key and proof digest stay in memory and die with this invocation.
+    """
+
+    def __init__(self, source_key: str, result: tuple[Any, ...]) -> None:
+        self.source_key = source_key
+        self.directory, connection, facts, watermark, bounds = result
+        encoded = json.dumps(
+            [facts, watermark, bounds], separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+        self.proof_bytes = len(encoded)
+        self.proof_digest = hashlib.sha256(encoded).digest()
+        connection.execute(
+            "CREATE TABLE migration_scan_proof (payload BLOB NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO migration_scan_proof(payload) VALUES (?)", (encoded,),
+        )
+        connection.commit()
+
+    def reopen(self) -> tuple[Any, ...]:
+        import sqlite3
+
+        connection = sqlite3.connect(
+            os.path.join(self.directory.name, "rowids.sqlite3"),
+        )
+        try:
+            lengths = connection.execute(
+                "SELECT length(payload) FROM migration_scan_proof LIMIT 2"
+            ).fetchall()
+            if lengths != [(self.proof_bytes,)]:
+                raise RuntimeError("Migration scan proof changed between passes")
+            encoded = connection.execute(
+                "SELECT payload FROM migration_scan_proof"
+            ).fetchone()[0]
+            if (
+                not isinstance(encoded, bytes)
+                or hashlib.sha256(encoded).digest() != self.proof_digest
+            ):
+                raise RuntimeError("Migration scan proof changed between passes")
+            facts, watermark, bounds = json.loads(encoded)
+            return self.directory, connection, facts, watermark, bounds
+        except BaseException:
+            connection.close()
+            raise
 
 
 class NamespaceCleanupPostCommitError(RuntimeError):
@@ -209,6 +262,13 @@ class SuperTable:
         rows or deletion-vector entries are invented.  v2.4 processes do not
         understand the current namespace fence, so the operator must stop all
         system traffic and processes before making this exact confirmation.
+
+        A successful invocation fully scans each v2.4 data file only once.
+        Its private disk-backed row-ID indexes survive preflight until their
+        publication pass, then are removed. Scratch capacity must accommodate
+        the retained indexes across this namespace, plus one file spill. A
+        failed invocation discards these proofs; retries safely rescan only
+        tables which have not already migrated. No original Parquet is rewritten.
         """
         if confirm_system_offline is not True:
             raise ValueError(
@@ -245,6 +305,7 @@ class SuperTable:
         if not token:
             raise TimeoutError("Could not acquire namespace migration lock")
         migrated: list[str] = []
+        scan_cache: dict[str, _MigrationScanResult] = {}
         try:
             root = self.catalog.get_root(self.organization, self.super_name)
             if not isinstance(root, dict):
@@ -342,8 +403,10 @@ class SuperTable:
                     "operator-approved production inventory"
                 )
             # Pass one performs all source reads and semantic validation but
-            # publishes nothing.  Only after every table passes do we repeat
-            # the pinned validation and create successors one table at a time.
+            # publishes nothing. Only after every table passes do we recheck
+            # the pinned sources and create successors one table at a time.
+            # Reuse full-scan proofs only within this invocation and only for
+            # the identical source snapshot and immutable data identities.
             # This keeps a corrupt late table from leaving the namespace half
             # migrated on the first production attempt.
             planned_migrations = 0
@@ -396,6 +459,7 @@ class SuperTable:
                             simple_token=simple_token,
                             mirror_pin=mutation.get("mirror_pin"),
                             preflight_only=preflight_only,
+                            scan_cache=scan_cache,
                         )
                         if preflight_only and was_migrated:
                             planned_migrations += 1
@@ -450,7 +514,11 @@ class SuperTable:
                             "Offline migration lacks Redis root version headroom"
                         )
         finally:
-            self.catalog.release_namespace_lock(self.organization, self.super_name, token)
+            try:
+                for cached_scan in scan_cache.values():
+                    cached_scan.directory.cleanup()
+            finally:
+                self.catalog.release_namespace_lock(self.organization, self.super_name, token)
         return {"super_name": self.super_name, "organization": self.organization, "migrated_tables": migrated}
 
     def _migrate_legacy_leaf(
@@ -462,6 +530,7 @@ class SuperTable:
         simple_token: str,
         mirror_pin: Optional[str],
         preflight_only: bool = False,
+        scan_cache: Optional[dict[str, _MigrationScanResult]] = None,
     ) -> bool:
         from supertable.processing import (
             MAX_SHOW_STATS_DECODED_BYTES,
@@ -763,89 +832,10 @@ class SuperTable:
             )
             successor["_row_filter"] = None
         data_paths = [resource["file"] for resource in resources]
-        # A legacy snapshot cannot acquire stable-row-ID authority from metadata
-        # alone.  Every current writer seal is tied to its immutable footer, but
-        # migration cannot prove an old digest without scanning data pages.
-        if preserve_current_rowids:
-            original_resources = {
-                resource["file"]: resource
-                for resource in snapshot["resources"]
-            }
-            for resource in resources:
-                original = original_resources[resource["file"]]
-                resource["rowid_integrity"] = copy.deepcopy(
-                    original["rowid_integrity"],
-                )
-            if not snapshot_proves_stable_rowids(successor):
-                raise RuntimeError(
-                    f"Table {simple} stable row-ID proof could not be preserved"
-                )
-        else:
-            successor.pop("rowid_high_watermark", None)
-
-        rowid_index = None
-        rowid_index_directory = None
-        legacy_rowid_facts: dict[str, Dict[str, Any]] = {}
-        legacy_binary_value_bounds: dict[str, Dict[str, int]] = {}
-        legacy_rowid_high_watermark = 0
-        legacy_allocator_high_watermark = None
-        if legacy_v2_4_snapshot and resources:
-            (
-                rowid_index_directory,
-                rowid_index,
-                legacy_rowid_facts,
-                legacy_rowid_high_watermark,
-                legacy_binary_value_bounds,
-            ) = self._scan_v2_4_resources(
-                simple=simple,
-                resources=resources,
-                footer_cache=footer_cache,
-            )
         if legacy_v2_4_snapshot:
-            legacy_allocator_high_watermark = (
-                self._read_v2_4_rowid_sequence(simple=simple)
-            )
-            migrated_rowid_high_watermark = max(
-                legacy_rowid_high_watermark,
-                legacy_allocator_high_watermark,
-            )
-            if migrated_rowid_high_watermark > MAX_JSON_EXACT_INTEGER:
-                raise ValueError(
-                    f"Table {simple} v2.4 row IDs exceed the current Redis "
-                    "snapshot limit"
-                )
-            successor["rowid_high_watermark"] = migrated_rowid_high_watermark
-            for resource in resources:
-                facts = legacy_rowid_facts.get(resource["file"])
-                if facts is None:
-                    raise RuntimeError(
-                        f"Table {simple} lacks a verified v2.4 row-ID seal"
-                    )
-                resource["rowid_integrity"] = facts
-                binary_bounds = legacy_binary_value_bounds.get(resource["file"])
-                if binary_bounds:
-                    resource["column_max_value_bytes"] = binary_bounds
-            if not snapshot_proves_stable_rowids(successor):
-                raise RuntimeError(
-                    f"Table {simple} v2.4 row-ID proof is not write-ready"
-                )
-        try:
-            self._migrate_legacy_tombstone(
-                simple=simple,
-                snapshot=successor,
-                version=version,
-                allowed_files=set(data_paths),
-                available_rows=sum(resource["rows"] for resource in resources),
-                publish_successor=not preflight_only,
-                legacy_rowid_index=rowid_index,
-            )
-        finally:
-            if rowid_index is not None:
-                rowid_index.close()
-            if rowid_index_directory is not None:
-                rowid_index_directory.cleanup()
-
-        if legacy_v2_4_snapshot:
+            # Reject metadata-known limits before downloading and decoding the
+            # retained data. These are admission checks only: the exact vector
+            # membership and decoded statistics are still verified below.
             projected_stats_rows = 0
             projected_stats_bytes = 0
             try:
@@ -893,6 +883,209 @@ class SuperTable:
                     f"Table {simple} statistics materialization could not be "
                     "bounded"
                 ) from None
+
+            from supertable.simple_table import (
+                _MAX_RESTORE_TOMBSTONE_BYTES,
+                _MAX_RESTORE_TOMBSTONE_DECODED_BYTES,
+                _MAX_RESTORE_TOMBSTONE_ROWS,
+                _sealed_parquet_metadata,
+            )
+            from supertable.storage.storage_interface import ObjectMetadata
+
+            legacy_tombstone_rows = successor.get("tombstone_rows")
+            legacy_tombstone_path = successor.get("tombstone")
+            if (
+                type(legacy_tombstone_rows) is int
+                and legacy_tombstone_rows > 0
+                and isinstance(legacy_tombstone_path, str)
+                and legacy_tombstone_path.endswith(".parquet")
+            ):
+                if (
+                    legacy_tombstone_rows > _MAX_RESTORE_TOMBSTONE_ROWS
+                    or legacy_tombstone_rows
+                    > sum(resource["rows"] for resource in resources)
+                ):
+                    raise ValueError(
+                        f"Table {simple} deletion-vector row count exceeds "
+                        "its safety bound"
+                    )
+                tombstone_dir = os.path.join(table_dir, "tombstone")
+                legacy_tombstone_path = _contained_artifact_path(
+                    legacy_tombstone_path,
+                    label="migration tombstone",
+                    required_prefix=tombstone_dir,
+                )
+                _validate_physical_containment(
+                    self.storage, legacy_tombstone_path, tombstone_dir,
+                )
+                observed_tombstone = self.storage.stat_object(
+                    legacy_tombstone_path,
+                )
+                if (
+                    not isinstance(observed_tombstone, ObjectMetadata)
+                    or type(observed_tombstone.size) is not int
+                    or not 0 < observed_tombstone.size
+                    <= _MAX_RESTORE_TOMBSTONE_BYTES
+                    or not observed_tombstone.identity_token()
+                ):
+                    raise ValueError(
+                        f"Table {simple} deletion-vector object exceeds "
+                        "its safety bound"
+                    )
+                observed, tombstone_metadata, _ = _sealed_parquet_metadata(
+                    self.storage,
+                    legacy_tombstone_path,
+                    expected_size=observed_tombstone.size,
+                )
+                if (
+                    observed != observed_tombstone
+                    or int(tombstone_metadata.num_rows) != legacy_tombstone_rows
+                ):
+                    raise ValueError(
+                        f"Table {simple} deletion-vector row-count seal is invalid"
+                    )
+                longest_file = max(
+                    (len(data_path.encode("utf-8")) for data_path in data_paths),
+                    default=0,
+                )
+                projected_tombstone_bytes = legacy_tombstone_rows * (
+                    longest_file + 16
+                )
+                expanded_tombstone_bytes = 0
+                for group_index in range(tombstone_metadata.num_row_groups):
+                    group = tombstone_metadata.row_group(group_index)
+                    for column_index in range(group.num_columns):
+                        value = int(
+                            group.column(column_index).total_uncompressed_size or 0
+                        )
+                        if value < 0:
+                            raise ValueError(
+                                f"Table {simple} deletion-vector metadata is invalid"
+                            )
+                        expanded_tombstone_bytes += value
+                if max(projected_tombstone_bytes, expanded_tombstone_bytes) > (
+                    _MAX_RESTORE_TOMBSTONE_DECODED_BYTES
+                ):
+                    raise ValueError(
+                        f"Table {simple} deletion vector exceeds "
+                        "its decoded-byte limit"
+                    )
+        # A legacy snapshot cannot acquire stable-row-ID authority from metadata
+        # alone.  Every current writer seal is tied to its immutable footer, but
+        # migration cannot prove an old digest without scanning data pages.
+        if preserve_current_rowids:
+            original_resources = {
+                resource["file"]: resource
+                for resource in snapshot["resources"]
+            }
+            for resource in resources:
+                original = original_resources[resource["file"]]
+                resource["rowid_integrity"] = copy.deepcopy(
+                    original["rowid_integrity"],
+                )
+            if not snapshot_proves_stable_rowids(successor):
+                raise RuntimeError(
+                    f"Table {simple} stable row-ID proof could not be preserved"
+                )
+        else:
+            successor.pop("rowid_high_watermark", None)
+
+        rowid_index = None
+        rowid_index_directory = None
+        legacy_rowid_facts: dict[str, Dict[str, Any]] = {}
+        legacy_binary_value_bounds: dict[str, Dict[str, int]] = {}
+        legacy_rowid_high_watermark = 0
+        legacy_allocator_high_watermark = None
+        try:
+            if legacy_v2_4_snapshot and resources:
+                # Capture by value before adding proofs to successor resources.
+                # Footer revalidation above freshly pins every source object;
+                # neither equal paths nor migration markers authorize reuse.
+                source_key = hashlib.sha256(json.dumps(
+                    {
+                        "organization": self.organization,
+                        "super_name": self.super_name,
+                        "simple": simple,
+                        "path": path,
+                        "version": version,
+                        "snapshot": snapshot,
+                        "snapshot_seal": _object_seal_document(_snapshot_metadata),
+                        "resources": resources,
+                    },
+                    sort_keys=True, separators=(",", ":"), allow_nan=False,
+                ).encode("utf-8")).hexdigest()
+                cached_scan = (
+                    scan_cache.get(simple) if scan_cache is not None else None
+                )
+                if cached_scan is not None:
+                    if preflight_only or cached_scan.source_key != source_key:
+                        raise RuntimeError(
+                            f"Table {simple} source changed between migration passes"
+                        )
+                    scan_result = cached_scan.reopen()
+                else:
+                    scan_result = self._scan_v2_4_resources(
+                        simple=simple,
+                        resources=resources,
+                        footer_cache=footer_cache,
+                    )
+                (
+                    rowid_index_directory,
+                    rowid_index,
+                    legacy_rowid_facts,
+                    legacy_rowid_high_watermark,
+                    legacy_binary_value_bounds,
+                ) = scan_result
+                if preflight_only and scan_cache is not None:
+                    scan_cache[simple] = _MigrationScanResult(
+                        source_key, scan_result,
+                    )
+            if legacy_v2_4_snapshot:
+                legacy_allocator_high_watermark = (
+                    self._read_v2_4_rowid_sequence(simple=simple)
+                )
+                migrated_rowid_high_watermark = max(
+                    legacy_rowid_high_watermark,
+                    legacy_allocator_high_watermark,
+                )
+                if migrated_rowid_high_watermark > MAX_JSON_EXACT_INTEGER:
+                    raise ValueError(
+                        f"Table {simple} v2.4 row IDs exceed the current Redis "
+                        "snapshot limit"
+                    )
+                successor["rowid_high_watermark"] = migrated_rowid_high_watermark
+                for resource in resources:
+                    facts = legacy_rowid_facts.get(resource["file"])
+                    if facts is None:
+                        raise RuntimeError(
+                            f"Table {simple} lacks a verified v2.4 row-ID seal"
+                        )
+                    resource["rowid_integrity"] = facts
+                    binary_bounds = legacy_binary_value_bounds.get(resource["file"])
+                    if binary_bounds:
+                        resource["column_max_value_bytes"] = binary_bounds
+                if not snapshot_proves_stable_rowids(successor):
+                    raise RuntimeError(
+                        f"Table {simple} v2.4 row-ID proof is not write-ready"
+                    )
+            self._migrate_legacy_tombstone(
+                simple=simple,
+                snapshot=successor,
+                version=version,
+                allowed_files=set(data_paths),
+                available_rows=sum(resource["rows"] for resource in resources),
+                publish_successor=not preflight_only,
+                legacy_rowid_index=rowid_index,
+            )
+        finally:
+            if rowid_index is not None:
+                rowid_index.close()
+            if rowid_index_directory is not None:
+                retained = scan_cache is not None and simple in scan_cache
+                if not preflight_only or not retained:
+                    rowid_index_directory.cleanup()
+                    if retained and scan_cache is not None:
+                        scan_cache.pop(simple)
 
         if legacy_v2_4_snapshot:
             stats_rows = extract_stats_rows(
@@ -2464,6 +2657,11 @@ except BaseException:
                             def worker_line() -> str:
                                 if worker.stdout is None:
                                     raise RuntimeError
+                                # A large local estate can legitimately pin more
+                                # than FD_SETSIZE directory handles. poll preserves
+                                # the bounded wait without select's 1024-FD ceiling.
+                                readiness = select.poll()
+                                readiness.register(worker.stdout, select.POLLIN)
                                 progress_deadline = (
                                     time.monotonic()
                                     + _MAX_MIGRATION_ARRAY_WORKER_STALL_SECONDS
@@ -2478,11 +2676,8 @@ except BaseException:
                                             f"Table {simple} Array worker stalled"
                                         ) from None
                                     enforce_worker_memory()
-                                    ready, _, _ = select.select(
-                                        [worker.stdout],
-                                        [],
-                                        [],
-                                        min(0.05, remaining),
+                                    ready = readiness.poll(
+                                        max(1, int(min(0.05, remaining) * 1000)),
                                     )
                                     if ready:
                                         if time.monotonic() > progress_deadline:
