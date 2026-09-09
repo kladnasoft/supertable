@@ -29,10 +29,6 @@ local disk for development). See
 [docs/02_configuration.md](docs/02_configuration.md) for environment
 variables.
 
-Upgrading an existing 2.4.0 estate? See the
-[offline metadata migration guide](docs/19_legacy_migration.md). Migration
-retains the original data Parquet files; it does not compact or rewrite them.
-
 ---
 
 ## Architecture
