@@ -1041,7 +1041,7 @@ def test_zero_cooldown_cron_state_advances_before_execution_lease_release(
             SUPER,
             TABLE,
             dqc,
-            {"timezone": "UTC", "post_ingest": False},
+            {"enabled": True, "timezone": "UTC", "post_ingest": False},
             0,
             "* * * * *",
             "0 0 1 1 *",

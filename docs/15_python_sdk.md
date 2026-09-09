@@ -328,6 +328,47 @@ pipe.create(
 )
 ```
 
+## Automatic data quality checks
+
+Automatic quality checks are disabled by default for each SuperTable. An
+absent, empty, or cron-only schedule stays disabled; automatic execution
+requires the global schedule to contain `"enabled": true`. Creating tables,
+writing data, and starting the scheduler do not enable checks.
+
+Built-in quick checks and cron/post-ingest modes retain their presets. These
+select what an enabled schedule or a manual run checks; they do not activate
+automatic scheduling. Manual checks remain available through the Core Quality
+page or its `/api/v1/quality/run` and `/api/v1/quality/run-all` endpoints while
+the automatic schedule is disabled.
+
+To opt in for an existing SuperTable, explicitly save its global schedule:
+
+```python
+from supertable import SuperTable
+from supertable.quality.config import DQConfig
+
+st = SuperTable("example", "my-org", create_if_missing=False)
+dq = DQConfig(st.catalog.r, st.organization, st.super_name)
+schedule = dq.get_schedule()
+schedule["enabled"] = True
+if not dq.set_schedule(schedule):
+    raise RuntimeError("Quality schedule was not saved")
+```
+
+Review the returned cron intervals and `post_ingest_quick`,
+`post_ingest_custom`, and `post_ingest_deep` settings before enabling them.
+Call `supertable.quality.start_scheduler()` once during host-application
+startup and `stop_scheduler()` during shutdown. Core starts this worker from
+its API lifecycle; its **Quality → Schedule → Scheduler enabled** control
+saves the same global setting. Per-table overrides cannot bypass a disabled
+global schedule.
+
+Existing schedules with an explicit `"enabled": true` remain enabled. To
+pause automatic checks, read the current schedule, set `"enabled"` to `False`,
+and save it with `dq.set_schedule(schedule)` (or clear and save **Scheduler
+enabled** in Core). Keeping the other fields preserves the schedule for later
+use.
+
 ## Demos
 
 The package ships three runnable demos under `supertable.demo`:

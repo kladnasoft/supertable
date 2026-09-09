@@ -354,10 +354,10 @@
       "supertable/quality/checker.py:808: error: Argument 1 to \"abs\" has incompatible type \"Literal['n', 'N', 'F'] | int\"; expected \"SupportsAbs[int]\"  [arg-type]"
     ],
     "supertable/quality/scheduler.py": [
-      "supertable/quality/scheduler.py:1394: error: Too many arguments for \"_process_table_job\"  [call-arg]",
-      "supertable/quality/scheduler.py:2973: error: Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
-      "supertable/quality/scheduler.py:4105: error: Name \"base_updates\" already defined on line 3925  [no-redef]",
-      "supertable/quality/scheduler.py:4420: error: Name \"base_updates\" already defined on line 4245  [no-redef]"
+      "supertable/quality/scheduler.py:1378: error: Too many arguments for \"_process_table_job\"  [call-arg]",
+      "supertable/quality/scheduler.py:2959: error: Argument 1 to \"int\" has incompatible type \"Any | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"  [arg-type]",
+      "supertable/quality/scheduler.py:4091: error: Name \"base_updates\" already defined on line 3911  [no-redef]",
+      "supertable/quality/scheduler.py:4406: error: Name \"base_updates\" already defined on line 4231  [no-redef]"
     ],
     "supertable/rbac/role_manager.py": [
       "supertable/rbac/role_manager.py:163: error: Argument 1 to \"validate_role_name\" has incompatible type \"Any | None\"; expected \"str\"  [arg-type]",

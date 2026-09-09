@@ -501,6 +501,109 @@ def fake_meta(monkeypatch):
     monkeypatch.setattr("supertable.quality.history.write_history", lambda *_a, **_k: True)
 
 
+@pytest.mark.parametrize("stored", [
+    None,
+    {},
+    {"quick_cron": "* * * * *", "post_ingest": True},
+    {"enabled": False},
+])
+def test_unconfigured_automatic_quality_does_no_table_or_history_work(
+    redis_client, monkeypatch, stored,
+):
+    from supertable.quality.config import DQConfig
+
+    config = DQConfig(redis_client, ORG, SUPER)
+    if stored is not None:
+        redis_client.set(config._key("schedule"), json.dumps(stored))
+    # A table override does not implicitly enable the global schedule.
+    assert config.set_table_schedule(TABLE, {"enabled": True})
+    monkeypatch.setattr(
+        "supertable.redis_connector.create_redis_client", lambda: redis_client,
+    )
+    monkeypatch.setattr(scheduler, "_discover_dq_pairs", lambda _r: [(ORG, SUPER)])
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("automatic quality work requires explicit global enablement")
+
+    for name in (
+        "_list_tables", "_drain_history_outbox", "_execute_quality_statement",
+        "_run_quick_check", "_run_deep_check", "_run_custom_check", "_write_mode_history",
+    ):
+        monkeypatch.setattr(scheduler, name, forbidden)
+
+    scheduler.notify_ingest(redis_client, ORG, SUPER, TABLE)
+    unresolved_key = scheduler._unresolved_pending_key(ORG, SUPER, TABLE)
+    generation = redis_client.get(unresolved_key)
+    before_tick = {key: redis_client.dump(key) for key in redis_client.scan_iter()}
+
+    scheduler._scheduler_tick({}, {}, {})
+
+    assert generation is not None
+    assert redis_client.get(unresolved_key) == generation
+    assert config.get_latest(TABLE) is None
+    assert {key: redis_client.dump(key) for key in redis_client.scan_iter()} == before_tick
+    assert all(
+        redis_client.get(scheduler._pending_key(ORG, SUPER, TABLE, mode)) is None
+        for mode in scheduler.QUALITY_MODES
+    )
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+def test_quality_profile_runs_after_manual_request_or_explicit_schedule_enable(
+    redis_client, fake_meta, monkeypatch, automatic,
+):
+    from supertable.quality.config import DQConfig
+
+    config = DQConfig(redis_client, ORG, SUPER)
+    statements = []
+    history_modes = []
+    frame = pd.DataFrame([{
+        "__total": 200,
+        "__present_amount": 200,
+        "__distinct_amount": 200,
+        "__min_amount": 1.0,
+        "__max_amount": 200.0,
+        "__avg_amount": 100.5,
+        "__stddev_amount": 20.0,
+        "__zero_amount": 0,
+        "__neg_amount": 0,
+        "__present_label": 200,
+        "__distinct_label": 200,
+    }])
+
+    def execute(_org, _sup, sql, **_kwargs):
+        statements.append(sql)
+        return FakeExecution(frame)
+
+    monkeypatch.setattr(scheduler, "_execute_quality_statement", execute)
+    monkeypatch.setattr(
+        scheduler, "_write_mode_history",
+        lambda _org, _sup, _table, mode, *_args, **_kwargs: (
+            history_modes.append(mode) or True
+        ),
+    )
+    if automatic:
+        assert config.set_schedule({"enabled": True, "post_ingest_custom": False})
+        scheduler.notify_ingest(redis_client, ORG, SUPER, TABLE)
+        monkeypatch.setattr(
+            "supertable.redis_connector.create_redis_client", lambda: redis_client,
+        )
+        monkeypatch.setattr(scheduler, "_discover_dq_pairs", lambda _r: [(ORG, SUPER)])
+        monkeypatch.setattr(scheduler, "_list_tables", lambda *_args: [TABLE])
+        scheduler._scheduler_tick({}, {}, {})
+    else:
+        assert config.get_schedule()["enabled"] is False
+        outcome = scheduler._try_run_check(
+            redis_client, ORG, SUPER, TABLE, "quick", config, 0,
+        )
+        assert outcome.successful
+
+    assert len(statements) == 1
+    assert history_modes == ["quick"]
+    assert config.get_latest(TABLE)["parsed"]["total"] == 200
+    assert config.get_schedule()["enabled"] is automatic
+
+
 def test_notify_ingest_keeps_scalar_marker_and_independent_mode_generations(
     redis_client,
 ):

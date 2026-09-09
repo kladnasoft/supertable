@@ -574,11 +574,13 @@ def notify_ingest(r, org: str, sup: str, table_name: str) -> None:
         from supertable.quality.config import DQConfig
         dqc = DQConfig(r, org, sup)
         schedule = dqc.get_schedule()
+        if schedule.get("enabled") is not True:
+            # Retain only the bounded generation marker until explicit opt-in.
+            return
         table_schedule = dqc.get_table_schedule(table_name) or {}
         modes = (
             _post_ingest_modes(schedule, table_schedule)
-            if schedule.get("enabled", True)
-            and table_schedule.get("enabled", True)
+            if table_schedule.get("enabled", True)
             else ()
         )
         if not modes:
@@ -1295,9 +1297,12 @@ def _scheduler_tick(
             break
         pairs_processed += 1
         dqc = DQConfig(r, org, sup)
-        _drain_history_outbox(r, org, sup)
         try:
             schedule = dqc.get_schedule()
+            if schedule.get("enabled") is not True:
+                # No table enumeration, profiling, or history delivery before
+                # explicit opt-in. Pending generations/history remain durable.
+                continue
             cooldown_sec = _require_redis_ttl_seconds(
                 schedule.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS),
                 label="quality cooldown_seconds",
@@ -1327,33 +1332,12 @@ def _scheduler_tick(
                 break
             continue
 
+        _drain_history_outbox(r, org, sup)
         quick_cron = schedule.get("quick_cron", "0 */4 * * *")
         deep_cron = schedule.get("deep_cron", "0 2 * * *")
         custom_cron = schedule.get("custom_cron", "0 */6 * * *")
         tables = _list_tables(r, org, sup, discovery_budget)
 
-        if not schedule.get("enabled", True):
-            for table_name in tables:
-                if not discovery_budget.take_table_action():
-                    break
-                lifecycle_admission = _snapshot_pending_lifecycle_admission(
-                    r, org, sup, table_name,
-                )
-                if lifecycle_admission is not None:
-                    _resolve_unresolved_pending(
-                        r,
-                        org,
-                        sup,
-                        table_name,
-                        (),
-                        lifecycle_admission,
-                    )
-            if (
-                discovery_budget.remaining_scan_calls <= 0
-                or discovery_budget.remaining_table_actions <= 0
-            ):
-                break
-            continue
         for table_name in tables:
             if (
                 len(jobs) >= _MAX_SCHEDULER_JOBS_PER_TICK
@@ -1545,6 +1529,8 @@ def _process_table_job(
     """Run one table's serial modes inside the bounded table worker pool."""
     from supertable.quality.config import DQConfigReadError
 
+    if schedule.get("enabled") is not True:
+        return
     tkey = f"{org}:{sup}:{table_name}"
     if cancel_event is not None and cancel_event.is_set():
         _stats_increment("jobs_cancelled")

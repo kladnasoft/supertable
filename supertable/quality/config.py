@@ -1092,7 +1092,9 @@ class DQConfig:
             "post_ingest_quick": True,
             "post_ingest_custom": True,
             "post_ingest_deep": False,
-            "enabled": True,
+            # Automatic profiling requires an explicit operator opt-in.
+            # Keep mode/cron presets ready for an enabled schedule or manual run.
+            "enabled": False,
             "timezone": "UTC",
         }
         stored = self._read_json(

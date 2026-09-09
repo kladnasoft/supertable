@@ -43,6 +43,34 @@ def test_quality_documents_have_a_bounded_serialized_size():
     assert config.set_global_config({"extra": "x" * (1024 * 1024)}) is False
 
 
+@pytest.mark.parametrize("stored", [None, {}, {"quick_cron": "* * * * *"}])
+def test_automatic_schedule_requires_explicit_enablement(stored):
+    redis_client, config = _config()
+    if stored is not None:
+        redis_client.set(config._key("schedule"), json.dumps(stored))
+    before = redis_client.get(config._key("schedule"))
+
+    assert config.get_schedule()["enabled"] is False
+    assert config.get_effective_config("facts")["checks"]["T1"]["enabled"] is True
+    assert redis_client.get(config._key("schedule")) == before
+
+
+def test_existing_enabled_schedule_preserves_its_settings_and_mode_presets():
+    redis_client, config = _config()
+    assert config.set_schedule({"enabled": True, "quick_cron": "*/15 * * * *"})
+    before = redis_client.get(config._key("schedule"))
+
+    schedule = config.get_schedule()
+
+    assert schedule["enabled"] is True
+    assert schedule["quick_cron"] == "*/15 * * * *"
+    assert schedule["post_ingest"] is True
+    assert schedule["post_ingest_quick"] is True
+    assert schedule["post_ingest_custom"] is True
+    assert schedule["post_ingest_deep"] is False
+    assert redis_client.get(config._key("schedule")) == before
+
+
 def test_old_partial_global_config_is_forward_merged_with_all_builtins():
     redis_client, config = _config()
     redis_client.set(
