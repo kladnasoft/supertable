@@ -11,7 +11,19 @@ the generator is seeded and every load/transform is an upsert.
 """
 
 import argparse
+import os
 import sys
+from pathlib import Path
+
+# Direct file / `python -m` runs from a source checkout use that checkout's
+# configuration before any SDK import freezes settings. Anchor this to the
+# script, not the IDE's working directory; explicit configuration still wins.
+# Importing this module and using the SDK retain opt-in dotenv semantics.
+if __name__ == "__main__" and "SUPERTABLE_DOTENV_PATH" not in os.environ:
+    _checkout_root = Path(__file__).resolve().parents[3]
+    _checkout_env = _checkout_root / ".env"
+    if (_checkout_root / "pyproject.toml").is_file() and _checkout_env.is_file():
+        os.environ["SUPERTABLE_DOTENV_PATH"] = str(_checkout_env)
 
 from supertable.config.homedir import initialize_app_home
 from supertable.demo.medcenter import defaults

@@ -195,6 +195,13 @@ registered Lua scripts.
 
 ### Activation on an existing estate
 
+Empty organizations are initialized automatically by the first writable
+`SuperTable`/`DataWriter` construction, including their audit genesis and
+default role/user. The procedure below applies to organizations that already
+contain privileged state. See the [worker runbook](17_privileged_audit_worker.md)
+for exporting an automatically created baseline when deploying the archive
+worker.
+
 The mandatory ledger is complete **from its controlled activation point**; it
 cannot reconstruct changes made by an older binary before that point.  Treat
 activation as a security migration, not a rolling feature toggle:

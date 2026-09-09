@@ -360,8 +360,8 @@
       "supertable/quality/scheduler.py:4420: error: Name \"base_updates\" already defined on line 4245  [no-redef]"
     ],
     "supertable/rbac/role_manager.py": [
-      "supertable/rbac/role_manager.py:161: error: Argument 1 to \"validate_role_name\" has incompatible type \"Any | None\"; expected \"str\"  [arg-type]",
-      "supertable/rbac/role_manager.py:262: error: Incompatible return value type (got \"str | None\", expected \"str\")  [return-value]"
+      "supertable/rbac/role_manager.py:163: error: Argument 1 to \"validate_role_name\" has incompatible type \"Any | None\"; expected \"str\"  [arg-type]",
+      "supertable/rbac/role_manager.py:264: error: Incompatible return value type (got \"str | None\", expected \"str\")  [return-value]"
     ],
     "supertable/redis_catalog.py": [
       "supertable/redis_catalog.py:2037: error: Argument \"role\" to \"RowColumnSecurity\" has incompatible type \"str | Any | None\"; expected \"str\"  [arg-type]",
@@ -446,7 +446,7 @@
   "known_error_count": 320,
   "known_suppression_count": 10,
   "mypy_version": "2.3.0",
-  "production_file_count": 162,
+  "production_file_count": 163,
   "schema": 1,
   "target": "supertable"
 }

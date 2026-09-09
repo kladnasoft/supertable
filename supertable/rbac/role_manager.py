@@ -63,8 +63,10 @@ class RoleManager:
             lock_token = self._catalog.acquire_simple_lock(
                 self.organization, self.super_name, "roles_init", ttl_s=10, timeout_s=30,
             )
+            if not lock_token:
+                raise TimeoutError("Could not acquire the role initialization lock")
             try:
-                if lock_token and not self._catalog.rbac_get_superadmin_role_id(
+                if not self._catalog.rbac_get_superadmin_role_id(
                     self.organization, self.super_name
                 ):
                     sysadmin_data = {

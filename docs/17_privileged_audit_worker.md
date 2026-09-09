@@ -20,6 +20,39 @@ for each concurrently running process.
 
 ## 17.1  Deployment prerequisites
 
+### New organizations
+
+`SuperTable(...)` and `DataWriter(...)` initialize an empty organization's
+audit genesis automatically before creating the default role and user. No
+pre-populated Redis keys, baseline file, or worker invocation is required to
+create the first SuperTable. The empty-state check and genesis installation
+are atomic, so concurrent first creators share one baseline. Writable opens
+also finish an interrupted root/role/user bootstrap; read-only opens do not
+initialize any state.
+
+The automatic path requires no existing role/user documents, assignments,
+tokens, or audit history. A missing anchor in an existing estate is still a
+recovery/cutover problem and is never silently replaced.
+
+To configure the archive worker after automatic initialization, export the
+canonical baseline from its immutable anchor:
+
+```python
+import hashlib
+from pathlib import Path
+from supertable.audit.bootstrap import read_activation_baseline
+from supertable.redis_connector import RedisConnector
+
+payload = read_activation_baseline(RedisConnector().r, "acme")
+Path("acme-activation-baseline.json").write_bytes(payload)
+print(hashlib.sha256(payload).hexdigest())
+```
+
+Preserve the exported artifact and pin its SHA-256 independently for the
+worker options below. Exporting the baseline does not change Redis state.
+
+### Existing organizations and archive deployment
+
 For an existing estate, first complete the
 [controlled activation procedure](12_audit.md#activation-on-an-existing-estate),
 including the quiescent cutover, signed baseline, named ACL rotation, and first

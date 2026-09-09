@@ -11,6 +11,7 @@ import uuid
 from typing import Any, Callable, Dict, Optional
 
 from supertable.config.defaults import logger
+from supertable.audit.bootstrap import ensure_greenfield_activation
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager
 from supertable.errors import SuperTableNotFoundError
@@ -135,7 +136,9 @@ class SuperTable:
         organization: Organization (tenant) name.
         create_if_missing: When True (default), bootstrap the supertable
             (storage mkdir, Redis ``meta:root``, RBAC scaffolding) if it
-            does not exist. When False, raise
+            does not exist, including automatic audit genesis for an empty
+            organization. A writable reopen resumes interrupted RBAC setup.
+            When False, raise
             ``SuperTableNotFoundError`` instead. Read-side callers
             (``DataReader``, ``MetaReader``, ``DataEstimator``) pass
             ``False`` so a missing supertable surfaces as an error
@@ -178,22 +181,26 @@ class SuperTable:
         # Directories for data layout (still used for heavy JSON & data files)
         self.super_dir = os.path.join(self.organization, self.super_name, self.identity)
 
-        # Fast path: if meta:root exists, don't touch storage
+        # A root can survive interrupted RBAC initialization. Writable opens
+        # finish that bootstrap; read-only opens never create security state.
         if self.catalog.root_exists(self.organization, self.super_name):
-            return
-
-        # Read-only opt-out: refuse to bootstrap as a side effect. This
-        # is the guarantee that lets ``DataReader`` / ``MetaReader`` open
-        # a session against a missing name and get a clean, named error
-        # back instead of silently creating an empty supertable.
-        if not create_if_missing:
+            if not create_if_missing or self._rbac_bootstrap_complete():
+                return
+        elif not create_if_missing:
             raise SuperTableNotFoundError(organization, super_name)
 
-        self.init_super_table()
+        self._initialize(bootstrap_rbac=True)
 
-        # Initialize RBAC scaffolding
-        RoleManager(super_name=self.super_name, organization=self.organization)
-        UserManager(super_name=self.super_name, organization=self.organization)
+    def _rbac_bootstrap_complete(self) -> bool:
+        """Check default identities without changing existing access policy."""
+        org, sup = self.organization, self.super_name
+        role_id = self.catalog.rbac_get_role_id_by_name(org, sup, "superadmin")
+        user_id = self.catalog.rbac_get_user_id_by_username(org, sup, "superuser")
+        return bool(
+            role_id and user_id
+            and self.catalog.get_role_details(org, sup, role_id)
+            and self.catalog.get_user_details(org, sup, user_id)
+        )
 
     # ------------------------------------------------------------------ init
     def init_super_table(self) -> None:
@@ -203,35 +210,51 @@ class SuperTable:
           * Otherwise, create the base folder (best-effort) and bootstrap Redis meta:root.
         """
 
+        self._initialize(bootstrap_rbac=False)
+
+    def _initialize(self, *, bootstrap_rbac: bool) -> None:
+        """Serialize root and optional RBAC bootstrap under one namespace lease."""
         token = self.catalog.acquire_namespace_lock(
             self.organization, self.super_name, ttl_s=30, timeout_s=60,
         )
         if not token:
             raise TimeoutError("Could not acquire the namespace creation lock")
         try:
-            # Check before either fast-path return: stale root metadata behind
+            # Check before root creation or RBAC repair: stale metadata behind
             # a terminal tombstone must never reopen a deleted namespace.
             self.catalog.check_initialization_allowed(
                 self.organization,
                 self.super_name,
                 namespace_token=token,
             )
-            if self.catalog.root_exists(self.organization, self.super_name):
-                return
+            if bootstrap_rbac:
+                # An empty organization initializes its own audit
+                # genesis. Existing privileged state is never re-baselined.
+                ensure_greenfield_activation(self.catalog.r, self.organization)
             # The structural lock is acquired before the first storage write,
             # so an initializer paused here cannot write a directory marker
             # after a concurrent verified namespace deletion.
-            try:
-                self.storage.makedirs(self.super_dir)
-            except Exception:
-                # Object storage may no-op; that's fine
-                pass
+            if not self.catalog.root_exists(self.organization, self.super_name):
+                try:
+                    self.storage.makedirs(self.super_dir)
+                except Exception:
+                    # Object storage may no-op; that's fine
+                    pass
 
-            self.catalog.ensure_root(
-                self.organization,
-                self.super_name,
-                namespace_token=token,
-            )
+                self.catalog.ensure_root(
+                    self.organization,
+                    self.super_name,
+                    namespace_token=token,
+                )
+            if bootstrap_rbac:
+                RoleManager(
+                    super_name=self.super_name, organization=self.organization,
+                    redis_catalog=self.catalog,
+                )
+                UserManager(
+                    super_name=self.super_name, organization=self.organization,
+                    redis_catalog=self.catalog,
+                )
         finally:
             self.catalog.release_namespace_lock(
                 self.organization, self.super_name, token,

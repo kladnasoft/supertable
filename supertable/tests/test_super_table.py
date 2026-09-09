@@ -3,7 +3,7 @@ Comprehensive test suite for supertable/super_table.py
 
 Covers:
   1. SuperTable.__init__
-     - Fast path: root exists in Redis → skip storage mkdirs, skip RBAC init
+     - Fast path: root and default identities exist → skip storage/RBAC init
      - Slow path: root absent → makedirs, ensure_root, RBAC scaffolding
      - makedirs exception swallowed
      - Attributes wired correctly
@@ -44,6 +44,12 @@ _P_REDIS_CAT = f"{_MOD}.RedisCatalog"
 _P_ROLE_MGR = f"{_MOD}.RoleManager"
 _P_USER_MGR = f"{_MOD}.UserManager"
 _P_RESOLVE_ROLE_CONTEXT = f"{_MOD}.resolve_role_access_context"
+
+
+@pytest.fixture(autouse=True)
+def _mock_audit_bootstrap(monkeypatch):
+    # The catalog and RBAC managers in this module are unit-test doubles.
+    monkeypatch.setattr(f"{_MOD}.ensure_greenfield_activation", lambda *_args: None)
 
 
 # ---------------------------------------------------------------------------
@@ -135,8 +141,12 @@ class TestSuperTableInit:
         mock_cat.ensure_root.assert_called_once_with(
             "org", "sup", namespace_token="namespace-token",
         )
-        MockRole.assert_called_once_with(super_name="sup", organization="org")
-        MockUser.assert_called_once_with(super_name="sup", organization="org")
+        MockRole.assert_called_once_with(
+            super_name="sup", organization="org", redis_catalog=mock_cat,
+        )
+        MockUser.assert_called_once_with(
+            super_name="sup", organization="org", redis_catalog=mock_cat,
+        )
 
     @patch(_P_USER_MGR)
     @patch(_P_ROLE_MGR)

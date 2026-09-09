@@ -220,6 +220,7 @@ def test_namespace_terminal_tombstone_preserves_rbac_and_recovers_without_root(
         patch("supertable.super_table.RedisCatalog", return_value=catalog),
         patch("supertable.super_table.RoleManager"),
         patch("supertable.super_table.UserManager"),
+        patch("supertable.super_table.ensure_greenfield_activation"),
     ):
         recreated = SuperTable("lake", "acme")
     assert recreated.super_name == "lake"

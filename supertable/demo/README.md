@@ -4,6 +4,41 @@ Self-contained demonstrations bundled with `pip install supertable`. All
 demos talk to a live Redis + storage backend, so configure your environment
 first — see [../../docs/02_configuration.md](../../docs/02_configuration.md).
 
+The medcenter source script loads its checkout's `.env` automatically, so a
+direct IDE run or either of these commands works without extra environment
+variables:
+
+```bash
+python supertable/demo/medcenter/run.py
+python -m supertable.demo.medcenter.run
+```
+
+An explicitly set `SUPERTABLE_DOTENV_PATH` and exported configuration values
+take precedence. This convenience applies to direct execution from a source
+checkout; importing the demo does not change dotenv configuration.
+
+For other demos and the installed console commands below, explicitly select
+the checkout's `.env`:
+
+```bash
+# Run from the repository root; this also applies to the commands below.
+export SUPERTABLE_DOTENV_PATH="$PWD/.env"
+```
+
+PyCharm users can also select the shared **medcenter** run configuration, which
+sets this path to `$PROJECT_DIR$/.env`. SDK applications that do not select
+their configuration or export Redis settings use unauthenticated local Redis,
+even when a nearby `.env` contains a configured Sentinel deployment.
+
+Creating a new SuperTable in an empty organization automatically initializes
+its audit baseline, default `superadmin` role, and `superuser`. No Redis keys
+or baseline files need to be prepared first. Reopening a table whose creation
+was interrupted completes the missing role/user setup.
+
+An existing organization with privileged state or audit history but a missing
+baseline still requires the [activation/recovery runbook](../../docs/17_privileged_audit_worker.md).
+It is not treated as a new empty organization.
+
 ## quickstart
 
 A numbered sequence of small, focused scripts that walks through the full

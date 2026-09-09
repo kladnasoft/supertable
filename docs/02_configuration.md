@@ -8,10 +8,41 @@ SuperTable uses a centralized, immutable configuration system. All settings are 
 
 ## How Configuration Works
 
-1. **`.env` loading** — when `supertable.config.settings` is first imported, `python-dotenv` loads the nearest `.env` file (via `find_dotenv(usecwd=True)`). Existing env vars are NOT overridden (`override=False`). Importing the top-level `supertable` package alone does not load settings.
+1. **`.env` loading** — when `supertable.config.settings` is first imported, `python-dotenv` loads the file explicitly selected by `SUPERTABLE_DOTENV_PATH`, if set. Existing env vars are NOT overridden (`override=False`). Importing the top-level `supertable` package alone does not load settings.
 2. **Type-safe parsing** — Helper functions (`_env_str`, `_env_int`, `_env_bool`, `_env_float`) parse each variable with fallback defaults. Boolean parsing accepts `1/true/yes/y/on` and `0/false/no/n/off`.
 3. **Frozen dataclass** — All values are stored in a `@dataclass(frozen=True)` singleton named `settings`. Immutable after construction.
 4. **Zero internal imports** — The settings module has no imports from `supertable.*`, preventing circular dependencies. It can safely be imported first.
+
+For a local checkout, select the configuration file before starting Python:
+
+```bash
+SUPERTABLE_DOTENV_PATH="$PWD/.env" .venv/bin/python supertable/demo/medcenter/run.py
+```
+
+The medcenter source script also supports running directly without that prefix:
+
+```bash
+.venv/bin/python supertable/demo/medcenter/run.py
+```
+
+Direct script execution and `python -m supertable.demo.medcenter.run` select
+the source checkout's `.env` before importing SDK settings. The path is anchored
+to the script location, regardless of the IDE's working directory, and requires
+the checkout's `pyproject.toml` to be present. An existing
+`SUPERTABLE_DOTENV_PATH` always takes precedence, including an explicitly empty
+value. Importing the demo module does not select a dotenv file.
+
+For other entry points, SDK use, and installed console commands, set
+`SUPERTABLE_DOTENV_PATH` explicitly. In an IDE, use an absolute path; the shared
+PyCharm `medcenter` configuration in `.run/medcenter.run.xml` provides it.
+
+`redis.exceptions.AuthenticationError: Authentication required` means Redis
+was reached without the credentials it requires. It occurs before table
+existence or creation can be checked. Load the intended configuration and
+use `SUPERTABLE_REDIS_PASSWORD` (plus `SUPERTABLE_REDIS_USERNAME` for an ACL
+user), or a credential-bearing `SUPERTABLE_REDIS_URL`, for direct Redis.
+For Sentinel, configure `SUPERTABLE_REDIS_SENTINEL=true`, the discovery
+endpoints, and the Sentinel/server credentials described below.
 
 ### Application Home and Process CWD
 
@@ -47,7 +78,8 @@ not change CWD.
 | `SUPERTABLE_HOME` | str | `~/supertable` | Root directory for local data storage |
 | `SUPERTABLE_ORGANIZATION` | str | _(empty)_ | Organization namespace |
 | `SUPERTABLE_PREFIX` | str | _(empty)_ | Base prefix for all storage keys |
-| `DOTENV_PATH` | str | `.env` | Path to .env file |
+| `SUPERTABLE_DOTENV_PATH` | str | _(unset)_ | Explicit .env file to load before settings are built |
+| `DOTENV_PATH` | str | `.env` | Legacy path setting; does not enable dotenv loading |
 
 ### Processing Defaults
 

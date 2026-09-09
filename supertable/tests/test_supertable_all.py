@@ -40,6 +40,12 @@ from supertable.mirroring.failure_safety import mirror_error_type
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
+def _mock_audit_bootstrap(monkeypatch):
+    monkeypatch.setattr(
+        "supertable.super_table.ensure_greenfield_activation", lambda *_args: None,
+    )
+
+@pytest.fixture(autouse=True)
 def _mock_data_reader_redis():
     """Prevent RedisCatalog() inside DataReader.execute() from connecting to Redis.
 

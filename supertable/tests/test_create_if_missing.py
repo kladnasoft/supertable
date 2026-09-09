@@ -46,6 +46,13 @@ _P_SUP_ROLE_MGR = f"{_SUP_MOD}.RoleManager"
 _P_SUP_USER_MGR = f"{_SUP_MOD}.UserManager"
 
 
+@pytest.fixture(autouse=True)
+def _mock_audit_bootstrap(monkeypatch):
+    # These constructor unit tests mock Redis and both RBAC managers.
+    # Real empty-Redis activation is exercised in test_super_table_bootstrap.
+    monkeypatch.setattr(f"{_SUP_MOD}.ensure_greenfield_activation", lambda *_args: None)
+
+
 # ---------------------------------------------------------------------------
 # Patch targets — SimpleTable
 # ---------------------------------------------------------------------------
