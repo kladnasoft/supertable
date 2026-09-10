@@ -383,7 +383,7 @@ class DataReader:
             exec_engine = engine
             if command.explain:
                 from supertable.engine.engine_enum import Engine as _EngineEnum
-                exec_engine = _EngineEnum.DUCKDB_LITE
+                exec_engine = _EngineEnum.DUCKDB
             result_df, engine_used = executor.execute(
                 engine=exec_engine,
                 reflection=reflection,

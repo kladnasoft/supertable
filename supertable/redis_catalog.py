@@ -1712,7 +1712,9 @@ return 1
     # Canonical field names and their env-var counterparts.  Used by the
     # resolver in engine_common to fall back to os.getenv when a field
     # is absent from Redis.
-    # Per-engine DuckDB runtime pragmas (separate sections for "lite" / "pro").
+    # DuckDB runtime pragmas.  The "lite"/"pro" split is historical: there is
+    # one DuckDB engine now, and "lite" remains its section name so existing
+    # stored configuration keeps resolving.
     DUCKDB_CONFIG_FIELDS = (
         "duckdb_memory_limit",
         "duckdb_io_multiplier",
@@ -1720,7 +1722,7 @@ return 1
         "duckdb_http_timeout",
         "duckdb_external_cache_size",
     )
-    DUCKDB_ENGINES = ("lite", "pro")
+    DUCKDB_ENGINES = ("lite",)
 
     def set_engine_config(
             self,
@@ -1728,7 +1730,7 @@ return 1
             engine: str,
             config: Dict[str, Any],
     ) -> bool:
-        """Store DuckDB runtime configuration for one engine ("lite" / "pro").
+        """Store DuckDB runtime configuration ("lite" is the one section).
 
         Org-level system scope: one engine document per organization, applied
         globally across all supertables (not per-supertable).

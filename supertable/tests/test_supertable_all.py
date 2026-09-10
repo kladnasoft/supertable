@@ -1421,11 +1421,11 @@ class TestEngineEnum:
 
     def test_duckdb_lite_value(self):
         from supertable.data_reader import engine
-        assert engine.DUCKDB_LITE.value == "duckdb_lite"
+        assert engine.DUCKDB_LITE.value == "duckdb"   # alias of DUCKDB
 
     def test_duckdb_pro_value(self):
         from supertable.data_reader import engine
-        assert engine.DUCKDB_PRO.value == "duckdb_pro"
+        assert engine.DUCKDB_PRO.value == "duckdb"   # alias of DUCKDB
 
     def test_spark_sql_value(self):
         from supertable.data_reader import engine

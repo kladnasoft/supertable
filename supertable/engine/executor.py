@@ -14,26 +14,10 @@ from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
 
 from supertable.engine.engine_enum import Engine
-from supertable.engine.duckdb_lite import DuckDBLite
-from supertable.engine.duckdb_pro import DuckDBPro
+from supertable.engine.duckdb import DuckDBEngine
 from supertable.engine.engine_config import resolve_engine_configs, EngineRuntimeConfig
 from supertable.data_classes import Reflection
 from supertable.config.defaults import logger
-
-
-# Module-level singleton for the pro executor so the persistent
-# connection survives across Executor instances (which are per-request).
-_pro_singleton: Optional[DuckDBPro] = None
-_pro_lock = __import__("threading").Lock()
-
-
-def _get_pro(storage: Optional[object] = None) -> DuckDBPro:
-    global _pro_singleton
-    if _pro_singleton is None:
-        with _pro_lock:
-            if _pro_singleton is None:
-                _pro_singleton = DuckDBPro(storage=storage)
-    return _pro_singleton
 
 
 class Executor:
@@ -44,7 +28,7 @@ class Executor:
     def __init__(self, storage: Optional[object] = None, organization: str = ""):
         self.storage = storage
         self.organization = organization
-        self.lite_exec = DuckDBLite(storage=storage)
+        self.duck_exec = DuckDBEngine(storage=storage)
         self.spark_exec = None
         self._catalog = None  # lazily created RedisCatalog for live config reads
 
@@ -108,71 +92,48 @@ class Executor:
         return cfg.engine_spark_min_bytes
 
     def _auto_pick(self, reflection: Reflection, cfg: EngineRuntimeConfig) -> Engine:
-        """Select the best engine based on data size and freshness.
+        """Pick DuckDB or Spark.
 
-        Decision matrix (all thresholds configurable via env vars):
+        With one DuckDB engine the choice is binary: hand the query to Spark
+        only when an **active Spark cluster is registered** for the org AND the
+        job reaches the fleet's minimum accepted size (the smallest
+        ``min_bytes`` across active clusters — see :meth:`_spark_min_bytes`).
+        Everything else runs on DuckDB, so with no cluster registered AUTO
+        always picks DuckDB.
 
-                              Data freshness
-                         FRESH (<threshold)   STABLE (>=threshold)
-                    ┌─────────────────────┬─────────────────────┐
-          Small     │       LITE          │       LITE          │
-          (<lite)   │  cheap anyway       │  cheap anyway       │
-                    ├─────────────────────┼─────────────────────┤
-          Medium    │       LITE          │       PRO           │
-          (lite–spk)│  cache would churn  │  cache pays off     │
-                    ├─────────────────────┼─────────────────────┤
-          Large     │       SPARK *       │       SPARK *       │
-          (>=spark) │  hand off to fleet  │  hand off to fleet  │
-                    └─────────────────────┴─────────────────────┘
+        The concrete cluster is chosen later by
+        :meth:`RedisCatalog.select_spark_cluster`, at random among the active
+        clusters whose ``[min_bytes, max_bytes]`` window contains the job.
 
-        * Spark is chosen only when an **active Spark cluster is registered**
-          for the org and the job reaches the fleet's minimum accepted size
-          (the smallest ``min_bytes`` across active clusters — see
-          :meth:`_spark_min_bytes`).  With no active cluster, AUTO stays on
-          DuckDB regardless of size.  The concrete cluster is chosen later by
-          :meth:`RedisCatalog.select_spark_cluster`, at random among the active
-          clusters whose ``[min_bytes, max_bytes]`` window contains the job.
+        Data freshness no longer participates: it existed only to decide when
+        the pro flavour's materialised cache would pay for itself, and that
+        flavour is gone.
 
-        Env var overrides:
-          SUPERTABLE_ENGINE_LITE_MAX_BYTES   – upper bound for Lite (default 100 MB)
+        Env var override:
           SUPERTABLE_ENGINE_SPARK_MIN_BYTES  – Spark floor used only when no
                                                active cluster is registered
-          SUPERTABLE_ENGINE_FRESHNESS_SEC    – age threshold in seconds (default 300)
         """
         bytes_total = reflection.reflection_bytes
 
-        # --- thresholds (resolved live from org system config) ---
-        lite_max = cfg.engine_lite_max_bytes
-        freshness_threshold_s = cfg.engine_freshness_sec
-
-        # --- Spark fleet: the registered clusters decide availability + floor ---
+        # There is ONE DuckDB engine, so AUTO is a single question: is Spark
+        # available and is this query big enough to be worth shipping to it?
+        # If no Spark cluster is registered, AUTO always picks DuckDB. The old
+        # size/freshness matrix existed only to decide between the lite and pro
+        # DuckDB flavours, and pro is gone.
         active_clusters = self._active_spark_clusters()
         spark_available = bool(active_clusters)
         spark_min = self._spark_min_bytes(cfg, active_clusters)
 
-        # --- freshness: how long ago was the most recent snapshot updated ---
-        if reflection.freshness_ms > 0:
-            age_s = (time.time() * 1000 - reflection.freshness_ms) / 1000.0
-            data_is_fresh = age_s < freshness_threshold_s
-        else:
-            # Unknown freshness — assume stable so Pro gets a chance to cache.
-            age_s = -1
-            data_is_fresh = False
-
-        # --- decision ---
         if spark_available and bytes_total >= spark_min:
             chosen = Engine.SPARK_SQL
             reason = (f"bytes={bytes_total} >= fleet_min={spark_min} "
                       f"({len(active_clusters)} active cluster(s))")
-        elif bytes_total <= lite_max:
-            chosen = Engine.DUCKDB_LITE
-            reason = f"bytes={bytes_total} <= lite_max={lite_max}"
-        elif data_is_fresh:
-            chosen = Engine.DUCKDB_LITE
-            reason = f"data fresh (age={age_s:.0f}s < {freshness_threshold_s}s), cache would churn"
+        elif spark_available:
+            chosen = Engine.DUCKDB
+            reason = f"bytes={bytes_total} < fleet_min={spark_min}"
         else:
-            chosen = Engine.DUCKDB_PRO
-            reason = f"stable data (age={age_s:.0f}s >= {freshness_threshold_s}s), cache pays off"
+            chosen = Engine.DUCKDB
+            reason = "no active Spark cluster"
 
         logger.info(
             f"[engine.auto] {chosen.value} — {reason} "
@@ -197,38 +158,25 @@ class Executor:
         # Pro carry independent DuckDB pragmas; the shared auto-pick thresholds
         # are identical in both, so either may drive the routing decision.
         cfgs = resolve_engine_configs(self.organization, self._get_catalog())
-        lite_cfg = cfgs["lite"]
-        pro_cfg = cfgs["pro"]
+        duck_cfg = cfgs["lite"]
 
-        chosen = engine if engine != Engine.AUTO else self._auto_pick(reflection, lite_cfg)
+        chosen = engine if engine != Engine.AUTO else self._auto_pick(reflection, duck_cfg)
 
         def timer_capture(evt: str):
             timer.capture_and_reset_timing(evt)
 
-        if chosen == Engine.DUCKDB_LITE:
-            df = self.lite_exec.execute(
+        if chosen == Engine.DUCKDB:
+            df = self.duck_exec.execute(
                 reflection=reflection,
                 parser=parser,
                 query_manager=query_manager,
                 timer_capture=timer_capture,
                 log_prefix=log_prefix,
-                engine_config=lite_cfg,
+                engine_config=duck_cfg,
                 explain=explain,
                 explain_options=explain_options,
             )
-            used = "duckdb_lite"
-
-        elif chosen == Engine.DUCKDB_PRO:
-            pro = _get_pro(storage=self.storage)
-            df = pro.execute(
-                reflection=reflection,
-                parser=parser,
-                query_manager=query_manager,
-                timer_capture=timer_capture,
-                log_prefix=log_prefix,
-                engine_config=pro_cfg,
-            )
-            used = "duckdb_pro"
+            used = "duckdb"
 
         elif chosen == Engine.SPARK_SQL:
             if self.spark_exec is None:

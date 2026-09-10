@@ -132,11 +132,11 @@ class TestEngineEnum:
 
     def test_duckdb_lite_value(self):
         from supertable.data_reader import engine
-        assert engine.DUCKDB_LITE.value == "duckdb_lite"
+        assert engine.DUCKDB_LITE.value == "duckdb"   # alias of DUCKDB
 
     def test_duckdb_pro_value(self):
         from supertable.data_reader import engine
-        assert engine.DUCKDB_PRO.value == "duckdb_pro"
+        assert engine.DUCKDB_PRO.value == "duckdb"   # alias of DUCKDB
 
     def test_spark_sql_value(self):
         from supertable.data_reader import engine
@@ -148,7 +148,15 @@ class TestEngineEnum:
 
     def test_engine_members(self):
         from supertable.data_reader import engine
-        assert set(engine.__members__.keys()) == {"AUTO", "DUCKDB_LITE", "DUCKDB_PRO", "SPARK_SQL"}
+        # __members__ includes the back-compat aliases; the distinct engines
+        # are AUTO / DUCKDB / SPARK_SQL, with DUCKDB_LITE and DUCKDB_PRO both
+        # resolving to DUCKDB so stored engine preferences keep working.
+        assert set(engine.__members__.keys()) == {
+            "AUTO", "DUCKDB", "DUCKDB_LITE", "DUCKDB_PRO", "SPARK_SQL",
+        }
+        assert {e.name for e in engine} == {"AUTO", "DUCKDB", "SPARK_SQL"}
+        assert engine.DUCKDB_LITE is engine.DUCKDB
+        assert engine.DUCKDB_PRO is engine.DUCKDB
 
 
 # ====================================================================

@@ -10,8 +10,7 @@ Covers:
   - data_estimator: get_missing_columns, DataEstimator.estimate
   - engine_enum:   Engine enum values
   - executor:      Executor routing (lite / pro / spark_sql / auto)
-  - duckdb_lite:   DuckDBLite.execute
-  - duckdb_pro:    DuckDBPro lifecycle, table caching, ref counting, staleness
+  - duckdb:        DuckDBEngine.execute
   - spark_sql:  SparkThriftExecutor helpers & execute flow
 """
 
@@ -52,7 +51,6 @@ from supertable.engine.engine_common import (
     sanitize_sql_string,
     escape_parquet_path,
     hashed_table_name,
-    pro_table_name,
     normalize_endpoint_for_s3,
     detect_endpoint,
     detect_region,
@@ -77,9 +75,8 @@ from supertable.engine.engine_common import (
 )
 from supertable.engine.data_estimator import DataEstimator, get_missing_columns
 from supertable.engine.engine_enum import Engine
-from supertable.engine.executor import Executor, _get_pro
-from supertable.engine.duckdb_lite import DuckDBLite
-from supertable.engine.duckdb_pro import DuckDBPro, _ProCacheEntry
+from supertable.engine.executor import Executor
+from supertable.engine.duckdb import DuckDBEngine
 from supertable.engine.spark_thrift import (
     _spark_table_name,
     _spark_create_parquet_view,
@@ -226,23 +223,6 @@ class TestHashedTableName:
         assert len(name) == 3 + 16  # "st_" + 16 hex
 
 
-class TestProTableName:
-
-    def test_deterministic(self):
-        assert pro_table_name("s", "t", 5) == pro_table_name("s", "t", 5)
-
-    def test_prefix_and_version_suffix(self):
-        name = pro_table_name("s", "t", 7)
-        assert name.startswith("pro_")
-        assert name.endswith("_v7")
-
-    def test_different_version_different_name(self):
-        assert pro_table_name("s", "t", 1) != pro_table_name("s", "t", 2)
-
-    def test_same_key_different_version_share_prefix(self):
-        n1 = pro_table_name("s", "t", 1)
-        n2 = pro_table_name("s", "t", 2)
-        assert n1.rsplit("_v", 1)[0] == n2.rsplit("_v", 1)[0]
 
 
 # ═══════════════════════════════════════════════════════════
@@ -522,11 +502,11 @@ def _duckdb_settings_snapshot(con):
 
 
 class TestReadWriteDuckDBParity:
-    """Read (DuckDBLite) and write (probe via new_duckdb_connection) must
+    """Read (DuckDBEngine) and write (probe via new_duckdb_connection) must
     configure DuckDB identically — same pragmas, same pinned home directory."""
 
     def test_helper_matches_read_executor_settings(self, tmp_path):
-        lite = DuckDBLite(storage=None)
+        lite = DuckDBEngine(storage=None)
         con_read = lite._get_connection(temp_dir=str(tmp_path))
         con_write = new_duckdb_connection(temp_dir=str(tmp_path))
         try:
@@ -1465,17 +1445,6 @@ class TestDataEstimator:
 # ═══════════════════════════════════════════════════════════
 
 
-class TestEngineEnum:
-
-    def test_values(self):
-        assert Engine.AUTO.value == "auto"
-        assert Engine.DUCKDB_LITE.value == "duckdb_lite"
-        assert Engine.DUCKDB_PRO.value == "duckdb_pro"
-        assert Engine.SPARK_SQL.value == "spark_sql"
-
-    def test_from_string(self):
-        assert Engine("auto") == Engine.AUTO
-        assert Engine("spark_sql") == Engine.SPARK_SQL
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1498,140 +1467,39 @@ def _exec_fixtures():
     return reflection, parser, qm, timer, ps
 
 
-class TestExecutor:
-
-    @patch.object(DuckDBLite, "execute", return_value=pd.DataFrame({"a": [1]}))
-    def test_route_lite(self, mock_exec):
-        r, p, qm, t, ps = _exec_fixtures()
-        _, used = Executor().execute(Engine.DUCKDB_LITE, r, p, qm, t, ps, "test")
-        assert used == "duckdb_lite"
-        mock_exec.assert_called_once()
-
-    @patch.object(DuckDBPro, "execute", return_value=pd.DataFrame({"a": [1]}))
-    def test_route_pro(self, mock_exec):
-        import supertable.engine.executor as mod
-        mod._pro_singleton = None
-        _, used = Executor().execute(Engine.DUCKDB_PRO, *_exec_fixtures()[:-1], PlanStats(), "test")
-        assert used == "duckdb_pro"
-        mock_exec.assert_called_once()
-
-    @patch.object(DuckDBPro, "execute", return_value=pd.DataFrame())
-    def test_route_duckdb_pro_explicit(self, mock_exec):
-        import supertable.engine.executor as mod
-        mod._pro_singleton = None
-        _, used = Executor().execute(Engine.DUCKDB_PRO, *_exec_fixtures()[:-1], PlanStats(), "test")
-        assert used == "duckdb_pro"
-
-    @patch("supertable.engine.spark_thrift.SparkThriftExecutor")
-    def test_route_spark(self, MockSpark):
-        instance = MagicMock()
-        instance.execute.return_value = pd.DataFrame()
-        MockSpark.return_value = instance
-        r, p, qm, t, ps = _exec_fixtures()
-        _, used = Executor().execute(Engine.SPARK_SQL, r, p, qm, t, ps, "test")
-        assert used == "spark_sql"
-        _, kwargs = instance.execute.call_args
-        assert kwargs.get("force") is True
-
-    @patch.object(DuckDBLite, "execute", return_value=pd.DataFrame())
-    def test_auto_picks_lite_for_small_data(self, mock_exec):
-        r, p, qm, t, ps = _exec_fixtures()
-        r.reflection_bytes = 1000
-        _, used = Executor().execute(Engine.AUTO, r, p, qm, t, ps, "test")
-        assert used == "duckdb_lite"
-
-    @patch.object(DuckDBPro, "execute", return_value=pd.DataFrame())
-    def test_auto_picks_pro_for_medium_stable_data(self, mock_exec):
-        import supertable.engine.executor as mod
-        mod._pro_singleton = None
-        r, p, qm, t, ps = _exec_fixtures()
-        # 500 MB, stable (freshness_ms=0 means unknown → treated as stable)
-        r.reflection_bytes = 500 * 1024 * 1024
-        r.freshness_ms = 0
-        _, used = Executor().execute(Engine.AUTO, r, p, qm, t, ps, "test")
-        assert used == "duckdb_pro"
-
-    @patch.object(DuckDBLite, "execute", return_value=pd.DataFrame())
-    def test_auto_picks_lite_for_medium_fresh_data(self, mock_exec):
-        import time
-        r, p, qm, t, ps = _exec_fixtures()
-        # 500 MB, just updated 10 seconds ago (fresh → cache would churn)
-        r.reflection_bytes = 500 * 1024 * 1024
-        r.freshness_ms = int(time.time() * 1000) - 10_000
-        _, used = Executor().execute(Engine.AUTO, r, p, qm, t, ps, "test")
-        assert used == "duckdb_lite"
-
-    @patch.object(DuckDBPro, "execute", return_value=pd.DataFrame())
-    def test_auto_picks_pro_for_medium_old_data(self, mock_exec):
-        import time
-        import supertable.engine.executor as mod
-        mod._pro_singleton = None
-        r, p, qm, t, ps = _exec_fixtures()
-        # 500 MB, updated 10 minutes ago (stable → cache pays off)
-        r.reflection_bytes = 500 * 1024 * 1024
-        r.freshness_ms = int(time.time() * 1000) - 600_000
-        _, used = Executor().execute(Engine.AUTO, r, p, qm, t, ps, "test")
-        assert used == "duckdb_pro"
-
-    @patch.object(DuckDBLite, "execute", return_value=pd.DataFrame())
-    def test_auto_picks_lite_at_boundary(self, mock_exec):
-        r, p, qm, t, ps = _exec_fixtures()
-        # Exactly at lite_max threshold (100 MB) — should still pick LITE
-        r.reflection_bytes = 100 * 1024 * 1024
-        _, used = Executor().execute(Engine.AUTO, r, p, qm, t, ps, "test")
-        assert used == "duckdb_lite"
-
-    @patch.object(DuckDBLite, "execute", return_value=pd.DataFrame())
-    def test_plan_stats_records_engine(self, mock_exec):
-        r, p, qm, t, ps = _exec_fixtures()
-        Executor().execute(Engine.DUCKDB_LITE, r, p, qm, t, ps, "test")
-        assert any(s.get("ENGINE") == "duckdb_lite" for s in ps.stats)
 
 
-class TestGetPro:
-
-    def test_returns_duckdb_pro_instance(self):
-        import supertable.engine.executor as mod
-        mod._pro_singleton = None
-        assert isinstance(_get_pro(), DuckDBPro)
-
-    def test_singleton_returns_same_instance(self):
-        import supertable.engine.executor as mod
-        mod._pro_singleton = None
-        a = _get_pro()
-        b = _get_pro()
-        assert a is b
 
 
 # ═══════════════════════════════════════════════════════════
-#  duckdb_lite
+#  duckdb
 # ═══════════════════════════════════════════════════════════
 
 
-class TestDuckDBLite:
+class TestDuckDBEngine:
 
     def test_init(self):
-        dt = DuckDBLite(storage=MagicMock())
+        dt = DuckDBEngine(storage=MagicMock())
         assert dt.storage is not None
 
     def test_init_builds_tombstone_cache_from_settings(self):
-        dt = DuckDBLite()
+        dt = DuckDBEngine()
         assert dt._tombstone_cache.capacity == _settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE
         assert dt._tombstone_cache.ttl_seconds == _settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC
 
     def test_reset_clears_tombstone_cache(self):
-        dt = DuckDBLite()
+        dt = DuckDBEngine()
         dt._con = MagicMock()
         dt._tombstone_cache._registry["k"] = MagicMock()
         dt._reset_connection()
         assert dt._con is None
         assert dt._tombstone_cache.snapshot() == []
 
-    @patch("supertable.engine.duckdb_lite.duckdb")
-    @patch("supertable.engine.duckdb_lite.init_connection")
-    @patch("supertable.engine.duckdb_lite.hashed_table_name", return_value="st_abc")
-    @patch("supertable.engine.duckdb_lite.create_reflection_view_with_presign_retry", return_value=False)
-    @patch("supertable.engine.duckdb_lite.rewrite_query_with_hashed_tables", return_value="SELECT 1")
+    @patch("supertable.engine.duckdb.duckdb")
+    @patch("supertable.engine.duckdb.init_connection")
+    @patch("supertable.engine.duckdb.hashed_table_name", return_value="st_abc")
+    @patch("supertable.engine.duckdb.create_reflection_view_with_presign_retry", return_value=False)
+    @patch("supertable.engine.duckdb.rewrite_query_with_hashed_tables", return_value="SELECT 1")
     def test_execute_flow(self, mock_rewrite, mock_create, mock_hash, mock_init, mock_duckdb):
         fake_con = MagicMock()
         fake_con.execute.return_value.fetchdf.return_value = pd.DataFrame({"x": [1]})
@@ -1651,7 +1519,7 @@ class TestDuckDBLite:
         qm.query_plan_path = "/tmp/plan.json"
 
         captures = []
-        DuckDBLite(storage=MagicMock()).execute(
+        DuckDBEngine(storage=MagicMock()).execute(
             reflection, parser, qm, lambda e: captures.append(e)
         )
         assert "CONNECTING" in captures
@@ -1660,8 +1528,8 @@ class TestDuckDBLite:
         mock_create.assert_called_once()
         # The lite executor reuses a persistent connection; it is NOT closed per query.
 
-    @patch("supertable.engine.duckdb_lite.duckdb")
-    @patch("supertable.engine.duckdb_lite.init_connection")
+    @patch("supertable.engine.duckdb.duckdb")
+    @patch("supertable.engine.duckdb.init_connection")
     def test_connection_closed_on_error(self, mock_init, mock_duckdb):
         fake_con = MagicMock()
         mock_duckdb.connect.return_value = fake_con
@@ -1670,7 +1538,7 @@ class TestDuckDBLite:
         parser = MagicMock()
         parser.get_table_tuples.return_value = []
         with pytest.raises(RuntimeError):
-            DuckDBLite().execute(Reflection("m", 0, 0, []), parser, MagicMock(), lambda e: None)
+            DuckDBEngine().execute(Reflection("m", 0, 0, []), parser, MagicMock(), lambda e: None)
         # init_connection raises before self._con is assigned, so _reset_connection
         # is a no-op (self._con is None) and close() is not called on the raw con object.
 
@@ -1680,179 +1548,6 @@ class TestDuckDBLite:
 # ═══════════════════════════════════════════════════════════
 
 
-class TestDuckDBPro:
-
-    def _make(self):
-        return DuckDBPro(storage=MagicMock())
-
-    def test_init(self):
-        p = self._make()
-        assert p._con is None
-        assert p._httpfs_configured is False
-        assert p._registry == {}
-
-    def test_init_builds_tombstone_cache_from_settings(self):
-        p = self._make()
-        assert p._tombstone_cache.capacity == _settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE
-        assert p._tombstone_cache.ttl_seconds == _settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC
-
-    def test_reset_clears_tombstone_cache(self):
-        p = self._make()
-        p._con = MagicMock()
-        p._tombstone_cache._registry["k"] = MagicMock()
-        p._reset_connection()
-        assert p._tombstone_cache.snapshot() == []
-
-    @patch("supertable.engine.duckdb_pro.duckdb")
-    @patch("supertable.engine.duckdb_pro.init_connection")
-    def test_get_connection_creates_once(self, mock_init, mock_duckdb):
-        fake_con = MagicMock()
-        mock_duckdb.connect.return_value = fake_con
-        p = self._make()
-        assert p._get_connection("/tmp") is p._get_connection("/tmp")
-        mock_duckdb.connect.assert_called_once()
-
-    def test_reset_connection(self):
-        p = self._make()
-        p._con = MagicMock()
-        p._httpfs_configured = True
-        p._registry = {("s", "t"): [MagicMock()]}
-        p._reset_connection()
-        assert p._con is None
-        assert p._httpfs_configured is False
-        assert p._registry == {}
-
-    def test_reset_connection_handles_close_error(self):
-        p = self._make()
-        p._con = MagicMock()
-        p._con.close.side_effect = RuntimeError("close failed")
-        p._reset_connection()  # should not raise
-        assert p._con is None
-
-    @patch("supertable.engine.duckdb_pro.create_reflection_view")
-    @patch("supertable.engine.duckdb_pro.configure_httpfs_and_s3")
-    def test_ensure_table_creates_new(self, mock_httpfs, mock_create):
-        p = self._make()
-        name = p._ensure_view(MagicMock(), "s", "t", 1, ["f.parquet"])
-        assert name.startswith("pro_")
-        assert "_v1" in name
-        mock_create.assert_called_once()
-
-    @patch("supertable.engine.duckdb_pro.create_reflection_view")
-    @patch("supertable.engine.duckdb_pro.configure_httpfs_and_s3")
-    def test_ensure_table_reuses_cached(self, mock_httpfs, mock_create):
-        p = self._make()
-        con = MagicMock()
-        n1 = p._ensure_view(con, "s", "t", 1, ["f.parquet"])
-        n2 = p._ensure_view(con, "s", "t", 1, ["f.parquet"])
-        assert n1 == n2
-        mock_create.assert_called_once()
-
-    @patch("supertable.engine.duckdb_pro.create_reflection_view")
-    @patch("supertable.engine.duckdb_pro.configure_httpfs_and_s3")
-    def test_ensure_table_new_version_marks_old_stale(self, mock_httpfs, mock_create):
-        p = self._make()
-        con = MagicMock()
-        name1 = p._ensure_view(con, "s", "t", 1, ["f1.parquet"])
-        p._acquire_refs({name1})  # keep it alive
-        name2 = p._ensure_view(con, "s", "t", 2, ["f2.parquet"])
-        assert name1 != name2
-        assert mock_create.call_count == 2
-        stale = [e for e in p._registry[("s", "t")] if e.stale]
-        assert len(stale) == 1
-        assert stale[0].version == 1
-
-    @patch("supertable.engine.duckdb_pro.create_reflection_view")
-    @patch("supertable.engine.duckdb_pro.configure_httpfs_and_s3")
-    def test_ensure_table_new_version_drops_unreferenced_stale(self, mock_httpfs, mock_create):
-        p = self._make()
-        con = MagicMock()
-        name1 = p._ensure_view(con, "s", "t", 1, ["f1.parquet"])
-        p._ensure_view(con, "s", "t", 2, ["f2.parquet"])
-        entries = p._registry[("s", "t")]
-        assert len(entries) == 1
-        assert entries[0].version == 2
-        assert not entries[0].stale
-        drop_calls = [c[0][0] for c in con.execute.call_args_list if "DROP VIEW" in str(c)]
-        assert any(name1 in s for s in drop_calls)
-
-    def test_acquire_and_release_refs(self):
-        p = self._make()
-        entry = _ProCacheEntry("tbl_v1", "s", "t", 1)
-        p._registry[("s", "t")] = [entry]
-        p._acquire_refs({"tbl_v1"})
-        assert entry.ref_count == 1
-        p._acquire_refs({"tbl_v1"})
-        assert entry.ref_count == 2
-        p._release_refs({"tbl_v1"})
-        assert entry.ref_count == 1
-        p._release_refs({"tbl_v1"})
-        assert entry.ref_count == 0
-        p._release_refs({"tbl_v1"})
-        assert entry.ref_count == 0  # no negative
-
-    def test_drop_unreferenced_stale(self):
-        p = self._make()
-        con = MagicMock()
-        stale_zero = _ProCacheEntry("old_v1", "s", "t", 1, ref_count=0, stale=True)
-        stale_busy = _ProCacheEntry("old_v2", "s", "t", 2, ref_count=1, stale=True)
-        current = _ProCacheEntry("cur_v3", "s", "t", 3, ref_count=0, stale=False)
-        p._registry[("s", "t")] = [stale_zero, stale_busy, current]
-        p._drop_unreferenced_stale(con)
-        drop_calls = [c[0][0] for c in con.execute.call_args_list]
-        assert any("old_v1" in s for s in drop_calls)
-        remaining = p._registry[("s", "t")]
-        assert len(remaining) == 2
-        assert {e.table_name for e in remaining} == {"old_v2", "cur_v3"}
-
-    def test_get_cached_tables(self):
-        p = self._make()
-        p._registry[("s", "t")] = [
-            _ProCacheEntry("tbl1", "s", "t", 1, ref_count=0, stale=False),
-            _ProCacheEntry("tbl2", "s", "t", 2, ref_count=1, stale=True),
-        ]
-        tables = p.get_cached_tables()
-        assert len(tables) == 2
-        assert tables[0]["view_name"] == "tbl1"
-        assert tables[0]["stale"] is False
-        assert tables[1]["stale"] is True
-
-    def test_drop_all(self):
-        p = self._make()
-        p._con = MagicMock()
-        p._registry[("s", "t")] = [_ProCacheEntry("tbl1", "s", "t", 1)]
-        p.drop_all()
-        assert p._con is None
-        assert p._registry == {}
-
-    @patch("supertable.engine.duckdb_pro.create_reflection_view")
-    @patch("supertable.engine.duckdb_pro.make_presigned_list")
-    @patch("supertable.engine.duckdb_pro.configure_httpfs_and_s3")
-    def test_ensure_table_presign_fallback(self, mock_httpfs, mock_presign, mock_create):
-        p = self._make()
-        mock_create.side_effect = [Exception("HTTP Error 403"), None]
-        mock_presign.return_value = ["https://presigned/f.parquet"]
-        name = p._ensure_view(MagicMock(), "s", "t", 1, ["s3://bucket/f.parquet"])
-        assert name.startswith("pro_")
-        assert mock_create.call_count == 2
-        mock_presign.assert_called_once()
-
-    def test_current_entry_returns_non_stale(self):
-        p = self._make()
-        p._registry[("s", "t")] = [
-            _ProCacheEntry("t1", "s", "t", 1, stale=True),
-            _ProCacheEntry("t2", "s", "t", 2, stale=False),
-        ]
-        assert p._current_entry(("s", "t")).table_name == "t2"
-
-    def test_current_entry_none_when_all_stale(self):
-        p = self._make()
-        p._registry[("s", "t")] = [_ProCacheEntry("t1", "s", "t", 1, stale=True)]
-        assert p._current_entry(("s", "t")) is None
-
-    def test_current_entry_none_when_empty(self):
-        p = self._make()
-        assert p._current_entry(("s", "t")) is None
 
 
 # ═══════════════════════════════════════════════════════════

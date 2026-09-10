@@ -69,15 +69,6 @@ def hashed_table_name(
     return f"st_{digest}"
 
 
-def pro_table_name(
-        super_name: str,
-        simple_name: str,
-        simple_version: int,
-) -> str:
-    """Generate a deterministic table name for pro mode (all columns, version-scoped)."""
-    key = f"{super_name}_{simple_name}"
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
-    return f"pro_{digest}_v{simple_version}"
 
 
 # =========================================================
