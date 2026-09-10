@@ -166,7 +166,14 @@ def _marker_path(profile: str, scale: Scale) -> Path:
 
 
 def existing_dataset(profile: str, scale: Scale) -> Optional[Dict[str, Any]]:
-    """Return the record of a previously built dataset, if it still matches."""
+    """Return a previously built dataset only if it still matches in full.
+
+    The fingerprint covers the *requested* shape, not the shape that was
+    actually achieved, and those can differ: a dataset built before the
+    no-compaction config was in place ends up merged into far fewer files.
+    Reusing one of those silently measures a layout the read scenarios are not
+    written against, so the achieved file count is verified too.
+    """
     marker = _marker_path(profile, scale)
     if not marker.is_file():
         return None
@@ -175,6 +182,10 @@ def existing_dataset(profile: str, scale: Scale) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     if record.get("fingerprint") != fingerprint(scale):
+        return None
+    if record.get("files_live") != scale.files:
+        return None
+    if record.get("rows_in_snapshot") != scale.rows:
         return None
     return record
 
@@ -227,8 +238,12 @@ def build(profile: str, scale: Scale, *, rebuild: bool = False,
     SuperTable(super_name=_harness.BENCH_SUPER, organization=BENCH_ORG)
     writer = DataWriter(super_name=_harness.BENCH_SUPER, organization=BENCH_ORG)
 
-    if rebuild:
-        _drop_table(scale.table, log=log)
+    # Any path that reaches here is building from scratch — either the caller
+    # asked to, or the existing dataset was rejected as unusable.  Dropping is
+    # not optional: the writes below are appends, so building on top of a
+    # partial or mismatched table silently doubles the row count instead of
+    # replacing it.
+    _drop_table(scale.table, log=log)
 
     # Keep every generated file above the "small file" line so auto-compaction
     # leaves the layout alone and the table really has the file count the read

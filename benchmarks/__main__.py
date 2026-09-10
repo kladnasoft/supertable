@@ -25,11 +25,31 @@ from typing import List, Optional
 PROFILE_STORAGE = {"local": "LOCAL", "minio": "MINIO"}
 
 
+_bound_profile: Optional[str] = None
+
+
 def _bind_profile(profile: str) -> None:
-    """Pin the storage backend before the settings singleton is built."""
+    """Pin the storage backend before the settings singleton is built.
+
+    Idempotent for the profile already bound: ``all`` runs the read suite and
+    then the write suite in one process, and the second call must not trip the
+    import guard on modules the first suite legitimately loaded.  Switching to
+    a *different* profile mid-process is refused outright — the settings
+    singleton is built once, so the second profile would silently run against
+    the first one's backend.
+    """
+    global _bound_profile
     if profile not in PROFILE_STORAGE:
         raise SystemExit(f"unknown profile {profile!r}; expected one of "
                          f"{', '.join(sorted(PROFILE_STORAGE))}")
+    if _bound_profile == profile:
+        return
+    if _bound_profile is not None:
+        raise SystemExit(
+            f"cannot switch profile {_bound_profile!r} -> {profile!r} in one "
+            f"process; the storage backend is fixed at import. Use 'matrix', "
+            f"which runs each profile in its own process."
+        )
     for module in list(sys.modules):
         if module == "supertable" or module.startswith("supertable."):
             raise SystemExit(
@@ -41,6 +61,7 @@ def _bind_profile(profile: str) -> None:
     from benchmarks._harness import configure_profile
 
     configure_profile(profile)
+    _bound_profile = profile
 
 
 def _scale(name: str):

@@ -1,0 +1,831 @@
+{
+  "suite": "read",
+  "profile": "local",
+  "scale": "full",
+  "started_at": "2026-09-10T14:57:15.096281+00:00",
+  "finished_at": "2026-09-10T14:58:04.323607+00:00",
+  "duration_s": 49.23,
+  "environment": {
+    "profile": "local",
+    "supertable_version": "3.0.3",
+    "git_commit": "b8d7670dbc50c7459c6e61c915ef013bb0c09278",
+    "git_describe": "v3.0.1-4-gb8d7670-dirty",
+    "git_dirty": true,
+    "python": "3.10.12",
+    "duckdb": "1.5.4",
+    "polars": "1.42.1",
+    "pyarrow": "18.1.0",
+    "numpy": "2.2.6",
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "processor": "x86_64",
+    "cpu_count": 8,
+    "total_ram_gb": 15.6,
+    "storage_type": "LOCAL"
+  },
+  "dataset": {
+    "table": "perf_read_full",
+    "scale": "full",
+    "rows": 10000000,
+    "files_written": 100,
+    "span_days": 300,
+    "anchor": "2026-01-01T00:00:00+00:00",
+    "fingerprint": "59aea134df46235b",
+    "build_seconds": 41.32,
+    "reused": true,
+    "files_live": 100,
+    "rows_in_snapshot": 10000000,
+    "bytes_total": 225516134,
+    "snapshot_version": 100,
+    "layout_as_requested": true
+  },
+  "scenarios": [
+    {
+      "id": "random_1000_by_key",
+      "description": "1000 reproducibly-random primary keys scattered across the whole table (random access, not a range)",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 1083.039,
+        "p50": 1197.643,
+        "p95": 1255.561,
+        "max": 1255.561,
+        "mean": 1173.608,
+        "stdev": 78.272
+      },
+      "rows": 1000,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "dim_channel",
+          "dim_country",
+          "dim_device",
+          "event_id",
+          "event_ts",
+          "measure_amount",
+          "measure_qty",
+          "status",
+          "user_id"
+        ],
+        "row_count": 1000,
+        "digest": "920984d56717e721025388d6a01aa3c6f128d6c39aa30d78938a53479b2de15a"
+      },
+      "plan": {
+        "REFLECTIONS": 100,
+        "REFLECTION_SIZE": 225516134,
+        "REFLECTION_SIZE_RAW": 225516134,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 0,
+        "FILES_KEPT": 100,
+        "PRUNE_DURATION_MS": 6.334,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_pro"
+      },
+      "metrics": {
+        "query": "SELECT * FROM perf_read_full WHERE event_id IN (22514,32106,37338,51784,52647,75903,114013,117929,142612,142701,154322,159707,196102,202143,202422,210740,251948,267009,295597,302869,303478,319207,325572,330229,333379,343894,356768,366676,380124,380541,389834,396050,396840,405278,421103,431939,439378,466492,491621,507005,507066,512138,522556,549593,549896,550936,555260,567725,580355,592463,606094,618424,618613,619654,642092,653139,663966,676013,687104,688456,701000,721013,732913,741601,754103,775428,790179,811913,812584,815274,835684,847567,874634,879941,881152,888376,892979,902943,914873,915523,918067,928488,962403,965128,966957,968033,971834,1000001,1006164,1010937,1011024,1028623,1061610,1072297,1082175,1084960,1086464,1090413,1102121,1117521,1123981,1127104,1131887,1131976,1147025,1148222,1167524,1188198,1190713,1228822,1231300,1233770,1249026,1250480,1257362,1262274,1286462,1291306,1296647,1298154,1306674,1306780,1310727,1314278,1316046,1332003,1337143,1347976,1363051,1367536,1375568,1378111,1382141,1415441,1454477,1463956,1470982,1479828,1501863,1507748,1510505,1532208,1535844,1539977,1544468,1551272,1575951,1580523,1601967,1615037,1616937,1642316,1644470,1647872,1658338,1660009,1673362,1676372,1679400,1689671,1701950,1704432,1731406,1762992,1768015,1785486,1793665,1793927,1805374,1813255,1823731,1834829,1836983,1838773,1842625,1844383,1862149,1871348,1874917,1905508,1908299,1912413,1919789,1923842,1924473,1928916,1955469,1972715,1977582,1978398,1980210,1985063,1995179,2005881,2021844,2028978,2057131,2078125,2088860,2090340,2111215,2128937,2132948,2146649,2149855,2150471,2152880,2163897,2171876,2183440,2189673,2221942,2235165,2251848,2256312,2260500,2264065,2270173,2271726,2306384,2306613,2309984,2344020,2356186,2365450,2368780,2369707,2394695,2395431,2436989,2439697,2444628,2454249,2465278,2465680,2473973,2474917,2477771,2477807,2481063,2485543,2501958,2509816,2523509,2527529,2527614,2527891,2528980,2548447,2564005,2587869,2589402,2607981,2631449,2658574,2662258,2662450,2669006,2675747,2692317,2715047,2783984,2793184,2795728,2803219,2808297,2811225,2819172,2829450,2844742,2850388,2862038,2901538,2909231,2926408,2929210,2939697,2954043,2959722,2971367,2981780,2995224,2996794,3001365,3003943,3013235,3016381,3026001,3030027,3049699,3058399,3059597,3063963,3066391,3076298,3087825,3099883,3101223,3105513,3107966,3122207,3123103,3129649,3137035,3138006,3143850,3153433,3173032,3179848,3217251,3221372,3224393,3230075,3241620,3271505,3278868,3294275,3298360,3326585,3334185,3350704,3351517,3377529,3380300,3386404,3386696,3389351,3394446,3400431,3403128,3409931,3415700,3422624,3434274,3441835,3444848,3460358,3469170,3525508,3553859,3579643,3612316,3616645,3630999,3633534,3668093,3695020,3707165,3716265,3717053,3721553,3744689,3753570,3756898,3762568,3764174,3767537,3768348,3771379,3771394,3781656,3791748,3792998,3793406,3794126,3804270,3805653,3809599,3814466,3815490,3822139,3830285,3860220,3874181,3875039,3875972,3897695,3897961,3922085,3940912,3940983,3947611,3950033,3955935,3960792,3982482,4009626,4022827,4024634,4052944,4060715,4061250,4090648,4109215,4114900,4116168,4121229,4125681,4150812,4157709,4169432,4171289,4188717,4197547,4202426,4206274,4237810,4247353,4248899,4266190,4281862,4299665,4307433,4332512,4333150,4334837,4345127,4347482,4347935,4355447,4373635,4388096,4394477,4402751,4413562,4423214,4444458,4447163,4447816,4450330,4456698,4462579,4467006,4472146,4472859,4473779,4506461,4528138,4533004,4536408,4538759,4542857,4543251,4550031,4557201,4560804,4564864,4574032,4615249,4650527,4658092,4658115,4659323,4661619,4661857,4666174,4676921,4678890,4681286,4686628,4694414,4733872,4734704,4752314,4764407,4771451,4781024,4791643,4806992,4826573,4842289,4853055,4853384,4889692,4918162,4936706,4938326,4945267,4968268,4970161,4973729,4981597,4997375,5018130,5033216,5036519,5044993,5064635,5077264,5093980,5097442,5101846,5129650,5136562,5138007,5140693,5144563,5147364,5148400,5154853,5161470,5187537,5190579,5194782,5211285,5232709,5232914,5236986,5246272,5269225,5307906,5322844,5329879,5337531,5338071,5348709,5360972,5361936,5381129,5383639,5394947,5400687,5410949,5412585,5423492,5440364,5454618,5471043,5475907,5480081,5507401,5516911,5522804,5534437,5534532,5578229,5581012,5583185,5586437,5615860,5627842,5628010,5636801,5670207,5674859,5682681,5688118,5696472,5696711,5700371,5732905,5736092,5743607,5749333,5753346,5753652,5760315,5765721,5782349,5786383,5790265,5795362,5806112,5814262,5824864,5834049,5835955,5844846,5849902,5899397,5902445,5903516,5906955,5909638,5926186,5932172,5932212,5946451,5946461,5950841,5966307,5981304,5982762,5999605,6032080,6037384,6050031,6068132,6072124,6093006,6107143,6124811,6128919,6174849,6189504,6198949,6203793,6221193,6250330,6265758,6280595,6284144,6285164,6291669,6295786,6298400,6310649,6319202,6330059,6351845,6359394,6364264,6379406,6382063,6387145,6396589,6405261,6412034,6415185,6418224,6428365,6431884,6436700,6437970,6444949,6507730,6532790,6554168,6572101,6577083,6579867,6592310,6600976,6601230,6611552,6616049,6621583,6624127,6625180,6627096,6628643,6636282,6647355,6696460,6698456,6717075,6741713,6763911,6764241,6775625,6776683,6778323,6780852,6781224,6786257,6797866,6803257,6814619,6822254,6836307,6841117,6854109,6855403,6859595,6919677,6921093,6940429,6997501,7002070,7003694,7028293,7050359,7054863,7066746,7073078,7077052,7078583,7107117,7108495,7126503,7128865,7133095,7143384,7170361,7189756,7194007,7197256,7203393,7204342,7209094,7209430,7212669,7216132,7220084,7241302,7257949,7267215,7272923,7278266,7278308,7288074,7299422,7308386,7310578,7316017,7349435,7356673,7362266,7363702,7381513,7412447,7417035,7427140,7430345,7430524,7442860,7444327,7457213,7466427,7482998,7495058,7501559,7502787,7503669,7506733,7512642,7513894,7526955,7529196,7537314,7543126,7549750,7554511,7563731,7565092,7574271,7576608,7594643,7603457,7609423,7610528,7612106,7613764,7613850,7626147,7631444,7635853,7639805,7651878,7668160,7678946,7690857,7691595,7698083,7728077,7734700,7756085,7764390,7770844,7781572,7834630,7852352,7864306,7890671,7903854,7907927,7909674,7922120,7925855,7927945,7929638,7934135,7937619,7969911,7970817,7974125,7986734,7995037,8001335,8007811,8016172,8017820,8019854,8034691,8036516,8036677,8059828,8070375,8075858,8083698,8104647,8115387,8142321,8151691,8151943,8155215,8162657,8163248,8163852,8189087,8193894,8211476,8233853,8238406,8240052,8252941,8256240,8257302,8260139,8260880,8268129,8284685,8289619,8299711,8305106,8306099,8312968,8319694,8327558,8335397,8335682,8350412,8351725,8371714,8401120,8410115,8418431,8418707,8420315,8429908,8436523,8440353,8442878,8446385,8447233,8450026,8450064,8455431,8457671,8470663,8470729,8473409,8496748,8500035,8535702,8539591,8542657,8548248,8550349,8551069,8554271,8573673,8575068,8592590,8603288,8604508,8627602,8637530,8661102,8665040,8665570,8667048,8672269,8712609,8727402,8734143,8734671,8740023,8740341,8761473,8762415,8776355,8781253,8786808,8802515,8808369,8809417,8815098,8817615,8825712,8838823,8839835,8843971,8885240,8886719,8890709,8893112,8929000,8954119,8957405,8964759,8965488,8965882,8971244,8988711,9005035,9033047,9038404,9039464,9063499,9071321,9087087,9091087,9099017,9121571,9125331,9125693,9132964,9136528,9137128,9143974,9149337,9154023,9155775,9162958,9170811,9183903,9194295,9194370,9205395,9210132,9226941,9228718,9257532,9267648,9267863,9278281,9321015,9324387,9332377,9333473,9348065,9366246,9382846,9391416,9396662,9398025,9415673,9419929,9427391,9447552,9448105,9448682,9449228,9456930,9478963,9480540,9497706,9504797,9505460,9505700,9508714,9513855,9516869,9519699,9521414,9566812,9583356,9590849,9600146,9605033,9612872,9623803,9641740,9648071,9654093,9670710,9677446,9689279,9693397,9694269,9697630,9698833,9701727,9703416,9712426,9714936,9717300,9731241,9786615,9795716,9803235,9832444,9842225,9863579,9863943,9875343,9878374,9888652,9903634,9928104,9929131,9931587,9943404,9948464,9953308,9954041,9967302,9990553,9991029)"
+      },
+      "expectations": {}
+    },
+    {
+      "id": "agg_30d_by_country",
+      "description": "past 30 days: SUM(measure) GROUP BY dimension (~10% of the table)",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 290.955,
+        "p50": 319.294,
+        "p95": 417.125,
+        "max": 417.125,
+        "mean": 349.213,
+        "stdev": 59.907
+      },
+      "rows": 12,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "dim_country",
+          "matched_rows",
+          "total_amount",
+          "total_qty"
+        ],
+        "row_count": 12,
+        "digest": "d20abffd6c2041256d3ffc6e31882257c6513317d01fb1ecf1ead3647e65cdad"
+      },
+      "plan": {
+        "REFLECTIONS": 10,
+        "REFLECTION_SIZE": 10645764,
+        "REFLECTION_SIZE_RAW": 22553136,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 90,
+        "FILES_KEPT": 10,
+        "PRUNE_DURATION_MS": 8.039,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read_pruned_files": 90,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_lite"
+      },
+      "metrics": {
+        "query": "SELECT dim_country, COUNT(*) AS matched_rows, SUM(measure_amount) AS total_amount, SUM(measure_qty) AS total_qty FROM perf_read_full WHERE event_ts >= TIMESTAMP '2025-12-02 00:00:00' GROUP BY dim_country ORDER BY dim_country"
+      },
+      "expectations": {
+        "selectivity_pct": {
+          "ok": true,
+          "actual": 10.0,
+          "expected": "8.0..12.0%"
+        }
+      }
+    },
+    {
+      "id": "agg_24h_by_country",
+      "description": "past 24 hours: SUM(measure) GROUP BY dimension (<1% of the table)",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 277.158,
+        "p50": 342.51,
+        "p95": 451.422,
+        "max": 451.422,
+        "mean": 350.603,
+        "stdev": 65.491
+      },
+      "rows": 12,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "dim_country",
+          "matched_rows",
+          "total_amount"
+        ],
+        "row_count": 12,
+        "digest": "581b399a0cab75ddc83f764d61e423c8db37c4bcaf945fb964e20f446e07522b"
+      },
+      "plan": {
+        "REFLECTIONS": 1,
+        "REFLECTION_SIZE": 995225,
+        "REFLECTION_SIZE_RAW": 2248688,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 99,
+        "FILES_KEPT": 1,
+        "PRUNE_DURATION_MS": 16.151,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read_pruned_files": 99,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_lite"
+      },
+      "metrics": {
+        "query": "SELECT dim_country, COUNT(*) AS matched_rows, SUM(measure_amount) AS total_amount FROM perf_read_full WHERE event_ts >= TIMESTAMP '2025-12-31 00:00:00' GROUP BY dim_country ORDER BY dim_country"
+      },
+      "expectations": {
+        "selectivity_pct": {
+          "ok": true,
+          "actual": 0.348,
+          "expected": "0.0..1.0%"
+        }
+      }
+    },
+    {
+      "id": "top_1000_by_date_desc",
+      "description": "SELECT * ORDER BY date DESC LIMIT 1000 (order is part of the seal)",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 724.255,
+        "p50": 799.469,
+        "p95": 846.626,
+        "max": 846.626,
+        "mean": 788.678,
+        "stdev": 50.773
+      },
+      "rows": 1000,
+      "seal": {
+        "algorithm": "sha256/ordered-v2",
+        "columns": [
+          "dim_channel",
+          "dim_country",
+          "dim_device",
+          "event_id",
+          "event_ts",
+          "measure_amount",
+          "measure_qty",
+          "status",
+          "user_id"
+        ],
+        "row_count": 1000,
+        "digest": "426e5be0e8d242b9f30b23018de477cec1e45ff4a790d9a1971b211de9abf5fa"
+      },
+      "plan": {
+        "REFLECTIONS": 100,
+        "REFLECTION_SIZE": 225516134,
+        "REFLECTION_SIZE_RAW": 225516134,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 0,
+        "FILES_KEPT": 100,
+        "PRUNE_DURATION_MS": 0.239,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_pro"
+      },
+      "metrics": {
+        "query": "SELECT * FROM perf_read_full ORDER BY event_ts DESC, event_id DESC LIMIT 1000"
+      },
+      "expectations": {}
+    },
+    {
+      "id": "top_10000_by_date_desc",
+      "description": "SELECT * ORDER BY date DESC LIMIT 10000 (order is part of the seal)",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 1322.491,
+        "p50": 1423.287,
+        "p95": 1528.438,
+        "max": 1528.438,
+        "mean": 1439.416,
+        "stdev": 82.142
+      },
+      "rows": 10000,
+      "seal": {
+        "algorithm": "sha256/ordered-v2",
+        "columns": [
+          "dim_channel",
+          "dim_country",
+          "dim_device",
+          "event_id",
+          "event_ts",
+          "measure_amount",
+          "measure_qty",
+          "status",
+          "user_id"
+        ],
+        "row_count": 10000,
+        "digest": "880d032408efb1e57985210025100a02f4a6917335348cfa9d33d6f2b804e28b"
+      },
+      "plan": {
+        "REFLECTIONS": 100,
+        "REFLECTION_SIZE": 225516134,
+        "REFLECTION_SIZE_RAW": 225516134,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 0,
+        "FILES_KEPT": 100,
+        "PRUNE_DURATION_MS": 0.017,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_pro"
+      },
+      "metrics": {
+        "query": "SELECT * FROM perf_read_full ORDER BY event_ts DESC, event_id DESC LIMIT 10000"
+      },
+      "expectations": {}
+    },
+    {
+      "id": "count_star_full",
+      "description": "full-table COUNT(*) \u2014 the unprunable floor, every file must be touched",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 234.42,
+        "p50": 241.81,
+        "p95": 298.084,
+        "max": 298.084,
+        "mean": 253.466,
+        "stdev": 26.23
+      },
+      "rows": 1,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "matched_rows"
+        ],
+        "row_count": 1,
+        "digest": "dada06bcd33aa7b61653728f89c4ac157718f052281c41c024baa53a8a498524"
+      },
+      "plan": {
+        "REFLECTIONS": 100,
+        "REFLECTION_SIZE": 225516134,
+        "REFLECTION_SIZE_RAW": 225516134,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 0,
+        "FILES_KEPT": 100,
+        "PRUNE_DURATION_MS": 0.038,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_pro"
+      },
+      "metrics": {
+        "query": "SELECT COUNT(*) AS matched_rows FROM perf_read_full"
+      },
+      "expectations": {}
+    },
+    {
+      "id": "point_lookup_single_key",
+      "description": "single-row lookup by primary key \u2014 best-case pruning and latency floor",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 266.733,
+        "p50": 280.258,
+        "p95": 289.72,
+        "max": 289.72,
+        "mean": 280.584,
+        "stdev": 8.867
+      },
+      "rows": 1,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "dim_channel",
+          "dim_country",
+          "dim_device",
+          "event_id",
+          "event_ts",
+          "measure_amount",
+          "measure_qty",
+          "status",
+          "user_id"
+        ],
+        "row_count": 1,
+        "digest": "04395303643e525c8a7176a3cb79dd73d3f5faa4a55bfca0045809e1ef5f092a"
+      },
+      "plan": {
+        "REFLECTIONS": 1,
+        "REFLECTION_SIZE": 2256925,
+        "REFLECTION_SIZE_RAW": 2256925,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 99,
+        "FILES_KEPT": 1,
+        "PRUNE_DURATION_MS": 8.85,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read_pruned_files": 99,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_lite"
+      },
+      "metrics": {
+        "query": "SELECT * FROM perf_read_full WHERE event_id = 5161470"
+      },
+      "expectations": {}
+    },
+    {
+      "id": "distinct_users_30d",
+      "description": "COUNT(DISTINCT high-cardinality column) over 30 days \u2014 hash-aggregate pressure, not I/O",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 368.109,
+        "p50": 385.563,
+        "p95": 433.646,
+        "max": 433.646,
+        "mean": 398.596,
+        "stdev": 28.026
+      },
+      "rows": 1,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "distinct_users"
+        ],
+        "row_count": 1,
+        "digest": "307e8ab33d26ee14f52f61a804cc3fa3a6a2b814bc70fe80d2770dad2b3b1c29"
+      },
+      "plan": {
+        "REFLECTIONS": 10,
+        "REFLECTION_SIZE": 11762486,
+        "REFLECTION_SIZE_RAW": 22553136,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 90,
+        "FILES_KEPT": 10,
+        "PRUNE_DURATION_MS": 3.278,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read_pruned_files": 90,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_lite"
+      },
+      "metrics": {
+        "query": "SELECT COUNT(DISTINCT user_id) AS distinct_users FROM perf_read_full WHERE event_ts >= TIMESTAMP '2025-12-02 00:00:00'"
+      },
+      "expectations": {}
+    },
+    {
+      "id": "dimension_filter_full_scan",
+      "description": "non-time filter with no prunable predicate \u2014 full scan, aggregated so the payload stays small",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 437.388,
+        "p50": 471.052,
+        "p95": 512.723,
+        "max": 512.723,
+        "mean": 473.956,
+        "stdev": 26.965
+      },
+      "rows": 1,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "matched_rows",
+          "total_amount"
+        ],
+        "row_count": 1,
+        "digest": "de809f75c9eaa42d4789bf672b5f5443277479c3c226608fed875c607565f490"
+      },
+      "plan": {
+        "REFLECTIONS": 100,
+        "REFLECTION_SIZE": 31176021,
+        "REFLECTION_SIZE_RAW": 225516134,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 0,
+        "FILES_KEPT": 100,
+        "PRUNE_DURATION_MS": 4.005,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_lite"
+      },
+      "metrics": {
+        "query": "SELECT COUNT(*) AS matched_rows, ROUND(SUM(measure_amount), 2) AS total_amount FROM perf_read_full WHERE dim_country = 'AT'"
+      },
+      "expectations": {}
+    },
+    {
+      "id": "two_dim_group_by_30d",
+      "description": "two-dimension group-by over 30 days \u2014 wider grouping key than the single-dimension case",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 338.936,
+        "p50": 358.294,
+        "p95": 438.031,
+        "max": 438.031,
+        "mean": 382.845,
+        "stdev": 45.907
+      },
+      "rows": 60,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "dim_channel",
+          "dim_country",
+          "matched_rows",
+          "total_amount"
+        ],
+        "row_count": 60,
+        "digest": "74fb697f193dc7892b2af4df8309f091ed198c7bdf62b48f71fc5eb8a523ac63"
+      },
+      "plan": {
+        "REFLECTIONS": 10,
+        "REFLECTION_SIZE": 10354356,
+        "REFLECTION_SIZE_RAW": 22553136,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 90,
+        "FILES_KEPT": 10,
+        "PRUNE_DURATION_MS": 5.963,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read_pruned_files": 90,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_lite"
+      },
+      "metrics": {
+        "query": "SELECT dim_country, dim_channel, COUNT(*) AS matched_rows, ROUND(SUM(measure_amount), 2) AS total_amount FROM perf_read_full WHERE event_ts >= TIMESTAMP '2025-12-02 00:00:00' GROUP BY dim_country, dim_channel ORDER BY dim_country, dim_channel"
+      },
+      "expectations": {}
+    },
+    {
+      "id": "narrow_window_single_file",
+      "description": "time window contained in one file's slice \u2014 the engine's best achievable prune on a time filter",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 282.515,
+        "p50": 325.161,
+        "p95": 444.075,
+        "max": 444.075,
+        "mean": 347.559,
+        "stdev": 65.498
+      },
+      "rows": 1,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "matched_rows",
+          "total_amount"
+        ],
+        "row_count": 1,
+        "digest": "bcf88c574c995f79a21434011fd0da708a7023688928fcd352853663bf91cf28"
+      },
+      "plan": {
+        "REFLECTIONS": 1,
+        "REFLECTION_SIZE": 958839,
+        "REFLECTION_SIZE_RAW": 2258002,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 99,
+        "FILES_KEPT": 1,
+        "PRUNE_DURATION_MS": 4.167,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read_pruned_files": 99,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_lite"
+      },
+      "metrics": {
+        "query": "SELECT COUNT(*) AS matched_rows, ROUND(SUM(measure_amount), 2) AS total_amount FROM perf_read_full WHERE event_ts >= TIMESTAMP '2025-12-26 00:00:00' AND event_ts < TIMESTAMP '2025-12-27 12:00:00'"
+      },
+      "expectations": {}
+    },
+    {
+      "id": "filtered_order_limit",
+      "description": "filter + ORDER BY + LIMIT together \u2014 pruning and top-N in one plan",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 391.534,
+        "p50": 464.084,
+        "p95": 537.468,
+        "max": 537.468,
+        "mean": 467.117,
+        "stdev": 64.619
+      },
+      "rows": 1000,
+      "seal": {
+        "algorithm": "sha256/ordered-v2",
+        "columns": [
+          "dim_country",
+          "event_id",
+          "event_ts",
+          "measure_amount"
+        ],
+        "row_count": 1000,
+        "digest": "a91f51f18127fb60db565ef958fe3d9d192d6d98e519110ac143dd7b3a44959d"
+      },
+      "plan": {
+        "REFLECTIONS": 10,
+        "REFLECTION_SIZE": 13358770,
+        "REFLECTION_SIZE_RAW": 22553136,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 90,
+        "FILES_KEPT": 10,
+        "PRUNE_DURATION_MS": 9.288,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read_pruned_files": 90,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_lite"
+      },
+      "metrics": {
+        "query": "SELECT event_id, event_ts, dim_country, measure_amount FROM perf_read_full WHERE event_ts >= TIMESTAMP '2025-12-02 00:00:00' AND status = 'paid' ORDER BY event_ts DESC, event_id DESC LIMIT 1000"
+      },
+      "expectations": {}
+    },
+    {
+      "id": "prune_30d_window",
+      "description": "pruning: a 30-day predicate may keep at most ~10% of files",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 233.426,
+        "p50": 285.654,
+        "p95": 528.21,
+        "max": 528.21,
+        "mean": 322.484,
+        "stdev": 117.071
+      },
+      "rows": 1,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "matched_rows"
+        ],
+        "row_count": 1,
+        "digest": "af5bd0660581cd66ed9392910a38d88bae3a24adbf46f657229d4aeaaff60f64"
+      },
+      "plan": {
+        "REFLECTIONS": 10,
+        "REFLECTION_SIZE": 6900840,
+        "REFLECTION_SIZE_RAW": 22553136,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 90,
+        "FILES_KEPT": 10,
+        "PRUNE_DURATION_MS": 3.913,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read_pruned_files": 90,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_lite"
+      },
+      "metrics": {
+        "query": "SELECT COUNT(*) AS matched_rows FROM perf_read_full WHERE event_ts >= TIMESTAMP '2025-12-02 00:00:00'",
+        "predicate": "event_ts >= TIMESTAMP '2025-12-02 00:00:00'"
+      },
+      "expectations": {
+        "files_kept_within_bound": {
+          "ok": true,
+          "actual": 10,
+          "expected": "<= 15"
+        },
+        "prune_arithmetic": {
+          "ok": true,
+          "actual": 100,
+          "expected": "before == pruned + kept"
+        }
+      }
+    },
+    {
+      "id": "prune_24h_window",
+      "description": "pruning: a 24-hour predicate should survive on a single file",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 233.26,
+        "p50": 271.525,
+        "p95": 325.778,
+        "max": 325.778,
+        "mean": 277.005,
+        "stdev": 36.137
+      },
+      "rows": 1,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "matched_rows"
+        ],
+        "row_count": 1,
+        "digest": "7276bc0d234db6fa76a776bc0d7fd10dd1b5e8b32228cc9510d7c7d4ea46dc3d"
+      },
+      "plan": {
+        "REFLECTIONS": 1,
+        "REFLECTION_SIZE": 685056,
+        "REFLECTION_SIZE_RAW": 2248688,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 99,
+        "FILES_KEPT": 1,
+        "PRUNE_DURATION_MS": 5.393,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read_pruned_files": 99,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_lite"
+      },
+      "metrics": {
+        "query": "SELECT COUNT(*) AS matched_rows FROM perf_read_full WHERE event_ts >= TIMESTAMP '2025-12-31 00:00:00'",
+        "predicate": "event_ts >= TIMESTAMP '2025-12-31 00:00:00'"
+      },
+      "expectations": {
+        "files_kept_within_bound": {
+          "ok": true,
+          "actual": 1,
+          "expected": "<= 3"
+        },
+        "prune_arithmetic": {
+          "ok": true,
+          "actual": 100,
+          "expected": "before == pruned + kept"
+        }
+      }
+    },
+    {
+      "id": "prune_key_point",
+      "description": "pruning: an equality on the clustered key should survive on a single file",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 233.183,
+        "p50": 291.922,
+        "p95": 356.004,
+        "max": 356.004,
+        "mean": 291.389,
+        "stdev": 57.115
+      },
+      "rows": 1,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "matched_rows"
+        ],
+        "row_count": 1,
+        "digest": "b7b41e11fad83580f2aa36da4ee50691f34378c21003e60720863673ff3baee7"
+      },
+      "plan": {
+        "REFLECTIONS": 1,
+        "REFLECTION_SIZE": 308850,
+        "REFLECTION_SIZE_RAW": 2256925,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 99,
+        "FILES_KEPT": 1,
+        "PRUNE_DURATION_MS": 7.168,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read_pruned_files": 99,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_lite"
+      },
+      "metrics": {
+        "query": "SELECT COUNT(*) AS matched_rows FROM perf_read_full WHERE event_id = 5161470",
+        "predicate": "event_id = 5161470"
+      },
+      "expectations": {
+        "files_kept_within_bound": {
+          "ok": true,
+          "actual": 1,
+          "expected": "<= 1"
+        },
+        "prune_arithmetic": {
+          "ok": true,
+          "actual": 100,
+          "expected": "before == pruned + kept"
+        }
+      }
+    },
+    {
+      "id": "prune_no_predicate",
+      "description": "pruning control: with no predicate nothing may be pruned \u2014 guards against over-eager pruning",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 5,
+        "min": 160.299,
+        "p50": 173.414,
+        "p95": 383.836,
+        "max": 383.836,
+        "mean": 222.168,
+        "stdev": 93.2
+      },
+      "rows": 1,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "matched_rows"
+        ],
+        "row_count": 1,
+        "digest": "dada06bcd33aa7b61653728f89c4ac157718f052281c41c024baa53a8a498524"
+      },
+      "plan": {
+        "REFLECTIONS": 100,
+        "REFLECTION_SIZE": 225516134,
+        "REFLECTION_SIZE_RAW": 225516134,
+        "FILES_BEFORE_PRUNE": 100,
+        "FILES_PRUNED": 0,
+        "FILES_KEPT": 100,
+        "PRUNE_DURATION_MS": 0.017,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb_pro"
+      },
+      "metrics": {
+        "query": "SELECT COUNT(*) AS matched_rows FROM perf_read_full WHERE 1 = 1",
+        "predicate": "1 = 1"
+      },
+      "expectations": {
+        "files_kept_within_bound": {
+          "ok": true,
+          "actual": 100,
+          "expected": "<= 100"
+        },
+        "prune_arithmetic": {
+          "ok": true,
+          "actual": 100,
+          "expected": "before == pruned + kept"
+        }
+      }
+    }
+  ],
+  "schema_version": 2
+}

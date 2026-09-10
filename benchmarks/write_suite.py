@@ -152,19 +152,72 @@ class ThreadOutcome:
     rows: int = 0
     errors: int = 0
     first_error: str = ""
+    setup_ms: float = 0.0
     latencies_ms: List[float] = field(default_factory=list)
+
+
+class _StartGate:
+    """Hold every writer at the line until all of them are constructed.
+
+    Building a ``DataWriter`` touches storage and the catalog, and doing it
+    inside the timed window makes slow setup indistinguishable from slow
+    writing: a thread whose construction outlives the deadline reports zero
+    rows and zero errors, which reads as "the engine did nothing" when it
+    actually means "the clock ran out before this thread was ready".  The
+    deadline is therefore started by the last thread to finish setting up.
+    """
+
+    def __init__(self, parties: int, duration_s: float) -> None:
+        self.deadline = 0.0
+        self.duration_s = duration_s
+        self.started_at = 0.0
+        self.barrier = threading.Barrier(parties, action=self._begin)
+
+    def _begin(self) -> None:
+        self.started_at = time.perf_counter()
+        self.deadline = self.started_at + self.duration_s
+
+    def wait(self) -> float:
+        try:
+            self.barrier.wait()
+        except threading.BrokenBarrierError:
+            # A peer failed to set up.  Measure the remaining threads rather
+            # than hanging the whole phase on a party that will never arrive.
+            if not self.deadline:
+                self._begin()
+        return self.deadline
+
+    def abandon(self) -> None:
+        """Release peers waiting on a thread that will never reach the line."""
+        self.barrier.abort()
+        if not self.deadline:
+            self._begin()
 
 
 def _throughput_worker(
     thread_index: int,
     table: str,
-    deadline: float,
+    gate: "_StartGate",
     key_base: int,
     batch_bounds: Tuple[int, int],
     outcome: ThreadOutcome,
 ) -> None:
-    """Write batches until the deadline, recording per-batch latency."""
-    writer = _writer()                            # one writer per thread
+    """Write batches until the shared deadline, recording per-batch latency."""
+    setup_started = time.perf_counter()
+    try:
+        writer = _writer()                        # one writer per thread
+    except BaseException as exc:
+        # A thread that dies constructing its writer would otherwise report
+        # zero rows and zero errors — indistinguishable from an engine that
+        # simply did no work.  Record it, and still release the barrier so the
+        # remaining threads are not left waiting for a party that never comes.
+        outcome.setup_ms = (time.perf_counter() - setup_started) * 1000.0
+        outcome.errors += 1
+        outcome.first_error = f"writer setup failed: {type(exc).__name__}: {exc}"
+        gate.abandon()
+        return
+    outcome.setup_ms = (time.perf_counter() - setup_started) * 1000.0
+    deadline = gate.wait()                        # clock starts once all are ready
     rng = random.Random(1000 + thread_index)
     next_key = key_base
     while time.perf_counter() < deadline:
@@ -195,21 +248,20 @@ def parallel_distinct_tables(
         drop_table(table)
 
     outcomes = [ThreadOutcome(thread=i, table=tables[i]) for i in range(threads)]
-    deadline = time.perf_counter() + duration_s
+    gate = _StartGate(threads, duration_s)
     workers = [
         threading.Thread(
             target=_throughput_worker,
-            args=(i, tables[i], deadline, i * 50_000_000, batch_bounds, outcomes[i]),
+            args=(i, tables[i], gate, i * 50_000_000, batch_bounds, outcomes[i]),
             name=f"perf-write-{i}",
         )
         for i in range(threads)
     ]
-    started = time.perf_counter()
     for worker in workers:
         worker.start()
     for worker in workers:
         worker.join()
-    elapsed = time.perf_counter() - started
+    elapsed = time.perf_counter() - gate.started_at
 
     per_table: Dict[str, Any] = {}
     checks: Dict[str, Any] = {}
@@ -227,6 +279,10 @@ def parallel_distinct_tables(
             "batches": outcome.batches,
             "errors": outcome.errors,
             "first_error": outcome.first_error,
+            # Writer construction, excluded from the timed window but recorded:
+            # a thread that takes seconds to reach the start line is telling
+            # you something about concurrent setup cost.
+            "setup_ms": round(outcome.setup_ms, 1),
             "rows_per_second": round(outcome.rows / elapsed, 1) if elapsed else 0,
             "batch_latency_ms": summarize_ms(outcome.latencies_ms),
         }
@@ -253,6 +309,7 @@ def parallel_distinct_tables(
             "total_rows_written": total_written,
             "total_rows_observed": total_observed,
             "total_rows_per_second": round(total_written / elapsed, 1) if elapsed else 0,
+            "setup_ms": summarize_ms([o.setup_ms for o in outcomes]),
             "per_table": per_table,
         },
         "rows": total_written,
@@ -273,21 +330,20 @@ def parallel_same_table(
     drop_table(table)
 
     outcomes = [ThreadOutcome(thread=i, table=table) for i in range(threads)]
-    deadline = time.perf_counter() + duration_s
+    gate = _StartGate(threads, duration_s)
     workers = [
         threading.Thread(
             target=_throughput_worker,
-            args=(i, table, deadline, i * 50_000_000, batch_bounds, outcomes[i]),
+            args=(i, table, gate, i * 50_000_000, batch_bounds, outcomes[i]),
             name=f"perf-shared-{i}",
         )
         for i in range(threads)
     ]
-    started = time.perf_counter()
     for worker in workers:
         worker.start()
     for worker in workers:
         worker.join()
-    elapsed = time.perf_counter() - started
+    elapsed = time.perf_counter() - gate.started_at
 
     written = sum(o.rows for o in outcomes)
     errors = sum(o.errors for o in outcomes)
@@ -308,9 +364,11 @@ def parallel_same_table(
         "distinct_keys": distinct,
         "total_rows_per_second": round(written / elapsed, 1) if elapsed else 0,
         "batch_latency_ms": summarize_ms(all_latencies),
+        "setup_ms": summarize_ms([o.setup_ms for o in outcomes]),
         "per_thread": [
             {"thread": o.thread, "batches": o.batches, "rows": o.rows,
-             "errors": o.errors, "first_error": o.first_error}
+             "errors": o.errors, "first_error": o.first_error,
+             "setup_ms": round(o.setup_ms, 1)}
             for o in outcomes
         ],
     }

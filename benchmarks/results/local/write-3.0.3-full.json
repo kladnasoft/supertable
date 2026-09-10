@@ -1,0 +1,611 @@
+{
+  "suite": "write",
+  "profile": "local",
+  "scale": "full",
+  "started_at": "2026-09-10T14:58:04.347392+00:00",
+  "finished_at": "2026-09-10T15:01:34.054641+00:00",
+  "duration_s": 209.71,
+  "environment": {
+    "profile": "local",
+    "supertable_version": "3.0.3",
+    "git_commit": "b8d7670dbc50c7459c6e61c915ef013bb0c09278",
+    "git_describe": "v3.0.1-4-gb8d7670-dirty",
+    "git_dirty": true,
+    "python": "3.10.12",
+    "duckdb": "1.5.4",
+    "polars": "1.42.1",
+    "pyarrow": "18.1.0",
+    "numpy": "2.2.6",
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "processor": "x86_64",
+    "cpu_count": 8,
+    "total_ram_gb": 15.6,
+    "storage_type": "LOCAL"
+  },
+  "dataset": {},
+  "scenarios": [
+    {
+      "id": "parallel_8_distinct_tables",
+      "description": "8 threads writing 1000-10000 row batches to their OWN tables for 60s; per-table and total ingest",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 1,
+        "min": 63757.35,
+        "p50": 63757.35,
+        "p95": 63757.35,
+        "max": 63757.35,
+        "mean": 63757.35,
+        "stdev": 0.0
+      },
+      "rows": 1835043,
+      "seal": null,
+      "plan": {},
+      "metrics": {
+        "threads": 8,
+        "duration_s": 60.87,
+        "batch_rows_min": 1000,
+        "batch_rows_max": 10000,
+        "total_rows_written": 1835043,
+        "total_rows_observed": 1835043,
+        "total_rows_per_second": 30148.9,
+        "setup_ms": {
+          "n": 8,
+          "min": 9.71,
+          "p50": 35.925,
+          "p95": 44.298,
+          "max": 44.298,
+          "mean": 31.61,
+          "stdev": 11.445
+        },
+        "per_table": {
+          "perf_write_par_0": {
+            "rows_written": 245973,
+            "rows_observed": 245973,
+            "batches": 43,
+            "errors": 0,
+            "first_error": "",
+            "setup_ms": 9.7,
+            "rows_per_second": 4041.2,
+            "batch_latency_ms": {
+              "n": 43,
+              "min": 588.274,
+              "p50": 1448.723,
+              "p95": 2163.147,
+              "max": 2406.809,
+              "mean": 1391.765,
+              "stdev": 457.233
+            }
+          },
+          "perf_write_par_1": {
+            "rows_written": 211542,
+            "rows_observed": 211542,
+            "batches": 43,
+            "errors": 0,
+            "first_error": "",
+            "setup_ms": 44.3,
+            "rows_per_second": 3475.5,
+            "batch_latency_ms": {
+              "n": 43,
+              "min": 481.897,
+              "p50": 1413.296,
+              "p95": 2093.073,
+              "max": 2474.524,
+              "mean": 1390.492,
+              "stdev": 491.709
+            }
+          },
+          "perf_write_par_2": {
+            "rows_written": 222798,
+            "rows_observed": 222798,
+            "batches": 42,
+            "errors": 0,
+            "first_error": "",
+            "setup_ms": 39.1,
+            "rows_per_second": 3660.5,
+            "batch_latency_ms": {
+              "n": 42,
+              "min": 489.417,
+              "p50": 1327.492,
+              "p95": 2265.225,
+              "max": 2493.904,
+              "mean": 1413.669,
+              "stdev": 542.116
+            }
+          },
+          "perf_write_par_3": {
+            "rows_written": 257004,
+            "rows_observed": 257004,
+            "batches": 42,
+            "errors": 0,
+            "first_error": "",
+            "setup_ms": 23.7,
+            "rows_per_second": 4222.5,
+            "batch_latency_ms": {
+              "n": 42,
+              "min": 571.188,
+              "p50": 1375.826,
+              "p95": 2142.863,
+              "max": 2331.368,
+              "mean": 1416.519,
+              "stdev": 465.709
+            }
+          },
+          "perf_write_par_4": {
+            "rows_written": 227200,
+            "rows_observed": 227200,
+            "batches": 43,
+            "errors": 0,
+            "first_error": "",
+            "setup_ms": 35.9,
+            "rows_per_second": 3732.8,
+            "batch_latency_ms": {
+              "n": 43,
+              "min": 451.556,
+              "p50": 1410.094,
+              "p95": 2231.516,
+              "max": 2341.877,
+              "mean": 1387.988,
+              "stdev": 483.009
+            }
+          },
+          "perf_write_par_5": {
+            "rows_written": 245641,
+            "rows_observed": 245641,
+            "batches": 42,
+            "errors": 0,
+            "first_error": "",
+            "setup_ms": 40.9,
+            "rows_per_second": 4035.8,
+            "batch_latency_ms": {
+              "n": 42,
+              "min": 605.716,
+              "p50": 1319.319,
+              "p95": 2190.024,
+              "max": 2490.516,
+              "mean": 1410.683,
+              "stdev": 504.992
+            }
+          },
+          "perf_write_par_6": {
+            "rows_written": 219441,
+            "rows_observed": 219441,
+            "batches": 42,
+            "errors": 0,
+            "first_error": "",
+            "setup_ms": 24.8,
+            "rows_per_second": 3605.3,
+            "batch_latency_ms": {
+              "n": 42,
+              "min": 464.868,
+              "p50": 1372.046,
+              "p95": 2244.734,
+              "max": 2277.254,
+              "mean": 1410.63,
+              "stdev": 505.526
+            }
+          },
+          "perf_write_par_7": {
+            "rows_written": 205444,
+            "rows_observed": 205444,
+            "batches": 43,
+            "errors": 0,
+            "first_error": "",
+            "setup_ms": 34.3,
+            "rows_per_second": 3375.3,
+            "batch_latency_ms": {
+              "n": 43,
+              "min": 602.049,
+              "p50": 1365.197,
+              "p95": 2236.168,
+              "max": 2339.378,
+              "mean": 1390.769,
+              "stdev": 484.836
+            }
+          }
+        }
+      },
+      "expectations": {
+        "perf_write_par_0_rows_match": {
+          "ok": true,
+          "actual": 245973,
+          "expected": 245973
+        },
+        "perf_write_par_0_no_errors": {
+          "ok": true,
+          "actual": 0,
+          "expected": 0
+        },
+        "perf_write_par_1_rows_match": {
+          "ok": true,
+          "actual": 211542,
+          "expected": 211542
+        },
+        "perf_write_par_1_no_errors": {
+          "ok": true,
+          "actual": 0,
+          "expected": 0
+        },
+        "perf_write_par_2_rows_match": {
+          "ok": true,
+          "actual": 222798,
+          "expected": 222798
+        },
+        "perf_write_par_2_no_errors": {
+          "ok": true,
+          "actual": 0,
+          "expected": 0
+        },
+        "perf_write_par_3_rows_match": {
+          "ok": true,
+          "actual": 257004,
+          "expected": 257004
+        },
+        "perf_write_par_3_no_errors": {
+          "ok": true,
+          "actual": 0,
+          "expected": 0
+        },
+        "perf_write_par_4_rows_match": {
+          "ok": true,
+          "actual": 227200,
+          "expected": 227200
+        },
+        "perf_write_par_4_no_errors": {
+          "ok": true,
+          "actual": 0,
+          "expected": 0
+        },
+        "perf_write_par_5_rows_match": {
+          "ok": true,
+          "actual": 245641,
+          "expected": 245641
+        },
+        "perf_write_par_5_no_errors": {
+          "ok": true,
+          "actual": 0,
+          "expected": 0
+        },
+        "perf_write_par_6_rows_match": {
+          "ok": true,
+          "actual": 219441,
+          "expected": 219441
+        },
+        "perf_write_par_6_no_errors": {
+          "ok": true,
+          "actual": 0,
+          "expected": 0
+        },
+        "perf_write_par_7_rows_match": {
+          "ok": true,
+          "actual": 205444,
+          "expected": 205444
+        },
+        "perf_write_par_7_no_errors": {
+          "ok": true,
+          "actual": 0,
+          "expected": 0
+        }
+      }
+    },
+    {
+      "id": "parallel_4_same_table",
+      "description": "4 threads contending on ONE table for 60s; row count and key uniqueness verified",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 1,
+        "min": 61779.096,
+        "p50": 61779.096,
+        "p95": 61779.096,
+        "max": 61779.096,
+        "mean": 61779.096,
+        "stdev": 0.0
+      },
+      "rows": 1690114,
+      "seal": null,
+      "plan": {},
+      "metrics": {
+        "threads": 4,
+        "duration_s": 60.85,
+        "rows_written": 1690114,
+        "rows_observed": 1690114,
+        "distinct_keys": 1690114,
+        "total_rows_per_second": 27774.0,
+        "batch_latency_ms": {
+          "n": 307,
+          "min": 52.921,
+          "p50": 552.385,
+          "p95": 2386.063,
+          "max": 4009.603,
+          "mean": 781.784,
+          "stdev": 785.311
+        },
+        "setup_ms": {
+          "n": 4,
+          "min": 6.87,
+          "p50": 9.329,
+          "p95": 15.267,
+          "max": 15.267,
+          "mean": 9.7,
+          "stdev": 3.861
+        },
+        "per_thread": [
+          {
+            "thread": 0,
+            "batches": 61,
+            "rows": 358799,
+            "errors": 0,
+            "first_error": "",
+            "setup_ms": 6.9
+          },
+          {
+            "thread": 1,
+            "batches": 91,
+            "rows": 482572,
+            "errors": 0,
+            "first_error": "",
+            "setup_ms": 15.3
+          },
+          {
+            "thread": 2,
+            "batches": 80,
+            "rows": 400959,
+            "errors": 0,
+            "first_error": "",
+            "setup_ms": 9.3
+          },
+          {
+            "thread": 3,
+            "batches": 75,
+            "rows": 447784,
+            "errors": 0,
+            "first_error": "",
+            "setup_ms": 7.3
+          }
+        ]
+      },
+      "expectations": {
+        "rows_match": {
+          "ok": true,
+          "actual": 1690114,
+          "expected": 1690114
+        },
+        "no_duplicate_keys": {
+          "ok": true,
+          "actual": 1690114,
+          "expected": 1690114
+        },
+        "no_write_errors": {
+          "ok": true,
+          "actual": 0,
+          "expected": 0
+        }
+      }
+    },
+    {
+      "id": "serial_append_only",
+      "description": "single-threaded append for 60s \u2014 uncontended baseline",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 1,
+        "min": 60642.393,
+        "p50": 60642.393,
+        "p95": 60642.393,
+        "max": 60642.393,
+        "mean": 60642.393,
+        "stdev": 0.0
+      },
+      "rows": 1595000,
+      "seal": null,
+      "plan": {},
+      "metrics": {
+        "duration_s": 60.11,
+        "batch_rows": 5000,
+        "batches": 319,
+        "rows_written": 1595000,
+        "rows_observed": 1595000,
+        "rows_per_second": 26534.3,
+        "write_latency_ms": {
+          "n": 319,
+          "min": 68.266,
+          "p50": 154.982,
+          "p95": 270.332,
+          "max": 2681.252,
+          "mean": 183.854,
+          "stdev": 233.858
+        },
+        "errors": 0,
+        "first_error": ""
+      },
+      "expectations": {
+        "rows_match": {
+          "ok": true,
+          "actual": 1595000,
+          "expected": 1595000
+        },
+        "no_write_errors": {
+          "ok": true,
+          "actual": 0,
+          "expected": 0
+        }
+      }
+    },
+    {
+      "id": "lifecycle_append_delete_update_sealed",
+      "description": "fixed deterministic append + delete + update, then hash the table \u2014 the cross-version correctness seal",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 1,
+        "min": 2420.972,
+        "p50": 2420.972,
+        "p95": 2420.972,
+        "max": 2420.972,
+        "mean": 2420.972,
+        "stdev": 0.0
+      },
+      "rows": 17142,
+      "seal": {
+        "algorithm": "sha256/unordered-v2",
+        "columns": [
+          "amount",
+          "category",
+          "quantity",
+          "record_id",
+          "revision"
+        ],
+        "row_count": 17142,
+        "digest": "e8e2cde88db78f0ff9e8aa63194d0ddf5222ea677b406e166e6c6a2d3070dfcd"
+      },
+      "plan": {},
+      "metrics": {
+        "seed_rows": 20000,
+        "deleted_keys": 2858,
+        "deleted_reported": 2858,
+        "updated_keys": 3429,
+        "rows_after_append": 20000,
+        "rows_after_delete": 17142,
+        "rows_after_update": 17142,
+        "timings": {
+          "append_ms": 110.143,
+          "delete_ms": 95.367,
+          "update_ms": 189.494
+        }
+      },
+      "expectations": {
+        "rows_after_append": {
+          "ok": true,
+          "actual": 20000,
+          "expected": 20000
+        },
+        "rows_after_delete": {
+          "ok": true,
+          "actual": 17142,
+          "expected": 17142
+        },
+        "update_preserves_row_count": {
+          "ok": true,
+          "actual": 17142,
+          "expected": 17142
+        },
+        "deleted_rows_gone": {
+          "ok": true,
+          "actual": true,
+          "expected": true
+        },
+        "updated_rows_carry_new_revision": {
+          "ok": true,
+          "actual": 3429,
+          "expected": 3429
+        }
+      }
+    },
+    {
+      "id": "small_write_latency",
+      "description": "many single-row writes \u2014 per-write fixed cost, where PUT and warmup overhead dominate",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 1,
+        "min": 18021.562,
+        "p50": 18021.562,
+        "p95": 18021.562,
+        "max": 18021.562,
+        "mean": 18021.562,
+        "stdev": 0.0
+      },
+      "rows": 100,
+      "seal": null,
+      "plan": {},
+      "metrics": {
+        "writes": 100,
+        "rows_observed": 100,
+        "write_latency_ms": {
+          "n": 100,
+          "min": 65.161,
+          "p50": 164.588,
+          "p95": 279.117,
+          "max": 1252.078,
+          "mean": 177.38,
+          "stdev": 124.24
+        }
+      },
+      "expectations": {
+        "rows_match": {
+          "ok": true,
+          "actual": 100,
+          "expected": 100
+        }
+      }
+    },
+    {
+      "id": "large_batch_write",
+      "description": "one large append \u2014 per-row cost with fixed cost amortised away",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 1,
+        "min": 1493.337,
+        "p50": 1493.337,
+        "p95": 1493.337,
+        "max": 1493.337,
+        "mean": 1493.337,
+        "stdev": 0.0
+      },
+      "rows": 500000,
+      "seal": null,
+      "plan": {},
+      "metrics": {
+        "rows": 500000,
+        "elapsed_ms": 640.96,
+        "rows_per_second": 780080.4
+      },
+      "expectations": {
+        "rows_match": {
+          "ok": true,
+          "actual": 500000,
+          "expected": 500000
+        }
+      }
+    },
+    {
+      "id": "upsert_existing_keys",
+      "description": "rewrite every existing key (merge-on-read); row count must stay flat",
+      "status": "ok",
+      "error": null,
+      "timings_ms": {
+        "n": 1,
+        "min": 1501.583,
+        "p50": 1501.583,
+        "p95": 1501.583,
+        "max": 1501.583,
+        "mean": 1501.583,
+        "stdev": 0.0
+      },
+      "rows": 100000,
+      "seal": null,
+      "plan": {},
+      "metrics": {
+        "rows": 100000,
+        "rows_before": 100000,
+        "rows_after": 100000,
+        "upsert_ms": 532.876
+      },
+      "expectations": {
+        "row_count_stable": {
+          "ok": true,
+          "actual": 100000,
+          "expected": 100000
+        },
+        "all_rows_revised": {
+          "ok": true,
+          "actual": 100000,
+          "expected": 100000
+        }
+      }
+    }
+  ],
+  "schema_version": 2
+}
