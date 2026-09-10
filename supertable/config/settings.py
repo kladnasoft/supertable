@@ -119,12 +119,12 @@ class Settings:
     MAX_TOMBSTONE_ROWS: int = 1_000_000            # MAX_TOMBSTONE_ROWS
     DEFAULT_TIMEOUT_SEC: int = 60                  # DEFAULT_TIMEOUT_SEC
     DEFAULT_LOCK_DURATION_SEC: int = 30            # DEFAULT_LOCK_DURATION_SEC
-    IS_SHOW_TIMING: bool = False                   # IS_SHOW_TIMING
+    IS_SHOW_TIMING: bool = True                    # IS_SHOW_TIMING
 
     # ── Storage ──────────────────────────────────────────────────────
     STORAGE_TYPE: str = "LOCAL"                  # STORAGE_TYPE
     STORAGE_BUCKET: str = "supertable"           # STORAGE_BUCKET  (unified default)
-    STORAGE_REGION: str = "eu-central-1"         # STORAGE_REGION  (unified default)
+    STORAGE_REGION: str = "us-east-1"            # STORAGE_REGION  (unified default)
     STORAGE_ENDPOINT_URL: str = ""               # STORAGE_ENDPOINT_URL
     STORAGE_ACCESS_KEY: str = ""                 # STORAGE_ACCESS_KEY
     STORAGE_SECRET_KEY: str = ""                 # STORAGE_SECRET_KEY
@@ -492,7 +492,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_DUCKDB_IO_MULTIPLIER=_env_int("SUPERTABLE_DUCKDB_IO_MULTIPLIER", 3),
         SUPERTABLE_DUCKDB_HTTP_TIMEOUT=_env_str("SUPERTABLE_DUCKDB_HTTP_TIMEOUT"),
         SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE=_env_bool("SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE", True),
-        SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE=_env_str("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE"),
+        SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE=_env_str("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE", "5GB"),
         SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR=_env_str("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR"),
         SUPERTABLE_DUCKDB_MATERIALIZE=_env_str("SUPERTABLE_DUCKDB_MATERIALIZE", "view"),
         SUPERTABLE_DUCKDB_PRESIGNED=_env_bool("SUPERTABLE_DUCKDB_PRESIGNED", False),
