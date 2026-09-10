@@ -150,6 +150,8 @@ class DataEstimator:
         # identical — this switch is what lets a test assert that instead of
         # trusting it.  It is a correctness escape hatch, not a tuning knob.
         self.fullscan = bool(fullscan)
+        # Lazily-built key→path resolver; see _to_duckdb_path.
+        self._resolve_plan = None
         self.catalog = RedisCatalog()
 
     def _schema_to_dict(self, schema_obj) -> Dict[str, str]:
@@ -244,6 +246,162 @@ class DataEstimator:
         return val in ("1", "true", "yes", "on")
 
     def _to_duckdb_path(self, key: str) -> str:
+        """
+        Resolve a storage key to a usable path for DuckDB.
+        If SUPERTABLE_DUCKDB_PRESIGNED=1, presign with an **object key** (never pass a URL to presign).
+
+        Resolution is planned once per estimate, not once per file.  Only
+        ``key`` varies across the loop: whether presigning is on, which storage
+        helper works, and the endpoint/bucket/scheme are properties of the
+        storage object and settings, identical for every file in the query.
+        Re-deriving them per file cost 22.1ms/query — 11.7% of read wall on a
+        100-file scan — and on LOCAL storage the helper probe raised
+        ``NotImplementedError`` for every file, paying to build, raise, catch
+        and log an exception 100 times to reach the same fallback.
+
+        The plan is discovered by running the real chain on the first key and
+        remembering which branch answered, so behaviour is unchanged: the same
+        branch order, the same fallbacks, the same result.
+        """
+        if not key:
+            return key
+
+        # getattr rather than attribute access: DataEstimator is constructed via
+        # __new__ in several tests, which skips __init__ and its field defaults.
+        plan = getattr(self, "_resolve_plan", None)
+        if plan is None:
+            # The probe resolves this key as a side effect; reuse its answer so
+            # the first file is never resolved twice.
+            plan, probed = self._build_resolve_plan(key)
+            self._resolve_plan = plan
+            return probed
+        return plan(key)
+
+    def _build_resolve_plan(self, probe_key: str):
+        """Return ``(plan, answer_for_probe_key)``, probing with a real key."""
+        # 1) Presigning is genuinely per-key: it stays a live call. Only the
+        #    "is it available" question is answered once.
+        if settings.SUPERTABLE_DUCKDB_PRESIGNED:
+            presign_fn = getattr(self.storage, "presign", None)
+            if callable(presign_fn):
+                # `presign` is defined on the base class and raises
+                # NotImplementedError on backends that cannot presign (LOCAL is
+                # one). That is a property of the backend, not of the key, so it
+                # is settled once: probing per key meant 100 exceptions AND 100
+                # WARNING lines per query — logged at warning level, so it hit
+                # production logs too, not just DEBUG runs.
+                #
+                # Only NotImplementedError is treated as permanent. Any other
+                # presign failure may be transient (expired credentials, a
+                # throttled call), so those keep the original per-key retry.
+                probed = None
+                permanent = False
+                try:
+                    url = presign_fn(probe_key)
+                    if isinstance(url, str) and url:
+                        probed = url
+                except NotImplementedError:
+                    permanent = True
+                except Exception as e:
+                    logger.warning(
+                        f"[estimate.resolve] presign failed; falling back: {e}"
+                    )
+
+                if not permanent:
+                    def _presign_plan(k: str) -> str:
+                        try:
+                            url = presign_fn(k)
+                            if isinstance(url, str) and url:
+                                return url
+                        except Exception as e:
+                            logger.warning(
+                                f"[estimate.resolve] presign failed; falling back: {e}"
+                            )
+                        return self._resolve_unsigned(k)
+
+                    if probed is None:
+                        probed = self._resolve_unsigned(probe_key)
+                    return _presign_plan, probed
+
+                logger.debug(
+                    f"[estimate.resolve] {type(self.storage).__name__} cannot "
+                    f"presign; resolving unsigned"
+                )
+
+        return self._resolve_unsigned, self._resolve_unsigned(probe_key)
+
+    def _resolve_unsigned(self, key: str):
+        """Steps 2–5, with the winning branch memoized after the first key."""
+        # 2) Already a URL — a property of the key, so checked every time.
+        if "://" in key:
+            return key
+
+        plan = getattr(self, "_unsigned_plan", None)
+        if plan is None:
+            # The probe already resolved this key; returning its answer avoids
+            # resolving the first key twice, which for a working remote helper
+            # would be a duplicated network call.
+            plan, probed = self._build_unsigned_plan(key)
+            self._unsigned_plan = plan
+            return probed
+        return plan(key)
+
+    def _build_unsigned_plan(self, probe_key: str):
+        """Return ``(plan, answer_for_probe_key)``."""
+        # 3) storage helpers — probe each in order, exactly as before. A helper
+        #    that raises here raises for every key (it is unimplemented, not
+        #    key-dependent), so the failure is learned once.
+        for attr in ("to_duckdb_path", "make_duckdb_url", "make_url"):
+            fn = getattr(self.storage, attr, None)
+            if callable(fn):
+                try:
+                    url = fn(probe_key)
+                    if isinstance(url, str) and url:
+                        logger.info(f"[estimate.resolve] storage.{attr} → {url}")
+
+                        def _helper_plan(k: str, _fn=fn, _attr=attr) -> str:
+                            try:
+                                out = _fn(k)
+                                if isinstance(out, str) and out:
+                                    return out
+                            except Exception as e:
+                                logger.debug(
+                                    f"[estimate.resolve] storage.{_attr} failed: {e}"
+                                )
+                            return self._build_url(k)
+
+                        return _helper_plan, url
+                except Exception as e:
+                    logger.debug(f"[estimate.resolve] storage.{attr} failed: {e}")
+
+        # 4/5) No helper answered: the URL shape is fixed for the whole query.
+        endpoint_raw = self._detect_endpoint()
+        bucket = self._detect_bucket()
+        use_http = settings.SUPERTABLE_DUCKDB_USE_HTTPFS
+        scheme = "https" if self._detect_ssl() else "http"
+
+        if not (endpoint_raw and bucket):
+            return (lambda k: k), probe_key          # step 5 fallback
+        if use_http:
+            prefix = f"{scheme}://{endpoint_raw.rstrip('/')}/{bucket}/"
+        else:
+            prefix = f"s3://{bucket}/"
+        plan = lambda k: prefix + k.lstrip("/")
+        return plan, plan(probe_key)
+
+    def _build_url(self, key: str) -> str:
+        """Steps 4–5 for a single key, when a helper fails mid-query."""
+        endpoint_raw = self._detect_endpoint()
+        bucket = self._detect_bucket()
+        scheme = "https" if self._detect_ssl() else "http"
+        key_norm = key.lstrip("/")
+        if endpoint_raw and bucket:
+            if settings.SUPERTABLE_DUCKDB_USE_HTTPFS:
+                return f"{scheme}://{endpoint_raw.rstrip('/')}/{bucket}/{key_norm}"
+            return f"s3://{bucket}/{key_norm}"
+        return key
+
+    def _to_duckdb_path_uncached(self, key: str) -> str:
         """
         Resolve a storage key to a usable path for DuckDB.
         If SUPERTABLE_DUCKDB_PRESIGNED=1, presign with an **object key** (never pass a URL to presign).

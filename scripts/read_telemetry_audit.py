@@ -89,6 +89,23 @@ def install() -> None:
     if hasattr(est, "prune_files_by_predicates"):
         _wrap(est, "prune_files_by_predicates", "prune", on_return=rec_prune)
     _wrap(proc, "load_stats", "stats_load")
+    # Inside estimate: what is the 18.8% actually doing? Pruning is only a
+    # sliver of it, so break out path resolution, projection sizing and
+    # snapshot filtering separately.
+    for meth, label in (("_to_duckdb_path", "est.path_resolve"),
+                        ("_projected_bytes_index", "est.proj_index"),
+                        ("_selected_columns", "est.sel_cols"),
+                        ("_ratio_bytes", "est.ratio_bytes"),
+                        ("_filter_snapshots", "est.filter_snap"),
+                        ("_get_supertable_map", "est.super_map"),
+                        ("_schema_to_dict", "est.schema_dict")):
+        if hasattr(est.DataEstimator, meth):
+            if meth == "_to_duckdb_path":
+                def _cnt(a, k, out):
+                    COUNTS["path_calls"] = COUNTS.get("path_calls", 0) + 1
+                _wrap(est.DataEstimator, meth, label, on_return=_cnt)
+            else:
+                _wrap(est.DataEstimator, meth, label)
     _wrap(ac, "restrict_read_access", "rbac")
 
     for mod, cls_name, tag in ((duck, "DuckDBEngine", "duckdb"),):
