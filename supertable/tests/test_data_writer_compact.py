@@ -36,6 +36,21 @@ _P_REDIS_CAT     = f"{_MOD}.RedisCatalog"
 _P_COMPACT_RES   = f"{_MOD}.compact_resources"
 _P_COMPACT_TOMB  = f"{_MOD}.compact_tombstones"
 _P_READ_PARQUET  = f"{_MOD}._read_parquet_safe"
+
+
+def _as_parquet_bytes(arrow_tbl) -> bytes:
+    """Encode an Arrow table to parquet bytes.
+
+    ``_build_compact_model_df`` derives the post-compaction schema from the
+    file FOOTER (``storage.read_bytes`` + ``pq.read_metadata``) rather than
+    decoding the whole file, so these tests hand it real parquet bytes.
+    """
+    import io as _io
+    import pyarrow.parquet as _pq
+    buf = _io.BytesIO()
+    _pq.write_table(arrow_tbl, buf)
+    return buf.getvalue()
+
 _P_MIRROR        = f"{_MOD}.MirrorFormats"
 _P_MON_WRITER    = f"{_MOD}.MonitoringWriter"
 _P_AUDIT         = f"{_MOD}._audit_emit"
@@ -739,7 +754,7 @@ class TestSchemaPreservation:
             "amount": pa.array([1.1, 2.2, 3.3], type=pa.float64()),
             "ok": pa.array([True, False, True], type=pa.bool_()),
         })
-        dw.super_table.storage.read_parquet.return_value = arrow_tbl
+        dw.super_table.storage.read_bytes.return_value = _as_parquet_bytes(arrow_tbl)
 
         snap = _snapshot([_resource("a"), _resource("b")])
         mock_simple = _mk_simple_mock(snap)
@@ -786,7 +801,7 @@ class TestSchemaPreservation:
         dw = _build_writer()
 
         # Storage.read_parquet raises — exercise the fallback
-        dw.super_table.storage.read_parquet.side_effect = RuntimeError("io fail")
+        dw.super_table.storage.read_bytes.side_effect = RuntimeError("io fail")
 
         # Snapshot with a real schema list (Spark-style entries)
         snap = {
@@ -840,7 +855,7 @@ class TestSchemaPreservation:
         fallback must reconstruct from that shape, including parameterised
         reprs like ``Datetime(time_unit='us', time_zone='UTC')``."""
         dw = _build_writer()
-        dw.super_table.storage.read_parquet.side_effect = RuntimeError("io fail")
+        dw.super_table.storage.read_bytes.side_effect = RuntimeError("io fail")
 
         snap = {
             "simple_name": "orders",
@@ -898,7 +913,7 @@ class TestSchemaPreservation:
         OVERWRITES the real schema with an empty one. Compaction never changes
         the logical schema, so preserving is always the correct fallback."""
         dw = _build_writer()
-        dw.super_table.storage.read_parquet.side_effect = RuntimeError("nope")
+        dw.super_table.storage.read_bytes.side_effect = RuntimeError("nope")
 
         snap = {
             "simple_name": "orders",
@@ -957,7 +972,8 @@ class TestSchemaPreservation:
         })
 
         # Storage.read_parquet returns chunk1 for the first call, chunk2 for the second
-        dw.super_table.storage.read_parquet.side_effect = [chunk1_arrow, chunk2_arrow]
+        dw.super_table.storage.read_bytes.side_effect = [
+            _as_parquet_bytes(chunk1_arrow), _as_parquet_bytes(chunk2_arrow)]
 
         snap = _snapshot([_resource("a"), _resource("b"), _resource("c")])
         mock_simple = _mk_simple_mock(snap)
@@ -1027,10 +1043,10 @@ class TestTwoPhaseAggregation:
     ):
         dw = _build_writer()
 
-        # Storage.read_parquet returns an arrow table for schema derivation
+        # Footer bytes for schema derivation
         import pyarrow as pa
-        dw.super_table.storage.read_parquet.return_value = pa.table(
-            {"id": pa.array([1], type=pa.int64())}
+        dw.super_table.storage.read_bytes.return_value = _as_parquet_bytes(
+            pa.table({"id": pa.array([1], type=pa.int64())})
         )
 
         # Snapshot has A, B, C plus a non-empty deletion-vector.
@@ -1104,8 +1120,8 @@ class TestTwoPhaseAggregation:
         dw = _build_writer()
 
         import pyarrow as pa
-        dw.super_table.storage.read_parquet.return_value = pa.table(
-            {"id": pa.array([1], type=pa.int64())}
+        dw.super_table.storage.read_bytes.return_value = _as_parquet_bytes(
+            pa.table({"id": pa.array([1], type=pa.int64())})
         )
 
         snap = _snapshot(

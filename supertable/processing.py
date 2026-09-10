@@ -318,6 +318,25 @@ def prune_not_overlapping_files_by_threshold(
     return result
 
 
+# A merged file is written by accumulating SOURCE bytes up to
+# ``max_memory_chunk_size`` and then re-encoding them, so the output lands
+# *below* the very threshold that selected its inputs.  With "small" defined as
+# ``file_size < max_mem`` the fresh output immediately re-qualifies, and the
+# next small append drags the whole merged file through another full
+# read-rewrite cycle: ~35 MiB of I/O to absorb a 1.6 MiB append, forever.
+#
+# Hysteresis breaks the loop.  A file that already reached this fraction of the
+# chunk size is "big enough" and stops being a candidate, so a merge result is
+# final instead of being immediately re-merged.  Compaction exists to stop
+# small-file proliferation, not to drive every file to exactly max_mem.
+_COMPACTION_TARGET_RATIO = 0.75
+
+
+def _small_file_threshold(max_mem: int) -> int:
+    """Size below which a file still counts as "small" for compaction."""
+    return max(1, int(max_mem * _COMPACTION_TARGET_RATIO))
+
+
 def should_compact_small_files(
         resources: List[Dict],
         table_config: Optional[dict] = None,
@@ -335,10 +354,11 @@ def should_compact_small_files(
     ``file_size``).  Limits resolve per-table via ``_resolve_limits``.
     """
     max_mem, max_files = _resolve_limits(table_config)
+    threshold = _small_file_threshold(max_mem)
     small_sizes = [
         int(r.get("file_size") or 0)
         for r in (resources or [])
-        if r.get("file") and int(r.get("file_size") or 0) < max_mem
+        if r.get("file") and int(r.get("file_size") or 0) < threshold
     ]
     if not small_sizes:
         return False
@@ -492,16 +512,19 @@ def compact_resources(
     max_mem, _max_files = _resolve_limits(table_config)
 
     # Classify candidates. Per ``small_only``, a file is a compaction
-    # candidate when its ``file_size`` is < max_mem (small files create
-    # the small-file accumulation problem this method exists to fix).
+    # candidate while it is still under ``_small_file_threshold`` — the same
+    # hysteresis band ``should_compact_small_files`` gates on, so the gate and
+    # the candidate set can never disagree (a gate that opens on files this
+    # loop then skips would spin, re-firing every write with nothing to do).
     # When ``small_only=False`` every file is a candidate.
+    threshold = _small_file_threshold(max_mem)
     candidates: List[Tuple[str, int]] = []
     for resource in resources:
         file_path = resource.get("file")
         if not file_path:
             continue
         file_size = int(resource.get("file_size") or 0)
-        if small_only and file_size >= max_mem:
+        if small_only and file_size >= threshold:
             continue
         candidates.append((file_path, file_size))
 
@@ -680,19 +703,30 @@ def _write_single_parquet_file(
         with p.span("write.sort"):
             write_df = write_df.sort(sort_cols)
 
-    # Write to the active storage backend
+    # Write to the active storage backend.
+    #
+    # Encoding goes through polars' own writer rather than pyarrow's.  Both
+    # emit per-row-group min/max (so DuckDB still prunes row groups) and
+    # per-column compressed sizes (so the stats artifact still records them),
+    # and both round-trip byte-identical data — but polars encodes several
+    # times faster and produces substantially smaller files at the same zstd
+    # level.  Smaller files compound: less to read back during compaction,
+    # less to ship, fewer bytes for every later scan.
+    #
+    # The min/max land in the parquet ``min_value``/``max_value`` fields.
+    # DuckDB's reader prunes on those - verified empirically, ~8x on a narrow
+    # predicate over a 163-row-group file - even though its
+    # ``parquet_metadata()`` view only surfaces the deprecated ``min``/``max``
+    # columns and reports NULL for them.  Do not "fix" that NULL by reverting
+    # this; check pruning, not the metadata view.
     try:
-        with p.span("write.to_arrow"):
-            arrow_tbl: pa.Table = write_df.to_arrow()
         with p.span("write.parquet_encode"):
             buf = io.BytesIO()
-            pq.write_table(
-                arrow_tbl,
+            write_df.write_parquet(
                 buf,
                 compression="zstd",
                 compression_level=int(compression_level),
-                use_dictionary=True,
-                write_statistics=True,
+                statistics=True,
                 row_group_size=_PARQUET_ROW_GROUP_SIZE,
             )
             data = buf.getvalue()
@@ -713,6 +747,10 @@ def _write_single_parquet_file(
                     pass
         elif hasattr(_get_storage(), "write_parquet"):
             with p.span("write.upload_parquet"):
+                # Arrow is materialised only on this branch (no backend in the
+                # tree reaches it - every one defines write_bytes).
+                with p.span("write.to_arrow"):
+                    arrow_tbl: pa.Table = write_df.to_arrow()
                 _get_storage().write_parquet(arrow_tbl, new_parquet_path)
         else:
             with p.span("write.local_fallback"):
@@ -905,25 +943,33 @@ def _write_df_parquet(
         path: str,
         compression_level: int = 1,
         profiler: Optional[Profiler] = None,
+        label: str = "artifact",
 ) -> int:
     """Write a Polars DataFrame to a single parquet file on the active storage.
 
-    Minimal writer for system files (the tombstone deletion-vector) that need
-    no column statistics or Hive partitioning. Returns the file size in bytes.
+    Minimal writer for the immutable system artifacts (the tombstone
+    deletion-vector and the column-stats parquet). Returns the file size.
+
+    *label* names the encode span.  It is a parameter because this function
+    serves BOTH artifacts: a hardcoded span attributed the stats parquet's
+    encode time to the tombstone, which reads as "tombstones are expensive" on
+    an append-only workload that creates none.
     """
     p = profiler or get_null_profiler()
     data = None
     wrote_exact_bytes = False
     try:
-        with p.span("tombstone.encode"):
-            arrow_tbl = write_df.to_arrow()
+        with p.span(f"{label}.encode"):
+            # polars' own writer, not pyarrow's: several times faster and it
+            # emits markedly smaller files at the same zstd level, while still
+            # writing the per-row-group min/max DuckDB prunes on and the
+            # per-column compressed sizes the stats artifact records.
             buf = io.BytesIO()
-            pq.write_table(
-                arrow_tbl, buf,
+            write_df.write_parquet(
+                buf,
                 compression="zstd",
                 compression_level=int(compression_level),
-                use_dictionary=True,
-                write_statistics=True,
+                statistics=True,
                 row_group_size=_PARQUET_ROW_GROUP_SIZE,
             )
             data = buf.getvalue()
@@ -933,7 +979,7 @@ def _write_df_parquet(
             # no need for a follow-up size() HEAD round-trip below.
             wrote_exact_bytes = True
         elif hasattr(_get_storage(), "write_parquet"):
-            _get_storage().write_parquet(arrow_tbl, path)
+            _get_storage().write_parquet(write_df.to_arrow(), path)
         else:
             write_df.write_parquet(file=path, compression="zstd", compression_level=int(compression_level), statistics=True, row_group_size=_PARQUET_ROW_GROUP_SIZE)
     except Exception:
@@ -1520,7 +1566,7 @@ def build_tombstone_file(
     combined = combined.unique(subset=[ROWID_COL], keep="first")
 
     new_path = _partitioned_new_path(tombstone_dir, "deleted")
-    _write_df_parquet(combined, new_path, compression_level, profiler=p)
+    _write_df_parquet(combined, new_path, compression_level, profiler=p, label="tombstone")
     return new_path, combined
 
 
@@ -1578,7 +1624,7 @@ def reclaim_fully_dead_files(
         return fully_dead, None, None
 
     new_path = _partitioned_new_path(tombstone_dir, "deleted")
-    _write_df_parquet(survivors, new_path, compression_level, profiler=p)
+    _write_df_parquet(survivors, new_path, compression_level, profiler=p, label="tombstone")
     p.add("reclaimed_dead_files", len(fully_dead))
     return fully_dead, new_path, survivors
 
@@ -1891,7 +1937,7 @@ def build_stats_file(
         combined = new_df
 
     new_path = _partitioned_new_path(stats_dir, "stats")
-    _write_df_parquet(combined, new_path, compression_level, profiler=p)
+    _write_df_parquet(combined, new_path, compression_level, profiler=p, label="stats")
     p.add("stats_rows_total", int(combined.height))
     return new_path, combined
 

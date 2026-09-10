@@ -445,9 +445,11 @@ an orphaned but unreferenced object (harmless garbage).
    caller passes `overwrite_columns=[]` here, so in practice the sort is on
    `__timestamp__` alone — which is a *constant* for the batch. The sort therefore only
    does real work during compaction (where mixed timestamps exist).
-4. Encode in memory: `pq.write_table(..., compression="zstd",
-   compression_level=int(compression_level), use_dictionary=True, write_statistics=True,
-   row_group_size=122_880)` ([processing.py:689](supertable/processing.py:689)).
+4. Encode in memory with **polars'** own writer — `write_df.write_parquet(buf,
+   compression="zstd", compression_level=…, statistics=True, row_group_size=122_880)`
+   ([processing.py:697](supertable/processing.py:697)). Not pyarrow: measured 5.5x faster and
+   3.7x smaller at the same zstd level, with row-group statistics and per-column compressed
+   sizes preserved. See [§24](#24-measured-performance-profile-100-appends--10m-rows).
 5. Upload, by capability probe in this order:
    `write_bytes` → `write_parquet` → `polars.write_parquet` local fallback.
    Any exception in the whole block falls back to `write_df.write_parquet(...)`.
@@ -511,9 +513,11 @@ tombstone_threshold_hit = combined_tombstone_df is not None and \
 ```
 
 `should_compact_small_files` ([processing.py:321](supertable/processing.py:321)):
-"small" = `file_size < max_mem`; gate opens when
-`len(small) >= max_files` **or** `sum(small) > max_mem`. Files ≥ chunk size are never
-counted.
+"small" = `file_size < _small_file_threshold(max_mem)` — i.e. **0.75 × max_mem**, not max_mem.
+The gate opens when `len(small) >= max_files` **or** `sum(small) > max_mem`. The hysteresis
+band is what stops a freshly merged file from immediately re-qualifying and being rewritten by
+the next small append; `compact_resources` applies the identical threshold so the gate and the
+candidate set cannot disagree. See [§24.1a](#241-the-four-bottlenecks-this-workload-exposed).
 
 **Phase A — drain the deletion vector** (`if tombstone_threshold_hit or compaction_gate`).
 The vector to drain is `combined_tombstone_df`, or — for a pure carry-forward — the
@@ -1172,12 +1176,12 @@ storage.write_parquet(arrow_tbl, path)   # (pa.Table, path) ← DEAD on the writ
 ```
 
 This matters: **the Parquet encoding is done by `processing.py`, not by the backend.** The
-zstd codec, `compression_level`, `use_dictionary=True`, `write_statistics=True` and
-`row_group_size=122_880` all come from
-[processing.py:689-697](supertable/processing.py:689). Each backend's own `write_parquet` uses
-**pyarrow defaults (snappy)** and would silently change the encoding if it were ever reached.
-The only genuine `storage.write_parquet(table, path)` call in the repo is
-[staging_area.py:240](supertable/staging_area.py:240).
+zstd codec, `compression_level`, `statistics=True` and `row_group_size=122_880` are passed to
+**polars' own writer** ([processing.py:697](supertable/processing.py:697)). Each backend's
+`write_parquet` instead uses **pyarrow defaults (snappy)** and would silently change the
+encoding if it were ever reached — another reason that dead branch matters. The only genuine
+`storage.write_parquet(table, path)` call in the repo is
+[staging_area.py:240](supertable/staging_area.py:240), on the staging drop-box path.
 
 Also note the interface's argument orders differ: `write_parquet(table, path)` is table-first,
 `write_bytes(path, data)` is path-first.
@@ -1532,7 +1536,10 @@ unencrypted.
   colliding with a span name would clobber it. `newer_than` is marked twice within `write()`
   (lines 477 and 510) — the second overwrites the first.
 * `span()` does **no** automatic prefixing; the dotted hierarchy is a naming convention in the
-  literal strings. Nested spans therefore double-count wall time.
+  literal strings. Nested spans therefore double-count wall time — only the top-level `mark()`
+  stages sum to wall. A hardcoded span name in a helper serving two callers mis-attributes
+  cost outright; that happened with `tombstone.encode` (see
+  [§24.5](#245-a-telemetry-trap-that-was-fixed)) and the span is now caller-labelled.
 * **Not thread-safe** (plain dict read-modify-write, no lock). The write path works around this
   by giving each `ThreadPoolExecutor` branch a private `Profiler()` and merging in the parent.
 
@@ -1913,3 +1920,101 @@ DataWriter(super, org)                    # bootstraps supertable + RBAC if abse
    is what makes the in-process caches safe and time travel possible.
 5. Stats pruning may only ever **remove files with zero possible matches** — every uncertainty
    retains. It is a performance optimisation and never changes the result.
+
+---
+
+## 24. Measured performance profile (100 appends → 10M rows)
+
+Driven by `scripts/write_telemetry_audit.py`, which swaps `MonitoringWriter` for a recorder
+and keeps the `Profiler` payload of every write; analysed with
+`scripts/write_telemetry_report.py`. Workload: 100 appends × 100k rows, 7 columns, LOCAL
+storage. Analysis is polars end to end.
+
+**Reading the telemetry correctly.** The top-level `mark()` stages are mutually exclusive and
+sum to wall time. The `write.*` / `io.*` / `<artifact>.encode` / `simple_update.*` / `redis.*`
+entries are **nested spans inside those stages** and therefore double-count — summing
+everything gives >100%. Judge cost from the top-level set only.
+
+### 24.1 The four bottlenecks this workload exposed
+
+**a) Compaction re-merged its own output — 53% of all write time.**
+A merged file was written by accumulating *source* bytes up to `max_memory_chunk_size` and
+re-encoding, so the output landed *below* the threshold that selected its inputs. With "small"
+defined as `file_size < max_mem`, the fresh 15.8 MiB output immediately re-qualified, and the
+next 1.6 MiB append dragged the whole file through another read-rewrite:
+
+```
+merged 10 small files -> 1 file (16.2 MiB read, 15.8 MiB written)   ← still < 16 MiB
+merged  2 small files -> 1 file (17.4 MiB read, 17.3 MiB written)   ← rewrites what it just wrote
+```
+
+~35 MiB of I/O to absorb 1.6 MiB, on a perfectly regular 11-write cycle.
+Fixed with hysteresis: `_COMPACTION_TARGET_RATIO` (0.75) sets a `_small_file_threshold`
+below `max_mem`, applied to **both** `should_compact_small_files` (the gate) and
+`compact_resources` (the candidate set) so the two can never disagree.
+
+**b) `_build_compact_model_df` fully decoded files to read their schema — 6.8%.**
+`storage.read_parquet()` on a 16 MiB / 1.1M-row merged chunk, then `.limit(0)`: ~260ms per
+compacting write, every row discarded. Now a footer read (`read_bytes` + `pq.read_metadata` →
+`to_arrow_schema().empty_table()`).
+
+**c) The encoder was pyarrow.** Same frame, same zstd level, 9 runs:
+`pq.write_table` 139.2ms / 648,779 bytes vs `DataFrame.write_parquet` **25.2ms / 175,664
+bytes** — 5.5x faster, 3.7x smaller. Verified equivalent: round-trip identical to source and
+to each other, same row-group count, statistics set on every column, per-column
+`total_compressed_size` present (which `STATS_SCHEMA.compressed_bytes` records).
+
+**d) `build_stats` was the only stage that grew.** Isolating non-compaction writes,
+every stage was flat except `build_stats` (21.8 → 36.8ms, 1.69x) — the artifact is rewritten
+whole on every write and grows monotonically. Still only ~5%, but it is the line that bends.
+
+### 24.2 Before / after
+
+| | before | after |
+|---|---|---|
+| total write wall | 68.5s | **15.3s** (−78%) |
+| `compact_small` | 36.41s | 4.52s (−88%) |
+| `write_parquet` | 18.07s | 3.60s (−80%) |
+| `update_simple` | 5.38s | 0.74s (−86%) |
+| `build_stats` | 3.37s | 1.37s (−59%) |
+| writes that compacted | 18 | 3 |
+| mean plain write | 276.6ms | 106.3ms |
+| bytes written | 459.8 MiB | 112.5 MiB (−76%) |
+| bytes read | 302.2 MiB | 49.4 MiB (−84%) |
+| live size (10M rows) | 157.6 MiB | 63.1 MiB (−60%) |
+| write amplification | 2.92x | 1.78x |
+
+### 24.3 DuckDB pushdown — verified, and how to check it
+
+Polars-written files **are** pruned by DuckDB: ~8x faster on a narrow predicate over a
+163-row-group / 20M-row file (pyarrow 9.1x on the same data), and the polars file full-scans
+faster too because it is 3.5x smaller. Full `DataReader` → DuckDB read checks pass on a
+compacted 1.5M-row table (count, sum, range predicate, distinct, filter+agg).
+
+**Do not verify this with `parquet_metadata()`.** That view surfaces only the deprecated v1
+`min`/`max` columns and reports **NULL** for these files; polars writes the v2
+`min_value`/`max_value` fields, which the reader actually prunes on. Checking the metadata view
+would produce a false alarm. Verify with a timing or I/O measurement instead — and note DuckDB
+answers unfiltered `count(*)` from metadata alone, so it is useless as a baseline.
+
+### 24.4 Trade-offs taken, deliberately
+
+* **More live files.** Hysteresis leaves files in the 12–16 MiB band alone, and smaller files
+  mean more of them accumulate before the gate's `sum(small) > max_mem` trips. Final file
+  count went 10 → 22 for the same 10M rows, oscillating in a healthy sawtooth (4 → 28 → 4)
+  rather than being pinned low by constant rewriting.
+* **Chunk memory is bounded by compressed bytes.** `compact_resources` caps a chunk on summed
+  *file_size*. Better compression means a 16 MiB chunk now holds ~2.6M rows instead of ~1.1M,
+  so peak memory during a merge rises proportionally. Still bounded, but `max_memory_chunk_size`
+  is a weaker proxy for memory than it was.
+* **Tombstone cost is unmeasured here.** An append-only load tombstones nothing —
+  `build_tombstone` totalled 0.5ms across all 100 writes. Any claim about tombstone
+  performance needs an upsert/delete workload.
+
+### 24.5 A telemetry trap that was fixed
+
+`_write_df_parquet` serves **both** system artifacts, and its encode span was hardcoded to
+`tombstone.encode`. It therefore fired on 100/100 writes for 2.44s on a workload with **zero
+deletes** — the stats parquet's encode wearing a tombstone label. Anyone reading that
+telemetry would have concluded tombstones cost 3.6% here. The span is now labelled by the
+caller (`tombstone` / `stats`).
