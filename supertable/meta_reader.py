@@ -149,22 +149,32 @@ def _leaf_has_complete_policy_context(leaf: object) -> bool:
 def _validated_live_row_count(
     snapshot: Dict[str, Any],
     physical_rows: int,
+    table: str = "",
 ) -> int:
-    """Return exact live rows without coercing malformed DV state to zero."""
+    """Return exact live rows without coercing malformed DV state to zero.
+
+    ``table`` is named in both failures on purpose.  ``get_super_meta``
+    aggregates every authorized table and does not catch these, so one
+    unreadable table fails the whole namespace; without the identity here the
+    error says only that *some* table is malformed, and finding it needs a
+    separate sweep over the leaf documents.
+    """
+    subject = f"Table {table} snapshot" if table else "Snapshot"
     tombstone_state_error = False
     try:
         state = normalize_snapshot_tombstone_state(snapshot)
     except (TypeError, TombstoneManifestV2Error):
         tombstone_state_error = True
     if tombstone_state_error:
-        raise RuntimeError("Snapshot has an invalid deletion-vector state")
+        raise RuntimeError(f"{subject} has an invalid deletion-vector state")
 
     if state.pointer is None:
         return physical_rows
     deleted_rows = state.rows
     if deleted_rows > physical_rows:
         raise RuntimeError(
-            "Snapshot deletion-vector rows exceed physical resource rows"
+            f"{subject} deletion-vector rows ({deleted_rows}) exceed physical "
+            f"resource rows ({physical_rows})"
         )
     return physical_rows - deleted_rows
 
@@ -922,6 +932,7 @@ class MetaReader:
                 table_rows = _validated_live_row_count(
                     st_data,
                     physical_rows,
+                    table,
                 )
                 table_size = sum(res.get("file_size", 0) for res in resources if isinstance(res, dict))
 

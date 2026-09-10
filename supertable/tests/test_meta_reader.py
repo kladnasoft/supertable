@@ -1360,7 +1360,12 @@ class TestGetSuperMeta:
         ))
         reader.catalog.r.mget.return_value = [leaf.encode()]
 
-        with pytest.raises(RuntimeError, match="exceed physical"):
+        # get_super_meta aggregates every table and does not catch this, so one
+        # bad table fails the whole namespace: the message must say which.
+        with pytest.raises(
+            RuntimeError,
+            match=r"Table events snapshot deletion-vector rows .*exceed physical",
+        ):
             reader.get_super_meta("admin")
 
     @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
@@ -1396,7 +1401,10 @@ class TestGetSuperMeta:
             "snapshot.json",
         )
 
-        with pytest.raises(RuntimeError, match="invalid deletion-vector"):
+        with pytest.raises(
+            RuntimeError,
+            match=r"Table events snapshot has an invalid deletion-vector",
+        ):
             reader.get_super_meta("admin")
 
     @patch(_P_CHECK_META)
