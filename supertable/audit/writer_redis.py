@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -58,6 +59,22 @@ class RedisAuditWriter:
         # that actually needs it is called.
         self._ensure_stream()
 
+    @staticmethod
+    def _key_safe_instance_id(instance_id: str) -> str:
+        """Coerce an instance id into a valid Redis key segment.
+
+        ``INSTANCE_ID`` is ``f"{hostname}-{pid}"``, but key segments must match
+        ``^[a-z0-9][a-z0-9_-]{0,63}$``.  A host whose name carries an uppercase
+        letter or a dot (an FQDN) made the key builder raise — swallowed by the
+        save/load callers — so the chain head silently never persisted and
+        every restart began from genesis.  Lowercasing and remapping the
+        remaining invalid characters keeps the id stable and per-host distinct,
+        and is an identity transform for names that were already valid.
+        """
+        cleaned = re.sub(r"[^a-z0-9_-]", "-", (instance_id or "").lower())
+        cleaned = cleaned.lstrip("-_")[:64]
+        return cleaned or "unknown"
+
     @property
     def _chain_key(self) -> str:
         if not self._instance_id:
@@ -66,7 +83,9 @@ class RedisAuditWriter:
                 "instance_id; this writer was instantiated for "
                 "read-only use (query) and cannot save/load chain head."
             )
-        return RK.audit_chain_head(self._org, self._instance_id)
+        return RK.audit_chain_head(
+            self._org, self._key_safe_instance_id(self._instance_id)
+        )
 
     def _ensure_stream(self) -> None:
         """Create the stream and archival consumer group if they don't exist."""

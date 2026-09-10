@@ -14,7 +14,7 @@ from polars import DataFrame
 
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
-from supertable.errors import SuperTableNotFoundError, TableNotFoundError
+from supertable.errors import LockLostError, SuperTableNotFoundError, TableNotFoundError
 from supertable.monitoring.partitions import MONITORING_SINK_TABLES
 from supertable.monitoring_writer import MonitoringWriter  # async monitoring
 from supertable.super_table import SuperTable
@@ -138,6 +138,41 @@ class DataWriter:
         # Update local cache so the next write() sees it immediately
         self._table_config_cache[simple_name] = config
 
+    def _assert_lock_still_held(self, simple_name: str, token, lp) -> None:
+        """Abort before publishing if this writer no longer owns the lock.
+
+        Called immediately before the leaf commit.  A residual race remains
+        between this check and the commit (one Redis round-trip); closing it
+        fully needs the ownership test and the leaf SET in one script.  This
+        still turns the common case — a lock lost minutes earlier, during the
+        parquet writes — from a silent clobber into a loud failure.
+
+        Tolerant of catalogs that predate ``verify_simple_lock`` (and of test
+        doubles): a missing method skips the check rather than failing the
+        write.
+        """
+        if not token:
+            return
+        verify = getattr(self.catalog, "verify_simple_lock", None)
+        if not callable(verify):
+            return
+        try:
+            still_held = verify(
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple_name,
+                token,
+            )
+        except Exception as e:
+            logger.debug(lp(f"lock ownership check unavailable: {e}"))
+            return
+        if still_held is False:
+            raise LockLostError(
+                self.super_table.organization,
+                self.super_table.super_name,
+                simple_name,
+            )
+
     def _get_table_config(self, simple_name: str) -> dict:
         """Return table config from local cache, falling back to Redis once."""
         if simple_name not in self._table_config_cache:
@@ -233,9 +268,18 @@ class DataWriter:
             # snapshot-schema fallback rather than returning empty.
 
         # --- 2. Reconstruct from the prior snapshot's schema ------
+        # Two on-disk shapes are supported.  ``collect_schema`` (the path every
+        # normal write takes) stores a DICT of polars dtype reprs
+        # -- {"id": "Int64", "ts": "Datetime(time_unit='us', ...)"} -- while
+        # older/aternate snapshots carry a LIST of Spark-typed field dicts.
         prior_schema = (last_snapshot or {}).get("schema")
-        if isinstance(prior_schema, list) and prior_schema:
-            schema_dict: dict = {}
+        schema_dict: dict = {}
+        if isinstance(prior_schema, dict) and prior_schema:
+            for name, type_repr in prior_schema.items():
+                dtype = self._polars_dtype_from_repr(type_repr)
+                if name and dtype is not None:
+                    schema_dict[name] = dtype
+        elif isinstance(prior_schema, list) and prior_schema:
             for col in prior_schema:
                 if not isinstance(col, dict):
                     continue
@@ -244,11 +288,62 @@ class DataWriter:
                 pl_name = self._SPARK_TYPE_TO_POLARS.get(spark_type)
                 if name and pl_name and hasattr(polars, pl_name):
                     schema_dict[name] = getattr(polars, pl_name)
-            if schema_dict:
-                return polars.DataFrame(schema=schema_dict)
+        if schema_dict:
+            frame = self._frame_from_schema_dict(schema_dict)
+            if frame is not None:
+                return frame
 
-        # --- 3. Empty frame --------------------------------------
-        return polars.DataFrame()
+        # --- 3. Unknown schema — preserve the previous one --------
+        # Returning a zero-column frame here would make simple_table.update
+        # derive an EMPTY schema and overwrite the snapshot's real one.
+        # ``None`` is update()'s explicit "leave the schema untouched" signal,
+        # which is what an unresolvable schema must fall back to: compaction
+        # never changes the logical schema, so the prior one stays correct.
+        return None
+
+    @classmethod
+    def _polars_dtype_from_repr(cls, type_repr) -> object | None:
+        """Resolve a stored dtype string to a polars dtype, or None.
+
+        Accepts a polars repr (``"Int64"``, ``"Datetime(time_unit='us')"`` —
+        parameters are dropped, the base class is returned) and, as a
+        convenience, a Spark-style name (``"long"``).
+        """
+        if not isinstance(type_repr, str) or not type_repr.strip():
+            return None
+        base = type_repr.split("(", 1)[0].strip()
+        dtype = getattr(polars, base, None)
+        if dtype is not None:
+            return dtype
+        pl_name = cls._SPARK_TYPE_TO_POLARS.get(base.lower())
+        if pl_name:
+            return getattr(polars, pl_name, None)
+        return None
+
+    @staticmethod
+    def _frame_from_schema_dict(schema_dict: dict) -> "DataFrame | None":
+        """Build a zero-row frame, dropping any column polars rejects.
+
+        Nested dtypes (``List``, ``Struct``) lose their inner type in the
+        stored repr and can fail to instantiate bare; those columns are skipped
+        rather than losing the whole schema.
+        """
+        try:
+            return polars.DataFrame(schema=schema_dict)
+        except Exception:
+            usable = {}
+            for name, dtype in schema_dict.items():
+                try:
+                    polars.DataFrame(schema={name: dtype})
+                except Exception:
+                    continue
+                usable[name] = dtype
+            if not usable:
+                return None
+            try:
+                return polars.DataFrame(schema=usable)
+            except Exception:
+                return None
 
     def write(self, role_name, simple_name, data, overwrite_columns, compression_level=1, newer_than=None, delete_only=False, lineage=None):
         """
@@ -966,6 +1061,15 @@ class DataWriter:
                 )
                 mark("update_simple")
 
+                # --- Fence: refuse to publish without the lock --------------------
+                # The leaf write is last-write-wins, so committing after losing
+                # the lock silently clobbers whichever writer took it next.  The
+                # heartbeat can lose a lock mid-write (process stalled past the
+                # TTL, key evicted, operator DEL), and until this check nothing
+                # told the writer.  Everything written so far is immutable and
+                # unreferenced, so aborting here leaks only harmless garbage.
+                self._assert_lock_still_held(simple_name, token, lp)
+
                 # --- CAS set leaf pointer + atomic root bump ----------------------
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
@@ -1532,6 +1636,12 @@ class DataWriter:
                     lineage=eff_lineage,
                 )
                 mark("update_simple")
+
+                # --- Fence: refuse to publish without the lock -------------------
+                # Same hazard as write(): compaction sunsets files, so
+                # committing without the lock can drop a concurrent writer's
+                # resources from the snapshot.
+                self._assert_lock_still_held(simple_name, token, lp)
 
                 # --- CAS set leaf pointer + atomic root bump ---------------------
                 now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)

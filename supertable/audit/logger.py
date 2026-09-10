@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from supertable.audit.events import AuditEvent, INSTANCE_ID
-from supertable.audit.chain import InstanceChain, GENESIS_HASH
+from supertable.audit.chain import InstanceChain, GENESIS_HASH, compute_content_hash
 
 logger = logging.getLogger(__name__)
 
@@ -289,8 +289,21 @@ class AuditLogger:
 
         chain_hash = ""
         if self._config.hash_chain:
+            # Bind event CONTENT into the chain, not just the ids.  Chaining
+            # ids alone leaves the chain verifying cleanly after an event's
+            # detail / actor_id / outcome is edited in place, which is exactly
+            # the tampering the chain exists to detect.
+            try:
+                content_hash = compute_content_hash(
+                    [e.event_hash() for e in events]
+                )
+            except Exception as e:  # never let hashing kill the audit thread
+                logger.warning(
+                    "[audit] content hash failed, chaining ids only: %s", e
+                )
+                content_hash = ""
             with self._chain_lock:
-                chain_hash = self._chain.advance(event_ids)
+                chain_hash = self._chain.advance(event_ids, content_hash)
 
             # Stamp chain_hash onto every event dict in the batch
             for d in event_dicts:

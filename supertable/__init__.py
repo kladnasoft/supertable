@@ -25,7 +25,7 @@ See the ``supertable.demo`` package for runnable end-to-end demos and the
 project documentation for the full API surface.
 """
 
-__version__ = "3.0.3"
+__version__ = "3.0.4"
 
 # Re-export the core public surface so users can do ``from supertable import …``
 # instead of remembering submodule paths.
@@ -40,6 +40,7 @@ from supertable.redis_catalog import RedisCatalog
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager
 from supertable.errors import (
+    LockLostError,
     SupertableLookupError,
     SuperTableNotFoundError,
     TableNotFoundError,
@@ -63,4 +64,5 @@ __all__ = [
     "SupertableLookupError",
     "SuperTableNotFoundError",
     "TableNotFoundError",
+    "LockLostError",
 ]

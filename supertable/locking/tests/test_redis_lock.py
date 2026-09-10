@@ -326,3 +326,69 @@ class TestErrorHandling:
             assert rl.extend("k", "irrelevant", ttl_ms=5_000) is False
         finally:
             rl._on_exit()
+
+
+# ---------------------------------------------------------------------------
+# is_held — ownership check used to fence mutations before they are published
+# ---------------------------------------------------------------------------
+
+class TestIsHeld:
+
+    def test_true_while_token_owns_the_key(self, fake_redis):
+        lk = RedisLocking(fake_redis)
+        token = lk.acquire("k", ttl_s=30, timeout_s=1)
+        assert token
+        assert lk.is_held("k", token) is True
+        lk.release("k", token)
+
+    def test_false_after_release(self, fake_redis):
+        lk = RedisLocking(fake_redis)
+        token = lk.acquire("k", ttl_s=30, timeout_s=1)
+        lk.release("k", token)
+        assert lk.is_held("k", token) is False
+
+    def test_false_when_key_holds_a_different_token(self, fake_redis):
+        """The classic steal: our TTL lapsed and somebody else acquired."""
+        lk = RedisLocking(fake_redis)
+        token = lk.acquire("k", ttl_s=30, timeout_s=1)
+        fake_redis.set("k", "somebody-elses-token")
+        assert lk.is_held("k", token) is False
+        lk.release("k", token)
+
+    def test_false_once_the_heartbeat_recorded_a_loss(self, fake_redis):
+        """A recorded loss is sticky even if the key is later restored.
+
+        Between the loss and the restore another holder may have mutated
+        shared state, so this instance must not treat itself as protected.
+        """
+        lk = RedisLocking(fake_redis)
+        token = lk.acquire("k", ttl_s=30, timeout_s=1)
+        lk._lost[("k", token)] = None
+        fake_redis.set("k", token)
+        assert lk.is_held("k", token) is False
+        lk.release("k", token)
+
+    def test_false_when_redis_errors(self, fake_redis):
+        """"Unknown" must never be reported as "safe to publish"."""
+        import redis as _redis
+
+        lk = RedisLocking(fake_redis)
+        token = lk.acquire("k", ttl_s=30, timeout_s=1)
+
+        def _boom(_key):
+            raise _redis.RedisError("connection reset")
+
+        fake_redis.get = _boom
+        assert lk.is_held("k", token) is False
+
+    def test_reacquire_clears_a_previously_recorded_loss(self, fake_redis):
+        lk = RedisLocking(fake_redis)
+        token = lk.acquire("k", ttl_s=30, timeout_s=1)
+        lk._lost[("k", token)] = None
+        lk.release("k", token)
+
+        # A fresh acquire gets a fresh token, and the stale entry must not
+        # follow it around.
+        token2 = lk.acquire("k", ttl_s=30, timeout_s=1)
+        assert token2 != token
+        assert lk.is_held("k", token2) is True

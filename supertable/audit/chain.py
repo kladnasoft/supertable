@@ -37,12 +37,32 @@ GENESIS_HASH = "0" * 64  # Chain starts here (no previous batch)
 # ---------------------------------------------------------------------------
 
 def compute_batch_hash(event_ids: List[str], file_hash: str = "") -> str:
-    """Hash a batch of event IDs + the Parquet file hash.
+    """Hash a batch of event IDs plus a digest binding the batch payload.
 
     Event IDs are sorted to ensure deterministic ordering regardless
     of the order events were queued.
+
+    *file_hash* is whatever digest the caller uses to bind the batch's
+    contents — see :func:`compute_content_hash`.  Event ids alone record
+    *which* events were written but nothing about *what* they said, so a chain
+    built from ids only stays valid after an event's fields are edited in
+    place.
     """
     payload = "\n".join(sorted(event_ids)) + "\n" + (file_hash or "")
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_content_hash(event_hashes: List[str]) -> str:
+    """Digest binding the CONTENT of every event in a batch.
+
+    Feeds :func:`compute_batch_hash` so the chain covers event fields, not
+    just their ids: altering ``detail`` / ``actor_id`` / ``outcome`` while
+    preserving ``event_id`` now breaks verification.  Sorted for the same
+    reason event ids are — queue order must not change the digest.
+    """
+    if not event_hashes:
+        return ""
+    payload = "\n".join(sorted(event_hashes))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

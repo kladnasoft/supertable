@@ -828,13 +828,75 @@ class TestSchemaPreservation:
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
-    def test_empty_frame_when_no_schema_anywhere(
+    def test_fallback_handles_dict_schema_written_by_collect_schema(
+        self, mock_check_write, MockSimple, mock_settings,
+        mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
+    ):
+        """The shape production actually stores.
+
+        ``simple_table.update`` derives ``schema`` from ``collect_schema``,
+        which returns ``{column: str(polars_dtype)}`` — a DICT of polars dtype
+        reprs, not a list of Spark field dicts. The storage-read-failure
+        fallback must reconstruct from that shape, including parameterised
+        reprs like ``Datetime(time_unit='us', time_zone='UTC')``."""
+        dw = _build_writer()
+        dw.super_table.storage.read_parquet.side_effect = RuntimeError("io fail")
+
+        snap = {
+            "simple_name": "orders",
+            "snapshot_version": 1,
+            "resources": [_resource("a"), _resource("b")],
+            "schema": {
+                "id": "Int64",
+                "name": "String",
+                "amount": "Float64",
+                "flag": "Boolean",
+                "created": "Datetime(time_unit='us', time_zone='UTC')",
+            },
+        }
+        mock_simple = _mk_simple_mock(snap)
+        MockSimple.return_value = mock_simple
+
+        new_res = [{"file": "/data/compacted.parquet", "file_size": 5000,
+                    "rows": 3, "columns": 5, "stats": None}]
+        mock_compact_res.return_value = (2, 3, new_res, {"a", "b"})
+        dw._get_table_config = MagicMock(return_value={})
+
+        dw.compact("admin", "tbl")
+
+        args, kwargs = mock_simple.update.call_args
+        model_df = args[2]
+        assert model_df is not None, "dict schema must be reconstructible"
+        assert set(model_df.columns) == {
+            "id", "name", "amount", "flag", "created",
+        }
+        dtype_map = dict(zip(model_df.columns, model_df.dtypes))
+        assert dtype_map["id"] == pl.Int64
+        assert dtype_map["amount"] == pl.Float64
+        assert dtype_map["flag"] == pl.Boolean
+        # Parameterised repr resolves to the base dtype class
+        assert dtype_map["created"] == pl.Datetime
+
+    @patch(_P_AUDIT)
+    @patch(_P_MON_WRITER)
+    @patch(_P_MIRROR)
+    @patch(_P_COMPACT_RES)
+    @patch(_P_COMPACT_TOMB, return_value=(0, [], set()))
+    @patch(_P_SETTINGS, new_callable=_stub_settings)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_WRITE)
+    def test_model_df_is_none_when_no_schema_anywhere(
         self, mock_check_write, MockSimple, mock_settings,
         mock_compact_tomb, mock_compact_res, MockMirror, MockMW, mock_audit,
     ):
         """Pathological case: storage read fails AND snapshot has no
-        schema field. Falls back to an empty frame — the snapshot's
-        existing schema (None/missing) is left as-is."""
+        schema field. Must hand update() ``None`` — its "preserve the
+        previous schema" signal.
+
+        A zero-column DataFrame would be actively harmful here: update()
+        derives the new snapshot's schema from the frame, so an empty frame
+        OVERWRITES the real schema with an empty one. Compaction never changes
+        the logical schema, so preserving is always the correct fallback."""
         dw = _build_writer()
         dw.super_table.storage.read_parquet.side_effect = RuntimeError("nope")
 
@@ -856,10 +918,10 @@ class TestSchemaPreservation:
 
         args, kwargs = mock_simple.update.call_args
         model_df = args[2]
-        # Empty frame is acceptable here — it would leave the schema
-        # blank in the new snapshot, which is no worse than the
-        # pre-fix behaviour (silent corruption).
-        assert isinstance(model_df, pl.DataFrame)
+        assert model_df is None, (
+            "unresolvable schema must preserve the prior snapshot schema, "
+            f"not overwrite it with an empty one (got {model_df!r})"
+        )
 
     @patch(_P_AUDIT)
     @patch(_P_MON_WRITER)

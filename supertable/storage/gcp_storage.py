@@ -335,7 +335,9 @@ class GCSStorage(StorageInterface):
     def write_bytes(self, path: str, data: bytes) -> None:
         path = self._with_base(path)
         blob = self.bucket.blob(path)
-        blob.upload_from_string(data)
+        # Match write_parquet: without an explicit content_type the SDK stamps
+        # text/plain, and this is the branch the write path always takes.
+        blob.upload_from_string(data, content_type="application/octet-stream")
 
     def read_bytes(self, path: str) -> bytes:
         path = self._with_base(path)

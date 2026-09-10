@@ -724,14 +724,34 @@ def _write_single_parquet_file(
                     row_group_size=_PARQUET_ROW_GROUP_SIZE,
                 )
     except Exception:
+        # Fall back to polars' own encoder (it accepts dtype shapes pyarrow's
+        # writer can reject) but keep the destination on the ACTIVE storage
+        # backend.  ``new_parquet_path`` is a storage KEY, not a local path:
+        # writing it to the local filesystem would drop the object outside the
+        # configured store while the snapshot still records the key as written,
+        # and the size lookup below would then mask it (storage.size() fails,
+        # os.path.getsize() succeeds on the stray local file).
+        _storage_be = _get_storage()
         with p.span("write.local_fallback"):
-            write_df.write_parquet(
-                file=new_parquet_path,
-                compression="zstd",
-                compression_level=int(compression_level),
-                statistics=True,
-                row_group_size=_PARQUET_ROW_GROUP_SIZE,
-            )
+            if hasattr(_storage_be, "write_bytes"):
+                _buf = io.BytesIO()
+                write_df.write_parquet(
+                    _buf,
+                    compression="zstd",
+                    compression_level=int(compression_level),
+                    statistics=True,
+                    row_group_size=_PARQUET_ROW_GROUP_SIZE,
+                )
+                data = _buf.getvalue()
+                _storage_be.write_bytes(new_parquet_path, data)
+            else:
+                write_df.write_parquet(
+                    file=new_parquet_path,
+                    compression="zstd",
+                    compression_level=int(compression_level),
+                    statistics=True,
+                    row_group_size=_PARQUET_ROW_GROUP_SIZE,
+                )
 
     # Determine file size
     try:
@@ -917,7 +937,26 @@ def _write_df_parquet(
         else:
             write_df.write_parquet(file=path, compression="zstd", compression_level=int(compression_level), statistics=True, row_group_size=_PARQUET_ROW_GROUP_SIZE)
     except Exception:
-        write_df.write_parquet(file=path, compression="zstd", compression_level=int(compression_level), statistics=True, row_group_size=_PARQUET_ROW_GROUP_SIZE)
+        # Same contract as _write_single_parquet_file's fallback: re-encode with
+        # polars if pyarrow choked, but keep the object on the ACTIVE storage
+        # backend.  ``path`` is a storage key, so writing it to the local
+        # filesystem would leave the deletion-vector / stats artifact outside
+        # the configured store while the snapshot points at the key.
+        _storage_be = _get_storage()
+        if hasattr(_storage_be, "write_bytes"):
+            _buf = io.BytesIO()
+            write_df.write_parquet(
+                _buf,
+                compression="zstd",
+                compression_level=int(compression_level),
+                statistics=True,
+                row_group_size=_PARQUET_ROW_GROUP_SIZE,
+            )
+            data = _buf.getvalue()
+            _storage_be.write_bytes(path, data)
+            wrote_exact_bytes = True
+        else:
+            write_df.write_parquet(file=path, compression="zstd", compression_level=int(compression_level), statistics=True, row_group_size=_PARQUET_ROW_GROUP_SIZE)
     # Fast path: the write_bytes backend (MinIO/S3/local) stored precisely
     # `data`, so return its length and skip the extra HEAD.  Only the
     # write_parquet / fallback branches (which may re-encode) consult size().

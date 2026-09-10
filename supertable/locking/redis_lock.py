@@ -34,6 +34,7 @@ import atexit
 import time
 import threading
 import uuid
+from collections import OrderedDict
 from typing import Dict, Optional, Tuple
 
 import redis
@@ -89,6 +90,14 @@ class RedisLocking:
         self._held: Dict[str, Tuple[str, int]] = {}
         self._held_lock = threading.Lock()
 
+        # (key, token) pairs whose ownership this instance has provably lost
+        # (a heartbeat extend returned 0 => expired or stolen).  Recorded so
+        # the loss is observable by the holder instead of only being logged;
+        # cleared when the same key is acquired again.  Bounded so a
+        # long-running process cannot grow it without limit.
+        self._lost: "OrderedDict[Tuple[str, str], None]" = OrderedDict()
+        self._lost_max = 1024
+
         # Heartbeat state
         self._hb_stop = threading.Event()
         self._hb_thread: Optional[threading.Thread] = None
@@ -123,6 +132,7 @@ class RedisLocking:
                 if ok:
                     with self._held_lock:
                         self._held[key] = (token, ttl_ms)
+                        self._lost.pop((key, token), None)
                         if self._hb_thread is None or not self._hb_thread.is_alive():
                             self._start_heartbeat()
                     return token
@@ -130,6 +140,32 @@ class RedisLocking:
                 logger.debug(f"[redis-lock] acquire error on {key}: {e}")
             time.sleep(retry_interval)
         return None
+
+    # ------------------------------------------------------------------ ownership
+
+    def is_held(self, key: str, token: str) -> bool:
+        """Return True only if *token* still owns *key*.
+
+        Two independent signals, both required:
+
+          * the heartbeat has not recorded a loss for this (key, token);
+          * Redis still stores exactly *token* at *key*.
+
+        A Redis error is reported as NOT held: the caller uses this to decide
+        whether it is safe to publish a mutation, and "unknown" must not be
+        treated as "safe".
+        """
+        with self._held_lock:
+            if (key, token) in self._lost:
+                return False
+        try:
+            cur = self.r.get(key)
+        except redis.RedisError as e:
+            logger.warning(f"[redis-lock] ownership check failed on {key}: {e}")
+            return False
+        if isinstance(cur, bytes):
+            cur = cur.decode("utf-8", "replace")
+        return cur == token
 
     # ------------------------------------------------------------------ release
 
@@ -223,9 +259,18 @@ class RedisLocking:
                 try:
                     ok = self.extend(key, token, ttl_ms)
                     if not ok:
-                        # Lock expired or was stolen — remove from tracking
-                        logger.debug(f"[redis-lock] heartbeat: lost lock on {key}")
+                        # Lock expired or was stolen.  Record the loss so the
+                        # holder can find out (is_held) instead of continuing
+                        # to mutate shared state believing it is protected —
+                        # a debug line alone is invisible to the caller.
+                        logger.warning(
+                            f"[redis-lock] heartbeat: LOST lock on {key} "
+                            f"(expired or stolen); holder is no longer protected"
+                        )
                         with self._held_lock:
+                            self._lost[(key, token)] = None
+                            while len(self._lost) > self._lost_max:
+                                self._lost.popitem(last=False)
                             held_entry = self._held.get(key)
                             if held_entry is not None and held_entry[0] == token:
                                 del self._held[key]

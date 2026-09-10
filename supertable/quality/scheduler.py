@@ -33,6 +33,7 @@ import re
 import threading
 import time
 import traceback
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -300,6 +301,29 @@ def _scheduler_tick(
                 # the pending key stays — we'll retry on the next tick.
 
 
+_LUA_RELEASE_IF_TOKEN = """
+local cur = redis.call('GET', KEYS[1])
+if cur and cur == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0
+"""
+
+
+def _release_running_lock(r, running_key: str, token: str) -> None:
+    """Compare-and-delete the running lock; never raise out of a finally."""
+    try:
+        r.eval(_LUA_RELEASE_IF_TOKEN, 1, running_key, token)
+    except Exception as e:
+        # Falling back to an unconditional DEL would reintroduce the very
+        # cross-worker deletion this guards against, so leave the key to its
+        # TTL instead.
+        logger.warning(
+            f"[dq-scheduler] running-lock release failed for {running_key}: {e}"
+        )
+
+
 def _try_run_check(
     r,
     org: str,
@@ -327,9 +351,14 @@ def _try_run_check(
         return False
 
     # ── Acquire lock (SET NX = only if not exists) ────────────
+    # The value is a per-attempt token, not a timestamp, so the release below
+    # can prove ownership.  A check that outruns DEFAULT_RUNNING_TTL_SECONDS
+    # has its key expire and possibly re-acquired by another worker; an
+    # unconditional DEL at that point would free somebody else's lock.
+    running_token = uuid.uuid4().hex
     acquired = r.set(
         running_key,
-        _now_iso(),
+        running_token,
         nx=True,                          # only set if key does not exist
         ex=DEFAULT_RUNNING_TTL_SECONDS,   # safety TTL in case of crash
     )
@@ -363,8 +392,8 @@ def _try_run_check(
         return False
 
     finally:
-        # ── Release lock ──────────────────────────────────────
-        r.delete(running_key)
+        # ── Release lock (only if we still own it) ────────────
+        _release_running_lock(r, running_key, running_token)
 
 
 # ──────────────────────────────────────────────────────────────────────

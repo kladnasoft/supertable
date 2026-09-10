@@ -68,8 +68,31 @@ class TableNotFoundError(SupertableLookupError):
         self.simple_name = simple_name
 
 
+class LockLostError(RuntimeError):
+    """Raised when a writer discovers it no longer owns the table lock.
+
+    The per-table lock is what makes the leaf pointer safe to overwrite, so a
+    writer that lost it must not publish: the leaf write is last-write-wins and
+    would clobber whichever writer holds the lock now. Everything the aborted
+    write produced is immutable and unreferenced, so nothing is corrupted —
+    the operation is simply not committed and can be retried.
+
+    Not a ``LookupError``: nothing was missing, the mutation was refused.
+    """
+
+    def __init__(self, organization: str, super_name: str, simple_name: str):
+        super().__init__(
+            f"Lock lost during write, refusing to publish snapshot: "
+            f"{organization}/{super_name}/{simple_name}"
+        )
+        self.organization = organization
+        self.super_name = super_name
+        self.simple_name = simple_name
+
+
 __all__ = [
     "SupertableLookupError",
     "SuperTableNotFoundError",
     "TableNotFoundError",
+    "LockLostError",
 ]

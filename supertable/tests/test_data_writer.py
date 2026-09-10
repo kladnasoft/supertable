@@ -2098,3 +2098,136 @@ class TestWriteAutoCompaction:
         mock_compact_tomb.assert_called_once()
         mock_compact_res.assert_called_once()
         assert order == ["tomb", "res"]
+
+
+# ====================================================================
+# 20. Lock fence — refuse to publish a snapshot without the lock
+# ====================================================================
+#
+# The per-table lock is what makes the leaf pointer safe to overwrite:
+# the leaf write is last-write-wins, so a writer that lost its lock and
+# commits anyway silently clobbers whichever writer holds it now.  The
+# heartbeat can lose a lock mid-write (process stalled past the TTL, key
+# evicted, operator DEL) and nothing previously told the writer.
+
+class TestLockFenceBeforeCommit:
+
+    @staticmethod
+    def _wire(MockST, MockCat, MockSimple, mock_from_arrow, verify_result):
+        mock_st = MagicMock(super_name="s1", organization="o1")
+        MockST.return_value = mock_st
+
+        mock_cat = MagicMock()
+        mock_cat.reserve_rowids.return_value = 0
+        mock_cat.get_table_config.return_value = None
+        mock_cat.acquire_simple_lock.return_value = "tok"
+        mock_cat.release_simple_lock.return_value = True
+        mock_cat.set_leaf_payload_cas.return_value = 1
+        mock_cat.bump_root.return_value = 1
+        mock_cat.verify_simple_lock.return_value = verify_result
+        MockCat.return_value = mock_cat
+
+        mock_from_arrow.return_value = _polars_df({"id": [1, 2], "val": ["a", "b"]})
+
+        mock_simple = MagicMock()
+        mock_simple.data_dir = "/data"
+        mock_simple.simple_dir = "/d"
+        mock_simple.get_simple_table_snapshot.return_value = (
+            {"resources": [], "snapshot_version": 0}, "/snap/path",
+        )
+        mock_simple.update.return_value = (
+            {"resources": [{"file": "f1"}]}, "/snap/new",
+        )
+        MockSimple.return_value = mock_simple
+        return mock_cat, mock_simple
+
+    @patch(_PATCH_GET_MON_LOGGER)
+    @patch(_PATCH_MIRROR)
+    @patch(_PATCH_PROCESS_OVERLAP)
+    @patch(_PATCH_FIND_OVERLAP, return_value=set())
+    @patch(_PATCH_SIMPLE_TABLE)
+    @patch(_PATCH_CHECK_WRITE)
+    @patch(_PATCH_POLARS_FROM_ARROW)
+    @patch(_PATCH_REDIS_CATALOG)
+    @patch(_PATCH_SUPER_TABLE)
+    def test_lost_lock_aborts_before_leaf_commit(
+        self, MockST, MockCat, mock_from_arrow, mock_check_write,
+        MockSimple, mock_find_overlap, mock_process, MockMirror, mock_get_mon,
+    ):
+        """verify_simple_lock() False => raise, and publish NOTHING.
+
+        The snapshot JSON may already be on storage, but it is unreferenced
+        garbage until the leaf moves — so the leaf write and the root bump
+        must both be skipped.
+        """
+        from supertable.errors import LockLostError
+        from supertable.data_writer import DataWriter
+
+        mock_cat, mock_simple = self._wire(
+            MockST, MockCat, MockSimple, mock_from_arrow, verify_result=False,
+        )
+
+        dw = DataWriter("s1", "o1")
+        with pytest.raises(LockLostError):
+            dw.write("admin", "my_tbl", _arrow_table({"id": [1, 2]}), ["id"])
+
+        mock_cat.set_leaf_payload_cas.assert_not_called()
+        mock_cat.set_leaf_path_cas.assert_not_called()
+        mock_cat.bump_root.assert_not_called()
+        # The lock is still released on the way out.
+        mock_cat.release_simple_lock.assert_called_once()
+
+    @patch(_PATCH_GET_MON_LOGGER)
+    @patch(_PATCH_MIRROR)
+    @patch(_PATCH_PROCESS_OVERLAP)
+    @patch(_PATCH_FIND_OVERLAP, return_value=set())
+    @patch(_PATCH_SIMPLE_TABLE)
+    @patch(_PATCH_CHECK_WRITE)
+    @patch(_PATCH_POLARS_FROM_ARROW)
+    @patch(_PATCH_REDIS_CATALOG)
+    @patch(_PATCH_SUPER_TABLE)
+    def test_held_lock_commits_normally(
+        self, MockST, MockCat, mock_from_arrow, mock_check_write,
+        MockSimple, mock_find_overlap, mock_process, MockMirror, mock_get_mon,
+    ):
+        """verify_simple_lock() True => the commit proceeds untouched."""
+        from supertable.data_writer import DataWriter
+
+        mock_cat, _ = self._wire(
+            MockST, MockCat, MockSimple, mock_from_arrow, verify_result=True,
+        )
+
+        dw = DataWriter("s1", "o1")
+        result = dw.write("admin", "my_tbl", _arrow_table({"id": [1, 2]}), ["id"])
+
+        assert result is not None
+        mock_cat.verify_simple_lock.assert_called_once_with("o1", "s1", "my_tbl", "tok")
+        mock_cat.set_leaf_payload_cas.assert_called_once()
+        mock_cat.bump_root.assert_called_once()
+
+    @patch(_PATCH_GET_MON_LOGGER)
+    @patch(_PATCH_MIRROR)
+    @patch(_PATCH_PROCESS_OVERLAP)
+    @patch(_PATCH_FIND_OVERLAP, return_value=set())
+    @patch(_PATCH_SIMPLE_TABLE)
+    @patch(_PATCH_CHECK_WRITE)
+    @patch(_PATCH_POLARS_FROM_ARROW)
+    @patch(_PATCH_REDIS_CATALOG)
+    @patch(_PATCH_SUPER_TABLE)
+    def test_catalog_without_verify_method_still_commits(
+        self, MockST, MockCat, mock_from_arrow, mock_check_write,
+        MockSimple, mock_find_overlap, mock_process, MockMirror, mock_get_mon,
+    ):
+        """An older catalog with no verify_simple_lock must not break writes."""
+        from supertable.data_writer import DataWriter
+
+        mock_cat, _ = self._wire(
+            MockST, MockCat, MockSimple, mock_from_arrow, verify_result=True,
+        )
+        del mock_cat.verify_simple_lock
+
+        dw = DataWriter("s1", "o1")
+        result = dw.write("admin", "my_tbl", _arrow_table({"id": [1, 2]}), ["id"])
+
+        assert result is not None
+        mock_cat.set_leaf_payload_cas.assert_called_once()

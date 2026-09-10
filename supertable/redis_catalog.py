@@ -157,17 +157,29 @@ local key = KEYS[1]
 local now_ms = tonumber(ARGV[1])
 
 local cur = redis.call('GET', key)
+local doc = nil
 local old_version = -1
 if cur then
   local ok, obj = pcall(cjson.decode, cur)
-  if ok and obj and obj['version'] then
-    old_version = tonumber(obj['version'])
+  if ok and type(obj) == 'table' then
+    doc = obj
+    local v = tonumber(obj['version'])
+    if v then
+      old_version = v
+    end
   end
 end
-local new_version = old_version + 1
-local new_val = cjson.encode({version=new_version, ts=now_ms})
-redis.call('SET', key, new_val)
-return new_version
+if doc == nil then
+  doc = {}
+end
+-- Merge, never replace: the root document also carries flags written by
+-- update_root_flags (read_only / cloned_from / clone_type / clone_ts /
+-- replica_tables) which _resolve_replica_info and the RBAC read-only guard
+-- read back.  Re-encoding only {version, ts} would drop them on every write.
+doc['version'] = old_version + 1
+doc['ts'] = now_ms
+redis.call('SET', key, cjson.encode(doc))
+return doc['version']
 """
 
     # ------------- RBAC Lua scripts ------------- #
@@ -316,6 +328,16 @@ return 1
         str]:
         """SET lock key NX EX with retry/backoff <= timeout. Returns token if acquired else None."""
         return self._locker.acquire(RK.lock_leaf(org, sup, simple), ttl_s=ttl_s, timeout_s=timeout_s)
+
+    def verify_simple_lock(self, org: str, sup: str, simple: str, token: str) -> bool:
+        """Return True only if *token* still owns this simple table's lock.
+
+        Callers use this to fence a mutation that is about to become visible:
+        the heartbeat can lose a lock mid-operation (TTL elapsed while the
+        process was stalled, or an operator deleted the key), and without a
+        check the holder would publish anyway.
+        """
+        return self._locker.is_held(RK.lock_leaf(org, sup, simple), token)
 
     def release_simple_lock(self, org: str, sup: str, simple: str, token: str) -> bool:
         """Compare-and-delete via Lua."""
@@ -813,7 +835,14 @@ return 1
         return ids[0] if ids else None
 
     def rbac_get_role_id_by_name(self, org: str, sup: str, role_name: str) -> Optional[str]:
-        """Look up a role_id from a role_name (case-insensitive)."""
+        """Look up a role_id from a role_name (case-insensitive).
+
+        A missing / non-string role_name resolves to "no such role" rather than
+        raising AttributeError out of the access check, so callers guarding on
+        PermissionError see the denial they expect.
+        """
+        if not isinstance(role_name, str) or not role_name:
+            return None
         val = self.r.hget(RK.rbac_rolename_to_id(org, sup), role_name.lower())
         if val is None:
             return None
@@ -1302,7 +1331,7 @@ return 1
 
         try:
             with self.r.pipeline() as p:
-                p.set(RK.staging(org, sup, staging_name), json.dumps(payload))
+                p.set(RK.staging_doc(org, sup, staging_name), json.dumps(payload))
                 p.sadd(RK.staging_index(org, sup), staging_name)
                 p.execute()
             return True
@@ -1315,7 +1344,7 @@ return 1
         if not (org and sup and staging_name):
             return None
         try:
-            raw = self.r.get(RK.staging(org, sup, staging_name))
+            raw = self.r.get(RK.staging_doc(org, sup, staging_name))
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_staging_meta error: {e}")
             return None
@@ -1358,7 +1387,7 @@ return 1
 
         try:
             # Delete the base meta key
-            deleted += int(self.r.delete(RK.staging(org, sup, staging_name)) or 0)
+            deleted += int(self.r.delete(RK.staging_doc(org, sup, staging_name)) or 0)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] delete_staging_meta del error: {e}")
 
@@ -1387,7 +1416,7 @@ return 1
 
         try:
             with self.r.pipeline() as p:
-                p.set(RK.pipe(org, sup, staging_name, pipe_name), json.dumps(payload))
+                p.set(RK.pipe_doc(org, sup, staging_name, pipe_name), json.dumps(payload))
                 p.sadd(RK.pipe_index(org, sup, staging_name), pipe_name)
                 p.execute()
             return True
@@ -1399,7 +1428,7 @@ return 1
         if not (org and sup and staging_name and pipe_name):
             return None
         try:
-            raw = self.r.get(RK.pipe(org, sup, staging_name, pipe_name))
+            raw = self.r.get(RK.pipe_doc(org, sup, staging_name, pipe_name))
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_pipe_meta error: {e}")
             return None
@@ -1477,7 +1506,7 @@ return 1
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] delete_pipe_meta srem error: {e}")
         try:
-            return int(self.r.delete(RK.pipe(org, sup, staging_name, pipe_name)) or 0)
+            return int(self.r.delete(RK.pipe_doc(org, sup, staging_name, pipe_name)) or 0)
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] delete_pipe_meta del error: {e}")
             return 0
