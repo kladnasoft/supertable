@@ -1615,6 +1615,10 @@ class TestExecuteExecutorArgs:
             tables=physical_tables,
             predicate_constraints={},
             plan_stats=MockPlanStats.return_value,
+            # Pruning is on by default; fullscan is the opt-in correctness
+            # escape hatch that disables it so a test can compare pruned and
+            # unpruned results and assert they are identical.
+            fullscan=False,
         )
 
 

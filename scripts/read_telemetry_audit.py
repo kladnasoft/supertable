@@ -1,119 +1,117 @@
-"""Read-path telemetry: where does a query's wall time actually go?
+"""Read-path telemetry, with exclusive-time accounting.
 
-The write path emits 22 timed stages through its Profiler; the read path emits
-two coarse Timer events. This wraps the real seams so a query breaks down into
-phases without touching production code:
+The first version of this script double-counted: it gave one label to three
+nested functions, so a child's time was added to both itself and its parent,
+and `connect` appeared to cost ~60ms on every query when the connection is in
+fact built once per process. It also instrumented only duckdb_lite, so any
+query routed to duckdb_pro reported zeros for every engine phase.
 
-    parse      SQL -> sqlglot -> table refs + predicate intervals
-    rbac       role resolution / column+row filters
-    snapshots  catalog reads (Redis leaf payloads)
-    stats      loading the column-stats artifact
-    prune      dropping files by predicate vs stats
-    estimate   the rest of DataEstimator.estimate (sizing, engine routing)
-    connect    DuckDB connection init / pragmas
-    view       reflection + RBAC + tombstone view construction
-    execute    the query itself
-    fetch      materialising the result
+Both are fixed here:
 
-It also records PRUNING EFFECTIVENESS per query — files before and after —
-because a phase being fast is not the same as it doing its job.
+  * every wrapped function has its OWN label — no label is reused;
+  * timings are kept as INCLUSIVE and EXCLUSIVE (self) time. Exclusive time
+    subtracts whatever nested wrapped calls consumed, so the exclusive column
+    sums to the instrumented total and cannot double-count. Shares are
+    reported on exclusive time only;
+  * both engines are wrapped, and the engine that actually ran is recorded.
 
-    python scripts/read_telemetry_audit.py --super perf_local --table perf_read_full
+    STORAGE_TYPE=LOCAL python scripts/read_telemetry_audit.py
 """
 from __future__ import annotations
 
 import argparse
 import os
-import statistics as st
 import time
 from contextlib import contextmanager
+from importlib import import_module
 
 os.environ.setdefault("STORAGE_TYPE", "LOCAL")
 
 import polars as pl
 
-PHASES: dict[str, float] = {}
+INCL: dict[str, float] = {}
+EXCL: dict[str, float] = {}
 COUNTS: dict[str, int] = {}
+_STACK: list[float] = []          # per-frame accumulator of child time
+
+
+def reset() -> None:
+    INCL.clear(); EXCL.clear(); COUNTS.clear(); _STACK.clear()
 
 
 @contextmanager
 def phase(name: str):
-    t = time.perf_counter()
+    t0 = time.perf_counter()
+    _STACK.append(0.0)
     try:
         yield
     finally:
-        PHASES[name] = PHASES.get(name, 0.0) + (time.perf_counter() - t) * 1000.0
+        dt = (time.perf_counter() - t0) * 1000.0
+        child = _STACK.pop()
+        INCL[name] = INCL.get(name, 0.0) + dt
+        EXCL[name] = EXCL.get(name, 0.0) + (dt - child)
+        if _STACK:                       # charge our full span to the parent
+            _STACK[-1] += dt
 
 
-def _wrap(obj, attr, name, *, count_files=None):
-    """Time a method in place, optionally recording file counts."""
+def _wrap(obj, attr, label, *, on_return=None):
     orig = getattr(obj, attr)
 
     def inner(*a, **k):
-        with phase(name):
+        with phase(label):
             out = orig(*a, **k)
-        if count_files:
-            count_files(a, k, out)
+        if on_return:
+            on_return(a, k, out)
         return out
 
-    inner.__wrapped__ = orig
     setattr(obj, attr, inner)
-    return orig
 
 
-def install():
-    """Patch the seams. Returns a restore callable."""
-    # NOTE: `import supertable.engine.X` fails once `supertable` is imported —
-    # supertable/__init__.py binds the name `engine` to the Engine ENUM, which
-    # shadows the engine SUBPACKAGE as an attribute. importlib goes through the
-    # module registry and is unaffected.
-    from importlib import import_module
-    est_mod = import_module("supertable.engine.data_estimator")
+def install() -> None:
+    # `import supertable.engine.X` fails once supertable is imported: its
+    # __init__ binds the name `engine` to the Engine ENUM, shadowing the engine
+    # SUBPACKAGE attribute. importlib goes through the module registry instead.
+    est = import_module("supertable.engine.data_estimator")
     ec = import_module("supertable.engine.engine_common")
     proc = import_module("supertable.processing")
-    sp = import_module("supertable.utils.sql_parser")
     ac = import_module("supertable.rbac.access_control")
-
-    undo = []
+    lite = import_module("supertable.engine.duckdb_lite")
+    pro = import_module("supertable.engine.duckdb_pro")
 
     def rec_prune(a, k, out):
         raw = a[0] if a else k.get("file_keys", [])
-        COUNTS["files_before_prune"] = COUNTS.get("files_before_prune", 0) + len(raw)
-        COUNTS["files_after_prune"] = COUNTS.get("files_after_prune", 0) + len(out)
+        COUNTS["files_before"] = COUNTS.get("files_before", 0) + len(raw)
+        COUNTS["files_after"] = COUNTS.get("files_after", 0) + len(out)
 
-    undo.append((proc, "prune_files_by_predicates",
-                 _wrap(proc, "prune_files_by_predicates", "prune", count_files=rec_prune)))
-    undo.append((proc, "load_stats", _wrap(proc, "load_stats", "stats")))
-    # The estimator imported both by name, so its namespace needs patching too.
-    # The estimator calls its OWN imported reference, so the counter has to be
-    # attached here too — wrapping only processing.* times the phase but never
-    # records how many files pruning actually removed.
-    if hasattr(est_mod, "prune_files_by_predicates"):
-        undo.append((est_mod, "prune_files_by_predicates",
-                     _wrap(est_mod, "prune_files_by_predicates", "prune",
-                           count_files=rec_prune)))
-    if hasattr(est_mod, "load_stats"):
-        undo.append((est_mod, "load_stats", _wrap(est_mod, "load_stats", "stats")))
-    undo.append((est_mod.DataEstimator, "estimate",
-                 _wrap(est_mod.DataEstimator, "estimate", "estimate")))
-    undo.append((est_mod.DataEstimator, "_collect_snapshots_from_redis",
-                 _wrap(est_mod.DataEstimator, "_collect_snapshots_from_redis", "snapshots")))
-    undo.append((sp.SQLParser, "parse", _wrap(sp.SQLParser, "parse", "parse"))
-                if hasattr(sp.SQLParser, "parse") else None)
-    undo.append((ac, "restrict_read_access", _wrap(ac, "restrict_read_access", "rbac")))
-    undo.append((ec, "create_reflection_view", _wrap(ec, "create_reflection_view", "view")))
-    undo.append((ec, "new_duckdb_connection", _wrap(ec, "new_duckdb_connection", "connect")))
-    undo.append((ec, "init_connection", _wrap(ec, "init_connection", "connect"))
-                if hasattr(ec, "init_connection") else None)
+    _wrap(est.DataEstimator, "estimate", "estimate")
+    _wrap(est.DataEstimator, "_collect_snapshots_from_redis", "catalog_read")
+    if hasattr(est, "load_stats"):
+        _wrap(est, "load_stats", "stats_load")
+    if hasattr(est, "prune_files_by_predicates"):
+        _wrap(est, "prune_files_by_predicates", "prune", on_return=rec_prune)
+    _wrap(proc, "load_stats", "stats_load")
+    _wrap(ac, "restrict_read_access", "rbac")
 
-    def restore():
-        for item in undo:
-            if item is None:
-                continue
-            obj, attr, orig = item
-            setattr(obj, attr, orig)
+    for mod, cls_name, tag in ((lite, "DuckDBLite", "lite"), (pro, "DuckDBPro", "pro")):
+        cls = getattr(mod, cls_name, None)
+        if cls is None:
+            continue
 
-    return restore
+        def mark(a, k, out, _t=tag):
+            COUNTS[f"engine_{_t}"] = COUNTS.get(f"engine_{_t}", 0) + 1
+
+        _wrap(cls, "execute", f"engine[{tag}]", on_return=mark)
+        if hasattr(cls, "_get_connection"):
+            _wrap(cls, "_get_connection", f"conn[{tag}]")
+        if hasattr(cls, "_ensure_httpfs"):
+            _wrap(cls, "_ensure_httpfs", f"httpfs[{tag}]")
+        for fn in ("create_reflection_view_with_presign_retry",
+                   "create_reflection_table_with_presign_retry"):
+            if hasattr(mod, fn):
+                _wrap(mod, fn, f"reflect[{tag}]")
+
+    _wrap(ec, "init_connection", "conn_init")
+    _wrap(ec, "create_reflection_view", "view_sql")
 
 
 def main() -> int:
@@ -124,7 +122,7 @@ def main() -> int:
     ap.add_argument("--role", default="superadmin")
     ap.add_argument("--key", default="event_id")
     ap.add_argument("--tcol", default="event_ts")
-    ap.add_argument("--iterations", type=int, default=5)
+    ap.add_argument("--iterations", type=int, default=4)
     args = ap.parse_args()
 
     install()
@@ -132,20 +130,17 @@ def main() -> int:
 
     T = args.table
     queries = {
-        "count_star":       f"SELECT count(*) AS n FROM {T}",
-        "point_lookup":     f"SELECT count(*) AS n FROM {T} WHERE {args.key} = 4242",
-        "narrow_range":     f"SELECT count(*) AS n FROM {T} WHERE {args.key} BETWEEN 100 AND 200",
-        "ts_cast":          f"SELECT count(*) AS n FROM {T} "
-                            f"WHERE {args.tcol} >= TIMESTAMP '2025-12-01'",
-        "ts_barestring":    f"SELECT count(*) AS n FROM {T} "
-                            f"WHERE {args.tcol} >= '2025-12-01'",
-        "dim_filter":       f"SELECT count(*) AS n FROM {T} WHERE dim_country = 'DE'",
+        "count_star":    f"SELECT count(*) AS n FROM {T}",
+        "point_lookup":  f"SELECT count(*) AS n FROM {T} WHERE {args.key} = 4242",
+        "narrow_range":  f"SELECT count(*) AS n FROM {T} WHERE {args.key} BETWEEN 100 AND 200",
+        "ts_barestring": f"SELECT count(*) AS n FROM {T} WHERE {args.tcol} >= '2025-12-01'",
+        "dim_filter":    f"SELECT count(*) AS n FROM {T} WHERE dim_country = 'DE'",
     }
 
     rows = []
     for name, sql in queries.items():
-        for i in range(args.iterations + 1):        # first is warmup
-            PHASES.clear(); COUNTS.clear()
+        for i in range(args.iterations + 1):          # first run warms caches
+            reset()
             t0 = time.perf_counter()
             df, status, msg = DataReader(
                 super_name=args.sup, organization=args.org, query=sql,
@@ -155,10 +150,13 @@ def main() -> int:
                 print(f"  {name}: FAILED — {msg}")
                 break
             if i == 0:
-                continue                            # discard warmup
-            rec = {"query": name, "wall_ms": wall}
-            rec.update({f"t.{k}": v for k, v in PHASES.items()})
-            rec.update({f"c.{k}": v for k, v in COUNTS.items()})
+                continue
+            rec = {"query": name, "wall_ms": wall,
+                   "engine": "pro" if COUNTS.get("engine_pro") else
+                             ("lite" if COUNTS.get("engine_lite") else "?")}
+            rec.update({f"x.{k}": v for k, v in EXCL.items()})
+            rec.update({f"c.{k}": v for k, v in COUNTS.items()
+                        if not k.startswith("engine_")})
             rows.append(rec)
 
     if not rows:
@@ -166,34 +164,35 @@ def main() -> int:
         return 1
 
     df = pl.DataFrame(rows, infer_schema_length=None).fill_null(0.0)
-    pl.Config.set_tbl_rows(40); pl.Config.set_tbl_width_chars(150)
+    pl.Config.set_tbl_rows(40); pl.Config.set_tbl_width_chars(170)
+    xcols = sorted(c for c in df.columns if c.startswith("x."))
 
-    print("\nPER-QUERY PHASE BREAKDOWN (median ms over "
-          f"{args.iterations} runs, warmup discarded)")
-    tcols = [c for c in df.columns if c.startswith("t.")]
-    agg = df.group_by("query").agg(
+    print("\nEXCLUSIVE (self) TIME PER QUERY — median ms, warmup discarded")
+    print(df.group_by("query", "engine").agg(
         [pl.col("wall_ms").median().round(1).alias("wall")]
-        + [pl.col(c).median().round(1).alias(c.removeprefix("t.")) for c in tcols]
-    )
-    print(agg)
+        + [pl.col(c).median().round(1).alias(c.removeprefix("x.")) for c in xcols]
+    ).sort("wall", descending=True))
 
-    print("\nSHARE OF WALL, all queries pooled")
-    tot = df["wall_ms"].sum()
-    share = sorted(((c.removeprefix("t."), df[c].sum()) for c in tcols),
-                   key=lambda x: -x[1])
-    for n, v in share:
+    print("\nSHARE OF WALL (exclusive time — these sum, they do not overlap)")
+    wall_tot = df["wall_ms"].sum()
+    acc = 0.0
+    for c in sorted(xcols, key=lambda c: -df[c].sum()):
+        v = df[c].sum()
+        acc += v
         if v > 0.5:
-            print(f"  {n:12s} {v / len(rows):8.1f}ms/query   {v / tot * 100:5.1f}%")
+            print(f"  {c.removeprefix('x.'):20s} {v / len(rows):8.1f}ms/query  "
+                  f"{v / wall_tot * 100:5.1f}%")
+    print(f"  {'UNINSTRUMENTED':20s} {(wall_tot - acc) / len(rows):8.1f}ms/query  "
+          f"{(wall_tot - acc) / wall_tot * 100:5.1f}%")
 
-    if "c.files_before_prune" in df.columns:
+    if "c.files_before" in df.columns:
         print("\nPRUNING EFFECTIVENESS")
-        pr = df.group_by("query").agg(
-            pl.col("c.files_before_prune").median().alias("before"),
-            pl.col("c.files_after_prune").median().alias("after"),
+        print(df.group_by("query").agg(
+            pl.col("c.files_before").median().alias("before"),
+            pl.col("c.files_after").median().alias("after"),
         ).with_columns(
             ((1 - pl.col("after") / pl.col("before")) * 100).round(1).alias("pruned_pct")
-        )
-        print(pr)
+        ).sort("pruned_pct", descending=True))
     return 0
 
 

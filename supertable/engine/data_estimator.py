@@ -129,6 +129,7 @@ class DataEstimator:
         tables: List[TableDefinition],
         predicate_constraints: Optional[Dict] = None,
         plan_stats: Optional[PlanStats] = None,
+        fullscan: bool = False,
     ):
         self.organization = organization
         self.storage = storage
@@ -143,6 +144,12 @@ class DataEstimator:
         # the same object that flows to extend_execution_plan, so they reach the
         # read monitoring payload. Standalone callers get a fresh PlanStats.
         self.plan_stats: Optional[PlanStats] = plan_stats
+        # Force every file to be returned, skipping predicate pruning entirely.
+        # Pruning is only ever allowed to remove files that provably hold no
+        # matching row, so a fullscan result and a pruned result MUST be
+        # identical — this switch is what lets a test assert that instead of
+        # trusting it.  It is a correctness escape hatch, not a tuning knob.
+        self.fullscan = bool(fullscan)
         self.catalog = RedisCatalog()
 
     def _schema_to_dict(self, schema_obj) -> Dict[str, str]:
@@ -346,6 +353,12 @@ class DataEstimator:
         write path emits (``read_pruned_files``) so the read monitoring payload
         can surface them.
         """
+        if self.fullscan:
+            logger.debug(
+                f"[estimate.prune] fullscan: retaining all {len(raw_keys)} "
+                f"file(s) for {super_name}.{simple_name}"
+            )
+            return raw_keys
         if not settings.SUPERTABLE_READ_PRUNING_ENABLED:
             return raw_keys
         if stats_df is None or not raw_keys:

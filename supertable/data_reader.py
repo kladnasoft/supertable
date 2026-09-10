@@ -191,7 +191,17 @@ class DataReader:
         role_name: str,
         with_scan: bool = False,
         engine: engine = engine.AUTO,
+        fullscan: bool = False,
     ) -> Tuple[pd.DataFrame, Status, Optional[str]]:
+        """Run the query.
+
+        *fullscan* disables read-path file pruning, so every file in the
+        snapshot is scanned. Pruning may only ever drop files that provably
+        hold no matching row, which means a fullscan result and a pruned
+        result must be identical — this switch exists so a test can assert
+        that equality rather than assume it. It is a correctness escape
+        hatch, not a performance knob.
+        """
         status = Status.ERROR
         message: Optional[str] = None
         self.timer = Timer()
@@ -289,6 +299,7 @@ class DataReader:
                 tables=physical_tables,
                 predicate_constraints=predicate_constraints,
                 plan_stats=self.plan_stats,
+                fullscan=fullscan,
             )
             reflection = estimator.estimate()
 
