@@ -29,6 +29,47 @@ from supertable.engine.engine_common import (
 )
 
 
+# Shared per-thread engine state.
+#
+# `data_reader` builds a fresh Executor — and therefore a fresh DuckDBEngine —
+# for every query, which is fine in itself: the engine object is cheap. What is
+# NOT fine is holding the expensive, reusable state on that object. Cached on
+# `self`, the connection was rebuilt on every single query (five queries, five
+# connections, while the log said "persistent connection created" each time)
+# at a measured 51.6ms/query — 18% of read wall — and the deletion-vector
+# table cache was thrown away with it.
+#
+# So the state lives here instead, keyed per thread. Thread-local rather than
+# process-global because a DuckDB connection is not safe to share across
+# threads; this mirrors the write path's pooled probe connection. The stats
+# artifact cache already works this way (a module-level cache in processing),
+# which is why it never had this problem.
+_SHARED = threading.local()
+
+
+def _shared_state():
+    """Per-thread holder for the connection and the deletion-vector cache."""
+    st = getattr(_SHARED, "state", None)
+    if st is None:
+        st = {"con": None, "httpfs": False, "tombstone_cache": None}
+        _SHARED.state = st
+    return st
+
+
+def reset_shared_duckdb_state() -> None:
+    """Drop this thread's connection and caches (tests / eviction hook)."""
+    st = _shared_state()
+    con = st.get("con")
+    st["con"] = None
+    st["httpfs"] = False
+    st["tombstone_cache"] = None
+    if con is not None:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
 class DuckDBEngine:
     """
     Per-query DuckDB executor backed by a single persistent connection.
@@ -56,15 +97,16 @@ class DuckDBEngine:
     def __init__(self, storage: Optional[object] = None):
         self.storage = storage
         self._lock = threading.Lock()
-        self._con: Optional[duckdb.DuckDBPyConnection] = None
-        self._httpfs_configured = False
         # Shared deletion-vector table cache: per-table eviction (idle TTL +
         # per-table version cap), bounded by config. Tables live on the
         # persistent connection and are forgotten when it resets.
-        self._tombstone_cache = TombstoneCache(
-            settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE,
-            settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC,
-        )
+        st = _shared_state()
+        if st["tombstone_cache"] is None:
+            st["tombstone_cache"] = TombstoneCache(
+                settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE,
+                settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC,
+            )
+        self._tombstone_cache = st["tombstone_cache"]
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -72,35 +114,38 @@ class DuckDBEngine:
 
     def _get_connection(self, temp_dir: str) -> duckdb.DuckDBPyConnection:
         """Return the persistent connection, creating and configuring it once."""
-        if self._con is not None:
-            return self._con
+        st = _shared_state()
+        if st["con"] is not None:
+            return st["con"]
 
         con = duckdb.connect()
         init_connection(con, temp_dir=temp_dir)
         # httpfs (and both cache settings) are configured lazily on the first
         # query via _ensure_httpfs → configure_httpfs_and_s3.  They cannot be
         # applied here because the httpfs extension is not loaded yet.
-        self._con = con
-        self._httpfs_configured = False
+        st["con"] = con
+        st["httpfs"] = False
         logger.info("[duckdb] persistent connection created")
         return con
 
     def _ensure_httpfs(self, con: duckdb.DuckDBPyConnection, paths: List[str]) -> None:
         """Configure httpfs once per connection lifetime, under the lock."""
+        st = _shared_state()
         with self._lock:
-            if not self._httpfs_configured:
+            if not st["httpfs"]:
                 configure_httpfs_and_s3(con, paths)
-                self._httpfs_configured = True
+                st["httpfs"] = True
 
     def _reset_connection(self) -> None:
         """Close and discard the connection on unrecoverable error."""
-        if self._con is not None:
+        st = _shared_state()
+        if st["con"] is not None:
             try:
-                self._con.close()
+                st["con"].close()
             except Exception:
                 pass
-            self._con = None
-            self._httpfs_configured = False
+            st["con"] = None
+            st["httpfs"] = False
             # Tables died with the connection — just forget the registry.
             self._tombstone_cache.clear_registry()
             logger.warning("[duckdb] connection reset")

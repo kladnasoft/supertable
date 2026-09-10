@@ -141,7 +141,7 @@ def test_auto_never_spark_without_active_cluster_even_when_huge():
     # No active cluster: a 500 GiB job still stays on DuckDB (Pro for stable data).
     cat = _Catalog([])
     chosen = _executor(cat)._auto_pick(_reflection(500 * GIB), _cfg(10 * GIB))
-    assert chosen == Engine.DUCKDB_PRO
+    assert chosen == Engine.DUCKDB
 
 
 # --------------------------------------------------------------------------- #

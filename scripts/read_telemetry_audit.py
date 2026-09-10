@@ -75,8 +75,7 @@ def install() -> None:
     ec = import_module("supertable.engine.engine_common")
     proc = import_module("supertable.processing")
     ac = import_module("supertable.rbac.access_control")
-    lite = import_module("supertable.engine.duckdb_lite")
-    pro = import_module("supertable.engine.duckdb_pro")
+    duck = import_module("supertable.engine.duckdb")
 
     def rec_prune(a, k, out):
         raw = a[0] if a else k.get("file_keys", [])
@@ -92,7 +91,7 @@ def install() -> None:
     _wrap(proc, "load_stats", "stats_load")
     _wrap(ac, "restrict_read_access", "rbac")
 
-    for mod, cls_name, tag in ((lite, "DuckDBLite", "lite"), (pro, "DuckDBPro", "pro")):
+    for mod, cls_name, tag in ((duck, "DuckDBEngine", "duckdb"),):
         cls = getattr(mod, cls_name, None)
         if cls is None:
             continue
@@ -152,8 +151,7 @@ def main() -> int:
             if i == 0:
                 continue
             rec = {"query": name, "wall_ms": wall,
-                   "engine": "pro" if COUNTS.get("engine_pro") else
-                             ("lite" if COUNTS.get("engine_lite") else "?")}
+                   "engine": "duckdb" if COUNTS.get("engine_duckdb") else "?"}
             rec.update({f"x.{k}": v for k, v in EXCL.items()})
             rec.update({f"c.{k}": v for k, v in COUNTS.items()
                         if not k.startswith("engine_")})

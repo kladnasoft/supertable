@@ -130,13 +130,7 @@ class TestEngineEnum:
         from supertable.data_reader import engine
         assert engine.AUTO.value == "auto"
 
-    def test_duckdb_lite_value(self):
-        from supertable.data_reader import engine
-        assert engine.DUCKDB_LITE.value == "duckdb"   # alias of DUCKDB
 
-    def test_duckdb_pro_value(self):
-        from supertable.data_reader import engine
-        assert engine.DUCKDB_PRO.value == "duckdb"   # alias of DUCKDB
 
     def test_spark_sql_value(self):
         from supertable.data_reader import engine
@@ -148,15 +142,7 @@ class TestEngineEnum:
 
     def test_engine_members(self):
         from supertable.data_reader import engine
-        # __members__ includes the back-compat aliases; the distinct engines
-        # are AUTO / DUCKDB / SPARK_SQL, with DUCKDB_LITE and DUCKDB_PRO both
-        # resolving to DUCKDB so stored engine preferences keep working.
-        assert set(engine.__members__.keys()) == {
-            "AUTO", "DUCKDB", "DUCKDB_LITE", "DUCKDB_PRO", "SPARK_SQL",
-        }
-        assert {e.name for e in engine} == {"AUTO", "DUCKDB", "SPARK_SQL"}
-        assert engine.DUCKDB_LITE is engine.DUCKDB
-        assert engine.DUCKDB_PRO is engine.DUCKDB
+        assert set(engine.__members__.keys()) == {"AUTO", "DUCKDB", "SPARK_SQL"}
 
 
 # ====================================================================
@@ -390,10 +376,10 @@ class TestExecuteHappyPath:
         from supertable.data_reader import DataReader, engine
         from supertable.engine.executor import Engine as _Engine
         dr = DataReader("s", "o", "Q")
-        dr.execute("admin", engine=engine.DUCKDB_PRO)
+        dr.execute("admin", engine=engine.DUCKDB)
 
         exec_call_kwargs = mock_exec.execute.call_args
-        assert exec_call_kwargs[1]["engine"] == _Engine.DUCKDB_PRO or exec_call_kwargs[0][0] == _Engine.DUCKDB_PRO
+        assert exec_call_kwargs[1]["engine"] == _Engine.DUCKDB or exec_call_kwargs[0][0] == _Engine.DUCKDB
 
 
 # ====================================================================
@@ -1557,7 +1543,7 @@ class TestExecuteExecutorArgs:
         from supertable.data_reader import DataReader, engine
         from supertable.engine.executor import Engine as _Engine
         dr = DataReader("s", "o", "Q")
-        dr.execute("admin", engine=engine.DUCKDB_LITE)
+        dr.execute("admin", engine=engine.DUCKDB)
 
         # Executor constructed with storage and organization
         MockExecutor.assert_called_once_with(storage=mock_storage, organization="o")
@@ -1569,9 +1555,9 @@ class TestExecuteExecutorArgs:
 
         # Engine should be the internal enum
         if "engine" in kwargs:
-            assert kwargs["engine"] == _Engine.DUCKDB_LITE
+            assert kwargs["engine"] == _Engine.DUCKDB
         else:
-            assert args[0] == _Engine.DUCKDB_LITE
+            assert args[0] == _Engine.DUCKDB
 
     @patch(_PATCH_EXTEND_PLAN)
     @patch(_PATCH_EXECUTOR)
@@ -1769,7 +1755,7 @@ class TestExecuteExplainRouting:
         from supertable.engine.executor import Engine as _Engine
         # Request PRO — EXPLAIN must override it to LITE.
         dr = DataReader("s", "o", "EXPLAIN SELECT * FROM t")
-        df, status, msg = dr.execute("admin", engine=engine.DUCKDB_PRO)
+        df, status, msg = dr.execute("admin", engine=engine.DUCKDB)
 
         assert status == Status.OK
         # Parser is built on the INNER select only (EXPLAIN prefix stripped).
@@ -1778,7 +1764,7 @@ class TestExecuteExplainRouting:
         ekw = mock_exec.execute.call_args.kwargs
         assert ekw["explain"] is True
         assert ekw["explain_options"] == ""
-        assert ekw["engine"] == _Engine.DUCKDB_LITE
+        assert ekw["engine"] == _Engine.DUCKDB
 
     @patch(_PATCH_EXTEND_PLAN)
     @patch(_PATCH_EXECUTOR)
@@ -1853,12 +1839,12 @@ class TestExecuteExplainRouting:
         from supertable.data_reader import DataReader, engine
         from supertable.engine.executor import Engine as _Engine
         dr = DataReader("s", "o", "SELECT * FROM t")
-        dr.execute("admin", engine=engine.DUCKDB_PRO)
+        dr.execute("admin", engine=engine.DUCKDB)
 
         ekw = mock_exec.execute.call_args.kwargs
         assert ekw["explain"] is False
         assert ekw["explain_options"] == ""
-        assert ekw["engine"] == _Engine.DUCKDB_PRO  # not overridden
+        assert ekw["engine"] == _Engine.DUCKDB  # not overridden
 
 
 # ====================================================================

@@ -1488,12 +1488,39 @@ class TestDuckDBEngine:
         assert dt._tombstone_cache.ttl_seconds == _settings.SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC
 
     def test_reset_clears_tombstone_cache(self):
+        # The connection and the DV cache live in per-THREAD shared state, not
+        # on the instance: data_reader builds a fresh Executor (and engine) per
+        # query, so instance-held state was rebuilt every time.
+        from supertable.engine.duckdb import _shared_state, reset_shared_duckdb_state
+
+        reset_shared_duckdb_state()
         dt = DuckDBEngine()
-        dt._con = MagicMock()
+        _shared_state()["con"] = MagicMock()
         dt._tombstone_cache._registry["k"] = MagicMock()
         dt._reset_connection()
-        assert dt._con is None
+        assert _shared_state()["con"] is None
         assert dt._tombstone_cache.snapshot() == []
+        reset_shared_duckdb_state()
+
+    def test_connection_is_shared_across_engine_instances(self):
+        """A fresh engine per query must reuse the same connection.
+
+        This is the regression that cost 51.6ms/query (18% of read wall):
+        five queries created five connections while the log claimed a
+        persistent one.
+        """
+        from supertable.engine.duckdb import _shared_state, reset_shared_duckdb_state
+
+        reset_shared_duckdb_state()
+        try:
+            sentinel = MagicMock()
+            _shared_state()["con"] = sentinel
+            assert DuckDBEngine()._get_connection("t") is sentinel
+            assert DuckDBEngine()._get_connection("t") is sentinel
+            # ...and so is the deletion-vector cache.
+            assert DuckDBEngine()._tombstone_cache is DuckDBEngine()._tombstone_cache
+        finally:
+            reset_shared_duckdb_state()
 
     @patch("supertable.engine.duckdb.duckdb")
     @patch("supertable.engine.duckdb.init_connection")
@@ -1531,16 +1558,27 @@ class TestDuckDBEngine:
     @patch("supertable.engine.duckdb.duckdb")
     @patch("supertable.engine.duckdb.init_connection")
     def test_connection_closed_on_error(self, mock_init, mock_duckdb):
-        fake_con = MagicMock()
-        mock_duckdb.connect.return_value = fake_con
-        mock_init.side_effect = RuntimeError("init failed")
+        # The connection is shared per thread, so a live one from an earlier
+        # test would be returned before init_connection is ever reached and
+        # the failure path would not be exercised at all.
+        from supertable.engine.duckdb import reset_shared_duckdb_state
 
-        parser = MagicMock()
-        parser.get_table_tuples.return_value = []
-        with pytest.raises(RuntimeError):
-            DuckDBEngine().execute(Reflection("m", 0, 0, []), parser, MagicMock(), lambda e: None)
-        # init_connection raises before self._con is assigned, so _reset_connection
-        # is a no-op (self._con is None) and close() is not called on the raw con object.
+        reset_shared_duckdb_state()
+        try:
+            fake_con = MagicMock()
+            mock_duckdb.connect.return_value = fake_con
+            mock_init.side_effect = RuntimeError("init failed")
+
+            parser = MagicMock()
+            parser.get_table_tuples.return_value = []
+            with pytest.raises(RuntimeError):
+                DuckDBEngine().execute(
+                    Reflection("m", 0, 0, []), parser, MagicMock(), lambda e: None)
+            # init_connection raises before the shared slot is assigned, so
+            # _reset_connection is a no-op and close() is never called on the
+            # raw connection object.
+        finally:
+            reset_shared_duckdb_state()
 
 
 # ═══════════════════════════════════════════════════════════

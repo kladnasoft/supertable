@@ -8,19 +8,12 @@ class Engine(Enum):
 
     There is ONE DuckDB engine. It previously came in a "lite" and a "pro"
     flavour, the latter materialising reflection tables and routing on data
-    freshness; that split is gone, and DUCKDB behaves as lite always did.
-    ``DUCKDB_LITE`` and ``DUCKDB_PRO`` remain as aliases so existing callers
-    and stored engine preferences keep resolving — in Python both are simply
-    other names for ``DUCKDB``.
+    freshness; that split is gone and DUCKDB behaves as lite always did.
     """
 
     AUTO = "auto"
     DUCKDB = "duckdb"
     SPARK_SQL = "spark_sql"
-
-    # Back-compat aliases: Enum maps equal values onto the same member.
-    DUCKDB_LITE = "duckdb"
-    DUCKDB_PRO = "duckdb"
 
     @property
     def dialect(self) -> str:
