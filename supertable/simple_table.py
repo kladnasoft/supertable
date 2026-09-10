@@ -282,7 +282,9 @@ class SimpleTable:
             ``dict`` with ``files`` (list of written paths),
             ``files_written``, ``total_rows`` and ``total_bytes``.
         """
-        from supertable.processing import compact_resources, ROWID_COL, _read_parquet_safe
+        from supertable.processing import (
+            compact_resources, ROWID_COL, load_tombstone_parts, tombstone_parts,
+        )
 
         snapshot, _path = self.get_simple_table_snapshot()
         table_config = self.catalog.get_table_config(
@@ -296,7 +298,8 @@ class SimpleTable:
         dead_rowids = None
         tombstone_path = snapshot.get("tombstone")
         if tombstone_path:
-            tomb_df = _read_parquet_safe(tombstone_path)
+            # The vector is a list of parts (older snapshots hold one string).
+            tomb_df = load_tombstone_parts(tombstone_parts(tombstone_path))
             if tomb_df is not None and ROWID_COL in tomb_df.columns:
                 # Hand the frame over as-is: materialising the whole vector as
                 # a Python set costs O(deleted rows) of object churn for a

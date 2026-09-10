@@ -123,12 +123,15 @@ class TestTombstonePartitioning:
     def test_first_write_is_hour_partitioned(self, mock_gs):
         stor = _FakeStorage()
         mock_gs.return_value = stor
-        path, combined = build_tombstone_file(
+        parts, combined = build_tombstone_file(
             tombstone_dir="t/tombstone",
             prev_tombstone_path=None,
             new_pairs=[("fileA.parquet", 1), ("fileA.parquet", 2)],
             compression_level=1,
         )
+        # The vector is a list of parts; the first write produces exactly one.
+        assert isinstance(parts, list) and len(parts) == 1
+        path = parts[0]
         assert path.startswith("t/tombstone/")
         assert _PART_RE.search(path) is not None
         assert path.endswith("deleted.parquet")
@@ -140,12 +143,13 @@ class TestTombstonePartitioning:
     def test_exact_partition_path_and_dir(self, mock_gs, _part):
         stor = _FakeStorage()
         mock_gs.return_value = stor
-        path, _ = build_tombstone_file(
+        parts, _ = build_tombstone_file(
             tombstone_dir="t/tombstone",
             prev_tombstone_path=None,
             new_pairs=[("fileA.parquet", 1)],
             compression_level=1,
         )
+        path = parts[0]
         assert path.startswith(f"t/tombstone/{_FIXED_PART}/")
         assert f"t/tombstone/{_FIXED_PART}" in stor.made_dirs
 
@@ -156,13 +160,15 @@ class TestTombstonePartitioning:
         # flat-layout artifacts are untouched.
         stor = _FakeStorage()
         mock_gs.return_value = stor
-        path, combined = build_tombstone_file(
+        parts, combined = build_tombstone_file(
             tombstone_dir="t/tombstone",
             prev_tombstone_path="t/tombstone/legacy_flat.parquet",
             new_pairs=[],
             compression_level=1,
         )
-        assert path == "t/tombstone/legacy_flat.parquet"
+        # A legacy single-string pointer normalises to a one-part vector and is
+        # carried forward verbatim — pre-existing flat artifacts still resolve.
+        assert parts == ["t/tombstone/legacy_flat.parquet"]
         assert combined is None
         assert stor.made_dirs == []        # nothing created
 

@@ -26,6 +26,8 @@ from supertable.utils.timer import Timer
 from supertable.utils.profiler import Profiler
 from supertable.processing import (
     ROWID_COL,
+    load_tombstone_parts,
+    tombstone_parts,
     as_delete_pairs,
     empty_delete_pairs,
     find_overlapping_files,
@@ -828,7 +830,9 @@ class DataWriter:
                     )
                     if reclaimed_files:
                         sunset_files |= reclaimed_files
-                        tombstone_path = reclaimed_tomb_path
+                        # Reclaim rewrites the vector whole, so it becomes one part.
+                        tombstone_path = ([reclaimed_tomb_path]
+                                          if reclaimed_tomb_path else None)
                         combined_tombstone_df = reclaimed_dv
                         tombstone_rows = (
                             reclaimed_dv.height if reclaimed_dv is not None else 0
@@ -894,7 +898,8 @@ class DataWriter:
                         dv_to_drain = (
                             prev_dv_df
                             if prev_dv_df is not None
-                            else _read_parquet_safe(tombstone_path, profiler=profiler)
+                            else load_tombstone_parts(
+                                tombstone_parts(tombstone_path), profiler=profiler)
                         )
                     if dv_to_drain is not None and dv_to_drain.height > 0:
                         removed, tomb_new, tomb_sunset = compact_tombstones(
@@ -1488,7 +1493,8 @@ class DataWriter:
             # so there is no carry-forward hit to gain and it never re-seeds the
             # cache after draining — the loop-caching win lives on the write path.
             tombstone_df = (
-                _read_parquet_safe(tombstone_path, required=True)
+                load_tombstone_parts(
+                    tombstone_parts(tombstone_path), required=True)
                 if tombstone_path else None
             )
             tombstone_rows = (

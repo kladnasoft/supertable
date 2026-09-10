@@ -292,12 +292,21 @@ def _spark_create_tombstone_view(
         # same access method — direct s3a:// by default, presigned when
         # SUPERTABLE_SPARK_PRESIGNED is on — instead of a bare key or a
         # DuckDB-shaped presigned URL.
-        escaped = _resolve_spark_file(storage, tomb_path).replace("'", "''")
+        # The vector is a LIST of parts (a legacy pointer is one string).
+        # Spark's ``parquet.`path`` `` syntax takes a SINGLE path, so the parts
+        # are UNION ALL-ed before the DISTINCT.  Every part must appear —
+        # dropping one resurrects exactly the rows it recorded.
+        _parts = ([tomb_path] if isinstance(tomb_path, str)
+                  else [x for x in (tomb_path or []) if x])
+        _union = " UNION ALL ".join(
+            "SELECT `__rowid__` FROM parquet.`"
+            + _resolve_spark_file(storage, x).replace("`", "``") + "`"
+            for x in _parts
+        )
         sql = (
             f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
             f"SELECT {select_cols} FROM {source_table} AS src "
-            f"LEFT ANTI JOIN (SELECT DISTINCT `__rowid__` "
-            f"FROM parquet.`{escaped}`) AS __dv__ "
+            f"LEFT ANTI JOIN (SELECT DISTINCT `__rowid__` FROM ({_union})) AS __dv__ "
             f"ON src.`__rowid__` = __dv__.`__rowid__`"
         )
     else:

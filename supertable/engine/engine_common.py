@@ -1289,6 +1289,11 @@ def create_tombstone_view(
     )
 
     tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
+    # The vector is a LIST of immutable parts (a checkpoint base plus per-write
+    # deltas); older snapshots hold a single path.  Every part must be read —
+    # missing one silently resurrects exactly the rows it recorded.
+    tomb_parts = ([tomb_path] if isinstance(tomb_path, str)
+                  else [x for x in (tomb_path or []) if x])
     rid = quote_if_needed(ROWID_COL)
 
     if dv_table:
@@ -1301,12 +1306,12 @@ def create_tombstone_view(
             f"ANTI JOIN {dv_table} AS __dv__ "
             f"ON {source_table}.{rid} = __dv__.{rid};"
         )
-    elif tomb_path:
-        escaped = escape_parquet_path(tomb_path)
+    elif tomb_parts:
+        files_sql = ", ".join(f"'{escape_parquet_path(x)}'" for x in tomb_parts)
         sql = (
             f"CREATE OR REPLACE VIEW {view_name} AS "
             f"SELECT {live_cols} FROM {source_table} "
-            f"ANTI JOIN (SELECT DISTINCT {rid} FROM read_parquet('{escaped}')) AS __dv__ "
+            f"ANTI JOIN (SELECT DISTINCT {rid} FROM read_parquet([{files_sql}])) AS __dv__ "
             f"ON {source_table}.{rid} = __dv__.{rid};"
         )
     else:
@@ -1430,10 +1435,16 @@ class TombstoneCache:
             if entry is None:
                 table_name = dv_table_name(cache_key)
                 rid = quote_if_needed(ROWID_COL)
-                escaped = escape_parquet_path(duckdb_path)
+                # duckdb_path is a LIST of vector parts (a legacy single
+                # string is one part).  Every part must be materialised —
+                # missing one resurrects exactly the rows it recorded.
+                _parts = ([duckdb_path] if isinstance(duckdb_path, str)
+                          else [x for x in (duckdb_path or []) if x])
+                files_sql = ", ".join(
+                    f"'{escape_parquet_path(x)}'" for x in _parts)
                 con.execute(
                     f"CREATE TABLE IF NOT EXISTS {table_name} AS "
-                    f"SELECT DISTINCT {rid} FROM read_parquet('{escaped}');"
+                    f"SELECT DISTINCT {rid} FROM read_parquet([{files_sql}]);"
                 )
                 entry = _DVCacheEntry(
                     table_name=table_name,

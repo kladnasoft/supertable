@@ -453,9 +453,11 @@ class TestExecuteTombstoneResolution:
         mock_est._to_duckdb_path.assert_called_once_with(raw_tomb_key)
         # ... and the RESOLVED (presigned) value is what lands in the reflection.
         assert "t" in reflection.tombstone_views
+        # tombstone_path is a LIST of parts — the vector is append-only, so a
+        # legacy single-string pointer normalises to a one-part list.
         assert (
             reflection.tombstone_views["t"].tombstone_path
-            == f"https://signed/{raw_tomb_key}"
+            == [f"https://signed/{raw_tomb_key}"]
         )
         # cache_key is the BARE (pre-presign) key — stable across appends,
         # so the DuckDB DV-table cache keys on it, not the rotating URL.
@@ -509,7 +511,7 @@ class TestExecuteTombstoneResolution:
         dr = DataReader("s", "o", "SELECT * FROM tbl")
         dr.execute("admin", engine=engine.AUTO)
 
-        assert reflection.tombstone_views["t"].tombstone_path == raw_tomb_key
+        assert reflection.tombstone_views["t"].tombstone_path == [raw_tomb_key]
         # LOCAL: no presign, so cache_key equals the (also unchanged) path.
         assert reflection.tombstone_views["t"].cache_key == raw_tomb_key
 

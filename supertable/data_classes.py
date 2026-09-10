@@ -70,7 +70,7 @@ class TombstoneDef:
       materialised deletion-vector table cache.  ``None`` disables caching
       for this alias (falls back to inline ``read_parquet``).
     """
-    tombstone_path: Optional[str] = None
+    tombstone_path: Optional[object] = None   # str | list[str] (parts)
     cache_key: Optional[str] = None
 
 

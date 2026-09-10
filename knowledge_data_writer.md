@@ -2079,9 +2079,11 @@ The remaining `to_list()` / `iter_rows()` calls in the write path are `O(files)`
 `O(rows)` — a group-by result over a handful of files, sunset-path sets. `delete_pairs_to_list`
 survives as an explicit escape hatch for tests and is documented as such.
 
-### 25.4 The DuckDB pushdown probe, now on by default
+### 25.4 The DuckDB pushdown probe — measured, then REVERTED
 
-`SUPERTABLE_DUCKDB_WRITE_PROBE` flipped to `True`. On 11 delete batches over a 10M-row table:
+`SUPERTABLE_DUCKDB_WRITE_PROBE` was flipped to `True` in 3.0.6 and **flipped back in
+3.0.7**. The reasoning that justified it was wrong. On 11 delete batches over a 10M-row
+LOCAL table:
 
 | | probe OFF | probe ON |
 |---|---|---|
@@ -2091,12 +2093,26 @@ survives as an explicit escape hatch for tests and is documented as such.
 | `resolve_overwrite` | 4.77s | 3.58s (−25%) |
 | wall | 11.5s | 10.3s (−10%) |
 
-Results byte-identical. **Local wall improved only 10% because local reads are cheap — on
-object storage those bytes are the cost, and that is where the 12x matters.** That case is
-not measured here.
+**Those counters do not mean what they look like.** `rows_read` / `bytes_read` are
+incremented ONLY inside `_read_parquet_safe` — the polars path. DuckDB's own reads are not
+instrumented, so enabling the probe did not shrink the I/O, it moved it somewhere unmeasured.
+The counters vanish entirely (the keys are absent, because `Profiler.add` skips zero).
 
-Safe to leave on without httpfs: the probe catches its own failures and returns `None`, and
-resolution falls back to the polars path.
+Measured properly, against MinIO, 3 runs each:
+
+| | polars fallback | DuckDB probe |
+|---|---|---|
+| `resolve_overwrite` | 3767 ms | 4882 ms (**+30%**) |
+| wall | 5080 ms | 6054 ms (**+19%**) |
+
+The probe reads through httpfs range requests; the fallback issues one bulk GET per file
+through the storage SDK and projects to the key columns. Against MinIO the SDK wins. The
+default is `False`; enable it per-deployment only if measurement says so on *your* backend.
+
+Two operational notes. The fallback is silent apart from the `overwrite_resolve_fallback`
+counter — and a **DuckDB patch upgrade alone disables the probe**, because extensions are
+pinned to the exact version (observed live: upgrading 1.5.2 → 1.5.5 left the seeded
+`v1.5.2` extension unusable and every probe silently fell back).
 
 ### 25.5 httpfs is no longer required for local storage
 
@@ -2120,3 +2136,101 @@ DuckDB 1.5.5 is verified working against this tree.
   `min(live_rows)` below the vector height, so the guard often passes anyway.
 * `build_tombstone` still rewrites the whole vector per delete — inherent to the immutable
   artifact design, and the reason delete cost climbs with deletes already done.
+
+---
+
+## 26. The append-only deletion vector (3.0.7)
+
+### 26.1 What changed
+
+`snapshot["tombstone"]` is now a **list of immutable parts** — a checkpoint base followed by
+one delta per write — instead of a single file restating every deletion ever made. Snapshots
+written before this hold a single string, which `tombstone_parts()` normalises to a one-part
+list, so existing tables read without migration.
+
+Each write appends only the rowids **it** removed. A checkpoint collapses the parts back into
+one base once there are more than `SUPERTABLE_TOMBSTONE_MAX_PARTS` (default 100).
+
+### 26.2 Why
+
+The old form was quadratic. Every delete rewrote the whole accumulated vector:
+
+```
+100 deletes x 2,000 rows:  200,000 deletions -> 10,100,000 rows written   (50x)
+identical 2,000-row delete: 8.2ms at vector size 2k  ->  56.6ms at 200k    (6.9x)
+```
+
+**No history is lost by writing deltas.** History was never lost by writing full copies
+either — every version is retained — but full copies *duplicate* it. With parts, snapshot v9
+holds `[base, p1..p9]` and v10 holds `[base, p1..p10]`; the shared parts are the same objects.
+Time travel reads a prefix.
+
+### 26.3 Why the part cap is 100
+
+Cost of the per-query `DISTINCT __rowid__` scan over a 1M-row vector:
+
+| parts | LOCAL | MinIO |
+|---|---|---|
+| 1 | 68.4 ms | 104.8 ms |
+| 10 | 72.1 ms (+5%) | 72.7 ms (0.69x) |
+| 100 | 75.8 ms (+11%) | **76.8 ms (0.73x)** |
+| 500 | 182.5 ms (+167%) | — |
+
+On MinIO 100 parts is **faster** than one file — DuckDB fetches the objects in parallel. The
+local knee is between 100 and 500.
+
+### 26.4 The durability constraint that shapes the design
+
+Part size is dictated by the delete, not chosen. Every write must durably record its own
+deletions **before** the leaf CAS; buffering small deletes in memory to fill a fixed-size part
+would mean a crash between commit and flush leaves a committed snapshot whose deletions are
+not on disk — and those rows come back. So 100 is a cap on part **count**, not a target size.
+
+Two independent triggers, kept strictly separate:
+
+| trigger | protects against | action | cost |
+|---|---|---|---|
+| parts > 100 | many tiny deletes | **checkpoint** — merge parts into one base | tombstone files only |
+| rows > `MAX_TOMBSTONE_ROWS` | few huge deletes | **drain** — `compact_tombstones` | rewrites data files |
+
+### 26.5 Measured
+
+On the 5M-delete workload: `build_tombstone` **−32%**, bytes written **−22%**.
+
+The threshold and the rewrite are coupled, which is why this had to come first. Raising
+`MAX_TOMBSTONE_ROWS` on the OLD form made things worse, not better:
+
+| threshold | wall | drains | `compact_tombstones` | `build_tombstone` | DV rows written |
+|---|---|---|---|---|---|
+| 1M | 44.4s | 4 | 15.5s | 4.5s | 21,377,598 |
+| 5M | 64.6s | 1 | 9.8s (−37%) | **17.0s (+278%)** | **107,217,754 (5x)** |
+
+Fewer drains, but a bigger vector rewritten every delete. Now that writes are O(delta),
+raising the threshold is a usable lever again — untested, and the obvious next experiment.
+
+### 26.6 Equivalence — verified by hash, not by aggregates
+
+Insert 300k → update the same rows 3x → delete 90k → re-insert 30k of them, run twice (parts
+vs forced single-file rewrite):
+
+```
+append-only : f9a116d9a3dee055a4f5c23552baa8fb26cdb10fe79a032ce45898d25c5b02c3
+old rewrite : f9a116d9a3dee055a4f5c23552baa8fb26cdb10fe79a032ce45898d25c5b02c3
+```
+
+Full SHA-256 over all 240,000 rows in canonical order, plus a per-column hash for `id`, `grp`,
+`rev`, `amt` — all match. Aggregates alone (count/sum) would not have caught a per-row swap.
+
+### 26.7 The consumers that must see every part
+
+A read that misses one part resurrects exactly the rows it recorded. Seven sites carry the
+pointer, and all seven were updated:
+
+`data_writer` (carry-forward + Phase-A drain) · `processing.load_tombstone` /
+`load_tombstone_parts` · `simple_table.export_to` · `data_reader` (`TombstoneDef`) ·
+`engine_common.create_reflection_view` (`read_parquet([...])`) ·
+`engine_common.TombstoneCache` (the materialised DV table) · `spark_thrift`
+(Spark's ``parquet.`path` `` takes ONE path, so the parts are `UNION ALL`-ed).
+
+The Spark and DV-cache sites were found only because the end-to-end equivalence test failed
+on them — the unit suite passed while they were still broken.

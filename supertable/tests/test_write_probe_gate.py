@@ -130,14 +130,18 @@ def test_gate_result_identical_on_and_off(tmp_path, monkeypatch):
     assert _run(True) == _run(False)
 
 
-def test_probe_is_enabled_by_default():
-    """The default is ON.
+def test_probe_is_disabled_by_default():
+    """The default is OFF, on measurement.
 
-    It pushes the key semi-join into DuckDB instead of materialising every
-    overlapping file's key columns: 12x less data read on a 10M-row delete
-    workload, byte-identical results.  Safe without httpfs — the probe catches
-    its own failures and the polars fallback takes over.
+    Against MinIO the probe is slower than the polars fallback (resolve_overwrite
+    +30%, wall +19%, 3 runs each): it reads through httpfs range requests, while
+    the fallback issues one bulk GET per file through the storage SDK and
+    projects to the key columns.
+
+    3.0.6 briefly defaulted this ON after a LOCAL run showed c.rows_read drop
+    120M -> 10M. That reading was wrong: those counters are only incremented by
+    the polars path, so the probe made them vanish rather than shrink.
     """
     from supertable.config.settings import Settings
 
-    assert Settings().SUPERTABLE_DUCKDB_WRITE_PROBE is True
+    assert Settings().SUPERTABLE_DUCKDB_WRITE_PROBE is False

@@ -56,6 +56,9 @@ _PATCH_UUID4 = f"{_MOD}.uuid.uuid4"
 _PATCH_COMPACT_RES = f"{_MOD}.compact_resources"
 _PATCH_COMPACT_TOMB = f"{_MOD}.compact_tombstones"
 _PATCH_READ_PARQUET = f"{_MOD}._read_parquet_safe"
+# The deletion-vector is a LIST of parts (checkpoint base + per-write deltas),
+# loaded through load_tombstone_parts rather than a single-path read.
+_PATCH_LOAD_PARTS = f"{_MOD}.load_tombstone_parts"
 _PATCH_EXTRACT_STATS = f"{_MOD}.extract_stats_rows"
 _PATCH_BUILD_STATS = f"{_MOD}.build_stats_file"
 
@@ -1863,7 +1866,7 @@ class TestWriteAutoCompaction:
 
     @patch(_PATCH_COMPACT_RES)
     @patch(_PATCH_COMPACT_TOMB)
-    @patch(_PATCH_READ_PARQUET)
+    @patch(_PATCH_LOAD_PARTS)
     @patch(_PATCH_BUILD_STATS)
     @patch(_PATCH_EXTRACT_STATS)
     @patch(_PATCH_BUILD_TOMBSTONE)
@@ -1947,7 +1950,7 @@ class TestWriteAutoCompaction:
 
     @patch(_PATCH_COMPACT_RES)
     @patch(_PATCH_COMPACT_TOMB)
-    @patch(_PATCH_READ_PARQUET)
+    @patch(_PATCH_LOAD_PARTS)
     @patch(_PATCH_BUILD_STATS)
     @patch(_PATCH_EXTRACT_STATS)
     @patch(_PATCH_BUILD_TOMBSTONE)
@@ -2010,7 +2013,7 @@ class TestWriteAutoCompaction:
 
     @patch(_PATCH_COMPACT_RES)
     @patch(_PATCH_COMPACT_TOMB)
-    @patch(_PATCH_READ_PARQUET)
+    @patch(_PATCH_LOAD_PARTS)
     @patch(_PATCH_BUILD_STATS)
     @patch(_PATCH_EXTRACT_STATS)
     @patch(_PATCH_BUILD_TOMBSTONE)
@@ -2092,8 +2095,10 @@ class TestWriteAutoCompaction:
 
         assert result is not None
         # The carried-forward vector was read off its pointer to drain it.
+        # The pointer is a part LIST, so the drain unions every part — reading
+        # only some of them would resurrect the rows the others recorded.
         mock_read_parquet.assert_called_once()
-        assert mock_read_parquet.call_args[0][0] == "/d/tombstone/dv.parquet"
+        assert mock_read_parquet.call_args[0][0] == ["/d/tombstone/dv.parquet"]
         # Both phases ran, drain strictly before merge.
         mock_compact_tomb.assert_called_once()
         mock_compact_res.assert_called_once()

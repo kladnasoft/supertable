@@ -167,20 +167,28 @@ class Settings:
     SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD: bool = False  # SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD
     # Write-path overwrite/delete resolution via the DuckDB pushdown probe.
     #
-    # ENABLED by default.  The probe pushes the key semi-join into DuckDB
-    # instead of materialising every overlapping file's key columns in polars.
-    # Measured on a 10M-row table over 11 delete batches: 120,000,000 rows /
-    # 646 MiB read with the probe off, versus 10,000,000 rows / 54 MiB with it
-    # on -- 12x less data -- for byte-identical results and zero fallbacks.
-    # Local wall time improved only ~10% because local reads are cheap; on
-    # object storage, where those bytes ARE the cost, that gap is the point.
+    # DISABLED by default, on measurement.  3.0.6 briefly enabled it on the
+    # strength of a LOCAL run where c.rows_read fell from 120,000,000 to
+    # 10,000,000 -- but those counters are incremented ONLY by the polars path
+    # (_read_parquet_safe).  DuckDB's own reads are not instrumented, so the
+    # counters did not show less I/O, they showed I/O moving somewhere
+    # unmeasured.  The real comparison, on MinIO, 3 runs each:
     #
-    # Safe where httpfs is unavailable: the probe catches its own failures and
-    # returns None, so resolution falls back to the polars path, which reads
-    # only the projected key columns through the storage SDK and needs no
-    # extension.  Local-filesystem paths no longer load httpfs at all (see
-    # configure_httpfs_and_s3).  Set false to force the fallback.
-    SUPERTABLE_DUCKDB_WRITE_PROBE: bool = True     # SUPERTABLE_DUCKDB_WRITE_PROBE
+    #     resolve_overwrite   polars 3767ms   probe 4882ms   +30%
+    #     wall                polars 5080ms   probe 6054ms   +19%
+    #
+    # The probe reads through httpfs (HTTP range requests per file); the
+    # fallback issues one bulk GET per file through the storage SDK and
+    # projects to the key columns.  Against MinIO the SDK wins.  On LOCAL the
+    # probe was ~10% faster, which is not a reason to default it on for
+    # object-store deployments.
+    #
+    # Enable per-deployment if measurement says so on YOUR backend.  It is
+    # safe where httpfs is missing -- the probe catches its own failures and
+    # falls back -- but note that fallback is silent apart from the
+    # overwrite_resolve_fallback counter: a DuckDB version bump alone will
+    # disable it, because extensions are pinned to the exact duckdb version.
+    SUPERTABLE_DUCKDB_WRITE_PROBE: bool = False    # SUPERTABLE_DUCKDB_WRITE_PROBE
     # Deletion-vector (tombstone) table cache.  Each entry is a small
     # `DISTINCT __rowid__` table keyed by the stable tombstone path; the
     # tombstone view ANTI JOINs it instead of re-reading the parquet every
@@ -318,6 +326,15 @@ class Settings:
     # held in the in-process tombstone cache (one DataFrame per table; older
     # versions are always read fresh and never cached).  Mirrors the stats cache
     # so a process writing in a loop skips the carry-forward read.  0 disables.
+    # Deletion-vector parts before a checkpoint collapses them into one base.
+    # The vector is append-only: each write adds a part holding only the rowids
+    # IT removed, instead of restating every earlier deletion (which was
+    # quadratic — 200,000 deletions caused 10,100,000 rows to be written).
+    # This bounds both the part count and the per-query read fan-out.
+    # Measured DISTINCT-scan cost of a 1M-row vector at 100 parts: +11% on
+    # local disk, and 0.73x (i.e. FASTER) on MinIO, where DuckDB fetches the
+    # parts in parallel.  500 parts is where local cost turns sharply (+167%).
+    SUPERTABLE_TOMBSTONE_MAX_PARTS: int = 100  # SUPERTABLE_TOMBSTONE_MAX_PARTS
     SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES: int = 64   # SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES
 
     # Read-path file pruning: when True the estimator uses the stats artifact to
@@ -481,7 +498,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_DUCKDB_PRESIGNED=_env_bool("SUPERTABLE_DUCKDB_PRESIGNED", False),
         SUPERTABLE_DUCKDB_USE_HTTPFS=_env_bool("SUPERTABLE_DUCKDB_USE_HTTPFS", False),
         SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=_env_bool("SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD", False),
-        SUPERTABLE_DUCKDB_WRITE_PROBE=_env_bool("SUPERTABLE_DUCKDB_WRITE_PROBE", True),
+        SUPERTABLE_DUCKDB_WRITE_PROBE=_env_bool("SUPERTABLE_DUCKDB_WRITE_PROBE", False),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE", 8),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC", 300),
         SUPERTABLE_DEBUG_TIMINGS=_env_bool("SUPERTABLE_DEBUG_TIMINGS", False),
@@ -589,6 +606,7 @@ def _build_settings() -> Settings:
         # ── Meta Reader / Caching ────────────────────────────────────
         SUPERTABLE_SUPER_META_CACHE_TTL_S=meta_ttl,
         SUPERTABLE_STATS_CACHE_MAX_TABLES=_env_int("SUPERTABLE_STATS_CACHE_MAX_TABLES", 64),
+        SUPERTABLE_TOMBSTONE_MAX_PARTS=_env_int("SUPERTABLE_TOMBSTONE_MAX_PARTS", 100),
         SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES=_env_int("SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES", 64),
         SUPERTABLE_READ_PRUNING_ENABLED=_env_bool("SUPERTABLE_READ_PRUNING_ENABLED", True),
         SUPERTABLE_READ_PROJECTION_SIZING_ENABLED=_env_bool("SUPERTABLE_READ_PROJECTION_SIZING_ENABLED", True),

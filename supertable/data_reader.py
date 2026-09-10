@@ -320,11 +320,19 @@ class DataReader:
                                 # object key, which DuckDB/Spark cannot read against
                                 # an object store and must be presigned. LOCAL
                                 # storage returns the key unchanged.
+                                # The vector is a list of parts (older
+                                # snapshots hold one string).  EVERY part must
+                                # reach the reader — dropping one resurrects
+                                # exactly the rows it recorded.
+                                _parts = ([tomb_path] if isinstance(tomb_path, str)
+                                          else [x for x in (tomb_path or []) if x])
                                 reflection.tombstone_views[td.alias] = TombstoneDef(
-                                    tombstone_path=estimator._to_duckdb_path(tomb_path),
+                                    tombstone_path=[
+                                        estimator._to_duckdb_path(x) for x in _parts
+                                    ],
                                     # Bare key (pre-presign) is stable across
                                     # appends → safe deletion-vector cache key.
-                                    cache_key=tomb_path,
+                                    cache_key=str(tomb_path),
                                 )
                     except Exception as te:
                         logger.debug(self._lp(f"[tombstone] leaf lookup failed for {td.alias}: {te}"))

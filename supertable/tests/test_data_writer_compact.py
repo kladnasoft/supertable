@@ -36,6 +36,10 @@ _P_REDIS_CAT     = f"{_MOD}.RedisCatalog"
 _P_COMPACT_RES   = f"{_MOD}.compact_resources"
 _P_COMPACT_TOMB  = f"{_MOD}.compact_tombstones"
 _P_READ_PARQUET  = f"{_MOD}._read_parquet_safe"
+# compact() loads the deletion-vector through load_tombstone_parts: the vector
+# is a LIST of immutable parts (checkpoint base + per-write deltas), so a
+# single-path read is no longer the right seam to intercept.
+_P_LOAD_PARTS    = f"{_MOD}.load_tombstone_parts"
 
 
 def _as_parquet_bytes(arrow_tbl) -> bytes:
@@ -323,7 +327,7 @@ class TestTombstoneGating:
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
     @patch(_P_COMPACT_TOMB)
-    @patch(_P_READ_PARQUET)
+    @patch(_P_LOAD_PARTS)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
@@ -351,7 +355,7 @@ class TestTombstoneGating:
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
     @patch(_P_COMPACT_TOMB)
-    @patch(_P_READ_PARQUET)
+    @patch(_P_LOAD_PARTS)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
@@ -380,7 +384,7 @@ class TestTombstoneGating:
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
     @patch(_P_COMPACT_TOMB)
-    @patch(_P_READ_PARQUET)
+    @patch(_P_LOAD_PARTS)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
@@ -410,7 +414,7 @@ class TestTombstoneGating:
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
     @patch(_P_COMPACT_TOMB)
-    @patch(_P_READ_PARQUET)
+    @patch(_P_LOAD_PARTS)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
@@ -440,7 +444,7 @@ class TestTombstoneGating:
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES, return_value=(0, 0, [], set()))
     @patch(_P_COMPACT_TOMB)
-    @patch(_P_READ_PARQUET)
+    @patch(_P_LOAD_PARTS)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
@@ -1033,7 +1037,7 @@ class TestTwoPhaseAggregation:
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES)
     @patch(_P_COMPACT_TOMB)
-    @patch(_P_READ_PARQUET)
+    @patch(_P_LOAD_PARTS)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
@@ -1099,7 +1103,7 @@ class TestTwoPhaseAggregation:
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES)
     @patch(_P_COMPACT_TOMB)
-    @patch(_P_READ_PARQUET)
+    @patch(_P_LOAD_PARTS)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
@@ -1193,7 +1197,7 @@ class TestResultShape:
     @patch(_P_MIRROR)
     @patch(_P_COMPACT_RES)
     @patch(_P_COMPACT_TOMB)
-    @patch(_P_READ_PARQUET)
+    @patch(_P_LOAD_PARTS)
     @patch(_P_SETTINGS, new_callable=_stub_settings)
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_WRITE)
