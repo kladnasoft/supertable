@@ -24,6 +24,23 @@ _ROOT = Path(__file__).resolve().parents[1]
 _FAKE_PYPI_TOKEN = "pypi" + "-test_token"
 
 
+def _repo_version() -> str:
+    """Read the released version from the real pyproject.toml.
+
+    ``_release_checkout`` copies that exact file into its temporary checkout,
+    so every expectation below must track it.  Hardcoding the version made
+    these tests fail on each release bump for no reason, which trains
+    maintainers to edit the assertion rather than read it.
+    """
+    text = (_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    assert match, "pyproject.toml has no version field"
+    return match.group(1)
+
+
+_REPO_VERSION = _repo_version()
+
+
 def _run(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
@@ -35,7 +52,8 @@ def _run(*args: str, cwd: Path, check: bool = True) -> subprocess.CompletedProce
     )
 
 
-def _release_checkout(tmp_path: Path, *, init_version: str = "2.5.11") -> Path:
+def _release_checkout(tmp_path: Path, *, init_version: str | None = None) -> Path:
+    init_version = _REPO_VERSION if init_version is None else init_version
     checkout = tmp_path / "checkout"
     (checkout / "supertable").mkdir(parents=True)
     for name in ("push-pypi.sh", "pyproject.toml", "setup.py"):
@@ -159,7 +177,10 @@ def test_release_helper_accepts_metadata_free_setup_shim(tmp_path: Path) -> None
     result = _invoke_release_helper(checkout)
 
     assert result.returncode == 6
-    assert "--push requires the existing signed local tag v2.5.11" in result.stderr
+    assert (
+        f"--push requires the existing signed local tag v{_REPO_VERSION}"
+        in result.stderr
+    )
     assert "version mismatch" not in result.stderr
     assert "setup.py" not in result.stderr
 
@@ -171,7 +192,7 @@ def test_release_helper_rejects_init_version_mismatch(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert "version mismatch" in result.stderr
-    assert "pyproject=2.5.11" in result.stderr
+    assert f"pyproject={_REPO_VERSION}" in result.stderr
     assert "__init__=['9.9.9']" in result.stderr
 
 
