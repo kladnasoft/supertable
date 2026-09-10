@@ -1160,15 +1160,44 @@ class TestConfigureHttpfsAndS3:
         configure_httpfs_and_s3(con, [])
         con.execute.assert_not_called()
 
-    def test_local_paths_installs_httpfs_but_no_s3_config(self):
+    def test_local_paths_do_not_touch_httpfs_at_all(self):
+        """Local paths must not require the httpfs extension.
+
+        httpfs exists to reach object storage; DuckDB reads local files
+        natively. Loading it for local paths was a pure packaging tax on
+        LOCAL deployments — and not a harmless one: when the extension is
+        absent, the load raises a hard RuntimeError that kills the query, so
+        a LOCAL-only install could not read its own data without shipping a
+        ~20 MiB platform- and version-locked binary it never uses.
+        """
         con = MagicMock()
         configure_httpfs_and_s3(con, ["/local/file.parquet"])
         calls = [str(c) for c in con.execute.call_args_list]
-        # With a MagicMock connection, LOAD httpfs succeeds silently so INSTALL
-        # is never called.  The relevant assertion is that httpfs IS loaded and
-        # that no S3-specific settings are applied for local paths.
-        assert any("LOAD httpfs" in s for s in calls)
+        assert not any("httpfs" in s for s in calls), (
+            f"local paths must not load httpfs, got: {calls}"
+        )
         assert not any("s3_endpoint" in s for s in calls)
+
+    def test_s3_paths_still_load_httpfs(self):
+        """The other side of the gate: remote paths genuinely need it."""
+        con = MagicMock()
+        configure_httpfs_and_s3(con, ["s3://bucket/key.parquet"])
+        calls = [str(c) for c in con.execute.call_args_list]
+        assert any("LOAD httpfs" in s for s in calls)
+
+    def test_http_paths_still_load_httpfs(self):
+        """Presigned URLs are the other remote form."""
+        con = MagicMock()
+        configure_httpfs_and_s3(con, ["https://host/bucket/key.parquet?sig=x"])
+        calls = [str(c) for c in con.execute.call_args_list]
+        assert any("LOAD httpfs" in s for s in calls)
+
+    def test_mixed_paths_load_httpfs(self):
+        """One remote path among local ones is enough to need it."""
+        con = MagicMock()
+        configure_httpfs_and_s3(con, ["/local/a.parquet", "s3://bucket/b.parquet"])
+        calls = [str(c) for c in con.execute.call_args_list]
+        assert any("LOAD httpfs" in s for s in calls)
 
 
 # ═══════════════════════════════════════════════════════════

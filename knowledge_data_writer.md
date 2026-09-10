@@ -2007,9 +2007,9 @@ answers unfiltered `count(*)` from metadata alone, so it is useless as a baselin
   *file_size*. Better compression means a 16 MiB chunk now holds ~2.6M rows instead of ~1.1M,
   so peak memory during a merge rises proportionally. Still bounded, but `max_memory_chunk_size`
   is a weaker proxy for memory than it was.
-* **Tombstone cost is unmeasured here.** An append-only load tombstones nothing —
-  `build_tombstone` totalled 0.5ms across all 100 writes. Any claim about tombstone
-  performance needs an upsert/delete workload.
+* **Tombstone cost is not measurable on this workload.** An append-only load tombstones
+  nothing — `build_tombstone` totalled 0.5ms across all 100 writes. Measured separately in
+  [§25](#25-measured-delete-profile-5m-rows-deleted-from-10m).
 
 ### 24.5 A telemetry trap that was fixed
 
@@ -2018,3 +2018,105 @@ answers unfiltered `count(*)` from metadata alone, so it is useless as a baselin
 deletes** — the stats parquet's encode wearing a tombstone label. Anyone reading that
 telemetry would have concluded tombstones cost 3.6% here. The span is now labelled by the
 caller (`tombstone` / `stats`).
+
+---
+
+## 25. Measured delete profile (5M rows deleted from 10M)
+
+Driven by `scripts/delete_telemetry_audit.py`: build 10M rows, then delete until 5,000,000
+are gone in batches of 10k–200k **random** keys. Random keys are deliberate — they are the
+worst case for stats pruning (the probe range spans every file, so nothing can be excluded)
+and they are what "delete these specific records" looks like. A range-shaped delete prunes
+and is a different measurement.
+
+### 25.1 The shape of a delete
+
+Deletes run through `write(..., overwrite_columns=[key], delete_only=True)` with a frame
+carrying only the key column. Nothing is inserted; the work is *finding* the rowids and
+extending the deletion vector.
+
+The load produced a clean sawtooth: the vector grows to `MAX_TOMBSTONE_ROWS` (1M), a drain
+fires and physically rewrites the files it names, the vector resets to 0, repeat. **4 drains
+over 47 deletes.**
+
+### 25.2 Before / after
+
+| stage | before | after | |
+|---|---|---|---|
+| `resolve_overwrite` | 18.86s | 13.9s | probe pushes the semi-join into DuckDB |
+| `compact_tombstones` | 15.63s | 16.4s | 4 vector drains — untouched |
+| **`identify_deletes`** | **10.80s** | **1.06s** | **−90%** |
+| `build_tombstone` | 6.72s | 4.2s | −37% |
+| `reclaim_dead_files` | 2.97s | 2.56s | −14% |
+| **total** | **59.9s** | **40.3s** | **−33%** |
+
+Final state identical both ways: 5,645,571 physical rows, 645,571 vector rows, 7 files.
+
+### 25.3 What was actually slow
+
+**a) Read amplification.** Before: every plain delete read **7 files / 70.9 MiB /
+8,141,484 rows to delete ~101,000** — 80x. With random keys no file can be pruned, so the
+question is only whether the key columns get materialised. They did.
+
+**b) `identify_deletes` rebuilt a Python `set` of the whole vector, per delete.**
+
+```python
+prev_dv_rowids = set(prev_dv_df.get_column("__rowid__").to_list())   # up to 1M ints
+new_delete_pairs = [(f, rid) for (f, rid) in pairs if rid not in prev_dv_rowids]
+```
+
+and the pairs it filtered had themselves come out of polars via `iter_rows()`, only to be
+rebuilt into a frame by `build_tombstone_file`. **polars → Python → polars, three times.**
+Cost grew **6.5x** with vector size (64.8ms → 421.2ms). Replaced with an anti-join:
+**846ms → 48ms** on a 1M/100k case; growth now 2.4x.
+
+**c) The same pattern hid in two more places**, both `O(rows)`:
+`SimpleTable.export_to` built a Python set of the entire vector, and `compact_resources` ran
+`is_in(list(dead_rowids))` **inside its per-file loop** — `O(vector × files)`. Both are now
+anti-joins; measured **1041ms → 56ms per file**.
+
+The remaining `to_list()` / `iter_rows()` calls in the write path are `O(files)`, not
+`O(rows)` — a group-by result over a handful of files, sunset-path sets. `delete_pairs_to_list`
+survives as an explicit escape hatch for tests and is documented as such.
+
+### 25.4 The DuckDB pushdown probe, now on by default
+
+`SUPERTABLE_DUCKDB_WRITE_PROBE` flipped to `True`. On 11 delete batches over a 10M-row table:
+
+| | probe OFF | probe ON |
+|---|---|---|
+| rows read | 120,000,000 | **10,000,000** |
+| bytes read | 646 MiB | **54 MiB** |
+| fallbacks | 11 | **0** |
+| `resolve_overwrite` | 4.77s | 3.58s (−25%) |
+| wall | 11.5s | 10.3s (−10%) |
+
+Results byte-identical. **Local wall improved only 10% because local reads are cheap — on
+object storage those bytes are the cost, and that is where the 12x matters.** That case is
+not measured here.
+
+Safe to leave on without httpfs: the probe catches its own failures and returns `None`, and
+resolution falls back to the polars path.
+
+### 25.5 httpfs is no longer required for local storage
+
+`configure_httpfs_and_s3` ran `LOAD httpfs` **before** checking whether any path was even
+remote, then returned early for local paths. A LOCAL deployment therefore had to carry an
+extension it never uses — and its absence raised a hard error that killed the query.
+
+The check now runs first. LOCAL needs no extension at all (verified by deleting the extension
+and re-running a previously-failing read test); remote still requires it.
+
+**Do not bundle httpfs into the wheel.** Extensions live under
+`v{exact_duckdb_version}/{platform}/`, the pin is `duckdb>=1.1,<2.0`, and the binary is
+20.9 MiB — that is 5+ platform wheels that silently break on any `pip install -U duckdb`.
+DuckDB 1.5.5 is verified working against this tree.
+
+### 25.6 Still open
+
+* `compact_tombstones` is now the largest single item (16.4s, ~37%) and is untouched. With
+  random keys every drain rewrites essentially the whole table.
+* `reclaim_dead_files` gained only 14% from its cheap pre-check: uneven file sizes keep
+  `min(live_rows)` below the vector height, so the guard often passes anyway.
+* `build_tombstone` still rewrites the whole vector per delete — inherent to the immutable
+  artifact design, and the reason delete cost climbs with deletes already done.

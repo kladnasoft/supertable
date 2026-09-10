@@ -29,6 +29,7 @@ import pytest
 
 import supertable.processing as st_processing
 from supertable.processing import (
+    delete_pairs_to_list,
     resolve_overwrite_writes,
     filter_stale_incoming_rows,
     identify_deleted_rowids,
@@ -68,7 +69,7 @@ def _oracle(incoming, files, keys, ntc):
         filter_stale_incoming_rows(incoming, files, keys, ntc)
         if ntc else incoming
     )
-    pairs = identify_deleted_rowids(filt, files, keys)
+    pairs = delete_pairs_to_list(identify_deleted_rowids(filt, files, keys))
     return filt, pairs
 
 
@@ -85,7 +86,7 @@ def _compare(incoming, files, keys, ntc):
     """Run both paths; assert DuckDB ran and equals the polars oracle."""
     exp_filt, exp_pairs = _oracle(incoming, files, keys, ntc)
     prof = Profiler()
-    got_filt, got_pairs = resolve_overwrite_writes(
+    got_filt, _got_pairs_frame = resolve_overwrite_writes(
         incoming_df=incoming,
         overlapping_files=files,
         overwrite_columns=keys,
@@ -93,6 +94,7 @@ def _compare(incoming, files, keys, ntc):
         profiler=prof,
     )
     counts = prof.emit_counts()
+    got_pairs = delete_pairs_to_list(_got_pairs_frame)
     assert _used_duck(counts), f"DuckDB probe not exercised; counts={counts}"
     assert _rows(got_filt) == _rows(exp_filt), "filtered rows diverge from oracle"
     assert sorted(got_pairs) == sorted(exp_pairs), "delete pairs diverge from oracle"

@@ -298,7 +298,10 @@ class SimpleTable:
         if tombstone_path:
             tomb_df = _read_parquet_safe(tombstone_path)
             if tomb_df is not None and ROWID_COL in tomb_df.columns:
-                dead_rowids = set(tomb_df.get_column(ROWID_COL).drop_nulls().to_list())
+                # Hand the frame over as-is: materialising the whole vector as
+                # a Python set costs O(deleted rows) of object churn for a
+                # filter polars performs natively.
+                dead_rowids = tomb_df.select(ROWID_COL).drop_nulls()
 
         _considered, total_rows, new_resources, _sunset = compact_resources(
             snapshot=snapshot,

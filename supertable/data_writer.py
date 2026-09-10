@@ -25,6 +25,9 @@ from supertable.simple_table import SimpleTable
 from supertable.utils.timer import Timer
 from supertable.utils.profiler import Profiler
 from supertable.processing import (
+    ROWID_COL,
+    as_delete_pairs,
+    empty_delete_pairs,
     find_overlapping_files,
     resolve_overwrite_writes,
     identify_all_rowids,
@@ -553,7 +556,7 @@ class DataWriter:
             # pairs derived from the surviving keys; falls back to the polars
             # oracle on any probe/derive failure.  delete_only (no
             # overwrite_columns) is handled separately in the deletion block.
-            resolved_delete_pairs = None
+            resolved_delete_pairs = empty_delete_pairs()
             if overwrite_columns:
                 pre_filter_count = dataframe.height
                 dataframe, resolved_delete_pairs = resolve_overwrite_writes(
@@ -563,6 +566,10 @@ class DataWriter:
                     newer_than_col=newer_than,
                     profiler=profiler,
                 )
+                # Normalise at the boundary so everything downstream is a frame,
+                # whatever shape the resolver handed back (it returns a frame;
+                # a legacy caller or a test double may still return tuples).
+                resolved_delete_pairs = as_delete_pairs(resolved_delete_pairs)
                 mark("resolve_overwrite")
                 _counts = profiler.counts
                 _fallback = bool(_counts.get("overwrite_resolve_fallback"))
@@ -570,7 +577,7 @@ class DataWriter:
                     f"step[probe-resolve] via {'polars-fallback' if _fallback else 'duckdb-pushdown'}: "
                     f"matched {_counts.get('probe_rows_matched', _counts.get('delete_rows_matched', 0))} "
                     f"existing row(s) on {overwrite_columns} → "
-                    f"{len(resolved_delete_pairs or [])} (file,__rowid__) delete pair(s); "
+                    f"{resolved_delete_pairs.height} (file,__rowid__) delete pair(s); "
                     f"{dataframe.height}/{pre_filter_count} incoming row(s) survive"
                 ))
                 if newer_than:
@@ -641,31 +648,22 @@ class DataWriter:
                     load_tombstone(prev_tombstone_path, allow_cache=True, required=True, profiler=profiler)
                     if prev_tombstone_path else None
                 )
-                # The rowid set is consumed only by the idempotency filter below,
-                # which runs only when this write actually tombstones rows
-                # (overwrite or delete_only).  Pure appends tombstone nothing, so
-                # skip materialising the whole deletion-vector as a Python set —
-                # prev_dv_df is still carried forward into build_tombstone_file.
-                prev_dv_rowids = set()
-                if (overwrite_columns or delete_only) and prev_dv_df is not None \
-                        and "__rowid__" in prev_dv_df.columns:
-                    prev_dv_rowids = set(prev_dv_df.get_column("__rowid__").to_list())
-
                 # 1. Identify which existing rows this write deletes/replaces.
                 #    overwrite_columns drives the anti-join key (delete + upsert);
                 #    pure appends (no overwrite_columns) tombstone nothing.  The
                 #    pairs were already derived (from the surviving keys) by the
-                #    resolve_overwrite_writes probe above.
-                new_delete_pairs = []
+                #    resolve_overwrite_writes probe above.  Pairs are a polars
+                #    frame (__file__, __rowid__) all the way through.
+                new_delete_pairs = empty_delete_pairs()
                 if overwrite_columns:
-                    new_delete_pairs = resolved_delete_pairs or []
+                    new_delete_pairs = as_delete_pairs(resolved_delete_pairs)
                 elif delete_only:
                     # delete-all: no overwrite_columns → tombstone every row.
-                    new_delete_pairs = identify_all_rowids(
+                    new_delete_pairs = as_delete_pairs(identify_all_rowids(
                         last_simple_table.get("resources", []),
                         file_cache=file_cache,
                         profiler=profiler,
-                    )
+                    ))
 
                 # Never re-tombstone rows already in the deletion-vector.  The
                 # overlap probe (and identify_all_rowids) scan the *physical*
@@ -675,16 +673,26 @@ class DataWriter:
                 # needless tombstone rewrite even when nothing live was removed.
                 # Excluding them makes ``deleted`` the true count of live rows
                 # removed and lets unchanged writes carry the vector forward.
-                if new_delete_pairs and prev_dv_rowids:
-                    new_delete_pairs = [
-                        (f, rid) for (f, rid) in new_delete_pairs
-                        if rid not in prev_dv_rowids
-                    ]
-                deleted = len(new_delete_pairs)
+                #
+                # A polars anti-join, NOT a Python set.  Building
+                # ``set(prev_dv_df[...].to_list())` re-materialised the entire
+                # deletion-vector as Python ints on every delete: measured 6.5x
+                # growth in this stage as the vector approached its 1M-row
+                # threshold, and 846ms vs 48ms against the anti-join on a 1M/100k
+                # case.  Only run it when this write tombstones anything —
+                # a pure append has no pairs to filter.
+                dv_excluded = 0
+                if (new_delete_pairs.height and prev_dv_df is not None
+                        and ROWID_COL in prev_dv_df.columns):
+                    dv_excluded = prev_dv_df.height
+                    new_delete_pairs = new_delete_pairs.join(
+                        prev_dv_df.select(ROWID_COL), on=ROWID_COL, how="anti",
+                    )
+                deleted = new_delete_pairs.height
                 mark("identify_deletes")
                 logger.debug(lp(
                     f"step[deletes]: tombstoning {deleted} live row(s) this write "
-                    f"(excluded {len(prev_dv_rowids)} row(s) already in the deletion-vector)"
+                    f"(excluded {dv_excluded} row(s) already in the deletion-vector)"
                 ))
 
                 # 2. + 3.  Write the incoming rows as a new data file (insert/
@@ -791,7 +799,24 @@ class DataWriter:
                 #     overwrite probe.  Only runs when the vector changed this
                 #     write (combined_tombstone_df is not None) — a carry-forward
                 #     can create no newly-dead file.
-                if combined_tombstone_df is not None:
+                #     Cheap pre-check first: a file can only be fully dead if the
+                #     vector holds at least as many rows as the smallest live
+                #     file has.  Comparing two integers skips the group_by over
+                #     the ENTIRE vector that this otherwise runs on every single
+                #     delete — measured 2.68x growth with vector size for an
+                #     outcome that, on a spread-out delete workload, is almost
+                #     never reached.
+                _live = [
+                    int(r.get("rows") or 0)
+                    for r in (last_simple_table.get("resources") or [])
+                    if isinstance(r, dict) and int(r.get("rows") or 0) > 0
+                ]
+                _reclaim_possible = (
+                    combined_tombstone_df is not None
+                    and bool(_live)
+                    and combined_tombstone_df.height >= min(_live)
+                )
+                if _reclaim_possible:
                     reclaimed_files, reclaimed_tomb_path, reclaimed_dv = (
                         reclaim_fully_dead_files(
                             resources=last_simple_table.get("resources") or [],

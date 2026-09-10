@@ -2,12 +2,12 @@
 """Gate test for ``SUPERTABLE_DUCKDB_WRITE_PROBE``.
 
 The DuckDB pushdown probe in the overwrite/delete write path is opt-in and
-disabled by default.  Environments without the httpfs extension (or without
+enabled by default.  Environments without the httpfs extension (or without
 internet to install it) must NOT stall on a DuckDB httpfs install; they use the
 polars fallback, which reads only the projected key columns through the storage
 SDK.  These tests pin the gate's contract:
 
-  * flag OFF (default) -> the probe is never called; resolution goes through the
+  * flag OFF -> the probe is never called; resolution goes through the
     polars fallback (profiler 'overwrite_resolve_fallback' set, no 'probe_files').
   * flag ON            -> the probe IS called ('probe_files' set).
   * both produce identical (filtered rows, delete pairs) -- the gate changes
@@ -24,7 +24,7 @@ import pytest
 
 import supertable.processing as st_processing
 from supertable.config.settings import settings
-from supertable.processing import resolve_overwrite_writes
+from supertable.processing import resolve_overwrite_writes, delete_pairs_to_list
 from supertable.storage.local_storage import LocalStorage
 from supertable.utils.profiler import Profiler
 
@@ -70,7 +70,7 @@ def _resolve(incoming, files, keys, ntc, prof):
     )
 
 
-def test_probe_disabled_by_default_uses_fallback(tmp_path, monkeypatch):
+def test_probe_flag_off_uses_fallback(tmp_path, monkeypatch):
     f = _write(tmp_path, "a.parquet", pl.DataFrame(
         {"__rowid__": [1], "user_id": [5], "name": ["Alice"], "updated_at": [7]}))
     incoming = pl.DataFrame({"user_id": [5], "name": ["Bob"], "updated_at": [9]})
@@ -87,7 +87,7 @@ def test_probe_disabled_by_default_uses_fallback(tmp_path, monkeypatch):
     # Correct result via the fallback: the newer incoming row survives and
     # tombstones the existing row's __rowid__.
     assert filt.height == 1
-    assert pairs == [(f[0], 1)]
+    assert delete_pairs_to_list(pairs) == [(f[0], 1)]
 
 
 def test_probe_enabled_calls_probe(tmp_path, monkeypatch):
@@ -104,7 +104,7 @@ def test_probe_enabled_calls_probe(tmp_path, monkeypatch):
     assert calls["n"] == 1, "probe must be called when the flag is on"
     assert "probe_files" in counts, f"probe did not run; counts={counts}"
     assert filt.height == 1
-    assert pairs == [(f[0], 1)]
+    assert delete_pairs_to_list(pairs) == [(f[0], 1)]
 
 
 def test_gate_result_identical_on_and_off(tmp_path, monkeypatch):
@@ -125,6 +125,19 @@ def test_gate_result_identical_on_and_off(tmp_path, monkeypatch):
         rows = sorted(
             filt.select(["user_id", "name", "updated_at"]).to_dicts(), key=repr
         )
-        return rows, sorted(pairs)
+        return rows, sorted(delete_pairs_to_list(pairs))
 
     assert _run(True) == _run(False)
+
+
+def test_probe_is_enabled_by_default():
+    """The default is ON.
+
+    It pushes the key semi-join into DuckDB instead of materialising every
+    overlapping file's key columns: 12x less data read on a 10M-row delete
+    workload, byte-identical results.  Safe without httpfs — the probe catches
+    its own failures and the polars fallback takes over.
+    """
+    from supertable.config.settings import Settings
+
+    assert Settings().SUPERTABLE_DUCKDB_WRITE_PROBE is True

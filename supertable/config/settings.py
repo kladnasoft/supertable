@@ -166,12 +166,21 @@ class Settings:
     # self-install.
     SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD: bool = False  # SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD
     # Write-path overwrite/delete resolution via the DuckDB pushdown probe.
-    # Disabled by default: the polars fallback reads only the projected key
-    # columns through the storage SDK and needs no httpfs extension, so it works
-    # in environments without one (or without internet to install it).  Enable
-    # only where httpfs is available and the probe's row-group skipping is worth
-    # it (e.g. very wide tables / many overlapping files).
-    SUPERTABLE_DUCKDB_WRITE_PROBE: bool = False    # SUPERTABLE_DUCKDB_WRITE_PROBE
+    #
+    # ENABLED by default.  The probe pushes the key semi-join into DuckDB
+    # instead of materialising every overlapping file's key columns in polars.
+    # Measured on a 10M-row table over 11 delete batches: 120,000,000 rows /
+    # 646 MiB read with the probe off, versus 10,000,000 rows / 54 MiB with it
+    # on -- 12x less data -- for byte-identical results and zero fallbacks.
+    # Local wall time improved only ~10% because local reads are cheap; on
+    # object storage, where those bytes ARE the cost, that gap is the point.
+    #
+    # Safe where httpfs is unavailable: the probe catches its own failures and
+    # returns None, so resolution falls back to the polars path, which reads
+    # only the projected key columns through the storage SDK and needs no
+    # extension.  Local-filesystem paths no longer load httpfs at all (see
+    # configure_httpfs_and_s3).  Set false to force the fallback.
+    SUPERTABLE_DUCKDB_WRITE_PROBE: bool = True     # SUPERTABLE_DUCKDB_WRITE_PROBE
     # Deletion-vector (tombstone) table cache.  Each entry is a small
     # `DISTINCT __rowid__` table keyed by the stable tombstone path; the
     # tombstone view ANTI JOINs it instead of re-reading the parquet every
@@ -472,7 +481,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_DUCKDB_PRESIGNED=_env_bool("SUPERTABLE_DUCKDB_PRESIGNED", False),
         SUPERTABLE_DUCKDB_USE_HTTPFS=_env_bool("SUPERTABLE_DUCKDB_USE_HTTPFS", False),
         SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=_env_bool("SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD", False),
-        SUPERTABLE_DUCKDB_WRITE_PROBE=_env_bool("SUPERTABLE_DUCKDB_WRITE_PROBE", False),
+        SUPERTABLE_DUCKDB_WRITE_PROBE=_env_bool("SUPERTABLE_DUCKDB_WRITE_PROBE", True),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE", 8),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC", 300),
         SUPERTABLE_DEBUG_TIMINGS=_env_bool("SUPERTABLE_DEBUG_TIMINGS", False),

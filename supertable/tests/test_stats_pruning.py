@@ -32,6 +32,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from supertable.processing import (
+    delete_pairs_to_list,
     STATS_SCHEMA,
     _intervals_overlap,
     _probe_lane_for_dtype,
@@ -456,10 +457,10 @@ class TestDifferentialTombstoneIdentity:
         probe = probe_ranges_from_df(incoming, ["a"])
         pruned = prune_overlapping_files_by_stats(all_files, stats, probe)
 
-        unpruned_pairs = sorted(identify_deleted_rowids(
-            incoming, all_files, ["a"], file_cache=cache))
-        pruned_pairs = sorted(identify_deleted_rowids(
-            incoming, pruned, ["a"], file_cache=cache))
+        unpruned_pairs = sorted(delete_pairs_to_list(identify_deleted_rowids(
+            incoming, all_files, ["a"], file_cache=cache)))
+        pruned_pairs = sorted(delete_pairs_to_list(identify_deleted_rowids(
+            incoming, pruned, ["a"], file_cache=cache)))
         return unpruned_pairs, pruned_pairs, all_files, pruned
 
     def test_disjoint_file_is_pruned_without_changing_result(self):

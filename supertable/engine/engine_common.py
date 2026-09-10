@@ -215,6 +215,19 @@ def configure_httpfs_and_s3(
     if not for_paths:
         return
 
+    # Decide whether httpfs is needed BEFORE trying to load it.
+    #
+    # httpfs is only required to reach object storage.  Local filesystem paths
+    # need nothing — DuckDB reads them natively.  Loading first and checking
+    # after (the previous order) meant a LOCAL deployment, whose paths are all
+    # plain filesystem paths, still had to have httpfs present, and its absence
+    # raised the hard error below and killed the query.  That is a pure
+    # packaging tax on users who never touch S3.
+    any_s3 = any(str(p).lower().startswith("s3://") for p in for_paths)
+    any_http = any(str(p).lower().startswith(("http://", "https://")) for p in for_paths)
+    if not (any_s3 or any_http):
+        return
+
     # Load httpfs.  It is baked into the image and seeded into the DuckDB
     # extension dir (see the container entrypoint), so LOAD normally succeeds
     # with no network access.
@@ -252,12 +265,6 @@ def configure_httpfs_and_s3(
                 "or set SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=true to permit a "
                 f"one-time online install. Underlying DuckDB error: {load_err}"
             ) from load_err
-
-    any_s3 = any(str(p).lower().startswith("s3://") for p in for_paths)
-    any_http = any(str(p).lower().startswith(("http://", "https://")) for p in for_paths)
-
-    if not (any_s3 or any_http):
-        return
 
     try:
         supported = {
