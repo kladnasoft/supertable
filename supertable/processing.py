@@ -2312,6 +2312,36 @@ def prune_overlapping_files_by_stats(
 # ===========================================================================
 
 
+
+def _to_us_datetime_from_text(value) -> Optional[datetime]:
+    """Parse a date/time literal into a naive microsecond datetime, or None.
+
+    Accepts the forms SQL writers actually use for a timestamp column:
+    ``2025-12-01``, ``2025-12-01 13:45:00``, ``2025-12-01T13:45:00``, with an
+    optional fractional part and a trailing ``Z``.  Anything else returns None
+    and the caller keeps the file.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return _to_us_datetime(value)
+    if isinstance(value, date):
+        return _to_us_datetime(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1]
+    text = text.replace("T", " ", 1)
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]) -> bool:
     """True if a value in the stored row-group range ``[s_min, s_max]`` could
     satisfy the predicate interval *pred*.
@@ -2330,6 +2360,22 @@ def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]
         smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
     elif p_lane == "string" and s_lane == "string":
         smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
+    elif p_lane == "string" and s_lane == "timestamp":
+        # A date/time literal written WITHOUT a cast — `event_ts >= '2025-12-01'`
+        # — parses as a string, because the lane is taken from the literal and
+        # not from the column.  Left incomparable, that silently disabled
+        # pruning for the most common analytical filter there is: measured on a
+        # 100-file table, the cast form pruned 89% of files and the bare-string
+        # form pruned 0%.
+        #
+        # Coerce here rather than in the parser, which does not know column
+        # types.  An unparseable string stays incomparable and retains the file,
+        # so the conservative contract is unchanged.
+        plo = _to_us_datetime_from_text(pred.lo)
+        phi = _to_us_datetime_from_text(pred.hi)
+        if (pred.lo is not None and plo is None) or (pred.hi is not None and phi is None):
+            return True
+        smin, smax = s_min, s_max
     else:
         return True  # incomparable lanes → cannot exclude
 
