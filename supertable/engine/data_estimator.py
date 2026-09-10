@@ -30,6 +30,10 @@ from supertable.processing import (
 
 from typing import Dict, List, Optional, Set, Tuple
 
+# Backends whose files are addressed as bucket + key rather than a filesystem
+# path.  Only these may be described with an ``s3://``/HTTP URL.
+_OBJECT_STORE_TYPES = frozenset({"S3", "MINIO", "AZURE", "GCS"})
+
 
 def get_missing_columns(
         tables: List[TableDefinition],
@@ -199,17 +203,30 @@ class DataEstimator:
             composed = f"{host}{':' + port if port else ''}"
             return self._normalize_endpoint_for_s3(composed)
 
-        # 2) Environment variable
-        if settings.STORAGE_ENDPOINT_URL:
-            return self._normalize_endpoint_for_s3(env_single)
+        # 2) Environment variable — only meaningful for a bucket backend.
+        if self._is_object_store() and settings.STORAGE_ENDPOINT_URL:
+            return self._normalize_endpoint_for_s3(settings.STORAGE_ENDPOINT_URL)
 
         return None
+
+    def _is_object_store(self) -> bool:
+        """Whether the active backend addresses data by bucket and endpoint.
+
+        The endpoint/bucket settings can be populated for a backend that is not
+        currently selected — a process configured for MinIO may still be asked
+        to read LOCAL storage.  Consulting them unconditionally would describe
+        local files with an ``s3://`` URL that resolves to nothing, so the
+        settings fallbacks apply only when a bucket backend is actually in use.
+        """
+        return (settings.STORAGE_TYPE or "").upper() in _OBJECT_STORE_TYPES
 
     def _detect_bucket(self) -> Optional[str]:
         for name in ("bucket", "bucket_name", "default_bucket"):
             v = self._storage_attr(name)
             if v:
                 return v
+        if not self._is_object_store():
+            return None
         return settings.STORAGE_BUCKET or None
 
     def _detect_ssl(self) -> bool:
