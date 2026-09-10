@@ -816,6 +816,22 @@ def lock_stage(org: str, sup: str, stage_name: str) -> str:
     )
 
 
+def lock_rbac_init(org: str, sup: str) -> str:
+    """RBAC bootstrap lock token (STRING).
+
+    Deliberately NOT ``lock_leaf(org, sup, "roles_init")``.  That shared the
+    per-table lock namespace, so a table legitimately named ``roles_init``
+    self-deadlocked against its own RBAC bootstrap, and the namespace-deletion
+    drain (which recovers table names from ``lock:leaf:doc:`` keys) mistook the
+    bootstrap lease for a table.  Table names are not a reserved namespace, so
+    the bootstrap needs a key space of its own.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:lock:rbac:init"
+    )
+
+
 def lock_stage_pattern(org: str, sup: str) -> str:
     """SCAN pattern matching every staging lock in one SuperTable."""
     return lock_stage_prefix(org, sup) + "*"

@@ -1,67 +1,30 @@
 #!/usr/bin/env python3
-# route: supertable.tests.measure_lock_time
+# route: supertable.locking.benchmarks.measure_lock_time
 """
-Single-threaded acquisition latency benchmark for distributed locking.
+Single-threaded acquisition latency benchmark for the Redis distributed lock.
 
 Measures acquire + release round-trip time with no contention,
 giving the baseline cost of the locking mechanism itself.
 
-Supports both file-based and Redis-based backends.
+``RedisLocking`` is the only locking backend SuperTable has; there is no
+backend selection to benchmark against.
 
 Usage:
-    python3 measure_lock_time.py --backend file  [--iterations 100]
-    python3 measure_lock_time.py --backend redis [--iterations 100]
+    python3 measure_lock_time.py [--iterations 100]
 """
 
 import os
-import sys
-import time
 import argparse
+import tempfile
+import time
 
-# ---------------------------------------------------------------------------
-# Standalone import — stub supertable.config.defaults.logger if missing
-# ---------------------------------------------------------------------------
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-
-try:
-    from supertable.config.defaults import logger
-except ImportError:
-    import logging
-    logger = logging.getLogger("measure_lock_time")
-    logger.addHandler(logging.StreamHandler())
-    logger.setLevel(logging.WARNING)
-    import types
-    _st = types.ModuleType("supertable")
-    _cfg = types.ModuleType("supertable.config")
-    _dfl = types.ModuleType("supertable.config.defaults")
-    _dfl.logger = logger
-    sys.modules["supertable"] = _st
-    sys.modules["supertable.config"] = _cfg
-    sys.modules["supertable.config.defaults"] = _dfl
-
-from supertable.locking.file_lock import FileLocking
+from supertable.locking.redis_lock import RedisLocking
+from supertable.redis_connector import create_redis_client
 
 
-def _create_locker(backend: str, workdir: str):
-    """Factory: return the appropriate locker instance."""
-    if backend == "file":
-        return FileLocking(working_dir=workdir)
-    elif backend == "redis":
-        try:
-            from supertable.locking.redis_lock import RedisLocking
-            from supertable.redis_connector import create_redis_client
-            r = create_redis_client()
-            return RedisLocking(r)
-        except ImportError:
-            import redis
-            from supertable.locking.redis_lock import RedisLocking
-            r = redis.Redis(host="localhost", port=6379, db=0)
-            r.ping()
-            return RedisLocking(r)
-    else:
-        raise ValueError(f"Unknown backend: {backend}")
+def _create_locker() -> RedisLocking:
+    """Build a locker on the application's own Redis connection path."""
+    return RedisLocking(create_redis_client())
 
 
 def measure_acquire_release(locker, key: str, ttl_s: int) -> float:
@@ -107,36 +70,37 @@ def _print_stats(label: str, times: list[float]) -> None:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Lock acquisition latency benchmark.")
-    ap.add_argument("--backend", choices=["file", "redis"], default="file",
-                    help="Locking backend (default: file)")
-    ap.add_argument("--workdir", type=str, default=os.path.join(_HERE, ".locks"),
-                    help="Working directory for file lock (default: .locks)")
+    ap = argparse.ArgumentParser(
+        description="Redis lock acquisition latency benchmark."
+    )
+    ap.add_argument("--datadir", type=str, default=None,
+                    help="Scratch directory for the sample payload read under "
+                         "the lock (default: a fresh temporary directory)")
     ap.add_argument("--ttl", type=int, default=5,
                     help="Lock TTL in seconds (default: 5)")
     ap.add_argument("--iterations", type=int, default=100,
                     help="Number of acquire/release cycles (default: 100)")
     args = ap.parse_args()
 
-    workdir = os.path.abspath(args.workdir)
-    os.makedirs(workdir, exist_ok=True)
+    datadir = os.path.abspath(args.datadir) if args.datadir else tempfile.mkdtemp(
+        prefix="supertable-lock-bench-"
+    )
+    os.makedirs(datadir, exist_ok=True)
     iterations = args.iterations
     ttl = args.ttl
 
     # Create a small data file for the read-with-lock test
-    data_file = os.path.join(workdir, "sample_data.json")
+    data_file = os.path.join(datadir, "sample_data.json")
     if not os.path.exists(data_file):
         with open(data_file, "w") as f:
             f.write('{"status": "ok"}')
 
-    locker = _create_locker(args.backend, workdir)
+    locker = _create_locker()
 
-    print(f"==== LOCK LATENCY BENCHMARK ({args.backend.upper()}) ====")
+    print("==== REDIS LOCK LATENCY BENCHMARK ====")
     print(f"  Iterations : {iterations}")
     print(f"  TTL        : {ttl}s")
-    print(f"  Backend    : {args.backend}")
-    if args.backend == "file":
-        print(f"  Working dir: {workdir}")
+    print(f"  Data dir   : {datadir}")
     print()
 
     # ---- Warm-up (3 cycles, discarded) ----
@@ -158,7 +122,7 @@ def main():
         read_times.append(t)
     _print_stats("Acquire + read + release", read_times)
 
-    print(f"\nDone.")
+    print("\nDone.")
 
 
 if __name__ == "__main__":

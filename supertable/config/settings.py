@@ -162,6 +162,10 @@ class Settings:
     # format-3 snapshots remain sticky when the transition switch is disabled.
     SUPERTABLE_DV_V3_WRITES_ENABLED: bool = False   # SUPERTABLE_DV_V3_WRITES_ENABLED
     DEFAULT_TIMEOUT_SEC: int = 60                  # DEFAULT_TIMEOUT_SEC
+    # TTL of every distributed lock (table, namespace, staging).  The
+    # holder's heartbeat renews at half this value for as long as the
+    # operation runs, so this is the CRASH-RECOVERY window -- how long a
+    # dead holder's lock lingers -- not a cap on operation duration.
     DEFAULT_LOCK_DURATION_SEC: int = 30            # DEFAULT_LOCK_DURATION_SEC
     IS_SHOW_TIMING: bool = False                   # IS_SHOW_TIMING
 

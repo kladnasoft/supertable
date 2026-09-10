@@ -199,6 +199,9 @@ class GCSStorage(StorageInterface):
             raise ValueError("Invalid JSON") from None
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
+        # Enroll before the upload: a request that times out ambiguously may
+        # still have created the object, and only an enrolled key rolls back.
+        self._record_new_object(path)
         path = self._with_base(path)
         payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         blob = self.bucket.blob(path)
@@ -391,6 +394,17 @@ class GCSStorage(StorageInterface):
             raise FileNotFoundError("File or folder not found")
         self.delete_prefix(logical)
 
+    def _delete_object_for_rollback(self, path: str) -> None:
+        """Delete exactly one enrolled object; never widen into a prefix delete.
+
+        ``delete`` falls back to recursive prefix deletion when the exact key is
+        absent, which rollback must never do.
+        """
+        try:
+            self.bucket.blob(self._with_base(path)).delete()
+        except NotFound:
+            return
+
     def delete_prefix(self, path: str) -> None:
         """Delete and verify a GCS prefix with bounded retry batches."""
         import itertools
@@ -464,6 +478,7 @@ class GCSStorage(StorageInterface):
     # Parquet
     # -------------------------
     def write_parquet(self, table: pa.Table, path: str) -> None:
+        self._record_new_object(path)
         path = self._with_base(path)
         buf = io.BytesIO()
         pq.write_table(table, buf)
@@ -503,17 +518,23 @@ class GCSStorage(StorageInterface):
     # Raw bytes / text
     # -------------------------
     def write_bytes(self, path: str, data: bytes) -> None:
+        self._record_new_object(path)
         path = self._with_base(path)
         blob = self.bucket.blob(path)
         blob.upload_from_string(data)
 
     def create_bytes_if_absent(self, path: str, data: bytes) -> bool:
+        logical = path
         path = self._with_base(path)
         blob = self.bucket.blob(path)
         try:
             blob.upload_from_string(data, if_generation_match=0)
         except PreconditionFailed:
             return False
+        # Enroll only a proven create.  A failed generation precondition means
+        # the object belongs to whoever won the race, and an ambiguous failure
+        # may equally be a lost 412 response, so neither is ever enrolled.
+        self._record_new_object(logical)
         return True
 
     def read_bytes(self, path: str) -> bytes:
@@ -530,6 +551,7 @@ class GCSStorage(StorageInterface):
         return self.read_bytes(path).decode(encoding)
 
     def copy(self, src_path: str, dst_path: str) -> None:
+        self._record_new_object(dst_path)
         src_path = self._with_base(src_path)
         dst_path = self._with_base(dst_path)
         src_blob = self._get_blob_raise(src_path)

@@ -79,7 +79,7 @@ supertable/
 ├── engine/              # Query engines (DuckDB/Pro, Spark Thrift,
 │                        #   executor, engine_enum, plan_stats, data_estimator)
 ├── infra/               # Optional infra scaffolding (minio, redis assets)
-├── locking/             # Distributed locking (Redis + file fallback)
+├── locking/             # Distributed locking (Redis only)
 ├── mirroring/           # Table format export (Delta, Iceberg, Parquet,
 │                        #   mirror_formats dispatcher)
 ├── rbac/                # Role-based access control (access_control,
@@ -157,7 +157,7 @@ SuperTable SDK's own state under `supertable:`. See
 | [05 Redis Catalog](05_redis_catalog.md) | Metadata store and key naming |
 | [06 Data Writer](06_data_writer.md) | Write pipeline with locking and dedup |
 | [07 Ingestion](07_ingestion.md) | Staging areas and pipes |
-| [08 Locking](08_locking.md) | Distributed locking (Redis + file) |
+| [08 Locking](08_locking.md) | Distributed locking (Redis) |
 | [09 Query Engine](09_query_engine.md) | DuckDB/Pro, Spark SQL, engine selection |
 | [10 Data Reader](10_data_reader.md) | Read facade, view chain, plan stats |
 | [11 RBAC](11_rbac.md) | Roles, users, row/column-level security |

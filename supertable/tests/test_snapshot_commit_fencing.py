@@ -610,9 +610,20 @@ def test_unflagged_expected_absent_reply_loss_is_not_reconciled(
 
 
 @pytest.mark.parametrize("pinned_no_mirrors", [False, True])
-def test_unflagged_expected_absent_keeps_namespace_lock_fence(
+def test_unflagged_expected_absent_ignores_a_bare_namespace_lock(
     pinned_no_mirrors, monkeypatch,
 ):
+    """A namespace-lock holder alone must not fence publication.
+
+    The lock value is an opaque token, so a holder cannot be distinguished
+    from a concurrent first-time *creator* -- which is by far the common case,
+    since table creation takes this same lock.  Rejecting on it made 6 of 8
+    racing creators fail and broke ordinary appends to unrelated tables, both
+    reported as a spurious "namespace is fenced for deletion" error.
+    Namespace deletion is fenced by its durable intent, which
+    ``begin_namespace_deletion`` persists before draining any leaf lease; see
+    :func:`test_unflagged_expected_absent_reaches_terminal_deletion_fence`.
+    """
     catalog, fake = _catalog()
     fake.set(
         RK.meta_root("org", "lake"),
@@ -631,19 +642,34 @@ def test_unflagged_expected_absent_keeps_namespace_lock_fence(
     if pinned_no_mirrors:
         kwargs["expected_mirror_pin"] = None
 
-    with pytest.raises(RuntimeError, match="namespace is fenced"):
-        catalog.commit_snapshot(
-            "org", "lake", "table", _snapshot_payload(snapshot_version=0),
-            "snap/0.json",
-            expected_version=-1,
-            expected_path="",
-            lock_token="token",
-            commit_id="legacy-initial",
-            **kwargs,
-        )
+    catalog.commit_snapshot(
+        "org", "lake", "table", _snapshot_payload(snapshot_version=0),
+        "snap/0.json",
+        expected_version=-1,
+        expected_path="",
+        lock_token="token",
+        commit_id="legacy-initial",
+        **kwargs,
+    )
 
     script.assert_called_once()
-    assert fake.get(RK.meta_leaf("org", "lake", "table")) is None
+    assert fake.get(RK.meta_leaf("org", "lake", "table")) is not None
+
+    # The durable intent, unlike the lock, is still an unconditional fence.
+    fake.set(
+        RK.meta_namespace_deletion_intent("org", "lake"),
+        json.dumps({"intent_id": "pending-delete"}),
+    )
+    with pytest.raises(DeletionIntentConflictError):
+        catalog.commit_snapshot(
+            "org", "lake", "table", _snapshot_payload(snapshot_version=1),
+            "snap/1.json",
+            expected_version=0,
+            expected_path="snap/0.json",
+            lock_token="token",
+            commit_id="after-intent",
+            **kwargs,
+        )
 
 
 @pytest.mark.parametrize("pinned_no_mirrors", [False, True])
@@ -1833,7 +1859,9 @@ def test_no_mirror_fast_path_rejects_nonempty_raw_pin():
     [
         ("stale-base", SnapshotCommitConflictError),
         ("lost-lock", LockLostError),
-        ("namespace-lock", RuntimeError),
+        # "namespace-lock" is deliberately absent: a bare namespace-lock holder
+        # is not a deletion fence (it is usually a concurrent creator). The
+        # durable "namespace-delete" intent below is the real fence.
         ("namespace-delete", DeletionIntentConflictError),
         ("simple-delete", DeletionIntentConflictError),
         ("missing-root", FileNotFoundError),
@@ -1850,8 +1878,6 @@ def test_no_mirror_fast_path_retains_publication_fences(race, error_type):
         expected_version = 3
     elif race == "lost-lock":
         lock_token = "stale-owner"
-    elif race == "namespace-lock":
-        fake.set(RK.lock_namespace("org", "lake"), "deleter")
     elif race == "namespace-delete":
         fake.set(RK.meta_namespace_deletion_intent("org", "lake"), "pending")
     elif race == "simple-delete":

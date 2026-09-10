@@ -135,20 +135,21 @@ def test_second_namespace_reuses_organization_activation(empty_backend):
 
 
 def test_role_initialization_timeout_is_retryable(empty_backend, monkeypatch):
+    # The RBAC bootstrap owns a dedicated key space (RK.lock_rbac_init) rather
+    # than borrowing the per-table namespace under the pseudo-name
+    # "roles_init", which a real table could legitimately be called.
     r, catalog = empty_backend
-    acquire = RedisCatalog.acquire_simple_lock
+    acquire = RedisCatalog.acquire_rbac_init_lock
 
-    def fail_role_lock(self, org, sup, simple, **kwargs):
-        if simple == "roles_init":
-            return None
-        return acquire(self, org, sup, simple, **kwargs)
+    def fail_role_lock(self, org, sup, **kwargs):
+        return None
 
-    monkeypatch.setattr(RedisCatalog, "acquire_simple_lock", fail_role_lock)
+    monkeypatch.setattr(RedisCatalog, "acquire_rbac_init_lock", fail_role_lock)
     with pytest.raises(TimeoutError, match="role initialization lock"):
         SuperTable("lake", "org")
     assert not catalog.rbac_get_role_id_by_name("org", "lake", "superadmin")
 
-    monkeypatch.setattr(RedisCatalog, "acquire_simple_lock", acquire)
+    monkeypatch.setattr(RedisCatalog, "acquire_rbac_init_lock", acquire)
     SuperTable("lake", "org")
     _default_ids(catalog)
     assert r.xlen(RK.audit_privileged_outbox("org")) == 2

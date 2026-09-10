@@ -49,6 +49,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Any, Dict, Iterator, Literal, Optional, Protocol
 
 try:  # POSIX interprocess durability boundary; fail clear at logger creation.
@@ -236,8 +237,14 @@ def _today_utc_date() -> str:
 _MONITOR_TTL_DAYS: int = 7
 
 
+@lru_cache(maxsize=64)
 def _partition_expire_at(date: str) -> int:
     """Absolute EXPIREAT epoch (seconds) for a monitoring partition.
+
+    Memoized: this is a pure function of the calendar date (``strptime`` is
+    otherwise one of the most expensive operations on the enqueue/decode hot
+    path, and it runs several times per record).  Only a handful of dates are
+    ever live, and unlike :func:`_today_utc_date` the mapping cannot go stale.
 
     Anchored to midnight UTC of the partition's *own* calendar date plus
     ``_MONITOR_TTL_DAYS`` days — not to the time of the last write. So a
@@ -293,6 +300,11 @@ class _MonitorKey:
 
 _SPOOL_VERSION = 1
 _PRODUCER_RECEIPT_GRACE_DAYS = 1
+
+# A ``.partial`` file is an in-flight record that has not been published yet.
+# Only sweep ones old enough that no live writer could still own them: a single
+# write+fsync completes in milliseconds, so anything this old is crash debris.
+_PARTIAL_SWEEP_GRACE_S = 300.0
 
 # KEYS[1] = monitoring LIST; KEYS[2] = producer receipt HASH.
 # ARGV = delivery id, payload digest, canonical payload JSON, partition expiry,
@@ -370,10 +382,28 @@ class _SpoolRecord:
 class _DurableMonitoringSpool:
     """Bounded, crash-durable, process-safe local monitoring WAL.
 
-    One immutable JSON file is published per event.  A process lock protects
-    capacity accounting and filesystem transitions, while Redis delivery is
-    intentionally outside that lock: concurrent retry is harmless because the
-    Redis Lua boundary is idempotent.  No failed event is retained in memory.
+    One immutable JSON file is published per event.
+
+    Sharding
+    --------
+    Records are stored under one directory *per ``_MonitorKey``* (named by the
+    same key hash that already prefixes every record filename), and each shard
+    owns its own ``.spool.lock``.  Unrelated tenants therefore never queue
+    behind one another's ``flock``.  A spool constructed on a base directory is
+    a router over those shards; records written by a pre-sharding release are
+    migrated into their shard on construction, so no durable record is orphaned.
+
+    Locking
+    -------
+    The interprocess lock covers filesystem *transitions* (temp recovery, the
+    publish rename, delivered-record removal).  It deliberately does **not**
+    cover the record fsync or the acknowledging directory fsync: those run
+    outside it so concurrent writers' commits coalesce into one filesystem
+    journal commit instead of serializing.  Capacity is accounted incrementally
+    in memory and re-derived from disk on init/reconcile, so per-operation cost
+    does not grow with the backlog.  Redis delivery is likewise outside the
+    lock: concurrent retry is harmless because the Redis Lua boundary is
+    idempotent.  No failed event is retained in memory.
     """
 
     def __init__(
@@ -382,6 +412,7 @@ class _DurableMonitoringSpool:
         *,
         max_bytes: int,
         max_records: int,
+        _shard: bool = False,
     ) -> None:
         expanded_root = os.path.expanduser(str(root))
         if not os.path.isabs(expanded_root):
@@ -394,11 +425,26 @@ class _DurableMonitoringSpool:
             raise MonitoringDurabilityError(
                 "monitoring spool byte and record limits must be positive"
             )
+        self._is_shard = bool(_shard)
         self._thread_lock = threading.RLock()
         self._lock_path = os.path.join(self.root, ".spool.lock")
+        # Incremental capacity accounting.  ``_records``/``_bytes`` include
+        # records already published to disk plus this object's in-flight
+        # reservations (``_inflight``), which a reconcile scan cannot see.
+        self._counter_lock = threading.Lock()
+        self._records = 0
+        self._bytes = 0
+        self._inflight = 0
+        self._inflight_bytes = 0
+        self._shards: Dict[str, "_DurableMonitoringSpool"] = {}
+        self._shards_lock = threading.Lock()
         self._ensure_secure_root()
         with self._locked():
             self._recover_temps_locked()
+            self._sweep_partials_locked()
+            if not self._is_shard:
+                self._migrate_legacy_records_locked()
+            self._records, self._bytes = self._usage_locked()
 
     @staticmethod
     def _fsync_directory(path: str) -> None:
@@ -535,6 +581,63 @@ class _DurableMonitoringSpool:
     @staticmethod
     def _is_temp_name(name: str) -> bool:
         return name.startswith(".") and name.endswith(".monitor.json.tmp")
+
+    @staticmethod
+    def _is_partial_name(name: str) -> bool:
+        """An in-flight record body that has never been published.
+
+        Recovery deliberately ignores these: because the publishing rename is
+        atomic, a ``.partial`` is either still owned by a live writer that has
+        not been acknowledged yet, or crash debris.  Keeping it invisible is
+        what makes writing/fsyncing it outside the interprocess lock safe.
+        """
+        return name.startswith(".") and name.endswith(".monitor.json.partial")
+
+    @staticmethod
+    def _is_shard_name(name: str) -> bool:
+        return len(name) == 24 and all(ch in "0123456789abcdef" for ch in name)
+
+    @classmethod
+    def _shard_name_for_record(cls, name: str) -> Optional[str]:
+        """The shard directory a record filename belongs to, if well-formed."""
+        candidate = name.split("-", 1)[0]
+        return candidate if cls._is_shard_name(candidate) else None
+
+    def _shard_at(self, name: str) -> "_DurableMonitoringSpool":
+        """Get/create the child spool that owns one shard directory."""
+        if self._is_shard:  # pragma: no cover - routers only
+            raise MonitoringDurabilityError("monitoring spool shard cannot re-shard")
+        if not self._is_shard_name(name):
+            raise MonitoringDurabilityError("invalid monitoring spool shard")
+        with self._shards_lock:
+            shard = self._shards.get(name)
+            if shard is None:
+                shard = _DurableMonitoringSpool(
+                    os.path.join(self.root, name),
+                    max_bytes=self.max_bytes,
+                    max_records=self.max_records,
+                    _shard=True,
+                )
+                self._shards[name] = shard
+            return shard
+
+    def _shard_for(self, key: _MonitorKey) -> "_DurableMonitoringSpool":
+        return self._shard_at(self._key_hash(key))
+
+    def _known_shards(self) -> list["_DurableMonitoringSpool"]:
+        """Every shard this router can see, including other processes' shards."""
+        names: set[str] = set()
+        with self._shards_lock:
+            names.update(self._shards)
+        try:
+            for entry in os.scandir(self.root):
+                if entry.is_dir(follow_symlinks=False) and self._is_shard_name(
+                    entry.name
+                ):
+                    names.add(entry.name)
+        except FileNotFoundError:  # pragma: no cover - root removed underneath
+            return []
+        return [self._shard_at(name) for name in sorted(names)]
 
     def _safe_path(self, name: str) -> str:
         if not name or name != os.path.basename(name):
@@ -716,6 +819,137 @@ class _DurableMonitoringSpool:
         if changed:
             self._fsync_directory(self.root)
 
+    def _sweep_partials_locked(self) -> None:
+        """Delete crash debris left by an interrupted, never-acknowledged write."""
+        changed = False
+        cutoff = time.time() - _PARTIAL_SWEEP_GRACE_S
+        for entry in os.scandir(self.root):
+            if not self._is_partial_name(entry.name):
+                continue
+            entry_stat = entry.stat(follow_symlinks=False)
+            if not stat.S_ISREG(entry_stat.st_mode):
+                raise MonitoringDurabilityError(
+                    "unsafe monitoring spool partial entry"
+                )
+            # Never touch a partial a concurrent process could still be
+            # publishing; removing it would fail an already-committed caller.
+            if entry_stat.st_mtime > cutoff:
+                continue
+            os.unlink(self._safe_path(entry.name))
+            changed = True
+        if changed:
+            self._fsync_directory(self.root)
+
+    def _migrate_legacy_records_locked(self) -> None:
+        """Move pre-sharding records into their per-key shard directory.
+
+        The record filename already begins with the key hash that names the
+        shard, so the move needs no decode and cannot mis-file a record.
+        """
+        touched: set[str] = set()
+        migrated = 0
+        for entry in os.scandir(self.root):
+            if not self._is_record_name(entry.name):
+                continue
+            shard_name = self._shard_name_for_record(entry.name)
+            if shard_name is None:
+                # Unrecognizable legacy name: leave it in place rather than
+                # orphan it.  The router's own directory is still drained.
+                logger.warning("[monitor] leaving unrecognized spool record in place")
+                continue
+            shard_root = os.path.join(self.root, shard_name)
+            os.makedirs(shard_root, mode=0o700, exist_ok=True)
+            os.replace(
+                self._safe_path(entry.name), os.path.join(shard_root, entry.name),
+            )
+            touched.add(shard_root)
+            migrated += 1
+        if touched:
+            for shard_root in touched:
+                self._fsync_directory(shard_root)
+            self._fsync_directory(self.root)
+            logger.info(
+                "[monitor] migrated %d monitoring spool record(s) into %d "
+                "per-tenant shard(s)", migrated, len(touched),
+            )
+
+    def _reserve(self, size: int) -> None:
+        """Admit one record against the bound using in-memory accounting.
+
+        In-memory counters can only ever *over*-count (a sibling spool object or
+        another process may have delivered and removed records this object still
+        counts), so one exact rescan is paid before refusing a metric.  The
+        bound therefore stays exactly as strict as the old full-scan version
+        while the accepted path stays O(1).
+        """
+        with self._counter_lock:
+            if (
+                self._records + 1 <= self.max_records
+                and self._bytes + size <= self.max_bytes
+            ):
+                self._records += 1
+                self._bytes += size
+                self._inflight += 1
+                self._inflight_bytes += size
+                return
+        self.reconcile()
+        with self._counter_lock:
+            if self._records + 1 > self.max_records:
+                raise MonitoringBackpressureError(
+                    "monitoring spool record cap reached; restore Redis delivery "
+                    "or increase SUPERTABLE_MONITOR_SPOOL_MAX_RECORDS"
+                )
+            if self._bytes + size > self.max_bytes:
+                raise MonitoringBackpressureError(
+                    "monitoring spool byte cap reached; restore Redis delivery "
+                    "or increase SUPERTABLE_MONITOR_SPOOL_MAX_BYTES"
+                )
+            self._records += 1
+            self._bytes += size
+            self._inflight += 1
+            self._inflight_bytes += size
+
+    def _settle_reservation(self, size: int, *, published: bool) -> None:
+        with self._counter_lock:
+            self._inflight = max(0, self._inflight - 1)
+            self._inflight_bytes = max(0, self._inflight_bytes - size)
+            if not published:
+                self._records = max(0, self._records - 1)
+                self._bytes = max(0, self._bytes - size)
+
+    def _release_published(self, size: int) -> None:
+        with self._counter_lock:
+            self._records = max(0, self._records - 1)
+            self._bytes = max(0, self._bytes - size)
+
+    def reconcile(self) -> tuple[int, int]:
+        """Re-derive the bound from disk (init, recovery, explicit reconcile)."""
+        if not self._is_shard:
+            totals = [shard.reconcile() for shard in self._known_shards()]
+            with self._locked():
+                here = self._usage_locked()
+            with self._counter_lock:
+                self._records = here[0] + self._inflight
+                self._bytes = here[1] + self._inflight_bytes
+                mine = (self._records, self._bytes)
+            return (
+                mine[0] + sum(item[0] for item in totals),
+                mine[1] + sum(item[1] for item in totals),
+            )
+        with self._locked():
+            records, total_bytes = self._usage_locked()
+        with self._counter_lock:
+            self._records = records + self._inflight
+            self._bytes = total_bytes + self._inflight_bytes
+            return self._records, self._bytes
+
+    def approximate_count(self, key: Optional[_MonitorKey] = None) -> int:
+        """O(1) backlog estimate for debug stats — never a directory scan."""
+        if not self._is_shard and key is not None:
+            return self._shard_for(key).approximate_count(key)
+        with self._counter_lock:
+            return self._records
+
     def _usage_locked(self) -> tuple[int, int]:
         records = 0
         total_bytes = 0
@@ -732,6 +966,10 @@ class _DurableMonitoringSpool:
         return records, total_bytes
 
     def enqueue(self, key: _MonitorKey, payload: Dict[str, Any]) -> _SpoolRecord:
+        if not self._is_shard:
+            # Per-tenant shard: unrelated organizations/monitor types never
+            # contend on the same lock or scan each other's backlog.
+            return self._shard_for(key).enqueue(key, payload)
         canonical_failure: Optional[MonitoringDurabilityError] = None
         try:
             date = _today_utc_date()
@@ -776,50 +1014,76 @@ class _DurableMonitoringSpool:
             )
 
         final_name = self._final_name(envelope)
-        temp_name = f".{final_name}.tmp"
         final_path = self._safe_path(final_name)
-        temp_path = self._safe_path(temp_name)
-        with self._locked():
-            self._recover_temps_locked()
-            record_count, byte_count = self._usage_locked()
-            if record_count + 1 > self.max_records:
-                raise MonitoringBackpressureError(
-                    "monitoring spool record cap reached; restore Redis delivery "
-                    "or increase SUPERTABLE_MONITOR_SPOOL_MAX_RECORDS"
-                )
-            if byte_count + len(serialized) > self.max_bytes:
-                raise MonitoringBackpressureError(
-                    "monitoring spool byte cap reached; restore Redis delivery "
-                    "or increase SUPERTABLE_MONITOR_SPOOL_MAX_BYTES"
-                )
-            flags = (
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                | getattr(os, "O_NOFOLLOW", 0)
-            )
-            publish_failure: Optional[MonitoringDurabilityError] = None
+        partial_path = self._safe_path(f".{final_name}.partial")
+        flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        )
+        self._reserve(len(serialized))
+        published = False
+        publish_failure: Optional[MonitoringDurabilityError] = None
+        try:
+            # The record body write + fsync runs OUTSIDE the interprocess lock.
+            # Its name is unique to this delivery id and ``.partial`` files are
+            # invisible to recovery, so no other writer can observe or reclaim
+            # it.  Keeping it out of the critical section is what lets
+            # concurrent writers' fsyncs coalesce into one journal commit.
+            fd = os.open(partial_path, flags, 0o600)
             try:
-                fd = os.open(temp_path, flags, 0o600)
+                with os.fdopen(fd, "wb", closefd=False) as handle:
+                    handle.write(serialized)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                os.close(fd)
+            # Publication is a single atomic rename; the lock only orders it
+            # against recovery/removal, so the critical section is microseconds.
+            with self._locked():
+                os.replace(partial_path, final_path)
+            published = True
+            # The acknowledging directory fsync also runs outside the lock.  It
+            # happens-after this thread's own rename, so returning still means
+            # *this* record is durable, while concurrent acknowledgements batch.
+            self._fsync_directory(self.root)
+        except OSError as exc:
+            publish_failure = _safe_durability_error(
+                "could not durably publish monitoring spool record", exc,
+            )
+        finally:
+            self._settle_reservation(len(serialized), published=published)
+            if not published:
                 try:
-                    with os.fdopen(fd, "wb", closefd=False) as handle:
-                        handle.write(serialized)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                finally:
-                    os.close(fd)
-                os.replace(temp_path, final_path)
-                self._fsync_directory(self.root)
-            except OSError as exc:
-                publish_failure = _safe_durability_error(
-                    "could not durably publish monitoring spool record", exc,
-                )
-            if publish_failure is not None:
-                raise publish_failure
+                    os.unlink(partial_path)
+                except OSError:
+                    pass
+        if publish_failure is not None:
+            raise publish_failure
         decoded = self._decode_envelope(serialized)
         return _SpoolRecord(final_path, decoded, len(serialized))
 
     def pending(
         self,
         key: Optional[_MonitorKey] = None,
+        *,
+        limit: Optional[int] = None,
+    ) -> list[_SpoolRecord]:
+        if not self._is_shard:
+            if key is not None:
+                return self._shard_for(key).pending(key, limit=limit)
+            # Union across every shard, plus any un-migratable legacy record
+            # still sitting in the router's own directory.
+            records = self._pending_here(None, limit=limit)
+            for shard in self._known_shards():
+                remaining = None if limit is None else limit - len(records)
+                if remaining is not None and remaining <= 0:
+                    break
+                records.extend(shard.pending(None, limit=remaining))
+            return records
+        return self._pending_here(key, limit=limit)
+
+    def _pending_here(
+        self,
+        key: Optional[_MonitorKey],
         *,
         limit: Optional[int] = None,
     ) -> list[_SpoolRecord]:
@@ -854,33 +1118,105 @@ class _DurableMonitoringSpool:
             return records
 
     def count(self, key: Optional[_MonitorKey] = None) -> int:
-        return len(self.pending(key))
+        """Exact backlog size.
+
+        Deliberately a name-only scan: unlike the old ``len(self.pending(key))``
+        it never reads or decodes record bodies, and with sharding it only ever
+        walks one tenant's directory.
+        """
+        if not self._is_shard:
+            if key is not None:
+                return self._shard_for(key).count(key)
+            return self._count_here(None) + sum(
+                shard.count(None) for shard in self._known_shards()
+            )
+        return self._count_here(key)
+
+    def _count_here(self, key: Optional[_MonitorKey]) -> int:
+        prefix = self._key_hash(key) + "-" if key is not None else ""
+        with self._locked():
+            return sum(
+                1
+                for entry in os.scandir(self.root)
+                if self._is_record_name(entry.name)
+                and (not prefix or entry.name.startswith(prefix))
+            )
 
     def delete(self, record: _SpoolRecord) -> None:
-        path = os.path.abspath(record.path)
-        if os.path.dirname(path) != self.root:
-            raise MonitoringDurabilityError("monitoring spool delete escaped its root")
-        with self._locked():
-            if not os.path.lexists(path):
-                # Another process delivered and durably removed this same
-                # idempotent record.
-                return
-            data = self._read_bytes(path)
-            current = self._decode_envelope(data)
-            if current["delivery_id"] != record.envelope["delivery_id"]:
-                raise MonitoringDurabilityError(
-                    "monitoring spool record changed before acknowledgement"
-                )
-            delete_failure: Optional[MonitoringDurabilityError] = None
-            try:
-                os.unlink(path)
-                self._fsync_directory(self.root)
-            except OSError as exc:
-                delete_failure = _safe_durability_error(
-                    "could not durably remove delivered monitoring record", exc,
-                )
-            if delete_failure is not None:
-                raise delete_failure
+        self.delete_many([record])
+
+    def delete_many(self, records: list[_SpoolRecord]) -> None:
+        """Durably remove an acknowledged batch with one directory fsync.
+
+        A crash before that fsync lands only replays deliveries Redis already
+        deduplicates, so batching the fsync cannot lose or duplicate a record.
+        """
+        if not records:
+            return
+        if not self._is_shard:
+            grouped: Dict[str, list[_SpoolRecord]] = {}
+            for record in records:
+                parent = os.path.dirname(os.path.abspath(record.path))
+                grouped.setdefault(parent, []).append(record)
+            for parent, group in grouped.items():
+                if parent == self.root:
+                    self._delete_here(group)
+                    continue
+                if os.path.dirname(parent) != self.root:
+                    raise MonitoringDurabilityError(
+                        "monitoring spool delete escaped its root"
+                    )
+                self._shard_at(os.path.basename(parent))._delete_here(group)
+            return
+        self._delete_here(records)
+
+    def _delete_here(self, records: list[_SpoolRecord]) -> None:
+        removed: list[_SpoolRecord] = []
+        delete_failure: Optional[MonitoringDurabilityError] = None
+        try:
+            with self._locked():
+                try:
+                    for record in records:
+                        path = os.path.abspath(record.path)
+                        if os.path.dirname(path) != self.root:
+                            raise MonitoringDurabilityError(
+                                "monitoring spool delete escaped its root"
+                            )
+                        if not os.path.lexists(path):
+                            # Another process delivered and durably removed
+                            # this same idempotent record.
+                            continue
+                        data = self._read_bytes(path)
+                        current = self._decode_envelope(data)
+                        if current["delivery_id"] != record.envelope["delivery_id"]:
+                            raise MonitoringDurabilityError(
+                                "monitoring spool record changed before "
+                                "acknowledgement"
+                            )
+                        os.unlink(path)
+                        removed.append(record)
+                except OSError as exc:
+                    delete_failure = _safe_durability_error(
+                        "could not durably remove delivered monitoring record", exc,
+                    )
+        finally:
+            # Persist the removals outside the interprocess lock, for the same
+            # reason as the enqueue acknowledgement: the unlinks already
+            # happened under the lock and this fsync happens-after them, so
+            # removal is still durable when this returns — but concurrent
+            # writers' publish renames no longer queue behind our fsync.
+            # Runs even if a later record in the batch failed validation.
+            if removed:
+                try:
+                    self._fsync_directory(self.root)
+                except OSError as exc:
+                    delete_failure = delete_failure or _safe_durability_error(
+                        "could not durably remove delivered monitoring record", exc,
+                    )
+                for record in removed:
+                    self._release_published(record.size)
+        if delete_failure is not None:
+            raise delete_failure
 
 
 def _deliver_spool_record(
@@ -1044,7 +1380,12 @@ class _AsyncMonitoringLogger:
         # internal controls
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._ship_lock = threading.Lock()  # prevents request_flush() shipping concurrently with worker
+        # Serializes Redis *delivery* only (worker / request_flush / log_metric's
+        # post-acknowledgement retry).  The durable enqueue never takes it, so a
+        # writer is never blocked by another thread's delivery.  Because exactly
+        # one thread delivers at a time, two threads cannot double-remove a
+        # record; across processes the Redis Lua boundary is idempotent.
+        self._ship_lock = threading.Lock()
         self._batch_max = int(batch_max)
         self._batch_wait_s = float(batch_wait_s)
         if self._batch_max <= 0:
@@ -1114,26 +1455,50 @@ class _AsyncMonitoringLogger:
         # Publish the WAL entry before any Redis I/O.  This closes the crash
         # window where Redis could accept a write but its reply is lost, and it
         # makes retry safe across process restart.
-        with self._ship_lock:
-            enqueue_failure: Optional[MonitoringDurabilityError] = None
-            try:
-                self._spool.enqueue(self._key, payload)
-                # Oldest-first: a new live event never leaps over an existing
-                # outage backlog.  Network failure simply leaves the WAL intact.
-                self._deliver_pending(max_items=self._batch_max)
+        #
+        # The durable enqueue+fsync is the acknowledgement this caller depends
+        # on, so it runs on its own: it is NOT serialized behind another
+        # thread's Redis delivery.  ``_ship_lock`` guards delivery only.
+        enqueue_failure: Optional[MonitoringDurabilityError] = None
+        try:
+            self._spool.enqueue(self._key, payload)
+        except MonitoringDeliveryError:
+            raise
+        except Exception as exc:
+            # No enabled-monitoring call site may mistake a pre-WAL runtime
+            # failure for optional telemetry.  If publication succeeded,
+            # the record remains durable; if it did not, this explicit
+            # error prevents an acknowledged gap.
+            enqueue_failure = _safe_durability_error(
+                "monitoring durable enqueue failed", exc,
+            )
+        if enqueue_failure is not None:
+            raise enqueue_failure
+
+        # The record is already durable, so delivery below can never lose it —
+        # at worst the background worker ships it a moment later.
+        deliver_failure: Optional[MonitoringDurabilityError] = None
+        try:
+            with self._ship_lock:
+                # Whoever won this lock first already shipped a batch that
+                # covered this record, so the losers of the convoy skip the
+                # scan entirely instead of each re-walking the directory.
+                # Nothing can be stranded: our own enqueue counted itself, and
+                # the background worker still uses the exact on-disk count.
+                if self._spool.approximate_count(self._key):
+                    # Oldest-first: a new live event never leaps over an
+                    # existing outage backlog.  Network failure simply leaves
+                    # the WAL intact.
+                    self._deliver_pending(max_items=self._batch_max)
                 self._refresh_size()
-            except MonitoringDeliveryError:
-                raise
-            except Exception as exc:
-                # No enabled-monitoring call site may mistake a pre-WAL runtime
-                # failure for optional telemetry.  If publication succeeded,
-                # the record remains durable; if it did not, this explicit
-                # error prevents an acknowledged gap.
-                enqueue_failure = _safe_durability_error(
-                    "monitoring durable enqueue failed", exc,
-                )
-            if enqueue_failure is not None:
-                raise enqueue_failure
+        except MonitoringDeliveryError:
+            raise
+        except Exception as exc:
+            deliver_failure = _safe_durability_error(
+                "monitoring durable enqueue failed", exc,
+            )
+        if deliver_failure is not None:
+            raise deliver_failure
 
     def request_flush(self, timeout_s: float = 2.0) -> None:
         """
@@ -1269,7 +1634,9 @@ class _AsyncMonitoringLogger:
 
     def _refresh_size(self, *, pending: Optional[int] = None) -> None:
         if pending is None:
-            pending = self._spool.count(self._key)
+            # Debug gauge only: use the O(1) in-memory backlog estimate so the
+            # hot path never pays a directory scan that grows with the backlog.
+            pending = self._spool.approximate_count(self._key)
         with self.queue_stats_lock:
             self.queue_stats["current_size"] = self.queue.qsize() + pending
 
@@ -1280,7 +1647,7 @@ class _AsyncMonitoringLogger:
         self._set_current_batch([
             record.envelope["payload"] for record in records
         ])
-        delivered = 0
+        acknowledged: list[_SpoolRecord] = []
         try:
             for record in records:
                 accepted = _deliver_spool_record(
@@ -1292,10 +1659,14 @@ class _AsyncMonitoringLogger:
                     # Preserve global order: later records cannot leapfrog the
                     # first Redis-unaccepted record.
                     break
-                self._spool.delete(record)
-                delivered += 1
+                acknowledged.append(record)
         finally:
             self._clear_current_batch()
+            # One directory fsync for the whole acknowledged batch instead of
+            # one per record.  Redis has already accepted them, so a crash
+            # before the removal lands only replays an idempotent delivery.
+            self._spool.delete_many(acknowledged)
+        delivered = len(acknowledged)
         if delivered:
             with self.queue_stats_lock:
                 self.queue_stats["total_processed"] += delivered

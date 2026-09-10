@@ -5,38 +5,48 @@
 **Redis:** Sentinel mode (3 sentinels, `mymaster`, DB 1, strict mode)  
 **Python:** 3.12, `.venv`
 
+`RedisLocking` is the only locking backend. These numbers are a baseline for
+the lock primitive itself, not a comparison between alternatives.
+
 ---
 
 ## Latency (no contention, 100 iterations)
 
 Single-threaded acquire + release round-trip, no competing threads.
+Reproduce with `python3 measure_lock_time.py --iterations 100`.
 
-| Metric | File     | Redis   | Redis advantage |
-|--------|----------|---------|-----------------|
-| AVG    | 7.8 ms   | 2.9 ms  | 2.7×            |
-| P50    | 5.0 ms   | 2.7 ms  | 1.9×            |
-| P99    | 20.5 ms  | 6.6 ms  | 3.1×            |
-| MIN    | 3.0 ms   | 1.5 ms  | 2.0×            |
-| MAX    | 20.5 ms  | 6.6 ms  | 3.1×            |
+| Metric | Redis   |
+|--------|---------|
+| AVG    | 2.9 ms  |
+| P50    | 2.7 ms  |
+| P99    | 6.6 ms  |
+| MIN    | 1.5 ms  |
+| MAX    | 6.6 ms  |
 
-**File backend cost breakdown:** `fcntl` flock + JSON parse + JSON serialize + `fsync` per cycle.  
-**Redis backend cost breakdown:** `SET NX EX` + Lua `EVALSHA` (compare-and-delete) per cycle.
+**Cost breakdown:** `SET NX EX` + Lua `EVALSHA` (compare-and-delete) per cycle.
 
 ---
 
 ## Contention (12 threads, 0.5s hold)
 
-12 threads each pick a random key from a pool of 50. Threads targeting the same key contend; others proceed concurrently.
+12 threads each pick a random key from a pool of 50. Threads targeting the same
+key contend; others proceed concurrently. Reproduce with
+`python3 measure_lock_speed.py --threads 12 --hold 0.5`.
 
-| Metric     | File      | Redis     | Redis advantage |
-|------------|-----------|-----------|-----------------|
-| Threads    | 12        | 12        | —               |
-| Successful | 12        | 12        | —               |
-| Avg wait   | 136.0 ms  | 60.1 ms   | 2.3×            |
-| Min wait   | 25.4 ms   | 6.3 ms    | 4.0×            |
-| Max wait   | 601.1 ms  | 538.9 ms  | 1.1×            |
+| Metric     | Redis     |
+|------------|-----------|
+| Threads    | 12        |
+| Successful | 12        |
+| Avg wait   | 60.1 ms   |
+| Min wait   | 6.3 ms    |
+| Max wait   | 538.9 ms  |
 
-**Max wait (~500-600ms):** expected — one thread waits for the 0.5s hold to expire. This is correct contention behavior, not a performance issue.
+**Max wait (~500ms):** expected — one thread waits for the 0.5s hold to expire.
+This is correct contention behavior, not a performance issue.
+
+Waiters poll rather than queue, so `acquire()` applies mean-preserving jitter
+after the first few attempts to decorrelate the retry herd. That keeps the mean
+poll rate identical while spreading wake-ups; it does not make the lock fair.
 
 ---
 
@@ -44,22 +54,24 @@ Single-threaded acquire + release round-trip, no competing threads.
 
 ```
 supertable/locking/
-├── __init__.py        # exports RedisLocking, FileLocking
-├── redis_lock.py      # production backend (Sentinel-aware, heartbeat, Lua CAS)
-└── file_lock.py       # dev fallback (fcntl, same API)
+├── __init__.py        # exports RedisLocking
+└── redis_lock.py      # the only backend (Sentinel-aware, heartbeat, Lua CAS)
 ```
-
-Both backends share the same API:
 
 ```python
 token = locker.acquire(key, ttl_s=30, timeout_s=10)  # → str | None
 locker.release(key, token)                             # → bool
 locker.extend(key, token, ttl_ms)                      # → bool
+locker.lease_lost(key, token)                          # → bool
 ```
 
-**Heartbeat:** both backends auto-extend held locks at half-TTL via a background thread. The TTL is a crash recovery timeout, not an operation timeout. If the holder dies, the lock expires within one TTL cycle (~30s default).
+**Heartbeat:** a background thread auto-extends held locks at half the shortest
+held TTL, batching all renewals into one Lua round trip. The TTL is a crash
+recovery timeout, not an operation timeout. If the holder dies, the lock expires
+within one TTL cycle (~30s default).
 
-**Token safety:** only the UUID token holder can release or extend. Lua scripts (Redis) and atomic file operations (file) guarantee no TOCTOU races.
+**Token safety:** only the UUID token holder can release or extend; the Lua
+compare-and-delete / compare-and-extend scripts make that check atomic.
 
 ---
 
@@ -82,9 +94,3 @@ locker.extend(key, token, ttl_ms)                      # → bool
 | `SUPERTABLE_REDIS_SENTINEL_MASTER` | `mymaster` | Sentinel master name |
 | `SUPERTABLE_REDIS_SENTINEL_PASSWORD` | — | Sentinel auth (falls back to `REDIS_PASSWORD`) |
 | `SUPERTABLE_REDIS_SENTINEL_STRICT` | `false` | Fail hard if Sentinel unavailable |
-
----
-
-## Conclusion
-
-Redis is **~2.7× faster** per acquire/release cycle and the correct choice for multi-host production. File backend is a viable single-host dev fallback at ~8ms avg latency.

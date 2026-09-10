@@ -1767,25 +1767,17 @@ class TestWriteEmptyDataFrame:
 
 
 # ====================================================================
-# 18. DataWriter.write — timer class attribute
+# 18. DataWriter.write — timer class attribute (REMOVED)
 # ====================================================================
-
-class TestTimerAttribute:
-
-    def test_timer_is_class_attribute(self):
-        from supertable.data_writer import DataWriter
-        assert hasattr(DataWriter, "timer")
-
-    @patch(_PATCH_REDIS_CATALOG)
-    @patch(_PATCH_SUPER_TABLE)
-    def test_timer_shared_across_instances(self, MockST, MockCat):
-        MockST.return_value = MagicMock()
-        MockCat.return_value = MagicMock()
-
-        from supertable.data_writer import DataWriter
-        dw1 = DataWriter("a", "b")
-        dw2 = DataWriter("c", "d")
-        assert dw1.timer is dw2.timer
+#
+# ``DataWriter.timer = Timer()`` was a class attribute shared by every
+# instance and thread.  ``Timer`` is mutable (an unguarded list append plus
+# read-modify-write on shared floats in ``capture_and_reset_timing``), so the
+# sharing these tests asserted was a latent cross-thread corruption hazard
+# rather than a feature.  It was inert only because nothing in production ever
+# read or wrote it -- the writer records timings through ``Profiler`` instead.
+# The attribute and these two characterization tests were removed together.
+# ``DataReader.timer`` is unrelated: it is per-instance and genuinely used.
 
 
 # ====================================================================

@@ -240,6 +240,9 @@ class MinioStorage(StorageInterface):
             raise ValueError("Invalid JSON") from None
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
+        # Enroll before the PUT: a request that times out ambiguously may still
+        # have created the object, and only an enrolled key can be rolled back.
+        self._record_new_object(path)
         path = self._with_base(path)
         payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         buf = io.BytesIO(payload)
@@ -452,6 +455,20 @@ class MinioStorage(StorageInterface):
             )
         self.delete_prefix(logical)
 
+    def _delete_object_for_rollback(self, path: str) -> None:
+        """Delete exactly one enrolled key; never widen into a prefix delete.
+
+        ``delete`` falls back to recursive prefix deletion when the exact key is
+        absent, which rollback must never do.  ``RemoveObject`` is idempotent,
+        but a strict gateway may still answer NoSuchKey, so absence is absorbed.
+        """
+        try:
+            self.client.remove_object(self.bucket_name, self._with_base(path))
+        except S3Error as exc:
+            if getattr(exc, "code", None) in ("NoSuchKey", "NotFound"):
+                return
+            raise
+
     def delete_prefix(self, path: str) -> None:
         """Delete and verify a MinIO prefix with bounded retry batches."""
         import itertools
@@ -519,6 +536,7 @@ class MinioStorage(StorageInterface):
     # ---------- parquet ----------
 
     def write_parquet(self, table: pa.Table, path: str) -> None:
+        self._record_new_object(path)
         path = self._with_base(path)
         buf = io.BytesIO()
         pq.write_table(table, buf)
@@ -555,6 +573,7 @@ class MinioStorage(StorageInterface):
     # ---------- bytes / text / copy ----------
 
     def write_bytes(self, path: str, data: bytes) -> None:
+        self._record_new_object(path)
         path = self._with_base(path)
         buf = io.BytesIO(data)
         self.client.put_object(
@@ -567,6 +586,7 @@ class MinioStorage(StorageInterface):
 
     def create_bytes_if_absent(self, path: str, data: bytes) -> bool:
         """Issue one S3 conditional PUT through MinIO's signed request path."""
+        logical = path
         path = self._with_base(path)
         try:
             self.client._execute(
@@ -589,6 +609,10 @@ class MinioStorage(StorageInterface):
             ):
                 return False
             raise
+        # Enroll only a proven create.  A 412 means the object belongs to
+        # whoever won the race, and an ambiguous failure may equally be a lost
+        # 412 response, so neither may ever be enrolled for deletion.
+        self._record_new_object(logical)
         return True
 
     def read_bytes(self, path: str) -> bytes:
@@ -607,6 +631,7 @@ class MinioStorage(StorageInterface):
         return self.read_bytes(path).decode(encoding)
 
     def copy(self, src_path: str, dst_path: str) -> None:
+        self._record_new_object(dst_path)
         src_path = self._with_base(src_path)
         dst_path = self._with_base(dst_path)
         self.client.copy_object(

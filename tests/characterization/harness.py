@@ -185,7 +185,6 @@ def bootstrap_hermetic_env(home: Optional[str] = None) -> str:
         "SUPERTABLE_MONITOR_SPOOL_MAX_BYTES": str(256 * 1024 * 1024),
         "SUPERTABLE_MONITOR_SPOOL_MAX_RECORDS": "100000",
         "SUPERTABLE_LOG_LEVEL": "WARNING",
-        "LOCKING_BACKEND": "redis",
     }
     for k, v in hermetic.items():
         os.environ[k] = v

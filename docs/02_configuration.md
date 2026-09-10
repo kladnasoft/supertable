@@ -88,7 +88,7 @@ not change CWD.
 | `MAX_MEMORY_CHUNK_SIZE` | int | `16777216` (16 MB) | Maximum in-memory chunk size for processing |
 | `MAX_OVERLAPPING_FILES` | int | `100` | Maximum overlapping files before error |
 | `DEFAULT_TIMEOUT_SEC` | int | `60` | Default operation timeout |
-| `DEFAULT_LOCK_DURATION_SEC` | int | `30` | Default distributed lock TTL |
+| `DEFAULT_LOCK_DURATION_SEC` | int | `30` | TTL of every distributed lock (table, namespace, staging). The holder's heartbeat renews the lease at **half** this value for as long as the operation runs, so this is the crash-recovery window — how long a dead holder's lock lingers before another writer may take it — **not** a limit on how long a write or compaction may take. |
 | `IS_SHOW_TIMING` | bool | `true` | Show timing information in responses |
 
 ### Storage (General)

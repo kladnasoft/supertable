@@ -97,7 +97,7 @@ def test_write_authority_generation_is_atomic_and_fail_closed() -> None:
 
 
 @pytest.mark.parametrize("pinned_no_mirrors", [False, True])
-@pytest.mark.parametrize("changed_generation", ["role", "user", "root"])
+@pytest.mark.parametrize("changed_generation", ["role", "user"])
 def test_snapshot_commit_atomically_fences_write_authority_generation(
     pinned_no_mirrors: bool,
     changed_generation: str,
@@ -117,13 +117,8 @@ def test_snapshot_commit_atomically_fences_write_authority_generation(
 
     if changed_generation == "role":
         client.hincrby(RK.rbac_role_meta("acme", "lake"), "version", 1)
-    elif changed_generation == "user":
-        client.hincrby(RK.rbac_user_meta("acme", "lake"), "version", 1)
     else:
-        client.set(
-            RK.meta_root("acme", "lake"),
-            json.dumps({"version": 1, "ts": 2}),
-        )
+        client.hincrby(RK.rbac_user_meta("acme", "lake"), "version", 1)
 
     commit_kwargs = {"expected_mirror_pin": None} if pinned_no_mirrors else {}
     with pytest.raises(PermissionError, match="Write authority changed"):
@@ -167,6 +162,91 @@ def test_snapshot_commit_accepts_exact_write_authority_generation(
         expected_write_authority_generation=generation,
         **commit_kwargs,
     ) == (0, 1)
+
+
+@pytest.mark.parametrize("pinned_no_mirrors", [False, True])
+def test_sibling_table_commit_does_not_deny_write_authority(
+    pinned_no_mirrors: bool,
+) -> None:
+    """A sibling table's ordinary commit must not fence an unrelated writer.
+
+    Every ``commit_snapshot`` bumps the shared per-SuperTable root document.
+    Fencing publication on that counter rejected any writer whose storage I/O
+    overlapped another table's commit -- and because ``PermissionError`` is
+    classified as a definite rejection, it also deleted that writer's durable
+    objects.  The root's authorization-relevant states are still checked
+    against the live document; see the read-only test below.
+    """
+    catalog, client = _catalog()
+    _seed_root(client)
+    client.set(RK.lock_leaf("acme", "lake", "orders"), "owner")
+    generation = catalog.sample_write_authority_generation("acme", "lake")
+
+    # Exactly what a concurrent commit to a *different* table does to shared
+    # state: advance the root version and timestamp. RBAC is untouched.
+    client.set(
+        RK.meta_root("acme", "lake"),
+        json.dumps({"version": 41, "ts": 1234567890, "commit_id": "sibling"}),
+    )
+    assert catalog.validate_write_authority_generation(
+        "acme", "lake", generation,
+    ) is True
+
+    commit_kwargs = {"expected_mirror_pin": None} if pinned_no_mirrors else {}
+    assert catalog.commit_snapshot(
+        "acme",
+        "lake",
+        "orders",
+        _snapshot_payload(0),
+        "acme/lake/tables/orders/snapshots/v0.json",
+        expected_version=-1,
+        expected_path="",
+        lock_token="owner",
+        expected_write_authority_generation=generation,
+        **commit_kwargs,
+    ) == (0, 42)
+    assert client.get(RK.meta_leaf("acme", "lake", "orders")) is not None
+
+
+@pytest.mark.parametrize(
+    ("mutated_root", "expected_error"),
+    [
+        # Authorization state genuinely changed -> still denied.
+        ({"version": 9, "ts": 9, "read_only": True}, ReadOnlyCatalogError),
+        # Root became unreadable/invalid -> still denied (fail closed).
+        ({"version": 9, "ts": 9, "clone_type": "replica"}, RuntimeError),
+        ({"version": 9, "ts": 9, "clone_type": "bogus"}, RuntimeError),
+    ],
+)
+def test_root_authority_states_still_fence_publication(
+    mutated_root, expected_error,
+) -> None:
+    """Dropping the counter compare must not weaken the real root fence.
+
+    Each case also advances version/ts, proving the denial comes from the live
+    root's authorization state rather than from the counter comparison that
+    :func:`test_sibling_table_commit_does_not_deny_write_authority` removed.
+    """
+    catalog, client = _catalog()
+    _seed_root(client)
+    client.set(RK.lock_leaf("acme", "lake", "orders"), "owner")
+    generation = catalog.sample_write_authority_generation("acme", "lake")
+
+    client.set(RK.meta_root("acme", "lake"), json.dumps(mutated_root))
+
+    with pytest.raises(expected_error):
+        catalog.commit_snapshot(
+            "acme",
+            "lake",
+            "orders",
+            _snapshot_payload(0),
+            "acme/lake/tables/orders/snapshots/v0.json",
+            expected_version=-1,
+            expected_path="",
+            lock_token="owner",
+            expected_write_authority_generation=generation,
+        )
+    assert client.get(RK.meta_leaf("acme", "lake", "orders")) is None
 
 
 @pytest.mark.parametrize(

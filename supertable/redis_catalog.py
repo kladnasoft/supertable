@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 
 import redis
 from supertable.config.defaults import logger
+from supertable.config.settings import settings
 from supertable.errors import LockLostError, SnapshotCommitConflictError
 from supertable.mirroring.failure_safety import (
     mirror_error_type,
@@ -3844,10 +3845,19 @@ local function snapshot_write_authority_state(
   local role_generation = snapshot_rbac_generation(role_meta)
   local user_generation = snapshot_rbac_generation(user_meta)
   if not role_generation or not user_generation then return -1 end
+  -- Only the RBAC generations carry an authorization signal.  The root
+  -- document bumps its version/ts on EVERY table commit in the namespace, so
+  -- comparing them here denied a writer whenever an unrelated sibling table
+  -- committed during its storage I/O -- a false denial that also deleted the
+  -- rejecting writer's durable objects.  The authorization-relevant root
+  -- states (read-only, replica, corrupt, absent) and both deletion intents are
+  -- already checked unconditionally against the *live* document by every
+  -- caller of this helper, which is strictly stronger than comparing a
+  -- counter sampled earlier.  ``expected_root_version``/``expected_root_ts``
+  -- remain in the signature so the disabled-fence strictness check above keeps
+  -- rejecting a partially supplied generation.
   if role_generation ~= expected_role
-      or user_generation ~= expected_user
-      or tostring(root['version']) ~= expected_root_version
-      or tostring(root['ts']) ~= expected_root_ts then
+      or user_generation ~= expected_user then
     return 0
   end
   return 1
@@ -5600,17 +5610,19 @@ if not held_token or held_token ~= lock_token then
   return {-2, 0, 0}
 end
 -- A waiting first-time creator may hold the namespace lock while blocked on
--- this writer's leaf lease.  It must not wound the current flagged one-shot
--- publisher.  A real delete linearizes by persisting namespace_delete before
--- draining this lease; that durable intent remains an unconditional fence.
+-- this writer's leaf lease.  A real delete linearizes by persisting
+-- namespace_delete before draining this lease, so that durable intent --
+-- checked unconditionally immediately below -- is the only sound deletion
+-- fence.  A bare namespace-lock holder proves nothing about deletion: far more
+-- often it is a concurrent first-time *creator*, and rejecting on it made
+-- every create race lose 6 of 8 writers and broke ordinary appends to
+-- unrelated tables, both with a spurious "fenced for deletion" error.
   local namespace_holder = redis.call('GET', namespace_lock)
   if expected_namespace_token ~= '' then
     if not namespace_holder
         or namespace_holder ~= expected_namespace_token then
       return {-21, 0, 0}
     end
-  elseif one_shot_initial ~= '1' and namespace_holder then
-    return {-7, 0, 0}
 end
 if redis.call('EXISTS', namespace_delete) == 1 then
   return {-8, 0, 0}
@@ -5873,16 +5885,15 @@ local held_token = redis.call('GET', lock_key)
 if not held_token or held_token ~= lock_token then
   return {-2, 0, 0}
 end
--- Do not let a waiting creator's namespace lock wound the current first
--- publisher.  Namespace deletion is still fenced by its durable intent below.
+-- Do not let a waiting creator's namespace lock wound any publisher.
+-- Namespace deletion is fenced by its durable intent below, which is persisted
+-- before any leaf lease is drained; a bare lock holder is not proof of one.
   local namespace_holder = redis.call('GET', namespace_lock)
   if expected_namespace_token ~= '' then
     if not namespace_holder
         or namespace_holder ~= expected_namespace_token then
       return {-21, 0, 0}
     end
-  elseif one_shot_initial ~= '1' and namespace_holder then
-    return {-7, 0, 0}
 end
 if redis.call('EXISTS', namespace_delete) == 1 then
   return {-8, 0, 0}
@@ -7970,22 +7981,49 @@ return 1
 
     # ------------- Locking -------------
 
-    def acquire_simple_lock(self, org: str, sup: str, simple: str, ttl_s: int = 30, timeout_s: int = 30) -> Optional[
-        str]:
+    @staticmethod
+    def _lock_ttl(ttl_s: Optional[int]) -> int:
+        """Resolve a lock TTL, defaulting to ``DEFAULT_LOCK_DURATION_SEC``.
+
+        Every lock in the system is auto-renewed at half its TTL by the
+        holder's heartbeat thread for as long as the operation runs, so this
+        value is the crash-recovery window -- how long a dead holder's lock
+        survives before another writer may take it -- and NOT a limit on how
+        long a write, compaction or deletion may take.
+
+        Call sites used to hardcode ``ttl_s=30``, which meant the configured
+        ``DEFAULT_LOCK_DURATION_SEC`` was silently ignored.  Passing an
+        explicit value still overrides, for the few operations that
+        deliberately want a different recovery window.
+        """
+        if ttl_s is None:
+            return int(settings.DEFAULT_LOCK_DURATION_SEC)
+        if type(ttl_s) is not int or ttl_s <= 0:
+            raise ValueError("Lock TTL must be a positive integer number of seconds")
+        return ttl_s
+
+    def acquire_simple_lock(
+            self, org: str, sup: str, simple: str,
+            ttl_s: Optional[int] = None, timeout_s: int = 30,
+    ) -> Optional[str]:
         """SET lock key NX EX with retry/backoff <= timeout. Returns token if acquired else None."""
-        return self._locker.acquire(RK.lock_leaf(org, sup, simple), ttl_s=ttl_s, timeout_s=timeout_s)
+        return self._locker.acquire(
+            RK.lock_leaf(org, sup, simple),
+            ttl_s=self._lock_ttl(ttl_s), timeout_s=timeout_s,
+        )
 
     def release_simple_lock(self, org: str, sup: str, simple: str, token: str) -> bool:
         """Compare-and-delete via Lua."""
         return self._locker.release(RK.lock_leaf(org, sup, simple), token)
 
     def acquire_namespace_lock(
-            self, org: str, sup: str, ttl_s: int = 30,
+            self, org: str, sup: str, ttl_s: Optional[int] = None,
             timeout_s: int = 30,
     ) -> Optional[str]:
         """Fence creation/publication while deleting a SuperTable namespace."""
         return self._locker.acquire(
-            RK.lock_namespace(org, sup), ttl_s=ttl_s, timeout_s=timeout_s,
+            RK.lock_namespace(org, sup),
+            ttl_s=self._lock_ttl(ttl_s), timeout_s=timeout_s,
         )
 
     def release_namespace_lock(
@@ -9175,18 +9213,36 @@ return 1
             raise
 
 
+    def acquire_rbac_init_lock(
+            self, org: str, sup: str, ttl_s: int = 10, timeout_s: int = 30,
+    ) -> Optional[str]:
+        """Acquire the RBAC bootstrap lock in its own key space.
+
+        Kept out of the per-table lock namespace so a table named
+        ``roles_init`` cannot collide with it; see :func:`RK.lock_rbac_init`.
+        """
+        return self._locker.acquire(
+            RK.lock_rbac_init(org, sup), ttl_s=ttl_s, timeout_s=timeout_s,
+        )
+
+    def release_rbac_init_lock(self, org: str, sup: str, token: str) -> bool:
+        return self._locker.release(RK.lock_rbac_init(org, sup), token)
+
     def acquire_stage_lock(
             self,
             org: str,
             sup: str,
             stage_name: str,
-            ttl_s: int = 30,
+            ttl_s: Optional[int] = None,
             timeout_s: int = 30,
     ) -> Optional[str]:
         """Acquire lock for staging/pipe operations:
             supertable:{org}:lakes:{sup}:lock:stage:doc:{stage_name}
         """
-        return self._locker.acquire(RK.lock_stage(org, sup, stage_name), ttl_s=ttl_s, timeout_s=timeout_s)
+        return self._locker.acquire(
+            RK.lock_stage(org, sup, stage_name),
+            ttl_s=self._lock_ttl(ttl_s), timeout_s=timeout_s,
+        )
 
     def release_stage_lock(
             self, org: str, sup: str, stage_name: str, token: str,
@@ -9767,6 +9823,14 @@ return 1
         use :meth:`validate_write_authority_generation` for a one-round-trip
         unchanged-policy recheck. Corrupt RBAC metadata, deletion fencing, and
         readonly/replica roots fail closed rather than returning a generation.
+
+        Only the first two components are compared by
+        :meth:`validate_write_authority_generation` and by the Lua publication
+        fence.  ``root_version``/``root_ts`` are diagnostic only: they advance
+        on every table commit in the namespace, so fencing on them rejected a
+        writer whenever an unrelated sibling table committed.  The
+        authorization-relevant root states are re-read from the live document
+        inside the same atomic script instead.
         """
         try:
             raw = self._sample_write_authority(
@@ -9826,7 +9890,15 @@ return 1
             or any(type(value) is not int or value < 0 for value in expected)
         ):
             raise ValueError("Expected write-authority generation is invalid")
-        return self.sample_write_authority_generation(org, sup) == tuple(expected)
+        # Compare only the RBAC generations, matching the Lua publication
+        # fence.  The sampled root version/ts are retained for diagnostics but
+        # advance on every sibling table's ordinary commit; comparing them here
+        # made an unrelated concurrent write look like a policy change and
+        # burned all three attempts of the caller's stability loop.
+        return (
+            self.sample_write_authority_generation(org, sup)[:2]
+            == tuple(expected)[:2]
+        )
 
     def update_root_flags(
             self,

@@ -10,7 +10,6 @@ import pytest
 
 from supertable.data_reader import _caller_deadline
 from supertable.engine.data_estimator import _trusted_storage_type
-from supertable.locking.file_lock import _safe_error_type as file_lock_error_type
 from supertable.locking.redis_lock import _safe_error_type as redis_lock_error_type
 from supertable.logging import JSONFormatter, TextFormatter
 from supertable.meta_reader import _safe_error_type as meta_reader_error_type
@@ -93,7 +92,6 @@ def test_safe_exception_type_rejects_runtime_class_name_without_rendering() -> N
 @pytest.mark.parametrize(
     "extractor",
     [
-        file_lock_error_type,
         redis_lock_error_type,
         meta_reader_error_type,
         mirror_error_type,

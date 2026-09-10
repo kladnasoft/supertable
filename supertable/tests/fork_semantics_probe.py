@@ -1,8 +1,8 @@
 """Isolated subprocess probes for the tests that require real ``fork()``.
 
 The probes deliberately run outside pytest's already multi-threaded process.
-Two of them first create the thread whose inherited state is under test.  On
-CPython 3.12 and newer, those two forks must emit the interpreter's precise
+One of them first creates the thread whose inherited state is under test.  On
+CPython 3.12 and newer, that fork must emit the interpreter's precise
 ``DeprecationWarning``; the warning is captured and checked at the call site.
 """
 
@@ -126,54 +126,6 @@ def _audit_identity_probe() -> dict[str, Any]:
         "parent_identity": parent_identity,
         "probe": "audit_identity",
     }
-
-
-def _file_lock_probe(root: str) -> dict[str, Any]:
-    from supertable.locking.file_lock import FileLocking
-
-    owner = FileLocking(working_dir=root, retry_interval=0.01)
-    contender = FileLocking(working_dir=root, retry_interval=0.01)
-    token = owner.acquire("parent-owned", ttl_s=5, timeout_s=1)
-    _require(token is not None, "parent failed to acquire the probe lock")
-
-    try:
-        child_pid, warning_count = _fork_with_warning_contract(threaded=True)
-        if child_pid == 0:  # pragma: no cover - assertions execute in parent
-            try:
-                owner._on_exit()
-            except BaseException:
-                os._exit(1)
-            os._exit(0)
-
-        waited, status = os.waitpid(child_pid, 0)
-        child_exitcode = os.waitstatus_to_exitcode(status)
-        parent_token_survived = owner.who("parent-owned") == token
-        contender_blocked = (
-            contender.acquire(
-                "parent-owned",
-                ttl_s=2,
-                timeout_s=1,
-                retry_interval=0.01,
-            )
-            is None
-        )
-        _require(waited == child_pid, "waitpid returned the wrong lock child")
-        _require(child_exitcode == 0, "file-lock child did not exit cleanly")
-        _require(
-            parent_token_survived,
-            "child cleanup released the live parent lock",
-        )
-        _require(contender_blocked, "a contender acquired the live parent lock")
-        return {
-            "child_exitcode": child_exitcode,
-            "contender_blocked": contender_blocked,
-            "fork_warning_count": warning_count,
-            "parent_token_survived": parent_token_survived,
-            "probe": "file_lock",
-        }
-    finally:
-        owner._on_exit()
-        contender._on_exit()
 
 
 def _durability_batch_probe(root: str) -> dict[str, Any]:
@@ -325,9 +277,6 @@ def _main() -> int:
     if probe == "audit_identity":
         _require(root is None, "audit identity probe does not accept a root")
         result = _audit_identity_probe()
-    elif probe == "file_lock":
-        _require(root is not None, "file-lock probe requires a root")
-        result = _file_lock_probe(root)
     elif probe == "durability_batch":
         _require(root is not None, "durability probe requires a root")
         result = _durability_batch_probe(root)

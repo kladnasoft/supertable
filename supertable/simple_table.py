@@ -921,7 +921,7 @@ class SimpleTable:
         # locks during SuperTable deletion. Acquiring this before any storage
         # write closes the new-child write-after-prefix-verification race.
         namespace_token = self.catalog.acquire_namespace_lock(
-            org, sup, ttl_s=30, timeout_s=60,
+            org, sup, timeout_s=60,
         )
         if not namespace_token:
             raise TimeoutError(
@@ -1044,7 +1044,6 @@ class SimpleTable:
         namespace_token = self.catalog.acquire_namespace_lock(
             self.super_table.organization,
             self.super_table.super_name,
-            ttl_s=30,
             timeout_s=60,
         )
         if not namespace_token:
@@ -1053,7 +1052,6 @@ class SimpleTable:
             self.super_table.organization,
             self.super_table.super_name,
             self.simple_name,
-            ttl_s=30,
             timeout_s=60,
         )
         if not token:
@@ -1514,7 +1512,7 @@ class SimpleTable:
             table_name=self.simple_name,
         )
         token = self.catalog.acquire_simple_lock(
-            org, sup, self.simple_name, ttl_s=30, timeout_s=60,
+            org, sup, self.simple_name, timeout_s=60,
         )
         if not token:
             raise TimeoutError("Could not acquire the table lock")
@@ -1644,7 +1642,7 @@ class SimpleTable:
             )
 
         token = self.catalog.acquire_simple_lock(
-            org, sup, self.simple_name, ttl_s=30, timeout_s=60,
+            org, sup, self.simple_name, timeout_s=60,
         )
         if not token:
             raise TimeoutError("Could not acquire the table lock")

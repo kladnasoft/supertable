@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import threading
 import time
 import traceback
 from types import SimpleNamespace
@@ -200,6 +202,173 @@ def test_noncanonical_payload_is_a_durability_error_not_generic_type_error(
     with pytest.raises(mw.MonitoringDurabilityError, match="canonical JSON"):
         monitor.log_metric({"not_json": object()})
     assert monitor._spool.count() == 0
+
+
+def test_unrelated_organizations_never_share_one_spool_lock(tmp_path):
+    """Sharding: one tenant's interprocess lock cannot stall another tenant."""
+    spool = mw._DurableMonitoringSpool(
+        str(tmp_path / "wal"), max_bytes=1_000_000, max_records=100,
+    )
+    acme = mw._MonitorKey("acme", "writes")
+    beta = mw._MonitorKey("beta", "writes")
+    spool.enqueue(acme, {"query_id": "a-1"})
+    spool.enqueue(beta, {"query_id": "b-1"})
+
+    acme_shard = spool._shard_for(acme)
+    beta_shard = spool._shard_for(beta)
+    assert acme_shard.root != beta_shard.root
+    assert acme_shard._lock_path != beta_shard._lock_path
+
+    held = os.open(acme_shard._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX)
+
+        # The blocked tenant proves the lock is genuinely exclusive...
+        blocked = threading.Event()
+        threading.Thread(
+            target=lambda: (spool.enqueue(acme, {"query_id": "a-2"}),
+                            blocked.set()),
+            daemon=True,
+        ).start()
+        assert not blocked.wait(0.4)
+
+        # ...while an unrelated organization is completely unaffected.
+        free = threading.Event()
+        threading.Thread(
+            target=lambda: (spool.enqueue(beta, {"query_id": "b-2"}), free.set()),
+            daemon=True,
+        ).start()
+        assert free.wait(5), "unrelated organization serialized behind another's lock"
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        os.close(held)
+    assert blocked.wait(5)
+
+
+def test_backlog_adds_no_directory_scan_to_the_enqueue_path(tmp_path, monkeypatch):
+    """Per-op cost must not grow with the spooled backlog."""
+    spool = mw._DurableMonitoringSpool(
+        str(tmp_path / "wal"), max_bytes=10_000_000, max_records=5_000,
+    )
+    key = mw._MonitorKey("acme", "writes")
+    for index in range(400):
+        spool.enqueue(key, {"query_id": f"q-{index}"})
+    assert spool.count(key) == 400
+
+    scanned: list[str] = []
+    real_scandir = os.scandir
+    monkeypatch.setattr(
+        mw.os,
+        "scandir",
+        lambda path: (scanned.append(str(path)), real_scandir(path))[1],
+    )
+    spool.enqueue(key, {"query_id": "measured"})
+    assert scanned == []
+
+
+def test_bounded_capacity_still_refuses_once_the_backlog_reaches_its_cap(tmp_path):
+    """Incremental accounting must not weaken the bound it replaced."""
+    spool = mw._DurableMonitoringSpool(
+        str(tmp_path / "wal"), max_bytes=10_000_000, max_records=3,
+    )
+    key = mw._MonitorKey("acme", "writes")
+    for index in range(3):
+        spool.enqueue(key, {"query_id": f"q-{index}"})
+    with pytest.raises(mw.MonitoringBackpressureError, match="record cap"):
+        spool.enqueue(key, {"query_id": "q-overflow"})
+    assert spool.count(key) == 3
+
+    # Draining one record must restore exactly one slot.
+    spool.delete(spool.pending(key)[0])
+    spool.enqueue(key, {"query_id": "q-after-drain"})
+    assert spool.count(key) == 3
+
+
+def test_concurrent_writers_lose_no_record_and_never_double_deliver(tmp_path):
+    """Delivery outside the acknowledgement lock stays exactly-once."""
+    redis = fakeredis.FakeRedis(decode_responses=True)
+    submitted: list[str] = []
+    submitted_lock = threading.Lock()
+
+    class RecordingRedis:
+        def eval(self, script, numkeys, *args):
+            with submitted_lock:
+                submitted.append(args[2])  # delivery id
+            return redis.eval(script, numkeys, *args)
+
+    monitor = _logger(tmp_path / "wal", RecordingRedis(), max_records=1_000)
+    threads, per_thread = 8, 15
+    failures: list[BaseException] = []
+
+    def run(worker: int) -> None:
+        try:
+            for index in range(per_thread):
+                monitor.log_metric({"query_id": f"q-{worker}-{index}"})
+        except BaseException as exc:  # pragma: no cover - failure detail
+            failures.append(exc)
+
+    workers = [threading.Thread(target=run, args=(w,)) for w in range(threads)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(30)
+    monitor.request_flush(timeout_s=10)
+
+    assert failures == []
+    key = mw._MonitorKey("acme", "writes").redis_list_key_today()
+    stored = [
+        json.loads(redis.lindex(key, index))["query_id"]
+        for index in range(redis.llen(key))
+    ]
+    expected = [
+        f"q-{worker}-{index}"
+        for worker in range(threads)
+        for index in range(per_thread)
+    ]
+    # No record lost, and none delivered twice.
+    assert sorted(stored) == sorted(expected)
+    assert len(submitted) == len(set(submitted))
+    assert monitor._spool.count() == 0
+
+
+def test_log_metric_fsyncs_the_record_before_returning(tmp_path, monkeypatch):
+    """The durability acknowledgement survives moving delivery off the lock."""
+    monitor = _logger(tmp_path / "wal", _DownRedis())
+    synced: list[int] = []
+    real_fsync = os.fsync
+    monkeypatch.setattr(
+        mw.os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1],
+    )
+
+    monitor.log_metric({"query_id": "q-durable"})
+
+    # Record body and the directory entry that publishes it.
+    assert len(synced) >= 2
+    assert [item["query_id"] for item in monitor._retry_batch] == ["q-durable"]
+
+
+def test_pre_sharding_spool_records_are_migrated_not_orphaned(tmp_path):
+    """A durable record written by an older, unsharded release still drains."""
+    root = tmp_path / "wal"
+    legacy = _logger(root, _DownRedis())
+    legacy.log_metric({"query_id": "q-legacy"})
+    record = legacy._spool.pending()[0]
+
+    # Recreate the pre-sharding flat layout: record directly under the root.
+    flat_path = os.path.join(str(root), os.path.basename(record.path))
+    os.replace(record.path, flat_path)
+    assert os.path.exists(flat_path)
+
+    redis = fakeredis.FakeRedis(decode_responses=True)
+    delivered = mw.drain_monitoring_spool(
+        redis_connector=SimpleNamespace(r=redis),
+        spool_dir=str(root),
+    )
+
+    assert delivered == 1
+    assert not os.path.exists(flat_path)
+    key = mw._MonitorKey("acme", "writes").redis_list_key_today()
+    assert json.loads(redis.lindex(key, 0))["query_id"] == "q-legacy"
 
 
 def test_stream_monitoring_finalizes_on_exhaustion_with_measured_rows_bytes():

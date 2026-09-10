@@ -411,7 +411,6 @@ class Staging:
             self.organization,
             self.super_name,
             stage_name,
-            ttl_s=30,
             timeout_s=30,
         )
         if not token:

@@ -29,18 +29,18 @@
       "supertable/data_reader.py:2450: error: Argument \"timing\" to \"extend_execution_plan\" has incompatible type \"list[dict[str, float]]\"; expected \"dict[str, float] | None\"  [arg-type]"
     ],
     "supertable/data_writer.py": [
-      "supertable/data_writer.py:1794: error: Key expression in dictionary comprehension has incompatible type \"Any | None\"; expected type \"str\"  [misc]",
-      "supertable/data_writer.py:1799: error: Key expression in dictionary comprehension has incompatible type \"Any | None\"; expected type \"str\"  [misc]",
-      "supertable/data_writer.py:1980: error: Need type annotation for \"new_resources\" (hint: \"new_resources: list[<type>] = ...\")  [var-annotated]",
-      "supertable/data_writer.py:2053: error: Need type annotation for \"footer_md_cache\" (hint: \"footer_md_cache: dict[<type>, <type>] = ...\")  [var-annotated]",
-      "supertable/data_writer.py:277: error: Set comprehension has incompatible type Set[Any | None]; expected Set[str]  [misc]",
-      "supertable/data_writer.py:2899: error: Argument 1 to \"extract_stats_rows\" has incompatible type \"list[Any | None]\"; expected \"list[str]\"  [arg-type]",
-      "supertable/data_writer.py:2907: error: Argument \"removed_files\" to \"build_stats_file\" has incompatible type \"set[Any | None]\"; expected \"set[str] | None\"  [arg-type]",
-      "supertable/data_writer.py:3566: error: Need type annotation for \"footer_md_cache\" (hint: \"footer_md_cache: dict[<type>, <type>] = ...\")  [var-annotated]",
-      "supertable/data_writer.py:3702: error: Item \"None\" of \"Any | None\" has no attribute \"height\"  [union-attr]",
-      "supertable/data_writer.py:3994: error: Argument 1 to \"extract_stats_rows\" has incompatible type \"list[Any | None]\"; expected \"list[str]\"  [arg-type]",
-      "supertable/data_writer.py:4022: error: Argument 1 to \"_stats_cache_identity\" of \"DataWriter\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
-      "supertable/data_writer.py:4298: error: Incompatible default for parameter \"newer_than\" (default has type \"None\", parameter has type \"str\")  [assignment]"
+      "supertable/data_writer.py:1830: error: Key expression in dictionary comprehension has incompatible type \"Any | None\"; expected type \"str\"  [misc]",
+      "supertable/data_writer.py:1835: error: Key expression in dictionary comprehension has incompatible type \"Any | None\"; expected type \"str\"  [misc]",
+      "supertable/data_writer.py:2016: error: Need type annotation for \"new_resources\" (hint: \"new_resources: list[<type>] = ...\")  [var-annotated]",
+      "supertable/data_writer.py:2089: error: Need type annotation for \"footer_md_cache\" (hint: \"footer_md_cache: dict[<type>, <type>] = ...\")  [var-annotated]",
+      "supertable/data_writer.py:275: error: Set comprehension has incompatible type Set[Any | None]; expected Set[str]  [misc]",
+      "supertable/data_writer.py:2935: error: Argument 1 to \"extract_stats_rows\" has incompatible type \"list[Any | None]\"; expected \"list[str]\"  [arg-type]",
+      "supertable/data_writer.py:2943: error: Argument \"removed_files\" to \"build_stats_file\" has incompatible type \"set[Any | None]\"; expected \"set[str] | None\"  [arg-type]",
+      "supertable/data_writer.py:3613: error: Need type annotation for \"footer_md_cache\" (hint: \"footer_md_cache: dict[<type>, <type>] = ...\")  [var-annotated]",
+      "supertable/data_writer.py:3749: error: Item \"None\" of \"Any | None\" has no attribute \"height\"  [union-attr]",
+      "supertable/data_writer.py:4041: error: Argument 1 to \"extract_stats_rows\" has incompatible type \"list[Any | None]\"; expected \"list[str]\"  [arg-type]",
+      "supertable/data_writer.py:4069: error: Argument 1 to \"_stats_cache_identity\" of \"DataWriter\" has incompatible type \"str | None\"; expected \"str\"  [arg-type]",
+      "supertable/data_writer.py:4356: error: Incompatible default for parameter \"newer_than\" (default has type \"None\", parameter has type \"str\")  [assignment]"
     ],
     "supertable/demo/medcenter/finance_sources.py": [
       "supertable/demo/medcenter/finance_sources.py:277: error: Argument \"booking_date\" to \"_bank_entry\" of \"FinanceSourcesGenerator\" has incompatible type \"date | None\"; expected \"date\"  [arg-type]",
@@ -288,8 +288,8 @@
       "supertable/mirroring/mirror_iceberg.py:275: error: Argument 1 to \"_encode_bytes\" has incompatible type \"bytes | bytearray\"; expected \"bytes\"  [arg-type]"
     ],
     "supertable/monitoring_writer.py": [
-      "supertable/monitoring_writer.py:75: error: Cannot assign to a type  [misc]",
-      "supertable/monitoring_writer.py:75: error: Incompatible types in assignment (expression has type \"None\", variable has type \"type[RedisConnector]\")  [assignment]"
+      "supertable/monitoring_writer.py:76: error: Cannot assign to a type  [misc]",
+      "supertable/monitoring_writer.py:76: error: Incompatible types in assignment (expression has type \"None\", variable has type \"type[RedisConnector]\")  [assignment]"
     ],
     "supertable/plan_extender.py": [
       "supertable/plan_extender.py:163: error: \"QueryPlanManager\" has no attribute \"query_profile\"  [attr-defined]",
@@ -360,13 +360,13 @@
       "supertable/quality/scheduler.py:4406: error: Name \"base_updates\" already defined on line 4231  [no-redef]"
     ],
     "supertable/rbac/role_manager.py": [
-      "supertable/rbac/role_manager.py:163: error: Argument 1 to \"validate_role_name\" has incompatible type \"Any | None\"; expected \"str\"  [arg-type]",
-      "supertable/rbac/role_manager.py:264: error: Incompatible return value type (got \"str | None\", expected \"str\")  [return-value]"
+      "supertable/rbac/role_manager.py:166: error: Argument 1 to \"validate_role_name\" has incompatible type \"Any | None\"; expected \"str\"  [arg-type]",
+      "supertable/rbac/role_manager.py:267: error: Incompatible return value type (got \"str | None\", expected \"str\")  [return-value]"
     ],
     "supertable/redis_catalog.py": [
-      "supertable/redis_catalog.py:2037: error: Argument \"role\" to \"RowColumnSecurity\" has incompatible type \"str | Any | None\"; expected \"str\"  [arg-type]",
-      "supertable/redis_catalog.py:27: error: Name \"RedisConnector\" already defined (possibly by an import)  [no-redef]",
-      "supertable/redis_catalog.py:27: error: Name \"RedisOptions\" already defined (possibly by an import)  [no-redef]"
+      "supertable/redis_catalog.py:2038: error: Argument \"role\" to \"RowColumnSecurity\" has incompatible type \"str | Any | None\"; expected \"str\"  [arg-type]",
+      "supertable/redis_catalog.py:28: error: Name \"RedisConnector\" already defined (possibly by an import)  [no-redef]",
+      "supertable/redis_catalog.py:28: error: Name \"RedisOptions\" already defined (possibly by an import)  [no-redef]"
     ],
     "supertable/redis_connector.py": [
       "supertable/redis_connector.py:411: error: Dict entry 0 has incompatible type \"str\": \"str\"; expected \"str\": \"bool\"  [dict-item]",
@@ -376,7 +376,7 @@
       "supertable/redis_infra.py:320: error: Unused \"type: ignore\" comment  [unused-ignore]"
     ],
     "supertable/storage/azure_storage.py": [
-      "supertable/storage/azure_storage.py:517: error: Need type annotation for \"root\" (hint: \"root: dict[<type>, <type>] = ...\")  [var-annotated]"
+      "supertable/storage/azure_storage.py:531: error: Need type annotation for \"root\" (hint: \"root: dict[<type>, <type>] = ...\")  [var-annotated]"
     ],
     "supertable/storage/local_storage.py": [
       "supertable/storage/local_storage.py:1205: error: Need type annotation for \"directory_structure\" (hint: \"directory_structure: dict[<type>, <type>] = ...\")  [var-annotated]",
@@ -386,7 +386,7 @@
       "supertable/storage/local_storage.py:613: error: \"bool\" is invalid as return type for \"__exit__\" that always returns False  [exit-return]"
     ],
     "supertable/storage/minio_storage.py": [
-      "supertable/storage/minio_storage.py:465: error: Need type annotation for \"prior_errors\" (hint: \"prior_errors: list[<type>] = ...\")  [var-annotated]"
+      "supertable/storage/minio_storage.py:482: error: Need type annotation for \"prior_errors\" (hint: \"prior_errors: list[<type>] = ...\")  [var-annotated]"
     ],
     "supertable/storage/storage_factory.py": [
       "supertable/storage/storage_factory.py:26: error: Module has no attribute \"util\"  [attr-defined]"
@@ -436,7 +436,7 @@
       "supertable/mirroring/mirror_iceberg.py:1086:def write_iceberg_table(super_table, table_name: str, simple_snapshot: Dict[str, Any]) -> None:  # type: ignore[override]"
     ],
     "supertable/monitoring_writer.py": [
-      "supertable/monitoring_writer.py:57:fcntl = None  # type: ignore[assignment]"
+      "supertable/monitoring_writer.py:58:fcntl = None  # type: ignore[assignment]"
     ],
     "supertable/redis_infra.py": [
       "supertable/redis_infra.py:320:from supertable.redis_catalog import RedisCatalog as _RC  # type: ignore",
@@ -446,7 +446,7 @@
   "known_error_count": 320,
   "known_suppression_count": 10,
   "mypy_version": "2.3.0",
-  "production_file_count": 163,
+  "production_file_count": 162,
   "schema": 1,
   "target": "supertable"
 }

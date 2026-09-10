@@ -2,10 +2,13 @@
 import abc
 import base64
 import binascii
+import contextvars
 import hashlib
+import logging
 import os
 import posixpath
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +17,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from supertable.utils.diagnostic_redaction import safe_exception_type
+
+
+logger = logging.getLogger(__name__)
 
 
 # Decoding one physical row at a time is necessary to make the byte budget
@@ -233,6 +239,296 @@ def read_exact_range_body(body: BinaryIO, length: int) -> bytes:
     return b"".join(chunks)
 
 
+_ACTIVE_OBJECT_DURABILITY_BATCH: "contextvars.ContextVar[Optional[ObjectStoreDurabilityBatch]]" = (
+    contextvars.ContextVar("supertable_object_durability_batch", default=None)
+)
+
+
+def _reset_object_durability_batch_after_fork() -> None:
+    """Detach a parent-owned batch from the child's inherited context.
+
+    ``contextvars`` survive ``fork()`` verbatim, so without this hook a child
+    would observe the parent's open batch, refuse to open its own as "nested",
+    and could enroll its objects in a ledger the parent will later roll back.
+    """
+
+    _ACTIVE_OBJECT_DURABILITY_BATCH.set(None)
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_object_durability_batch_after_fork)
+
+
+class ObjectStoreDurabilityBatch:
+    """Write-scoped rollback ledger for newly created immutable objects.
+
+    ``LocalStorage`` owns an equivalent batch whose barrier must actually
+    ``fdatasync`` file bytes and then flush the directory ancestry that names
+    them.  An object store has no such gap: an S3 / MinIO / Azure / GCS ``2xx``
+    write response *is* the durability acknowledgement, and the object's name
+    becomes readable with it.  :meth:`barrier` is therefore a pure state
+    transition here — there is nothing left to flush — while the rest of the
+    contract (states, the deliberate ``abort()`` asymmetry, context locality,
+    fork safety) is identical, because ``DataWriter`` drives both through the
+    same duck-typed commit state machine.
+
+    What the batch adds on an object store is the missing half of that state
+    machine: every object created while it is open is recorded, so a mutation
+    rejected before or during catalog publication can delete exactly the
+    objects it created instead of orphaning them forever.
+
+    Lifecycle::
+
+        new -> __enter__ -> open -> barrier() -> durable
+            -> catalog_commit_started() -> commit_started
+            -> catalog_commit_succeeded() -> committed
+            -> catalog_commit_rejected()  -> commit_rejected
+
+    A batch is context-local (``contextvars``), so two writers sharing one
+    storage adapter cannot steal each other's publication scope.  Writer worker
+    threads inherit it because ``DataWriter`` submits its data/tombstone
+    branches through ``copy_context().run``; a thread started without that
+    explicit propagation simply sees no batch and writes unenrolled.
+    """
+
+    __slots__ = (
+        "storage",
+        "pid",
+        "_namespace",
+        "_lock",
+        "_paths",
+        "_seen",
+        "_state",
+        "_token",
+    )
+
+    def __init__(self, storage: "StorageInterface") -> None:
+        self.storage = storage
+        self.pid = os.getpid()
+        self._namespace = self._namespace_key(storage)
+        self._lock = threading.RLock()
+        self._paths: List[str] = []
+        self._seen: set[str] = set()
+        self._state = "new"
+        self._token: Any = None
+
+    # -------------------------
+    # Scope / ownership
+    # -------------------------
+    @staticmethod
+    def _namespace_key(storage: "StorageInterface") -> Optional[tuple]:
+        """Return a stable bucket/container namespace identity, or ``None``.
+
+        ``LocalStorage`` scopes a batch by filesystem root rather than by object
+        identity, so two adapters opened on the same namespace cooperate.  The
+        object-store equivalent is the cache namespace (provider, bucket or
+        container, endpoint, base prefix).  A third-party adapter with a broken
+        or exotic ``cache_namespace`` yields ``None``, which never matches and
+        so falls back to strict object identity.
+        """
+
+        try:
+            namespace = storage.cache_namespace()
+        except Exception:
+            return None
+        if not isinstance(namespace, dict) or not namespace:
+            return None
+        try:
+            return tuple(sorted((str(k), str(v)) for k, v in namespace.items()))
+        except Exception:
+            return None
+
+    def accepts(self, storage: "StorageInterface") -> bool:
+        """Whether *storage* writes belong to this open, same-process batch."""
+
+        if self.pid != os.getpid() or self._state != "open":
+            return False
+        if storage is self.storage:
+            return True
+        if self._namespace is None:
+            return False
+        return self._namespace_key(storage) == self._namespace
+
+    def _require_owner_locked(self) -> None:
+        if self.pid != os.getpid():
+            raise RuntimeError("durability batch cannot cross a fork boundary")
+
+    def __enter__(self) -> "ObjectStoreDurabilityBatch":
+        with self._lock:
+            self._require_owner_locked()
+            if self._state != "new":
+                raise RuntimeError("durability batch cannot be re-entered")
+            active = _ACTIVE_OBJECT_DURABILITY_BATCH.get()
+            # A batch inherited across fork belongs to the parent and is not a
+            # nesting attempt; the fork hook normally clears it already.
+            if active is not None and active.pid == os.getpid():
+                raise RuntimeError(
+                    "nested object-store durability batches are not supported"
+                )
+            self._token = _ACTIVE_OBJECT_DURABILITY_BATCH.set(self)
+            self._state = "open"
+        return self
+
+    # -------------------------
+    # Enrollment
+    # -------------------------
+    def record_new_object(self, path: str) -> None:
+        """Enroll one logical path created by this mutation.
+
+        Enrollment is deliberately unconditional rather than existence-checked.
+        Every object a mutation publishes is named by
+        ``supertable.utils.helper.generate_filename``: an epoch-millisecond
+        stamp plus ``secrets.token_hex(8)`` — 64 CSPRNG bits — so a name written
+        inside a batch is new by construction and cannot collide with a
+        concurrent writer's object.  ``abort()`` can therefore delete exactly
+        these keys without a pre-write HEAD on the critical path, and without
+        any chance of removing somebody else's data.  Deterministic mirror
+        artifacts (Delta/Iceberg commit files) are written only after
+        ``catalog_commit_succeeded``, when the batch no longer accepts
+        enrollment.
+        """
+
+        with self._lock:
+            if self.pid != os.getpid() or self._state != "open":
+                return
+            key = str(path or "").strip("/")
+            if not key or key in self._seen:
+                return
+            self._seen.add(key)
+            self._paths.append(key)
+
+    def recorded_objects(self) -> List[str]:
+        """Return the enrolled logical paths in creation order (diagnostics)."""
+
+        with self._lock:
+            return list(self._paths)
+
+    # -------------------------
+    # Commit state machine
+    # -------------------------
+    def barrier(self) -> None:
+        """Close enrollment before the catalog transaction may begin.
+
+        Nothing is flushed here.  On an object store the provider's success
+        response for each PUT already acknowledges durable bytes *and* a
+        durable name, so unlike the local filesystem there is no fsync and no
+        directory-entry ordering left to enforce.  The transition still exists
+        because it is the point after which a rejected commit is the only thing
+        that may delete these objects.
+        """
+
+        with self._lock:
+            self._require_owner_locked()
+            if self._state != "open":
+                raise RuntimeError("durability barrier may run exactly once")
+            self._state = "durable"
+
+    def catalog_commit_started(self) -> None:
+        """Mark the point after which a catalog failure can be ambiguous."""
+
+        with self._lock:
+            self._require_owner_locked()
+            if self._state != "durable":
+                raise RuntimeError(
+                    "catalog commit requires a completed durability barrier"
+                )
+            self._state = "commit_started"
+
+    def catalog_commit_succeeded(self) -> None:
+        with self._lock:
+            self._require_owner_locked()
+            if self._state != "commit_started":
+                raise RuntimeError("catalog commit was not started")
+            self._state = "committed"
+
+    def catalog_commit_rejected(self) -> None:
+        """Record a typed, definite CAS/lease rejection (not an ambiguity)."""
+
+        with self._lock:
+            self._require_owner_locked()
+            if self._state != "commit_started":
+                raise RuntimeError("catalog commit was not started")
+            self._state = "commit_rejected"
+
+    def abort(self) -> None:
+        """Delete the objects this mutation created, when that is provably safe.
+
+        The skip set is ``{aborted, committed, commit_started, closed}``.
+        ``commit_started`` is in it because a transport failure after the
+        catalog call began is *ambiguous* — the commit may have landed, so its
+        objects must survive.  ``commit_rejected`` is deliberately *not* in it:
+        a typed rejection (stale base, lost lease, deletion intent, revoked
+        authority) proves the catalog never referenced these objects, so they
+        are unreferenced garbage and are removed.  That asymmetry is the whole
+        point of the state machine.
+        """
+
+        with self._lock:
+            if self.pid != os.getpid():
+                return
+            if self._state in {"aborted", "committed", "commit_started", "closed"}:
+                return
+            first_error: BaseException | None = None
+            failures = 0
+            for path in reversed(self._paths):
+                try:
+                    self.storage._delete_object_for_rollback(path)
+                except FileNotFoundError:
+                    # A retried or provider-idempotent delete is a success.
+                    continue
+                except BaseException as exc:
+                    failures += 1
+                    if first_error is None:
+                        first_error = exc
+                    # Never render the path: object keys carry tenant names.
+                    logger.error(
+                        "durability rollback could not delete an object; "
+                        f"error_type={storage_error_type(exc)}"
+                    )
+            self._state = "aborted"
+            if first_error is not None:
+                logger.error(
+                    "durability rollback left unreferenced objects; "
+                    f"failures={failures}, total={len(self._paths)}"
+                )
+                raise first_error
+
+    def close(self) -> None:
+        with self._lock:
+            if self.pid != os.getpid():
+                # The parent owns both the ledger and the ContextVar token.
+                self._token = None
+                self._state = "closed"
+                return
+            try:
+                if self._token is not None:
+                    _ACTIVE_OBJECT_DURABILITY_BATCH.reset(self._token)
+            except ValueError:
+                # ``close`` ran in a different context than ``__enter__``.  The
+                # token cannot be reset there, so detach by value instead;
+                # leaving a closed batch installed would reject the next batch
+                # as nested.
+                if _ACTIVE_OBJECT_DURABILITY_BATCH.get() is self:
+                    _ACTIVE_OBJECT_DURABILITY_BATCH.set(None)
+            finally:
+                self._token = None
+            if self._state not in {"aborted", "committed", "commit_started"}:
+                self._state = "closed"
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        # Returning ``None`` never suppresses the caller's exception, which is
+        # the same contract as LocalStorage's explicit ``return False``.
+        try:
+            if exc_type is not None:
+                self.abort()
+            elif self._state != "committed":
+                raise RuntimeError(
+                    "durability batch exited without a catalog commit"
+                )
+        finally:
+            self.close()
+
+
 class StorageInterface(abc.ABC):
     """
     Abstract base class for a storage interface that can handle both local and
@@ -240,6 +536,51 @@ class StorageInterface(abc.ABC):
     """
 
     base_prefix: str = ""
+
+    # -------------------------
+    # Write-scoped orphan rollback
+    # -------------------------
+    def durability_batch(self) -> Any:
+        """Create a write-scoped durability/rollback batch for this adapter.
+
+        ``DataWriter`` probes for this factory duck-typed and, when present,
+        drives the full commit state machine: ``barrier()`` before the catalog
+        transaction, ``catalog_commit_started/succeeded/rejected`` around it,
+        and ``abort()`` + ``close()`` on every exit path.  Backends that need
+        real durability work (``LocalStorage``) override this with their own
+        batch type; object stores inherit the generic ledger below.
+
+        A third-party adapter that never calls :meth:`_record_new_object`
+        inherits an empty batch: the state machine runs unchanged and
+        ``abort()`` is a no-op, exactly as before this method existed.
+        """
+
+        return ObjectStoreDurabilityBatch(self)
+
+    def _record_new_object(self, path: str) -> None:
+        """Enroll *path* in the active batch; a cheap no-op when there is none.
+
+        Adapters call this at every object-creating entry point, with the
+        *logical* path (before ``_with_base``), so a rejected mutation can
+        delete precisely what it created.
+        """
+
+        batch = _ACTIVE_OBJECT_DURABILITY_BATCH.get()
+        if batch is not None and batch.accepts(self):
+            batch.record_new_object(path)
+
+    def _delete_object_for_rollback(self, path: str) -> None:
+        """Delete exactly one enrolled logical object, tolerating absence.
+
+        Object-store adapters override this with a single-key provider delete.
+        The compatibility implementation must never widen into a prefix delete,
+        so it goes through ``delete`` and simply absorbs a missing target.
+        """
+
+        try:
+            self.delete(path)
+        except FileNotFoundError:
+            pass
 
     def _with_base(self, path: str) -> str:
         """Translate one public logical path to a provider object key.

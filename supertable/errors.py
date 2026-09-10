@@ -73,7 +73,22 @@ class TableNotFoundError(SupertableLookupError):
         self.simple_name = simple_name
 
 
-class SnapshotCommitConflictError(RuntimeError):
+class RetryableCommitError(RuntimeError):
+    """Base for definite publication rejections that a caller should redo.
+
+    Both subclasses mean the same thing operationally: this mutation was
+    rejected before it changed anything, and the correct response is to redo
+    the whole write against freshly read state -- never to blindly re-publish
+    the same payload, whose immutable artifacts were derived from a base that
+    is no longer current.
+
+    They exist as siblings because the *cause* differs (stale base vs. lost
+    lease), but callers that only caught ``SnapshotCommitConflictError``
+    silently missed lease takeover.  Catch this base to cover both.
+    """
+
+
+class SnapshotCommitConflictError(RetryableCommitError):
     """Raised when a writer tries to publish from a stale base snapshot.
 
     Snapshot data files are immutable, so a rejected writer may leave
@@ -82,7 +97,7 @@ class SnapshotCommitConflictError(RuntimeError):
     """
 
 
-class LockLostError(RuntimeError):
+class LockLostError(RetryableCommitError):
     """Raised when a mutation no longer owns its table fencing lock."""
 
 
@@ -100,6 +115,7 @@ __all__ = [
     "SupertableLookupError",
     "SuperTableNotFoundError",
     "TableNotFoundError",
+    "RetryableCommitError",
     "SnapshotCommitConflictError",
     "LockLostError",
     "TombstoneIntegrityError",

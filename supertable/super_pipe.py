@@ -90,7 +90,6 @@ class SuperPipe:
             self.organization,
             self.super_name,
             self.staging_name,
-            ttl_s=30,
             timeout_s=30,
         )
         if not token:

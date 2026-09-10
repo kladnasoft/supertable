@@ -21,7 +21,7 @@
 |---|----------|-------------|
 | 06 | [Data Writer](06_data_writer.md) | Write pipeline, locking, dedup, tombstones, schema alignment |
 | 07 | [Ingestion & Pipes](07_ingestion.md) | Staging areas, automated ingestion pipes |
-| 08 | [Distributed Locking](08_locking.md) | Redis locks with heartbeat, file locks, deadlock prevention |
+| 08 | [Distributed Locking](08_locking.md) | Redis locks with heartbeat, lease loss, deadlock prevention |
 
 ## Read Path
 

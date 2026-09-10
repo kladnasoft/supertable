@@ -35,7 +35,6 @@ from supertable.monitoring_writer import (
 )
 from supertable.super_table import SuperTable
 from supertable.simple_table import SimpleTable
-from supertable.utils.timer import Timer
 from supertable.utils.profiler import Profiler
 from supertable.processing import (
     find_overlapping_files,
@@ -79,6 +78,7 @@ from supertable.rbac.access_control import (  # noqa: F401
 )
 from supertable.redis_catalog import (
     DeletionIntentConflictError,
+    RbacIntegrityError,
     ReadOnlyCatalogError,
     RedisCatalog,
     persist_unresolved_quality_generation,
@@ -157,8 +157,6 @@ class DataWriter:
             organization=self.super_table.organization,
             storage=self.super_table.storage,
         )
-
-    timer = Timer()
 
     @staticmethod
     def _snapshot_uses_tombstone_v2(snapshot: dict) -> bool:
@@ -772,11 +770,27 @@ class DataWriter:
                         DeletionIntentConflictError,
                         ReadOnlyCatalogError,
                         PermissionError,
+                        # Every negative status returns before the script's
+                        # first mutation, so these code-derived responses are
+                        # equally definite rejections and their orphans are
+                        # equally safe to reclaim.  ValueError/TypeError also
+                        # cover the wrapper's pre-flight validation, which
+                        # never reaches Redis at all.
+                        RbacIntegrityError,
+                        FileNotFoundError,
+                        ValueError,
+                        TypeError,
                     ),
                 ):
                     # These typed responses prove the fenced Lua transaction
                     # rejected the commit. Unlike a transport timeout, cleanup
                     # is therefore safe and should remove its exact orphans.
+                    #
+                    # A bare RuntimeError is deliberately NOT listed: the
+                    # wrapper raises it for an unparseable script result, which
+                    # is genuinely ambiguous because the transaction may have
+                    # applied before the reply was lost.  Those objects must be
+                    # retained, exactly like a transport timeout.
                     durability_batch.catalog_commit_rejected()
                 if mirror_formats:
                     try:
@@ -1019,7 +1033,6 @@ class DataWriter:
             self.super_table.organization,
             self.super_table.super_name,
             simple_name,
-            ttl_s=30,
             timeout_s=60,
         )
         if not token:
@@ -1250,6 +1263,27 @@ class DataWriter:
                 but at least one configured mirror failed. Callers must not
                 blindly retry the mutation; use the exception's snapshot and
                 commit identifiers to reconcile the mirror.
+
+            RetryableCommitError: the publication was definitively rejected
+                before it changed anything, either because the base snapshot
+                advanced (``SnapshotCommitConflictError``) or because this
+                writer no longer owned its table lease
+                (``LockLostError``). Nothing was published. The caller should
+                redo the whole ``write`` against freshly read state -- the
+                immutable artifacts of the rejected attempt were derived from a
+                base that is no longer current, so re-publishing the same
+                payload is not a valid retry. ``write`` deliberately does not
+                retry internally, because only the caller knows whether its
+                input is still the intended mutation. Catch the
+                ``RetryableCommitError`` base to cover both causes.
+
+            PermissionError: authorization changed during the write, the
+                SuperTable is read-only/a replica, or a durable deletion intent
+                fences the target. Not retryable without operator action.
+
+            TimeoutError: the per-table lease could not be acquired within its
+                timeout, i.e. sustained contention on this table. Retryable
+                with backoff.
         """
         qid = str(uuid.uuid4())
         lp = lambda msg: f"[write][qid={qid}][super={self.super_table.super_name}][table={simple_name}] {msg}"
@@ -1431,7 +1465,6 @@ class DataWriter:
                 namespace_token = self.catalog.acquire_namespace_lock(
                     self.super_table.organization,
                     self.super_table.super_name,
-                    ttl_s=30,
                     timeout_s=60,
                 )
                 if not namespace_token:
@@ -1440,9 +1473,12 @@ class DataWriter:
                         f"{self.super_table.organization}/"
                         f"{self.super_table.super_name}"
                     )
+            # TTL comes from DEFAULT_LOCK_DURATION_SEC. The lease is renewed at
+            # half that interval by the locker's heartbeat for as long as this
+            # write runs, so it bounds crash recovery, not write duration.
             token = self.catalog.acquire_simple_lock(
                 self.super_table.organization, self.super_table.super_name, simple_name,
-                ttl_s=30, timeout_s=60
+                timeout_s=60,
             )
             if not token:
                 raise TimeoutError(f"Could not acquire lock for simple '{simple_name}'")
@@ -3168,8 +3204,20 @@ class DataWriter:
                 # Before the catalog ambiguity boundary, remove only paths this
                 # mutation newly created and fsync those removals. After commit
                 # starts, abort() intentionally retains all durable objects.
+                #
+                # Rollback failure must never replace the exception that caused
+                # the rollback.  Raising from this ``finally`` would substitute
+                # an unlink OSError for the SnapshotCommitConflictError the
+                # caller needs to see, so a leftover orphan is logged instead.
                 if durability_batch is not None:
-                    durability_batch.abort()
+                    try:
+                        durability_batch.abort()
+                    except Exception as abort_exc:
+                        logger.error(lp(
+                            "durability rollback failed; unreferenced objects "
+                            "may remain; "
+                            f"error_type={mirror_error_type(abort_exc)}"
+                        ))
             finally:
                 try:
                     if durability_batch is not None:
@@ -3504,7 +3552,6 @@ class DataWriter:
                 self.super_table.organization,
                 self.super_table.super_name,
                 simple_name,
-                ttl_s=30,
                 timeout_s=60,
             )
             if not token:
@@ -4182,21 +4229,32 @@ class DataWriter:
             try:
                 if durability_batch is not None:
                     exc_info = sys.exc_info()
-                    if durability_batch_committed:
-                        durability_batch.__exit__(None, None, None)
-                    elif exc_info[0] is not None:
-                        durability_batch.__exit__(*exc_info)
-                    else:
-                        # A no-op compaction has no catalog transaction. Exit
-                        # through the failure/cancellation arm so any temporary
-                        # immutable publications are rolled back and the
-                        # context-local batch is always detached.
-                        cancelled = RuntimeError(
-                            "compaction completed without catalog publication"
-                        )
-                        durability_batch.__exit__(
-                            RuntimeError, cancelled, None,
-                        )
+                    try:
+                        if durability_batch_committed:
+                            durability_batch.__exit__(None, None, None)
+                        elif exc_info[0] is not None:
+                            durability_batch.__exit__(*exc_info)
+                        else:
+                            # A no-op compaction has no catalog transaction.
+                            # Exit through the failure/cancellation arm so any
+                            # temporary immutable publications are rolled back
+                            # and the context-local batch is always detached.
+                            cancelled = RuntimeError(
+                                "compaction completed without catalog publication"
+                            )
+                            durability_batch.__exit__(
+                                RuntimeError, cancelled, None,
+                            )
+                    except Exception as batch_exc:
+                        # Never let rollback failure replace the exception that
+                        # caused it; see the matching guard in write().
+                        if exc_info[0] is None:
+                            raise
+                        logger.error(lp(
+                            "durability rollback failed; unreferenced objects "
+                            "may remain; "
+                            f"error_type={mirror_error_type(batch_exc)}"
+                        ))
             finally:
                 # Rollback/durability cleanup remains inside the table lock.
                 if token:

@@ -498,8 +498,12 @@ class TestAccessAndLock:
 
         dw.compact("admin", "tbl")
 
+        # No ttl_s: the lease duration must come from
+        # DEFAULT_LOCK_DURATION_SEC, resolved inside the catalog. Passing a
+        # literal here is exactly what made that setting inert before 2.6.0,
+        # so this assertion deliberately pins its ABSENCE.
         dw.catalog.acquire_simple_lock.assert_called_once_with(
-            "acme", "warehouse", "tbl", ttl_s=30, timeout_s=60,
+            "acme", "warehouse", "tbl", timeout_s=60,
         )
         dw.catalog.release_simple_lock.assert_called_once()
 

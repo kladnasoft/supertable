@@ -60,8 +60,11 @@ class RoleManager:
         self._catalog.rbac_init_role_meta(org, sup)
 
         if not self._catalog.rbac_get_superadmin_role_id(org, sup):
-            lock_token = self._catalog.acquire_simple_lock(
-                self.organization, self.super_name, "roles_init", ttl_s=10, timeout_s=30,
+            # Dedicated key space, not the per-table lock namespace: a table
+            # legitimately named "roles_init" used to self-deadlock here, and
+            # the namespace-deletion drain mistook this lease for a table.
+            lock_token = self._catalog.acquire_rbac_init_lock(
+                self.organization, self.super_name, ttl_s=10, timeout_s=30,
             )
             if not lock_token:
                 raise TimeoutError("Could not acquire the role initialization lock")
@@ -84,8 +87,8 @@ class RoleManager:
                     logger.info("Default superadmin role created")
             finally:
                 if lock_token:
-                    self._catalog.release_simple_lock(
-                        self.organization, self.super_name, "roles_init", lock_token,
+                    self._catalog.release_rbac_init_lock(
+                        self.organization, self.super_name, lock_token,
                     )
 
     # ── CRUD ────────────────────────────────────────────────────────── #

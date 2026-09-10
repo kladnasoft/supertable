@@ -136,7 +136,7 @@ class SuperTable:
     def _initialize(self, *, bootstrap_rbac: bool) -> None:
         """Serialize root and optional RBAC bootstrap under one namespace lease."""
         token = self.catalog.acquire_namespace_lock(
-            self.organization, self.super_name, ttl_s=30, timeout_s=60,
+            self.organization, self.super_name, timeout_s=60,
         )
         if not token:
             raise TimeoutError("Could not acquire the namespace creation lock")
@@ -277,7 +277,7 @@ class SuperTable:
 
         base_dir = os.path.join(self.organization, self.super_name)
         namespace_token = self.catalog.acquire_namespace_lock(
-            self.organization, self.super_name, ttl_s=30, timeout_s=60,
+            self.organization, self.super_name, timeout_s=60,
         )
         if not namespace_token:
             raise TimeoutError("Could not acquire the namespace deletion fence")
@@ -346,7 +346,6 @@ class SuperTable:
                     self.organization,
                     self.super_name,
                     name,
-                    ttl_s=30,
                     timeout_s=60,
                 )
                 if not token:
@@ -383,7 +382,6 @@ class SuperTable:
                         self.organization,
                         self.super_name,
                         name,
-                        ttl_s=30,
                         timeout_s=60,
                     )
                     if not token:
@@ -422,7 +420,6 @@ class SuperTable:
                         self.organization,
                         self.super_name,
                         name,
-                        ttl_s=30,
                         timeout_s=60,
                     )
                     if not token:

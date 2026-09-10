@@ -1,49 +1,23 @@
 #!/usr/bin/env python3
-# route: supertable.tests.measure_lock_speed
+# route: supertable.locking.benchmarks.measure_lock_speed
 """
-Multi-threaded contention benchmark for distributed locking.
+Multi-threaded contention benchmark for the Redis distributed lock.
 
-Supports both file-based and Redis-based backends.
-Standalone: works without the full supertable stack (uses stub logger).
+``RedisLocking`` is the only locking backend SuperTable has; there is no
+backend selection to benchmark against.
 
 Usage:
-    python3 measure_lock_speed.py --backend file  [--threads 10] [--hold 1.0]
-    python3 measure_lock_speed.py --backend redis [--threads 10] [--hold 1.0]
+    python3 measure_lock_speed.py [--threads 10] [--hold 1.0]
 """
 
-import os
-import sys
 import gc
 import time
 import random
 import argparse
 import threading
 
-# ---------------------------------------------------------------------------
-# Standalone import — stub supertable.config.defaults.logger if missing
-# ---------------------------------------------------------------------------
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-
-try:
-    from supertable.config.defaults import logger
-except ImportError:
-    import logging
-    logger = logging.getLogger("measure_lock_speed")
-    logger.addHandler(logging.StreamHandler())
-    logger.setLevel(logging.DEBUG)
-    # Patch into module path so file_lock / redis_lock can import
-    import types
-    _st = types.ModuleType("supertable")
-    _cfg = types.ModuleType("supertable.config")
-    _dfl = types.ModuleType("supertable.config.defaults")
-    _dfl.logger = logger
-    sys.modules["supertable"] = _st
-    sys.modules["supertable.config"] = _cfg
-    sys.modules["supertable.config.defaults"] = _dfl
-
-from supertable.locking.file_lock import FileLocking
+from supertable.locking.redis_lock import RedisLocking
+from supertable.redis_connector import create_redis_client
 
 # ---------- Defaults ----------
 NUM_THREADS_DEFAULT = 10
@@ -52,33 +26,15 @@ RES_POOL_SIZE = 50
 LOCK_TTL_DEFAULT = 30
 
 
-def _create_locker(backend: str, workdir: str):
-    """Factory: return the appropriate locker instance."""
-    if backend == "file":
-        return FileLocking(working_dir=workdir)
-    elif backend == "redis":
-        try:
-            from supertable.locking.redis_lock import RedisLocking
-            from supertable.redis_connector import create_redis_client
-            r = create_redis_client()
-            return RedisLocking(r)
-        except ImportError:
-            # Fallback: try bare redis on localhost
-            import redis
-            from supertable.locking.redis_lock import RedisLocking
-            r = redis.Redis(host="localhost", port=6379, db=0)
-            r.ping()
-            return RedisLocking(r)
-    else:
-        raise ValueError(f"Unknown backend: {backend}")
+def _create_locker() -> RedisLocking:
+    """Build a locker on the application's own Redis connection path."""
+    return RedisLocking(create_redis_client())
 
 
 def run_multithreaded_test(
     label: str,
-    backend: str = "file",
     num_threads: int = NUM_THREADS_DEFAULT,
     hold_time: float = HOLD_TIME_DEFAULT,
-    working_dir: str | None = None,
     lock_ttl: int = LOCK_TTL_DEFAULT,
 ):
     """
@@ -88,9 +44,6 @@ def run_multithreaded_test(
     acquire it.  Threads that pick the same key will contend; threads
     that pick different keys proceed concurrently.
     """
-    workdir = working_dir or os.path.join(_HERE, ".locks")
-    os.makedirs(workdir, exist_ok=True)
-
     barrier = threading.Barrier(num_threads)
     results: list[dict] = []
     results_lock = threading.Lock()
@@ -98,7 +51,7 @@ def run_multithreaded_test(
     def worker(idx: int) -> None:
         name = f"{label}-T{idx}"
         key = f"res{random.randint(1, RES_POOL_SIZE)}"
-        locker = _create_locker(backend, workdir)
+        locker = _create_locker()
 
         print(f"  [{name}] targeting {key}")
         barrier.wait()
@@ -149,7 +102,6 @@ def run_multithreaded_test(
     if waits:
         avg = sum(waits) / len(waits)
         print(f"\n{label} SUMMARY:")
-        print(f"  Backend           : {backend}")
         print(f"  Threads attempted : {num_threads}")
         print(f"  Successful locks  : {len(waits)}")
         print(f"  Avg wait          : {avg:.4f}s")
@@ -162,11 +114,7 @@ def run_multithreaded_test(
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Multi-threaded lock contention benchmark."
-    )
-    ap.add_argument(
-        "--backend", choices=["file", "redis"], default="file",
-        help="Locking backend (default: file)",
+        description="Multi-threaded Redis lock contention benchmark."
     )
     ap.add_argument(
         "--threads", type=int, default=NUM_THREADS_DEFAULT,
@@ -175,10 +123,6 @@ def main() -> None:
     ap.add_argument(
         "--hold", type=float, default=HOLD_TIME_DEFAULT,
         help=f"Seconds each thread holds the lock (default: {HOLD_TIME_DEFAULT})",
-    )
-    ap.add_argument(
-        "--workdir", type=str, default=os.path.join(_HERE, ".locks"),
-        help="Working directory for file lock (default: .locks)",
     )
     ap.add_argument(
         "--ttl", type=int, default=LOCK_TTL_DEFAULT,
@@ -193,13 +137,11 @@ def main() -> None:
     if args.seed is not None:
         random.seed(args.seed)
 
-    print(f"==== LOCK CONTENTION BENCHMARK ({args.backend.upper()}) ====\n")
+    print("==== REDIS LOCK CONTENTION BENCHMARK ====\n")
     run_multithreaded_test(
         label="contention",
-        backend=args.backend,
         num_threads=args.threads,
         hold_time=args.hold,
-        working_dir=args.workdir,
         lock_ttl=args.ttl,
     )
 

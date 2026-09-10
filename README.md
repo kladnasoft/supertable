@@ -163,7 +163,7 @@ See [docs/00_index.md](docs/00_index.md) for the full table of contents.
 | 05 | [Redis Catalog](docs/05_redis_catalog.md) | Metadata store, key naming, operations, CAS |
 | 06 | [Data Writer](docs/06_data_writer.md) | Write pipeline, locking, dedup, tombstones |
 | 07 | [Ingestion & Pipes](docs/07_ingestion.md) | Staging areas, automated ingestion pipes |
-| 08 | [Distributed Locking](docs/08_locking.md) | Redis locks, file locks, deadlock prevention |
+| 08 | [Distributed Locking](docs/08_locking.md) | Redis locks, lease loss, deadlock prevention |
 | 09 | [Query Engine](docs/09_query_engine.md) | DuckDB, IslandDB, Spark SQL, auto selection |
 | 10 | [Data Reader](docs/10_data_reader.md) | Read facade, snapshot history, view chain |
 | 11 | [RBAC & Access Control](docs/11_rbac.md) | Roles, users, row/column security |

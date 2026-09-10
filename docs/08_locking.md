@@ -4,12 +4,11 @@
 
 SuperTable is a multi-writer system. Multiple API servers, ingestion workers, and background tasks (GC, compaction, data quality) can attempt to modify the same table concurrently. Without coordination, concurrent writes would corrupt snapshots, produce orphaned Parquet files, or silently lose data.
 
-The locking subsystem provides mutual exclusion at the SimpleTable level: only one writer can modify a given table at a time. Two interchangeable backends are provided:
+The locking subsystem provides mutual exclusion at the SimpleTable level: only one writer can modify a given table at a time.
 
-- **`RedisLocking`** -- distributed locks for production multi-host deployments. Uses Redis `SET NX EX` with Lua-script-based atomic operations and a background heartbeat thread.
-- **`FileLocking`** -- POSIX `fcntl`-based file locks for single-host development environments. Same API surface, no external dependencies beyond the filesystem.
+**`RedisLocking` is the only locking backend.** There is no backend selection, no factory, and no configuration switch: `RedisCatalog.__init__` constructs `RedisLocking(self.r)` directly, and every lock in the system flows through the `RedisCatalog` domain methods. A working Redis is therefore a hard requirement for any write path, not a production-only optimization.
 
-Both backends share the same public interface (`acquire`, `release`, `extend`) and the same token-based ownership model, so the rest of the codebase does not need to know which backend is active.
+> Earlier releases shipped a `FileLocking` class alongside it. It was never wired into `RedisCatalog` and it was never selectable, so it never held a real SuperTable lock. It also coordinated exclusively through POSIX `fcntl` on a local path and never touched `StorageInterface`, which means it could not have worked on object storage: two pods sharing an S3/MinIO bucket have no shared filesystem, so each would have taken an independent, mutually invisible lock while believing it was serialized. It has been deleted.
 
 ---
 
@@ -17,8 +16,7 @@ Both backends share the same public interface (`acquire`, `release`, `extend`) a
 
 | Module | Class | Purpose |
 |---|---|---|
-| `supertable/locking/redis_lock.py` | `RedisLocking` | Production distributed lock using Redis |
-| `supertable/locking/file_lock.py` | `FileLocking` | Development single-host lock using POSIX fcntl |
+| `supertable/locking/redis_lock.py` | `RedisLocking` | The distributed lock — the only backend |
 
 ---
 
@@ -26,11 +24,12 @@ Both backends share the same public interface (`acquire`, `release`, `extend`) a
 
 ### Overview
 
-`RedisLocking` implements a distributed mutual exclusion lock using Redis as the coordination backend. It relies on three Redis primitives:
+`RedisLocking` implements a distributed mutual exclusion lock using Redis as the coordination backend. It relies on four Redis primitives:
 
 1. **`SET key token NX EX ttl`** -- atomic acquire (set-if-not-exists with expiry).
 2. **Lua compare-and-delete** -- atomic release (only the holder can delete).
 3. **Lua compare-and-extend** -- atomic TTL extension (only the holder can extend).
+4. **Lua batched compare-and-extend** -- one round trip that renews every held lease.
 
 A background heartbeat thread automatically renews held locks at half their TTL, so long-running operations never lose their lock due to expiry. The TTL controls crash recovery time, not operation timeout: if the lock holder dies, the heartbeat thread dies with it, and Redis expires the key within one TTL cycle.
 
@@ -45,11 +44,12 @@ Receives an already-configured `redis.Redis` client -- it never creates its own 
 
 On initialization:
 
-- Registers the two Lua scripts with the Redis server via `r.register_script()`.
-- Initializes `_held: Dict[str, Tuple[str, int]]` -- a dict mapping lock keys to `(token, ttl_ms)` for all locks held by this instance.
-- Creates a `threading.Lock` (`_held_lock`) to protect concurrent access to the `_held` dict.
-- Sets up heartbeat state (`_hb_stop` event, `_hb_thread`).
-- Registers `_on_exit()` via `atexit` for best-effort cleanup on interpreter shutdown.
+- Registers the three Lua scripts with the Redis server via `r.register_script()`.
+- Initializes `_held: Dict[str, Tuple[str, int]]` -- a dict mapping lock keys to `(token, ttl_ms)` for all locks held by this instance, guarded by `_held_lock`.
+- Initializes `_lease_op_locks` -- a reference-counted `threading.Lock` per `(key, token)` pair, guarded by `_lease_op_locks_guard`. TTL mutation is serialized **per lease**, not process-wide, so a stalled Redis call for one lease cannot block renewal of an unrelated short-lived lease. Entries are dropped when their last reference goes, so heavy key churn leaves no registry behind.
+- Initializes `_lost_leases` -- a bounded `OrderedDict` (`_LOST_LEASE_MEMORY = 256`) of leases the heartbeat proved lost, guarded by `_held_lock`.
+- Sets up heartbeat state (`_hb_stop` event, `_hb_thread`) and records `_owner_pid`.
+- Adds itself to the module-level `_LIVE_LOCKERS` registry (see [Process-Wide Registry](#process-wide-registry)).
 
 ### Lua Scripts
 
@@ -82,7 +82,27 @@ end
 return 0
 ```
 
-Atomically extends the TTL of a lock only if the caller still owns it. Used by the heartbeat thread to keep locks alive during long operations.
+Atomically extends the TTL of a lock only if the caller still owns it. Used by explicit `extend()` calls.
+
+#### Extend-many (batched compare-and-extend)
+
+```lua
+local results = {}
+for i = 1, #KEYS do
+  local token = ARGV[(i - 1) * 2 + 1]
+  local ttl_ms = tonumber(ARGV[(i - 1) * 2 + 2])
+  local cur = redis.pcall('GET', KEYS[i])
+  if type(cur) ~= 'table' and cur and cur == token then
+    redis.call('PEXPIRE', KEYS[i], ttl_ms)
+    results[i] = 1
+  else
+    results[i] = 0
+  end
+end
+return results
+```
+
+The heartbeat renews every held lease in a single invocation, so one slow or lost key does not become a separate network round trip ahead of every sibling lease. The token check and `PEXPIRE` remain atomic per key. `redis.pcall` is deliberate: a corrupt or non-string value is loss of *that* lease, not permission to abort renewal of the healthy siblings behind it in the batch.
 
 ### acquire()
 
@@ -103,19 +123,36 @@ def acquire(
 | `key` | (required) | The Redis key to lock |
 | `ttl_s` | 30 | Lock TTL in seconds (controls crash recovery time) |
 | `timeout_s` | 30 | Maximum time to wait for acquisition |
-| `retry_interval` | 0.05 | Sleep between retry attempts (50ms) |
+| `retry_interval` | 0.05 | Base sleep between retry attempts (50ms) |
 
 **Algorithm**:
 
 1. Generate a unique token via `uuid.uuid4().hex`.
-2. Compute `ttl_ms = max(1000, ttl_s * 1000)`.
-3. Loop until `timeout_s` elapses:
+2. Compute `ttl_ms = max(1000, ttl_s * 1000)` and `deadline = now + max(1, timeout_s)`.
+3. Loop until the deadline elapses:
    a. Attempt `SET key token NX EX ttl_s`.
-   b. On success: register the lock in `_held`, start the heartbeat thread (if not already running), return the token.
-   c. On failure or `RedisError`: sleep for `retry_interval` and retry.
+   b. On success: register the lock in `_held`, start or refresh the heartbeat generation, return the token.
+   c. On failure or `RedisError`: sleep `_retry_delay(...)` and retry.
 4. On timeout: return `None`.
 
 **Return value**: A unique token string on success, or `None` if the lock could not be acquired within the timeout.
+
+**Heartbeat generation on acquire.** If no heartbeat thread is alive, one is started. If one is already running, it is restarted when the new lease is *shorter* than the shortest currently held lease, or when this key was already tracked under a prior token — otherwise the running generation could still be sleeping for half of a much longer lease, or blocked renewing an expired prior token for this same key, and the new short lease would expire unrenewed. Per-`(key, token)` operation locks let the new generation bypass the obsolete one safely.
+
+**Unreturned-lease safety.** If registration raises before the token reaches the caller (realistically `Thread.start` raising `RuntimeError` under thread exhaustion), the lease is live in Redis but nothing could ever release it — and the heartbeat would renew it forever, so the TTL could never reclaim it either. `_abandon_unreturned_lease()` compare-deletes it before the exception propagates.
+
+### Retry pacing and jitter
+
+```python
+@staticmethod
+def _retry_delay(attempt: int, retry_interval: float, deadline: float) -> float
+```
+
+The first `_ACQUIRE_FAST_RETRIES` (4) attempts sleep exactly `retry_interval`, so the uncontended path — four times the 50ms default covers a short critical section — never pays for jitter. After that, the delay becomes `random.uniform(retry_interval * 0.5, retry_interval * 1.5)`. The delay is then clamped so a waiter never sleeps past its own deadline.
+
+This is **mean-preserving jitter, not backoff**. A fixed poll interval makes every waiter on a contended key wake in lockstep and race the same `SET NX`; spreading wake-ups over `[0.5x, 1.5x]` decorrelates that herd while leaving the mean poll rate identical, so the lock is never left idle longer than before. Exponential backoff was measured and rejected: this lock's bottleneck is the lock itself, not Redis, so backing off leaves the lock idle. With 16 waiters on 200ms sections at `timeout_s=5`, capped-exponential raised timeouts from 10 to 12 and p95 wait from 1931ms to 2665ms, while mean-preserving jitter measured 8-9 timeouts against a baseline of 10.
+
+Jitter does **not** solve starvation and is not claimed to. `SET NX` contention has no queue, so a waiter's expected wait still scales with the number of contenders; the ceiling remains roughly `timeout_s / hold_time` concurrent writers per key. Bounding that properly needs a fair (FIFO) lock, which is a different design.
 
 ### release()
 
@@ -125,7 +162,7 @@ def release(self, key: str, token: str) -> bool
 
 Releases the lock by executing the Lua compare-and-delete script. Regardless of whether the Lua script returns success (the lock may have already expired), the key is removed from the `_held` tracking dict. If no locks remain held, the heartbeat thread is stopped.
 
-The heartbeat stop decision is made inside `_held_lock`, but `_stop_heartbeat()` is called outside to avoid deadlock (the heartbeat thread also acquires `_held_lock`).
+The heartbeat stop decision is made inside `_held_lock`, but `_stop_heartbeat()` is called outside to avoid deadlock (the heartbeat thread also acquires `_held_lock`). It is called with `restart_if_held=True`, because another `acquire()` can race between the empty-`_held` decision and the actual stop — without the restart, a newly acquired long-running mutation would silently lose lease renewal.
 
 ### extend()
 
@@ -133,29 +170,45 @@ The heartbeat stop decision is made inside `_held_lock`, but `_stop_heartbeat()`
 def extend(self, key: str, token: str, ttl_ms: int) -> bool
 ```
 
-Extends the lock TTL by executing the Lua compare-and-extend script. Returns `True` if the extension succeeded, `False` if the lock was lost.
+Extends the lock TTL by executing the Lua compare-and-extend script. Returns `True` if the extension succeeded, `False` if the lock was definitively lost.
+
+- `ttl_ms` must be an exact positive `int`. `bool` and `float` are rejected with `ValueError` (the check is `type(ttl_ms) is not int`, so `True` does not slip through as `1`), and the live lease is not mutated.
+- The call is serialized under the `(key, token)` operation lock.
+- A Lua `0` is definitive: the key is absent or another token owns it, so `False` is returned. A **transport exception is ambiguous** — Redis may even have applied the `PEXPIRE` before the reply was lost — so it propagates instead of being flattened to `False`. The heartbeat retains tracking and retries; treating ambiguity as loss would abandon a valid long-running compaction lease after one timeout.
+- If the extension shortens the lease below the previous minimum, the heartbeat generation is restarted before returning, since `PEXPIRE` has already taken effect while an older generation may still be in a long sleep.
+
+### lease_lost()
+
+```python
+def lease_lost(self, key: str, token: str) -> bool
+```
+
+Returns whether the heartbeat **proved** this exact lease was lost. A lost lease is not cosmetic: the holder is still doing storage I/O it can no longer publish (the commit fences on this exact token), and another writer may already be mutating the same table. `lease_lost()` lets a long operation ask before paying for work its commit cannot publish.
+
+`False` is **not** a liveness guarantee — it only means no loss has been *observed* yet. This is a cheap early-abort hint, never a substitute for the token fence enforced inside the publication script. The backing `_lost_leases` record is bounded to the most recent 256 entries so a long-lived process with heavy key churn cannot accumulate them; a caller that cares checks within its own operation, long before eviction could matter.
 
 ### Heartbeat Thread
 
-The heartbeat is a daemon thread (`_hb_loop`) that automatically extends all held locks at half their TTL interval.
+The heartbeat is a daemon thread (`_hb_loop`) that renews all held locks at half the shortest held TTL. It is **generation-based**: each start captures its own `threading.Event`, so stopping one generation can never signal or clobber a newer one.
 
-```python
-def _hb_loop(self) -> None:
-    while not self._hb_stop.is_set():
-        # Compute sleep = half of shortest TTL across held locks
-        min_ttl_ms = min(ttl_ms for _, ttl_ms in self._held.values())
-        interval_s = max(1.0, (min_ttl_ms / 1000.0) / 2.0)
+Each cycle:
 
-        self._hb_stop.wait(timeout=interval_s)
-        # ... extend all held locks ...
-```
+1. Compute `interval_s = max(0.05, (min_ttl_ms / 1000) / 2)` across held locks (or a shorter retry delay left over from the previous cycle) and `Event.wait()` on it.
+2. Snapshot `_held` under `_held_lock`.
+3. For each key, take the `(key, token)` operation lock **non-blocking**. A key whose lock is busy (an explicit `extend()` or another generation owns that lease's mutation boundary) is skipped and retried sooner rather than holding up the batch.
+4. Skip keys whose `_held` entry is no longer current.
+5. Renew everything remaining in **one** `EXTEND_MANY` invocation; an incomplete or non-list reply is treated as an error.
+6. For every `0` result: log a warning, drop the key from `_held`, and record `(key, token)` in `_lost_leases`.
 
 **Key behaviors**:
 
-- **Adaptive interval**: Sleeps for half the shortest TTL across all currently held locks. This ensures every lock is renewed before it expires.
-- **Interruptible**: Uses `Event.wait()` instead of `time.sleep()` so `_stop_heartbeat()` can wake it immediately.
-- **Lost lock detection**: If `extend()` returns `False` for a lock (expired or stolen), the lock is removed from `_held` tracking and a debug message is logged.
-- **Thread-safe**: The `_held` dict is always accessed under `_held_lock`. A snapshot is taken under the lock, then extensions are performed outside the lock.
+- **Adaptive interval**: half the shortest TTL across all currently held locks, so every lock is renewed before it expires.
+- **Interruptible**: `Event.wait()` rather than `time.sleep()`, so `_stop_heartbeat()` wakes it immediately.
+- **Batched**: one Lua round trip per cycle regardless of how many leases are held.
+- **Fail-soft on transport errors**: a batch exception logs a redacted error type and retries at roughly a tenth of the shortest TTL (clamped to `[0.1s, 1.0s]`) without abandoning tracking.
+- **Self-healing exit**: a natural loop exit has a narrow teardown window where a concurrent `acquire()` could observe this generation as still alive and skip starting a replacement. The `finally` block publishes termination under `_held_lock` and, if the stop was not intentional, hands any newly-held locks to a fresh generation.
+
+`_stop_heartbeat(restart_if_held=...)` publishes the replacement generation **before** joining the old one. The old thread may be stuck in a Redis call, and making a newly acquired short lease wait for `join(timeout=2.0)` could consume its entire TTL before renewal even begins. When no replacement is needed, it joins with a 2-second timeout.
 
 ### Crash Recovery
 
@@ -169,163 +222,50 @@ The TTL on the Redis key is the crash recovery mechanism:
 
 No manual intervention or separate crash-detection process is needed.
 
+### Process-Wide Registry
+
+Shutdown and fork cleanup are driven by **one** module-level `atexit` handler and **one** module-level `os.register_at_fork(after_in_child=...)` handler, both registered at import time. Live instances join a `weakref.WeakSet`:
+
+```python
+_LIVE_LOCKERS: "weakref.WeakSet[RedisLocking]" = weakref.WeakSet()
+
+_register_at_fork = getattr(os, "register_at_fork", None)
+if callable(_register_at_fork):
+    _register_at_fork(after_in_child=_reset_live_lockers_after_fork_in_child)
+atexit.register(_release_live_lockers_at_exit)
+```
+
+This replaces per-instance registration, which leaked. Registering `self._on_exit` / `self._reset_after_fork_in_child` per instance stores a *strong* bound method — and therefore `self`, and its Redis client — in a registry that can never be unregistered. One `RedisLocking` is built per catalog and a catalog is built per write, so per-instance registration pinned every locker ever created for the life of the process. The weak registry preserves the exact same semantics while retaining nothing.
+
+Both dispatchers swallow per-locker exceptions on purpose, to preserve the isolation the underlying mechanisms already provide: CPython runs the remaining at-fork handlers after one raises, and `atexit` isolates each registered callback. One damaged locker must not leave its siblings holding a parent lease, a dead thread primitive, or a stranded lease.
+
 ### Cleanup on Exit
 
 ```python
 def _on_exit(self) -> None:
+    if os.getpid() != self._owner_pid:
+        return
     # Best-effort release of all held locks on interpreter shutdown
     for key, (token, _) in snapshot.items():
         self.release(key, token)
     self._stop_heartbeat()
 ```
 
-Registered via `atexit.register()`. Attempts to release all held locks during normal interpreter shutdown. Failures are silently ignored.
+Attempts to release all held locks during normal interpreter shutdown. Failures are silently ignored.
 
----
+The PID guard is load-bearing: fork children inherit `atexit` handlers, and the parent's token is still live in Redis. Without the guard, a forked child exiting would compare-delete a lock its parent is actively holding.
 
-## File Locks (Development)
-
-### Overview
-
-`FileLocking` provides the same locking semantics using POSIX `fcntl` advisory locks on a shared JSON file. It is designed for single-host development environments where Redis is not available.
-
-### Lock File Structure
-
-The lock state is stored in a JSON file (default: `.lock.json`) as a list of lock records:
-
-```json
-[
-  {"res": "my:lock:key", "exp": 1713192030, "tok": "a1b2c3d4..."},
-  {"res": "other:key", "exp": 1713192045, "tok": "e5f6g7h8..."}
-]
-```
-
-Each record contains:
-
-| Field | Type | Description |
-|---|---|---|
-| `res` | string | The resource key being locked |
-| `exp` | int | Unix timestamp when the lock expires |
-| `tok` | string | UUID token identifying the lock holder |
-
-### Constructor
+### Cleanup After Fork
 
 ```python
-class FileLocking:
-    def __init__(
-        self,
-        working_dir: str,
-        lock_file_name: str = ".lock.json",
-        retry_interval: float = 0.1,
-    )
+def _reset_after_fork_in_child(self) -> None
 ```
 
-Creates the working directory if it does not exist. Registers `_on_exit()` via `atexit` for cleanup.
+Runs in the child after `fork()`. It re-reads `_owner_pid` and discards every piece of inherited state that the child has no right to and no working machinery for: `_held` (leases that belong to the parent), `_lost_leases`, and the thread primitives (`_held_lock`, `_lease_op_locks`, `_lease_op_locks_guard`, `_hb_stop`, `_hb_thread`) — a mutex inherited mid-hold from a thread that does not exist in the child can never be released.
 
-### Atomic Read-Write
+### Diagnostics
 
-The core primitive is `_atomic_read_write(callback)`:
-
-```python
-def _atomic_read_write(self, callback):
-    with open(self.lock_path, "a+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)      # exclusive lock
-        f.seek(0)
-        records = json.loads(f.read() or "[]")
-        new_records = callback(records)
-        f.seek(0)
-        f.truncate(0)
-        f.write(json.dumps(new_records))
-        f.flush()
-        os.fsync(f.fileno())
-        fcntl.flock(f, fcntl.LOCK_UN)      # release
-```
-
-Uses `a+` mode to atomically create the file if missing (no TOCTOU race between existence check and open). The `LOCK_EX` ensures only one process can modify the file at a time. `os.fsync()` ensures data is durable before the lock is released.
-
-### acquire()
-
-```python
-def acquire(
-    self,
-    key: str,
-    ttl_s: int = 30,
-    timeout_s: int = 30,
-    retry_interval: float | None = None,
-) -> Optional[str]
-```
-
-Same semantics as `RedisLocking.acquire()`:
-
-1. Generate a UUID token.
-2. Loop until timeout:
-   a. Open the lock file under `LOCK_EX`.
-   b. Purge expired records.
-   c. Check if `key` is already held by a different token. If so, retry.
-   d. If the key is free, append a new record with expiry `now + ttl_s`.
-   e. Return the token.
-3. On timeout: return `None`.
-
-Starts the heartbeat thread on successful acquisition.
-
-### release()
-
-```python
-def release(self, key: str, token: str) -> bool
-```
-
-Opens the lock file under `LOCK_EX` and removes the record matching both `key` and `token`. Returns `True` if a record was removed. Stops the heartbeat if no locks remain held.
-
-### extend()
-
-```python
-def extend(self, key: str, token: str, ttl_ms: int) -> bool
-```
-
-Opens the lock file under `LOCK_EX` and updates the `exp` field of the matching record to `now + ttl_ms / 1000`. Returns `True` if the record was found and updated.
-
-### who()
-
-```python
-def who(self, key: str) -> Optional[str]
-```
-
-Returns the token currently holding the specified key, or `None` if the key is not locked. Only checks non-expired records. This method is not present on `RedisLocking` and is specific to the file-lock backend for debugging purposes.
-
-### Heartbeat
-
-The file-lock heartbeat works similarly to the Redis version but uses a single fixed TTL for all held locks:
-
-```python
-def _hb_loop(self) -> None:
-    while not self._hb_stop.is_set():
-        interval = max(1, self._hb_ttl_s // 2)
-        self._hb_stop.wait(timeout=interval)
-        # Refresh all held locks via _atomic_read_write
-```
-
-The refresh callback updates the `exp` field of all records whose token appears in `self._held` and then purges expired records.
-
----
-
-## Backend Comparison
-
-| Feature | `RedisLocking` | `FileLocking` |
-|---|---|---|
-| **Deployment** | Multi-host (production) | Single-host (development) |
-| **Coordination** | Redis server | POSIX fcntl on shared file |
-| **Acquire** | `SET NX EX` with retry | `fcntl.LOCK_EX` + JSON read/write |
-| **Release** | Lua compare-and-delete (atomic) | `fcntl.LOCK_EX` + JSON read/write |
-| **Extend** | Lua compare-and-extend (atomic) | `fcntl.LOCK_EX` + JSON read/write |
-| **Heartbeat** | Half of shortest held TTL | Half of TTL (fixed per instance) |
-| **Crash recovery** | Redis key expires after TTL | Lock record expires after TTL |
-| **Atomicity** | Server-side Lua scripts | Kernel-level file lock |
-| **Dependencies** | `redis` Python package | POSIX `fcntl` (Linux/macOS) |
-| **Throughput** | High (network + Redis) | Moderate (disk I/O + fsync) |
-| **`who()` method** | Not available | Available for debugging |
-| **Token storage** | Redis key value | JSON record in file |
-| **Expiry purge** | Automatic (Redis TTL) | On next acquire/extend |
-| **Cleanup on exit** | `atexit` best-effort release | `atexit` best-effort release |
+Every logged failure passes through `_safe_error_type()` (`supertable.utils.diagnostic_redaction.safe_exception_type`), which yields bounded exception taxonomy and never renders backend text. Redis error strings can carry connection URIs, key material, and command payloads; lock diagnostics never reproduce them.
 
 ---
 
@@ -335,19 +275,23 @@ The locking subsystem uses several strategies to prevent deadlocks:
 
 1. **Fixed hierarchy**: ordinary writes acquire the per-SimpleTable lock. Structural create/delete operations acquire the namespace lock before a child table lock; whole-namespace deletion drains child locks in sorted order. Callers must preserve that order.
 
-2. **Timeout-based acquisition**: Both backends use a bounded timeout (`timeout_s`, default 30 seconds). If a lock cannot be acquired within the timeout, `None` is returned (or `TimeoutError` is raised by the caller). This prevents indefinite blocking.
+2. **Timeout-based acquisition**: acquisition is bounded by `timeout_s` (default 30 seconds). If a lock cannot be acquired within the timeout, `None` is returned (or `TimeoutError` is raised by the caller). This prevents indefinite blocking.
 
-3. **TTL-based expiry**: Every lock has a finite TTL. Even if a holder crashes without releasing, the lock expires automatically. Redis handles this natively; the file backend purges expired records on the next operation.
+3. **TTL-based expiry**: every lock has a finite TTL. Even if a holder crashes without releasing, Redis expires the key automatically.
 
-4. **Token-based ownership**: Releases and extensions are conditioned on the caller's token matching the current holder. This prevents a slow process from accidentally releasing a lock that was already expired and re-acquired by another process.
+4. **Token-based ownership**: releases and extensions are conditioned on the caller's token matching the current holder. This prevents a slow process from accidentally releasing a lock that was already expired and re-acquired by another process.
 
-5. **Heartbeat separation**: The heartbeat thread takes a snapshot of held locks under `_held_lock` and then performs extensions outside the lock. This prevents the heartbeat from blocking on `_held_lock` for extended periods.
+5. **Heartbeat separation**: the heartbeat thread takes a snapshot of held locks under `_held_lock` and then performs extensions outside the lock. This prevents the heartbeat from blocking on `_held_lock` for extended periods.
 
-6. **Lock release outside held_lock**: In `RedisLocking.release()`, the decision to stop the heartbeat is made inside `_held_lock`, but `_stop_heartbeat()` is called outside the lock to avoid deadlock with the heartbeat thread (which also acquires `_held_lock`).
+6. **Per-lease operation locks**: TTL mutation is serialized per `(key, token)` rather than process-wide, and the heartbeat only ever takes those locks non-blocking. A stalled Redis call for one lease cannot stall renewal of the rest.
+
+7. **Lock release outside `_held_lock`**: in `release()`, the decision to stop the heartbeat is made inside `_held_lock`, but `_stop_heartbeat()` is called outside the lock to avoid deadlock with the heartbeat thread (which also acquires `_held_lock`).
 
 ---
 
 ## Configuration
+
+There is **no** locking backend setting. `RedisLocking` is selected unconditionally by `RedisCatalog`, and it is configured entirely by the Redis connection settings documented in [02 Configuration](02_configuration.md) (`SUPERTABLE_REDIS_*`).
 
 ### Default Constants
 
@@ -384,25 +328,18 @@ token = self.catalog.acquire_stage_lock(
 |---|---|---|
 | `ttl_s` | 30 | Lock TTL in seconds |
 | `timeout_s` | 30 | Maximum wait time for acquisition |
-| `retry_interval` | 0.05 | Sleep between retries (50ms) |
+| `retry_interval` | 0.05 | Base sleep between retries (50ms) |
 
-### FileLocking Defaults
+### Internal Tuning Constants
 
-| Parameter | Default | Description |
+| Constant | Value | Description |
 |---|---|---|
-| `lock_file_name` | `.lock.json` | Name of the lock state file |
-| `retry_interval` | 0.1 | Sleep between retries (100ms) |
-| `ttl_s` | 30 | Default lock TTL |
-| `timeout_s` | 30 | Default maximum wait time |
+| `_ACQUIRE_FAST_RETRIES` | 4 | Attempts that use the exact `retry_interval` before jitter starts |
+| `_LOST_LEASE_MEMORY` | 256 | Most recent proven-lost leases remembered for `lease_lost()` |
 
 ### Heartbeat Timing
 
-| Backend | Heartbeat Interval |
-|---|---|
-| `RedisLocking` | `max(1.0, (min_ttl_ms / 1000) / 2)` seconds -- adapts to the shortest held lock |
-| `FileLocking` | `max(1, ttl_s // 2)` seconds -- fixed per instance |
-
-With the default 30-second TTL, the heartbeat fires every 15 seconds, giving two renewal opportunities before expiry.
+The heartbeat sleeps `max(0.05, (min_ttl_ms / 1000) / 2)` seconds, adapting to the shortest held lock. With the default 30-second TTL it fires every 15 seconds, giving two renewal opportunities before expiry. A transport failure shortens the next interval to roughly a tenth of the shortest held TTL, clamped to `[0.1s, 1.0s]`.
 
 ---
 
@@ -419,7 +356,9 @@ token = locker.acquire("my:lock:key", ttl_s=30, timeout_s=10)
 if token:
     try:
         # ... critical section ...
-        pass
+        # Optional early abort for long operations:
+        if locker.lease_lost("my:lock:key", token):
+            raise RuntimeError("lease lost; this commit would be fenced out")
     finally:
         locker.release("my:lock:key", token)
 ```

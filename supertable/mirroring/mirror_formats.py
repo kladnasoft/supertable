@@ -346,7 +346,7 @@ class MirrorFormats:
         # copy a large immutable snapshot, so it must not rely on the initial
         # 30-second lease alone.
         token = catalog.acquire_simple_lock(
-            org, sup, table_name, ttl_s=30, timeout_s=lock_timeout_s,
+            org, sup, table_name, timeout_s=lock_timeout_s,
         )
         if not token:
             raise TimeoutError(

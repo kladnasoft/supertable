@@ -309,6 +309,9 @@ class AzureBlobStorage(StorageInterface):
             raise ValueError("Invalid JSON") from None
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
+        # Enroll before the upload: a request that times out ambiguously may
+        # still have created the blob, and only an enrolled key rolls back.
+        self._record_new_object(path)
         path = self._with_base(path)
         payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         blob = self.container.get_blob_client(path)
@@ -471,6 +474,17 @@ class AzureBlobStorage(StorageInterface):
             raise FileNotFoundError("File or folder not found")
         self.delete_prefix(logical)
 
+    def _delete_object_for_rollback(self, path: str) -> None:
+        """Delete exactly one enrolled blob; never widen into a prefix delete.
+
+        ``delete`` falls back to recursive prefix deletion when the exact blob
+        is absent, which rollback must never do.
+        """
+        try:
+            self.container.delete_blob(self._with_base(path))
+        except ResourceNotFoundError:
+            return
+
     def delete_prefix(self, path: str) -> None:
         """Delete and verify an Azure blob prefix with bounded retries."""
         import itertools
@@ -538,6 +552,7 @@ class AzureBlobStorage(StorageInterface):
     # Parquet
     # -------------------------
     def write_parquet(self, table: pa.Table, path: str) -> None:
+        self._record_new_object(path)
         path = self._with_base(path)
         buf = io.BytesIO()
         pq.write_table(table, buf)
@@ -572,6 +587,7 @@ class AzureBlobStorage(StorageInterface):
     # Bytes / Text / Copy
     # -------------------------
     def write_bytes(self, path: str, data: bytes) -> None:
+        self._record_new_object(path)
         path = self._with_base(path)
         blob = self.container.get_blob_client(path)
         blob.upload_blob(
@@ -581,6 +597,7 @@ class AzureBlobStorage(StorageInterface):
         )
 
     def create_bytes_if_absent(self, path: str, data: bytes) -> bool:
+        logical = path
         path = self._with_base(path)
         blob = self.container.get_blob_client(path)
         try:
@@ -593,6 +610,10 @@ class AzureBlobStorage(StorageInterface):
             )
         except ResourceExistsError:
             return False
+        # Enroll only a proven create.  A ResourceExistsError means the blob
+        # belongs to whoever won the race, and an ambiguous failure may equally
+        # be a lost conflict response, so neither is ever enrolled.
+        self._record_new_object(logical)
         return True
 
     def read_bytes(self, path: str) -> bytes:
@@ -612,4 +633,6 @@ class AzureBlobStorage(StorageInterface):
     def copy(self, src_path: str, dst_path: str) -> None:
         """Copy blob via download→upload (synchronous, works with private containers)."""
         data = self.read_bytes(src_path)
+        # write_bytes receives the logical destination and enrolls it in the
+        # active durability batch; do not enroll it twice here.
         self.write_bytes(dst_path, data)

@@ -11,13 +11,18 @@ exercising the genuine acquire / release / extend / heartbeat code paths.
 
 from __future__ import annotations
 
+import atexit
+import gc
+import os
 import threading
 import time
+import weakref
 from typing import Any, Dict, Optional, Tuple
 
 import pytest
 import redis
 
+from supertable.locking import redis_lock
 from supertable.locking.redis_lock import RedisLocking
 
 
@@ -174,6 +179,105 @@ class TestInit:
     def test_initial_state_no_holds(self, locker):
         assert locker._held == {}
         assert locker._hb_thread is None
+
+
+# ---------------------------------------------------------------------------
+# Process-lifetime retention
+# ---------------------------------------------------------------------------
+
+class TestInstanceRetention:
+    """A locker is built per catalog, and a catalog is built per write.
+
+    Nothing process-global may therefore hold a strong reference to one:
+    ``atexit`` / ``os.register_at_fork`` registrations can never be undone,
+    so a per-instance registration is an unbounded process-lifetime leak.
+    """
+
+    def test_discarded_instances_are_garbage_collectable(self):
+        lockers = [RedisLocking(FakeRedis()) for _ in range(50)]
+        alive = [weakref.ref(locker) for locker in lockers]
+
+        del lockers
+        gc.collect()
+
+        assert [ref() for ref in alive] == [None] * 50
+
+    def test_construction_does_not_grow_the_atexit_registry(self):
+        # Import-time registration only: the count must be flat no matter how
+        # many lockers a long-running writer process constructs.
+        RedisLocking(FakeRedis())
+        gc.collect()
+        before = atexit._ncallbacks()
+
+        lockers = [RedisLocking(FakeRedis()) for _ in range(50)]
+        assert atexit._ncallbacks() == before
+
+        del lockers
+        gc.collect()
+        assert atexit._ncallbacks() == before
+
+    @staticmethod
+    def _isolate_registry(monkeypatch, *lockers):
+        """Publish-then-isolate: prove real registration, then scope the sweep.
+
+        ``__init__`` must join the genuine process-wide registry, but driving
+        a module handler over it would tear down leases belonging to any other
+        locker alive in the same pytest process.
+        """
+        for locker in lockers:
+            assert locker in redis_lock._LIVE_LOCKERS
+        monkeypatch.setattr(
+            redis_lock, "_LIVE_LOCKERS", weakref.WeakSet(lockers),
+        )
+
+    def test_module_exit_handler_releases_every_live_locker(
+        self, fake_redis, monkeypatch,
+    ):
+        first = RedisLocking(fake_redis)
+        second = RedisLocking(fake_redis)
+        try:
+            assert first.acquire("first", ttl_s=5, timeout_s=2) is not None
+            assert second.acquire("second", ttl_s=5, timeout_s=2) is not None
+            self._isolate_registry(monkeypatch, first, second)
+
+            redis_lock._release_live_lockers_at_exit()
+
+            # One shared handler must cover every instance, not just the last.
+            assert fake_redis.get("first") is None
+            assert fake_redis.get("second") is None
+        finally:
+            first._on_exit()
+            second._on_exit()
+
+    def test_module_fork_handler_resets_every_live_locker(
+        self, fake_redis, monkeypatch,
+    ):
+        first = RedisLocking(fake_redis)
+        second = RedisLocking(fake_redis)
+        orphaned_stops: list[threading.Event] = []
+        try:
+            assert first.acquire("first", ttl_s=5, timeout_s=2) is not None
+            assert second.acquire("second", ttl_s=5, timeout_s=2) is not None
+            assert first._hb_thread is not None
+            assert second._hb_thread is not None
+            orphaned_stops = [first._hb_stop, second._hb_stop]
+            self._isolate_registry(monkeypatch, first, second)
+
+            redis_lock._reset_live_lockers_after_fork_in_child()
+
+            for locker in (first, second):
+                assert locker._held == {}
+                assert locker._hb_thread is None
+                assert locker._lease_op_locks == {}
+                assert locker._owner_pid == os.getpid()
+                assert not locker._hb_stop.is_set()
+        finally:
+            # A genuine fork leaves no parent thread behind.  This in-process
+            # stand-in must retire the generations the reset orphaned.
+            for stop_event in orphaned_stops:
+                stop_event.set()
+            first._on_exit()
+            second._on_exit()
 
 
 # ---------------------------------------------------------------------------

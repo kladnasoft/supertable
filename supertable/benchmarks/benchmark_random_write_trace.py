@@ -633,7 +633,6 @@ def _configure_hermetic_environment(home: Path, package_root: Path | None) -> No
         "SUPERTABLE_MONITORING_ENABLED": "false",
         "SUPERTABLE_LOG_LEVEL": "WARNING",
         "SUPERTABLE_MAX_LIMIT": "10000000",
-        "LOCKING_BACKEND": "redis",
     }
     os.environ.update(environment)
     # Releases before 2.4.1 root LocalStorage at the process CWD.  Newer

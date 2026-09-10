@@ -6,7 +6,7 @@ import os
 
 from supertable.config.settings import settings
 import re
-from typing import Any, BinaryIO, Dict, List, Optional
+from typing import Any, BinaryIO, Callable, Dict, List, Optional
 from urllib.parse import quote, urlparse
 
 import boto3
@@ -25,6 +25,32 @@ from supertable.storage.storage_interface import (
     validate_range_request,
     write_all,
 )
+
+
+def _body_rewinder(body: Any) -> Optional[Callable[[], Any]]:
+    """Return a callable that restores *body* to its pre-request position.
+
+    Returns a no-op for in-memory payloads (``bytes``/``str``/absent), which
+    botocore re-serialises from scratch on every attempt.  Returns ``None``
+    when the body is a stream that cannot be rewound (generator, socket-backed
+    file): such a request must never be retried, because the retry would send
+    only the unconsumed remainder.
+    """
+    if body is None or isinstance(body, (bytes, bytearray, memoryview, str)):
+        return lambda: None
+
+    seek = getattr(body, "seek", None)
+    tell = getattr(body, "tell", None)
+    if not callable(seek) or not callable(tell):
+        return None
+    seekable = getattr(body, "seekable", None)
+    if callable(seekable) and not seekable():
+        return None
+    try:
+        start = tell()
+    except (OSError, ValueError):
+        return None
+    return lambda: seek(start)
 
 
 class S3Storage(StorageInterface):
@@ -316,12 +342,18 @@ class S3Storage(StorageInterface):
             self.secure = parsed.scheme != "http"
 
     def _call(self, method: str, **kwargs: Any) -> Any:
+        # A retried request must resend the *whole* payload.  botocore consumes
+        # a file-like Body on the first attempt, so a naive retry would upload
+        # whatever is left after the stream position (usually nothing) and
+        # report success — silently storing a truncated/zero-byte object.
+        # Rewind before every attempt; refuse to retry a body we cannot rewind.
+        body_rewind = _body_rewinder(kwargs.get("Body"))
         attempts = 0
         while True:
             try:
                 return getattr(self.client, method)(**kwargs)
             except ClientError as e:
-                if attempts >= 1:
+                if attempts >= 1 or body_rewind is None:
                     raise
 
                 error_resp = e.response.get("Error", {}) or {}
@@ -384,6 +416,7 @@ class S3Storage(StorageInterface):
                     raise
 
                 self._rebuild_client()
+                body_rewind()
                 attempts += 1
 
     def _ensure_bucket_region(self) -> None:
@@ -476,6 +509,9 @@ class S3Storage(StorageInterface):
             raise ValueError("Invalid JSON") from None
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
+        # Enroll before the PUT: a request that times out ambiguously may still
+        # have created the object, and only an enrolled key can be rolled back.
+        self._record_new_object(path)
         path = self._with_base(path)
         self._ensure_bucket_region()
         payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
@@ -708,6 +744,18 @@ class S3Storage(StorageInterface):
                 f"failures={len(errors)}"
             )
 
+    def _delete_object_for_rollback(self, path: str) -> None:
+        """Delete exactly one enrolled key; never widen into a prefix delete.
+
+        ``delete`` falls back to recursive prefix deletion when the exact key is
+        absent, which rollback must never do.  ``DeleteObject`` is idempotent on
+        S3, so an already-absent key succeeds without a preceding HEAD.
+        """
+        self._ensure_bucket_region()
+        self._call(
+            "delete_object", Bucket=self.bucket_name, Key=self._with_base(path),
+        )
+
     def _iter_prefix_keys(self, physical_prefix: str):
         prefix = physical_prefix if physical_prefix.endswith("/") else f"{physical_prefix}/"
         self._ensure_bucket_region()
@@ -798,15 +846,17 @@ class S3Storage(StorageInterface):
     # Parquet
     # -------------------------
     def write_parquet(self, table: pa.Table, path: str) -> None:
+        self._record_new_object(path)
         path = self._with_base(path)
         self._ensure_bucket_region()
         buf = io.BytesIO()
         pq.write_table(table, buf)
-        buf.seek(0)
+        # Send the serialised bytes, not the stream: a retried PUT must carry
+        # the full payload even though the first attempt consumed the buffer.
         self._call("put_object",
                    Bucket=self.bucket_name,
                    Key=path,
-                   Body=buf,
+                   Body=buf.getvalue(),
                    ContentType="application/octet-stream",
                    )
 
@@ -836,6 +886,7 @@ class S3Storage(StorageInterface):
     # Bytes / Text / Copy
     # -------------------------
     def write_bytes(self, path: str, data: bytes) -> None:
+        self._record_new_object(path)
         path = self._with_base(path)
         self._ensure_bucket_region()
         self._call("put_object",
@@ -843,6 +894,7 @@ class S3Storage(StorageInterface):
                    )
 
     def create_bytes_if_absent(self, path: str, data: bytes) -> bool:
+        logical = path
         path = self._with_base(path)
         self._ensure_bucket_region()
         try:
@@ -860,6 +912,10 @@ class S3Storage(StorageInterface):
             if code == "PreconditionFailed" or status == 412:
                 return False
             raise
+        # Enroll only a proven create.  A 412 means the object belongs to
+        # whoever won the race, and an ambiguous failure may equally be a lost
+        # 412 response, so neither may ever be enrolled for deletion.
+        self._record_new_object(logical)
         return True
 
     def read_bytes(self, path: str) -> bytes:
@@ -880,6 +936,7 @@ class S3Storage(StorageInterface):
         return self.read_bytes(path).decode(encoding)
 
     def copy(self, src_path: str, dst_path: str) -> None:
+        self._record_new_object(dst_path)
         src_path = self._with_base(src_path)
         dst_path = self._with_base(dst_path)
         self._ensure_bucket_region()
