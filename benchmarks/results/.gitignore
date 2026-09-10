@@ -1,0 +1,4 @@
+# Dataset build markers describe a dataset that exists on THIS machine's
+# storage backend. They are local state, not results — committing them would
+# tell another machine it already has data it has never built.
+.dataset-*.json
