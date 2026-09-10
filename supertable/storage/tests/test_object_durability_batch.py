@@ -15,6 +15,7 @@ the real adapter code (including ``_with_base`` key translation) is exercised.
 
 from __future__ import annotations
 
+import importlib
 import os
 import threading
 from contextvars import copy_context
@@ -820,19 +821,47 @@ def test_abort_reports_a_delete_failure_after_deleting_everything_else(backend, 
 # ---------------------------------------------------------------------------
 # The gap itself, plus third-party compatibility
 # ---------------------------------------------------------------------------
-def test_every_backend_exposes_a_durability_batch():
+def test_the_base_interface_exposes_a_durability_batch():
     """The regression under test: only LocalStorage used to implement this."""
-    from supertable.storage.azure_storage import AzureBlobStorage
-    from supertable.storage.gcp_storage import GCSStorage
-    from supertable.storage.local_storage import LocalStorage
-    from supertable.storage.minio_storage import MinioStorage
-    from supertable.storage.s3_storage import S3Storage
+    assert callable(getattr(StorageInterface, "durability_batch", None))
 
-    for cls in (
-        StorageInterface, LocalStorage, S3Storage, MinioStorage,
-        AzureBlobStorage, GCSStorage,
-    ):
-        assert callable(getattr(cls, "durability_batch", None)), cls.__name__
+
+@pytest.mark.parametrize(
+    ("module_name", "class_name", "requires"),
+    [
+        ("supertable.storage.local_storage", "LocalStorage", None),
+        ("supertable.storage.s3_storage", "S3Storage", "boto3"),
+        ("supertable.storage.minio_storage", "MinioStorage", "minio"),
+        (
+            "supertable.storage.azure_storage",
+            "AzureBlobStorage",
+            "azure.storage.blob",
+        ),
+        ("supertable.storage.gcp_storage", "GCSStorage", "google.cloud.storage"),
+    ],
+)
+def test_every_backend_exposes_a_durability_batch(
+    module_name, class_name, requires,
+):
+    """Each concrete backend must inherit the batch, not just LocalStorage.
+
+    The cloud adapters import their provider SDK at module scope, and those
+    SDKs are optional extras -- ``google-cloud-storage`` in particular is in
+    the ``gcp`` extra and absent from ``requirements-dev.txt``.  Importing
+    them unconditionally passed locally (where every extra is installed) and
+    failed the release gate with ``ModuleNotFoundError: No module named
+    'google'``.  Skip per backend so the assertion still covers everything
+    the running environment can actually import.
+    """
+    if requires is not None:
+        pytest.importorskip(
+            requires,
+            reason=f"{class_name} needs the optional {requires} SDK",
+        )
+    module = importlib.import_module(module_name)
+    cls = getattr(module, class_name)
+
+    assert callable(getattr(cls, "durability_batch", None)), class_name
 
 
 def _third_party_storage():
