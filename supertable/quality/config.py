@@ -250,17 +250,30 @@ class DQConfig:
             "post_ingest_quick": True,
             "post_ingest_custom": True,
             "post_ingest_deep": False,
-            "enabled": True,
+            # Automatic profiling is opt-in: an unconfigured lake must not put
+            # work on the write path.  The cron/mode presets above stay ready
+            # so enabling the schedule is the only step an operator needs.
+            "enabled": False,
         }
 
     def set_schedule(self, schedule: Dict[str, Any]) -> bool:
         try:
             schedule["updated_at"] = _now_iso()
             self.r.set(self._key("schedule"), json.dumps(schedule, default=str))
-            return True
         except Exception as e:
             logger.error(f"[dq-config] set_schedule error: {e}")
             return False
+
+        # The ingest producer remembers "quality is off" to keep the write path
+        # free of a Redis read.  Enabling a schedule must not wait for that memo
+        # to expire, so drop it now — after the store succeeded, and without
+        # letting a failure here report the stored schedule as unwritten.
+        try:
+            from supertable.quality.scheduler import forget_disabled_memo
+            forget_disabled_memo()
+        except Exception as e:
+            logger.warning(f"[dq-config] could not clear the disabled memo: {e}")
+        return True
 
     def get_table_schedule(self, table: str) -> Optional[Dict[str, Any]]:
         try:

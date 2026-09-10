@@ -221,6 +221,25 @@ The stats payload includes: `query_id`, `recorded_at`, `organization`,
 
 Calls `notify_ingest()` to set a debounced "pending" flag in Redis. The Data Quality scheduler picks it up on the next tick. This never blocks or fails the write.
 
+Automatic quality checks are **off by default**. Until a schedule explicitly
+says `enabled: True`, `notify_ingest()` returns without touching Redis, so a
+bulk load never pays for profiling it did not ask for — and the background
+scheduler skips the lake entirely. Opt in per supertable:
+
+```python
+from supertable.quality.config import DQConfig
+
+DQConfig(catalog.r, organization, super_name).set_schedule(
+    {"post_ingest": True, "enabled": True}
+)
+```
+
+A schedule that is already enabled keeps working unchanged. Opt-in is strict:
+a stored schedule that omits `enabled` counts as off, so a partially written
+config cannot switch profiling on by accident. The "off" verdict is cached in
+process for one scheduler tick to keep the write path free of a Redis read;
+`set_schedule()` clears that cache, so enabling takes effect on the next write.
+
 #### 18. Audit Logging
 
 Emits a `DATA_WRITE` audit event with category `DATA_MUTATION` including row counts, durations, and role information. Failures are silently ignored.

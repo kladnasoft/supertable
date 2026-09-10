@@ -51,6 +51,50 @@ TICK_INTERVAL_SECONDS = 60           # scheduler wakes up every 60s
 _scheduler_thread: Optional[threading.Thread] = None
 _scheduler_lock = threading.Lock()
 
+# Reading the schedule costs one Redis round trip, and the write path calls
+# ``notify_ingest`` after every table write.  With automatic checks off — the
+# default — that round trip buys nothing, so the "not enabled" verdict is
+# remembered per lake for one scheduler tick.  Only the negative verdict is
+# cached: the moment a schedule says ``enabled: True`` every write takes the
+# normal path again.  Bounding the map keeps a process that touches many lakes
+# from growing it without limit.
+_DISABLED_MEMO_TTL_SECONDS = TICK_INTERVAL_SECONDS
+_DISABLED_MEMO_MAX_ENTRIES = 1024
+_disabled_memo: Dict[Tuple[str, str], float] = {}
+_disabled_memo_lock = threading.Lock()
+
+
+def _recently_disabled(org: str, sup: str) -> bool:
+    """True while this lake's last observed schedule said "not enabled"."""
+    with _disabled_memo_lock:
+        expires_at = _disabled_memo.get((org, sup))
+        if expires_at is None:
+            return False
+        if expires_at <= time.monotonic():
+            del _disabled_memo[(org, sup)]
+            return False
+        return True
+
+
+def _remember_disabled(org: str, sup: str) -> None:
+    """Skip this lake's schedule read until the memo expires."""
+    with _disabled_memo_lock:
+        if len(_disabled_memo) >= _DISABLED_MEMO_MAX_ENTRIES:
+            _disabled_memo.clear()
+        _disabled_memo[(org, sup)] = time.monotonic() + _DISABLED_MEMO_TTL_SECONDS
+
+
+def forget_disabled_memo() -> None:
+    """Drop every remembered verdict so the next write re-reads the schedule.
+
+    ``DQConfig.set_schedule`` calls this so enabling quality inside one process
+    takes effect on the next write instead of after the memo expires.  Another
+    process still observes the change within ``_DISABLED_MEMO_TTL_SECONDS``,
+    which is the tick the scheduler would have acted on anyway.
+    """
+    with _disabled_memo_lock:
+        _disabled_memo.clear()
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Public API — called from ingest code
@@ -71,12 +115,18 @@ def notify_ingest(r, org: str, sup: str, table_name: str) -> None:
         # Skip system tables — they are written by quality checks themselves
         if table_name.startswith("__") and table_name.endswith("__"):
             return
+        if _recently_disabled(org, sup):
+            return
         from supertable.quality.config import DQConfig
         dqc = DQConfig(r, org, sup)
         schedule = dqc.get_schedule()
-        if not schedule.get("post_ingest", True):
+        # Opt-in only: a missing key, a partially written schedule, and the
+        # unconfigured default all mean "off", so automatic profiling can never
+        # start charging the write path without an operator asking for it.
+        if schedule.get("enabled") is not True:
+            _remember_disabled(org, sup)
             return
-        if not schedule.get("enabled", True):
+        if not schedule.get("post_ingest", True):
             return
 
         key = _pending_key(org, sup, table_name)
@@ -169,7 +219,9 @@ def _scheduler_tick(
         dqc = DQConfig(r, org, sup)
         schedule = dqc.get_schedule()
 
-        if not schedule.get("enabled", True):
+        # Same opt-in rule as the ingest producer, so a lake that never
+        # enabled quality is not enumerated or profiled by the daemon either.
+        if schedule.get("enabled") is not True:
             continue
 
         quick_cron = schedule.get("quick_cron", "0 */4 * * *")
