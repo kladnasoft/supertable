@@ -613,6 +613,11 @@ def rewrite_query_with_hashed_tables(
 # Connection initialization
 # =========================================================
 
+# Keyed by duckdb.__version__: the probe answers a question about the binary,
+# so one answer per build is all that can ever exist in a process.
+_EXTERNAL_FILE_CACHE_CAPPABLE: Dict[str, bool] = {}
+
+
 def _external_file_cache_cappable(con: duckdb.DuckDBPyConnection) -> bool:
     """True when this DuckDB build exposes a dedicated external-file-cache cap.
 
@@ -621,14 +626,29 @@ def _external_file_cache_cappable(con: duckdb.DuckDBPyConnection) -> bool:
     enforces.  This predicate gates only the *dedicated* per-cache size cap:
     when it returns False the cache still runs, bounded by ``memory_limit``
     rather than a separate cap.
+
+    Memoized per DuckDB build. The answer is a property of the binary — a
+    setting either exists in this build or it does not — so it cannot change
+    while the process runs. It was previously re-derived on every query by
+    ``apply_runtime_pragmas``, and the probe is a scan of ``duckdb_settings()``:
+    8.4ms per query, paid to re-learn the same False. That was invisible while
+    each query built its own connection; once the connection became persistent
+    it stood out as the second-largest avoidable cost in the read path.
     """
+    cached = _EXTERNAL_FILE_CACHE_CAPPABLE.get(duckdb.__version__)
+    if cached is not None:
+        return cached
     try:
-        return bool(con.execute(
+        result = bool(con.execute(
             "SELECT 1 FROM duckdb_settings() "
             "WHERE name = 'external_file_cache_max_size'"
         ).fetchone())
     except Exception:
+        # Not cached: a failure here may be connection-specific (a closed or
+        # broken connection) rather than a fact about the build.
         return False
+    _EXTERNAL_FILE_CACHE_CAPPABLE[duckdb.__version__] = result
+    return result
 
 
 def init_connection(
