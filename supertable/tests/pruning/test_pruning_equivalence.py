@@ -13,6 +13,11 @@ This is the regression net for the pruning bugs found by the audit:
     string to DATE and drops the time, while the pruner kept the full
     ``23:59:59`` and pruned the matching day away.
 
+It also covers two reader bugs this corpus surfaced — an alias produced by a
+subquery's window function being attributed to the base table, and a column
+referenced through a derived-table alias never reaching the reflection view.
+Both made the query fail outright, with pruning and without.
+
 The corpus is generated (thousands of queries), so the default run takes a
 STRATIFIED SAMPLE — every family is represented, and the sample is
 deterministic so a failure is reproducible. Run the whole corpus with:
@@ -85,38 +90,10 @@ def _run(sql: str, fullscan: bool):
     return df
 
 
-# Query shapes that fail to EXECUTE AT ALL — with pruning and without. They are
-# reader bugs, not pruning bugs, and they are recorded rather than deleted so
-# the corpus keeps covering the shape and tells us when it starts working.
-#
-#   window_*      "Missing required column(s): facts: rn"
-#                 an alias produced by a subquery's window function is
-#                 attributed to the BASE TABLE, which has no such column.
-#   sub_derived_* 'Values list "s" does not have a column named "status"'
-#                 a column referenced through a derived-table alias is not
-#                 mapped back to the underlying table, so the reflection view
-#                 is built without it and the binder then cannot find it.
-#
-# Both are the same root cause: column attribution does not follow subquery and
-# derived-table aliases. Neither is caused by pruning — they fail identically on
-# a full scan.
-_KNOWN_READER_BUGS = ("window_", "sub_derived_")
-
-
-def _is_known_reader_bug(qid: str) -> bool:
-    return qid.startswith("window_") or (
-        qid.startswith("sub_derived_") and not qid.startswith("sub_derived_join_")
-    )
-
-
 @pytest.mark.parametrize("qid,family,sql", SAMPLE,
                          ids=[q[0] for q in SAMPLE])
 def test_pruned_result_equals_fullscan(qid, family, sql):
     """The invariant, one query at a time."""
-    if _is_known_reader_bug(qid):
-        pytest.xfail("column attribution does not follow subquery aliases; "
-                     "the query fails to execute at all, with or without "
-                     "pruning — see _KNOWN_READER_BUGS")
     import numpy as np
     import pandas as pd
 

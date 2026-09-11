@@ -423,6 +423,56 @@ class SQLParser:
 
         select_expr = self._parsed.find(exp.Select)
 
+        # ---------------- Derived-table outputs ----------------
+        #
+        # A name defined in a derived table's SELECT list denotes that derived
+        # table's OUTPUT. Referenced from OUTSIDE the subquery it is not a
+        # column of any physical table, and attributing it to one produced
+        # 'Missing required column(s): facts: rn' for
+        #
+        #   SELECT count(*) FROM (SELECT fact_id,
+        #          row_number() OVER (...) AS rn FROM facts ...) w WHERE rn <= 3
+        #
+        # `rn` was unqualified and facts was the only table, so it was handed to
+        # facts, which has no such column.
+        derived_outputs: List[Tuple[exp.Subquery, Set[str]]] = []
+        derived_star_tables: Set[str] = set()
+        for sub in self._parsed.find_all(exp.Subquery):
+            if not sub.alias:
+                continue                      # not a derived table in FROM/JOIN
+            inner = sub.this if isinstance(sub.this, exp.Select) else None
+            names: Set[str] = set()
+            if inner is not None:
+                for proj in inner.expressions:
+                    if isinstance(proj, exp.Star) or (
+                        isinstance(proj, exp.Column) and proj.name == "*"
+                    ):
+                        for tbl in sub.find_all(exp.Table):
+                            derived_star_tables.add(tbl.alias_or_name)
+                    elif isinstance(proj, exp.Alias):
+                        ident = proj.args.get("alias")
+                        if isinstance(ident, exp.Identifier) and ident.name:
+                            names.add(ident.name.lower())
+            if names:
+                derived_outputs.append((sub, names))
+
+        def _is_derived_output(col: exp.Column, col_name: str) -> bool:
+            """True when this reference names a derived output, seen from outside."""
+            if not derived_outputs:
+                return False
+            lowered = col_name.lower()
+            for sub, names in derived_outputs:
+                if lowered not in names:
+                    continue
+                node = col.parent
+                while node is not None:
+                    if node is sub:
+                        break                 # inside: it is a real reference
+                    node = node.parent
+                else:
+                    return True
+            return False
+
         # ---------------- Detect * and t.* in SELECT ----------------
 
         global_star = False
@@ -487,6 +537,9 @@ class SQLParser:
                             # Ignore bogus or star-like columns here.
                             continue
 
+                        if _is_derived_output(col, col_name):
+                            continue
+
                         table_alias = col.table
                         resolved_alias: Optional[str] = None
 
@@ -509,6 +562,9 @@ class SQLParser:
                         col_name = col.name
                         if not col_name or col_name == "*":
                             # Do not treat "*" as a real column.
+                            continue
+
+                        if _is_derived_output(col, col_name):
                             continue
 
                         table_alias = col.table
@@ -560,6 +616,9 @@ class SQLParser:
             ):
                 continue
 
+            if _is_derived_output(col, col_name):
+                continue
+
             table_alias = col.table
             resolved_alias: Optional[str] = None
 
@@ -582,6 +641,21 @@ class SQLParser:
         # 3) Apply t.* semantics: any alias with t.* means "all columns"
         for alias in table_star_aliases:
             alias_to_columns[alias] = []
+
+        # 3b) Star inside a derived table -> the tables under it need every
+        # column. `SELECT * FROM (SELECT * FROM facts WHERE ...) s
+        # WHERE s.status = 'paid'` referenced `status` through the derived
+        # alias `s`, which is not a physical alias, so `status` was dropped and
+        # facts kept only the columns named INSIDE the subquery. The reflection
+        # view was built without it and the binder failed with
+        # 'Values list "s" does not have a column named "status"'.
+        #
+        # Only a STAR forces this. A derived table that projects explicitly is
+        # already resolved correctly from its own select list, and widening
+        # that case would throw away a tighter, correct projection.
+        for alias in derived_star_tables:
+            if alias in alias_to_columns:
+                alias_to_columns[alias] = []
 
         # 4) Sort columns for aliases that are not "all columns"
         for alias, cols in alias_to_columns.items():

@@ -1830,13 +1830,23 @@ CASES.append({
             ) inner_q GROUP BY x
         ) outer_q ORDER BY total DESC
     """,
-    # 't' is the only real table found by find_all(Table). Subquery aliases
-    # (inner_q, outer_q) are not registered as tables. With a single table,
-    # all unqualified Column nodes map to 't'. The outer SELECT has no Alias
-    # nodes (x and total are bare Column refs into the subquery), so 'total'
-    # in ORDER BY is not recognized as a SELECT alias — it's collected.
-    # This is a pre-existing parser limitation for deeply nested subqueries.
-    "expect": {"t": sorted(["total", "x", "y"])},
+    # WAS {"t": ["total", "x", "y"]} — the limitation this comment used to
+    # describe. None of those three is a column of 't' (it has 'a' and 'b'):
+    # they are names invented by the nested subqueries and attributed to the
+    # only physical table because they were unqualified. Requesting them made
+    # get_missing_columns reject the query, so this shape did not merely record
+    # an odd column list — it could not run at all.
+    #
+    # Names defined in a derived table's SELECT list are now recognised as that
+    # derived table's OUTPUT when referenced from outside it, so they are no
+    # longer handed to 't'. Nothing is then attributed to 't', and it falls back
+    # to [] — all columns.
+    #
+    # [] is correct but not the tightest answer; 'a' and 'b' are all this query
+    # really needs. Tightening it means resolving names down through each
+    # derived level, a larger change than the bug required. Reading every column
+    # is sound; asking for columns that do not exist was not.
+    "expect": {"t": []},
 })
 
 CASES.append({
