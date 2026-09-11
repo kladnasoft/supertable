@@ -132,3 +132,46 @@ def test_only_the_offset_window_is_newly_retained():
     just_outside = literal - _MAX_UTC_OFFSET_EAST - timedelta(seconds=1)
     stored = ("timestamp", just_outside - timedelta(days=1), just_outside)
     assert _pred_overlaps_stored(_Pred("timestamp", lo=literal), stored) is False
+
+
+# --------------------------------------------------------------------------
+# A bare string is cast to the COLUMN's type, which may drop the time
+# --------------------------------------------------------------------------
+
+def test_text_lower_bound_is_floored_to_the_day():
+    """`event_date >= '2025-04-05 23:59:59'` matches every row on the 5th.
+
+    DuckDB casts the string to the column type. Against a DATE column that
+    discards the time, so the predicate is really `>= DATE '2025-04-05'`.
+    Holding the full 23:59:59 pruned the matching day away — 277 rows lost on a
+    96k-row table, found by the generated pruning corpus.
+    """
+    stored = ("timestamp", _ts(2025, 3, 20), _ts(2025, 4, 5))   # max is midnight
+    pred = _Pred("string", lo="2025-04-05 23:59:59")
+    assert _pred_overlaps_stored(pred, stored) is True
+
+
+def test_timestamp_literal_is_not_floored():
+    """The explicit-cast form genuinely differs and must not be widened.
+
+        DATE '2025-04-05' >= '2025-04-05 23:59:59'            -> True
+        DATE '2025-04-05' >= TIMESTAMP '2025-04-05 23:59:59'  -> False
+
+    An explicit TIMESTAMP promotes the DATE to midnight rather than truncating
+    the literal, so flooring here would only give up pruning for nothing.
+    """
+    from supertable.processing import _floor_text_lower_bound_to_day
+
+    lit = _ts(2025, 4, 5, 23, 59, 59)
+    assert _floor_text_lower_bound_to_day(lit) == _ts(2025, 4, 5)
+    # ...but the timestamp lane never routes through it: with only the timezone
+    # widening, a file ending a day earlier is still pruned.
+    stored = ("timestamp", _ts(2025, 3, 20), _ts(2025, 4, 3))
+    assert _pred_overlaps_stored(_Pred("timestamp", lo=lit), stored) is False
+
+
+def test_flooring_does_not_disable_pruning():
+    """A file ending well before the literal's day is still dropped."""
+    stored = ("timestamp", _ts(2025, 1, 1), _ts(2025, 1, 5))
+    assert _pred_overlaps_stored(
+        _Pred("string", lo="2025-04-05 23:59:59"), stored) is False

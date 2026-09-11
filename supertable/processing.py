@@ -2378,6 +2378,35 @@ def _widen_naive_timestamp_bounds(plo, phi):
     return plo, phi
 
 
+def _floor_text_lower_bound_to_day(plo):
+    """Drop the time from a text lower bound, because the engine may drop it too.
+
+    A bare string literal is cast to the COLUMN's type. Against a ``DATE``
+    column that cast discards the time, so DuckDB evaluates
+
+        event_date >= '2025-04-05 23:59:59'
+
+    as ``event_date >= DATE '2025-04-05'`` — and every row on the 5th matches.
+    Verified directly against DuckDB:
+
+        DATE '2025-04-05' >= '2025-04-05 23:59:59'            -> True
+        DATE '2025-04-05' >= TIMESTAMP '2025-04-05 23:59:59'  -> False
+
+    The two forms genuinely differ: an explicit TIMESTAMP literal promotes the
+    DATE to a timestamp at midnight instead of truncating the literal, so only
+    the TEXT lane is affected. Holding the full ``23:59:59`` for the text form
+    pruned files whose final day matched — 277 rows lost on a 96k-row table.
+
+    The stats lane is ``"timestamp"`` for DATE and TIMESTAMP columns alike, so
+    the pruner cannot tell which it is and must assume the truncating one. On a
+    genuine TIMESTAMP column this costs at most the files whose max falls
+    inside that single day.
+    """
+    if isinstance(plo, datetime) and plo.tzinfo is None:
+        return plo.replace(hour=0, minute=0, second=0, microsecond=0)
+    return plo
+
+
 def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]) -> bool:
     """True if a value in the stored row-group range ``[s_min, s_max]`` could
     satisfy the predicate interval *pred*.
@@ -2412,7 +2441,9 @@ def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]
         phi = _to_us_datetime_from_text(pred.hi)
         if (pred.lo is not None and plo is None) or (pred.hi is not None and phi is None):
             return True
-        # A bare string parses naive, so it carries the same ambiguity.
+        # A bare string parses naive, so it carries the timezone ambiguity —
+        # and, against a DATE column, the engine truncates it to a day.
+        plo = _floor_text_lower_bound_to_day(plo)
         plo, phi = _widen_naive_timestamp_bounds(plo, phi)
         smin, smax = s_min, s_max
     else:
