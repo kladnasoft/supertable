@@ -335,6 +335,23 @@ class Settings:
     # local disk, and 0.73x (i.e. FASTER) on MinIO, where DuckDB fetches the
     # parts in parallel.  500 parts is where local cost turns sharply (+167%).
     SUPERTABLE_TOMBSTONE_MAX_PARTS: int = 100  # SUPERTABLE_TOMBSTONE_MAX_PARTS
+
+    # --- Streaming queries ---
+    # Rows per Arrow batch handed to the consumer. Bigger batches amortise
+    # per-batch overhead; smaller ones lower time-to-first-byte and make
+    # cancellation land sooner, since cancel is only checked between batches.
+    SUPERTABLE_STREAM_BATCH_ROWS: int = 65_536
+    # Target size of one spilled chunk. Chunks are the unit another instance
+    # fetches, so this trades object count against per-object overhead.
+    SUPERTABLE_STREAM_CHUNK_BYTES: int = 32 * 1024 * 1024
+    # How far the producer may run ahead of the consumer, in chunks. This is
+    # the backpressure knob: without it a large export would spill the entire
+    # result regardless of whether anyone is reading it.
+    SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS: int = 8
+    # Default wall-clock budget for a streaming job, seconds. 0 = no deadline.
+    SUPERTABLE_STREAM_DEADLINE_SEC: int = 3600
+    # How long a finished job's spilled chunks and Redis keys survive.
+    SUPERTABLE_STREAM_JOB_TTL_SEC: int = 3600
     SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES: int = 64   # SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES
 
     # Read-path file pruning: when True the estimator uses the stats artifact to
@@ -607,6 +624,11 @@ def _build_settings() -> Settings:
         SUPERTABLE_SUPER_META_CACHE_TTL_S=meta_ttl,
         SUPERTABLE_STATS_CACHE_MAX_TABLES=_env_int("SUPERTABLE_STATS_CACHE_MAX_TABLES", 64),
         SUPERTABLE_TOMBSTONE_MAX_PARTS=_env_int("SUPERTABLE_TOMBSTONE_MAX_PARTS", 100),
+        SUPERTABLE_STREAM_BATCH_ROWS=_env_int("SUPERTABLE_STREAM_BATCH_ROWS", 65_536),
+        SUPERTABLE_STREAM_CHUNK_BYTES=_env_int("SUPERTABLE_STREAM_CHUNK_BYTES", 32 * 1024 * 1024),
+        SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS=_env_int("SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS", 8),
+        SUPERTABLE_STREAM_DEADLINE_SEC=_env_int("SUPERTABLE_STREAM_DEADLINE_SEC", 3600),
+        SUPERTABLE_STREAM_JOB_TTL_SEC=_env_int("SUPERTABLE_STREAM_JOB_TTL_SEC", 3600),
         SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES=_env_int("SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES", 64),
         SUPERTABLE_READ_PRUNING_ENABLED=_env_bool("SUPERTABLE_READ_PRUNING_ENABLED", True),
         SUPERTABLE_READ_PROJECTION_SIZING_ENABLED=_env_bool("SUPERTABLE_READ_PROJECTION_SIZING_ENABLED", True),

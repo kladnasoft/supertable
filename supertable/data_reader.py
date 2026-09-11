@@ -67,6 +67,9 @@ class DataReader:
         self.query_plan_manager: Optional[QueryPlanManager] = None
 
         self._log_ctx = ""
+        # Set by stream(); when present, execute() hands back an open Arrow
+        # reader through it instead of a materialised frame.
+        self._stream_out: Optional[Dict[str, Any]] = None
 
     def _lp(self, msg: str) -> str:
         return f"{self._log_ctx}{msg}"
@@ -384,6 +387,21 @@ class DataReader:
             if command.explain:
                 from supertable.engine.engine_enum import Engine as _EngineEnum
                 exec_engine = _EngineEnum.DUCKDB
+            if self._stream_out is not None:
+                # Streaming shares every step above — RBAC, dedup, share
+                # filters, pruning — and diverges only at the final fetch.
+                # Anything else would make a streamed read a different query
+                # from a buffered one.
+                self._stream_out["handle"] = executor.stream(
+                    reflection=reflection,
+                    parser=parser,
+                    query_manager=self.query_plan_manager,
+                    timer=self.timer,
+                    log_prefix=self._lp(""),
+                    batch_rows=self._stream_out.get("batch_rows", 0),
+                )
+                self.timer.capture_and_reset_timing(event="EXECUTING_QUERY")
+                return pd.DataFrame(), Status.OK, ""
             result_df, engine_used = executor.execute(
                 engine=exec_engine,
                 reflection=reflection,
@@ -419,6 +437,48 @@ class DataReader:
         self.timer.capture_and_reset_timing(event="EXTENDING_PLAN")
         self.timer.capture_duration(event="TOTAL_EXECUTE")
         return result_df, status, message
+
+    def stream(
+            self,
+            role_name: str,
+            engine: Any = None,
+            fullscan: bool = False,
+            batch_rows: int = 0,
+    ):
+        """Run the query and return an open Arrow stream.
+
+        No LIMIT is applied, ever. ``execute`` materialises through
+        ``fetchdf()``, which is why callers needed one; a stream hands back
+        batches as DuckDB produces them, so ``SELECT *`` over a large table is
+        bounded by the consumer's appetite rather than by memory.
+
+        The result is a ``StreamHandle``: iterate ``.batches()``, and close it
+        (or use it as a context manager). It holds the per-query views open, so
+        leaking it leaks catalog objects on the shared connection.
+
+        Every step before the fetch is identical to ``execute`` — RBAC, the
+        deletion-vector anti-join, dedup, share filters, pruning — so a
+        streamed read returns exactly what a buffered read would.
+        """
+        from supertable.engine.engine_enum import Engine as _Engine
+
+        self._stream_out = {"handle": None, "batch_rows": batch_rows}
+        try:
+            _, status, message = self.execute(
+                role_name=role_name,
+                engine=engine if engine is not None else _Engine.AUTO,
+                with_scan=False,
+                fullscan=fullscan,
+            )
+            if not str(status).endswith("OK"):
+                raise RuntimeError(f"stream failed: {message}")
+            handle = self._stream_out.get("handle")
+            if handle is None:
+                raise RuntimeError(f"stream produced no reader: {message}")
+            return handle
+        finally:
+            self._stream_out = None
+
 
 def _ensure_sql_limit(sql: str, default_limit: int) -> str:
     """

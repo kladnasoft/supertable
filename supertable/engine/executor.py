@@ -141,6 +141,36 @@ class Executor:
         )
         return chosen
 
+    def stream(
+        self,
+        reflection: Reflection,
+        parser: SQLParser,
+        query_manager: QueryPlanManager,
+        timer: Timer,
+        log_prefix: str,
+        batch_rows: int = 0,
+    ):
+        """Return an open Arrow stream for this query.
+
+        DuckDB only. Spark's path materialises through a collect, so routing a
+        stream there would silently reintroduce the very buffering streaming
+        exists to avoid — better to be explicit than to quietly not stream.
+        """
+        cfgs = resolve_engine_configs(self.organization, self._get_catalog())
+
+        def timer_capture(evt: str):
+            timer.capture_and_reset_timing(evt)
+
+        return self.duck_exec.stream(
+            reflection=reflection,
+            parser=parser,
+            query_manager=query_manager,
+            timer_capture=timer_capture,
+            log_prefix=log_prefix,
+            engine_config=cfgs["lite"],
+            batch_rows=batch_rows,
+        )
+
     def execute(
         self,
         engine: Engine,

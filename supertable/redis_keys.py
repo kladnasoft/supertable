@@ -602,6 +602,73 @@ def engine_duckdb(org: str) -> str:
     return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:engine:duckdb"
 
 
+# --- Streaming query jobs --------------------------------------------------- #
+#
+# A streaming query is lake-scoped: it reads one supertable, so it sits beside
+# ``meta:`` and ``lock:`` rather than in the org system scope. The shape mirrors
+# the existing ``<area>:<kind>:doc:<id>`` convention so SCAN patterns and the
+# cleanup helpers behave the same way.
+#
+# Four keys per job, deliberately separate rather than one document:
+#
+#   doc     the job record — state, SQL, counters, deadline. Read on every poll.
+#   chunks  an append-only LIST of spilled chunk references. A consumer can
+#           read it while the producer is still appending, which is what makes
+#           the result streamable instead of poll-until-done.
+#   cancel  a one-way flag. Kept apart from the doc so cancelling is a single
+#           SET that cannot lose a concurrent counter update, and so the
+#           executor can check it with one cheap GET between batches.
+#   index   a SET of live job ids for listing and for reaping orphans whose
+#           executor died without cleaning up.
+
+def query_job_doc(org: str, sup: str, job_id: str) -> str:
+    """Streaming query job record (HASH)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:query:job:doc:{_safe('job_id', job_id)}"
+    )
+
+
+def query_job_chunks(org: str, sup: str, job_id: str) -> str:
+    """Ordered chunk manifest for one job (LIST, append-only)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:query:job:chunks:{_safe('job_id', job_id)}"
+    )
+
+
+def query_job_cancel(org: str, sup: str, job_id: str) -> str:
+    """Cancellation flag for one job (STRING); presence means cancel."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:query:job:cancel:{_safe('job_id', job_id)}"
+    )
+
+
+def query_job_index(org: str, sup: str) -> str:
+    """Set of live job ids in this supertable (SET)."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:query:job:index"
+    )
+
+
+def query_job_pattern(org: str, sup: str) -> str:
+    """SCAN pattern matching every key belonging to any job here."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:query:job:*"
+    )
+
+
+def query_job_subkey_pattern(org: str, sup: str, job_id: str) -> str:
+    """SCAN pattern matching every key belonging to ONE job."""
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:query:job:*:{_safe('job_id', job_id)}"
+    )
+
+
 # --- Locks ----------------------------------------------------------------- #
 
 def lock_leaf(org: str, sup: str, simple: str) -> str:

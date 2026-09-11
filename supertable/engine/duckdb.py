@@ -14,6 +14,7 @@ from supertable.config.settings import settings
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
 from supertable.data_classes import Reflection
+from supertable.processing import ROWID_COL as ROWID_SYSTEM_COL, TIMESTAMP_COL as TIMESTAMP_SYSTEM_COL
 
 from supertable.engine.engine_common import (
     hashed_table_name,
@@ -154,6 +155,107 @@ class DuckDBEngine:
     # Core execution
     # ------------------------------------------------------------------
 
+    def _build_view_chain(
+            self,
+            con,
+            reflection: Reflection,
+            parser: SQLParser,
+            alias_to_table_name: dict,
+            alias_to_files: dict,
+            alias_to_columns: dict,
+            created_views: List[str],
+            acquired_dv_keys: List[str],
+            timer_capture,
+            log_prefix: str = "",
+            explain: bool = False,
+            explain_options: str = "",
+    ):
+        """Build reflection -> tombstone -> RBAC views and rewrite the query.
+
+        Extracted so ``execute`` and ``stream`` share one definition of what a
+        query actually reads. A streamed read must see exactly the chain a
+        buffered read sees — the same deletion-vector anti-join, the same RBAC
+        column and row filtering — otherwise streaming would quietly become a
+        way to bypass both.
+
+        ``created_views`` and ``acquired_dv_keys`` are appended in place so the
+        CALLER owns teardown: a buffered query tears down when it returns, a
+        stream only when its reader is closed.
+
+        Returns ``(executing_query, tried_presign)``.
+        """
+        tried_presign = False
+        for alias, table_name in alias_to_table_name.items():
+            files = alias_to_files[alias]
+            cols = alias_to_columns[alias]
+
+            # Use VIEW (lazy, default). Set SUPERTABLE_DUCKDB_MATERIALIZE=table to revert.
+            used_presign = create_reflection_view_with_presign_retry(
+                con, self.storage, table_name, files, cols, log_prefix,
+            )
+            created_views.append(table_name)
+            if used_presign:
+                tried_presign = True
+
+        timer_capture("CREATING_REFLECTION")
+
+        # Per-query suffix so concurrent requests on the same table do not
+        # collide on a shared view name (CREATE OR REPLACE would silently
+        # corrupt a sibling query's view mid-execution).
+        query_suffix = _uuid.uuid4().hex[:8]
+        query_alias_to_name = dict(alias_to_table_name)
+
+        # Tombstone / system-column view — created for EVERY alias so the
+        # system columns (__rowid__, __timestamp__) are always stripped and
+        # the deletion-vector (when present) is anti-joined out.  Sits on
+        # the reflection table directly, before RBAC.
+        tombstone_views = getattr(reflection, "tombstone_views", None) or {}
+        for alias in list(query_alias_to_name.keys()):
+            source = query_alias_to_name[alias]
+            tomb_def = tombstone_views.get(alias)
+            view = f"tomb_{source}_{query_suffix}"
+            # Reuse a materialised deletion-vector table when the cache is
+            # enabled and the alias has a stable key; otherwise the call
+            # falls back to the inline read_parquet path (dv_table=None).
+            cache_key = getattr(tomb_def, "cache_key", None) if tomb_def else None
+            tomb_path = getattr(tomb_def, "tombstone_path", None) if tomb_def else None
+            dv_table = self._tombstone_cache.acquire(con, cache_key, tomb_path)
+            if dv_table:
+                acquired_dv_keys.append(cache_key)
+            create_tombstone_view(con, source, view, tomb_def, dv_table=dv_table)
+            created_views.append(view)
+            query_alias_to_name[alias] = view
+
+        # RBAC views (column + row filtering) on top of stripped data.
+        rbac_views = getattr(reflection, "rbac_views", None) or {}
+        if rbac_views:
+            for alias in list(query_alias_to_name.keys()):
+                view_def = rbac_views.get(alias)
+                if view_def:
+                    source = query_alias_to_name[alias]
+                    view = f"rbac_{source}_{query_suffix}"
+                    create_rbac_view(con, source, view, view_def)
+                    created_views.append(view)
+                    query_alias_to_name[alias] = view
+
+        executing_query = rewrite_query_with_hashed_tables(
+            parser.original_query, query_alias_to_name,
+        )
+        # EXPLAIN [ANALYZE] wrapper: ask DuckDB for the plan of the rewritten
+        # query (over the reflection/tombstone/RBAC view chain) instead of
+        # the rows. The prefix is applied to the final SQL so the plan
+        # reflects exactly what a real read would execute.
+        if explain:
+            _opts = (explain_options or "").strip()
+            executing_query = (
+                f"EXPLAIN {(_opts + ' ') if _opts else ''}{executing_query}"
+            )
+        parser.executing_query = executing_query
+
+        return executing_query, tried_presign
+
+
+
     def execute(
             self,
             reflection: Reflection,
@@ -222,72 +324,11 @@ class DuckDBEngine:
         # Deletion-vector cache keys acquired this query — released in finally.
         acquired_dv_keys: List[str] = []
         try:
-            for alias, table_name in alias_to_table_name.items():
-                files = alias_to_files[alias]
-                cols = alias_to_columns[alias]
-
-                # Use VIEW (lazy, default). Set SUPERTABLE_DUCKDB_MATERIALIZE=table to revert.
-                used_presign = create_reflection_view_with_presign_retry(
-                    con, self.storage, table_name, files, cols, log_prefix,
-                )
-                created_views.append(table_name)
-                if used_presign:
-                    tried_presign = True
-
-            timer_capture("CREATING_REFLECTION")
-
-            # Per-query suffix so concurrent requests on the same table do not
-            # collide on a shared view name (CREATE OR REPLACE would silently
-            # corrupt a sibling query's view mid-execution).
-            query_suffix = _uuid.uuid4().hex[:8]
-            query_alias_to_name = dict(alias_to_table_name)
-
-            # Tombstone / system-column view — created for EVERY alias so the
-            # system columns (__rowid__, __timestamp__) are always stripped and
-            # the deletion-vector (when present) is anti-joined out.  Sits on
-            # the reflection table directly, before RBAC.
-            tombstone_views = getattr(reflection, "tombstone_views", None) or {}
-            for alias in list(query_alias_to_name.keys()):
-                source = query_alias_to_name[alias]
-                tomb_def = tombstone_views.get(alias)
-                view = f"tomb_{source}_{query_suffix}"
-                # Reuse a materialised deletion-vector table when the cache is
-                # enabled and the alias has a stable key; otherwise the call
-                # falls back to the inline read_parquet path (dv_table=None).
-                cache_key = getattr(tomb_def, "cache_key", None) if tomb_def else None
-                tomb_path = getattr(tomb_def, "tombstone_path", None) if tomb_def else None
-                dv_table = self._tombstone_cache.acquire(con, cache_key, tomb_path)
-                if dv_table:
-                    acquired_dv_keys.append(cache_key)
-                create_tombstone_view(con, source, view, tomb_def, dv_table=dv_table)
-                created_views.append(view)
-                query_alias_to_name[alias] = view
-
-            # RBAC views (column + row filtering) on top of stripped data.
-            rbac_views = getattr(reflection, "rbac_views", None) or {}
-            if rbac_views:
-                for alias in list(query_alias_to_name.keys()):
-                    view_def = rbac_views.get(alias)
-                    if view_def:
-                        source = query_alias_to_name[alias]
-                        view = f"rbac_{source}_{query_suffix}"
-                        create_rbac_view(con, source, view, view_def)
-                        created_views.append(view)
-                        query_alias_to_name[alias] = view
-
-            executing_query = rewrite_query_with_hashed_tables(
-                parser.original_query, query_alias_to_name,
+            executing_query, tried_presign = self._build_view_chain(
+                con, reflection, parser, alias_to_table_name, alias_to_files,
+                alias_to_columns, created_views, acquired_dv_keys,
+                timer_capture, log_prefix, explain, explain_options,
             )
-            # EXPLAIN [ANALYZE] wrapper: ask DuckDB for the plan of the rewritten
-            # query (over the reflection/tombstone/RBAC view chain) instead of
-            # the rows. The prefix is applied to the final SQL so the plan
-            # reflects exactly what a real read would execute.
-            if explain:
-                _opts = (explain_options or "").strip()
-                executing_query = (
-                    f"EXPLAIN {(_opts + ' ') if _opts else ''}{executing_query}"
-                )
-            parser.executing_query = executing_query
 
             # Profiling PRAGMAs are connection-level state.  Under concurrent
             # queries the last SET wins — one query's profile may land in the
@@ -334,3 +375,174 @@ class DuckDBEngine:
                 except Exception:
                     pass
 
+    # ------------------------------------------------------------------
+    # Streaming execution
+    # ------------------------------------------------------------------
+
+    def stream(
+            self,
+            reflection: Reflection,
+            parser: SQLParser,
+            query_manager: QueryPlanManager,
+            timer_capture,
+            log_prefix: str = "",
+            engine_config=None,
+            batch_rows: int = 0,
+    ) -> "StreamHandle":
+        """Execute and return an Arrow reader instead of a materialised frame.
+
+        ``execute`` calls ``fetchdf()``, which builds the WHOLE result in memory
+        before the caller sees a row — the reason unbounded queries needed a
+        LIMIT. This returns a ``pyarrow.RecordBatchReader`` that DuckDB fills
+        incrementally: measured on a 5M-row query, the first batch arrived in
+        13.7ms out of 541ms total.
+
+        The query runs on a dedicated CURSOR, not on the shared connection.
+        A cursor sees views created on its parent, so the view chain is built
+        once on the shared connection and read from the cursor; meanwhile the
+        shared connection stays free for other queries, and ``interrupt()`` on
+        the cursor cancels THIS stream without touching anything else. Both are
+        verified in test_streaming_engine.
+
+        The caller must close the returned handle. Views and deletion-vector
+        references stay alive until it does — they are what the reader is
+        reading through.
+        """
+        with self._lock:
+            try:
+                con = self._get_connection(temp_dir=query_manager.temp_dir)
+            except Exception:
+                self._reset_connection()
+                con = self._get_connection(temp_dir=query_manager.temp_dir)
+
+        timer_capture("CONNECTING")
+
+        snapshots_by_key = {
+            (sup.super_name, sup.simple_name): sup for sup in reflection.supers
+        }
+        alias_to_table_name, alias_to_files, alias_to_columns = {}, {}, {}
+        for td in parser.get_table_tuples():
+            sup = snapshots_by_key.get((td.super_name, td.simple_name))
+            if not sup:
+                continue
+            cols = list(td.columns or [])
+            if cols:
+                lower = {x.lower() for x in cols}
+                for c in (ROWID_SYSTEM_COL, TIMESTAMP_SYSTEM_COL):
+                    if c not in lower:
+                        cols.append(c)
+            alias_to_table_name[td.alias] = hashed_table_name(
+                sup.super_name, sup.simple_name, sup.simple_version, cols,
+            )
+            alias_to_files[td.alias] = list(sup.files)
+            alias_to_columns[td.alias] = cols
+
+        self._ensure_httpfs(
+            con, [f for files in alias_to_files.values() for f in files],
+        )
+
+        created_views: List[str] = []
+        acquired_dv_keys: List[str] = []
+        cursor = None
+        try:
+            executing_query, _ = self._build_view_chain(
+                con, reflection, parser, alias_to_table_name, alias_to_files,
+                alias_to_columns, created_views, acquired_dv_keys,
+                timer_capture, log_prefix,
+            )
+            apply_runtime_pragmas(con, engine_config)
+
+            cursor = con.cursor()
+            rows = int(batch_rows or settings.SUPERTABLE_STREAM_BATCH_ROWS)
+            logger.debug(f"{log_prefix}[duckdb.stream] {executing_query}")
+            result = cursor.execute(executing_query)
+            reader = (result.to_arrow_reader(rows)
+                      if hasattr(result, "to_arrow_reader")
+                      else result.fetch_record_batch(rows))
+            return StreamHandle(
+                reader=reader, cursor=cursor, connection=con,
+                views=created_views, dv_keys=acquired_dv_keys,
+                cache=self._tombstone_cache,
+            )
+        except Exception:
+            # Nothing will close the handle if we never return one.
+            StreamHandle(
+                reader=None, cursor=cursor, connection=con,
+                views=created_views, dv_keys=acquired_dv_keys,
+                cache=self._tombstone_cache,
+            ).close()
+            raise
+
+
+class StreamHandle:
+    """An open Arrow stream plus everything that must outlive it.
+
+    A streamed result is not self-contained: it reads through per-query views
+    and a materialised deletion-vector table. Dropping those while the reader is
+    still open would fail the query mid-flight, so teardown is deferred to
+    ``close`` instead of happening when the producing call returns.
+
+    ``cancel`` is safe from another thread — that is the whole point. It
+    interrupts the cursor, which raises inside whichever ``read_next_batch``
+    is in flight.
+    """
+
+    def __init__(self, reader, cursor, connection, views, dv_keys, cache):
+        self.reader = reader
+        self._cursor = cursor
+        self._con = connection
+        self._views = views
+        self._dv_keys = dv_keys
+        self._cache = cache
+        self._closed = False
+
+    @property
+    def schema(self):
+        return self.reader.schema if self.reader is not None else None
+
+    def batches(self):
+        """Yield record batches until exhausted, then release resources."""
+        if self.reader is None:
+            return
+        try:
+            for batch in self.reader:
+                yield batch
+        finally:
+            self.close()
+
+    def cancel(self) -> None:
+        """Interrupt the in-flight read. Safe to call from another thread."""
+        if self._cursor is not None:
+            try:
+                self._cursor.interrupt()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for obj in (self.reader, self._cursor):
+            try:
+                if obj is not None and hasattr(obj, "close"):
+                    obj.close()
+            except Exception:
+                pass
+        # Views last: the reader was reading through them.
+        for view in reversed(self._views):
+            try:
+                self._con.execute(f"DROP VIEW IF EXISTS {view};")
+            except Exception:
+                pass
+        for key in self._dv_keys:
+            try:
+                self._cache.release(self._con, key)
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+        return False
