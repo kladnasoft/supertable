@@ -256,124 +256,19 @@ class DuckDBEngine:
 
 
 
-    def execute(
-            self,
-            reflection: Reflection,
-            parser: SQLParser,
-            query_manager: QueryPlanManager,
-            timer_capture,
-            log_prefix: str = "",
-            engine_config=None,
-            explain: bool = False,
-            explain_options: str = "",
-    ) -> pd.DataFrame:
-        tried_presign = False
-
-        with self._lock:
-            try:
-                con = self._get_connection(temp_dir=query_manager.temp_dir)
-            except Exception:
-                self._reset_connection()
-                con = self._get_connection(temp_dir=query_manager.temp_dir)
-
-        timer_capture("CONNECTING")
-
-        snapshots_by_key = {
-            (sup.super_name, sup.simple_name): sup
-            for sup in reflection.supers
-        }
-        table_defs = parser.get_table_tuples()
-
-        alias_to_table_name = {}
-        alias_to_files = {}
-        alias_to_columns = {}
-
-        for td in table_defs:
-            key = (td.super_name, td.simple_name)
-            sup = snapshots_by_key.get(key)
-            if not sup:
-                continue
-
-            cols = list(td.columns or [])
-
-            # When specific columns are requested, also pull the system
-            # columns (__rowid__/__timestamp__) so the tombstone view can
-            # anti-join on __rowid__ and then statically EXCLUDE both from
-            # the output. Every written file carries both columns, so they
-            # are always threaded in. A bare SELECT * (cols == []) already
-            # carries them.
-            if cols:
-                lower = {x.lower() for x in cols}
-                for c in ("__rowid__", "__timestamp__"):
-                    if c not in lower:
-                        cols.append(c)
-
-            name = hashed_table_name(
-                sup.super_name, sup.simple_name, sup.simple_version, cols,
-            )
-            alias_to_table_name[td.alias] = name
-            alias_to_files[td.alias] = list(sup.files)
-            alias_to_columns[td.alias] = cols
-
-        # Ensure httpfs is configured on the persistent connection (once only).
-        all_files = [f for files in alias_to_files.values() for f in files]
-        self._ensure_httpfs(con, all_files)
-
-        # Create per-query VIEWs. Dropped in finally regardless of outcome.
-        created_views: List[str] = []
-        # Deletion-vector cache keys acquired this query — released in finally.
-        acquired_dv_keys: List[str] = []
-        try:
-            executing_query, tried_presign = self._build_view_chain(
-                con, reflection, parser, alias_to_table_name, alias_to_files,
-                alias_to_columns, created_views, acquired_dv_keys,
-                timer_capture, log_prefix, explain, explain_options,
-            )
-
-            # Profiling PRAGMAs are connection-level state.  Under concurrent
-            # queries the last SET wins — one query's profile may land in the
-            # wrong file.  This is acceptable: profiling is best-effort
-            # diagnostics, and query_plan_path is already unique per query
-            # (contains query_id) so profiles never overwrite on disk.
-            # A lock here would serialise execution on a shared connection
-            # and destroy DuckDB's concurrent-read capability.
-            try:
-                con.execute("PRAGMA enable_profiling='json';")
-                con.execute(f"PRAGMA profile_output='{query_manager.query_plan_path}';")
-            except Exception:
-                pass
-
-            # Re-apply live engine config (memory/threads/http/cache) so UI
-            # changes take effect on this persistent connection per query.
-            apply_runtime_pragmas(con, engine_config)
-
-            logger.debug(f"{log_prefix}[duckdb] executing: {executing_query}")
-            result = con.execute(executing_query).fetchdf()
-
-            if tried_presign:
-                logger.debug(f"{log_prefix}[duckdb] presigned fallback succeeded")
-
-            return result
-
-        finally:
-            # Disable profiling so cleanup DDL is not captured.
-            try:
-                con.execute("PRAGMA disable_profiling;")
-            except Exception:
-                pass
-            # Drop all per-query VIEWs in reverse creation order.
-            for view in reversed(created_views):
-                try:
-                    con.execute(f"DROP VIEW IF EXISTS {view};")
-                except Exception:
-                    pass
-            # Release deletion-vector refs now the views referencing them are
-            # gone; this may evict + DROP unreferenced DV tables over capacity.
-            for cache_key in acquired_dv_keys:
-                try:
-                    self._tombstone_cache.release(con, cache_key)
-                except Exception:
-                    pass
+    # ------------------------------------------------------------------
+    # Execution
+    # ------------------------------------------------------------------
+    #
+    # There is no buffered execute() here any more. It called fetchdf(),
+    # which built the whole result in memory before the caller saw a row —
+    # the reason unbounded queries needed a LIMIT — and it was a SECOND
+    # implementation of the view chain that could drift from the streamed
+    # one. Buffering is now a consumer: Executor.execute drains stream()
+    # through arrow_result.materialize.
+    #
+    # Removing it also removed fetchdf's float64 coercion of DuckDB's
+    # decimal128 sums, which silently corrupted integer totals above 2**53.
 
     # ------------------------------------------------------------------
     # Streaming execution
@@ -388,6 +283,8 @@ class DuckDBEngine:
             log_prefix: str = "",
             engine_config=None,
             batch_rows: int = 0,
+            explain: bool = False,
+            explain_options: str = "",
     ) -> "StreamHandle":
         """Execute and return an Arrow reader instead of a materialised frame.
 
@@ -448,7 +345,7 @@ class DuckDBEngine:
             executing_query, _ = self._build_view_chain(
                 con, reflection, parser, alias_to_table_name, alias_to_files,
                 alias_to_columns, created_views, acquired_dv_keys,
-                timer_capture, log_prefix,
+                timer_capture, log_prefix, explain, explain_options,
             )
             apply_runtime_pragmas(con, engine_config)
 

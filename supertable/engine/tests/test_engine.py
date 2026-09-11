@@ -10,7 +10,8 @@ Covers:
   - data_estimator: get_missing_columns, DataEstimator.estimate
   - engine_enum:   Engine enum values
   - executor:      Executor routing (lite / pro / spark_sql / auto)
-  - duckdb:        DuckDBEngine.execute
+  - duckdb:        DuckDBEngine.stream (execute() was removed; buffering
+                   is Executor.execute draining the stream)
   - spark_sql:  SparkThriftExecutor helpers & execute flow
 """
 
@@ -1559,7 +1560,9 @@ class TestDuckDBEngine:
         qm.query_plan_path = "/tmp/plan.json"
 
         captures = []
-        DuckDBEngine(storage=MagicMock()).execute(
+        # execute() is gone: buffering is now a consumer of stream(), so the
+        # timer captures belong to the streaming path.
+        DuckDBEngine(storage=MagicMock()).stream(
             reflection, parser, qm, lambda e: captures.append(e)
         )
         assert "CONNECTING" in captures
@@ -1585,7 +1588,7 @@ class TestDuckDBEngine:
             parser = MagicMock()
             parser.get_table_tuples.return_value = []
             with pytest.raises(RuntimeError):
-                DuckDBEngine().execute(
+                DuckDBEngine().stream(
                     Reflection("m", 0, 0, []), parser, MagicMock(), lambda e: None)
             # init_connection raises before the shared slot is assigned, so
             # _reset_connection is a no-op and close() is never called on the

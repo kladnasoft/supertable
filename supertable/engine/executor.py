@@ -14,6 +14,7 @@ from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
 
 from supertable.config.settings import settings
+from supertable.engine.arrow_result import materialize
 from supertable.engine.engine_enum import Engine
 from supertable.engine.duckdb import DuckDBEngine
 from supertable.engine.engine_config import resolve_engine_configs, EngineRuntimeConfig
@@ -160,6 +161,8 @@ class Executor:
         log_prefix: str,
         engine: Engine = Engine.AUTO,
         batch_rows: int = 0,
+        explain: bool = False,
+        explain_options: str = "",
     ):
         """Return an open Arrow stream for this query.
 
@@ -195,8 +198,10 @@ class Executor:
             query_manager=query_manager,
             timer_capture=timer_capture,
             log_prefix=log_prefix,
-            engine_config=cfgs["lite"],
+            engine_config=duck_cfg,
             batch_rows=batch_rows,
+            explain=explain,
+            explain_options=explain_options,
         )
 
     def execute(
@@ -223,8 +228,12 @@ class Executor:
         def timer_capture(evt: str):
             timer.capture_and_reset_timing(evt)
 
+        # Buffering is now just a consumer that keeps every batch. There is
+        # one read implementation, so a buffered result and a streamed result
+        # cannot drift — they are produced by the same code with the same view
+        # chain, the same deletion-vector anti-join and the same RBAC filter.
         if chosen == Engine.DUCKDB:
-            df = self.duck_exec.execute(
+            handle = self.duck_exec.stream(
                 reflection=reflection,
                 parser=parser,
                 query_manager=query_manager,
@@ -234,19 +243,20 @@ class Executor:
                 explain=explain,
                 explain_options=explain_options,
             )
+            df = materialize(handle)
             used = "duckdb"
 
         elif chosen == Engine.SPARK_SQL:
-            self._get_spark()
-            # force=True when user explicitly requested Spark (not via AUTO)
-            df = self.spark_exec.execute(
+            handle = self._get_spark().execute(
                 reflection=reflection,
                 parser=parser,
                 query_manager=query_manager,
                 timer_capture=timer_capture,
                 log_prefix=log_prefix,
                 force=(engine == Engine.SPARK_SQL),
+                stream_batch_rows=settings.SUPERTABLE_STREAM_BATCH_ROWS,
             )
+            df = materialize(handle)
             used = "spark_sql"
 
         else:
