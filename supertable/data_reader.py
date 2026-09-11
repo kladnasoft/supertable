@@ -579,21 +579,24 @@ def query_sql(
     if status == Status.ERROR:
         raise RuntimeError(f"Query execution failed: {message}")
 
-    # Convert DataFrame to the expected format
+    # Convert the frame to the expected format.
     columns = list(result_df.columns)
 
-    # Sanitize pandas NA variants (pd.NA, pd.NaT, np.nan) to Python None
-    # so downstream JSON serialization does not choke on NAType.
-    # Note: DataFrame.where() + .values.tolist() does NOT fully sanitize
-    # nullable dtypes (Int64, string) or np.nan in float columns.
-    # We must sanitize the final Python objects after .tolist().
-    rows = result_df.values.tolist()
-    for row in rows:
-        for i, val in enumerate(row):
-            if val is pd.NA or val is pd.NaT:
-                row[i] = None
-            elif isinstance(val, float) and math.isnan(val):
-                row[i] = None
+    # polars.rows() yields Python tuples with real None for nulls, so the
+    # pandas NA sanitisation that used to live here is gone: pd.NA, pd.NaT and
+    # np.nan only ever appeared because pandas cannot represent a null inside a
+    # numeric column. `.values.tolist()` also forced every row through a shared
+    # numpy dtype, which upcast integers to float for exactly the same reason.
+    if hasattr(result_df, "rows"):
+        rows = [list(r) for r in result_df.rows()]
+    else:                                   # pandas fallback for old callers
+        rows = result_df.values.tolist()
+        for row in rows:
+            for i, val in enumerate(row):
+                if val is pd.NA or val is pd.NaT:
+                    row[i] = None
+                elif isinstance(val, float) and math.isnan(val):
+                    row[i] = None
 
     # Create basic column metadata
     columns_meta = [
