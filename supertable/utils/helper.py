@@ -1,7 +1,6 @@
 # route: supertable.utils.helper
 import hashlib
 import secrets
-import pandas as pd
 
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -15,10 +14,13 @@ def dict_keys_to_lowercase(dict_to_change: Dict[str, Any]) -> Dict[str, Any]:
     return {key.lower(): value for key, value in dict_to_change.items()}
 
 
-def collect_schema(model_df: pd.DataFrame) -> Dict[str, str]:
+def collect_schema(model_df) -> Dict[str, str]:
     """
-    Collects the schema (column names and dtypes) of a Pandas DataFrame.
+    Collects the schema (column names and dtypes) of a DataFrame.
     Returns a dictionary mapping column name -> dtype as string.
+
+    Frame-agnostic on purpose: polars and pandas both expose ``.columns`` and a
+    per-column ``.dtype``, so this needs no knowledge of which one it has.
     """
     return {col: str(model_df[col].dtype) for col in model_df.columns}
 

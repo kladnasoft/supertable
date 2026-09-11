@@ -10,7 +10,7 @@ import threading
 import uuid
 from typing import Dict, List, Optional
 
-import pandas as pd
+import polars as pl
 import pyarrow as pa
 
 from supertable.config.defaults import logger
@@ -1082,10 +1082,13 @@ class SparkThriftExecutor:
                     log_prefix=log_prefix,
                 )
 
-            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            # Buffered fallback. Executor always streams, but execute() is
+            # called directly too, so this stays — returning polars rather than
+            # pandas, which cannot hold a null inside a numeric column.
+            columns = [d[0] for d in cursor.description] if cursor.description else []
             rows = cursor.fetchall()
-
-            result = pd.DataFrame(rows, columns=columns) if columns else pd.DataFrame()
+            result = (pl.DataFrame(rows, schema=columns, orient="row")
+                      if columns else pl.DataFrame())
 
             logger.info(
                 f"{log_prefix}[spark.thrift] query complete: "

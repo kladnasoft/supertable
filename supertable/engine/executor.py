@@ -6,7 +6,6 @@ import os
 import time
 from typing import Optional, Tuple
 
-import pandas as pd
 import polars as pl
 
 from supertable.engine.plan_stats import PlanStats

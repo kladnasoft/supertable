@@ -7,7 +7,6 @@ import uuid as _uuid
 from typing import Optional, List
 
 import duckdb
-import pandas as pd
 
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
