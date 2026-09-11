@@ -13,6 +13,7 @@ from supertable.utils.timer import Timer
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
 
+from supertable.config.settings import settings
 from supertable.engine.engine_enum import Engine
 from supertable.engine.duckdb import DuckDBEngine
 from supertable.engine.engine_config import resolve_engine_configs, EngineRuntimeConfig
@@ -141,6 +142,15 @@ class Executor:
         )
         return chosen
 
+    def _get_spark(self):
+        """Lazily build the Spark executor; shared by execute() and stream()."""
+        if self.spark_exec is None:
+            from supertable.engine.spark_thrift import SparkThriftExecutor
+            self.spark_exec = SparkThriftExecutor(
+                storage=self.storage, organization=self.organization,
+            )
+        return self.spark_exec
+
     def stream(
         self,
         reflection: Reflection,
@@ -148,18 +158,36 @@ class Executor:
         query_manager: QueryPlanManager,
         timer: Timer,
         log_prefix: str,
+        engine: Engine = Engine.AUTO,
         batch_rows: int = 0,
     ):
         """Return an open Arrow stream for this query.
 
-        DuckDB only. Spark's path materialises through a collect, so routing a
-        stream there would silently reintroduce the very buffering streaming
-        exists to avoid — better to be explicit than to quietly not stream.
+        Both engines stream. DuckDB pulls Arrow batches straight out of the
+        result; Spark pulls rows with ``fetchmany`` over Thrift and converts
+        each batch to Arrow. Neither collects the whole result first.
+
+        AUTO routes the same way a buffered query would, so a caller does not
+        get a different engine merely for asking to stream.
         """
         cfgs = resolve_engine_configs(self.organization, self._get_catalog())
+        duck_cfg = cfgs["lite"]
+        chosen = engine if engine != Engine.AUTO else self._auto_pick(
+            reflection, duck_cfg)
 
         def timer_capture(evt: str):
             timer.capture_and_reset_timing(evt)
+
+        if chosen == Engine.SPARK_SQL:
+            rows = int(batch_rows or settings.SUPERTABLE_STREAM_BATCH_ROWS)
+            return self._get_spark().execute(
+                reflection=reflection,
+                parser=parser,
+                query_manager=query_manager,
+                timer_capture=timer_capture,
+                log_prefix=log_prefix,
+                stream_batch_rows=rows,
+            )
 
         return self.duck_exec.stream(
             reflection=reflection,
@@ -209,11 +237,7 @@ class Executor:
             used = "duckdb"
 
         elif chosen == Engine.SPARK_SQL:
-            if self.spark_exec is None:
-                from supertable.engine.spark_thrift import SparkThriftExecutor
-                self.spark_exec = SparkThriftExecutor(
-                    storage=self.storage, organization=self.organization,
-                )
+            self._get_spark()
             # force=True when user explicitly requested Spark (not via AUTO)
             df = self.spark_exec.execute(
                 reflection=reflection,

@@ -506,6 +506,16 @@ class TestReadWriteDuckDBParity:
     configure DuckDB identically — same pragmas, same pinned home directory."""
 
     def test_helper_matches_read_executor_settings(self, tmp_path):
+        # Compare two FRESH connections. The read connection is shared per
+        # thread and every query re-applies live config to it through
+        # apply_runtime_pragmas, so a connection that has served a query no
+        # longer matches a newly initialised one — by design. Without this
+        # reset the test passes or fails purely on whether some earlier test in
+        # the session happened to run a query, which it did once the pruning
+        # corpus and the streaming suite were added.
+        from supertable.engine.duckdb import reset_shared_duckdb_state
+
+        reset_shared_duckdb_state()
         lite = DuckDBEngine(storage=None)
         con_read = lite._get_connection(temp_dir=str(tmp_path))
         con_write = new_duckdb_connection(temp_dir=str(tmp_path))
@@ -524,6 +534,9 @@ class TestReadWriteDuckDBParity:
                 con_read.close()
             except Exception:
                 pass
+            # The connection just closed is the shared one; leave no corpse
+            # behind for the next test to pick up.
+            reset_shared_duckdb_state()
 
     def test_helper_loads_httpfs_only_for_remote_paths(self, tmp_path, monkeypatch):
         calls = []

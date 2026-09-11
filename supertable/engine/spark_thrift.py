@@ -11,6 +11,7 @@ import uuid
 from typing import Dict, List, Optional
 
 import pandas as pd
+import pyarrow as pa
 
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
@@ -751,7 +752,10 @@ class SparkThriftExecutor:
             timer_capture,
             log_prefix: str = "",
             force: bool = False,
-    ) -> pd.DataFrame:
+            stream_batch_rows: int = 0,
+    ):
+        """Execute against Spark. Returns a DataFrame, or a SparkStreamHandle
+        when ``stream_batch_rows`` is set."""
         """
         Execute a query against a Spark Thrift Server.
 
@@ -778,6 +782,7 @@ class SparkThriftExecutor:
 
         conn = None
         cursor = None
+        handed_to_stream = False
         created_views: List[str] = []
         created_tables: List[str] = []
 
@@ -1061,7 +1066,22 @@ class SparkThriftExecutor:
                     f"during query execution"
                 )
 
-            # 7. Fetch results as pandas
+            # 7. Return the rows — streamed, or collected.
+            if stream_batch_rows:
+                # Ownership of the cursor, connection and temp views passes to
+                # the handle; the finally block below must not tear down what
+                # the reader is still reading through.
+                handed_to_stream = True
+                logger.info(
+                    f"{log_prefix}[spark.thrift] streaming result in batches "
+                    f"of {stream_batch_rows}"
+                )
+                return SparkStreamHandle(
+                    cursor=cursor, connection=conn, views=created_views,
+                    tables=created_tables, batch_rows=stream_batch_rows,
+                    log_prefix=log_prefix,
+                )
+
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
             rows = cursor.fetchall()
 
@@ -1085,7 +1105,10 @@ class SparkThriftExecutor:
             # Cancel the watchdog so it doesn't fire after we're done.
             _timed_out.set()
 
-            # 8. Cleanup: drop RBAC views and temp tables
+            # 8. Cleanup: drop RBAC views and temp tables.
+            # Skipped when a stream handle owns them — it tears down on close.
+            if handed_to_stream:
+                return
             if cursor:
                 for view in created_views:
                     try:
@@ -1107,3 +1130,148 @@ class SparkThriftExecutor:
                     conn.close()
                 except Exception:
                     pass
+
+
+# ---------------------------------------------------------------------------
+# Streaming
+# ---------------------------------------------------------------------------
+
+#: HiveServer2 type names -> Arrow. The schema is fixed once from the cursor
+#: description so every batch shares it; inferring per batch would let an
+#: all-NULL column in one batch disagree with a typed column in the next, and
+#: pyarrow would then refuse to build the table.
+_HIVE_TO_ARROW = {
+    "BOOLEAN_TYPE": pa.bool_(),
+    "TINYINT_TYPE": pa.int8(),
+    "SMALLINT_TYPE": pa.int16(),
+    "INT_TYPE": pa.int32(),
+    "BIGINT_TYPE": pa.int64(),
+    "FLOAT_TYPE": pa.float32(),
+    "DOUBLE_TYPE": pa.float64(),
+    "STRING_TYPE": pa.string(),
+    "VARCHAR_TYPE": pa.string(),
+    "CHAR_TYPE": pa.string(),
+    "DATE_TYPE": pa.date32(),
+    "TIMESTAMP_TYPE": pa.timestamp("us"),
+    "BINARY_TYPE": pa.binary(),
+}
+
+
+def _spark_arrow_schema(description) -> Optional[pa.Schema]:
+    """Arrow schema from a PyHive cursor description, or None if unmappable.
+
+    Returning None is deliberate: an unknown Hive type is better handled by
+    letting pyarrow infer from the values than by guessing wrong and failing
+    every batch.
+    """
+    if not description:
+        return None
+    fields = []
+    for col in description:
+        name = col[0]
+        type_name = str(col[1]).upper() if len(col) > 1 and col[1] else ""
+        # DECIMAL carries precision/scale in the name; the exact form varies by
+        # server, so fall back to string rather than truncating a number.
+        arrow_type = _HIVE_TO_ARROW.get(type_name)
+        if arrow_type is None:
+            if type_name.startswith("DECIMAL"):
+                arrow_type = pa.decimal128(38, 18)
+            else:
+                return None
+        fields.append(pa.field(name.split(".")[-1], arrow_type))
+    return pa.schema(fields)
+
+
+class SparkStreamHandle:
+    """An open Spark result set, pulled in batches instead of collected.
+
+    ``execute`` ends in ``cursor.fetchall()``, which materialises the entire
+    result in the client before anything is returned — the same problem the
+    DuckDB path had. ``fetchmany`` pulls a bounded number of rows per round
+    trip, so a large export flows through rather than accumulating.
+
+    Teardown is deferred here rather than in ``execute``'s ``finally``: the
+    temp views and the connection are what the reader is reading through, so
+    dropping them on return would kill the stream.
+    """
+
+    def __init__(self, cursor, connection, views, tables, batch_rows,
+                 log_prefix="", schema=None):
+        self._cursor = cursor
+        self._con = connection
+        self._views = list(views or [])
+        self._tables = list(tables or [])
+        self._batch_rows = max(1, int(batch_rows))
+        self._log_prefix = log_prefix
+        self._closed = False
+        self.rows_streamed = 0
+        self.on_close = None
+        self.schema = schema or _spark_arrow_schema(
+            getattr(cursor, "description", None))
+
+    def _to_batch(self, rows) -> pa.RecordBatch:
+        # Rows arrive as tuples; Arrow wants columns.
+        columns = list(zip(*rows)) if rows else []
+        if self.schema is not None:
+            arrays = [pa.array(list(col), type=self.schema.field(i).type)
+                      for i, col in enumerate(columns)]
+            return pa.RecordBatch.from_arrays(arrays, schema=self.schema)
+        names = [d[0].split(".")[-1]
+                 for d in (self._cursor.description or [])]
+        arrays = [pa.array(list(col)) for col in columns]
+        batch = pa.RecordBatch.from_arrays(arrays, names=names)
+        # Freeze the inferred schema so later batches match this one.
+        self.schema = batch.schema
+        return batch
+
+    def batches(self):
+        try:
+            while True:
+                rows = self._cursor.fetchmany(self._batch_rows)
+                if not rows:
+                    break
+                self.rows_streamed += len(rows)
+                yield self._to_batch(rows)
+        finally:
+            self.close()
+
+    def cancel(self) -> None:
+        """Ask the Thrift server to abandon the operation.
+
+        Safe from another thread; that is the point. PyHive exposes cancel on
+        the cursor, which sends TCancelOperation rather than waiting for the
+        query to finish.
+        """
+        try:
+            self._cursor.cancel()
+        except Exception as e:
+            logger.debug(f"{self._log_prefix}[spark.stream] cancel failed: {e}")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for name in list(self._views) + list(self._tables):
+            try:
+                self._cursor.execute(f"DROP VIEW IF EXISTS {name}")
+            except Exception:
+                pass
+        for obj in (self._cursor, self._con):
+            try:
+                if obj is not None:
+                    obj.close()
+            except Exception:
+                pass
+        if self.on_close is not None:
+            try:
+                ncols = len(self.schema) if self.schema is not None else 0
+                self.on_close(self.rows_streamed, ncols)
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+        return False

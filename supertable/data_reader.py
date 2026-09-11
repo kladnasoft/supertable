@@ -398,6 +398,7 @@ class DataReader:
                     query_manager=self.query_plan_manager,
                     timer=self.timer,
                     log_prefix=self._lp(""),
+                    engine=exec_engine,
                     batch_rows=self._stream_out.get("batch_rows", 0),
                 )
                 self.timer.capture_and_reset_timing(event="EXECUTING_QUERY")
