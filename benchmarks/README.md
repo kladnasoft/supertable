@@ -157,12 +157,18 @@ were missing rows: `agg_30d_by_country`, `distinct_users_30d`,
 
 Comparing 3.0.8+ against an older baseline therefore reports correctness drift
 on exactly those five. That is the fix landing, not a regression. Compare
-against `read-3.0.8-full.json` or later.
+against `read-3.0.10-full.json`, the current baseline.
 
-The current seals are verified, not assumed: `read-3.0.8-full-fullscan.json` is
-the same suite with pruning disabled, and all 16 seals match the pruned run —
-so pruning provably returns what reading every file returns. Regenerate both
+The current seals are verified, not assumed: `read-3.0.10-full-fullscan.json`
+is the same suite with pruning disabled, and all 16 seals match the pruned run
+— so pruning provably returns what reading every file returns. Regenerate both
 together and keep them in step.
+
+3.0.10 seals are identical to 3.0.8's, so the further pruning fixes it carries
+(a bare string against a DATE column; column attribution across derived-table
+boundaries) changed no result the suite covers. They were found by the
+generated corpus instead — `scripts/pruning_audit.py`, 4,388 queries — which is
+the tool to reach for when a pruning change needs proving.
 
 A note on provenance: `read-3.0.3-full.json` was captured on a dirty working
 tree (`compare` warns about this), so it does not correspond to any commit.
