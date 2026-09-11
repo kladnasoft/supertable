@@ -472,3 +472,85 @@ def test_fire_and_forget_export_completes_without_a_consumer():
     assert final.state == "done", f"{final.state}: {final.error}"
     assert final.rows == D.table_row_counts()["facts"]
     store.delete(D.ORG, rec.job_id)
+
+
+# --------------------------------------------------------------------------
+# Shutdown
+# --------------------------------------------------------------------------
+
+def test_cancel_after_close_is_a_noop():
+    """The use-after-free that aborted the process.
+
+    A watcher thread could call interrupt() on a cursor the main thread had
+    already closed, reaching freed DuckDB C++ state:
+
+        terminate called without an active exception
+
+    Reproduced 2 runs in 6 before the guard; 0 in 12 after. Being a race, the
+    count alone proves little — so the mechanism is pinned here directly.
+    """
+    from supertable.data_reader import DataReader
+
+    handle = DataReader(super_name=D.SUPER, organization=D.ORG,
+                        query="SELECT * FROM facts", source="sdk",
+                        ).stream(role_name=D.ROLE, batch_rows=1_000)
+    next(handle.batches())
+    handle.close()
+    for _ in range(50):
+        handle.cancel()          # must not touch the freed cursor
+
+
+def test_shutdown_cancels_inflight_jobs():
+    from supertable.streaming import JobStore, submit_and_run
+    from supertable.streaming.runner import (
+        inflight_job_ids, shutdown, _SHUTTING_DOWN,
+    )
+
+    store = JobStore()
+    rec = submit_and_run(
+        D.ORG, D.SUPER,
+        "SELECT f.fact_id, e.ev_id FROM facts f, events e",
+        D.ROLE, background=True, batch_rows=4_000,
+    )
+    deadline = time.time() + 30
+    while time.time() < deadline and rec.job_id not in inflight_job_ids():
+        time.sleep(0.05)
+    assert rec.job_id in inflight_job_ids(), "job never registered as in-flight"
+
+    try:
+        stopped = shutdown(timeout=10.0)
+        assert stopped >= 1
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            if store.get(D.ORG, rec.job_id).state in (
+                    "cancelled", "done", "failed", "expired"):
+                break
+            time.sleep(0.1)
+        assert store.get(D.ORG, rec.job_id).state != "running", (
+            "shutdown left a job running")
+    finally:
+        # Other tests in this module still need to start jobs.
+        _SHUTTING_DOWN.clear()
+        store.delete(D.ORG, rec.job_id)
+
+
+def test_finished_job_leaves_no_inflight_entry():
+    """A registry that only grows would leak a handle per job."""
+    from supertable.streaming import JobStore, run_job
+    from supertable.streaming.runner import inflight_job_ids
+
+    store = JobStore()
+    rec = store.create(D.ORG, D.SUPER, "SELECT * FROM facts", D.ROLE,
+                       batch_rows=8_000)
+    run_job(rec, store)
+    assert rec.job_id not in inflight_job_ids()
+    store.delete(D.ORG, rec.job_id)
+
+
+def test_shutdown_is_safe_with_nothing_running():
+    from supertable.streaming.runner import shutdown, _SHUTTING_DOWN
+
+    try:
+        assert shutdown(timeout=1.0) == 0
+    finally:
+        _SHUTTING_DOWN.clear()

@@ -12,10 +12,11 @@ is what lets them live in different containers.
 
 from __future__ import annotations
 
+import atexit
 import json
 import threading
 import time
-from typing import Callable, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 import pyarrow as pa
 
@@ -33,6 +34,92 @@ from supertable.streaming.jobs import (
     read_chunk,
     write_chunk,
 )
+
+
+# ---------------------------------------------------------------------------
+# In-flight jobs and orderly shutdown
+# ---------------------------------------------------------------------------
+#
+# A background job runs on a DAEMON thread so a request handler is not blocked
+# by a long export. Python abandons daemon threads at interpreter shutdown
+# without unwinding them, and a thread abandoned inside DuckDB's C++ layer
+# aborts the process:
+#
+#     terminate called without an active exception
+#
+# Reproduced 2 runs in 6 by cancelling a job and exiting immediately. It is a
+# race, so it shows up as an occasional core dump rather than a reliable
+# failure — the worst kind to leave in a container that gets SIGTERM on every
+# rolling deploy.
+#
+# The fix is to HAVE a shutdown: cancel in-flight streams so DuckDB unwinds
+# normally, then join briefly. atexit runs before daemon threads are abandoned,
+# which is what makes this possible.
+
+_INFLIGHT: Dict[str, Dict[str, Any]] = {}
+_INFLIGHT_LOCK = threading.Lock()
+_SHUTTING_DOWN = threading.Event()
+
+
+def _register(job_id: str, **entry) -> None:
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.setdefault(job_id, {}).update(entry)
+
+
+def _unregister(job_id: str) -> None:
+    with _INFLIGHT_LOCK:
+        _INFLIGHT.pop(job_id, None)
+
+
+def inflight_job_ids() -> List[str]:
+    """Jobs this process is currently running."""
+    with _INFLIGHT_LOCK:
+        return sorted(_INFLIGHT)
+
+
+def shutdown(timeout: float = 5.0) -> int:
+    """Stop in-flight jobs so the process can exit without aborting.
+
+    Cancelling first is what matters: it makes the query raise inside DuckDB
+    and unwind through normal C++ paths, instead of the thread being killed
+    mid-call. Joining afterwards is a courtesy with a bound — a job that will
+    not stop must not hold the container hostage.
+
+    Safe to call more than once, and safe when nothing is running.
+    """
+    _SHUTTING_DOWN.set()
+    with _INFLIGHT_LOCK:
+        entries = list(_INFLIGHT.items())
+    if not entries:
+        return 0
+
+    logger.info(f"[stream.shutdown] stopping {len(entries)} in-flight job(s)")
+    for _, entry in entries:
+        stop = entry.get("stop")
+        if stop is not None:
+            stop.set()
+        handle = entry.get("handle")
+        if handle is not None:
+            try:
+                handle.cancel()
+            except Exception:
+                pass
+
+    deadline = time.time() + timeout
+    for job_id, entry in entries:
+        thread = entry.get("thread")
+        if thread is None or not thread.is_alive():
+            continue
+        thread.join(max(0.0, deadline - time.time()))
+        if thread.is_alive():
+            logger.warning(
+                f"[stream.shutdown] job {job_id} did not stop within "
+                f"{timeout}s; it will be abandoned"
+            )
+    return len(entries)
+
+
+atexit.register(shutdown)
 
 
 class Cancelled(Exception):
@@ -147,15 +234,20 @@ def run_job(
         handle = reader.stream(role_name=rec.role_name,
                                batch_rows=rec.batch_rows,
                                fullscan=rec.fullscan)
+        _register(rec.job_id, handle=handle)
         schema = handle.schema
         store.update(rec, schema_json=schema.serialize().to_pybytes().hex()
                      if schema is not None else "")
 
         # Cancellation from another thread lands inside read_next_batch.
         stop = threading.Event()
+        _register(rec.job_id, stop=stop)
 
         def _watch():
             while not stop.wait(1.0):
+                if _SHUTTING_DOWN.is_set():
+                    handle.cancel()
+                    return
                 if rec.deadline_ts and time.time() > rec.deadline_ts:
                     handle.cancel()
                     return
@@ -170,6 +262,8 @@ def run_job(
         try:
             seen = 0
             for batch in handle.batches():
+                if _SHUTTING_DOWN.is_set():
+                    raise Cancelled("process is shutting down")
                 seen += 1
                 _check_stop(seen)
                 pending.append(batch)
@@ -215,8 +309,17 @@ def run_job(
             store.set_state(rec, JobState.FAILED, f"{type(e).__name__}: {e}")
             logger.error(f"[stream.job] {rec.job_id} failed: {e}")
     finally:
+        # Join the watcher before tearing the handle down, so it cannot call
+        # cancel() on a cursor that close() is freeing.
+        try:
+            stop.set()
+            if watcher.is_alive():
+                watcher.join(2.0)
+        except (NameError, UnboundLocalError):
+            pass                              # failed before the watcher existed
         if handle is not None:
             handle.close()
+        _unregister(rec.job_id)
     return rec
 
 
@@ -343,8 +446,10 @@ def submit_and_run(
                        deadline_sec=deadline_sec, batch_rows=batch_rows,
                        fullscan=fullscan)
     if background:
-        threading.Thread(target=run_job, args=(rec, store), daemon=True,
-                         name=f"stream-job-{rec.job_id}").start()
+        thread = threading.Thread(target=run_job, args=(rec, store), daemon=True,
+                                  name=f"stream-job-{rec.job_id}")
+        _register(rec.job_id, thread=thread)
+        thread.start()
     else:
         run_job(rec, store)
     return rec

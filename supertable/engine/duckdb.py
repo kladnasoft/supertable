@@ -495,6 +495,11 @@ class StreamHandle:
         self._dv_keys = dv_keys
         self._cache = cache
         self._closed = False
+        # Guards cancel/close against each other. Without it a watcher thread
+        # can call interrupt() on a cursor the main thread has already closed,
+        # which is a use-after-free in DuckDB's C++ layer and aborts the
+        # process with "terminate called without an active exception".
+        self._teardown_lock = threading.Lock()
         #: Rows handed to the consumer so far. A streamed query has no row
         #: count until it ends, so monitoring is written on close, not on
         #: execute — see DataReader.stream.
@@ -518,17 +523,26 @@ class StreamHandle:
             self.close()
 
     def cancel(self) -> None:
-        """Interrupt the in-flight read. Safe to call from another thread."""
-        if self._cursor is not None:
+        """Interrupt the in-flight read. Safe to call from another thread.
+
+        A no-op once closed: interrupting a cursor that has been torn down
+        reaches freed C++ state rather than a live query.
+        """
+        with self._teardown_lock:
+            if self._closed or self._cursor is None:
+                return
             try:
                 self._cursor.interrupt()
             except Exception:
                 pass
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._teardown_lock:
+            if self._closed:
+                return
+            # Set INSIDE the lock so a concurrent cancel() either interrupts a
+            # live cursor or sees closed — never interrupts one being freed.
+            self._closed = True
         for obj in (self.reader, self._cursor):
             try:
                 if obj is not None and hasattr(obj, "close"):

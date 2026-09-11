@@ -1204,6 +1204,9 @@ class SparkStreamHandle:
         self._batch_rows = max(1, int(batch_rows))
         self._log_prefix = log_prefix
         self._closed = False
+        # Same race as the DuckDB handle: cancel must not reach a cursor that
+        # close() is tearing down.
+        self._teardown_lock = threading.Lock()
         self.rows_streamed = 0
         self.on_close = None
         self.schema = schema or _spark_arrow_schema(
@@ -1242,15 +1245,20 @@ class SparkStreamHandle:
         the cursor, which sends TCancelOperation rather than waiting for the
         query to finish.
         """
-        try:
-            self._cursor.cancel()
-        except Exception as e:
-            logger.debug(f"{self._log_prefix}[spark.stream] cancel failed: {e}")
+        with self._teardown_lock:
+            if self._closed:
+                return
+            try:
+                self._cursor.cancel()
+            except Exception as e:
+                logger.debug(
+                    f"{self._log_prefix}[spark.stream] cancel failed: {e}")
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        with self._teardown_lock:
+            if self._closed:
+                return
+            self._closed = True
         for name in list(self._views) + list(self._tables):
             try:
                 self._cursor.execute(f"DROP VIEW IF EXISTS {name}")
