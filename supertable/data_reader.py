@@ -401,6 +401,32 @@ class DataReader:
                     batch_rows=self._stream_out.get("batch_rows", 0),
                 )
                 self.timer.capture_and_reset_timing(event="EXECUTING_QUERY")
+
+                # Monitoring for a streamed read is written when the stream
+                # CLOSES, not here: the row count does not exist yet. Without
+                # this a streaming query would be invisible to monitoring —
+                # exactly the long-running read you most want to see.
+                handle = self._stream_out["handle"]
+                qpm, timer, stats = (self.query_plan_manager, self.timer,
+                                     self.plan_stats)
+                lp = self._lp
+
+                def _record(rows: int, cols: int) -> None:
+                    try:
+                        extend_execution_plan(
+                            query_plan_manager=qpm,
+                            role_name=role_name,
+                            timing=timer.timings,
+                            plan_stats=stats,
+                            status=str(Status.OK.value),
+                            message="streamed",
+                            result_shape=(rows, cols),
+                        )
+                    except Exception as e:
+                        logger.error(lp(f"extend_execution_plan (stream): {e}"))
+
+                if handle is not None:
+                    handle.on_close = _record
                 return pd.DataFrame(), Status.OK, ""
             result_df, engine_used = executor.execute(
                 engine=exec_engine,

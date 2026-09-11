@@ -344,10 +344,22 @@ class Settings:
     # Target size of one spilled chunk. Chunks are the unit another instance
     # fetches, so this trades object count against per-object overhead.
     SUPERTABLE_STREAM_CHUNK_BYTES: int = 32 * 1024 * 1024
-    # How far the producer may run ahead of the consumer, in chunks. This is
-    # the backpressure knob: without it a large export would spill the entire
-    # result regardless of whether anyone is reading it.
-    SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS: int = 8
+    # How far the producer may run ahead of the consumer, in chunks.
+    # 0 (the default) means "do not wait for a consumer at all".
+    #
+    # A job exists precisely because the consumer may arrive later, from another
+    # container — so coupling the producer to it by default made a
+    # fire-and-forget export stall after a few chunks and never finish. Storage
+    # is bounded instead by SUPERTABLE_STREAM_MAX_SPILL_BYTES and by the job
+    # deadline, neither of which depends on anyone reading.
+    #
+    # Set this above 0 only for a live, attached consumer where you would rather
+    # slow the producer than spill ahead of the reader.
+    SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS: int = 0
+    # Hard cap on what one job may spill, bytes. 0 = unlimited. This is the
+    # real protection against an unbounded export: it does not care whether a
+    # consumer exists, so it cannot deadlock the way consumer coupling did.
+    SUPERTABLE_STREAM_MAX_SPILL_BYTES: int = 0
     # Default wall-clock budget for a streaming job, seconds. 0 = no deadline.
     SUPERTABLE_STREAM_DEADLINE_SEC: int = 3600
     # How long a finished job's spilled chunks and Redis keys survive.
@@ -626,7 +638,8 @@ def _build_settings() -> Settings:
         SUPERTABLE_TOMBSTONE_MAX_PARTS=_env_int("SUPERTABLE_TOMBSTONE_MAX_PARTS", 100),
         SUPERTABLE_STREAM_BATCH_ROWS=_env_int("SUPERTABLE_STREAM_BATCH_ROWS", 65_536),
         SUPERTABLE_STREAM_CHUNK_BYTES=_env_int("SUPERTABLE_STREAM_CHUNK_BYTES", 32 * 1024 * 1024),
-        SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS=_env_int("SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS", 8),
+        SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS=_env_int("SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS", 0),
+        SUPERTABLE_STREAM_MAX_SPILL_BYTES=_env_int("SUPERTABLE_STREAM_MAX_SPILL_BYTES", 0),
         SUPERTABLE_STREAM_DEADLINE_SEC=_env_int("SUPERTABLE_STREAM_DEADLINE_SEC", 3600),
         SUPERTABLE_STREAM_JOB_TTL_SEC=_env_int("SUPERTABLE_STREAM_JOB_TTL_SEC", 3600),
         SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES=_env_int("SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES", 64),

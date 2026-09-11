@@ -131,6 +131,10 @@ SYSTEM_SCOPE: str = "system"
 # ``supertable:{org}:lakes:{sup}:*``.
 LAKES_SCOPE: str = "lakes"
 
+#: Org-level scope for streaming query jobs. A query may span supertables, so
+#: a job cannot live under any single lake.
+QUERY_SCOPE: str = "query"
+
 # Position-2 literal under ``supertable:{org}:`` for org-wide runtime
 # telemetry. Lives at this level (not under ``system``) because
 # monitoring is high-volume runtime data, conceptually distinct from
@@ -604,10 +608,14 @@ def engine_duckdb(org: str) -> str:
 
 # --- Streaming query jobs --------------------------------------------------- #
 #
-# A streaming query is lake-scoped: it reads one supertable, so it sits beside
-# ``meta:`` and ``lock:`` rather than in the org system scope. The shape mirrors
-# the existing ``<area>:<kind>:doc:<id>`` convention so SCAN patterns and the
-# cleanup helpers behave the same way.
+# ORG-level, not lake-level. A query is not confined to one supertable — a
+# qualified join reaches across them:
+#
+#     SELECT * FROM sup_a.t1 JOIN sup_b.t2 ON ...
+#
+# resolves to two different supertables, so there is no single lake a job could
+# belong to. These sit beside ``monitor:`` under the org, which has the same
+# property for the same reason.
 #
 # Four keys per job, deliberately separate rather than one document:
 #
@@ -621,52 +629,38 @@ def engine_duckdb(org: str) -> str:
 #   index   a SET of live job ids for listing and for reaping orphans whose
 #           executor died without cleaning up.
 
-def query_job_doc(org: str, sup: str, job_id: str) -> str:
+def query_job_doc(org: str, job_id: str) -> str:
     """Streaming query job record (HASH)."""
-    return (
-        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
-        f":{_safe('sup', sup)}:query:job:doc:{_safe('job_id', job_id)}"
-    )
+    return (f"{SUPERTABLE_PREFIX}:{_safe('org', org)}"
+            f":{QUERY_SCOPE}:job:doc:{_safe('job_id', job_id)}")
 
 
-def query_job_chunks(org: str, sup: str, job_id: str) -> str:
+def query_job_chunks(org: str, job_id: str) -> str:
     """Ordered chunk manifest for one job (LIST, append-only)."""
-    return (
-        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
-        f":{_safe('sup', sup)}:query:job:chunks:{_safe('job_id', job_id)}"
-    )
+    return (f"{SUPERTABLE_PREFIX}:{_safe('org', org)}"
+            f":{QUERY_SCOPE}:job:chunks:{_safe('job_id', job_id)}")
 
 
-def query_job_cancel(org: str, sup: str, job_id: str) -> str:
+def query_job_cancel(org: str, job_id: str) -> str:
     """Cancellation flag for one job (STRING); presence means cancel."""
-    return (
-        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
-        f":{_safe('sup', sup)}:query:job:cancel:{_safe('job_id', job_id)}"
-    )
+    return (f"{SUPERTABLE_PREFIX}:{_safe('org', org)}"
+            f":{QUERY_SCOPE}:job:cancel:{_safe('job_id', job_id)}")
 
 
-def query_job_index(org: str, sup: str) -> str:
-    """Set of live job ids in this supertable (SET)."""
-    return (
-        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
-        f":{_safe('sup', sup)}:query:job:index"
-    )
+def query_job_index(org: str) -> str:
+    """Set of live job ids in this organization (SET)."""
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{QUERY_SCOPE}:job:index"
 
 
-def query_job_pattern(org: str, sup: str) -> str:
-    """SCAN pattern matching every key belonging to any job here."""
-    return (
-        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
-        f":{_safe('sup', sup)}:query:job:*"
-    )
+def query_job_pattern(org: str) -> str:
+    """SCAN pattern matching every key belonging to any job in this org."""
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{QUERY_SCOPE}:job:*"
 
 
-def query_job_subkey_pattern(org: str, sup: str, job_id: str) -> str:
+def query_job_subkey_pattern(org: str, job_id: str) -> str:
     """SCAN pattern matching every key belonging to ONE job."""
-    return (
-        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
-        f":{_safe('sup', sup)}:query:job:*:{_safe('job_id', job_id)}"
-    )
+    return (f"{SUPERTABLE_PREFIX}:{_safe('org', org)}"
+            f":{QUERY_SCOPE}:job:*:{_safe('job_id', job_id)}")
 
 
 # --- Locks ----------------------------------------------------------------- #

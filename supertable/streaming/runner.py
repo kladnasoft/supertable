@@ -67,7 +67,7 @@ def _with_retry(fn, attempts: int = 6, delay: float = 0.5):
 
 
 def _chunk_path(rec: JobRecord, index: int) -> str:
-    return (f"{chunk_prefix(rec.organization, rec.super_name, rec.job_id)}"
+    return (f"{chunk_prefix(rec.organization, rec.job_id)}"
             f"/chunk-{index:06d}.arrow")
 
 
@@ -103,7 +103,9 @@ def run_job(
     total_rows = rec.rows
     total_bytes = rec.bytes
     target = settings.SUPERTABLE_STREAM_CHUNK_BYTES
-    max_ahead = max(1, settings.SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS)
+    # 0 = never wait for a consumer; see the setting for why that is the default.
+    max_ahead = int(settings.SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS or 0)
+    max_spill = int(settings.SUPERTABLE_STREAM_MAX_SPILL_BYTES or 0)
 
     def _check_stop(seen: int) -> None:
         """Cancel and deadline share one exit path."""
@@ -111,8 +113,7 @@ def run_job(
             raise Cancelled("deadline exceeded")
         if seen % poll_every_batches == 0:
             try:
-                if store.is_cancelled(rec.organization, rec.super_name,
-                                      rec.job_id):
+                if store.is_cancelled(rec.organization, rec.job_id):
                     raise Cancelled("cancelled by request")
             except Cancelled:
                 raise
@@ -158,8 +159,7 @@ def run_job(
                 if rec.deadline_ts and time.time() > rec.deadline_ts:
                     handle.cancel()
                     return
-                if store.is_cancelled(rec.organization, rec.super_name,
-                                      rec.job_id):
+                if store.is_cancelled(rec.organization, rec.job_id):
                     handle.cancel()
                     return
 
@@ -177,11 +177,14 @@ def run_job(
                 total_rows += batch.num_rows
                 if pending_bytes >= target:
                     _flush(schema)
-                    # Backpressure: stop producing when far enough ahead of
-                    # the consumer. Without it a big export just writes the
-                    # whole result to storage as fast as it can, which is the
-                    # memory problem relocated rather than fixed.
-                    while (chunk_index - _acked(store, rec)) >= max_ahead:
+                    if max_spill and total_bytes > max_spill:
+                        raise Cancelled(
+                            f"spill cap exceeded: {total_bytes:,} > "
+                            f"{max_spill:,} bytes")
+                    # Optional backpressure, off by default: only wait when an
+                    # attached consumer is expected. A job whose consumer has
+                    # not arrived yet must still finish.
+                    while max_ahead and (chunk_index - _acked(store, rec)) >= max_ahead:
                         _check_stop(seen)
                         time.sleep(0.05)
             _flush(schema)
@@ -196,14 +199,14 @@ def run_job(
 
     except Cancelled as e:
         _safe_flush(store, rec, storage, pending, handle)
-        state = (JobState.EXPIRED if "deadline" in str(e)
+        state = (JobState.EXPIRED
+                 if ("deadline" in str(e) or "spill cap" in str(e))
                  else JobState.CANCELLED)
         store.set_state(rec, state, str(e))
         logger.info(f"[stream.job] {rec.job_id} {state}: {e}")
     except Exception as e:
         # An interrupt raised from the watcher arrives here, not as Cancelled.
-        if _looks_interrupted(e) and store.is_cancelled(
-                rec.organization, rec.super_name, rec.job_id):
+        if _looks_interrupted(e) and store.is_cancelled(rec.organization, rec.job_id):
             store.set_state(rec, JobState.CANCELLED, "cancelled by request")
         elif _looks_interrupted(e) and rec.deadline_ts and \
                 time.time() > rec.deadline_ts:
@@ -238,8 +241,7 @@ def _acked(store: JobStore, rec: JobRecord) -> int:
     """
     try:
         raw = store._r.hget(
-            RK.query_job_doc(rec.organization, rec.super_name, rec.job_id),
-            "acked")
+            RK.query_job_doc(rec.organization, rec.job_id), "acked")
         if raw is None:
             return 0
         if isinstance(raw, (bytes, bytearray)):
@@ -256,7 +258,6 @@ def ack(store: JobStore, rec: JobRecord, through_index: int) -> None:
 
 def iter_job_batches(
     organization: str,
-    super_name: str,
     job_id: str,
     store: Optional[JobStore] = None,
     storage=None,
@@ -283,8 +284,7 @@ def iter_job_batches(
 
     while True:
         refs = _with_retry(
-            lambda: store.chunks(organization, super_name, job_id,
-                                 start=next_index))
+            lambda: store.chunks(organization, job_id, start=next_index))
         if refs:
             for ref in refs:
                 for batch in read_chunk(storage, ref.path):
@@ -292,7 +292,7 @@ def iter_job_batches(
                 next_index = ref.index + 1
                 if acknowledge:
                     try:
-                        rec = store.get(organization, super_name, job_id)
+                        rec = store.get(organization, job_id)
                         if rec is not None:
                             ack(store, rec, ref.index)
                     except Exception as e:
@@ -302,13 +302,13 @@ def iter_job_batches(
                             raise
             continue
 
-        rec = _with_retry(lambda: store.get(organization, super_name, job_id))
+        rec = _with_retry(lambda: store.get(organization, job_id))
         if rec is None:
             return                      # expired or deleted out from under us
         if rec.state in JobState.TERMINAL:
             # Re-check once: a chunk may have landed between the two reads.
             if _with_retry(lambda: store.chunk_count(
-                    organization, super_name, job_id)) > next_index:
+                    organization, job_id)) > next_index:
                 continue
             if rec.state == JobState.FAILED:
                 raise RuntimeError(f"job {job_id} failed: {rec.error}")

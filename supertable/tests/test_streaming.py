@@ -211,14 +211,14 @@ def test_job_output_matches_buffered_read():
     want = _buffered(sql)
     rec = submit_and_run(D.ORG, D.SUPER, sql, D.ROLE, background=True,
                          batch_rows=8_000)
-    batches = list(iter_job_batches(D.ORG, D.SUPER, rec.job_id))
+    batches = list(iter_job_batches(D.ORG, rec.job_id))
     got = sum(b.num_rows for b in batches)
 
     store = JobStore()
-    final = store.get(D.ORG, D.SUPER, rec.job_id)
+    final = store.get(D.ORG, rec.job_id)
     assert final.state == "done", f"{final.state}: {final.error}"
     assert got == len(want)
-    store.delete(D.ORG, D.SUPER, rec.job_id)
+    store.delete(D.ORG, rec.job_id)
 
 
 def test_consumer_uses_a_separate_store_instance():
@@ -233,9 +233,9 @@ def test_consumer_uses_a_separate_store_instance():
                          background=True, batch_rows=8_000)
     consumer_store = JobStore()          # fresh: no shared state with producer
     total = sum(b.num_rows for b in iter_job_batches(
-        D.ORG, D.SUPER, rec.job_id, store=consumer_store))
+        D.ORG, rec.job_id, store=consumer_store))
     assert total == D.table_row_counts()["facts"]
-    consumer_store.delete(D.ORG, D.SUPER, rec.job_id)
+    consumer_store.delete(D.ORG, rec.job_id)
 
 
 def test_cancel_stops_a_running_job():
@@ -250,21 +250,21 @@ def test_cancel_stops_a_running_job():
     )
     deadline = time.time() + 30
     while time.time() < deadline:
-        if store.get(D.ORG, D.SUPER, rec.job_id).state == "running":
+        if store.get(D.ORG, rec.job_id).state == "running":
             break
         time.sleep(0.05)
 
-    store.cancel(D.ORG, D.SUPER, rec.job_id)
+    store.cancel(D.ORG, rec.job_id)
 
     deadline = time.time() + 30
     state = None
     while time.time() < deadline:
-        state = store.get(D.ORG, D.SUPER, rec.job_id).state
+        state = store.get(D.ORG, rec.job_id).state
         if state in ("cancelled", "done", "failed", "expired"):
             break
         time.sleep(0.1)
     assert state == "cancelled", f"ended {state!r}"
-    store.delete(D.ORG, D.SUPER, rec.job_id)
+    store.delete(D.ORG, rec.job_id)
 
 
 def test_deadline_expires_a_job():
@@ -279,12 +279,12 @@ def test_deadline_expires_a_job():
     deadline = time.time() + 40
     state = None
     while time.time() < deadline:
-        state = store.get(D.ORG, D.SUPER, rec.job_id).state
+        state = store.get(D.ORG, rec.job_id).state
         if state in ("expired", "done", "failed", "cancelled"):
             break
         time.sleep(0.1)
     assert state == "expired", f"ended {state!r}"
-    store.delete(D.ORG, D.SUPER, rec.job_id)
+    store.delete(D.ORG, rec.job_id)
 
 
 def test_zero_deadline_means_no_deadline():
@@ -294,7 +294,7 @@ def test_zero_deadline_means_no_deadline():
     store = JobStore()
     rec = store.create(D.ORG, D.SUPER, "SELECT 1", D.ROLE, deadline_sec=0)
     assert rec.deadline_ts == 0.0
-    store.delete(D.ORG, D.SUPER, rec.job_id)
+    store.delete(D.ORG, rec.job_id)
 
 
 def test_cancelled_job_keeps_what_it_produced():
@@ -310,42 +310,49 @@ def test_cancelled_job_keeps_what_it_produced():
     # Let it produce at least one chunk before cancelling.
     deadline = time.time() + 60
     while time.time() < deadline:
-        if store.chunk_count(D.ORG, D.SUPER, rec.job_id) > 0:
+        if store.chunk_count(D.ORG, rec.job_id) > 0:
             break
         time.sleep(0.1)
-    produced = store.chunk_count(D.ORG, D.SUPER, rec.job_id)
-    store.cancel(D.ORG, D.SUPER, rec.job_id)
+    produced = store.chunk_count(D.ORG, rec.job_id)
+    store.cancel(D.ORG, rec.job_id)
 
     deadline = time.time() + 30
     while time.time() < deadline:
-        if store.get(D.ORG, D.SUPER, rec.job_id).state in (
+        if store.get(D.ORG, rec.job_id).state in (
                 "cancelled", "done", "failed", "expired"):
             break
         time.sleep(0.1)
 
     if produced:
         got = sum(b.num_rows for b in iter_job_batches(
-            D.ORG, D.SUPER, rec.job_id, follow=False))
+            D.ORG, rec.job_id, follow=False))
         assert got > 0, "a cancelled job discarded rows it had already spilled"
-    store.delete(D.ORG, D.SUPER, rec.job_id)
+    store.delete(D.ORG, rec.job_id)
 
 
 # --------------------------------------------------------------------------
 # Job bookkeeping
 # --------------------------------------------------------------------------
 
-def test_job_keys_live_under_the_query_route():
+def test_job_keys_are_org_scoped_not_lake_scoped():
     from supertable import redis_keys as RK
 
     jid = "abc123def456"
-    assert RK.query_job_doc(D.ORG, D.SUPER, jid).endswith(
-        f":lakes:{D.SUPER}:query:job:doc:{jid}")
-    assert RK.query_job_chunks(D.ORG, D.SUPER, jid).endswith(
+    # Asserted structurally rather than against a literal key: writing the key
+    # out as an f-string here is the very thing test_redis_key_prefix forbids,
+    # and it would also duplicate the constructor it is supposed to check.
+    parts = RK.query_job_doc(D.ORG, jid).split(":")
+    assert parts[0] == "supertable" and parts[1] == D.ORG
+    assert parts[2:5] == ["query", "job", "doc"] and parts[5] == jid
+    # The point of the route: ORG level. A qualified join can span supertables,
+    # so a job has no single lake to belong to.
+    assert "lakes" not in parts, RK.query_job_doc(D.ORG, jid)
+    assert RK.query_job_chunks(D.ORG, jid).endswith(
         f":query:job:chunks:{jid}")
-    assert RK.query_job_cancel(D.ORG, D.SUPER, jid).endswith(
+    assert RK.query_job_cancel(D.ORG, jid).endswith(
         f":query:job:cancel:{jid}")
     # One pattern must reach every key belonging to a single job.
-    pat = RK.query_job_subkey_pattern(D.ORG, D.SUPER, jid)
+    pat = RK.query_job_subkey_pattern(D.ORG, jid)
     assert pat.endswith(f":query:job:*:{jid}")
 
 
@@ -356,13 +363,13 @@ def test_delete_removes_keys_and_spilled_chunks():
     store, storage = JobStore(), get_storage()
     rec = submit_and_run(D.ORG, D.SUPER, "SELECT * FROM facts", D.ROLE,
                          background=True, batch_rows=8_000)
-    list(iter_job_batches(D.ORG, D.SUPER, rec.job_id))
-    paths = [c.path for c in store.chunks(D.ORG, D.SUPER, rec.job_id)]
+    list(iter_job_batches(D.ORG, rec.job_id))
+    paths = [c.path for c in store.chunks(D.ORG, rec.job_id)]
     assert paths, "job produced no chunks"
 
-    store.delete(D.ORG, D.SUPER, rec.job_id, storage=storage)
-    assert store.get(D.ORG, D.SUPER, rec.job_id) is None
-    assert rec.job_id not in store.list_jobs(D.ORG, D.SUPER)
+    store.delete(D.ORG, rec.job_id, storage=storage)
+    assert store.get(D.ORG, rec.job_id) is None
+    assert rec.job_id not in store.list_jobs(D.ORG)
     for p in paths:
         assert not storage.exists(p), f"chunk survived delete: {p}"
 
@@ -375,11 +382,11 @@ def test_reap_drops_index_entries_whose_job_expired():
     store = JobStore()
     rec = store.create(D.ORG, D.SUPER, "SELECT 1", D.ROLE)
     # Simulate the doc TTL expiring while the index member survives.
-    store._r.delete(RK.query_job_doc(D.ORG, D.SUPER, rec.job_id))
-    assert rec.job_id in store.list_jobs(D.ORG, D.SUPER)
+    store._r.delete(RK.query_job_doc(D.ORG, rec.job_id))
+    assert rec.job_id in store.list_jobs(D.ORG)
 
-    store.reap(D.ORG, D.SUPER)
-    assert rec.job_id not in store.list_jobs(D.ORG, D.SUPER)
+    store.reap(D.ORG)
+    assert rec.job_id not in store.list_jobs(D.ORG)
 
 
 def test_cancel_is_visible_to_any_instance():
@@ -388,7 +395,80 @@ def test_cancel_is_visible_to_any_instance():
 
     a, b = JobStore(), JobStore()
     rec = a.create(D.ORG, D.SUPER, "SELECT 1", D.ROLE)
-    assert not b.is_cancelled(D.ORG, D.SUPER, rec.job_id)
-    b.cancel(D.ORG, D.SUPER, rec.job_id)
-    assert a.is_cancelled(D.ORG, D.SUPER, rec.job_id)
-    a.delete(D.ORG, D.SUPER, rec.job_id)
+    assert not b.is_cancelled(D.ORG, rec.job_id)
+    b.cancel(D.ORG, rec.job_id)
+    assert a.is_cancelled(D.ORG, rec.job_id)
+    a.delete(D.ORG, rec.job_id)
+
+
+# --------------------------------------------------------------------------
+# Monitoring
+# --------------------------------------------------------------------------
+
+def test_streamed_query_is_recorded_in_monitoring_on_close():
+    """A streamed read must appear in monitoring like any other read.
+
+    The row count does not exist when ``stream`` returns, so the entry is
+    written when the stream CLOSES. Without that a streaming query would be
+    invisible — and a long export is exactly the read you most want to see.
+    """
+    import supertable.data_reader as dr
+    from supertable.data_reader import DataReader
+
+    seen = []
+    original = dr.extend_execution_plan
+    dr.extend_execution_plan = lambda **kw: (seen.append(kw), original(**kw))[1]
+    try:
+        handle = DataReader(super_name=D.SUPER, organization=D.ORG,
+                            query="SELECT * FROM facts", source="sdk",
+                            ).stream(role_name=D.ROLE, batch_rows=8_000)
+        assert not seen, "monitoring fired before any rows were streamed"
+        with handle:
+            rows = sum(b.num_rows for b in handle.batches())
+    finally:
+        dr.extend_execution_plan = original
+
+    assert len(seen) == 1, f"expected one monitoring entry, got {len(seen)}"
+    assert seen[0]["result_shape"] == (rows, 11), seen[0]["result_shape"]
+    assert rows == D.table_row_counts()["facts"]
+
+
+def test_monitoring_failure_cannot_break_a_stream():
+    """A query that already produced its rows must not fail at teardown."""
+    import supertable.data_reader as dr
+    from supertable.data_reader import DataReader
+
+    original = dr.extend_execution_plan
+
+    def boom(**kw):
+        raise RuntimeError("monitoring backend down")
+
+    dr.extend_execution_plan = boom
+    try:
+        handle = DataReader(super_name=D.SUPER, organization=D.ORG,
+                            query="SELECT * FROM facts", source="sdk",
+                            ).stream(role_name=D.ROLE, batch_rows=8_000)
+        with handle:
+            rows = sum(b.num_rows for b in handle.batches())
+        assert rows == D.table_row_counts()["facts"]
+    finally:
+        dr.extend_execution_plan = original
+
+
+def test_fire_and_forget_export_completes_without_a_consumer():
+    """The default must not require anybody to be reading.
+
+    Consumer-coupled backpressure was the original default and it made an
+    unattended export stall after a few chunks. A job exists precisely because
+    the consumer may arrive later, from another container.
+    """
+    from supertable.streaming import JobStore, run_job
+
+    store = JobStore()
+    rec = store.create(D.ORG, D.SUPER, "SELECT * FROM facts", D.ROLE,
+                       batch_rows=4_000)
+    run_job(rec, store)                      # nobody reads while it runs
+    final = store.get(D.ORG, rec.job_id)
+    assert final.state == "done", f"{final.state}: {final.error}"
+    assert final.rows == D.table_row_counts()["facts"]
+    store.delete(D.ORG, rec.job_id)

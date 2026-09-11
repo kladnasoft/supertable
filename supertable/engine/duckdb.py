@@ -495,6 +495,12 @@ class StreamHandle:
         self._dv_keys = dv_keys
         self._cache = cache
         self._closed = False
+        #: Rows handed to the consumer so far. A streamed query has no row
+        #: count until it ends, so monitoring is written on close, not on
+        #: execute — see DataReader.stream.
+        self.rows_streamed = 0
+        #: Called once with (rows, columns) when the stream is closed.
+        self.on_close = None
 
     @property
     def schema(self):
@@ -506,6 +512,7 @@ class StreamHandle:
             return
         try:
             for batch in self.reader:
+                self.rows_streamed += batch.num_rows
                 yield batch
         finally:
             self.close()
@@ -538,6 +545,13 @@ class StreamHandle:
             try:
                 self._cache.release(self._con, key)
             except Exception:
+                pass
+        if self.on_close is not None:
+            try:
+                ncols = len(self.reader.schema) if self.reader is not None else 0
+                self.on_close(self.rows_streamed, ncols)
+            except Exception:
+                # Monitoring must never break a query that already succeeded.
                 pass
 
     def __enter__(self):

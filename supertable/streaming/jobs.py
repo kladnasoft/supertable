@@ -94,6 +94,9 @@ class ChunkRef:
 class JobRecord:
     job_id: str
     organization: str
+    # The default schema for unqualified table names — NOT the job's scope.
+    # A qualified join may reach other supertables, which is why the keys are
+    # org-level.
     super_name: str
     sql: str
     role_name: str
@@ -135,13 +138,13 @@ class JobRecord:
         )
 
 
-def chunk_prefix(organization: str, super_name: str, job_id: str) -> str:
+def chunk_prefix(organization: str, job_id: str) -> str:
     """Storage prefix for one job's spilled chunks.
 
     Leading underscore keeps it out of the way of table directories; the job id
     scopes it so cleanup is a prefix delete.
     """
-    return f"{organization}/{super_name}/_query_jobs/{job_id}"
+    return f"{organization}/_query_jobs/{job_id}"
 
 
 class JobStore:
@@ -183,19 +186,18 @@ class JobStore:
             owner="", batch_rows=batch_rows, fullscan=fullscan,
         )
         r = self._r
-        doc = RK.query_job_doc(organization, super_name, rec.job_id)
+        doc = RK.query_job_doc(organization, rec.job_id)
         ttl = settings.SUPERTABLE_STREAM_JOB_TTL_SEC
         pipe = r.pipeline()
         pipe.hset(doc, mapping=rec.to_redis())
         pipe.expire(doc, ttl)
-        pipe.sadd(RK.query_job_index(organization, super_name), rec.job_id)
+        pipe.sadd(RK.query_job_index(organization), rec.job_id)
         pipe.execute()
         logger.info(f"[stream.job] created {rec.job_id} deadline={rec.deadline_ts:.0f}")
         return rec
 
-    def get(self, organization: str, super_name: str,
-            job_id: str) -> Optional[JobRecord]:
-        raw = self._r.hgetall(RK.query_job_doc(organization, super_name, job_id))
+    def get(self, organization: str, job_id: str) -> Optional[JobRecord]:
+        raw = self._r.hgetall(RK.query_job_doc(organization, job_id))
         if not raw:
             return None
         return JobRecord.from_redis(raw)
@@ -203,7 +205,7 @@ class JobStore:
     def update(self, rec: JobRecord, **fields) -> None:
         for k, v in fields.items():
             setattr(rec, k, v)
-        key = RK.query_job_doc(rec.organization, rec.super_name, rec.job_id)
+        key = RK.query_job_doc(rec.organization, rec.job_id)
         mapping = {k: ("1" if v is True else "0" if v is False else str(v))
                    for k, v in fields.items()}
         self._r.hset(key, mapping=mapping)
@@ -214,9 +216,9 @@ class JobStore:
             # Terminal jobs keep their chunks for the TTL so a consumer that
             # disconnected can still collect them.
             ttl = settings.SUPERTABLE_STREAM_JOB_TTL_SEC
-            org, sup, jid = rec.organization, rec.super_name, rec.job_id
-            for key in (RK.query_job_doc(org, sup, jid),
-                        RK.query_job_chunks(org, sup, jid)):
+            org, jid = rec.organization, rec.job_id
+            for key in (RK.query_job_doc(org, jid),
+                        RK.query_job_chunks(org, jid)):
                 try:
                     self._r.expire(key, ttl)
                 except Exception:
@@ -226,15 +228,15 @@ class JobStore:
 
     def append_chunk(self, rec: JobRecord, ref: ChunkRef) -> None:
         """Publish a chunk. Consumers may read it the moment this returns."""
-        key = RK.query_job_chunks(rec.organization, rec.super_name, rec.job_id)
+        key = RK.query_job_chunks(rec.organization, rec.job_id)
         pipe = self._r.pipeline()
         pipe.rpush(key, json.dumps(asdict(ref)))
         pipe.expire(key, settings.SUPERTABLE_STREAM_JOB_TTL_SEC)
         pipe.execute()
 
-    def chunks(self, organization: str, super_name: str, job_id: str,
+    def chunks(self, organization: str, job_id: str,
                start: int = 0) -> List[ChunkRef]:
-        key = RK.query_job_chunks(organization, super_name, job_id)
+        key = RK.query_job_chunks(organization, job_id)
         out = []
         for raw in self._r.lrange(key, start, -1):
             if isinstance(raw, (bytes, bytearray)):
@@ -242,56 +244,53 @@ class JobStore:
             out.append(ChunkRef(**json.loads(raw)))
         return out
 
-    def chunk_count(self, organization: str, super_name: str,
-                    job_id: str) -> int:
+    def chunk_count(self, organization: str, job_id: str) -> int:
         return int(self._r.llen(
-            RK.query_job_chunks(organization, super_name, job_id)) or 0)
+            RK.query_job_chunks(organization, job_id)) or 0)
 
     # -- cancellation ----------------------------------------------------
 
-    def cancel(self, organization: str, super_name: str, job_id: str) -> bool:
+    def cancel(self, organization: str, job_id: str) -> bool:
         """Request cancellation. Any instance may call this, not just the owner.
 
         A separate key rather than a field on the job document: cancelling is
         then a single SET that cannot race with the producer's counter updates,
         and the producer's between-batch check is one cheap GET.
         """
-        key = RK.query_job_cancel(organization, super_name, job_id)
+        key = RK.query_job_cancel(organization, job_id)
         self._r.set(key, "1", ex=settings.SUPERTABLE_STREAM_JOB_TTL_SEC)
         logger.info(f"[stream.job] cancel requested for {job_id}")
         return True
 
-    def is_cancelled(self, organization: str, super_name: str,
-                     job_id: str) -> bool:
+    def is_cancelled(self, organization: str, job_id: str) -> bool:
         return bool(self._r.exists(
-            RK.query_job_cancel(organization, super_name, job_id)))
+            RK.query_job_cancel(organization, job_id)))
 
     # -- cleanup ---------------------------------------------------------
 
-    def delete(self, organization: str, super_name: str, job_id: str,
-               storage=None) -> None:
+    def delete(self, organization: str, job_id: str, storage=None) -> None:
         """Drop a job's Redis keys and its spilled chunks."""
         if storage is not None:
-            for ref in self.chunks(organization, super_name, job_id):
+            for ref in self.chunks(organization, job_id):
                 try:
                     storage.delete(ref.path)
                 except Exception:
                     pass
         r = self._r
         pipe = r.pipeline()
-        for key in (RK.query_job_doc(organization, super_name, job_id),
-                    RK.query_job_chunks(organization, super_name, job_id),
-                    RK.query_job_cancel(organization, super_name, job_id)):
+        for key in (RK.query_job_doc(organization, job_id),
+                    RK.query_job_chunks(organization, job_id),
+                    RK.query_job_cancel(organization, job_id)):
             pipe.delete(key)
-        pipe.srem(RK.query_job_index(organization, super_name), job_id)
+        pipe.srem(RK.query_job_index(organization), job_id)
         pipe.execute()
 
-    def list_jobs(self, organization: str, super_name: str) -> List[str]:
-        vals = self._r.smembers(RK.query_job_index(organization, super_name))
+    def list_jobs(self, organization: str) -> List[str]:
+        vals = self._r.smembers(RK.query_job_index(organization))
         return sorted(v.decode() if isinstance(v, (bytes, bytearray)) else v
                       for v in (vals or []))
 
-    def reap(self, organization: str, super_name: str, storage=None) -> int:
+    def reap(self, organization: str, storage=None) -> int:
         """Remove jobs whose document has expired out from under the index.
 
         A container killed mid-export leaves the index entry behind; the doc TTL
@@ -299,9 +298,9 @@ class JobStore:
         without bound and every listing gets slower.
         """
         removed = 0
-        for job_id in self.list_jobs(organization, super_name):
-            if self.get(organization, super_name, job_id) is None:
-                self.delete(organization, super_name, job_id, storage=storage)
+        for job_id in self.list_jobs(organization):
+            if self.get(organization, job_id) is None:
+                self.delete(organization, job_id, storage=storage)
                 removed += 1
         if removed:
             logger.info(f"[stream.job] reaped {removed} orphaned job(s)")
