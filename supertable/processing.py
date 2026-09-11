@@ -9,7 +9,7 @@ import time
 import threading
 import uuid
 from collections import OrderedDict
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timedelta, timezone
 from typing import Callable, Dict, List, Set, Tuple, Optional
 
 import polars
@@ -2342,6 +2342,42 @@ def _to_us_datetime_from_text(value) -> Optional[datetime]:
     return None
 
 
+# The widest UTC offsets in use: -12:00 (Baker Island) to +14:00 (Kiribati).
+# A naive timestamp literal denotes an instant only once a zone is chosen, so
+# it spans [L - 14h, L + 12h] across every zone that could be in effect.
+_MAX_UTC_OFFSET_EAST = timedelta(hours=14)
+_MAX_UTC_OFFSET_WEST = timedelta(hours=12)
+
+
+def _widen_naive_timestamp_bounds(plo, phi):
+    """Widen naive predicate bounds to cover every timezone they could mean.
+
+    The stats artifact stores timestamps as UTC instants. DuckDB, comparing a
+    naive literal against a ``TIMESTAMPTZ`` column, resolves that literal in the
+    SESSION timezone — so ``TIMESTAMP '2025-12-02 00:00:00'`` at +01:00 means
+    the instant ``2025-12-01 23:00:00Z``, an hour EARLIER than the same text
+    read as UTC. Comparing the literal directly against UTC stats therefore
+    prunes files whose last hour genuinely matches, and the error window is
+    exactly the UTC offset — invisible on a UTC+0 machine, silent data loss
+    anywhere else. Measured on a 100-file table: 1,323 rows lost from a 30-day
+    window, 2.8% of the answer on a narrow one.
+
+    The lane recorded in the stats is ``"timestamp"`` for both naive and
+    zone-aware columns, so the pruner cannot tell which it is, and the session
+    timezone is the engine's, not ours. Rather than plumb both through and risk
+    a second silent-loss bug when either is wrong, the bound is widened to the
+    union of every timezone it could denote. Pruning is an optimisation and may
+    keep a file it did not need to; it may never drop one it did.
+
+    An already zone-aware bound is unambiguous and is left alone.
+    """
+    if isinstance(plo, datetime) and plo.tzinfo is None:
+        plo = plo - _MAX_UTC_OFFSET_EAST
+    if isinstance(phi, datetime) and phi.tzinfo is None:
+        phi = phi + _MAX_UTC_OFFSET_WEST
+    return plo, phi
+
+
 def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]) -> bool:
     """True if a value in the stored row-group range ``[s_min, s_max]`` could
     satisfy the predicate interval *pred*.
@@ -2357,7 +2393,8 @@ def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]
         plo = None if pred.lo is None else float(pred.lo)
         phi = None if pred.hi is None else float(pred.hi)
     elif p_lane == "timestamp" and s_lane == "timestamp":
-        smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
+        smin, smax = s_min, s_max
+        plo, phi = _widen_naive_timestamp_bounds(pred.lo, pred.hi)
     elif p_lane == "string" and s_lane == "string":
         smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
     elif p_lane == "string" and s_lane == "timestamp":
@@ -2375,6 +2412,8 @@ def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]
         phi = _to_us_datetime_from_text(pred.hi)
         if (pred.lo is not None and plo is None) or (pred.hi is not None and phi is None):
             return True
+        # A bare string parses naive, so it carries the same ambiguity.
+        plo, phi = _widen_naive_timestamp_bounds(plo, phi)
         smin, smax = s_min, s_max
     else:
         return True  # incomparable lanes → cannot exclude
