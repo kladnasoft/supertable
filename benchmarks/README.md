@@ -148,6 +148,26 @@ Re-running the same version overwrites its file, which is intended: the current
 version's numbers should reflect the current machine. Historical baselines come
 from git, e.g. `git show <rev>:benchmarks/results/local/read-3.0.2-full.json`.
 
+### Seals before 3.0.8 are wrong for five read scenarios
+
+Up to and including 3.0.7, predicate pruning dropped files whose timestamps fell
+within one UTC offset of a naive literal, so these scenarios sealed answers that
+were missing rows: `agg_30d_by_country`, `distinct_users_30d`,
+`narrow_window_single_file`, `prune_30d_window`, `two_dim_group_by_30d`.
+
+Comparing 3.0.8+ against an older baseline therefore reports correctness drift
+on exactly those five. That is the fix landing, not a regression. Compare
+against `read-3.0.8-full.json` or later.
+
+The current seals are verified, not assumed: `read-3.0.8-full-fullscan.json` is
+the same suite with pruning disabled, and all 16 seals match the pruned run —
+so pruning provably returns what reading every file returns. Regenerate both
+together and keep them in step.
+
+A note on provenance: `read-3.0.3-full.json` was captured on a dirty working
+tree (`compare` warns about this), so it does not correspond to any commit.
+Baselines from 3.0.8 on are taken on a clean tree.
+
 ## Scales and cost
 
 `full` is the specified shape — 10,000,000 rows across 100 files. `smoke`
