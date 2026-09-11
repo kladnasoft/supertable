@@ -1250,9 +1250,17 @@ def create_tombstone_view(
         view_name: str,
         tombstone_def,
         dv_table: Optional[str] = None,
+        expose_rowid: bool = False,
 ) -> None:
     """
     Create a view that hides the system columns and drops tombstoned rows.
+
+    ``expose_rowid`` keeps ``__rowid__`` in the projection. It exists for
+    OData, which needs the row identity as an entity key and as a pagination
+    cursor — a server cannot page on a column the view removed. It is opt-in
+    and off by default: the identity is an implementation detail of the lake,
+    and leaking it into ordinary query results would make it part of every
+    caller's schema. ``__timestamp__`` is stripped either way.
 
     Two responsibilities, applied to every reflected table:
 
@@ -1295,9 +1303,9 @@ def create_tombstone_view(
     # a literal ``EXCLUDE`` list would raise. In an ANTI JOIN only the left
     # table's columns reach the output, so the unqualified ``COLUMNS()`` never
     # picks up the deletion-vector's ``__rowid__``.
-    live_cols = (
-        f"COLUMNS(c -> c NOT IN ('{ROWID_COL}', '{TIMESTAMP_COL}'))"
-    )
+    hidden = (f"'{TIMESTAMP_COL}'" if expose_rowid
+              else f"'{ROWID_COL}', '{TIMESTAMP_COL}'")
+    live_cols = f"COLUMNS(c -> c NOT IN ({hidden}))"
 
     tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
     # The vector is a LIST of immutable parts (a checkpoint base plus per-write

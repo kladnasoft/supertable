@@ -163,6 +163,7 @@ class Executor:
         batch_rows: int = 0,
         explain: bool = False,
         explain_options: str = "",
+        expose_rowid: bool = False,
     ):
         """Return an open Arrow stream for this query.
 
@@ -202,6 +203,7 @@ class Executor:
             batch_rows=batch_rows,
             explain=explain,
             explain_options=explain_options,
+            expose_rowid=expose_rowid,
         )
 
     def execute(

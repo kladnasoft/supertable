@@ -51,6 +51,7 @@ from supertable.processing import (
     _read_parquet_safe,
 )
 from supertable.rbac.access_control import check_write_access  # noqa: F401
+from supertable.odata import row_identity
 from supertable.redis_catalog import RedisCatalog
 from supertable.mirroring.mirror_formats import MirrorFormats
 from supertable.audit import emit as _audit_emit, EventCategory, Actions, Severity, make_detail
@@ -437,6 +438,7 @@ class DataWriter:
             # delete_only writes, whose dataframe carries only delete-predicate
             # columns (no rows are inserted). with_columns overwrites any
             # caller-supplied __rowid__ so uniqueness is always enforced.
+            start_rowid = 0
             if not delete_only and incoming_rows > 0:
                 start_rowid = self.catalog.reserve_rowids(
                     self.super_table.organization,
@@ -1092,6 +1094,15 @@ class DataWriter:
                     )
                 else:
                     schema_model_df = None if delete_only else dataframe
+                # Record the highest rowid ever reserved. This is what lets a
+                # reader prove __rowid__ is safe as an OData entity key without
+                # scanning anything: live rows <= ids issued means no duplicate
+                # can exist. O(1) — two ints the writer already holds.
+                last_simple_table[row_identity.WATERMARK_KEY] = (
+                    row_identity.next_watermark(
+                        last_simple_table, start_rowid, incoming_rows
+                        if not delete_only else 0)
+                )
                 new_snapshot_dict, new_snapshot_path = simple_table.update(
                     new_resources, sunset_files, schema_model_df,
                     last_snapshot=last_simple_table,

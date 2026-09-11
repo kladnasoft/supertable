@@ -168,6 +168,7 @@ class DuckDBEngine:
             log_prefix: str = "",
             explain: bool = False,
             explain_options: str = "",
+            expose_rowid: bool = False,
     ):
         """Build reflection -> tombstone -> RBAC views and rewrite the query.
 
@@ -221,7 +222,8 @@ class DuckDBEngine:
             dv_table = self._tombstone_cache.acquire(con, cache_key, tomb_path)
             if dv_table:
                 acquired_dv_keys.append(cache_key)
-            create_tombstone_view(con, source, view, tomb_def, dv_table=dv_table)
+            create_tombstone_view(con, source, view, tomb_def, dv_table=dv_table,
+                                  expose_rowid=expose_rowid)
             created_views.append(view)
             query_alias_to_name[alias] = view
 
@@ -284,6 +286,7 @@ class DuckDBEngine:
             batch_rows: int = 0,
             explain: bool = False,
             explain_options: str = "",
+            expose_rowid: bool = False,
     ) -> "StreamHandle":
         """Execute and return an Arrow reader instead of a materialised frame.
 
@@ -345,6 +348,7 @@ class DuckDBEngine:
                 con, reflection, parser, alias_to_table_name, alias_to_files,
                 alias_to_columns, created_views, acquired_dv_keys,
                 timer_capture, log_prefix, explain, explain_options,
+                expose_rowid,
             )
             apply_runtime_pragmas(con, engine_config)
 

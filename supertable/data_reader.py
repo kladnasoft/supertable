@@ -400,6 +400,7 @@ class DataReader:
                     log_prefix=self._lp(""),
                     engine=exec_engine,
                     batch_rows=self._stream_out.get("batch_rows", 0),
+                    expose_rowid=self._stream_out.get("expose_rowid", False),
                 )
                 self.timer.capture_and_reset_timing(event="EXECUTING_QUERY")
 
@@ -471,6 +472,7 @@ class DataReader:
             engine: Any = None,
             fullscan: bool = False,
             batch_rows: int = 0,
+            expose_rowid: bool = False,
     ):
         """Run the query and return an open Arrow stream.
 
@@ -489,7 +491,8 @@ class DataReader:
         """
         from supertable.engine.engine_enum import Engine as _Engine
 
-        self._stream_out = {"handle": None, "batch_rows": batch_rows}
+        self._stream_out = {"handle": None, "batch_rows": batch_rows,
+                            "expose_rowid": expose_rowid}
         try:
             _, status, message = self.execute(
                 role_name=role_name,
