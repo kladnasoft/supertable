@@ -48,8 +48,18 @@ import pyarrow as pa
 from supertable.config.defaults import logger
 
 
-def normalize_arrow_types(table: pa.Table) -> pa.Table:
-    """Cast columns whose Arrow type converts badly to pandas."""
+def normalize_arrow_types(table: pa.Table, *, for_pandas: bool = True) -> pa.Table:
+    """Cast columns whose Arrow type converts badly to the target frame.
+
+    The two targets need different things, so this is not one rule:
+
+    scale-zero decimals become int64 for BOTH. DuckDB types an integer SUM as
+    decimal128(38, 0), and an integer is what it is — int64 is exact and usable.
+
+    scaled decimals are widened to float64 only for pandas, which has no
+    Decimal type. polars does, so it keeps them exact — which is the whole
+    point for a money column, where float64 silently loses cents at scale.
+    """
     if table.num_columns == 0:
         return table
 
@@ -57,10 +67,12 @@ def normalize_arrow_types(table: pa.Table) -> pa.Table:
     for field in table.schema:
         target = field.type
         if pa.types.is_decimal(field.type):
-            # Scale zero is an integer: int64 is exact AND usable. With a
-            # scale, float64 is what every consumer already expects.
-            target = pa.int64() if field.type.scale == 0 else pa.float64()
-            changed = True
+            if field.type.scale == 0:
+                target = pa.int64()
+                changed = True
+            elif for_pandas:
+                target = pa.float64()
+                changed = True
         if target is not field.type:
             fields.append(pa.field(field.name, target, field.nullable))
         else:
@@ -107,8 +119,17 @@ def batches_to_polars(batches, schema=None):
     """
     import polars as pl
     if not batches:
-        return pl.from_arrow(schema.empty_table()) if schema is not None else pl.DataFrame()
-    return pl.from_arrow(pa.Table.from_batches(batches, schema=schema))
+        if schema is None:
+            return pl.DataFrame()
+        return pl.from_arrow(
+            normalize_arrow_types(schema.empty_table(), for_pandas=False))
+    # normalize_arrow_types applies here too. It was originally written for the
+    # pandas path only, which left the polars path — the one actually used —
+    # returning DuckDB's decimal128(38,0) for an integer SUM. Exact, but a
+    # Decimal column where an integer belongs.
+    table = normalize_arrow_types(pa.Table.from_batches(batches, schema=schema),
+                                  for_pandas=False)
+    return pl.from_arrow(table)
 
 
 def batches_to_pandas(batches: List[pa.RecordBatch],
