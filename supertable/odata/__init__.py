@@ -1,45 +1,49 @@
 # route: supertable.odata
-"""OData integration helpers.
+"""Support for Core's OData service. Not an OData implementation.
 
-These support a server; they are not one. There is no HTTP here, no routing,
-and no OData URL parsing — only the three things a server cannot correctly
-invent on its own:
+The service owns the protocol — EDM types, entity identities, $metadata,
+response serialisation, and the continuation position it hands to clients. This
+package holds only what the service cannot do for itself:
 
-  row_identity   can this snapshot's __rowid__ be trusted as an entity key?
-  discovery      which tables can be exposed, and why the others cannot
-  continuation   $skiptoken paging that survives concurrent writes
+    row_identity   proves a snapshot's __rowid__ is safe to use as an entity
+                   key, so the service can fail closed instead of serving keys
+                   that mean different rows tomorrow
+    policy         fingerprints role policy, share filters and column masks, so
+                   the service can detect a policy change mid-page
+    stream         query_odata_sql_stream — one bounded, cancellable, resumable
+                   Arrow read
 
-Each answers a question where a wrong guess is silent: an unstable key gives
-URLs that resolve to different rows over time, an invented key exposes a table
-that breaks on the first merge, and OFFSET paging skips or repeats rows when
-someone writes mid-export.
+Nothing here parses an OData URL or emits an OData document. If something in
+this package starts to look like protocol, it belongs in the service instead.
 """
 
-from supertable.odata.continuation import (
-    Continuation,
-    InvalidContinuation,
-    advance,
-    apply_to_sql,
-    decode,
-    first_page,
-    page_predicate,
-    split_page,
+from supertable.odata.policy import (
+    fingerprint_views,
+    query_sql_policy_fingerprint,
 )
-from supertable.odata.discovery import EntitySet, Unservable, describe_table, discover
 from supertable.odata.row_identity import (
     IdentityVerdict,
     ROWID_COLUMN,
     WATERMARK_KEY,
+    identity_column_present,
     next_watermark,
     snapshot_live_rows,
     snapshot_watermark,
     verify_stable_identity,
 )
+from supertable.odata.stream import (
+    ODataPolicyChanged,
+    ODataStream,
+    SERVICE_ROWID_ALIAS,
+    keyset_predicate,
+    query_odata_sql_stream,
+)
 
 __all__ = [
-    "Continuation", "InvalidContinuation", "advance", "apply_to_sql", "decode",
-    "first_page", "page_predicate", "split_page",
-    "EntitySet", "Unservable", "describe_table", "discover",
-    "IdentityVerdict", "ROWID_COLUMN", "WATERMARK_KEY", "next_watermark",
-    "snapshot_live_rows", "snapshot_watermark", "verify_stable_identity",
+    "fingerprint_views", "query_sql_policy_fingerprint",
+    "IdentityVerdict", "ROWID_COLUMN", "WATERMARK_KEY",
+    "identity_column_present", "next_watermark", "snapshot_live_rows",
+    "snapshot_watermark", "verify_stable_identity",
+    "ODataPolicyChanged", "ODataStream", "SERVICE_ROWID_ALIAS",
+    "keyset_predicate", "query_odata_sql_stream",
 ]

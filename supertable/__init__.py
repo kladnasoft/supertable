@@ -66,3 +66,15 @@ __all__ = [
     "TableNotFoundError",
     "LockLostError",
 ]
+
+
+# --- OData service support -------------------------------------------------
+# Imported lazily by name so a deployment that never serves OData does not pay
+# for the module at import time, while `from supertable import
+# query_odata_sql_stream` still works — which is exactly how the service asks.
+
+def __getattr__(name):
+    if name in ("query_odata_sql_stream", "query_sql_policy_fingerprint"):
+        from supertable import odata as _odata
+        return getattr(_odata, name)
+    raise AttributeError(f"module 'supertable' has no attribute {name!r}")
