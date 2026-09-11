@@ -473,6 +473,19 @@ def meta_mirrors(org: str, sup: str) -> str:
     )
 
 
+def meta_namespace_deletion_intent(org: str, sup: str) -> str:
+    """Tombstone marking a supertable as being deleted (STRING).
+
+    Set before a namespace teardown begins and checked by readers, so a request
+    that arrives mid-deletion is refused rather than served from a half-removed
+    catalog. Lake-scoped beside ``meta:root``, which is what it guards.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:meta:deletion-intent"
+    )
+
+
 def meta_table_names(org: str, sup: str) -> str:
     """Set of all simple table names in this supertable (SET).
 
