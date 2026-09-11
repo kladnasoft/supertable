@@ -11,7 +11,7 @@ Three layers:
      and the bank credit, every booked BMD AR row points at a real source
      invoice, and every bank line got a match classification.
   3. The demo acceptance check: mart totals recomputed independently
-     (pandas over the generated CSV fixtures) and compared row by row.
+     (polars over the generated CSV fixtures) and compared row by row.
 
 Exits non-zero when any test fails — that exit code is the hook a
 scheduler's run-failure alert attaches to.
@@ -22,7 +22,7 @@ import os
 import sys
 from dataclasses import dataclass
 
-import pandas as pd
+import polars as pl
 
 from supertable.config.homedir import change_to_app_home
 from supertable.demo.medcenter.defaults import (
@@ -62,7 +62,7 @@ class TestResult:
 
 
 def _failure_count_test(name: str, query: str) -> TestResult:
-    failures = int(run_query(query).iloc[0, 0])
+    failures = int(run_query(query).item(0, 0))
     return TestResult(
         name=name,
         passed=failures == 0,
@@ -128,10 +128,10 @@ def mobimed_tests() -> list[TestResult]:
     ]
 
     raw_count = int(
-        run_query(f"SELECT COUNT(*) FROM {raw_mobimed_invoices}").iloc[0, 0]
+        run_query(f"SELECT COUNT(*) FROM {raw_mobimed_invoices}").item(0, 0)
     )
     stg_count = int(
-        run_query(f"SELECT COUNT(*) FROM {stg_invoices_table}").iloc[0, 0]
+        run_query(f"SELECT COUNT(*) FROM {stg_invoices_table}").item(0, 0)
     )
     results.append(
         TestResult(
@@ -144,12 +144,12 @@ def mobimed_tests() -> list[TestResult]:
     stg_gross = float(
         run_query(
             f"SELECT COALESCE(SUM(gross_total), 0) FROM {stg_invoices_table}"
-        ).iloc[0, 0]
+        ).item(0, 0)
     )
     mart_gross = float(
         run_query(
             f"SELECT COALESCE(SUM(gross_total), 0) FROM {mart_monthly_table}"
-        ).iloc[0, 0]
+        ).item(0, 0)
     )
     results.append(
         TestResult(
@@ -240,8 +240,8 @@ def review_queue_present() -> TestResult:
         f"SUM(CASE WHEN credit_debit = 'CRDT' THEN 1 ELSE 0 END) AS credits "
         f"FROM {mart_bank_reconciliation}"
     )
-    review = int(counts["review"].iloc[0])
-    credits = int(counts["credits"].iloc[0])
+    review = int(counts.item(0, "review"))
+    credits = int(counts.item(0, "credits"))
     return TestResult(
         name="reconcile__bank__review_queue_small_but_present",
         passed=0 < review <= max(1, int(credits * 0.10)),
@@ -251,7 +251,7 @@ def review_queue_present() -> TestResult:
 
 def acceptance_test(data_dir: str) -> TestResult:
     """Demo acceptance: mart totals must equal totals computed independently
-    (plain pandas) over the generated raw CSV fixtures."""
+    (plain polars) over the generated raw CSV fixtures."""
     invoices_dir = os.path.join(data_dir, raw_mobimed_invoices)
     if not os.path.isdir(invoices_dir):
         return TestResult(
@@ -261,33 +261,37 @@ def acceptance_test(data_dir: str) -> TestResult:
         )
 
     frames = [
-        pd.read_csv(os.path.join(invoices_dir, f), sep=";")
+        pl.read_csv(
+            os.path.join(invoices_dir, f), separator=";",
+            infer_schema_length=None,
+        )
         for f in sorted(os.listdir(invoices_dir))
         if f.endswith(".csv")
     ]
-    raw = pd.concat(frames, ignore_index=True)
-    raw["category"] = (
-        raw["Rechnungsnummer"].str[:3]
-        .map(category_prefix_rules)
-        .fillna(category_default)
+    # vertical_relaxed is pandas' concat: it upcasts to a common type when one
+    # month's file happens to type a column more narrowly than another's.
+    raw = pl.concat(frames, how="vertical_relaxed")
+    raw = raw.with_columns(
+        category=pl.col("Rechnungsnummer").str.slice(0, 3).replace_strict(
+            category_prefix_rules, default=category_default
+        ),
+        invoice_month=pl.col("Datum")
+        .str.to_date("%d.%m.%Y")
+        .dt.strftime("%Y-%m"),
     )
-    raw["invoice_month"] = pd.to_datetime(
-        raw["Datum"], format="%d.%m.%Y"
-    ).dt.strftime("%Y-%m")
 
     expected = (
-        raw.groupby(["invoice_month", "category"])
+        raw.group_by(["invoice_month", "category"])
         .agg(
-            invoice_count=("Rechnungsnummer", "count"),
-            net_vat0=("Umsatz0", "sum"),
-            net_vat10=("Umsatz10", "sum"),
-            net_vat20=("Umsatz20", "sum"),
-            vat10_amount=("MwSt10", "sum"),
-            vat20_amount=("MwSt20", "sum"),
-            gross_total=("SummeUmsatzinklUSt", "sum"),
+            invoice_count=pl.col("Rechnungsnummer").count(),
+            net_vat0=pl.col("Umsatz0").sum(),
+            net_vat10=pl.col("Umsatz10").sum(),
+            net_vat20=pl.col("Umsatz20").sum(),
+            vat10_amount=pl.col("MwSt10").sum(),
+            vat20_amount=pl.col("MwSt20").sum(),
+            gross_total=pl.col("SummeUmsatzinklUSt").sum(),
         )
-        .round(2)
-        .reset_index()
+        .with_columns(pl.col(pl.Float64).round(2))
     )
 
     mart = run_query(
@@ -308,13 +312,16 @@ def acceptance_test(data_dir: str) -> TestResult:
         "vat10_amount", "vat20_amount", "gross_total",
     ]
     mismatches = []
-    mart_indexed = mart.set_index(["invoice_month", "category"])
-    for _, exp_row in expected.iterrows():
+    mart_by_key = {
+        (row["invoice_month"], row["category"]): row
+        for row in mart.iter_rows(named=True)
+    }
+    for exp_row in expected.iter_rows(named=True):
         key = (exp_row["invoice_month"], exp_row["category"])
-        if key not in mart_indexed.index:
+        if key not in mart_by_key:
             mismatches.append(f"{key} missing from mart")
             continue
-        mart_row = mart_indexed.loc[key]
+        mart_row = mart_by_key[key]
         if int(mart_row["invoice_count"]) != int(exp_row["invoice_count"]):
             mismatches.append(
                 f"{key} invoice_count {int(mart_row['invoice_count'])} "

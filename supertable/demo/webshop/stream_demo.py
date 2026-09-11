@@ -38,17 +38,18 @@ import threading
 import time
 import webbrowser
 from collections import deque
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow as pa
 
 import supertable.config.homedir  # noqa: F401 — side effect: resolve/chdir app home
 from supertable.data_reader import DataReader, Status
 from supertable.data_writer import DataWriter
-from supertable.demo.webshop.core import GenerationConfig, WebshopDataGenerator
+from supertable.demo.webshop.core import GenerationConfig, WebshopDataGenerator, _floor_day
 from supertable.demo.webshop.defaults import (
     generated_data_dir,
     organization,
@@ -78,30 +79,14 @@ def _fmt_ms(x) -> str:
     return "     –" if x is None else f"{x:6.1f}ms"
 
 
-def _to_arrow(df: pd.DataFrame) -> pa.Table:
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    new_cols: list = []
-    new_fields: list = []
-    for i, field in enumerate(table.schema):
-        col = table.column(i)
-        if pa.types.is_null(field.type):
-            pd_dtype = df[field.name].dtype
-            if pd.api.types.is_integer_dtype(pd_dtype):
-                target = pa.int64()
-            elif pd.api.types.is_float_dtype(pd_dtype):
-                target = pa.float64()
-            elif pd.api.types.is_bool_dtype(pd_dtype):
-                target = pa.bool_()
-            else:
-                target = pa.string()
-            col = col.cast(target)
-            field = pa.field(field.name, target, nullable=True)
-        new_cols.append(col)
-        new_fields.append(field)
-    return pa.table(
-        {f.name: c for f, c in zip(new_fields, new_cols)},
-        schema=pa.schema(new_fields),
-    )
+def _to_arrow(df: pl.DataFrame) -> pa.Table:
+    # Polars keeps a column's type even when every value is null, so only a
+    # pl.Null column (one built from nothing but Nones) can still reach Arrow
+    # untyped; String is the one type that carries such a column.
+    null_columns = [name for name, dtype in df.schema.items() if dtype == pl.Null]
+    if null_columns:
+        df = df.with_columns(pl.col(name).cast(pl.String) for name in null_columns)
+    return df.to_arrow()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,7 +107,7 @@ def _load_dimensions(dim_dir: Path):
     cust = dim_dir / "customers" / "customers.parquet"
     prod = dim_dir / "products" / "products.parquet"
     if cust.exists() and prod.exists():
-        return pd.read_parquet(cust), pd.read_parquet(prod)
+        return pl.read_parquet(cust), pl.read_parquet(prod)
     # Cold start: generate a small in-memory dimension set (no disk/network).
     print("  No dimension files found — generating a small set in memory...")
     cfg = GenerationConfig(
@@ -148,11 +133,11 @@ def _producer_loop(q, stop, dim_dir: str, seed: int,
     try:
         rng = np.random.default_rng(seed)
         customers, products = _load_dimensions(Path(dim_dir))
-        today = pd.Timestamp.now().normalize()
+        today = _floor_day(datetime.now())
         cfg = GenerationConfig(
             output_dir="", seed=seed, n_orders=0, n_sessions=max_r,
             n_inventory_days=0, max_items_per_order=10, n_workers=1,
-            start_date=str((today - pd.Timedelta(days=1)).date()),
+            start_date=str((today - timedelta(days=1)).date()),
             end_date=str(today.date()),
         )
         gen = WebshopDataGenerator(cfg)
@@ -248,9 +233,10 @@ class Streamer:
                 query=f'SELECT MAX("session_id") FROM "{TABLE}"',
             )
             df, status, _ = reader.execute(role_name=role_name)
-            if status != Status.ERROR and not df.empty:
-                val = df.iloc[0, 0]
-                if not pd.isna(val):
+            if status != Status.ERROR and not df.is_empty():
+                # A missing MAX() is a plain None in polars — no NaN to isna().
+                val = df.item(0, 0)
+                if val is not None:
                     print(f"  bootstrap  : table MAX(session_id) = {int(val):,} "
                           f"(live from SuperTable)")
                     return int(val) + 1
@@ -262,8 +248,8 @@ class Streamer:
         path = dim_dir / "sessions" / "sessions.parquet"
         try:
             if path.exists():
-                mx = pd.read_parquet(path, columns=["session_id"])["session_id"].max()
-                if not pd.isna(mx):
+                mx = pl.read_parquet(path, columns=["session_id"])["session_id"].max()
+                if mx is not None:
                     print(f"  bootstrap  : snapshot MAX(session_id) = {int(mx):,} "
                           f"(local file fallback)")
                     return int(mx) + 1
@@ -293,12 +279,19 @@ class Streamer:
             n = item["n"]
 
             # Re-stamp session_start into a live window ending "now" (cheap).
-            now = pd.Timestamp.now().floor("s")
+            # with_columns returns a new frame, so the defensive .copy() the
+            # pandas version needed before assigning a column is gone.
+            now = datetime.now().replace(microsecond=0)
             offsets = np.sort(
                 self.rng.integers(0, LIVE_WINDOW_SECONDS + 1, size=len(sessions))
             )[::-1]
-            sessions = sessions.copy()
-            sessions["session_start"] = now - pd.to_timedelta(offsets, unit="s")
+            sessions = sessions.with_columns(
+                session_start=pl.Series(
+                    "session_start",
+                    [now - timedelta(seconds=int(off)) for off in offsets],
+                    dtype=pl.Datetime,
+                )
+            )
             payload = _to_arrow(sessions)
 
             # ── SuperTable update (network round-trip) — timed ALONE ─────────

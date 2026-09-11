@@ -22,7 +22,7 @@ collisions, and re-generating any month is an idempotent refresh.
 import argparse
 from pathlib import Path
 
-import pandas as pd
+import polars as pl
 
 from supertable.config.homedir import change_to_app_home
 from supertable.demo.medcenter.core import (
@@ -44,21 +44,25 @@ from supertable.demo.medcenter.defaults import (
 
 
 def _write_table(
-    output_root: Path, table_name: str, df: pd.DataFrame, month: str
+    output_root: Path, table_name: str, df: pl.DataFrame, month: str
 ) -> Path:
     table_dir = output_root / table_name
     table_dir.mkdir(parents=True, exist_ok=True)
     if table_name in csv_tables:
         file_path = table_dir / f"{table_name}_{month}.csv"
-        df.to_csv(file_path, sep=";", index=False, float_format="%.2f")
+        # float_precision=2 is polars' float_format="%.2f". Two cosmetic
+        # differences from the pandas writer, neither of which changes what a
+        # reader gets back: booleans render lowercase (true/false), and an
+        # empty string is quoted ("") so it stays distinguishable from a null.
+        df.write_csv(file_path, separator=";", float_precision=2)
     else:
         file_path = table_dir / f"{table_name}_{month}.parquet"
-        df.to_parquet(file_path, index=False)
+        df.write_parquet(file_path)
     return file_path
 
 
 def _write_category_rules(output_root: Path) -> Path:
-    rules = pd.DataFrame(
+    rules = pl.DataFrame(
         [
             {"prefix": prefix, "category": category}
             for prefix, category in category_prefix_rules.items()
@@ -66,7 +70,7 @@ def _write_category_rules(output_root: Path) -> Path:
         + [{"prefix": "DEFAULT", "category": category_default}]
     )
     rules_path = output_root / "demo_category_rules.csv"
-    rules.to_csv(rules_path, sep=";", index=False)
+    rules.write_csv(rules_path, separator=";")
     return rules_path
 
 

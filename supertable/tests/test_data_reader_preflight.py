@@ -216,7 +216,7 @@ class TestExecuteSurfacesNotFoundError:
         assert status == Status.ERROR
         assert "SuperTable not found" in (message or "")
         assert "ghost_sup" in (message or "")
-        assert df.empty
+        assert df.is_empty()
 
     @patch(_P_RESTRICT_READ)
     @patch(_P_REDIS_CATALOG)
@@ -283,4 +283,4 @@ class TestExecuteSurfacesNotFoundError:
         assert status == Status.ERROR
         assert "Table not found" in (message or "")
         assert "ghost_tbl" in (message or "")
-        assert df.empty
+        assert df.is_empty()

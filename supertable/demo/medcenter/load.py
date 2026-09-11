@@ -10,7 +10,7 @@ line makes that visible (2nd run: inserted == deleted).
 import argparse
 import os
 
-import pandas as pd
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -32,13 +32,12 @@ RAW_TABLES = [
 def read_file_as_table(file_path: str) -> pa.Table:
     if file_path.endswith(".parquet"):
         return pq.read_table(file_path)
-    df = pd.read_csv(file_path, sep=";", low_memory=False)
-    # Keep raw as-is, but normalise object columns to clean strings
-    # (NaN from empty CSV fields would otherwise stringify to "nan").
-    for col in df.columns:
-        if df[col].dtype == "object":
-            df[col] = df[col].fillna("").astype(str)
-    return pa.Table.from_pandas(df)
+    # infer_schema_length=None reads every row before typing a column, which
+    # is what pandas' low_memory=False did.
+    df = pl.read_csv(file_path, separator=";", infer_schema_length=None)
+    # Keep raw as-is, but normalise string columns to clean strings (an empty
+    # CSV field arrives as null and would otherwise land as SQL NULL).
+    return df.with_columns(pl.col(pl.String).fill_null("")).to_arrow()
 
 
 def load(data_dir: str = generated_data_dir) -> dict:

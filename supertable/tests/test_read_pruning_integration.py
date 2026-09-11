@@ -337,14 +337,14 @@ class TestExplainSqlContract:
         files = orders_on_disk["files"]
         plan = _duckdb_explain(_explain_prefixed(_PRUNE_Q), files)
         # DuckDB EXPLAIN yields a small plan table, not the matching data rows.
-        assert not plan.empty
+        assert not plan.empty  # _duckdb_explain returns pandas, not a library frame
         text = "\n".join(plan.astype(str).agg(" ".join, axis=1))
         assert "PHYSICAL_PLAN" in text.upper() or "SCAN" in text.upper()
 
     def test_explain_analyze_returns_plan(self, orders_on_disk):
         files = orders_on_disk["files"]
         plan = _duckdb_explain(_explain_prefixed(_PRUNE_Q, "ANALYZE"), files)
-        assert not plan.empty
+        assert not plan.empty  # _duckdb_explain returns pandas, not a library frame
 
     def test_explain_prefix_forms(self):
         assert _explain_prefixed("SELECT 1") == "EXPLAIN SELECT 1"

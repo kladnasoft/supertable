@@ -592,7 +592,7 @@ class TestExecuteEmptyReflection:
 
         assert status == Status.ERROR
         assert message == "No parquet files found"
-        assert df.empty
+        assert df.is_empty()
         # Executor should NOT be called when reflection has no supers
         MockExecutor.return_value.execute.assert_not_called()
 
@@ -674,7 +674,7 @@ class TestExecuteEstimationError:
 
         assert status == Status.ERROR
         assert "Missing required column(s)" in message
-        assert df.empty
+        assert df.is_empty()
 
 
 # ====================================================================
@@ -719,7 +719,7 @@ class TestExecuteExecutorError:
 
         assert status == Status.ERROR
         assert "DuckDB out of memory" in message
-        assert df.empty
+        assert df.is_empty()
 
     @patch(_PATCH_EXTEND_PLAN)
     @patch(_PATCH_EXECUTOR)
@@ -1867,7 +1867,7 @@ class TestExecuteRejectedCommands:
 
         assert status == Status.ERROR
         assert "table reference" in msg
-        assert df.empty
+        assert df.is_empty()
         # Rejected before any pipeline work.
         MockParser.assert_not_called()
         MockEstimator.assert_not_called()
@@ -1938,8 +1938,8 @@ class TestExecuteShowStats:
         assert msg is None
         assert list(df.columns) == list(STATS_SCHEMA.keys())
         assert len(df) == 1
-        assert df.iloc[0]["column_name"] == "id"
-        assert df.iloc[0]["max_bigint"] == 99
+        assert df.row(0, named=True)["column_name"] == "id"
+        assert df.row(0, named=True)["max_bigint"] == 99
         # RBAC table-gate enforced; engine pipeline skipped entirely.
         mock_restrict.assert_called_once()
         MockEstimator.assert_not_called()
@@ -1967,7 +1967,7 @@ class TestExecuteShowStats:
 
         assert status == Status.OK
         assert msg is None
-        assert df.empty
+        assert df.is_empty()
         assert list(df.columns) == list(STATS_SCHEMA.keys())
 
     @patch(_PATCH_EXECUTOR)
@@ -2005,7 +2005,7 @@ class TestExecuteShowStats:
         df, status, msg = dr.execute("admin")
 
         assert status == Status.ERROR
-        assert df.empty
+        assert df.is_empty()
         # Access check never reached (existence fails first).
         mock_restrict.assert_not_called()
 

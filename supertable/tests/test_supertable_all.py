@@ -1549,7 +1549,7 @@ class TestDataReaderExecute:
 
         assert status == Status.ERROR
         assert msg == "No parquet files found"
-        assert df.empty
+        assert df.is_empty()
 
     @patch("supertable.data_reader.extend_execution_plan")
     @patch("supertable.data_reader.Executor")

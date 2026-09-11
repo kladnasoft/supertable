@@ -22,7 +22,7 @@ stamped per row from the document's dominant VAT rate.
 import argparse
 import os
 
-import pandas as pd
+import polars as pl
 
 from supertable.config.homedir import change_to_app_home
 
@@ -58,41 +58,54 @@ GKONTO_BY_EXPORT = {
 DEMO_STEUERCODE_BY_RATE = {0: 0, 10: 1, 20: 2}
 
 
+def _belegdatum(dates: pl.Series) -> pl.Series:
+    """Render a document date as dd.mm.yyyy.
+
+    Both forms arrive here: the API sources keep their dates as ISO text,
+    staging hands over real dates. Polars, unlike the pandas conversion this
+    replaces, needs the string case parsed explicitly before formatting.
+    """
+    if dates.dtype == pl.String:
+        dates = dates.str.to_date("%Y-%m-%d")
+    return dates.dt.strftime("%d.%m.%Y")
+
+
 def _frame(
     export_key: str,
-    belegnr: pd.Series,
-    belegdatum: pd.Series,
+    belegnr: pl.Series,
+    belegdatum: pl.Series,
     buchsymbol,
-    prozent: pd.Series,
-    betrag: pd.Series,
-    steuer: pd.Series,
-    text: pd.Series,
-) -> pd.DataFrame:
-    prozent = prozent.astype(int)
-    return pd.DataFrame(
+    prozent: pl.Series,
+    betrag: pl.Series,
+    steuer: pl.Series,
+    text: pl.Series,
+) -> pl.DataFrame:
+    return pl.DataFrame(
         {
-            "satzart": DEMO_SATZART,
-            "konto": DEMO_KONTO,
-            "gkonto": GKONTO_BY_EXPORT[export_key],
             "belegnr": belegnr,
-            "belegdatum": pd.to_datetime(belegdatum).dt.strftime("%d.%m.%Y"),
-            "buchsymbol": buchsymbol,
-            "buchcode": DEMO_BUCHCODE,
-            "prozent": prozent,
-            "steuercode": prozent.map(DEMO_STEUERCODE_BY_RATE),
+            "belegdatum": _belegdatum(belegdatum),
+            "prozent": prozent.cast(pl.Int64),
             "betrag": betrag.round(2),
             "steuer": steuer.round(2),
             "text": text,
-        },
-        columns=EXPORT_COLUMNS,
-    )
+        }
+    ).with_columns(
+        # The constant columns are literals: unlike pandas, pl.DataFrame does
+        # not broadcast a bare python scalar across the other columns.
+        satzart=pl.lit(DEMO_SATZART, dtype=pl.Int64),
+        konto=pl.lit(DEMO_KONTO),
+        gkonto=pl.lit(GKONTO_BY_EXPORT[export_key]),
+        buchsymbol=pl.lit(buchsymbol),
+        buchcode=pl.lit(DEMO_BUCHCODE, dtype=pl.Int64),
+        # default=None keeps Series.map(dict)'s behaviour of leaving a rate
+        # the demo does not map empty instead of failing the export.
+        steuercode=pl.col("prozent").replace_strict(
+            DEMO_STEUERCODE_BY_RATE, default=None
+        ),
+    ).select(EXPORT_COLUMNS)
 
 
-def _empty_series() -> pd.Series:
-    return pd.Series(dtype=object)
-
-
-def _chargebee_frame(month: str) -> pd.DataFrame:
+def _chargebee_frame(month: str) -> pl.DataFrame:
     month = require_canonical_month(month)
     invoices = run_query(
         f"SELECT invoice_number, MIN(date_issued) AS date_issued, "
@@ -103,8 +116,10 @@ def _chargebee_frame(month: str) -> pd.DataFrame:
         f"WHERE substr(date_issued, 1, 7) = '{month}' AND status <> 'void' "
         f"GROUP BY invoice_number ORDER BY invoice_number"
     )
-    rate = invoices["tax_total"].gt(0).map({True: 20, False: 0}) \
-        if len(invoices) else _empty_series()
+    # A document that carries any tax is stamped with the 20% rate. Polars
+    # expressions are defined on an empty frame too, so unlike pandas' .map()
+    # this needs no separate no-rows branch.
+    rate = (invoices["tax_total"] > 0).cast(pl.Int64) * 20
     frames = [
         _frame(
             "chargebee",
@@ -130,16 +145,18 @@ def _chargebee_frame(month: str) -> pd.DataFrame:
                 credit_notes["credit_note_number"],
                 credit_notes["date"],
                 "GS",
-                pd.Series([0] * len(credit_notes)),
+                pl.Series([0] * len(credit_notes), dtype=pl.Int64),
                 -credit_notes["amount"],
-                pd.Series([0.0] * len(credit_notes)),
+                pl.Series([0.0] * len(credit_notes), dtype=pl.Float64),
                 "Gutschrift zu " + credit_notes["reference_invoice_number"],
             )
         )
-    return pd.concat(frames, ignore_index=True)
+    # Both frames come out of _frame, so the columns and types line up and a
+    # plain vertical concat is enough.
+    return pl.concat(frames, how="vertical")
 
 
-def _stripe_weight_frame(month: str) -> pd.DataFrame:
+def _stripe_weight_frame(month: str) -> pl.DataFrame:
     month = require_canonical_month(month)
     invoices = run_query(
         f"SELECT invoice_number, date, customer_name, status, amount "
@@ -147,25 +164,28 @@ def _stripe_weight_frame(month: str) -> pd.DataFrame:
         f"WHERE substr(date, 1, 7) = '{month}' ORDER BY invoice_number"
     )
     # Voided invoices enter the books as negative rows.
-    sign = invoices["status"].map(
-        lambda s: -1.0 if s == "void" else 1.0
-    ) if len(invoices) else _empty_series()
-    text_prefix = invoices["status"].map(
-        lambda s: "STORNO " if s == "void" else ""
-    ) if len(invoices) else _empty_series()
+    voided = pl.col("status") == "void"
+    betrag = invoices.select(
+        pl.when(voided).then(-pl.col("amount")).otherwise(pl.col("amount"))
+    ).to_series()
+    text = invoices.select(
+        pl.when(voided).then(pl.lit("STORNO ")).otherwise(pl.lit(""))
+        + pl.lit("Weight Programm ")
+        + pl.col("customer_name")
+    ).to_series()
     return _frame(
         "stripe_weight",
         invoices["invoice_number"],
         invoices["date"],
         "AR",
-        pd.Series([0] * len(invoices)),
-        invoices["amount"] * sign,
-        pd.Series([0.0] * len(invoices)),
-        text_prefix + "Weight Programm " + invoices["customer_name"],
+        pl.Series([0] * len(invoices), dtype=pl.Int64),
+        betrag,
+        pl.Series([0.0] * len(invoices), dtype=pl.Float64),
+        text,
     )
 
 
-def _eigenprodukte_frame(month: str) -> pd.DataFrame:
+def _eigenprodukte_frame(month: str) -> pl.DataFrame:
     month = require_canonical_month(month)
     stg = run_query(
         f"SELECT invoice_number, invoice_date, patient_name, positions, "
@@ -176,14 +196,18 @@ def _eigenprodukte_frame(month: str) -> pd.DataFrame:
         f"ORDER BY invoice_number"
     )
 
-    def dominant_rate(row: pd.Series) -> int:
-        nets = {0: row["net_vat0"], 10: row["net_vat10"],
-                20: row["net_vat20"]}
-        return max(nets, key=lambda rate: nets[rate])
-
-    rates = (
-        stg.apply(dominant_rate, axis=1) if len(stg) else _empty_series()
-    )
+    # The dominant VAT rate is the bucket holding the largest net. max() kept
+    # the first of equal values, so a tie still falls to the lower rate.
+    rates = stg.select(
+        pl.when(
+            (pl.col("net_vat0") >= pl.col("net_vat10"))
+            & (pl.col("net_vat0") >= pl.col("net_vat20"))
+        )
+        .then(0)
+        .when(pl.col("net_vat10") >= pl.col("net_vat20"))
+        .then(10)
+        .otherwise(20)
+    ).to_series()
     return _frame(
         "eigenprodukte",
         stg["invoice_number"],
@@ -217,7 +241,8 @@ def export_accounting_import(
         file_path = os.path.join(
             output_dir, f"accounting_import_{export_key}_{month}.csv"
         )
-        export.to_csv(file_path, sep=";", index=False, float_format="%.2f")
+        # float_precision=2 is polars' float_format="%.2f".
+        export.write_csv(file_path, separator=";", float_precision=2)
         total = export["betrag"].sum() if len(export) else 0.0
         print(
             f"Accounting import written: {file_path} "

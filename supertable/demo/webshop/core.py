@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import argparse
 import math
+import multiprocessing as mp
 import os
 import random
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import supertable.config.homedir
 import numpy as np
-import pandas as pd
+import polars as pl
 from tqdm import tqdm
 
 
@@ -31,6 +33,134 @@ class GenerationConfig:
     n_workers: int | None = None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Table schemas
+#
+# Every frame is built with an explicit schema instead of letting polars infer
+# one from the row dicts.  Two reasons:
+#
+#   1. Nullable integers stay integers.  ``estimated_delivery_days``,
+#      ``sessions.customer_id`` and ``pageviews.customer_id`` are int-or-null;
+#      pandas had to widen those to float64 because it cannot hold a null in an
+#      int column.  A declared Int64 keeps them integral.
+#   2. Chunk schemas are stable.  Workers build their slice independently and
+#      the results are ``pl.concat``-ed; inference could type an all-null column
+#      as Null in one chunk and Int64 in another.  Declaring the schema removes
+#      that whole failure class (and with it the all-null column that used to
+#      reach the writer as a typeless ``pa.null()``).
+# ─────────────────────────────────────────────────────────────────────────────
+
+CATEGORY_SCHEMA: Dict[str, pl.DataType] = {
+    "category_id": pl.Int64,
+    "category_name": pl.String,
+    "department": pl.String,
+    "is_active": pl.Boolean,
+    "created_at": pl.Datetime,
+}
+
+PRODUCT_SCHEMA: Dict[str, pl.DataType] = {
+    "product_id": pl.Int64,
+    "sku": pl.String,
+    "product_name": pl.String,
+    "brand": pl.String,
+    "category_id": pl.Int64,
+    "price": pl.Float64,
+    "cost": pl.Float64,
+    "margin_pct": pl.Float64,
+    "rating": pl.Float64,
+    "review_count": pl.Int64,
+    "is_active": pl.Boolean,
+    "weight_kg": pl.Float64,
+    "color": pl.String,
+    "created_at": pl.Datetime,
+}
+
+CUSTOMER_SCHEMA: Dict[str, pl.DataType] = {
+    "customer_id": pl.Int64,
+    "first_name": pl.String,
+    "last_name": pl.String,
+    "email": pl.String,
+    "country": pl.String,
+    "city": pl.String,
+    "gender": pl.String,
+    "birth_year": pl.Int64,
+    "customer_segment": pl.String,
+    "marketing_opt_in": pl.Boolean,
+    "created_at": pl.Datetime,
+}
+
+ORDER_SCHEMA: Dict[str, pl.DataType] = {
+    "order_id": pl.Int64,
+    "customer_id": pl.Int64,
+    "order_timestamp": pl.Datetime,
+    "order_date": pl.Datetime,
+    "status": pl.String,
+    "payment_method": pl.String,
+    "channel": pl.String,
+    "device_type": pl.String,
+    "items_count": pl.Int64,
+    "units_total": pl.Int64,
+    "subtotal": pl.Float64,
+    "shipping_fee": pl.Float64,
+    "tax_amount": pl.Float64,
+    "order_total": pl.Float64,
+    "gross_margin": pl.Float64,
+    "coupon_code": pl.String,
+    "estimated_delivery_days": pl.Int64,   # null for cancelled orders
+    "delivered_at": pl.Datetime,           # null until delivered/returned
+}
+
+ORDER_ITEM_SCHEMA: Dict[str, pl.DataType] = {
+    "order_id": pl.Int64,
+    "product_id": pl.Int64,
+    "quantity": pl.Int64,
+    "unit_price": pl.Float64,
+    "discount_pct": pl.Float64,
+    "net_unit_price": pl.Float64,
+    "line_revenue": pl.Float64,
+    "line_cost": pl.Float64,
+    "returned_qty": pl.Int64,
+}
+
+INVENTORY_SCHEMA: Dict[str, pl.DataType] = {
+    "snapshot_date": pl.Datetime,
+    "product_id": pl.Int64,
+    "warehouse_code": pl.String,
+    "stock_on_hand": pl.Int64,
+    "inbound_units": pl.Int64,
+    "outbound_units": pl.Int64,
+    "is_low_stock": pl.Boolean,
+}
+
+SESSION_SCHEMA: Dict[str, pl.DataType] = {
+    "session_id": pl.Int64,
+    "customer_id": pl.Int64,               # null for guest sessions
+    "session_start": pl.Datetime,
+    "channel": pl.String,
+    "device_type": pl.String,
+    "page_count": pl.Int64,
+    "duration_seconds": pl.Int64,
+    "converted": pl.Boolean,
+    "bounced": pl.Boolean,
+}
+
+PAGEVIEW_SCHEMA: Dict[str, pl.DataType] = {
+    "session_id": pl.Int64,
+    "customer_id": pl.Int64,               # null for guest sessions
+    "product_id": pl.Int64,
+    "view_timestamp": pl.Datetime,
+    "page_position": pl.Int64,
+    "add_to_cart": pl.Boolean,
+    "purchased": pl.Boolean,
+    "dwell_seconds": pl.Int64,
+}
+
+
+def _floor_day(ts: datetime) -> datetime:
+    """Midnight of ``ts``'s calendar day — stdlib stand-in for ``Timestamp.normalize()``."""
+    return ts.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
 class WebshopDataGenerator:
     def __init__(self, config: GenerationConfig):
         self.config = config
@@ -38,8 +168,11 @@ class WebshopDataGenerator:
         random.seed(config.seed)
 
         try:
-            self.start_date = pd.Timestamp(config.start_date)
-            self.end_date = pd.Timestamp(config.end_date)
+            # fromisoformat replaces pd.Timestamp(str): stricter (ISO-8601 only),
+            # which is all the YYYY-MM-DD config fields ever carry, and it still
+            # raises on anything unparseable.
+            self.start_date = datetime.fromisoformat(config.start_date)
+            self.end_date = datetime.fromisoformat(config.end_date)
         except Exception as exc:
             raise ValueError(
                 f"Invalid date in config. start_date={config.start_date}, end_date={config.end_date}"
@@ -105,7 +238,7 @@ class WebshopDataGenerator:
             "returned",
         ]
 
-    def run(self) -> Dict[str, pd.DataFrame]:
+    def run(self) -> Dict[str, pl.DataFrame]:
         self._announce(
             f"Starting dataset generation with {self.worker_count} worker"
             f"{'s' if self.worker_count != 1 else ''} (detected {self.cpu_count} CPU"
@@ -154,7 +287,7 @@ class WebshopDataGenerator:
         self.write_tables(tables)
         return tables
 
-    def generate_categories(self) -> pd.DataFrame:
+    def generate_categories(self) -> pl.DataFrame:
         category_names = [
             "Electronics",
             "Home & Kitchen",
@@ -180,12 +313,12 @@ class WebshopDataGenerator:
                     "department": name.split(" & ")[0],
                     "is_active": True,
                     "created_at": self.start_date
-                    - pd.Timedelta(days=int(self.rng.integers(30, 600))),
+                    - timedelta(days=int(self.rng.integers(30, 600))),
                 }
             )
-        return pd.DataFrame(rows)
+        return pl.DataFrame(rows, schema=CATEGORY_SCHEMA)
 
-    def generate_products(self, categories: pd.DataFrame) -> pd.DataFrame:
+    def generate_products(self, categories: pl.DataFrame) -> pl.DataFrame:
         if not self._should_parallel(self.config.n_products):
             return self._generate_products_range(
                 categories=categories,
@@ -208,15 +341,15 @@ class WebshopDataGenerator:
                 stop_id,
             ),
         )
-        return pd.concat(frames, ignore_index=True)
+        return pl.concat(frames, how="vertical")
 
     def _generate_products_range(
         self,
-        categories: pd.DataFrame,
+        categories: pl.DataFrame,
         start_id: int,
         stop_id: int,
         show_progress: bool,
-    ) -> pd.DataFrame:
+    ) -> pl.DataFrame:
         product_terms = {
             "Electronics": [
                 "Headphones",
@@ -311,7 +444,7 @@ class WebshopDataGenerator:
         }
 
         rows = []
-        category_ids = categories["category_id"].tolist()
+        category_ids = categories["category_id"].to_list()
         category_names = dict(
             zip(categories["category_id"], categories["category_name"])
         )
@@ -343,8 +476,8 @@ class WebshopDataGenerator:
             )
             review_count = int(max(0, self.rng.lognormal(mean=3.4, sigma=0.85)))
             created_at = self.random_timestamp(
-                self.start_date - pd.Timedelta(days=300),
-                self.end_date - pd.Timedelta(days=10),
+                self.start_date - timedelta(days=300),
+                self.end_date - timedelta(days=10),
             )
 
             rows.append(
@@ -371,9 +504,9 @@ class WebshopDataGenerator:
                 }
             )
 
-        return pd.DataFrame(rows)
+        return pl.DataFrame(rows, schema=PRODUCT_SCHEMA)
 
-    def generate_customers(self) -> pd.DataFrame:
+    def generate_customers(self) -> pl.DataFrame:
         if not self._should_parallel(self.config.n_customers):
             return self._generate_customers_range(
                 start_id=1,
@@ -394,14 +527,14 @@ class WebshopDataGenerator:
                 stop_id,
             ),
         )
-        return pd.concat(frames, ignore_index=True)
+        return pl.concat(frames, how="vertical")
 
     def _generate_customers_range(
         self,
         start_id: int,
         stop_id: int,
         show_progress: bool,
-    ) -> pd.DataFrame:
+    ) -> pl.DataFrame:
         first_names = [
             "Adam",
             "Ben",
@@ -454,8 +587,8 @@ class WebshopDataGenerator:
             first_name = random.choice(first_names)
             last_name = random.choice(last_names)
             created_at = self.random_timestamp(
-                self.start_date - pd.Timedelta(days=500),
-                self.end_date - pd.Timedelta(days=1),
+                self.start_date - timedelta(days=500),
+                self.end_date - timedelta(days=1),
             )
             birth_year = int(self.rng.integers(1958, 2008))
 
@@ -476,13 +609,13 @@ class WebshopDataGenerator:
                     "created_at": created_at,
                 }
             )
-        return pd.DataFrame(rows)
+        return pl.DataFrame(rows, schema=CUSTOMER_SCHEMA)
 
     def generate_orders_and_items(
         self,
-        customers: pd.DataFrame,
-        products: pd.DataFrame,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        customers: pl.DataFrame,
+        products: pl.DataFrame,
+    ) -> Tuple[pl.DataFrame, pl.DataFrame]:
         if not self._should_parallel(self.config.n_orders):
             orders, order_items = self._generate_orders_and_items_range(
                 customers=customers,
@@ -511,21 +644,23 @@ class WebshopDataGenerator:
 
         orders_frames = [result[0] for result in results]
         order_item_frames = [result[1] for result in results]
-        orders = pd.concat(orders_frames, ignore_index=True)
-        order_items = pd.concat(order_item_frames, ignore_index=True)
+        orders = pl.concat(orders_frames, how="vertical")
+        order_items = pl.concat(order_item_frames, how="vertical")
         return orders, self._finalize_order_item_ids(order_items)
 
     def _generate_orders_and_items_range(
         self,
-        customers: pd.DataFrame,
-        products: pd.DataFrame,
+        customers: pl.DataFrame,
+        products: pl.DataFrame,
         start_id: int,
         stop_id: int,
         show_progress: bool,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    ) -> Tuple[pl.DataFrame, pl.DataFrame]:
         product_ids = products["product_id"].to_numpy()
-        product_price = products.set_index("product_id")["price"].to_dict()
-        product_cost = products.set_index("product_id")["cost"].to_dict()
+        # polars has no index, so the id→value lookups are built by zipping the
+        # two columns rather than via set_index(...).to_dict()
+        product_price = dict(zip(products["product_id"], products["price"]))
+        product_cost = dict(zip(products["product_id"], products["cost"]))
         customer_ids = customers["customer_id"].to_numpy()
 
         orders_rows: List[dict] = []
@@ -612,14 +747,14 @@ class WebshopDataGenerator:
             if status in {"delivered", "returned", "shipped"}:
                 estimated_delivery_days = int(self.rng.integers(1, 8))
             if status in {"delivered", "returned"}:
-                delivered_at = order_ts + pd.Timedelta(days=estimated_delivery_days)
+                delivered_at = order_ts + timedelta(days=estimated_delivery_days)
 
             orders_rows.append(
                 {
                     "order_id": order_id,
                     "customer_id": customer_id,
                     "order_timestamp": order_ts,
-                    "order_date": order_ts.normalize(),
+                    "order_date": _floor_day(order_ts),
                     "status": status,
                     "payment_method": payment_method,
                     "channel": channel,
@@ -639,9 +774,12 @@ class WebshopDataGenerator:
                 }
             )
 
-        return pd.DataFrame(orders_rows), pd.DataFrame(item_rows)
+        return (
+            pl.DataFrame(orders_rows, schema=ORDER_SCHEMA),
+            pl.DataFrame(item_rows, schema=ORDER_ITEM_SCHEMA),
+        )
 
-    def generate_inventory_snapshots(self, products: pd.DataFrame) -> pd.DataFrame:
+    def generate_inventory_snapshots(self, products: pl.DataFrame) -> pl.DataFrame:
         if not self._should_parallel(self.config.n_products):
             return self._generate_inventory_snapshot_chunk(
                 products=products,
@@ -657,24 +795,27 @@ class WebshopDataGenerator:
             submit_fn=lambda executor, chunk_index, start_idx, stop_idx: executor.submit(
                 _generate_inventory_chunk,
                 self._worker_config(seed_offset=4000 + chunk_index),
-                products.iloc[start_idx:stop_idx].reset_index(drop=True),
+                products.slice(start_idx, stop_idx - start_idx),
             ),
         )
-        return pd.concat(frames, ignore_index=True)
+        return pl.concat(frames, how="vertical")
 
     def _generate_inventory_snapshot_chunk(
         self,
-        products: pd.DataFrame,
+        products: pl.DataFrame,
         show_progress: bool,
-    ) -> pd.DataFrame:
-        days = pd.date_range(
-            self.end_date - pd.Timedelta(days=self.config.n_inventory_days - 1),
+    ) -> pl.DataFrame:
+        # datetime_range (not date_range) keeps the Datetime dtype pandas'
+        # date_range produced; pl.date_range would yield Date instead.
+        days = pl.datetime_range(
+            self.end_date - timedelta(days=self.config.n_inventory_days - 1),
             self.end_date,
-            freq="D",
+            interval="1d",
+            eager=True,
         )
         rows = []
 
-        iterator = products.iterrows()
+        iterator = products.iter_rows(named=True)
         if show_progress:
             iterator = tqdm(
                 iterator,
@@ -685,7 +826,7 @@ class WebshopDataGenerator:
                 leave=True,
             )
 
-        for _, product in iterator:
+        for product in iterator:
             stock = int(max(0, self.rng.normal(80, 40)))
             warehouse = random.choice(["WH-BUD-01", "WH-BUD-02", "WH-DEB-01"])
 
@@ -707,13 +848,13 @@ class WebshopDataGenerator:
                         "is_low_stock": stock < 10,
                     }
                 )
-        return pd.DataFrame(rows)
+        return pl.DataFrame(rows, schema=INVENTORY_SCHEMA)
 
     def generate_sessions_and_pageviews(
         self,
-        customers: pd.DataFrame,
-        products: pd.DataFrame,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        customers: pl.DataFrame,
+        products: pl.DataFrame,
+    ) -> Tuple[pl.DataFrame, pl.DataFrame]:
         if not self._should_parallel(self.config.n_sessions):
             sessions, pageviews = self._generate_sessions_and_pageviews_range(
                 customers=customers,
@@ -742,18 +883,18 @@ class WebshopDataGenerator:
 
         sessions_frames = [result[0] for result in results]
         pageviews_frames = [result[1] for result in results]
-        sessions = pd.concat(sessions_frames, ignore_index=True)
-        pageviews = pd.concat(pageviews_frames, ignore_index=True)
+        sessions = pl.concat(sessions_frames, how="vertical")
+        pageviews = pl.concat(pageviews_frames, how="vertical")
         return sessions, self._finalize_pageview_ids(pageviews)
 
     def _generate_sessions_and_pageviews_range(
         self,
-        customers: pd.DataFrame,
-        products: pd.DataFrame,
+        customers: pl.DataFrame,
+        products: pl.DataFrame,
         start_id: int,
         stop_id: int,
         show_progress: bool,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    ) -> Tuple[pl.DataFrame, pl.DataFrame]:
         customer_ids = customers["customer_id"].to_numpy()
         product_ids = products["product_id"].to_numpy()
         popularity_weights = self.product_popularity_weights(products)
@@ -820,7 +961,7 @@ class WebshopDataGenerator:
                         "customer_id": None if customer_id == 0 else customer_id,
                         "product_id": int(product_id),
                         "view_timestamp": session_ts
-                        + pd.Timedelta(seconds=position * int(self.rng.integers(15, 70))),
+                        + timedelta(seconds=position * int(self.rng.integers(15, 70))),
                         "page_position": position,
                         "add_to_cart": add_to_cart,
                         "purchased": purchased,
@@ -828,82 +969,93 @@ class WebshopDataGenerator:
                     }
                 )
 
-        return pd.DataFrame(sessions_rows), pd.DataFrame(pageviews_rows)
+        return (
+            pl.DataFrame(sessions_rows, schema=SESSION_SCHEMA),
+            pl.DataFrame(pageviews_rows, schema=PAGEVIEW_SCHEMA),
+        )
 
     def generate_product_daily_stats(
         self,
-        products: pd.DataFrame,
-        pageviews: pd.DataFrame,
-        order_items: pd.DataFrame,
-        orders: pd.DataFrame,
-    ) -> pd.DataFrame:
-        pageviews = pageviews.copy()
-        pageviews["stat_date"] = pd.to_datetime(pageviews["view_timestamp"]).dt.normalize()
-
-        orders_lookup = orders[["order_id", "order_date", "status"]].copy()
-        valid_items = order_items.merge(orders_lookup, on="order_id", how="left")
-        valid_items = valid_items[
-            valid_items["status"].isin(["delivered", "shipped", "processing", "returned"])
-        ]
-
-        views_agg = (
-            pageviews.groupby(["stat_date", "product_id"], as_index=False)
-            .agg(
-                views=("pageview_id", "count"),
-                add_to_cart_count=("add_to_cart", "sum"),
-                purchase_clicks=("purchased", "sum"),
-                avg_dwell_seconds=("dwell_seconds", "mean"),
-            )
+        products: pl.DataFrame,
+        pageviews: pl.DataFrame,
+        order_items: pl.DataFrame,
+        orders: pl.DataFrame,
+    ) -> pl.DataFrame:
+        # truncate("1d") is the Datetime-preserving equivalent of pandas'
+        # .dt.normalize(); .dt.date() would demote the column to Date and no
+        # longer join against orders.order_date.
+        pageviews = pageviews.with_columns(
+            stat_date=pl.col("view_timestamp").dt.truncate("1d")
         )
 
-        sales_agg = (
-            valid_items.groupby(["order_date", "product_id"], as_index=False)
-            .agg(
-                units_sold=("quantity", "sum"),
-                revenue=("line_revenue", "sum"),
-                returned_units=("returned_qty", "sum"),
-            )
-            .rename(columns={"order_date": "stat_date"})
+        orders_lookup = orders.select("order_id", "order_date", "status")
+        valid_items = order_items.join(orders_lookup, on="order_id", how="left")
+        valid_items = valid_items.filter(
+            pl.col("status").is_in(["delivered", "shipped", "processing", "returned"])
         )
 
-        merged = views_agg.merge(sales_agg, on=["stat_date", "product_id"], how="outer")
-        merged = merged.merge(
-            products[["product_id", "price", "rating", "review_count"]],
+        views_agg = pageviews.group_by(["stat_date", "product_id"]).agg(
+            views=pl.col("pageview_id").count(),
+            add_to_cart_count=pl.col("add_to_cart").sum(),
+            purchase_clicks=pl.col("purchased").sum(),
+            avg_dwell_seconds=pl.col("dwell_seconds").mean(),
+        )
+
+        sales_agg = valid_items.group_by(["order_date", "product_id"]).agg(
+            units_sold=pl.col("quantity").sum(),
+            revenue=pl.col("line_revenue").sum(),
+            returned_units=pl.col("returned_qty").sum(),
+        ).rename({"order_date": "stat_date"})
+
+        # how="full" is polars' outer join; coalesce=True folds the duplicated
+        # key columns back into one, which is what pandas' merge always did.
+        merged = views_agg.join(
+            sales_agg, on=["stat_date", "product_id"], how="full", coalesce=True
+        )
+        merged = merged.join(
+            products.select("product_id", "price", "rating", "review_count"),
             on="product_id",
             how="left",
         )
 
-        for col in [
-            "views",
-            "add_to_cart_count",
-            "purchase_clicks",
-            "units_sold",
-            "returned_units",
-        ]:
-            merged[col] = merged[col].fillna(0).astype(int)
-        for col in ["revenue", "avg_dwell_seconds"]:
-            merged[col] = merged[col].fillna(0.0)
-
-        merged["conversion_rate"] = np.where(
-            merged["views"] > 0, merged["units_sold"] / merged["views"], 0.0
+        merged = merged.with_columns(
+            # count()/sum()-of-bool return UInt32 in polars, so cast back to the
+            # Int64 the pandas .astype(int) produced
+            [
+                pl.col(col).fill_null(0).cast(pl.Int64)
+                for col in (
+                    "views",
+                    "add_to_cart_count",
+                    "purchase_clicks",
+                    "units_sold",
+                    "returned_units",
+                )
+            ]
+            + [pl.col(col).fill_null(0.0) for col in ("revenue", "avg_dwell_seconds")]
         )
-        merged["add_to_cart_rate"] = np.where(
-            merged["views"] > 0, merged["add_to_cart_count"] / merged["views"], 0.0
-        )
-        merged["return_rate"] = np.where(
-            merged["units_sold"] > 0,
-            merged["returned_units"] / merged["units_sold"],
-            0.0,
-        )
-        merged["revenue"] = merged["revenue"].round(2)
-        merged["avg_dwell_seconds"] = merged["avg_dwell_seconds"].round(2)
-        merged["conversion_rate"] = merged["conversion_rate"].round(4)
-        merged["add_to_cart_rate"] = merged["add_to_cart_rate"].round(4)
-        merged["return_rate"] = merged["return_rate"].round(4)
 
-        return merged.sort_values(["stat_date", "product_id"]).reset_index(drop=True)
+        merged = merged.with_columns(
+            conversion_rate=pl.when(pl.col("views") > 0)
+            .then(pl.col("units_sold") / pl.col("views"))
+            .otherwise(0.0),
+            add_to_cart_rate=pl.when(pl.col("views") > 0)
+            .then(pl.col("add_to_cart_count") / pl.col("views"))
+            .otherwise(0.0),
+            return_rate=pl.when(pl.col("units_sold") > 0)
+            .then(pl.col("returned_units") / pl.col("units_sold"))
+            .otherwise(0.0),
+        )
+        merged = merged.with_columns(
+            pl.col("revenue").round(2),
+            pl.col("avg_dwell_seconds").round(2),
+            pl.col("conversion_rate").round(4),
+            pl.col("add_to_cart_rate").round(4),
+            pl.col("return_rate").round(4),
+        )
 
-    def write_tables(self, tables: Dict[str, pd.DataFrame]) -> None:
+        return merged.sort(["stat_date", "product_id"])
+
+    def write_tables(self, tables: Dict[str, pl.DataFrame]) -> None:
         output_root = Path(self.config.output_dir)
         output_root.mkdir(parents=True, exist_ok=True)
 
@@ -911,28 +1063,28 @@ class WebshopDataGenerator:
             table_dir = output_root / table_name
             table_dir.mkdir(parents=True, exist_ok=True)
             file_path = table_dir / f"{table_name}.parquet"
-            df.to_parquet(file_path, index=False)
+            df.write_parquet(file_path)
             print(f"Wrote {table_name:<22} -> {file_path} ({len(df):,} rows)")
 
-    def random_timestamp(self, start: pd.Timestamp, end: pd.Timestamp) -> pd.Timestamp:
+    def random_timestamp(self, start: datetime, end: datetime) -> datetime:
         total_seconds = int((end - start).total_seconds())
         offset = int(self.rng.integers(0, max(total_seconds, 1)))
-        return start + pd.Timedelta(seconds=offset)
+        return start + timedelta(seconds=offset)
 
-    def weighted_order_timestamp(self) -> pd.Timestamp:
+    def weighted_order_timestamp(self) -> datetime:
         total_days = (self.end_date - self.start_date).days
         day_offset = int(self.rng.integers(0, total_days + 1))
-        base_date = self.start_date + pd.Timedelta(days=day_offset)
+        base_date = self.start_date + timedelta(days=day_offset)
 
         if base_date.month in [11, 12]:
-            base_date += pd.Timedelta(hours=int(self.rng.integers(0, 8)))
+            base_date += timedelta(hours=int(self.rng.integers(0, 8)))
         if base_date.day in [1, 15, 28]:
-            base_date += pd.Timedelta(hours=int(self.rng.integers(0, 5)))
+            base_date += timedelta(hours=int(self.rng.integers(0, 5)))
 
         hour = int(np.clip(self.rng.normal(14, 5), 0, 23))
         minute = int(self.rng.integers(0, 60))
         second = int(self.rng.integers(0, 60))
-        return pd.Timestamp(
+        return datetime(
             base_date.year,
             base_date.month,
             base_date.day,
@@ -957,7 +1109,7 @@ class WebshopDataGenerator:
             "Automotive": 44,
         }.get(category_name, 35)
 
-    def product_popularity_weights(self, products: pd.DataFrame) -> np.ndarray:
+    def product_popularity_weights(self, products: pl.DataFrame) -> np.ndarray:
         base = np.linspace(1.0, 3.5, len(products))
         self.rng.shuffle(base)
         return base / base.sum()
@@ -1007,12 +1159,19 @@ class WebshopDataGenerator:
         desc: str,
         unit: str,
         submit_fn,
-    ) -> List[pd.DataFrame] | List[Tuple[pd.DataFrame, pd.DataFrame]]:
+    ) -> List[pl.DataFrame] | List[Tuple[pl.DataFrame, pl.DataFrame]]:
         results = []
         max_workers = min(self.worker_count, len(ranges))
 
+        # Workers must be spawned, not forked.  polars runs on a Rust thread
+        # pool that does not survive fork(): a child inherits the pool's locks
+        # without its threads, so the first polars call needing them (e.g.
+        # datetime_range in the inventory chunk) blocks forever.  pandas had no
+        # such constraint, so this was only safe before the migration.
+        ctx = mp.get_context("spawn")
+
         with tqdm(total=total, desc=desc, unit=unit, dynamic_ncols=True, leave=True) as pbar:
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
                 futures = {
                     submit_fn(executor, chunk_index, start, stop): (chunk_index, start, stop)
                     for chunk_index, (start, stop) in enumerate(ranges)
@@ -1032,23 +1191,19 @@ class WebshopDataGenerator:
             n_workers=1,
         )
 
-    def _finalize_order_item_ids(self, order_items: pd.DataFrame) -> pd.DataFrame:
-        order_items = order_items.reset_index(drop=True)
-        order_items.insert(
+    def _finalize_order_item_ids(self, order_items: pl.DataFrame) -> pl.DataFrame:
+        # insert_column is the polars counterpart of DataFrame.insert; there is
+        # no index to reset first.
+        return order_items.insert_column(
             0,
-            "order_item_id",
-            np.arange(1, len(order_items) + 1, dtype=np.int64),
+            pl.Series("order_item_id", np.arange(1, len(order_items) + 1, dtype=np.int64)),
         )
-        return order_items
 
-    def _finalize_pageview_ids(self, pageviews: pd.DataFrame) -> pd.DataFrame:
-        pageviews = pageviews.reset_index(drop=True)
-        pageviews.insert(
+    def _finalize_pageview_ids(self, pageviews: pl.DataFrame) -> pl.DataFrame:
+        return pageviews.insert_column(
             0,
-            "pageview_id",
-            np.arange(1, len(pageviews) + 1, dtype=np.int64),
+            pl.Series("pageview_id", np.arange(1, len(pageviews) + 1, dtype=np.int64)),
         )
-        return pageviews
 
     def _announce(self, message: str) -> None:
         tqdm.write("")
@@ -1057,10 +1212,10 @@ class WebshopDataGenerator:
 
 def _generate_products_chunk(
     config: GenerationConfig,
-    categories: pd.DataFrame,
+    categories: pl.DataFrame,
     start_id: int,
     stop_id: int,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     generator = WebshopDataGenerator(config)
     return generator._generate_products_range(
         categories=categories,
@@ -1074,7 +1229,7 @@ def _generate_customers_chunk(
     config: GenerationConfig,
     start_id: int,
     stop_id: int,
-) -> pd.DataFrame:
+) -> pl.DataFrame:
     generator = WebshopDataGenerator(config)
     return generator._generate_customers_range(
         start_id=start_id,
@@ -1085,11 +1240,11 @@ def _generate_customers_chunk(
 
 def _generate_orders_chunk(
     config: GenerationConfig,
-    customers: pd.DataFrame,
-    products: pd.DataFrame,
+    customers: pl.DataFrame,
+    products: pl.DataFrame,
     start_id: int,
     stop_id: int,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pl.DataFrame, pl.DataFrame]:
     generator = WebshopDataGenerator(config)
     return generator._generate_orders_and_items_range(
         customers=customers,
@@ -1102,8 +1257,8 @@ def _generate_orders_chunk(
 
 def _generate_inventory_chunk(
     config: GenerationConfig,
-    products: pd.DataFrame,
-) -> pd.DataFrame:
+    products: pl.DataFrame,
+) -> pl.DataFrame:
     generator = WebshopDataGenerator(config)
     return generator._generate_inventory_snapshot_chunk(
         products=products,
@@ -1113,11 +1268,11 @@ def _generate_inventory_chunk(
 
 def _generate_sessions_chunk(
     config: GenerationConfig,
-    customers: pd.DataFrame,
-    products: pd.DataFrame,
+    customers: pl.DataFrame,
+    products: pl.DataFrame,
     start_id: int,
     stop_id: int,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pl.DataFrame, pl.DataFrame]:
     generator = WebshopDataGenerator(config)
     return generator._generate_sessions_and_pageviews_range(
         customers=customers,

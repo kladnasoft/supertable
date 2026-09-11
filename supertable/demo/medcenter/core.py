@@ -26,7 +26,7 @@ from datetime import date, timedelta
 from typing import Dict
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from supertable.demo.medcenter.defaults import (
     category_prefix_rules,
@@ -162,7 +162,7 @@ class MedcenterDataGenerator:
     # ------------------------------------------------------------------
     # Invoices
     # ------------------------------------------------------------------
-    def generate_invoices(self) -> pd.DataFrame:
+    def generate_invoices(self) -> pl.DataFrame:
         cfg = self.config
         groups = list(category_prefix_rules.keys()) + ["OTHER"]
         rows = []
@@ -225,7 +225,9 @@ class MedcenterDataGenerator:
                 }
             )
 
-        return pd.DataFrame(rows)
+        # infer_schema_length=None types every column off all of the rows,
+        # the way pandas did — polars would otherwise stop after the first 100.
+        return pl.DataFrame(rows, infer_schema_length=None)
 
     def _draw_positions(self, group: str) -> tuple[str, float, float, float]:
         """Draw 1-3 billing positions and sum their nets per VAT bucket."""
@@ -245,7 +247,7 @@ class MedcenterDataGenerator:
     # ------------------------------------------------------------------
     # Payments
     # ------------------------------------------------------------------
-    def generate_payments(self, invoices: pd.DataFrame) -> pd.DataFrame:
+    def generate_payments(self, invoices: pl.DataFrame) -> pl.DataFrame:
         cfg = self.config
         rows = []
 
@@ -254,10 +256,10 @@ class MedcenterDataGenerator:
         # self-contained — downstream Hobex settlements and bank credits are
         # derived from exactly one generated month.
         month_end = date(self.year, self.month, self.days_in_month)
-        settled = invoices[
-            (invoices["Stornogrund"] == "") & (~invoices["Invoice_open"])
-        ]
-        for _, inv in settled.iterrows():
+        settled = invoices.filter(
+            (pl.col("Stornogrund") == "") & ~pl.col("Invoice_open")
+        )
+        for inv in settled.iter_rows(named=True):
             pay_date = min(
                 inv["_date"] + timedelta(days=int(self.rng.integers(0, 11))),
                 month_end,
@@ -285,12 +287,21 @@ class MedcenterDataGenerator:
                 pay_date, category, amount, self.rng.choice(DOCTORS)
             ))
 
-        payments = pd.DataFrame(rows).sort_values("_date", kind="stable")
-        payments["belegnr"] = [
-            f"BEL{self.year}-{cfg.payment_sequence_start + i:05d}"
-            for i in range(len(payments))
-        ]
-        return payments
+        # maintain_order=True is polars' stable sort (pandas: kind="stable"):
+        # receipts of the same day must keep the order they were drawn in,
+        # because the belegnr sequence is assigned from it.
+        payments = pl.DataFrame(rows, infer_schema_length=None).sort(
+            "_date", maintain_order=True
+        )
+        return payments.with_columns(
+            pl.Series(
+                "belegnr",
+                [
+                    f"BEL{self.year}-{cfg.payment_sequence_start + i:05d}"
+                    for i in range(len(payments))
+                ],
+            )
+        )
 
     def _payment_row(self, pay_date, category, amount, doctor) -> dict:
         category = str(category)
@@ -316,10 +327,10 @@ class MedcenterDataGenerator:
     # ------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------
-    def run(self) -> Dict[str, pd.DataFrame]:
+    def run(self) -> Dict[str, pl.DataFrame]:
         invoices = self.generate_invoices()
         payments = self.generate_payments(invoices)
         return {
-            raw_invoices_table: invoices[INVOICE_COLUMNS],
-            raw_payments_table: payments[PAYMENT_COLUMNS],
+            raw_invoices_table: invoices.select(INVOICE_COLUMNS),
+            raw_payments_table: payments.select(PAYMENT_COLUMNS),
         }

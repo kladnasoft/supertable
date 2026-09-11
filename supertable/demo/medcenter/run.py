@@ -13,6 +13,8 @@ the generator is seeded and every load/transform is an upsert.
 import argparse
 import sys
 
+import polars as pl
+
 from supertable.config.homedir import change_to_app_home
 from supertable.demo.medcenter import defaults
 from supertable.demo.medcenter.export_accounting import (
@@ -74,7 +76,19 @@ def teardown() -> None:
 
 def show(title: str, query: str) -> None:
     print(f"\n{title}:")
-    print(run_query(query).to_string(index=False))
+    # Every showcase view is printed whole. Polars, unlike pandas' to_string,
+    # abbreviates by default: 10 rows, 32-character strings, dtype headers.
+    # float_precision keeps the amounts on two decimals, the way money reads.
+    with pl.Config(
+        tbl_rows=-1,
+        tbl_cols=-1,
+        tbl_width_chars=-1,
+        tbl_hide_dataframe_shape=True,
+        tbl_hide_column_data_types=True,
+        fmt_str_lengths=120,
+        float_precision=2,
+    ):
+        print(run_query(query))
 
 
 def showcase() -> None:
@@ -147,16 +161,16 @@ def showcase() -> None:
 def snapshot_for_idempotency() -> tuple[int, str, str]:
     stg_count = int(run_query(
         f"SELECT COUNT(*) FROM {defaults.stg_invoices_table}"
-    ).iloc[0, 0])
+    ).item(0, 0))
     mart_csv = run_query(
         f"SELECT * FROM {defaults.mart_monthly_table} "
         f"ORDER BY invoice_month, category"
-    ).to_csv(index=False)
+    ).write_csv()
     recon_csv = run_query(
         f"SELECT matched_system, match_method, COUNT(*) AS n "
         f"FROM {defaults.mart_bank_reconciliation} "
         f"GROUP BY matched_system, match_method ORDER BY 1, 2"
-    ).to_csv(index=False)
+    ).write_csv()
     return stg_count, mart_csv, recon_csv
 
 

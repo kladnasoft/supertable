@@ -1,8 +1,7 @@
 
 import json
 import os
-import pandas as pd
-import pyarrow as pa
+import polars as pl
 import pyarrow.parquet as pq
 from collections import defaultdict
 import time
@@ -103,24 +102,25 @@ def format_duration(seconds):
 
 
 def read_file_as_table(file_path):
+    # The pandas version cast every "object" column to str so the writer never
+    # received an untyped column.  Polars has no object dtype — its readers
+    # always produce a concrete type (String for anything unparseable) — so the
+    # cast pass is gone rather than translated.
     if file_path.endswith(".csv"):
-        df = pd.read_csv(file_path, low_memory=False)
-        df = df.apply(lambda x: x.astype(str) if x.dtype == "object" else x)
-        return pa.Table.from_pandas(df)
+        return pl.read_csv(file_path).to_arrow()
     elif file_path.endswith(".json"):
         try:
-            df = pd.read_json(file_path, lines=True)
-        except ValueError:
+            df = pl.read_ndjson(file_path)
+        except pl.exceptions.PolarsError:
             with open(file_path, "r") as f:
                 try:
                     data = json.load(f)
-                    df = pd.DataFrame(data)
+                    df = pl.DataFrame(data)
                 except json.JSONDecodeError:
                     f.seek(0)
                     data = [json.loads(line) for line in f]
-                    df = pd.DataFrame(data)
-        df = df.apply(lambda x: x.astype(str) if x.dtype == "object" else x)
-        return pa.Table.from_pandas(df)
+                    df = pl.DataFrame(data)
+        return df.to_arrow()
     elif file_path.endswith(".parquet"):
         return pq.read_table(file_path)
     else:

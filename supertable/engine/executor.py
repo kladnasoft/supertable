@@ -7,6 +7,7 @@ import time
 from typing import Optional, Tuple
 
 import pandas as pd
+import polars as pl
 
 from supertable.engine.plan_stats import PlanStats
 from supertable.utils.timer import Timer
@@ -215,7 +216,7 @@ class Executor:
         log_prefix: str,
         explain: bool = False,
         explain_options: str = "",
-    ) -> Tuple[pd.DataFrame, str]:
+    ) -> Tuple[pl.DataFrame, str]:
         # Resolve engine config live (Redis → env → default) for this query so
         # UI changes take effect immediately without restart or cache.  Lite and
         # Pro carry independent DuckDB pragmas; the shared auto-pick thresholds

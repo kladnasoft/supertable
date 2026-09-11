@@ -27,11 +27,11 @@ bill". Deterministic under the configured seed.
 from __future__ import annotations
 
 import calendar
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Dict
 
 import numpy as np
-import pandas as pd
+import polars as pl
 
 from supertable.demo.medcenter import defaults as d
 from supertable.demo.medcenter.core import (
@@ -93,14 +93,31 @@ def _iban_for_entity(entity_id: int) -> str:
     return d.bank_accounts[d.legal_entities[entity_id]]
 
 
+def _frame(rows: list[dict]) -> pl.DataFrame:
+    """Build one source table from its row dicts.
+
+    ``infer_schema_length=None`` types every column off all of the rows the
+    way pandas did; polars would otherwise stop looking after the first 100
+    and could type a column that only turns decimal later as an integer.
+    """
+    return pl.DataFrame(rows, infer_schema_length=None)
+
+
+def _first_per_invoice(lines: pl.DataFrame) -> pl.DataFrame:
+    """Collapse a line-level invoice table to its first line per document."""
+    return lines.unique(
+        subset="invoice_number", keep="first", maintain_order=True
+    )
+
+
 class FinanceSourcesGenerator:
     """Generates all non-Mobimed source tables for one month."""
 
     def __init__(
         self,
         config: GenerationConfig,
-        mobimed_invoices: pd.DataFrame,
-        mobimed_payments: pd.DataFrame,
+        mobimed_invoices: pl.DataFrame,
+        mobimed_payments: pl.DataFrame,
     ):
         self.config = config
         self.rng = np.random.default_rng(config.seed + 7919)
@@ -188,7 +205,7 @@ class FinanceSourcesGenerator:
     # ------------------------------------------------------------------
     # Chargebee (+ the Stripe charges its transactions become)
     # ------------------------------------------------------------------
-    def generate_chargebee(self) -> Dict[str, pd.DataFrame]:
+    def generate_chargebee(self) -> Dict[str, pl.DataFrame]:
         plans = CHARGEBEE_PLANS
         plan_weights = [p[4] for p in plans]
 
@@ -337,16 +354,16 @@ class FinanceSourcesGenerator:
             )
 
         return {
-            d.raw_chargebee_subscriptions: pd.DataFrame(subscriptions),
-            d.raw_chargebee_invoices: pd.DataFrame(invoice_lines),
-            d.raw_chargebee_credit_notes: pd.DataFrame(credit_notes),
-            d.raw_chargebee_transactions: pd.DataFrame(transactions),
+            d.raw_chargebee_subscriptions: _frame(subscriptions),
+            d.raw_chargebee_invoices: _frame(invoice_lines),
+            d.raw_chargebee_credit_notes: _frame(credit_notes),
+            d.raw_chargebee_transactions: _frame(transactions),
         }
 
     # ------------------------------------------------------------------
     # Stripe (Chargebee traffic + weight program, blended in one account)
     # ------------------------------------------------------------------
-    def generate_stripe(self) -> Dict[str, pd.DataFrame]:
+    def generate_stripe(self) -> Dict[str, pl.DataFrame]:
         weight_invoices, charges = [], []
 
         for i in range(d.n_stripe_weight_invoices):
@@ -459,16 +476,16 @@ class FinanceSourcesGenerator:
             )
 
         return {
-            d.raw_stripe_invoices: pd.DataFrame(weight_invoices),
-            d.raw_stripe_charges: pd.DataFrame(charge_rows),
-            d.raw_stripe_balance_transactions: pd.DataFrame(balance_rows),
-            d.raw_stripe_payouts: pd.DataFrame(payout_rows),
+            d.raw_stripe_invoices: _frame(weight_invoices),
+            d.raw_stripe_charges: _frame(charge_rows),
+            d.raw_stripe_balance_transactions: _frame(balance_rows),
+            d.raw_stripe_payouts: _frame(payout_rows),
         }
 
     # ------------------------------------------------------------------
     # Zoho Books (B2B / insurance invoicing)
     # ------------------------------------------------------------------
-    def generate_zoho(self) -> Dict[str, pd.DataFrame]:
+    def generate_zoho(self) -> Dict[str, pl.DataFrame]:
         contacts = [
             {
                 "customer_id": f"ZC-{i + 1:04d}",
@@ -622,26 +639,27 @@ class FinanceSourcesGenerator:
             )
 
         return {
-            d.raw_zoho_contacts: pd.DataFrame(contacts),
-            d.raw_zoho_invoices: pd.DataFrame(invoice_lines),
-            d.raw_zoho_payments: pd.DataFrame(payments),
-            d.raw_zoho_credit_notes: pd.DataFrame(credit_notes),
+            d.raw_zoho_contacts: _frame(contacts),
+            d.raw_zoho_invoices: _frame(invoice_lines),
+            d.raw_zoho_payments: _frame(payments),
+            d.raw_zoho_credit_notes: _frame(credit_notes),
         }
 
     # ------------------------------------------------------------------
     # Hobex card settlements (derived from Mobimed terminal payments)
     # ------------------------------------------------------------------
-    def generate_hobex(self) -> Dict[str, pd.DataFrame]:
-        hobex_payments = self.mobimed_payments[
-            self.mobimed_payments["Payment_Category"] == "Hobex"
-        ].copy()
-        hobex_payments["clearing"] = pd.to_datetime(
-            hobex_payments["ClearingDate"], format="%d.%m.%Y"
-        ).dt.date
+    def generate_hobex(self) -> Dict[str, pl.DataFrame]:
+        hobex_payments = self.mobimed_payments.filter(
+            pl.col("Payment_Category") == "Hobex"
+        ).with_columns(
+            clearing=pl.col("ClearingDate").str.to_date("%d.%m.%Y")
+        )
 
         rows = []
-        for clearing_date, group in sorted(
-            hobex_payments.groupby("clearing"), key=lambda kv: kv[0]
+        # polars yields the group key as a tuple and in arbitrary order, so
+        # the settlement rows are put back in clearing-date order here.
+        for (clearing_date,), group in sorted(
+            hobex_payments.group_by("clearing"), key=lambda kv: kv[0]
         ):
             gross = round(float(group["betrag"].sum()), 2)
             fee = round(gross * d.hobex_fee_rate, 2)
@@ -668,12 +686,12 @@ class FinanceSourcesGenerator:
                 ),
             )
 
-        return {d.raw_hobex_settlements: pd.DataFrame(rows)}
+        return {d.raw_hobex_settlements: _frame(rows)}
 
     # ------------------------------------------------------------------
     # Domonda (supplier invoices) + misc bank debits
     # ------------------------------------------------------------------
-    def generate_domonda(self) -> Dict[str, pd.DataFrame]:
+    def generate_domonda(self) -> Dict[str, pl.DataFrame]:
         rows = []
         self._domonda_docs: list[dict] = []
         for i in range(d.n_domonda_invoices):
@@ -732,15 +750,15 @@ class FinanceSourcesGenerator:
                 remittance_unstructured=label,
             )
 
-        return {d.raw_domonda_invoices: pd.DataFrame(rows)}
+        return {d.raw_domonda_invoices: _frame(rows)}
 
     # ------------------------------------------------------------------
     # BMD booking journal (the official books, one row per document)
     # ------------------------------------------------------------------
     def generate_bmd(
-        self, chargebee: Dict[str, pd.DataFrame],
-        zoho: Dict[str, pd.DataFrame],
-    ) -> Dict[str, pd.DataFrame]:
+        self, chargebee: Dict[str, pl.DataFrame],
+        zoho: Dict[str, pl.DataFrame],
+    ) -> Dict[str, pl.DataFrame]:
         rows = []
         seq = self.bmd_seq
 
@@ -768,8 +786,11 @@ class FinanceSourcesGenerator:
             )
             seq += 1
 
+        # One journal row per document: keep="first" + maintain_order=True is
+        # pandas' drop_duplicates, and the order matters because sequence_no
+        # is handed out as the rows are walked.
         cb = chargebee[d.raw_chargebee_invoices]
-        for _, inv in cb.drop_duplicates("invoice_number").iterrows():
+        for inv in _first_per_invoice(cb).iter_rows(named=True):
             if inv["status"] == "void":
                 continue
             add(1, "AR", "20001", "4100", inv["invoice_number"],
@@ -777,7 +798,7 @@ class FinanceSourcesGenerator:
                 inv["total"], 0.0, 0, 0.0)
 
         zh = zoho[d.raw_zoho_invoices]
-        for _, inv in zh.drop_duplicates("invoice_number").iterrows():
+        for inv in _first_per_invoice(zh).iter_rows(named=True):
             if inv["status"] in ("draft", "void"):
                 continue
             company_id = (
@@ -787,12 +808,12 @@ class FinanceSourcesGenerator:
                 inv["invoice_date"], f"Firmenkunde {inv['customer_name']}",
                 inv["total"], 0.0, 0, 0.0)
 
-        for _, inv in self.mobimed_invoices.iterrows():
+        for inv in self.mobimed_invoices.iter_rows(named=True):
             if inv["Stornogrund"] != "":
                 continue
             tax_amount = round(inv["MwSt10"] + inv["MwSt20"], 2)
-            doc_date = pd.to_datetime(
-                inv["Datum"], format="%d.%m.%Y"
+            doc_date = datetime.strptime(
+                inv["Datum"], "%d.%m.%Y"
             ).date().isoformat()
             add(1, "AR", "20003", "4300", inv["Rechnungsnummer"],
                 doc_date, f"Patient {inv['Patient']}",
@@ -806,13 +827,13 @@ class FinanceSourcesGenerator:
                 f"Lieferant {doc['supplier']}", 0.0, doc["gross"],
                 doc["tax_pct"], doc["tax"])
 
-        return {d.raw_bmd_journal: pd.DataFrame(rows)}
+        return {d.raw_bmd_journal: _frame(rows)}
 
     # ------------------------------------------------------------------
     # Orchestration
     # ------------------------------------------------------------------
-    def run(self) -> Dict[str, pd.DataFrame]:
-        tables: Dict[str, pd.DataFrame] = {}
+    def run(self) -> Dict[str, pl.DataFrame]:
+        tables: Dict[str, pl.DataFrame] = {}
         chargebee = self.generate_chargebee()
         tables.update(chargebee)
         tables.update(self.generate_stripe())
@@ -821,5 +842,5 @@ class FinanceSourcesGenerator:
         tables.update(self.generate_hobex())
         tables.update(self.generate_domonda())
         tables.update(self.generate_bmd(chargebee, zoho))
-        tables[d.raw_erste_camt053] = pd.DataFrame(self._bank_rows)
+        tables[d.raw_erste_camt053] = _frame(self._bank_rows)
         return tables

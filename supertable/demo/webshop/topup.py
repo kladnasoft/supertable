@@ -27,19 +27,19 @@ import argparse
 import time
 import traceback
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pyarrow as pa
 
 import supertable.config.homedir  # noqa: F401 — required side-effect import
 from supertable.data_reader import DataReader, Status
 from supertable.data_writer import DataWriter
 
-from supertable.demo.webshop.core import GenerationConfig, WebshopDataGenerator
+from supertable.demo.webshop.core import GenerationConfig, WebshopDataGenerator, _floor_day
 from supertable.demo.webshop.defaults import (
     generated_data_dir,
     organization,
@@ -79,52 +79,35 @@ def _query_scalar(sql: str, fallback=None):
     """
     reader = DataReader(organization=organization, super_name=super_name, query=sql)
     df, status, _ = reader.execute(role_name=role_name)
-    if status == Status.ERROR or df.empty:
+    if status == Status.ERROR or df.is_empty():
         return fallback
-    val = df.iloc[0, 0]
-    return fallback if pd.isna(val) else val
+    # A missing aggregate is a plain None in polars — no NaN/NaT to isna().
+    val = df.item(0, 0)
+    return fallback if val is None else val
 
 
-def _to_arrow(df: pd.DataFrame) -> pa.Table:
+def _to_arrow(df: pl.DataFrame) -> pa.Table:
     """
     Convert a DataFrame to a PyArrow Table, ensuring no column has dtype
     pa.null().  When every value in a column is None, PyArrow infers the
     type as null — Polars then refuses to run min/max statistics on it
-    inside DataWriter.  We cast such columns to a concrete type derived
-    from the pandas dtype so the writer always receives a typed schema.
+    inside DataWriter.
+
+    Polars keeps a column's declared type even when every value is null, so the
+    pandas-era int/float/bool re-inference is unreachable now: the only way to
+    hand Arrow a typeless column is a pl.Null column (built from nothing but
+    Nones), and String is the only type that carries — the same fallback the
+    pandas version used for its object/datetime-like all-null columns.
     """
-    table = pa.Table.from_pandas(df, preserve_index=False)
-
-    new_columns: list[pa.ChunkedArray] = []
-    new_fields:  list[pa.Field]        = []
-
-    for i, field in enumerate(table.schema):
-        col = table.column(i)
-        if pa.types.is_null(field.type):
-            # Infer a concrete Arrow type from the pandas dtype
-            pd_dtype = df[field.name].dtype
-            if pd.api.types.is_integer_dtype(pd_dtype):
-                target = pa.int64()
-            elif pd.api.types.is_float_dtype(pd_dtype):
-                target = pa.float64()
-            elif pd.api.types.is_bool_dtype(pd_dtype):
-                target = pa.bool_()
-            else:
-                target = pa.string()   # object / datetime-like all-null → string
-            col   = col.cast(target)
-            field = pa.field(field.name, target, nullable=True)
-        new_columns.append(col)
-        new_fields.append(field)
-
-    return pa.table(
-        {f.name: c for f, c in zip(new_fields, new_columns)},
-        schema=pa.schema(new_fields),
-    )
+    null_columns = [name for name, dtype in df.schema.items() if dtype == pl.Null]
+    if null_columns:
+        df = df.with_columns(pl.col(name).cast(pl.String) for name in null_columns)
+    return df.to_arrow()
 
 
-def _write(writer: DataWriter, name: str, df: pd.DataFrame) -> Tuple[int, int, int]:
+def _write(writer: DataWriter, name: str, df: pl.DataFrame) -> Tuple[int, int, int]:
     """Write a DataFrame to SuperTable and print a one-line summary."""
-    if df.empty:
+    if df.is_empty():
         print(f"  [skip]  {name:<26} — nothing to write")
         return 0, 0, 0
     _, rows, inserted, deleted = writer.write(
@@ -144,9 +127,9 @@ def _write(writer: DataWriter, name: str, df: pd.DataFrame) -> Tuple[int, int, i
 @dataclass
 class SystemState:
     """Current high-water marks read from SuperTable."""
-    last_order_ts: pd.Timestamp
-    last_session_ts: pd.Timestamp
-    last_snapshot_date: pd.Timestamp
+    last_order_ts: datetime
+    last_session_ts: datetime
+    last_snapshot_date: datetime
     max_order_id: int
     max_order_item_id: int
     max_session_id: int
@@ -161,11 +144,20 @@ def bootstrap_state(config: TopUpConfig) -> SystemState:
     """
     print("  Bootstrapping state from SuperTable...")
 
-    now = pd.Timestamp.now().floor("s")
-    ts_fallback = now - pd.Timedelta(days=int(config.cold_start_years * 365))
+    now = datetime.now().replace(microsecond=0)
+    ts_fallback = now - timedelta(days=int(config.cold_start_years * 365))
 
-    def _ts(val, fallback: pd.Timestamp) -> pd.Timestamp:
-        return fallback if val is None else pd.Timestamp(val)
+    def _ts(val, fallback: datetime) -> datetime:
+        # Stands in for pd.Timestamp(val): the reader hands back a datetime for
+        # TIMESTAMP columns, a date for DATE ones, and an ISO string if the
+        # engine ever stringifies — normalise all three to datetime.
+        if val is None:
+            return fallback
+        if isinstance(val, datetime):
+            return val
+        if isinstance(val, date):
+            return datetime(val.year, val.month, val.day)
+        return datetime.fromisoformat(str(val))
 
     def _int(val, fallback: int = 0) -> int:
         return fallback if val is None else int(val)
@@ -205,7 +197,7 @@ def _dim_files_exist(data_dir: str) -> bool:
 def ensure_dimensions(
     config: TopUpConfig,
     writer: DataWriter,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pl.DataFrame, pl.DataFrame]:
     """
     Return (customers, products) DataFrames, generating them from scratch if
     the dimension parquet files don't exist yet (cold-start path).
@@ -220,15 +212,15 @@ def ensure_dimensions(
     base = Path(config.data_dir)
 
     if _dim_files_exist(config.data_dir):
-        customers = pd.read_parquet(base / "customers" / "customers.parquet")
-        products  = pd.read_parquet(base / "products"  / "products.parquet")
+        customers = pl.read_parquet(base / "customers" / "customers.parquet")
+        products  = pl.read_parquet(base / "products"  / "products.parquet")
         print(f"  Loaded dimensions: {len(customers):,} customers  {len(products):,} products")
         return customers, products
 
     # ── Cold start: generate dimensions ──────────────────────────────────────
     print("  No dimension files found — cold start: generating dimensions...")
-    now = pd.Timestamp.now().floor("s")
-    cold_start = now - pd.Timedelta(days=int(config.cold_start_years * 365))
+    now = datetime.now().replace(microsecond=0)
+    cold_start = now - timedelta(days=int(config.cold_start_years * 365))
 
     dim_cfg = GenerationConfig(
         output_dir=config.data_dir,
@@ -264,7 +256,7 @@ def ensure_dimensions(
     for name, df in [("categories", categories), ("products", products), ("customers", customers)]:
         table_dir = base / name
         table_dir.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(table_dir / f"{name}.parquet", index=False)
+        df.write_parquet(table_dir / f"{name}.parquet")
         print(f"    saved {config.data_dir}/{name}/{name}.parquet  ({len(df):,} rows)")
 
     print(f"  ✓ Dimensions ready: {len(customers):,} customers  {len(products):,} products")
@@ -291,8 +283,8 @@ def _event_counts(gap_seconds: float, config: TopUpConfig, rng: np.random.Genera
 
 
 def _make_generator(
-    start: pd.Timestamp,
-    end: pd.Timestamp,
+    start: datetime,
+    end: datetime,
     n_orders: int,
     n_sessions: int,
     n_inventory_days: int,
@@ -306,14 +298,14 @@ def _make_generator(
     the date-string level.  When start and end share the same calendar date
     (common for sub-day windows) we pass end_date + 1 day for construction,
     then immediately override gen.start_date / gen.end_date with the real
-    sub-day Timestamps so all generation methods use the correct window.
+    sub-day datetimes so all generation methods use the correct window.
     """
     start_date_str = str(start.date())
     end_date_str   = str(end.date())
 
     # Ensure the constructor receives end_date > start_date
     if end_date_str <= start_date_str:
-        end_date_str = str((end + pd.Timedelta(days=1)).date())
+        end_date_str = str((end + timedelta(days=1)).date())
 
     cfg = GenerationConfig(
         output_dir="",                          # not used — we write directly
@@ -335,12 +327,12 @@ def _make_generator(
 
 def generate_batch(
     state: SystemState,
-    customers: pd.DataFrame,
-    products: pd.DataFrame,
+    customers: pl.DataFrame,
+    products: pl.DataFrame,
     config: TopUpConfig,
     rng: np.random.Generator,
-    window_end: pd.Timestamp,
-) -> Dict[str, pd.DataFrame]:
+    window_end: datetime,
+) -> Dict[str, pl.DataFrame]:
     """
     Generate all transactional tables for the window [last_ts → window_end].
 
@@ -375,12 +367,15 @@ def generate_batch(
         show_progress=False,
     )
     # Assign sequential order_item_ids continuing from the max already stored
-    order_items.insert(
-        0, "order_item_id",
-        np.arange(
-            state.max_order_item_id + 1,
-            state.max_order_item_id + len(order_items) + 1,
-            dtype=np.int64,
+    order_items.insert_column(
+        0,
+        pl.Series(
+            "order_item_id",
+            np.arange(
+                state.max_order_item_id + 1,
+                state.max_order_item_id + len(order_items) + 1,
+                dtype=np.int64,
+            ),
         ),
     )
 
@@ -392,19 +387,25 @@ def generate_batch(
         stop_id=state.max_session_id + n_sessions + 1,
         show_progress=False,
     )
-    pageviews.insert(
-        0, "pageview_id",
-        np.arange(
-            state.max_pageview_id + 1,
-            state.max_pageview_id + len(pageviews) + 1,
-            dtype=np.int64,
+    pageviews.insert_column(
+        0,
+        pl.Series(
+            "pageview_id",
+            np.arange(
+                state.max_pageview_id + 1,
+                state.max_pageview_id + len(pageviews) + 1,
+                dtype=np.int64,
+            ),
         ),
     )
 
     # ── Inventory snapshots (daily, only missing calendar days) ──────────────
-    last_snap  = state.last_snapshot_date.normalize()
-    today      = window_end.normalize()
-    new_days   = pd.date_range(last_snap + pd.Timedelta(days=1), today, freq="D")
+    last_snap  = _floor_day(state.last_snapshot_date)
+    today      = _floor_day(window_end)
+    # datetime_range keeps the Datetime dtype (pl.date_range would yield Date)
+    # and, like pd.date_range, returns an empty series when start > end.
+    new_days   = pl.datetime_range(last_snap + timedelta(days=1), today,
+                                   interval="1d", eager=True)
 
     if len(new_days) > 0:
         print(f"  Generating inventory snapshots for {len(new_days)} new day(s): "
@@ -422,10 +423,10 @@ def generate_batch(
         )
     else:
         print("  Inventory snapshots: no new calendar days, skipping")
-        inventory = pd.DataFrame()
+        inventory = pl.DataFrame()
 
     # ── Product daily stats (derived aggregate for the new period) ───────────
-    if not pageviews.empty and not orders.empty:
+    if not pageviews.is_empty() and not orders.is_empty():
         product_daily_stats = gen.generate_product_daily_stats(
             products=products,
             pageviews=pageviews,
@@ -433,7 +434,7 @@ def generate_batch(
             orders=orders,
         )
     else:
-        product_daily_stats = pd.DataFrame()
+        product_daily_stats = pl.DataFrame()
 
     return {
         "orders":              orders,
@@ -452,7 +453,7 @@ def generate_batch(
 def run(config: TopUpConfig) -> None:
     rng    = np.random.default_rng(config.seed)
     writer = DataWriter(super_name, organization)
-    window = pd.Timedelta(minutes=config.sleep_minutes)
+    window = timedelta(minutes=config.sleep_minutes)
 
     print("=" * 72)
     print("Synthetic Webshop Top-Up Runner")
@@ -467,13 +468,13 @@ def run(config: TopUpConfig) -> None:
     while True:
         outer += 1
         print(f"\n{'═' * 72}")
-        print(f"[cycle {outer}]  {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"[cycle {outer}]  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
         try:
             # Bootstrap once per cycle — re-read real state from SuperTable
             state = bootstrap_state(config)
             last_ts = max(state.last_order_ts, state.last_session_ts)
-            now     = pd.Timestamp.now().floor("s")
+            now     = datetime.now().replace(microsecond=0)
             behind  = now - last_ts
 
             if behind > window:
@@ -484,7 +485,7 @@ def run(config: TopUpConfig) -> None:
                 total_windows = 1
 
             # ── Catchup: accumulate all windows in memory, then write once ───
-            now     = pd.Timestamp.now().floor("s")
+            now     = datetime.now().replace(microsecond=0)
             last_ts = max(state.last_order_ts, state.last_session_ts)
 
             # Collect per-table lists of DataFrames across all windows
@@ -496,7 +497,7 @@ def run(config: TopUpConfig) -> None:
             inner = 0
             t_gen = time.time()
             while True:
-                now        = pd.Timestamp.now().floor("s")
+                now        = datetime.now().replace(microsecond=0)
                 last_ts    = max(state.last_order_ts, state.last_session_ts)
                 remaining  = (now - last_ts).total_seconds()
 
@@ -519,7 +520,7 @@ def run(config: TopUpConfig) -> None:
                 )
 
                 for name, df in tables.items():
-                    if not df.empty:
+                    if not df.is_empty():
                         accumulated[name].append(df)
 
                 # Advance state locally — no SuperTable round-trip needed
@@ -541,7 +542,7 @@ def run(config: TopUpConfig) -> None:
                 if not frames:
                     print(f"  [skip]  {table_name:<26} — nothing to write")
                     continue
-                merged = pd.concat(frames, ignore_index=True)
+                merged = pl.concat(frames, how="vertical")
                 rows, inserted, _ = _write(writer, table_name, merged)
                 total_rows     += rows
                 total_inserted += inserted
@@ -555,7 +556,7 @@ def run(config: TopUpConfig) -> None:
             traceback.print_exc()
 
         sleep_secs = config.sleep_minutes * 60
-        next_run   = pd.Timestamp.now() + pd.Timedelta(seconds=sleep_secs)
+        next_run   = datetime.now() + timedelta(seconds=sleep_secs)
         print(f"\n  Sleeping {config.sleep_minutes} min "
               f"(next run ≈ {next_run.strftime('%H:%M:%S')})...")
         time.sleep(sleep_secs)

@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Optional, Tuple, Any, List, Dict
 
 import pandas as pd
+import polars as pl
 
 from supertable.config.defaults import logger
 from supertable.errors import SuperTableNotFoundError, TableNotFoundError
@@ -140,7 +141,7 @@ class DataReader:
 
     def _execute_show_stats(
         self, command, role_name: str,
-    ) -> Tuple[pd.DataFrame, Status, Optional[str]]:
+    ) -> Tuple[pl.DataFrame, Status, Optional[str]]:
         """Return the raw contents of a table's latest statistics parquet.
 
         Reads-never-create and table-level RBAC are enforced (the same gates a
@@ -165,7 +166,7 @@ class DataReader:
             self._assert_targets_exist([td])
         except (SuperTableNotFoundError, TableNotFoundError) as e:
             logger.warning(self._lp(f"[show-stats] target missing: {e}"))
-            return pd.DataFrame(), Status.ERROR, str(e)
+            return pl.DataFrame(), Status.ERROR, str(e)
 
         # Table-level RBAC: raises PermissionError if the role cannot read the
         # table at all. columns=[] means "all columns", which skips column-level
@@ -183,11 +184,11 @@ class DataReader:
             stats_df = load_stats(stats_file, allow_cache=True) if stats_file else None
         except Exception as e:
             logger.error(self._lp(f"[show-stats] failed to load stats: {e}"))
-            return pd.DataFrame(), Status.ERROR, str(e)
+            return pl.DataFrame(), Status.ERROR, str(e)
 
         if stats_df is None:
-            return pd.DataFrame(columns=list(STATS_SCHEMA.keys())), Status.OK, None
-        return stats_df.to_pandas(), Status.OK, None
+            return pl.DataFrame(schema={k: pl.Utf8 for k in STATS_SCHEMA}), Status.OK, None
+        return stats_df, Status.OK, None
 
     def execute(
         self,
@@ -195,7 +196,7 @@ class DataReader:
         with_scan: bool = False,
         engine: engine = engine.AUTO,
         fullscan: bool = False,
-    ) -> Tuple[pd.DataFrame, Status, Optional[str]]:
+    ) -> Tuple[pl.DataFrame, Status, Optional[str]]:
         """Run the query.
 
         *fullscan* disables read-path file pruning, so every file in the
@@ -218,7 +219,7 @@ class DataReader:
             command = classify_query(self.query, self.super_name)
         except ValueError as e:
             logger.warning(self._lp(f"rejected query: {e}"))
-            return pd.DataFrame(), Status.ERROR, str(e)
+            return pl.DataFrame(), Status.ERROR, str(e)
 
         # SHOW STATS short-circuits the engine entirely — it returns the raw
         # statistics artifact, no reflection/estimation/execution.
@@ -258,7 +259,7 @@ class DataReader:
             self._assert_targets_exist(physical_tables)
         except (SuperTableNotFoundError, TableNotFoundError) as e:
             logger.warning(self._lp(f"target missing: {e}"))
-            return pd.DataFrame(), Status.ERROR, str(e)
+            return pl.DataFrame(), Status.ERROR, str(e)
 
         # RBAC check — also returns per-alias column/row filter definitions.
         # PermissionError propagates to the caller (legacy behaviour).
@@ -378,7 +379,7 @@ class DataReader:
 
             if not reflection.supers:
                 message = "No parquet files found"
-                return pd.DataFrame(), status, message
+                return pl.DataFrame(), status, message
 
             # 2) EXECUTE.  EXPLAIN is pinned to DuckDB-lite so the plan is
             # produced cheaply and uniformly (no Pro materialisation / Spark
@@ -428,7 +429,7 @@ class DataReader:
 
                 if handle is not None:
                     handle.on_close = _record
-                return pd.DataFrame(), Status.OK, ""
+                return pl.DataFrame(), Status.OK, ""
             result_df, engine_used = executor.execute(
                 engine=exec_engine,
                 reflection=reflection,
@@ -444,7 +445,7 @@ class DataReader:
         except Exception as e:
             message = str(e)
             logger.error(self._lp(f"Exception: {e}"))
-            result_df = pd.DataFrame()
+            result_df = pl.DataFrame()
 
         # Extend plan + timings
         self.timer.capture_and_reset_timing(event="EXECUTING_QUERY")
