@@ -157,18 +157,25 @@ were missing rows: `agg_30d_by_country`, `distinct_users_30d`,
 
 Comparing 3.0.8+ against an older baseline therefore reports correctness drift
 on exactly those five. That is the fix landing, not a regression. Compare
-against `read-3.0.10-full.json`, the current baseline.
+against `read-3.0.11-full.json`, the current baseline.
 
-The current seals are verified, not assumed: `read-3.0.10-full-fullscan.json`
+The current seals are verified, not assumed: `read-3.0.11-full-fullscan.json`
 is the same suite with pruning disabled, and all 16 seals match the pruned run
 — so pruning provably returns what reading every file returns. Regenerate both
 together and keep them in step.
 
-3.0.10 seals are identical to 3.0.8's, so the further pruning fixes it carries
-(a bare string against a DATE column; column attribution across derived-table
-boundaries) changed no result the suite covers. They were found by the
-generated corpus instead — `scripts/pruning_audit.py`, 4,388 queries — which is
-the tool to reach for when a pruning change needs proving.
+Seals have not moved since 3.0.8: the pruning fixes in 3.0.10 (a bare string
+against a DATE column; column attribution across derived-table boundaries) and
+the streaming path in 3.0.11 changed no result this suite covers. That is a
+limit of the suite, not evidence of thoroughness — those fixes were found by the
+generated corpus, `scripts/pruning_audit.py`, 4,388 queries. Reach for that when
+a pruning change needs proving; 16 scenarios cannot cover the shapes where
+pruning actually breaks.
+
+Read timings on this machine are noisy: re-running the same commit moves p50 by
+a median of ~13%, with outliers past 100%. Treat a single-run read delta under
+about 30% as noise and repeat it before believing it. The write suite is far
+steadier (median ~6%).
 
 A note on provenance: `read-3.0.3-full.json` was captured on a dirty working
 tree (`compare` warns about this), so it does not correspond to any commit.
