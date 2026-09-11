@@ -108,22 +108,25 @@ def test_pruned_result_equals_fullscan(qid, family, sql):
         return
 
     cols = list(truth.columns)
-    a = truth.sort_values(cols, kind="mergesort").reset_index(drop=True)
-    b = got.sort_values(cols, kind="mergesort").reset_index(drop=True)
+    # polars compares frames directly, types included. The float tolerance that
+    # used to live here existed because a SUM re-associates over a different
+    # file order; that is still true, so floats are compared with a tolerance
+    # while everything else must match exactly.
+    import math
 
+    a = truth.sort(cols)
+    b = got.sort(cols)
+    if a.equals(b):
+        return
     for c in cols:
-        x, y = a[c], b[c]
-        if pd.api.types.is_float_dtype(x) or pd.api.types.is_float_dtype(y):
-            # A float SUM re-associates when files are read in a different
-            # order; that is arithmetic, not data loss. Real pruning bugs drop
-            # whole rows and show up far outside this tolerance.
-            xv = pd.to_numeric(x, errors="coerce").astype(float).to_numpy()
-            yv = pd.to_numeric(y, errors="coerce").astype(float).to_numpy()
-            assert np.allclose(xv, yv, rtol=1e-9, atol=1e-9, equal_nan=True), (
-                f"column {c!r} differs beyond float tolerance\n{sql}"
-            )
-        else:
-            assert x.equals(y), f"column {c!r} differs\n{sql}"
+        av, bv = a[c].to_list(), b[c].to_list()
+        for i, (x, y) in enumerate(zip(av, bv)):
+            if isinstance(x, float) and isinstance(y, float):
+                assert math.isclose(x, y, rel_tol=1e-9, abs_tol=1e-9) or (
+                    math.isnan(x) and math.isnan(y)), (
+                    f"column {c!r} row {i}: {x} vs {y}\n{sql}")
+            else:
+                assert x == y, f"column {c!r} row {i}: {x!r} vs {y!r}\n{sql}"
 
 
 def test_sample_covers_every_family():

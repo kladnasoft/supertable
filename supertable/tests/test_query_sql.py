@@ -11,7 +11,9 @@ Covers:
 import math
 from unittest.mock import patch, MagicMock
 
-import pandas as pd
+from datetime import datetime
+
+import polars as pl
 import numpy as np
 import pytest
 
@@ -159,7 +161,7 @@ class TestEnsureSqlLimitEdgeCases:
 # 2. query_sql — NAType sanitization
 # ---------------------------------------------------------------------------
 
-class TestQuerySqlNATypeSanitization:
+class TestQuerySqlNullSanitization:
     """
     Verify that query_sql converts pandas NA variants to None
     so the MCP server can JSON-serialize the response.
@@ -191,25 +193,26 @@ class TestQuerySqlNATypeSanitization:
         return columns, rows, meta
 
     def test_pandas_na_becomes_none(self, mock_reader):
-        df = pd.DataFrame({"a": pd.array([1, pd.NA, 3], dtype="Int64")})
+        df = pl.DataFrame({"a": [1, None, 3]}, schema={"a": pl.Int64})
         columns, rows, _ = self._run_query_sql(mock_reader, df)
 
         assert columns == ["a"]
-        # Row with pd.NA should now be Python None
+        # Row with None should now be Python None
         values = [r[0] for r in rows]
         assert values[0] == 1
         assert values[1] is None
         assert values[2] == 3
 
     def test_numpy_nan_becomes_none(self, mock_reader):
-        df = pd.DataFrame({"x": [1.0, np.nan, 3.0]})
+        df = pl.DataFrame({"x": [1.0, np.nan, 3.0]})
         _, rows, _ = self._run_query_sql(mock_reader, df)
 
         values = [r[0] for r in rows]
         assert values[1] is None
 
     def test_nat_becomes_none(self, mock_reader):
-        df = pd.DataFrame({"ts": pd.to_datetime(["2024-01-01", pd.NaT, "2024-03-01"])})
+        df = pl.DataFrame({"ts": [datetime(2024, 1, 1), None, datetime(2024, 3, 1)]},
+                          schema={"ts": pl.Datetime("us")})
         _, rows, _ = self._run_query_sql(mock_reader, df)
 
         values = [r[0] for r in rows]
@@ -217,10 +220,10 @@ class TestQuerySqlNATypeSanitization:
 
     def test_mixed_na_types(self, mock_reader):
         """DataFrame with multiple columns, each having a different NA flavor."""
-        df = pd.DataFrame({
-            "int_col": pd.array([1, pd.NA], dtype="Int64"),
+        df = pl.DataFrame({
+            "int_col": pl.Series([1, None], dtype=pl.Int64),
             "float_col": [1.0, np.nan],
-            "str_col": pd.array(["a", pd.NA], dtype="string"),
+            "str_col": pl.Series(["a", None], dtype=pl.Utf8),
         })
         _, rows, _ = self._run_query_sql(mock_reader, df)
 
@@ -231,14 +234,14 @@ class TestQuerySqlNATypeSanitization:
 
     def test_no_na_passes_through(self, mock_reader):
         """Clean DataFrame should not be altered."""
-        df = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
         _, rows, _ = self._run_query_sql(mock_reader, df)
 
         assert rows == [[1, "x"], [2, "y"], [3, "z"]]
 
     def test_columns_meta_reflects_original_dtypes(self, mock_reader):
         """Column metadata should use the original dtypes, not post-sanitization."""
-        df = pd.DataFrame({"a": pd.array([1, pd.NA], dtype="Int64")})
+        df = pl.DataFrame({"a": [1, None]}, schema={"a": pl.Int64})
         _, _, meta = self._run_query_sql(mock_reader, df)
 
         assert meta[0]["name"] == "a"
@@ -249,7 +252,7 @@ class TestQuerySqlNATypeSanitization:
         from supertable.data_reader import query_sql, Status
 
         instance = MagicMock()
-        instance.execute.return_value = (pd.DataFrame({"a": [1]}), Status.OK, None)
+        instance.execute.return_value = (pl.DataFrame({"a": [1]}), Status.OK, None)
         mock_reader.return_value = instance
 
         query_sql(

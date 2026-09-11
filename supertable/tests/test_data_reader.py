@@ -25,7 +25,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from unittest.mock import MagicMock, patch, call, PropertyMock
 
 import numpy as np
-import pandas as pd
+from datetime import datetime
+
+import polars as pl
 import pytest
 
 
@@ -284,7 +286,7 @@ class TestExecuteHappyPath:
         mock_est_inst.estimate.return_value = reflection
         MockEstimator.return_value = mock_est_inst
 
-        result_df = pd.DataFrame({"id": [1, 2], "value": ["a", "b"]})
+        result_df = pl.DataFrame({"id": [1, 2], "value": ["a", "b"]})
         mock_exec_inst = MagicMock()
         mock_exec_inst.execute.return_value = (result_df, "duckdb_pinned")
         MockExecutor.return_value = mock_exec_inst
@@ -325,7 +327,7 @@ class TestExecuteHappyPath:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        mock_exec.execute.return_value = (pl.DataFrame(), "duckdb_pinned")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -370,7 +372,7 @@ class TestExecuteHappyPath:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pro")
+        mock_exec.execute.return_value = (pl.DataFrame(), "duckdb_pro")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -436,7 +438,7 @@ class TestExecuteTombstoneResolution:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        mock_exec.execute.return_value = (pl.DataFrame(), "duckdb_pinned")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -498,7 +500,7 @@ class TestExecuteTombstoneResolution:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        mock_exec.execute.return_value = (pl.DataFrame(), "duckdb_pinned")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -796,7 +798,7 @@ class TestExecuteExtendPlanError:
         mock_est.estimate.return_value = _make_reflection()
         MockEstimator.return_value = mock_est
 
-        result_df = pd.DataFrame({"x": [1]})
+        result_df = pl.DataFrame({"x": [1]})
         mock_exec = MagicMock()
         mock_exec.execute.return_value = (result_df, "duckdb_pinned")
         MockExecutor.return_value = mock_exec
@@ -849,7 +851,7 @@ class TestExecuteTimerPlanStats:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        mock_exec.execute.return_value = (pl.DataFrame(), "duckdb_pinned")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -896,7 +898,7 @@ class TestExecuteTimerPlanStats:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        mock_exec.execute.return_value = (pl.DataFrame(), "duckdb_pinned")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -940,7 +942,7 @@ class TestExecuteQueryPlanManager:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        mock_exec.execute.return_value = (pl.DataFrame(), "duckdb_pinned")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -985,7 +987,7 @@ class TestExecuteQueryPlanManager:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        mock_exec.execute.return_value = (pl.DataFrame(), "duckdb_pinned")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -1034,7 +1036,7 @@ class TestExecuteExtendPlanArgs:
         mock_est.estimate.return_value = _make_reflection()
         MockEstimator.return_value = mock_est
 
-        result_df = pd.DataFrame({"a": [1, 2, 3]})
+        result_df = pl.DataFrame({"a": [1, 2, 3]})
         mock_exec = MagicMock()
         mock_exec.execute.return_value = (result_df, "duckdb_pinned")
         MockExecutor.return_value = mock_exec
@@ -1122,7 +1124,7 @@ class TestExecuteWithScan:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame({"x": [1]}), "duckdb_pinned")
+        mock_exec.execute.return_value = (pl.DataFrame({"x": [1]}), "duckdb_pinned")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, Status, engine
@@ -1234,7 +1236,7 @@ class TestQuerySqlHappyPath:
         mock_ensure.return_value = "SELECT * FROM t LIMIT 10"
 
         from supertable.data_reader import Status
-        result_df = pd.DataFrame({"id": [1, 2], "name": ["a", "b"]})
+        result_df = pl.DataFrame({"id": [1, 2], "name": ["a", "b"]})
         mock_reader = MagicMock()
         mock_reader.execute.return_value = (result_df, Status.OK, None)
         MockDR.return_value = mock_reader
@@ -1258,7 +1260,7 @@ class TestQuerySqlHappyPath:
 
         from supertable.data_reader import Status
         mock_reader = MagicMock()
-        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        mock_reader.execute.return_value = (pl.DataFrame(), Status.OK, None)
         MockDR.return_value = mock_reader
 
         from supertable.data_reader import query_sql
@@ -1280,7 +1282,7 @@ class TestQuerySqlError:
 
         from supertable.data_reader import Status
         mock_reader = MagicMock()
-        mock_reader.execute.return_value = (pd.DataFrame(), Status.ERROR, "something broke")
+        mock_reader.execute.return_value = (pl.DataFrame(), Status.ERROR, "something broke")
         MockDR.return_value = mock_reader
 
         from supertable.data_reader import query_sql
@@ -1294,7 +1296,7 @@ class TestQuerySqlError:
 
         from supertable.data_reader import Status
         mock_reader = MagicMock()
-        mock_reader.execute.return_value = (pd.DataFrame(), Status.ERROR, None)
+        mock_reader.execute.return_value = (pl.DataFrame(), Status.ERROR, None)
         MockDR.return_value = mock_reader
 
         from supertable.data_reader import query_sql
@@ -1306,15 +1308,21 @@ class TestQuerySqlError:
 # 18. query_sql — NA Sanitization
 # ====================================================================
 
-class TestQuerySqlNaSanitization:
+class TestQuerySqlNullSanitization:
+    """Nulls and NaN must both reach the caller as None.
+
+    polars keeps them distinct where pandas conflated them, so null is native
+    and NaN is folded deliberately — `NaN` is not valid JSON.
+    """
+
 
     @patch(f"{_MOD}.DataReader")
     @patch(f"{_MOD}._ensure_sql_limit")
-    def test_pd_na_replaced_with_none(self, mock_ensure, MockDR):
+    def test_null_reaches_caller_as_none(self, mock_ensure, MockDR):
         mock_ensure.return_value = "Q"
 
         from supertable.data_reader import Status
-        df = pd.DataFrame({"val": pd.array([1, pd.NA, 3], dtype=pd.Int64Dtype())})
+        df = pl.DataFrame({"val": [1, None, 3]}, schema={"val": pl.Int64})
         mock_reader = MagicMock()
         mock_reader.execute.return_value = (df, Status.OK, None)
         MockDR.return_value = mock_reader
@@ -1326,11 +1334,11 @@ class TestQuerySqlNaSanitization:
 
     @patch(f"{_MOD}.DataReader")
     @patch(f"{_MOD}._ensure_sql_limit")
-    def test_np_nan_replaced_with_none(self, mock_ensure, MockDR):
+    def test_nan_reaches_caller_as_none(self, mock_ensure, MockDR):
         mock_ensure.return_value = "Q"
 
         from supertable.data_reader import Status
-        df = pd.DataFrame({"val": [1.0, float("nan"), 3.0]})
+        df = pl.DataFrame({"val": [1.0, float("nan"), 3.0]})
         mock_reader = MagicMock()
         mock_reader.execute.return_value = (df, Status.OK, None)
         MockDR.return_value = mock_reader
@@ -1342,11 +1350,12 @@ class TestQuerySqlNaSanitization:
 
     @patch(f"{_MOD}.DataReader")
     @patch(f"{_MOD}._ensure_sql_limit")
-    def test_pd_nat_replaced_with_none(self, mock_ensure, MockDR):
+    def test_null_datetime_reaches_caller_as_none(self, mock_ensure, MockDR):
         mock_ensure.return_value = "Q"
 
         from supertable.data_reader import Status
-        df = pd.DataFrame({"ts": pd.array([pd.Timestamp("2024-01-01"), pd.NaT], dtype="datetime64[ns]")})
+        df = pl.DataFrame({"ts": [datetime(2024, 1, 1), None]},
+                          schema={"ts": pl.Datetime("us")})
         mock_reader = MagicMock()
         mock_reader.execute.return_value = (df, Status.OK, None)
         MockDR.return_value = mock_reader
@@ -1362,7 +1371,7 @@ class TestQuerySqlNaSanitization:
         mock_ensure.return_value = "Q"
 
         from supertable.data_reader import Status
-        df = pd.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+        df = pl.DataFrame({"a": [1, 2], "b": ["x", "y"]})
         mock_reader = MagicMock()
         mock_reader.execute.return_value = (df, Status.OK, None)
         MockDR.return_value = mock_reader
@@ -1385,7 +1394,7 @@ class TestQuerySqlColumnMeta:
         mock_ensure.return_value = "Q"
 
         from supertable.data_reader import Status
-        df = pd.DataFrame({"int_col": [1], "str_col": ["a"], "float_col": [1.5]})
+        df = pl.DataFrame({"int_col": [1], "str_col": ["a"], "float_col": [1.5]})
         mock_reader = MagicMock()
         mock_reader.execute.return_value = (df, Status.OK, None)
         MockDR.return_value = mock_reader
@@ -1394,11 +1403,11 @@ class TestQuerySqlColumnMeta:
         columns, rows, meta = query_sql("o", "s", "Q", 10, MagicMock(), "admin")
 
         assert meta[0]["name"] == "int_col"
-        assert meta[0]["type"] == "int64"
+        assert meta[0]["type"] == "Int64"   # polars type name, not numpy's
         assert meta[1]["name"] == "str_col"
-        assert meta[1]["type"] == "object"
+        assert meta[1]["type"] == "String"  # polars type name, not numpy's
         assert meta[2]["name"] == "float_col"
-        assert meta[2]["type"] == "float64"
+        assert meta[2]["type"] == "Float64"  # polars type name, not numpy's
         assert all(m["nullable"] is True for m in meta)
 
     @patch(f"{_MOD}.DataReader")
@@ -1408,7 +1417,7 @@ class TestQuerySqlColumnMeta:
 
         from supertable.data_reader import Status
         mock_reader = MagicMock()
-        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        mock_reader.execute.return_value = (pl.DataFrame(), Status.OK, None)
         MockDR.return_value = mock_reader
 
         from supertable.data_reader import query_sql
@@ -1432,7 +1441,7 @@ class TestQuerySqlDataReaderConstruction:
 
         from supertable.data_reader import Status
         mock_reader = MagicMock()
-        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        mock_reader.execute.return_value = (pl.DataFrame(), Status.OK, None)
         MockDR.return_value = mock_reader
 
         from supertable.data_reader import query_sql
@@ -1452,7 +1461,7 @@ class TestQuerySqlDataReaderConstruction:
 
         from supertable.data_reader import Status
         mock_reader = MagicMock()
-        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        mock_reader.execute.return_value = (pl.DataFrame(), Status.OK, None)
         MockDR.return_value = mock_reader
 
         sentinel_engine = MagicMock()
@@ -1471,7 +1480,7 @@ class TestQuerySqlDataReaderConstruction:
         mock_ensure.return_value = "Q"
         from supertable.data_reader import Status, query_sql
         mock_reader = MagicMock()
-        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        mock_reader.execute.return_value = (pl.DataFrame(), Status.OK, None)
         MockDR.return_value = mock_reader
 
         query_sql("o", "s", "Q", 10, MagicMock(), "admin", source="mcp")
@@ -1484,7 +1493,7 @@ class TestQuerySqlDataReaderConstruction:
         mock_ensure.return_value = "Q"
         from supertable.data_reader import Status, query_sql
         mock_reader = MagicMock()
-        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        mock_reader.execute.return_value = (pl.DataFrame(), Status.OK, None)
         mock_reader.query_plan_manager.query_id = "qid-123"
         mock_reader.query_plan_manager.query_hash = "qh-abc"
         MockDR.return_value = mock_reader
@@ -1537,7 +1546,7 @@ class TestExecuteExecutorArgs:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_lite")
+        mock_exec.execute.return_value = (pl.DataFrame(), "duckdb_lite")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -1594,7 +1603,7 @@ class TestExecuteExecutorArgs:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        mock_exec.execute.return_value = (pl.DataFrame(), "duckdb_pinned")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -1649,7 +1658,7 @@ class TestExecuteReturnFormat:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame({"a": [1]}), "duckdb_pinned")
+        mock_exec.execute.return_value = (pl.DataFrame({"a": [1]}), "duckdb_pinned")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, Status, engine
@@ -1658,7 +1667,7 @@ class TestExecuteReturnFormat:
         assert isinstance(result, tuple)
         assert len(result) == 3
         df, status, msg = result
-        assert isinstance(df, pd.DataFrame)
+        assert isinstance(df, pl.DataFrame)
         assert isinstance(status, Status)
         assert msg is None or isinstance(msg, str)
 
@@ -1696,7 +1705,7 @@ class TestExecuteEngineDefault:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pinned")
+        mock_exec.execute.return_value = (pl.DataFrame(), "duckdb_pinned")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -1748,7 +1757,7 @@ class TestExecuteExplainRouting:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame({"plan": ["x"]}), "duckdb_lite")
+        mock_exec.execute.return_value = (pl.DataFrame({"plan": ["x"]}), "duckdb_lite")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, Status, engine
@@ -1793,7 +1802,7 @@ class TestExecuteExplainRouting:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_lite")
+        mock_exec.execute.return_value = (pl.DataFrame(), "duckdb_lite")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -1833,7 +1842,7 @@ class TestExecuteExplainRouting:
         MockEstimator.return_value = mock_est
 
         mock_exec = MagicMock()
-        mock_exec.execute.return_value = (pd.DataFrame(), "duckdb_pro")
+        mock_exec.execute.return_value = (pl.DataFrame(), "duckdb_pro")
         MockExecutor.return_value = mock_exec
 
         from supertable.data_reader import DataReader, engine
@@ -2022,7 +2031,7 @@ class TestQuerySqlLimitGuard:
         mock_ensure.return_value = "SELECT 1 LIMIT 10"
         from supertable.data_reader import Status, query_sql
         mock_reader = MagicMock()
-        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        mock_reader.execute.return_value = (pl.DataFrame(), Status.OK, None)
         MockDR.return_value = mock_reader
 
         query_sql("org", "sup", "SELECT 1", 10, MagicMock(), "admin")
@@ -2033,7 +2042,7 @@ class TestQuerySqlLimitGuard:
     def test_limit_skipped_for_show_stats(self, mock_ensure, MockDR):
         from supertable.data_reader import Status, query_sql
         mock_reader = MagicMock()
-        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        mock_reader.execute.return_value = (pl.DataFrame(), Status.OK, None)
         MockDR.return_value = mock_reader
 
         query_sql("org", "sup", "SHOW STATS s.t", 10, MagicMock(), "admin")
@@ -2046,7 +2055,7 @@ class TestQuerySqlLimitGuard:
     def test_limit_skipped_for_explain(self, mock_ensure, MockDR):
         from supertable.data_reader import Status, query_sql
         mock_reader = MagicMock()
-        mock_reader.execute.return_value = (pd.DataFrame(), Status.OK, None)
+        mock_reader.execute.return_value = (pl.DataFrame(), Status.OK, None)
         MockDR.return_value = mock_reader
 
         query_sql("org", "sup", "EXPLAIN SELECT 1", 10, MagicMock(), "admin")

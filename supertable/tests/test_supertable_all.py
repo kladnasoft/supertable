@@ -1468,7 +1468,7 @@ class TestDataReaderExecute:
         mock_executor_cls,
         mock_extend,
     ):
-        import pandas as pd
+        import polars as pl
         from supertable.data_reader import DataReader, Status
 
         mock_parser = MagicMock()
@@ -1492,7 +1492,7 @@ class TestDataReaderExecute:
         mock_estimator.estimate.return_value = mock_reflection
         mock_estimator_cls.return_value = mock_estimator
 
-        result_df = pd.DataFrame({"x": [1, 2]})
+        result_df = pl.DataFrame({"x": [1, 2]})
         mock_executor = MagicMock()
         mock_executor.execute.return_value = (result_df, "duckdb")
         mock_executor_cls.return_value = mock_executor
@@ -1521,7 +1521,7 @@ class TestDataReaderExecute:
         mock_executor_cls,
         mock_extend,
     ):
-        import pandas as pd
+        import polars as pl
         from supertable.data_reader import DataReader, Status
 
         mock_parser = MagicMock()
@@ -1568,7 +1568,7 @@ class TestDataReaderExecute:
         mock_executor_cls,
         mock_extend,
     ):
-        import pandas as pd
+        import polars as pl
         from supertable.data_reader import DataReader, Status
 
         mock_parser = MagicMock()
@@ -1598,10 +1598,10 @@ class TestQuerySql:
 
     @patch("supertable.data_reader.DataReader")
     def test_query_sql_success(self, mock_reader_cls):
-        import pandas as pd
+        import polars as pl
         from supertable.data_reader import query_sql, Status
 
-        result_df = pd.DataFrame({"x": [1, 2, 3], "y": ["a", "b", "c"]})
+        result_df = pl.DataFrame({"x": [1, 2, 3], "y": ["a", "b", "c"]})
         mock_reader = MagicMock()
         mock_reader.execute.return_value = (result_df, Status.OK, None)
         mock_reader_cls.return_value = mock_reader
@@ -1622,11 +1622,11 @@ class TestQuerySql:
 
     @patch("supertable.data_reader.DataReader")
     def test_query_sql_error_raises(self, mock_reader_cls):
-        import pandas as pd
+        import polars as pl
         from supertable.data_reader import query_sql, Status
 
         mock_reader = MagicMock()
-        mock_reader.execute.return_value = (pd.DataFrame(), Status.ERROR, "bad query")
+        mock_reader.execute.return_value = (pl.DataFrame(), Status.ERROR, "bad query")
         mock_reader_cls.return_value = mock_reader
 
         with pytest.raises(RuntimeError, match="bad query"):

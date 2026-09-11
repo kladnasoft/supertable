@@ -59,8 +59,31 @@ def compute_manifest(scenario_ids: List[str]) -> dict:
     return {"version": MANIFEST_VERSION, "scenarios": scenarios}
 
 
-def write_manifest(scenario_ids: List[str]) -> dict:
+def write_manifest(scenario_ids: List[str], *, merge: bool = True) -> dict:
+    """Seal ``scenario_ids``, KEEPING every scenario already sealed.
+
+    Without the merge, resealing a subset silently dropped every other
+    scenario from the manifest and the next run failed the whole suite with
+    "scenario X is not sealed in the manifest" — a resealing tool that breaks
+    the seal for everything you did not name. Verified by
+    test_manifest_subset_reseal_keeps_other_scenarios.
+
+    ``merge=False`` reproduces the old whole-manifest rewrite, which is what a
+    full reseal wants when a scenario has been deleted outright.
+    """
     manifest = compute_manifest(scenario_ids)
+    if merge and SEALED_MANIFEST.exists():
+        try:
+            previous = load_manifest()
+        except Exception:
+            previous = {}
+        for key, value in previous.items():
+            if not isinstance(value, dict) or not isinstance(manifest.get(key), dict):
+                continue
+            # Entries the caller did not reseal keep their existing checksums.
+            merged = dict(value)
+            merged.update(manifest[key])
+            manifest[key] = merged
     SEALED_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
     SEALED_MANIFEST.write_bytes(
         json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")

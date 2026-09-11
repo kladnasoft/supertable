@@ -39,6 +39,10 @@ import duckdb
 import polars as pl
 import pyarrow.parquet as pq
 import pytest
+# pandas here is DELIBERATE: these helpers query DuckDB directly as an
+# independent oracle, and .fetchdf() is DuckDB's own API. Routing them
+# through the library's Arrow->polars conversion would make the oracle
+# share the code it is supposed to check.
 import pandas as pd
 from pandas.testing import assert_frame_equal
 

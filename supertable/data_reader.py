@@ -7,7 +7,6 @@ import re
 from enum import Enum
 from typing import Optional, Tuple, Any, List, Dict
 
-import pandas as pd
 import polars as pl
 
 from supertable.config.defaults import logger
@@ -588,16 +587,15 @@ def query_sql(
     # np.nan only ever appeared because pandas cannot represent a null inside a
     # numeric column. `.values.tolist()` also forced every row through a shared
     # numpy dtype, which upcast integers to float for exactly the same reason.
-    if hasattr(result_df, "rows"):
-        rows = [list(r) for r in result_df.rows()]
-    else:                                   # pandas fallback for old callers
-        rows = result_df.values.tolist()
-        for row in rows:
-            for i, val in enumerate(row):
-                if val is pd.NA or val is pd.NaT:
-                    row[i] = None
-                elif isinstance(val, float) and math.isnan(val):
-                    row[i] = None
+    # polars keeps NaN and null distinct, where pandas conflated them. Nulls
+    # already come out as None, but a float NaN would survive into the payload
+    # and `NaN` is not valid JSON — so it is folded into null here, which is
+    # what the old pandas sanitisation did for a different reason.
+    try:
+        result_df = result_df.fill_nan(None)
+    except Exception:
+        pass                                # no float columns to fill
+    rows = [list(r) for r in result_df.rows()]
 
     # Create basic column metadata
     columns_meta = [

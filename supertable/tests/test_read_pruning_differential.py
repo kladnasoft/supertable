@@ -30,6 +30,9 @@ import duckdb
 import polars as pl
 import pyarrow.parquet as pq
 import pytest
+# pandas here is DELIBERATE: the oracle queries DuckDB directly via
+# .fetchdf(), which is DuckDB's API. An oracle must not share the
+# library's conversion path.
 import pandas as pd
 from pandas.testing import assert_frame_equal
 

@@ -1,9 +1,9 @@
 # route: supertable.engine.arrow_result
 """Turn streamed Arrow batches into the DataFrame callers expect.
 
-Every read now goes through the streaming path, so this is the single place
-where Arrow becomes pandas. Two conversions need help; pyarrow's defaults are
-wrong for both in this context.
+Every read goes through the streaming path, so this is the single place where
+Arrow becomes a DataFrame — a polars one. pyarrow's defaults need help in one
+place; see below.
 
 DECIMALS WITH SCALE ZERO
     DuckDB types ``SUM`` of an integer as ``decimal128(38, 0)`` — exact, scale
@@ -25,30 +25,21 @@ DECIMALS WITH A SCALE
     Only the scale-zero case is changed, because there the exact answer is also
     the ergonomic one — there is no trade to make.
 
-NULLABLE INTEGERS
-    An Arrow int64 column containing a NULL converts to float64, because a
-    pandas int64 cannot hold NA. That is the same int-to-float coercion this
-    module exists to remove, so ``integer_object_nulls`` keeps those columns
-    integral. It applies ONLY to integer columns that actually contain a null;
-    dense ones stay int64.
-
-DATES
-    ``date32`` becomes ``object`` (``datetime.date``) by default, where the old
-    path produced ``datetime64``. ``date_as_object=False`` keeps the column
-    usable without changing any value.
+Both of those problems were pandas problems. polars holds a null inside an
+Int64 and has a real date type, so the coercions this module was originally
+written to work around simply do not arise.
 """
 
 from __future__ import annotations
 
 from typing import List, Optional
 
-import pandas as pd
 import pyarrow as pa
 
 from supertable.config.defaults import logger
 
 
-def normalize_arrow_types(table: pa.Table, *, for_pandas: bool = True) -> pa.Table:
+def normalize_arrow_types(table: pa.Table, *, for_pandas: bool = False) -> pa.Table:
     """Cast columns whose Arrow type converts badly to the target frame.
 
     The two targets need different things, so this is not one rule:
@@ -56,9 +47,11 @@ def normalize_arrow_types(table: pa.Table, *, for_pandas: bool = True) -> pa.Tab
     scale-zero decimals become int64 for BOTH. DuckDB types an integer SUM as
     decimal128(38, 0), and an integer is what it is — int64 is exact and usable.
 
-    scaled decimals are widened to float64 only for pandas, which has no
-    Decimal type. polars does, so it keeps them exact — which is the whole
-    point for a money column, where float64 silently loses cents at scale.
+    scaled decimals are left alone. They were widened to float64 when the
+    target could be pandas, which has no Decimal type; polars does, and for a
+    money column that exactness is the entire point — float64 silently loses
+    cents at scale. The ``for_pandas`` switch is kept because the rule it
+    encodes is real, but nothing in the library asks for pandas any more.
     """
     if table.num_columns == 0:
         return table
@@ -95,67 +88,37 @@ def normalize_arrow_types(table: pa.Table, *, for_pandas: bool = True) -> pa.Tab
             return table          # leave it as Decimal rather than lose data
 
 
-def table_to_pandas(table: pa.Table) -> pd.DataFrame:
-    return normalize_arrow_types(table).to_pandas(
-        date_as_object=False,
-        # Without this a nullable integer silently becomes float — the very
-        # coercion this module removes elsewhere.
-        integer_object_nulls=True,
-    )
-
-
-def batches_to_polars(batches, schema=None):
-    """Assemble streamed batches into a polars frame.
-
-    polars rather than pandas because pandas cannot represent a null inside a
-    numeric column, so every nullable integer silently becomes float — the same
-    coercion this module exists to remove. Measured on 3M rows:
-
-        arrow -> pandas   236ms   231 MB
-        arrow -> polars   171ms    60 MB     3.9x smaller
-
-    and on a nullable int64 column: pandas gives float64 [1.0, nan, 3.0] where
-    polars gives Int64 [1, None, 3].
-    """
-    import polars as pl
-    if not batches:
-        if schema is None:
-            return pl.DataFrame()
-        return pl.from_arrow(
-            normalize_arrow_types(schema.empty_table(), for_pandas=False))
-    # normalize_arrow_types applies here too. It was originally written for the
-    # pandas path only, which left the polars path — the one actually used —
-    # returning DuckDB's decimal128(38,0) for an integer SUM. Exact, but a
-    # Decimal column where an integer belongs.
-    table = normalize_arrow_types(pa.Table.from_batches(batches, schema=schema),
-                                  for_pandas=False)
-    return pl.from_arrow(table)
-
-
-def batches_to_pandas(batches: List[pa.RecordBatch],
-                      schema: Optional[pa.Schema] = None) -> pd.DataFrame:
-    """Assemble streamed batches into one DataFrame.
+def batches_to_polars(batches: List[pa.RecordBatch],
+                      schema: Optional[pa.Schema] = None):
+    """Assemble streamed batches into one polars frame.
 
     An empty result still needs its columns, which is why the schema is passed
     separately — a caller that selects nothing should get an empty frame with
     the right shape, not a shapeless one.
     """
+    import polars as pl
+
     if not batches:
         if schema is None:
-            return pd.DataFrame()
-        return table_to_pandas(schema.empty_table())
-    return table_to_pandas(pa.Table.from_batches(batches, schema=schema))
+            return pl.DataFrame()
+        return pl.from_arrow(
+            normalize_arrow_types(schema.empty_table(), for_pandas=False))
+    table = normalize_arrow_types(pa.Table.from_batches(batches, schema=schema),
+                                  for_pandas=False)
+    return pl.from_arrow(table)
 
 
-def materialize(handle) -> pd.DataFrame:
+def materialize(handle):
     """Drain a stream handle into a DataFrame, always closing it.
 
     This is what makes ``execute`` a thin wrapper over ``stream`` rather than a
     second implementation: there is one way to read, and buffering is just a
     consumer that keeps everything.
     """
+    import polars as pl
+
     if handle is None:
-        return pd.DataFrame()
+        return pl.DataFrame()
     try:
         batches = list(handle.batches())
         return batches_to_polars(batches, getattr(handle, "schema", None))

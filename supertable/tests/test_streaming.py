@@ -55,6 +55,19 @@ def _streamed(sql: str, **kw) -> pa.Table:
     return pa.Table.from_batches(batches, schema=handle.schema)
 
 
+def _to_polars(table: pa.Table):
+    """Arrow -> polars through the library's own normalisation.
+
+    Using the same normalisation the read path uses is deliberate: the point of
+    these tests is that a streamed read equals a buffered one, and a buffered
+    read goes through it too. Comparing raw Arrow against a normalised frame
+    would fail on type alone and say nothing about the rows.
+    """
+    from supertable.engine.arrow_result import batches_to_polars
+
+    return batches_to_polars(table.to_batches(), table.schema)
+
+
 # --------------------------------------------------------------------------
 # The invariant
 # --------------------------------------------------------------------------
@@ -70,28 +83,19 @@ def _streamed(sql: str, **kw) -> pa.Table:
 def test_streamed_equals_buffered(sql):
     """Streaming changes when rows arrive, not which rows arrive."""
     want = _buffered(sql)
-    got = _streamed(sql).to_pandas()
+    got = _to_polars(_streamed(sql))
 
     assert list(got.columns) == list(want.columns), sql
     assert len(got) == len(want), f"{len(want)} -> {len(got)}\n{sql}"
     if len(want) == 0:
         return
     cols = list(want.columns)
-    a = want.sort_values(cols, kind="mergesort").reset_index(drop=True)
-    b = got.sort_values(cols, kind="mergesort").reset_index(drop=True)
-    for c in cols:
-        # Compare VALUES, not dtypes: see test_streaming_preserves_integer_types
-        # — the buffered path widens ints to float, the streamed one does not.
-        import numpy as np
-        import pandas as pd
-        if pd.api.types.is_numeric_dtype(a[c]) or pd.api.types.is_numeric_dtype(b[c]):
-            av = pd.to_numeric(a[c], errors="coerce").astype(float).to_numpy()
-            bv = pd.to_numeric(b[c], errors="coerce").astype(float).to_numpy()
-            assert np.allclose(av, bv, rtol=1e-9, atol=1e-9, equal_nan=True), (
-                f"column {c!r} differs\n{sql}")
-        else:
-            assert a[c].astype(str).equals(b[c].astype(str)), (
-                f"column {c!r} differs\n{sql}")
+    # polars compares frames directly, types included — and after the
+    # int-sum fix both sides produce the same types, so there is nothing
+    # left to paper over with a value-only comparison.
+    assert want.sort(cols).equals(got.sort(cols)), (
+        f"streamed result differs from buffered\n{sql}"
+    )
 
 
 def test_streaming_preserves_exact_integer_sums():

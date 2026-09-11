@@ -669,24 +669,40 @@ def scenarios(duration_s: float, scale_name: str) -> List[Dict[str, Any]]:
         },
         {
             "id": "lifecycle_append_delete_update_sealed",
+            # Latency scenario: a single write. One cold sample cannot show its
+            # spread, which is what made a normal swing read as a regression.
+            "iterations": 5,
+            "warmup": 1,
             "description": "fixed deterministic append + delete + update, then "
                            "hash the table — the cross-version correctness seal",
             "body": lifecycle,
         },
         {
             "id": "small_write_latency",
+            # Latency scenario: a single write. One cold sample cannot show its
+            # spread, which is what made a normal swing read as a regression.
+            "iterations": 5,
+            "warmup": 1,
             "description": "many single-row writes — per-write fixed cost, "
                            "where PUT and warmup overhead dominate",
             "body": lambda: small_write_latency(20 if small else 100),
         },
         {
             "id": "large_batch_write",
+            # Latency scenario: a single write. One cold sample cannot show its
+            # spread, which is what made a normal swing read as a regression.
+            "iterations": 5,
+            "warmup": 1,
             "description": "one large append — per-row cost with fixed cost "
                            "amortised away",
             "body": lambda: large_batch_write(50_000 if small else 500_000),
         },
         {
             "id": "upsert_existing_keys",
+            # Latency scenario: a single write. One cold sample cannot show its
+            # spread, which is what made a normal swing read as a regression.
+            "iterations": 5,
+            "warmup": 1,
             "description": "rewrite every existing key (merge-on-read); row "
                            "count must stay flat",
             "body": lambda: upsert_existing_keys(10_000 if small else 100_000),
@@ -701,9 +717,17 @@ def run(profile: str, scale_name: str, *, duration_s: float = 60.0, log=print):
     log(f"\nwrite suite — profile={profile} scale={scale_name} "
         f"phase_duration={duration_s:g}s")
     for spec in scenarios(duration_s, scale_name):
+        # The time-boxed phases run for `duration_s` and are their own sample;
+        # repeating them would just multiply the runtime. The latency scenarios
+        # are a single write, and measuring one of those COLD once is why
+        # upsert_existing_keys reported "noise +/-0%" — with n=1 there is no
+        # spread to estimate, so any delta looked significant. Measured in
+        # isolation it has ~49% natural spread (245-366ms over 12 runs), which
+        # is wider than the +25.1% that was flagged as a regression.
+        reps = spec.get("iterations", 1)
         result: ScenarioResult = run_scenario(
             spec["id"], spec["description"], spec["body"],
-            iterations=1, warmup=0, log=log,
+            iterations=reps, warmup=spec.get("warmup", 0), log=log,
         )
         suite.scenarios.append(result)
 
