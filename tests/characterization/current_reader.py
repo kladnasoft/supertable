@@ -27,12 +27,16 @@ def _engine(engine: str):
     from supertable.engine.engine_enum import Engine
 
     e = (engine or "duckdb").lower()
-    if e in ("duckdb", "duckdb_lite", "lite"):
-        return Engine.DUCKDB_LITE
-    if e in ("duckdb_pro", "pro"):
-        return Engine.DUCKDB_PRO
+    # The lite/pro split is gone: there is one DuckDB engine now. The old names
+    # still appear in golden files recorded before the consolidation, and they
+    # describe the same engine, so they keep resolving rather than failing a
+    # scenario over a label.
+    if e in ("duckdb", "duckdb_lite", "lite", "duckdb_pro", "pro"):
+        return Engine.DUCKDB
     if e in ("spark", "spark_sql"):
         return Engine.SPARK_SQL
+    if e == "auto":
+        return Engine.AUTO
     raise ValueError(f"unknown engine {engine!r}")
 
 

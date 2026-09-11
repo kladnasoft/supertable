@@ -5,7 +5,7 @@ Every read now goes through the streaming path, so this is the single place
 where Arrow becomes pandas. Two conversions need help; pyarrow's defaults are
 wrong for both in this context.
 
-DECIMALS
+DECIMALS WITH SCALE ZERO
     DuckDB types ``SUM`` of an integer as ``decimal128(38, 0)`` — exact, scale
     zero, i.e. an integer. pyarrow maps decimals to ``object`` (Python
     ``Decimal``), which is exact but useless for arithmetic, and the old
@@ -17,6 +17,20 @@ DECIMALS
     A scale-zero decimal casts to ``int64`` losslessly, which is both. Only
     above 2**63 does that fail, and then float64 is the honest fallback — the
     value is beyond exact representation either way.
+
+DECIMALS WITH A SCALE
+    Left as float64, matching the old path. Keeping them exact would be
+    defensible, but it turns an ordinary numeric column into Python ``Decimal``
+    objects for every consumer, and the characterization suite seals float here.
+    Only the scale-zero case is changed, because there the exact answer is also
+    the ergonomic one — there is no trade to make.
+
+NULLABLE INTEGERS
+    An Arrow int64 column containing a NULL converts to float64, because a
+    pandas int64 cannot hold NA. That is the same int-to-float coercion this
+    module exists to remove, so ``integer_object_nulls`` keeps those columns
+    integral. It applies ONLY to integer columns that actually contain a null;
+    dense ones stay int64.
 
 DATES
     ``date32`` becomes ``object`` (``datetime.date``) by default, where the old
@@ -42,8 +56,10 @@ def normalize_arrow_types(table: pa.Table) -> pa.Table:
     fields, changed = [], False
     for field in table.schema:
         target = field.type
-        if pa.types.is_decimal(field.type) and field.type.scale == 0:
-            target = pa.int64()
+        if pa.types.is_decimal(field.type):
+            # Scale zero is an integer: int64 is exact AND usable. With a
+            # scale, float64 is what every consumer already expects.
+            target = pa.int64() if field.type.scale == 0 else pa.float64()
             changed = True
         if target is not field.type:
             fields.append(pa.field(field.name, target, field.nullable))
@@ -68,7 +84,12 @@ def normalize_arrow_types(table: pa.Table) -> pa.Table:
 
 
 def table_to_pandas(table: pa.Table) -> pd.DataFrame:
-    return normalize_arrow_types(table).to_pandas(date_as_object=False)
+    return normalize_arrow_types(table).to_pandas(
+        date_as_object=False,
+        # Without this a nullable integer silently becomes float — the very
+        # coercion this module removes elsewhere.
+        integer_object_nulls=True,
+    )
 
 
 def batches_to_pandas(batches: List[pa.RecordBatch],

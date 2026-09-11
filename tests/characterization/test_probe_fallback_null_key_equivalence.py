@@ -146,6 +146,12 @@ def test_probe_and_fallback_agree_on_null_key_under_newer_than():
 
     filt_probe, pairs_probe = _resolve(incoming, overlapping, VER)
     filt_fb, pairs_fb = _resolve_forced_fallback(incoming, overlapping, VER)
+    # Delete pairs are a polars frame now, not a list of tuples. sorted() on a
+    # frame iterates COLUMNS and compares Series, which raises "cannot compare
+    # string with numeric". delete_pairs_to_list exists for exactly this —
+    # comparisons and assertions — while the write path stays on the frame.
+    pairs_probe = st_processing.delete_pairs_to_list(pairs_probe)
+    pairs_fb = st_processing.delete_pairs_to_list(pairs_fb)
 
     # PRIMARY -- the two paths are equivalent => Finding #4 (divergence) is NOT real.
     assert _rowset(filt_probe) == _rowset(filt_fb), (
@@ -190,6 +196,8 @@ def test_probe_and_fallback_agree_on_null_key_overwrite_without_newer_than():
 
     filt_probe, pairs_probe = _resolve(incoming, overlapping, None)
     filt_fb, pairs_fb = _resolve_forced_fallback(incoming, overlapping, None)
+    pairs_probe = st_processing.delete_pairs_to_list(pairs_probe)
+    pairs_fb = st_processing.delete_pairs_to_list(pairs_fb)
 
     # No newer_than => no stale filter => every incoming row survives on both paths.
     assert _rowset(filt_probe) == _rowset(filt_fb) == _rowset(incoming)

@@ -92,11 +92,9 @@ def _dv_rowids(st, snap) -> set:
     """The set of ``__rowid__`` currently held by the snapshot's deletion-vector
     (empty if the pointer is cleared).  The tombstone dir is not date-partitioned, so
     this direct read is unaffected by the compacted-data partition-merge quirk."""
-    tomb_path = snap.get("tombstone")
-    if not tomb_path:
+    dv = _read_deletion_vector(st.storage, snap.get("tombstone"))
+    if dv is None:
         return set()
-    dv = st.storage.read_parquet(tomb_path)
-    dv = dv if isinstance(dv, pl.DataFrame) else pl.from_arrow(dv)
     return set(dv.get_column("__rowid__").to_list())
 
 
@@ -199,3 +197,30 @@ def test_compact_control_drains_vector():
     )
     assert _dv_rowids(st2, snap2) == set()
     assert int(snap2.get("tombstone_rows") or 0) == 0
+
+
+def _read_deletion_vector(storage, pointer):
+    """Read the deletion vector behind a snapshot ``tombstone`` pointer.
+
+    The pointer is a LIST of immutable parts — a checkpoint base plus per-write
+    deltas — not a single path. These tests were written when it was one file
+    and passed it straight to ``read_parquet``, which now fails with
+    "stat: path should be ... not list".
+
+    ``tombstone_parts`` also accepts the legacy single string, so this reads
+    snapshots written either side of that change. Returns None when there is no
+    vector, which is a real state: a fully drained table has no deletions.
+    """
+    import polars as _pl
+    from supertable.processing import tombstone_parts
+
+    parts = tombstone_parts(pointer)
+    if not parts:
+        return None
+    frames = []
+    for part in parts:
+        raw = storage.read_parquet(part)
+        frames.append(raw if isinstance(raw, _pl.DataFrame) else _pl.from_arrow(raw))
+    if not frames:
+        return None
+    return frames[0] if len(frames) == 1 else _pl.concat(frames, how="vertical_relaxed")

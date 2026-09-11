@@ -101,11 +101,7 @@ def _snapshot():
 def _dv_frame(st, snap):
     """The snapshot's deletion-vector as a polars frame (``__file__`` +
     ``__rowid__``), or ``None`` when the pointer is cleared."""
-    tomb_path = snap.get("tombstone")
-    if not tomb_path:
-        return None
-    dv = st.storage.read_parquet(tomb_path)
-    return dv if isinstance(dv, pl.DataFrame) else pl.from_arrow(dv)
+    return _read_deletion_vector(st.storage, snap.get("tombstone"))
 
 
 def _dv_rowids(st, snap) -> set:
@@ -236,3 +232,30 @@ def test_compact_datafile_read_failure_does_not_resurrect():
     assert {"b", "c", "d"} <= set(live_after), (
         f"compaction LOST a survivor; expected b,c,d present, got {dict(live_after)}"
     )
+
+
+def _read_deletion_vector(storage, pointer):
+    """Read the deletion vector behind a snapshot ``tombstone`` pointer.
+
+    The pointer is a LIST of immutable parts — a checkpoint base plus per-write
+    deltas — not a single path. These tests were written when it was one file
+    and passed it straight to ``read_parquet``, which now fails with
+    "stat: path should be ... not list".
+
+    ``tombstone_parts`` also accepts the legacy single string, so this reads
+    snapshots written either side of that change. Returns None when there is no
+    vector, which is a real state: a fully drained table has no deletions.
+    """
+    import polars as _pl
+    from supertable.processing import tombstone_parts
+
+    parts = tombstone_parts(pointer)
+    if not parts:
+        return None
+    frames = []
+    for part in parts:
+        raw = storage.read_parquet(part)
+        frames.append(raw if isinstance(raw, _pl.DataFrame) else _pl.from_arrow(raw))
+    if not frames:
+        return None
+    return frames[0] if len(frames) == 1 else _pl.concat(frames, how="vertical_relaxed")

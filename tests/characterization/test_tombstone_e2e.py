@@ -151,9 +151,8 @@ def test_demo_tombstone_end_state(n_passes):
 
     # --- tombstone file ----------------------------------------------------
     assert int(snap.get("tombstone_rows") or 0) == EXPECTED_TOMBSTONE_ROWS
-    tomb_path = snap.get("tombstone")
-    assert tomb_path and st.storage.exists(tomb_path)
-    dv = _as_polars(st.storage.read_parquet(tomb_path))
+    dv = _read_deletion_vector(st.storage, snap.get("tombstone"))
+    assert dv is not None, "expected a deletion vector"
     assert dv.height == EXPECTED_TOMBSTONE_ROWS
     # rowids are table-unique and never reused, so the vector holds no dups.
     assert dv.get_column("__rowid__").n_unique() == EXPECTED_TOMBSTONE_ROWS
@@ -178,3 +177,30 @@ def test_demo_tombstone_end_state(n_passes):
 
 def _as_polars(obj) -> pl.DataFrame:
     return obj if isinstance(obj, pl.DataFrame) else pl.from_arrow(obj)
+
+
+def _read_deletion_vector(storage, pointer):
+    """Read the deletion vector behind a snapshot ``tombstone`` pointer.
+
+    The pointer is a LIST of immutable parts — a checkpoint base plus per-write
+    deltas — not a single path. These tests were written when it was one file
+    and passed it straight to ``read_parquet``, which now fails with
+    "stat: path should be ... not list".
+
+    ``tombstone_parts`` also accepts the legacy single string, so this reads
+    snapshots written either side of that change. Returns None when there is no
+    vector, which is a real state: a fully drained table has no deletions.
+    """
+    import polars as _pl
+    from supertable.processing import tombstone_parts
+
+    parts = tombstone_parts(pointer)
+    if not parts:
+        return None
+    frames = []
+    for part in parts:
+        raw = storage.read_parquet(part)
+        frames.append(raw if isinstance(raw, _pl.DataFrame) else _pl.from_arrow(raw))
+    if not frames:
+        return None
+    return frames[0] if len(frames) == 1 else _pl.concat(frames, how="vertical_relaxed")
