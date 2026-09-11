@@ -48,6 +48,14 @@ def _flatten_plan(reader: Any) -> Dict[str, Any]:
     return plan
 
 
+# Set by run(fullscan=True). When on, the estimator returns every file and
+# prunes nothing, so the suite measures — and more importantly SEALS — the
+# unpruned path. Pruning may only ever drop files that provably hold no
+# matching row, so a fullscan seal and a pruned seal MUST be identical; any
+# difference is a pruning bug that dropped real data.
+FULLSCAN = False
+
+
 def _execute(query: str) -> tuple:
     """Run one query through the public read path and return (df, plan)."""
     from supertable.data_reader import DataReader, engine
@@ -57,6 +65,7 @@ def _execute(query: str) -> tuple:
     )
     df, status, message = reader.execute(
         role_name=BENCH_ROLE, with_scan=False, engine=engine.AUTO,
+        fullscan=FULLSCAN,
     )
     if not str(status).endswith("OK"):
         raise RuntimeError(f"read failed ({status}): {message}")
@@ -334,15 +343,24 @@ def scenarios(scale: ds.Scale) -> List[Dict[str, Any]]:
 
 
 def run(profile: str, scale: ds.Scale, *, iterations: int = 5, warmup: int = 1,
-        dataset_record: Optional[Dict[str, Any]] = None, log=print):
+        dataset_record: Optional[Dict[str, Any]] = None, fullscan: bool = False,
+        log=print):
     import time
+
+    global FULLSCAN
+    FULLSCAN = bool(fullscan)
 
     started = time.perf_counter()
     suite = new_run("read", profile, scale.name)
     suite.dataset = dataset_record or {}
+    if FULLSCAN:
+        # Tags the FILENAME only, so this cannot silently overwrite the pruned
+        # result — while still comparing cleanly against it.
+        suite.variant = "fullscan"
 
     log(f"\nread suite — profile={profile} scale={scale.name} "
-        f"iterations={iterations} warmup={warmup}")
+        f"iterations={iterations} warmup={warmup}"
+        f"{'  [FULLSCAN — pruning disabled]' if FULLSCAN else ''}")
     for spec in scenarios(scale):
         result: ScenarioResult = run_scenario(
             spec["id"], spec["description"], spec["body"],

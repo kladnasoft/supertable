@@ -90,7 +90,7 @@ def cmd_read(args) -> int:
     record = ds.build(args.profile, scale, rebuild=args.rebuild)
     run = read_suite.run(
         args.profile, scale, iterations=args.iterations, warmup=args.warmup,
-        dataset_record=record,
+        dataset_record=record, fullscan=getattr(args, "fullscan", False),
     )
     path = save_run(run)
     print(f"\nsaved {path}")
@@ -182,7 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    def add_common(p, *, with_scale=True):
+    def add_common(p, *, with_scale=True, with_fullscan=False):
         p.add_argument("--profile", default="local",
                        choices=sorted(PROFILE_STORAGE))
         if with_scale:
@@ -193,6 +193,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="discarded iterations before measuring")
         p.add_argument("--duration", type=float, default=60.0,
                        help="seconds per write throughput phase")
+        if with_fullscan:
+            p.add_argument("--fullscan", action="store_true",
+                           help="disable predicate pruning; every file is read. "
+                                "The seals MUST match a pruned run.")
         p.add_argument("--rebuild", action="store_true",
                        help="force a fresh read dataset")
 
@@ -201,7 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_setup.set_defaults(func=cmd_setup)
 
     p_read = sub.add_parser("read", help="run the read suite")
-    add_common(p_read)
+    add_common(p_read, with_fullscan=True)
     p_read.set_defaults(func=cmd_read)
 
     p_write = sub.add_parser("write", help="run the write suite")
@@ -209,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_write.set_defaults(func=cmd_write)
 
     p_all = sub.add_parser("all", help="run read then write")
-    add_common(p_all)
+    add_common(p_all, with_fullscan=True)
     p_all.set_defaults(func=cmd_all)
 
     p_matrix = sub.add_parser("matrix", help="run a suite on every profile")

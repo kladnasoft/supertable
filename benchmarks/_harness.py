@@ -337,6 +337,11 @@ class SuiteRun:
     environment: Dict[str, Any] = field(default_factory=dict)
     dataset: Dict[str, Any] = field(default_factory=dict)
     scenarios: List[ScenarioResult] = field(default_factory=list)
+    # Distinguishes a run of the same suite/scale taken under a different read
+    # mode (currently only "fullscan"). It affects the FILENAME only, never the
+    # scale, so a fullscan run can still be compared against the pruned run of
+    # the same scale — which is exactly the check it exists for.
+    variant: str = ""
     schema_version: int = RESULT_SCHEMA_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
@@ -346,15 +351,18 @@ class SuiteRun:
         return payload
 
 
-def result_path(suite: str, profile: str, version: str, scale: str) -> Path:
+def result_path(suite: str, profile: str, version: str, scale: str,
+                variant: str = "") -> Path:
     directory = RESULTS_ROOT / profile
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{suite}-{version}-{scale}.json"
+    suffix = f"-{variant}" if variant else ""
+    return directory / f"{suite}-{version}-{scale}{suffix}.json"
 
 
 def save_run(run: SuiteRun) -> Path:
     version = run.environment.get("supertable_version") or "unknown"
-    path = result_path(run.suite, run.profile, version, run.scale)
+    path = result_path(run.suite, run.profile, version, run.scale,
+                       getattr(run, "variant", ""))
     path.write_text(json.dumps(run.to_dict(), indent=2, sort_keys=False) + "\n")
     return path
 
