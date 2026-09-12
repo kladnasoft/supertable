@@ -83,15 +83,64 @@ class DQConfig:
     CRUD operations for Data Quality configuration stored in Redis.
     """
 
-    def __init__(self, r: redis.Redis, org: str, sup: str):
+    def __init__(self, r: redis.Redis, org: str, sup: str,
+                 actor_role_name: Optional[str] = None):
+        """
+        ``actor_role_name`` is the role on whose authority rules are written.
+        Required to create, update or delete a rule; unnecessary to read one,
+        because the scheduler reads them on a background thread with no actor.
+
+        A rule is not inert configuration. It is SQL that the scheduler later
+        executes, so whoever can register one chooses what gets read — which
+        is why writing a rule needs authority over the table the rule names,
+        and why the role that registered it is recorded and re-used at
+        execution time (see :meth:`create_rule`).
+        """
         self.r = r
         self.org = org
         self.sup = sup
+        self._actor_role_name = actor_role_name
 
     # ── Key shortcuts ─────────────────────────────────────────────────
 
     def _key(self, *parts: str) -> str:
         return _dq_key(self.org, self.sup, *parts)
+
+    # ── Authorisation ─────────────────────────────────────────────────
+
+    def _require_table_authority(self, table_name: str, action: str) -> str:
+        """Demand WRITE on *table_name* from this instance's actor.
+
+        WRITE rather than META: a rule changes what the lake *does* — the
+        scheduler runs its SQL and publishes the results — so it belongs with
+        the other per-table configuration (``configure_table`` is WRITE too),
+        not with reading a schema.
+
+        A rule targeting ``"*"`` runs against every table, so it needs the
+        wildcard grant. That falls out of passing the name through: the table
+        map is checked with ``get(name) or get("*")``.
+
+        Returns the validated actor role name, which the caller records on
+        the rule so the scheduler can execute it as that role instead of as
+        superadmin.
+        """
+        if not self._actor_role_name:
+            raise PermissionError(
+                f"Cannot {action}: no actor role was supplied. Construct "
+                f"DQConfig(..., actor_role_name=<role>) with a role holding "
+                f"WRITE on the table the rule targets."
+            )
+        # Local import: the quality package is optional and must not drag the
+        # RBAC layer in at module import time.
+        from supertable.rbac.access_control import check_write_access
+
+        check_write_access(
+            super_name=self.sup,
+            organization=self.org,
+            role_name=self._actor_role_name,
+            table_name=table_name or "*",
+        )
+        return self._actor_role_name
 
     # ── Global config ─────────────────────────────────────────────────
 
@@ -194,32 +243,85 @@ class DQConfig:
         return None
 
     def create_rule(self, rule: Dict[str, Any], created_by: str = "") -> Dict[str, Any]:
+        """Register a rule. Requires WRITE on the table it targets.
+
+        The actor role is stamped onto the rule as ``created_by_role``, and
+        the scheduler executes the rule's SQL **as that role**. This is the
+        whole of the fix for the escalation: a rule used to run as
+        ``superadmin``, so ``{"rule_type": "custom_sql", "sql": "SELECT * FROM
+        salaries"}`` was read with every row filter, column mask and table
+        grant bypassed, and the rows were then published to
+        ``latest:{table}`` and the DQ history table where the author could
+        read them.
+
+        Running as the registering role bounds a rule by the same grants its
+        author has everywhere else. Legitimate cross-table rules (referential
+        integrity, say) still work — they are simply bounded — which is why
+        this is an identity fix rather than a restriction on the SQL.
+
+        Writes fail loudly. The Redis error used to be logged and swallowed,
+        so a rule that never persisted was still returned to the caller as
+        though it had.
+        """
+        table_name = rule.get("table_name") or "*"
+        actor = self._require_table_authority(table_name, "create a quality rule")
+
         rule_id = rule.get("rule_id") or f"rule_{uuid.uuid4().hex[:8]}"
         rule["rule_id"] = rule_id
         rule.setdefault("enabled", True)
         rule.setdefault("severity", "warning")
         rule["created_by"] = created_by
+        rule["created_by_role"] = actor
         rule["created_at"] = _now_iso()
         try:
             self.r.set(self._key("rules", "doc", rule_id), json.dumps(rule, default=str))
             self.r.sadd(self._key("rules", "index"), rule_id)
         except Exception as e:
             logger.error(f"[dq-config] create_rule error: {e}")
+            raise
         return rule
 
     def update_rule(self, rule_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Update a rule. Requires WRITE on both the old and new target table.
+
+        Both, because ``table_name`` is updatable: checking only the new one
+        would let a role with WRITE on ``public`` retarget a rule that runs
+        against ``salaries``, and checking only the old one would let it aim
+        an existing rule at a table it has no grant on.
+
+        ``created_by_role`` is re-stamped to the actor making the change —
+        the rule now runs on *this* caller's authority, not the original
+        author's, so editing a rule cannot borrow someone else's reach.
+        """
         existing = self.get_rule(rule_id)
         if not existing:
             return None
+
+        old_table = existing.get("table_name") or "*"
+        new_table = updates.get("table_name", old_table) or "*"
+        actor = self._require_table_authority(old_table, "update a quality rule")
+        if new_table != old_table:
+            self._require_table_authority(new_table, "retarget a quality rule")
+
         existing.update(updates)
+        existing["created_by_role"] = actor
         existing["updated_at"] = _now_iso()
         try:
             self.r.set(self._key("rules", "doc", rule_id), json.dumps(existing, default=str))
         except Exception as e:
             logger.error(f"[dq-config] update_rule error: {e}")
+            raise
         return existing
 
     def delete_rule(self, rule_id: str) -> bool:
+        """Delete a rule. Requires WRITE on the table it targets.
+
+        A missing rule is authorised against ``"*"``, so a narrowly-granted
+        role cannot probe which rule ids exist.
+        """
+        existing = self.get_rule(rule_id)
+        table_name = (existing or {}).get("table_name") or "*"
+        self._require_table_authority(table_name, "delete a quality rule")
         try:
             self.r.delete(self._key("rules", "doc", rule_id))
             self.r.srem(self._key("rules", "index"), rule_id)

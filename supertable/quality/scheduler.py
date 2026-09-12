@@ -39,6 +39,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+
+#: Identity the *profiler* runs as — never the identity a user-defined rule
+#: runs as.
+#:
+#: Named rather than spelled "superadmin" inline at five call sites, because
+#: the distinction is the whole point: profiling executes library-generated
+#: SQL over a single declared table and legitimately needs to see every row,
+#: while a rule executes caller-supplied SQL and must not. Conflating the two
+#: is what let ``{"rule_type": "custom_sql", "sql": "SELECT * FROM salaries"}``
+#: read anything in the lake.
+PROFILER_ROLE = "superadmin"
+
 # ──────────────────────────────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────────────────────────────
@@ -422,7 +434,7 @@ def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
     # Get schema
     try:
         mr = MetaReader(super_name=sup, organization=org)
-        schema_raw = mr.get_table_schema(table_name, "superadmin")
+        schema_raw = mr.get_table_schema(table_name, PROFILER_ROLE)
         if not schema_raw or not schema_raw[0]:
             logger.warning(f"[dq-scheduler] No schema for {table_name}")
             return
@@ -452,7 +464,17 @@ def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
         dr = DataReader(super_name=sup, organization=org, query=sql)
         if dr.query_plan_manager:
             dr.query_plan_manager.source_type = "system"
-        result_df, status, message = dr.execute(role_name="superadmin")
+        # Elevated on purpose, and unlike a rule this is safe to be.
+        #
+        # ``build_quick_sql`` is library-generated: the table is the one being
+        # profiled, the columns come from that table's own schema, and no part
+        # of it is caller-supplied SQL. Profiling *is* a whole-table
+        # measurement — a null rate computed through one role's row filters
+        # would be a wrong answer, not a safer one — so it reads unfiltered.
+        #
+        # The rule path below is the opposite case and runs as the role that
+        # registered the rule. See _run_custom_rules.
+        result_df, status, message = dr.execute(role_name=PROFILER_ROLE)
         if result_df is None or result_df.empty:
             logger.warning(f"[dq-scheduler] Quick SQL returned empty for {table_name}")
             return
@@ -551,7 +573,7 @@ def _run_deep_check(r, org: str, sup: str, table_name: str, dqc) -> None:
 
     try:
         mr = MetaReader(super_name=sup, organization=org)
-        schema_raw = mr.get_table_schema(table_name, "superadmin")
+        schema_raw = mr.get_table_schema(table_name, PROFILER_ROLE)
         if not schema_raw or not schema_raw[0]:
             return
         schema_dict = schema_raw[0]
@@ -577,7 +599,7 @@ def _run_deep_check(r, org: str, sup: str, table_name: str, dqc) -> None:
             dr = DataReader(super_name=sup, organization=org, query=sql)
             if dr.query_plan_manager:
                 dr.query_plan_manager.source_type = "system"
-            result_df, status, message = dr.execute(role_name="superadmin")
+            result_df, status, message = dr.execute(role_name=PROFILER_ROLE)
             if result_df is None or result_df.empty:
                 continue
             deep_result = result_df.to_dict(orient="records")[0]
@@ -658,11 +680,36 @@ def _run_custom_check(r, org: str, sup: str, table_name: str, dqc) -> None:
         rule_sql = build_custom_rule_sql(rule, table_fqn)
         if not rule_sql:
             continue
+
+        # Execute as the role that registered the rule, never as superadmin.
+        #
+        # A rule is caller-supplied SQL — ``custom_sql`` is passed through
+        # verbatim — so running it elevated meant whoever could register a
+        # rule read any table with every row filter, column mask and table
+        # grant bypassed, and had the rows published to ``latest:{table}``
+        # and the DQ history table where they could read them back. Running
+        # it as the registering role bounds a rule by the same grants its
+        # author has everywhere else.
+        #
+        # A rule with no recorded role is SKIPPED rather than run elevated.
+        # Those predate the role being stamped on rules, so there is no way
+        # to tell whose authority they carry — and "unknown" must not resolve
+        # to "unrestricted". Re-saving one through ``update_rule`` stamps the
+        # current actor and revives it.
+        rule_role = rule.get("created_by_role")
+        if not rule_role:
+            logger.warning(
+                "[dq-scheduler] rule %s has no created_by_role and will not "
+                "run; re-save it to record the role it executes as",
+                rule.get("rule_id"),
+            )
+            continue
+
         try:
             dr = DataReader(super_name=sup, organization=org, query=rule_sql)
             if dr.query_plan_manager:
                 dr.query_plan_manager.source_type = "system"
-            r_df, _, _ = dr.execute(role_name="superadmin")
+            r_df, _, _ = dr.execute(role_name=rule_role)
             r_result = r_df.to_dict(orient="records") if r_df is not None and not r_df.empty else []
             eval_result = evaluate_custom_rule(rule, r_result)
             rule_results.append({

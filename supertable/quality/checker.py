@@ -50,6 +50,39 @@ def _quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _num(value: Any) -> Optional[float]:
+    """Coerce a rule threshold to a number, or ``None`` if it is not one.
+
+    Thresholds were interpolated into SQL as-is — ``f"... WHERE {q} <
+    {threshold}"`` — so a rule stored with ``threshold`` set to a string
+    injected straight into the predicate. That was reachable without the
+    ``custom_sql`` rule type at all, and until recently the result ran as
+    superadmin.
+
+    Booleans are rejected on purpose: ``bool`` is an ``int`` subclass, so
+    ``True`` would otherwise silently become ``1`` in a comparison.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _sql_str(value: Any) -> str:
+    """Render a value as a single-quoted SQL string literal.
+
+    ``expected_values`` was rendered with ``f"'{v}'"``, so a value containing
+    an apostrophe closed the literal and everything after it was parsed as
+    SQL. Doubling the quote is the standard escape and is what DuckDB
+    expects.
+    """
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 # System columns the merge-on-read write path injects into every data file
 # (``__rowid__`` for the deletion-vector anti-join, ``__timestamp__`` for the
 # dedup / partition key).  They live in the STORED table schema, but the read
@@ -125,9 +158,16 @@ def build_quick_sql(
     sql = f"SELECT\n  {select_clause}\nFROM {table_fqn}"
 
     # Incremental scope
+    #
+    # The column is quoted as an identifier; the timestamp is escaped as a
+    # string literal. It was interpolated bare inside quotes, which is the
+    # same break-out as expected_values had — and it matters more here,
+    # because the profiling path this builds SQL for runs elevated over the
+    # whole table. The value reaches this function from the stored
+    # ``latest:{table}`` document, so it is only as trustworthy as Redis.
     if incremental_column and last_check_ts:
         q_inc = _quote(incremental_column)
-        sql += f"\nWHERE {q_inc} > '{last_check_ts}'"
+        sql += f"\nWHERE {q_inc} > {_sql_str(last_check_ts)}"
 
     return sql
 
@@ -350,7 +390,9 @@ def build_custom_rule_sql(rule: Dict[str, Any], table_fqn: str) -> Optional[str]
     """Generate SQL for a user-defined custom rule. Returns None if rule_type unknown."""
     rt = rule.get("rule_type", "")
     col = rule.get("column_name")
-    threshold = rule.get("threshold")
+    # Validated, not interpolated raw: see _num. A non-numeric threshold
+    # makes the rule unbuildable rather than becoming SQL.
+    threshold = _num(rule.get("threshold"))
 
     if rt == "column_min" and col and threshold is not None:
         q = _quote(col)
@@ -376,7 +418,7 @@ def build_custom_rule_sql(rule: Dict[str, Any], table_fqn: str) -> Optional[str]
         if not expected:
             return None
         q = _quote(col)
-        vals = ", ".join(f"'{v}'" for v in expected)
+        vals = ", ".join(_sql_str(v) for v in expected)
         return (
             f"SELECT DISTINCT {q} AS unexpected_value FROM {table_fqn} "
             f"WHERE {q} IS NOT NULL AND {q} NOT IN ({vals})"
@@ -389,10 +431,31 @@ def build_custom_rule_sql(rule: Dict[str, Any], table_fqn: str) -> Optional[str]
 
 
 def evaluate_custom_rule(rule: Dict[str, Any], result: Any) -> Dict[str, Any]:
-    """Evaluate a custom rule result and return status + detail."""
+    """Evaluate a custom rule result and return status + detail.
+
+    The threshold goes through the same coercion as the SQL builder. Not for
+    injection — nothing here reaches SQL — but so the two agree: a value the
+    builder refuses must not then be compared against here, where a string
+    threshold would raise ``TypeError`` on ``<=`` and fail the rule with an
+    error that says nothing about the cause.
+    """
     rt = rule.get("rule_type", "")
-    threshold = rule.get("threshold")
+    threshold = _num(rule.get("threshold"))
     severity = rule.get("severity", "warning")
+
+    # Rule types that compare against a threshold cannot be evaluated without
+    # one. Coercing to None and falling through would compare an int to None
+    # and raise TypeError deep in a branch — reported as "rule failed", which
+    # points at the data rather than at the rule. Say what is actually wrong.
+    if rt in ("null_rate_max", "row_count_min") and threshold is None:
+        return {
+            "status": severity,
+            "value": None,
+            "detail": (
+                f"Rule is misconfigured: {rt} needs a numeric threshold, got "
+                f"{rule.get('threshold')!r}."
+            ),
+        }
 
     if rt in ("column_min", "column_max"):
         violations = 0
