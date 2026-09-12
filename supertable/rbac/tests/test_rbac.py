@@ -370,12 +370,23 @@ class TestRowColumnSecurity(unittest.TestCase):
         self.assertEqual(rcs.tables["t1"]["columns"], ["a", "b"])
         self.assertIsNotNone(rcs.content_hash)
 
-    def test_empty_tables_defaults_to_wildcard(self):
+    def test_empty_tables_is_no_grant(self):
+        """Inverted (C4).
+
+        This test used to assert ``{}`` was rewritten to
+        ``{"*": {"columns": ["*"], "filters": ["*"]}}``, i.e. that an empty
+        grant set meant *everything*.  It sealed the escalation rather than
+        catching it: revoking a role's last table grant produced exactly this
+        ``{}`` and promoted the role to every column of every table.  Note
+        that ``test_empty_columns_defaults_to_wildcard`` two lines below is
+        about a **missing** key, not an empty list — an empty ``columns``
+        list has always correctly denied, so "empty means none" was already
+        the house rule one level down.  The table level now agrees with it.
+        """
         rcs = RowColumnSecurity(role="admin", tables={})
         rcs.prepare()
-        self.assertIn("*", rcs.tables)
-        self.assertEqual(rcs.tables["*"]["columns"], ["*"])
-        self.assertEqual(rcs.tables["*"]["filters"], ["*"])
+        self.assertEqual(rcs.tables, {})
+        self.assertEqual(rcs.to_json()["tables"], {})
 
     def test_empty_columns_defaults_to_wildcard(self):
         rcs = RowColumnSecurity(role="admin", tables={"t1": {}})

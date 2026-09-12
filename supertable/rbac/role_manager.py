@@ -15,6 +15,27 @@ except ImportError:
     _audit_available = False
 
 
+# Role names the library owns.  ``superadmin`` is created at bootstrap in
+# every SuperTable (:meth:`RoleManager._init_role_storage`), so before this
+# reservation a tenant could ask for a role named "SuperAdmin" and — because
+# ``create_role`` returned the *existing* id on a name collision — be handed
+# the bootstrap superadmin's id, with the requested type and table grants
+# silently discarded (S11 / M12).  Matching is case-insensitive because the
+# name→id index lowercases on write.
+RESERVED_ROLE_NAMES = frozenset({"superadmin"})
+
+
+def _check_reserved_role_name(role_name: Optional[str]) -> None:
+    """Raise ``ValueError`` if *role_name* is one the library reserves."""
+    if not role_name:
+        return
+    if role_name.strip().lower() in RESERVED_ROLE_NAMES:
+        raise ValueError(
+            f"Role name {role_name!r} is reserved by SuperTable and cannot be "
+            f"created or assigned by a tenant."
+        )
+
+
 def _audit_rbac(organization: str, super_name: str, action, resource_id: str,
                 severity=None, **detail_kwargs) -> None:
     """Emit an RBAC audit event.  Never raises."""
@@ -86,7 +107,7 @@ class RoleManager:
                         "role_name": "superadmin",
                         "tables": {"*": {"columns": ["*"], "filters": ["*"]}},
                     }
-                    role_id = self.create_role(sysadmin_data)
+                    role_id = self.create_role(sysadmin_data, allow_reserved=True)
                     logger.info(f"Default superadmin role created: {role_id}")
             finally:
                 if lock_token:
@@ -103,7 +124,7 @@ class RoleManager:
     # for the canonical check.
     _SAFE_ROLE_NAME_RE = SAFE_ROLE_NAME_RE
 
-    def create_role(self, data: dict) -> str:
+    def create_role(self, data: dict, allow_reserved: bool = False) -> str:
         """
         Create a new role and return its ``role_id`` (UUID).
 
@@ -111,6 +132,16 @@ class RoleManager:
         and ``tables`` (a dict of per-table definitions).
         ``role_name`` is optional but must be unique (case-insensitive)
         when provided; it enables name-based lookups.
+
+        A name collision raises ``ValueError`` unless the stored role is
+        *identical* to the one requested — that keeps genuine retries
+        idempotent while refusing to hand back a role the caller did not ask
+        for.  Returning a different role silently discarded the requested type
+        and grants, and with ``superadmin`` reachable by name it returned the
+        bootstrap superadmin id to anyone who asked (S11 / M12).
+
+        ``allow_reserved`` is for the library's own bootstrap only; tenant
+        callers must not set it.
 
         Table definition format::
 
@@ -131,15 +162,26 @@ class RoleManager:
         # catalog layer re-checks on write, but that's defense in depth —
         # this is the user-facing contract.
         validate_role_name(role_name)
-
-        # If role_name given, check uniqueness (idempotent: return existing)
-        if role_name:
-            existing_id = self._catalog.rbac_get_role_id_by_name(org, sup, role_name)
-            if existing_id:
-                return existing_id
+        if not allow_reserved:
+            _check_reserved_role_name(role_name)
 
         rcs = RowColumnSecurity(**{k: v for k, v in data.items() if k != "role_name"})
         rcs.prepare()
+
+        # If role_name given, check uniqueness. Idempotent only for an
+        # identical request (same role type and same grants); anything else is
+        # a collision the caller has to resolve.
+        if role_name:
+            existing_id = self._catalog.rbac_get_role_id_by_name(org, sup, role_name)
+            if existing_id:
+                existing = self._catalog.get_role_details(org, sup, existing_id) or {}
+                if existing.get("content_hash") == rcs.content_hash:
+                    return existing_id
+                raise ValueError(
+                    f"Role name '{role_name}' is already taken by role "
+                    f"{existing_id} with different content. Use update_role to "
+                    f"change it, or pick another name."
+                )
 
         role_id = uuid.uuid4().hex
 
@@ -173,17 +215,20 @@ class RoleManager:
             # Validate format (same rule as create_role; catalog re-checks
             # on write as defense in depth).
             validate_role_name(new_name)
+            _check_reserved_role_name(new_name)
             # Check uniqueness
             if new_name:
                 conflicting_id = self._catalog.rbac_get_role_id_by_name(org, sup, new_name)
                 if conflicting_id and conflicting_id != role_id:
                     raise ValueError(f"Role name '{new_name}' is already taken by role {conflicting_id}")
 
-        default_tables = {"*": {"columns": ["*"], "filters": ["*"]}}
-
+        # A role document with no ``tables`` field has no grant — updating an
+        # unrelated field must not invent one.  The old fallback here was the
+        # wildcard-everything entry, so any update to a tableless document was
+        # a silent promotion to full access (the C4 substitution, second site).
         merged = {
             "role": data.get("role", existing.get("role")),
-            "tables": data.get("tables", existing.get("tables", default_tables)),
+            "tables": data.get("tables", existing.get("tables", {})),
         }
 
         rcs = RowColumnSecurity(**merged)

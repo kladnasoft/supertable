@@ -199,8 +199,13 @@ class TestRangeFilters(unittest.TestCase):
             {"operation": "<=", "value": "max_price", "type": "reference"},
         ]}}}
         fb = FilterBuilder("t1", ["*"], role_info)
-        # The LHS column is quoted; reference values stay unquoted.
-        self.assertIn('"price" >= min_price AND "price" <= max_price', fb.filter_query)
+        # Strengthened (S6): a reference names a column, so it is now
+        # validated and double-quoted exactly like the LHS instead of being
+        # interpolated as raw SQL.  It is still an identifier, never a string
+        # literal.
+        self.assertIn('"price" >= "min_price" AND "price" <= "max_price"',
+                      fb.filter_query)
+        self.assertNotIn("'min_price'", fb.filter_query)
 
     def test_single_bound_range(self):
         role_info = {"filters": {"score": {"range": [
@@ -242,8 +247,10 @@ class TestReferenceType(unittest.TestCase):
             "start_date": {"operation": "<", "value": "end_date", "type": "reference"},
         }}
         fb = FilterBuilder("t1", ["*"], role_info)
-        # LHS column is quoted; reference RHS stays unquoted (literal SQL).
-        self.assertIn('"start_date" < end_date', fb.filter_query)
+        # Strengthened (S6): the reference RHS is an identifier and is now
+        # double-quoted like the LHS.  It was previously emitted as raw SQL,
+        # which let ``"value": "0 OR 1=1"`` disable the row filter entirely.
+        self.assertIn('"start_date" < "end_date"', fb.filter_query)
         # Reference should NOT be string-literal quoted
         self.assertNotIn("'end_date'", fb.filter_query)
 
@@ -353,13 +360,24 @@ class TestNestedCombinations(unittest.TestCase):
 
 class TestEdgeCases(unittest.TestCase):
 
-    def test_empty_dict_filter_no_where(self):
-        fb = FilterBuilder("t1", ["*"], {"filters": {}})
-        self.assertNotIn("WHERE", fb.filter_query)
+    def test_empty_dict_filter_raises(self):
+        """Inverted (S9).
 
-    def test_empty_list_filter_no_where(self):
-        fb = FilterBuilder("t1", ["*"], {"filters": []})
-        self.assertNotIn("WHERE", fb.filter_query)
+        This used to assert that ``filters={}`` produced no ``WHERE`` — i.e.
+        that a configured-but-unrenderable row filter silently became *no
+        filter*.  Downstream, an empty predicate meant ``restrict_read_access``
+        built no RBAC view at all, so the policy applied nothing with no
+        exception and no log line.  ``["*"]`` (and an absent ``filters`` key,
+        which defaults to it) remains the one unambiguous way to say
+        "unrestricted" — see ``TestWildcardFilters`` above, still green.
+        """
+        with self.assertRaises(ValueError):
+            FilterBuilder("t1", ["*"], {"filters": {}})
+
+    def test_empty_list_filter_raises(self):
+        """Inverted (S9) — see ``test_empty_dict_filter_raises``."""
+        with self.assertRaises(ValueError):
+            FilterBuilder("t1", ["*"], {"filters": []})
 
     def test_query_starts_with_select(self):
         fb = FilterBuilder("t1", ["a"], {"filters": ["*"]})

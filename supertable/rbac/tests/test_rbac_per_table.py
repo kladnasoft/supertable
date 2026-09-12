@@ -107,15 +107,21 @@ def test_rcs_per_table_basic():
     assert rcs.content_hash is not None
 
 
-def test_rcs_defaults_when_empty():
-    """Empty tables defaults to wildcard everything."""
+def test_rcs_empty_tables_is_no_grant():
+    """Inverted (C4): an empty grant set is no grant, not wildcard-everything.
+
+    Previously named ``test_rcs_defaults_when_empty``, this asserted that
+    ``tables={}`` was substituted with ``{"*": {"columns": ["*"], "filters":
+    ["*"]}}``.  That substitution is what turned "revoke all tables" into
+    "grant all tables", and what made a role created before its grants were
+    attached a silent admin.  ``{}`` is now persisted verbatim and denies;
+    a caller that wants everything must pass ``{"*": ...}`` explicitly.
+    """
     rcs = RowColumnSecurity(role="reader", tables={})
     rcs.prepare()
     j = rcs.to_json()
 
-    assert "*" in j["tables"]
-    assert j["tables"]["*"]["columns"] == ["*"]
-    assert j["tables"]["*"]["filters"] == ["*"]
+    assert j["tables"] == {}
 
 
 def test_rcs_defaults_per_entry():

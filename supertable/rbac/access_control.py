@@ -7,6 +7,7 @@ from supertable.data_classes import TableDefinition
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.permissions import has_permission, Permission, RoleType
 from supertable.rbac.filter_builder import FilterBuilder
+from supertable.rbac.row_column_security import normalize_allowed_columns
 from supertable.utils.sql_parser import SQLParser
 
 
@@ -275,7 +276,7 @@ def restrict_read_access(
                 f"You don't have permission to read table '{pt.simple_name}'."
             )
 
-        allowed_columns = table_entry.get("columns", ["*"])
+        allowed_columns = normalize_allowed_columns(table_entry.get("columns"))
         if allowed_columns == ["*"]:
             # Unrestricted columns for this table — skip column validation.
             continue
@@ -314,21 +315,52 @@ def restrict_read_access(
             # will also skip this alias since it has no snapshot.
             continue
 
-        allowed_columns = table_entry.get("columns", ["*"])
+        allowed_columns = normalize_allowed_columns(table_entry.get("columns"))
         filters = table_entry.get("filters", ["*"])
 
         # Row-level filtering from per-table filters
         where_clause = ""
         if filters != ["*"]:
-            fb = FilterBuilder(
-                table_name="__PLACEHOLDER__",
-                columns=["*"],
-                role_info={"filters": filters},
-            )
+            try:
+                fb = FilterBuilder(
+                    table_name="__PLACEHOLDER__",
+                    columns=["*"],
+                    role_info={"filters": filters},
+                )
+            except Exception as exc:
+                # A filter that cannot be rendered is a broken policy.  Serving
+                # the table unfiltered would turn a rendering bug straight into
+                # a missing control, so deny instead (S9/S6).  The catch is
+                # deliberately broad: a malformed filter document raises
+                # TypeError/KeyError rather than ValueError, and *every* way of
+                # failing to render a configured restriction has to land on
+                # "deny", never on "no filter".
+                logger.error(
+                    f"Role '{role_name}' has an unusable row filter on "
+                    f"'{td.simple_name}': {exc}"
+                )
+                raise PermissionError(
+                    f"You don't have permission to read table "
+                    f"'{td.simple_name}'."
+                ) from exc
+
             generated = fb.filter_query
             where_idx = generated.upper().find("WHERE ")
             if where_idx >= 0:
                 where_clause = generated[where_idx + 6:]
+
+            if not where_clause:
+                # Belt and braces: the decision to skip the view must be driven
+                # by the *policy* (is it restrictive?), never by whether we
+                # managed to render it.
+                logger.error(
+                    f"Role '{role_name}' has a non-wildcard row filter on "
+                    f"'{td.simple_name}' that produced no WHERE clause"
+                )
+                raise PermissionError(
+                    f"You don't have permission to read table "
+                    f"'{td.simple_name}'."
+                )
 
         # Only add an entry if there's actual filtering to apply
         if allowed_columns != ["*"] or where_clause:

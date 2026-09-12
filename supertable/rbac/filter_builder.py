@@ -36,6 +36,43 @@ def _sanitize_operation(op: str) -> str:
     return normalized
 
 
+def _render_operand(spec: dict, operation: str) -> str:
+    """Render the right-hand side of a single RBAC filter comparison.
+
+    There are exactly three operand types and each has exactly one rendering:
+
+    * ``null``      → the SQL ``NULL`` keyword
+    * ``value``     → a single-quoted, escaped string literal
+    * ``reference`` → a **quoted identifier** (another column)
+
+    Any other ``type`` is rejected.  The old ``else`` branch interpolated the
+    operand *unquoted* for every non-``value`` type, which was a row-filter
+    bypass (S6): ``{"amount": {"operation": ">", "type": "reference",
+    "value": "0 OR 1=1"}}`` rendered as ``"amount" > 0 OR 1=1``, a tautology
+    that removed the restriction instead of applying it.  ``_sanitize_value``
+    did not catch it because the payload contains no quote, semicolon or
+    comment marker — it is ordinary SQL, and the defect was that it was
+    allowed to *be* SQL at all.
+    """
+    val_type = spec.get("type")
+
+    if val_type == "null":
+        return "NULL"
+
+    if val_type == "value":
+        escape_clause = ""
+        if operation in ("ILIKE", "NOT ILIKE") and "escape" in spec:
+            escape_clause = f" ESCAPE '{_sanitize_value(spec['escape'])}'"
+        return f"'{_sanitize_value(spec['value'])}'{escape_clause}"
+
+    if val_type == "reference":
+        # A reference names another column, so it is validated and quoted the
+        # same way the left-hand side is.
+        return _sanitize_column(str(spec["value"]))
+
+    raise ValueError(f"Invalid operand type in RBAC filter: {val_type!r}")
+
+
 def format_column_list(columns):
     if columns == ["*"]:
         return "*"
@@ -69,40 +106,45 @@ class FilterBuilder():
                     range_parts = []
                     for cond in val["range"]:
                         safe_op = _sanitize_operation(cond["operation"])
-                        if cond["type"] == "value":
-                            safe_val = _sanitize_value(cond["value"])
-                            range_parts.append(f"{safe_col} {safe_op} '{safe_val}'")
-                        else:
-                            safe_val = _sanitize_value(str(cond["value"]))
-                            range_parts.append(f"{safe_col} {safe_op} {safe_val}")
+                        range_parts.append(
+                            f"{safe_col} {safe_op} {_render_operand(cond, safe_op)}"
+                        )
                     clauses.append(" AND ".join(range_parts))
                 else:
                     safe_col = _sanitize_column(key)
                     operation = _sanitize_operation(val["operation"])
-                    val_type = val["type"]
-                    if val_type == "null":
-                        value = "NULL"
-                    elif val_type == "value":
-                        escape_clause = ""
-                        if operation in ("ILIKE", "NOT ILIKE") and "escape" in val:
-                            esc_char = _sanitize_value(val["escape"])
-                            escape_clause = f" ESCAPE '{esc_char}'"
-                        safe_val = _sanitize_value(val["value"])
-                        value = f"'{safe_val}'{escape_clause}"
-                    else:
-                        value = _sanitize_value(str(val["value"]))
+                    value = _render_operand(val, operation)
                     clauses.append(f"{safe_col} {operation} {value}")
             return " AND ".join(clauses)
         else:
             return ""
 
     def build_filter_query(self, table_name, columns, filters):
+        """Render the role's row filter into a ``SELECT … WHERE`` statement.
+
+        ``["*"]`` — and an absent ``filters`` key, which defaults to it — is
+        the one and only way to say "no row restriction".  Any *other* filter
+        value is a configured policy, and a configured policy that renders to
+        an empty predicate is a broken policy, not an unrestricted one: it
+        raises rather than silently dropping the ``WHERE`` (S9).
+
+        ``[{}]``, ``[{"AND": []}]``, ``[[]]``, ``[]`` and ``{}`` all rendered
+        to ``""`` before, and an empty predicate string meant no view was
+        built at all — a role-level row-security policy the operator believed
+        was in force applied nothing, with no exception and no log line.
+        """
         column_list = format_column_list(columns)
 
         if filters == ["*"]:
             where_clause = ""
         else:
             predicates = self.json_to_sql_clause(filters)
-            where_clause = f"\nWHERE {predicates}" if predicates else ""
+            if not predicates:
+                raise ValueError(
+                    f"RBAC row filter rendered to an empty predicate: {filters!r}. "
+                    f"A configured filter must produce SQL; use ['*'] to mean "
+                    f"unrestricted."
+                )
+            where_clause = f"\nWHERE {predicates}"
 
         return f"SELECT {column_list}\nFROM {table_name}{where_clause}"
