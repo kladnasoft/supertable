@@ -9,6 +9,40 @@ from supertable.config.defaults import logger
 from supertable.redis_catalog import RedisCatalog, validate_username
 from supertable import redis_keys as RK
 
+try:
+    from supertable.audit import emit as _audit_emit, EventCategory, Actions, Severity, make_detail
+    _audit_available = True
+except ImportError:
+    _audit_available = False
+
+
+def _audit_user(organization: str, super_name: str, action, resource_id: str,
+                severity=None, **detail_kwargs) -> None:
+    """Emit a user-RBAC audit event.  Never raises.
+
+    This module emitted nothing at all, while ``role_manager`` recorded every
+    role change — so a trail could show a role's grants being widened but not
+    the role being handed to a principal. ``add_role`` is the strongest call
+    in the subsystem (binding a role is how a principal acquires everything
+    that role holds) and it left no trace. The ``Actions.USER_*`` members
+    already existed and were never used.
+    """
+    if not _audit_available:
+        return
+    try:
+        _audit_emit(
+            category=EventCategory.RBAC_CHANGE,
+            action=action,
+            organization=organization,
+            super_name=super_name,
+            resource_type="user",
+            resource_id=resource_id,
+            severity=severity or Severity.WARNING,
+            detail=make_detail(**detail_kwargs),
+        )
+    except Exception:
+        pass
+
 
 class UserManager:
     """
@@ -161,6 +195,8 @@ class UserManager:
 
         self._catalog.rbac_create_user(org, sup, user_id, user_doc)
         logger.debug(f"User created: {user_id} ({username})")
+        _audit_user(org, sup, Actions.USER_CREATE, user_id,
+                    username=username, roles=list(roles))
         return user_id
 
     def get_user(self, user_id: str) -> Dict:
@@ -218,6 +254,12 @@ class UserManager:
 
         if update_fields:
             self._catalog.rbac_update_user(org, sup, user_id, update_fields)
+            # "roles" in update_fields is a privilege change, so record what
+            # moved rather than just that something did.
+            _audit_user(org, sup, Actions.USER_UPDATE, user_id,
+                        changed=sorted(update_fields),
+                        roles=list(update_fields.get("roles", []))
+                        if "roles" in update_fields else None)
 
     def delete_user(self, user_id: str) -> None:
         """Delete a user. The default superuser cannot be deleted.
@@ -233,6 +275,9 @@ class UserManager:
             raise ValueError("Superuser cannot be deleted")
         self._catalog.rbac_delete_user(org, sup, user_id)
         logger.debug(f"User deleted: {user_id}")
+        _audit_user(org, sup, Actions.USER_DELETE, user_id,
+                    severity=Severity.CRITICAL,
+                    username=user.get("username", ""))
 
     def list_users(self) -> List[Dict]:
         """List all user documents."""
@@ -253,7 +298,11 @@ class UserManager:
         org, sup = self.organization, self.super_name
         if not self._catalog.rbac_role_exists(org, sup, role_id):
             raise ValueError(f"Role {role_id} does not exist")
-        return self._catalog.rbac_add_role_to_user(org, sup, user_id, role_id)
+        result = self._catalog.rbac_add_role_to_user(org, sup, user_id, role_id)
+        if result:
+            _audit_user(org, sup, Actions.USER_ROLE_ASSIGN, user_id,
+                        severity=Severity.CRITICAL, role_id=role_id)
+        return result
 
     def remove_role(self, user_id: str, role_id: str) -> bool:
         """Remove a role from a user (atomic).
@@ -263,9 +312,13 @@ class UserManager:
         on the lake's administration, and in the limit locks everyone out.
         """
         self._require_rbac("revoke a role from a user")
-        return self._catalog.rbac_remove_role_from_user(
+        result = self._catalog.rbac_remove_role_from_user(
             self.organization, self.super_name, user_id, role_id
         )
+        if result:
+            _audit_user(self.organization, self.super_name,
+                        Actions.USER_ROLE_REMOVE, user_id, role_id=role_id)
+        return result
 
     def get_or_create_default_user(self) -> Optional[str]:
         """Return the default superuser's user_id, creating it if needed.
@@ -297,4 +350,6 @@ class UserManager:
         self._require_rbac("revoke a role from every user")
         org, sup = self.organization, self.super_name
         for uid in self._catalog.rbac_list_user_ids(org, sup):
-            self._catalog.rbac_remove_role_from_user(org, sup, uid, role_id)
+            if self._catalog.rbac_remove_role_from_user(org, sup, uid, role_id):
+                _audit_user(org, sup, Actions.USER_ROLE_REMOVE, uid,
+                            role_id=role_id)

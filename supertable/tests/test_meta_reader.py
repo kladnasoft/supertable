@@ -1247,3 +1247,91 @@ class TestListTables:
         mock_items.return_value = []
         mock_check.return_value = None
         assert list_tables("org", "sup", role_name="superadmin") == []
+
+# ===========================================================================
+# MetaReader._meta_scope — the lake-level sentinel
+# ===========================================================================
+
+class TestMetaScope:
+    """``table_name == super_name`` means "the whole lake", not a table.
+
+    ``get_table_schema`` and ``get_table_stats`` branch on that sentinel and
+    fan out over ``_get_all_tables()``, merging metadata from every table in
+    the lake; ``get_super_meta`` does so unconditionally. The access check
+    used to be scoped to the lake's own *name*, looked up in the role's
+    *table* map — so the cross-table aggregate was granted to any role
+    holding a table coincidentally named after the lake.
+    """
+
+    def test_the_sentinel_maps_to_a_wildcard_scope(self):
+        reader = _make_reader("sales", "org")
+        assert reader._meta_scope("sales") == "*"
+
+    def test_an_ordinary_table_is_unchanged(self):
+        reader = _make_reader("sales", "org")
+        assert reader._meta_scope("orders") == "orders"
+
+    @patch(_P_CHECK_META)
+    def test_the_aggregate_schema_read_is_checked_against_the_wildcard(
+        self, mock_check,
+    ):
+        reader = _make_reader("sales", "org")
+        _wire_catalog_scan(reader.catalog)
+        mock_check.return_value = None
+
+        reader.get_table_schema("sales", "admin")
+
+        assert mock_check.call_args.kwargs["table_name"] == "*", (
+            "asking for the lake's aggregate schema must require a lake-wide "
+            "grant, not a table named after the lake"
+        )
+
+    @patch(_P_CHECK_META)
+    def test_a_single_table_schema_read_is_checked_against_that_table(
+        self, mock_check,
+    ):
+        reader = _make_reader("sales", "org")
+        _wire_catalog_scan(reader.catalog)
+        mock_check.return_value = None
+
+        try:
+            reader.get_table_schema("orders", "admin")
+        except Exception:
+            pass          # the read itself may fail on mocks; the gate ran
+
+        assert mock_check.call_args.kwargs["table_name"] == "orders"
+
+    @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
+    @patch(_P_CHECK_META)
+    def test_get_super_meta_always_requires_the_wildcard(self, mock_check,
+                                                         mock_ttl):
+        reader = _make_reader("sales", "org")
+        reader.catalog.get_root.return_value = {"version": 1, "ts": 1}
+        _wire_catalog_scan(reader.catalog)
+        mock_check.return_value = None
+
+        reader.get_super_meta("admin")
+
+        assert mock_check.call_args.kwargs["table_name"] == "*"
+
+    @patch(_P_CHECK_META)
+    def test_a_role_named_after_the_lake_no_longer_gets_the_aggregate(
+        self, mock_check,
+    ):
+        """The coincidence, expressed as the gate's own argument.
+
+        A role granted ``{"sales": ...}`` in a lake called ``sales`` used to
+        satisfy the aggregate check by exact match. The gate is now asked
+        about ``"*"``, which that role does not hold.
+        """
+        reader = _make_reader("sales", "org")
+        _wire_catalog_scan(reader.catalog)
+
+        def only_the_sales_table(super_name, organization, role_name,
+                                 table_name):
+            if table_name != "sales":
+                raise PermissionError("no wildcard grant")
+        mock_check.side_effect = only_the_sales_table
+
+        with pytest.raises(PermissionError, match="no wildcard grant"):
+            reader.get_table_schema("sales", "coincidence")

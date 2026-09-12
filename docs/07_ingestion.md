@@ -312,4 +312,16 @@ All staging and pipe operations enforce role-based access control:
 - **Write operations** (`save_as_parquet`, `delete`, `create pipe`, `delete pipe`, `set_enabled`): require `check_write_access()`.
 - **Read operations** (`list_files`, `get_directory_structure`, `read pipe`): require `check_meta_access()`.
 
-Both checks verify the role has appropriate permissions on the SuperTable and target table.
+Both checks are scoped to a *table*, and what that table is differs:
+
+* **Staging** is lake-level -- a landing zone that may feed any number of
+  tables through pipes -- so it is checked against `"*"`, i.e. a lake-wide
+  grant is required.
+* **Pipes** are checked against the table the pipe feeds, read from the pipe's
+  own definition. `create` additionally requires the same on the pipe's
+  *current* target, because it is an upsert: without that, a role with WRITE
+  on one table could repoint or destroy a pipe feeding another.
+
+Both previously passed the *SuperTable's* name where a table name was
+expected, which only ever matched a role holding a table coincidentally named
+after the lake, and otherwise fell through to `"*"` anyway.

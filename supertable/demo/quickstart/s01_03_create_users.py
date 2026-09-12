@@ -46,7 +46,21 @@ bob_id = user_manager.create_user({
 })
 logger.info(f"bob created: {bob_id}")
 
-# Charlie: starts with no roles, then we add 'meta'
+# Charlie: starts with no roles, then we add 'meta', then gets renamed.
+#
+# The rename is what makes this script non-idempotent: on a second run
+# "charlie" no longer exists (it is "charlie_v2" by then), so create_user
+# mints a fresh one and the rename collides with the survivor of the first
+# run. Both names are cleared first so the demo can be re-run.
+#
+# Renaming charlie_v2 back is not enough: once a run has failed part-way,
+# *both* names are occupied, so the rename-back collides too.
+for stale in ("charlie", "charlie_v2"):
+    try:
+        user_manager.delete_user(user_manager.get_user_by_name(stale)["user_id"])
+    except ValueError:
+        pass      # not present — nothing to clear
+
 charlie_id = user_manager.create_user({"username": "charlie", "roles": []})
 if meta_role_id:
     user_manager.add_role(charlie_id, meta_role_id)

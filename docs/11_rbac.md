@@ -111,7 +111,38 @@ deleted by any caller:
 | `create_role({"role_name": "superadmin", ...})` | `ValueError` -- the name is reserved |
 | `update_role(other_id, {"role": "superadmin"})` | `ValueError` -- no promotion |
 | `update_role(superadmin_id, {"role": "reader"})` | `ValueError` -- no demotion |
+| `update_role(superadmin_id, {"role_name": "other"})` | `ValueError` -- no rename |
+| `update_role(superadmin_id, {"enabled": False})` | `ValueError` -- cannot be disabled |
 | `delete_role(superadmin_id)` | `ValueError` -- cannot be deleted |
+| `create_role({"role": "superadmin", ...}, allow_reserved=True)` | `ValueError` -- one per SuperTable |
+
+Every rule above is enforced on the **catalog write path**, not only in
+`RoleManager`. `RedisCatalog` is a documented public class (§15), so a check
+that lived only in the manager was one import wide:
+
+```python
+RedisCatalog().rbac_update_role(org, sup, my_reader_id, {"role": "superadmin"})
+```
+
+promoted a narrowly-granted reader to unrestricted reads of every table *and*
+the ability to administer roles. Authorization cannot live at that layer --
+the catalog has no actor -- but these invariants hold regardless of who is
+asking, so that is where they belong. Two write paths, one rule.
+
+Three of the five were each independently sufficient to take over or brick a
+lake:
+
+* **rename** orphans every caller that addresses the role by name (the docs,
+  the demo scripts and the package docstring all pass `role_name="superadmin"`),
+  and no replacement can be created because the name is reserved and the type
+  is already taken.
+* **disable** was a strictly better delete: `_resolve_role` denies a disabled
+  role *everywhere*, including inside the RBAC check needed to re-enable it.
+  One call bricked the lake with no recovery path through any gated API.
+* **`allow_reserved`** is a *public* parameter whose docstring merely asked
+  tenant callers not to set it. Passing it with a fresh name planted a second
+  superadmin -- which the immutability rules above then made undeletable and
+  undemotable by anyone, including the real superadmin.
 
 Both halves of the reservation matter. The **name** was reserved first, but
 the **type** is what enforcement reads: `access_control` takes
@@ -198,8 +229,14 @@ Creates a new role and returns its stable UUID (`role_id`).
 * `data["role"]` -- a `RoleType` string (e.g. `"reader"`).
 * `data["tables"]` -- per-table permission definitions (see Section 11.5).
 * `data["role_name"]` -- optional; must match `^[A-Za-z_][A-Za-z0-9_\- ]{0,126}$`.
-  If a role with the same name already exists, the existing `role_id` is
-  returned (idempotent create).
+  A name collision raises `ValueError` **unless** the stored role is identical
+  to the one requested (same `content_hash`), which keeps genuine retries
+  idempotent. Returning a *different* role on a collision silently discarded
+  the requested type and grants, and with `superadmin` reachable by name it
+  handed the bootstrap superadmin's id to anyone who asked (S11 / M12).
+* Requires an actor holding `Permission.RBAC` -- see §11.3.1.
+* The `superadmin` *type* is refused, as is a second role of that type. See
+  §11.2.
 
 Internally, a `RowColumnSecurity` value object is built, `prepare()` is
 called (validates, normalises columns, computes `content_hash`), and the

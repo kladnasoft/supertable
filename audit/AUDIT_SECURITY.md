@@ -128,8 +128,27 @@ that removes a whole category of future leak.
 | S8 | Share row filters fail open three ways — a leaf-read exception, an empty string, or a filter in the house dict format all serve the full table (2 rows → 4) | `data_reader.py:373` | VERIFIED |
 | S9 | Row filters that render to empty SQL (`[{}]`, `[{"AND": []}]`, `[]`) become no filter | rbac | VERIFIED |
 | S10 | `SHOW STATS` bypasses the column mask — min/max/null-count of a denied column | read path | VERIFIED |
-| S11 | `superadmin` is not a reserved name; a tenant can mint `role: "superadmin"`, and the type bypass at `access_control.py:249` discards any `tables` restriction stored with it | rbac | VERIFIED |
+| S11 | `superadmin` is not a reserved name; a tenant can mint `role: "superadmin"`, and the type bypass at `access_control.py:249` discards any `tables` restriction stored with it | rbac | **FIXED** |
 | S12 | `diagnostic_redaction.py` has **zero production call sites**, and redacts exception *type names* — not the secret *values* and messages that actually leak. The primitive the codebase needs does not exist | utils | VERIFIED |
+
+### S11 — fixed, and wider than first reported
+
+The reserved **name** was only half of it; the **type** is what enforcement
+reads. Closed in `role_manager.py` (user-facing errors) *and* on the catalog
+write path (`redis_catalog.py`, `RESERVED_ROLE_TYPE`), because `RedisCatalog`
+is a documented public class and a check in the manager alone was skippable
+by importing it.
+
+Follow-up review of the fix found four more paths to the same outcome, each
+verified exploitable and each now refused: promoting a role via
+`rbac_update_role`, planting a second superadmin through the *public*
+`allow_reserved` parameter, renaming the bootstrap role, and disabling it
+(which was unrecoverable — `_resolve_role` denies a disabled role inside the
+very check needed to re-enable it). See `docs/11_rbac.md` §11.2.
+
+Separately, `Permission.RBAC` is now enforced: `RoleManager` and `UserManager`
+take an `actor_role_name` and require it to mutate. Before that, RBAC
+administration was unauthenticated regardless of the reservation.
 
 `odata/policy.py:170-172` states share-filter failure is *"the one direction this must
 never fail in"*. The fingerprint obeys that rule; the enforcement at

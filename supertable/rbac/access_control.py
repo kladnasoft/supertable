@@ -140,27 +140,54 @@ def _check_scope_access(
 
 
 def _check_readonly_guard(super_name: str, organization: str, label: str) -> None:
-    """Block mutations on read-only SuperTables (snapshot clones, replicas, locked)."""
+    """Block mutations on read-only SuperTables (snapshot clones, replicas, locked).
+
+    Failure handling is split on purpose. A Redis outage passes: every other
+    part of the check needs Redis too — ``_resolve_role`` cannot read the role
+    — so the call is about to be denied anyway, and blocking here would only
+    replace a clear error with a confusing one.
+
+    Anything else fails **closed**. The distinction matters because the root
+    document can be unreadable while Redis is perfectly healthy: ``get_root``
+    catches only ``redis.RedisError``, so a malformed ``meta:root`` raises
+    ``JSONDecodeError`` straight through. Under the old blanket
+    ``except Exception: pass`` that was a silent skip — one corrupt key and
+    writes were accepted on a read-only replica, with the role check passing
+    normally because it reads a different key. An unverifiable flag is not an
+    absent flag.
+    """
+    import redis as _redis
+
     try:
         from supertable.redis_catalog import RedisCatalog
         root = RedisCatalog().get_root(organization, super_name)
-        if root and root.get("read_only"):
-            clone_type = root.get("clone_type", "")
-            if clone_type == "replica":
-                reason = "live replica"
-            elif clone_type == "readonly":
-                reason = "read-only snapshot clone"
-            elif root.get("cloned_from"):
-                reason = "read-only clone"
-            else:
-                reason = "locked"
-            raise PermissionError(
-                f"This SuperTable is {reason}. Cannot {label}."
-            )
+    except _redis.RedisError:
+        return  # Redis is down; the role lookup below will fail too.
     except PermissionError:
         raise
-    except Exception:
-        pass  # Never block on guard failures
+    except Exception as e:
+        logger.error(
+            "[readonly-guard] cannot determine read-only state of %s/%s: %s "
+            "— refusing rather than assuming writable",
+            organization, super_name, e,
+        )
+        raise PermissionError(
+            f"Cannot verify whether this SuperTable is read-only. Cannot {label}."
+        )
+
+    if root and root.get("read_only"):
+        clone_type = root.get("clone_type", "")
+        if clone_type == "replica":
+            reason = "a live replica"
+        elif clone_type == "readonly":
+            reason = "a read-only snapshot clone"
+        elif root.get("cloned_from"):
+            reason = "a read-only clone"
+        else:
+            reason = "locked"
+        raise PermissionError(
+            f"This SuperTable is {reason}. Cannot {label}."
+        )
 
 
 def check_control_access(
@@ -170,8 +197,11 @@ def check_control_access(
     table_name: str,
 ) -> None:
     """
-    Check whether *role_name* is allowed to perform a CONTROL operation
-    (e.g. drop table, truncate) on *table_name*.
+    Check whether *role_name* is allowed to perform a CONTROL operation on
+    *table_name* — dropping the whole SuperTable, and nothing else.
+
+    Dropping a single *table* is WRITE, not CONTROL: a writer owns the tables
+    it was granted and can create and drop them, bounded by its table grants.
 
     Raises ``PermissionError`` if the role lacks the necessary permission.
     """
@@ -189,9 +219,9 @@ def check_rbac_access(
 ) -> None:
     """Check whether *role_name* may administer roles and users.
 
-    Requires :attr:`Permission.RBAC`, which only ``SUPERADMIN`` holds. Not
-    table-scoped: a role grants access to tables, so checking "which table is
-    this role change about" has no answer.
+    Requires :attr:`Permission.RBAC`, held by ``SUPERADMIN`` and ``ADMIN``.
+    Not table-scoped: a role grants access to tables, so checking "which
+    table is this role change about" has no answer.
 
     Raises ``PermissionError`` if the role may not administer access.
     """
@@ -227,12 +257,23 @@ def check_meta_access(
     table_name: str,
 ) -> None:
     """
-    Check whether *role_name* is allowed to perform a META (ALTER) operation
-    on *table_name*.
+    Check whether *role_name* may read metadata for *table_name* — schemas,
+    statistics, and table/SuperTable listings. No row data.
+
+    Deliberately does NOT call :func:`_check_readonly_guard`. META is a pure
+    read: every call site in the tree reads and none mutates, so the guard
+    could only ever produce a false denial. On a read-only snapshot clone or
+    a live replica it did exactly that — ``SELECT`` succeeded through
+    :func:`restrict_read_access` while listing tables, reading a schema or
+    fetching stats all failed with "Cannot modify metadata". Worse, the
+    listing helpers filter ``PermissionError`` per item, so the replica did
+    not error: it silently appeared empty.
+
+    The name is historical. It was once described as an ALTER-style
+    operation, which is what put the mutation guard here.
 
     Raises ``PermissionError`` if the role lacks the necessary permission.
     """
-    _check_readonly_guard(super_name, organization, "modify metadata")
     _check_operation_access(
         super_name, organization, role_name, table_name,
         Permission.META, "META data",

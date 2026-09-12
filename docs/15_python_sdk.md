@@ -100,7 +100,7 @@ st = SuperTable(super_name="example", organization="my-org")
 | Method | Description |
 |--------|-------------|
 | `read_simple_table_snapshot(path)` | Read a snapshot JSON from storage |
-| `delete(role_name)` | Drop the SuperTable. Destructive. |
+| `delete(role_name)` | Drop the SuperTable. Destructive. Requires `CONTROL` with a lake-wide (`"*"`) table grant -- so `superadmin`/`admin` only. |
 
 ### DataWriter
 
@@ -189,10 +189,15 @@ mr.get_table_stats("facts", role_name="superadmin")
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager
 
-rm = RoleManager(super_name="example", organization="my-org")
+# Mutating roles or users requires an actor holding Permission.RBAC
+# (superadmin or admin). Reads need no actor. Omitting it raises
+# PermissionError -- see docs/11_rbac.md 11.3.1.
+rm = RoleManager(super_name="example", organization="my-org",
+                 actor_role_name="superadmin")
 rm.create_role({"role": "reader", "tables": {"facts": {"columns": ["*"], "filters": []}}})
 
-um = UserManager(super_name="example", organization="my-org")
+um = UserManager(super_name="example", organization="my-org",
+                 actor_role_name="superadmin")
 um.create_user({"username": "alice", "roles": [role_id]})
 ```
 

@@ -49,12 +49,24 @@ class SuperPipe:
 
     def create(self, *, role_name: str, pipe_name: str, simple_name: str, user_hash: str, overwrite_columns: List[str] = None,
                enabled: bool = True) -> str:
-        check_write_access(
-            super_name=self.super_name,
-            organization=self.organization,
-            role_name=role_name,
-            table_name=simple_name,
-        )
+        """Create or replace a pipe definition.
+
+        ``upsert_pipe_meta`` overwrites unconditionally, so this is an update
+        path as well as a create one — and that makes the caller-supplied
+        ``simple_name`` insufficient on its own. Checking only it let a role
+        with WRITE on ``public`` pass ``pipe_name=<pipe feeding secrets>,
+        simple_name=public`` and repoint or destroy a pipe feeding a table it
+        had no grant on. When the pipe already exists, WRITE on its *current*
+        target is required too: you must be allowed to take it over as well as
+        to point it somewhere.
+        """
+        for table_name in {simple_name, self._pipe_table(pipe_name)}:
+            check_write_access(
+                super_name=self.super_name,
+                organization=self.organization,
+                role_name=role_name,
+                table_name=table_name,
+            )
 
         def _op():
             # 1. Check for duplicate simple_name/overwrite_columns combo

@@ -5,7 +5,12 @@ from typing import Dict, List, Optional
 
 from supertable.rbac.row_column_security import RowColumnSecurity
 from supertable.config.defaults import logger
-from supertable.redis_catalog import RedisCatalog, SAFE_ROLE_NAME_RE, validate_role_name
+from supertable.redis_catalog import (
+    RESERVED_ROLE_TYPE as _RESERVED_ROLE_TYPE,
+    RedisCatalog,
+    SAFE_ROLE_NAME_RE,
+    validate_role_name,
+)
 from supertable import redis_keys as RK
 
 try:
@@ -46,7 +51,13 @@ def _check_reserved_role_name(role_name: Optional[str]) -> None:
 #: the name check and then had its own ``tables`` restriction discarded at
 #: read time. There is exactly one superadmin role and ``_init_role_storage``
 #: makes it; nothing else may mint one (S11).
-RESERVED_ROLE_TYPE = "superadmin"
+#:
+#: Re-exported from the catalog layer, which is where the invariants are
+#: enforced — ``RedisCatalog`` is public, so a check that lived only here was
+#: skippable by importing it directly. Checks in this module remain as the
+#: user-facing contract (clearer errors, earlier in the call), not as the
+#: only line of defence.
+RESERVED_ROLE_TYPE = _RESERVED_ROLE_TYPE
 
 
 def _check_reserved_role_type(role_type: Optional[str]) -> None:

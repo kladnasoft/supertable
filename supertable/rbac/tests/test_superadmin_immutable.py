@@ -98,17 +98,48 @@ def test_cannot_create_a_role_named_superadmin(rm):
         rm.create_role(_reader(role_name="superadmin"))
 
 
-def test_bootstrap_itself_is_still_allowed(rm):
-    """``allow_reserved`` is the library's own door and must stay open.
+def test_recreating_the_identical_bootstrap_role_is_idempotent(rm):
+    """``allow_reserved`` with the same name and content returns the same id.
 
-    Without this, a second SuperTable could never be initialised.
+    This is the retry path, not a second role: ``create_role`` sees the name
+    collision, finds an identical ``content_hash``, and hands back the
+    existing id without reaching the catalog.
+
+    An earlier version of this test asserted only ``assert role_id`` and
+    claimed to be testing "the bootstrap door". It passed because of the
+    idempotent-return above, so it never exercised creating a *second*
+    superadmin at all — which is the case that mattered. See the next test.
     """
+    existing = rm.get_superadmin_role_id()
     role_id = rm.create_role(
         {"role": "superadmin", "role_name": "superadmin",
          "tables": {"*": {"columns": ["*"], "filters": ["*"]}}},
         allow_reserved=True,
     )
-    assert role_id
+    assert role_id == existing, "must return the bootstrap role, not a new one"
+    assert len(rm.get_roles_by_type(RESERVED_ROLE_TYPE)) == 1
+
+
+def test_allow_reserved_cannot_plant_a_second_superadmin(rm):
+    """``allow_reserved`` is a *public* parameter, so it is not a door.
+
+    Its docstring asked tenant callers not to set it, which is a comment
+    rather than a check. Passing it with a fresh name minted a second
+    superadmin role — and the immutability rules then worked in the
+    attacker's favour: that role could never be deleted or demoted by
+    anyone, including the real superadmin.
+
+    "Exactly one per SuperTable" is now an invariant of the write path, so
+    bootstrap still works (none exists yet) and everything after is refused.
+    """
+    with pytest.raises(ValueError, match="already exists"):
+        rm.create_role(
+            {"role": "superadmin", "role_name": "shadow_admin",
+             "tables": {"*": {"columns": ["*"], "filters": ["*"]}}},
+            allow_reserved=True,
+        )
+
+    assert len(rm.get_roles_by_type(RESERVED_ROLE_TYPE)) == 1
 
 
 def test_ordinary_roles_are_unaffected(rm):

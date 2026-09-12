@@ -75,6 +75,50 @@ SAFE_ROLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_\-. ]{0,126}$")
 _VALID_ROLE_TYPES = frozenset(rt.value for rt in _RoleType)
 
 
+# ---------------------------------------------------------------------------
+# Superadmin invariants
+# ---------------------------------------------------------------------------
+#
+# The canonical home for the reserved role type. ``RoleManager`` re-exports it.
+#
+# These rules are enforced HERE, at the lowest write path, for the same reason
+# ``validate_role_name`` is: ``RedisCatalog`` is a documented public class
+# (see docs/15_python_sdk.md), so a caller can reach every RBAC write without
+# going through ``RoleManager`` and its actor gate. Checking only in the
+# manager made the gate one import wide:
+#
+#     RedisCatalog().rbac_update_role(org, sup, my_reader_id,
+#                                     {"role": "superadmin"})
+#
+# promoted a narrow reader to unrestricted read of every table *and* the
+# ability to administer roles — the exact transition ``RoleManager`` exists to
+# forbid. Two write paths, one rule.
+#
+# Authorization itself cannot live here: the catalog has no actor. What lives
+# here are the invariants that hold regardless of who is asking — there is
+# exactly one superadmin role per SuperTable, and it cannot be created a
+# second time, promoted to, demoted, renamed, disabled, or deleted.
+RESERVED_ROLE_TYPE = "superadmin"
+
+
+def _as_bool(value: Any) -> bool:
+    """Interpret a stored flag the way ``_resolve_role`` does.
+
+    Kept deliberately in step with ``access_control._resolve_role``: a value
+    this reads as True but enforcement reads as False would let the superadmin
+    role be disabled through a spelling the guard below did not recognise.
+    Redis returns strings, so ``"false"`` and ``"0"`` matter as much as the
+    bool; anything missing is True, matching the back-compat default.
+    """
+    if value is None:
+        return True
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "")
+    return bool(value)
+
+
 def validate_role_name(role_name: str) -> None:
     """Raise ``ValueError`` if ``role_name`` doesn't match :data:`SAFE_ROLE_NAME_RE`.
 
@@ -847,14 +891,39 @@ return 1
 
     # -- Role CRUD --
 
+    def _role_type_of(self, org: str, sup: str, role_id: str) -> str:
+        """The stored type of a role, or ``""`` if it has none/does not exist."""
+        raw = self.r.hget(RK.rbac_role_doc(org, sup, role_id), "role")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        return str(raw or "").strip().lower()
+
     def rbac_create_role(self, org: str, sup: str, role_id: str, role_data: Dict[str, Any]) -> None:
         """Persist a new role document and update indexes.
 
         Validates ``role_name`` against :data:`SAFE_ROLE_NAME_RE` before
         writing — direct callers (tests, admin scripts, migrations) can't
         bypass the rule by skipping ``RoleManager.create_role``.
+
+        Refuses a second role of type ``superadmin``. Bootstrap works because
+        none exists yet; everything after it is refused. Without this,
+        ``create_role(..., allow_reserved=True)`` — a *public* parameter whose
+        docstring merely asked callers not to use it — planted a permanent
+        backdoor: a second superadmin role that the immutability rules then
+        made undeletable and undemotable by anyone, including the real
+        superadmin. It also broke the ``ids[0]`` assumption in
+        :meth:`rbac_get_superadmin_role_id`, since a Redis SET is unordered.
         """
         validate_role_name(role_data.get("role_name", ""))
+
+        if str(role_data.get("role") or "").strip().lower() == RESERVED_ROLE_TYPE:
+            existing = self.rbac_get_superadmin_role_id(org, sup)
+            if existing and existing != role_id:
+                raise ValueError(
+                    f"A {RESERVED_ROLE_TYPE!r} role already exists ({existing}). "
+                    f"There is exactly one per SuperTable and it is created at "
+                    f"initialisation."
+                )
         key = RK.rbac_role_doc(org, sup, role_id)
         redis_data = {k: self._rbac_serialize(v) for k, v in role_data.items()}
         pipe = self.r.pipeline()
@@ -886,6 +955,51 @@ return 1
         """
         if "role_name" in fields:
             validate_role_name(fields.get("role_name", ""))
+
+        # Superadmin invariants, enforced at the write path rather than only
+        # in RoleManager — see RESERVED_ROLE_TYPE for why.
+        current_type = self._role_type_of(org, sup, role_id)
+        requested_type = (
+            str(fields.get("role") or "").strip().lower()
+            if "role" in fields else None
+        )
+
+        if requested_type == RESERVED_ROLE_TYPE and current_type != RESERVED_ROLE_TYPE:
+            raise ValueError(
+                f"Role type {RESERVED_ROLE_TYPE!r} is reserved and cannot be "
+                f"promoted to; it is created once at initialisation."
+            )
+
+        if current_type == RESERVED_ROLE_TYPE:
+            if requested_type is not None and requested_type != RESERVED_ROLE_TYPE:
+                raise ValueError(
+                    "The superadmin role's type cannot be changed. Changing it "
+                    "first is what made 'cannot be deleted' bypassable."
+                )
+            if "role_name" in fields:
+                # Renaming it orphans every caller that addresses it by name —
+                # the docs, the demo scripts and the package docstring all
+                # pass role_name="superadmin" — and no replacement can be
+                # created, because the name is reserved and the type is
+                # already taken.
+                new_name = str(fields.get("role_name") or "").strip().lower()
+                if new_name != RESERVED_ROLE_TYPE:
+                    raise ValueError(
+                        "The superadmin role cannot be renamed: it is "
+                        "addressed by name throughout, and no replacement "
+                        "could be created to take its place."
+                    )
+            if "enabled" in fields and not _as_bool(fields["enabled"]):
+                # _resolve_role denies a disabled role everywhere, including
+                # inside the RBAC gate that would be needed to re-enable it.
+                # Disabling the superadmin role bricked the lake with no
+                # recovery path through any gated API — and so was a strictly
+                # better version of the delete this class already refuses.
+                raise ValueError(
+                    "The superadmin role cannot be disabled: it is the only "
+                    "role able to restore access, and a disabled role is "
+                    "refused by the very check needed to re-enable it."
+                )
 
         new_type = ""
         if "role" in fields:
@@ -929,10 +1043,17 @@ return 1
             raise ValueError(f"Role {role_id} does not exist")
 
     def rbac_delete_role(self, org: str, sup: str, role_id: str) -> bool:
-        """Atomically delete a role, strip from users, and clean name→id mapping."""
+        """Atomically delete a role, strip from users, and clean name→id mapping.
+
+        Refuses to delete the ``superadmin`` role. ``RoleManager.delete_role``
+        already did, but this is the write path a direct caller reaches, and
+        the manager's check was skippable by importing the catalog.
+        """
         key = RK.rbac_role_doc(org, sup, role_id)
         if not self.r.exists(key):
             return False
+        if self._role_type_of(org, sup, role_id) == RESERVED_ROLE_TYPE:
+            raise ValueError("The superadmin role cannot be deleted.")
         role_type = self.r.hget(key, "role") or ""
         if isinstance(role_type, bytes):
             role_type = role_type.decode("utf-8")

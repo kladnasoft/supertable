@@ -171,6 +171,24 @@ class MetaReader:
             logger.error(f"Error getting tables from Redis: {e}")
             return []
 
+    def _meta_scope(self, table_name: str) -> str:
+        """The access scope for a metadata read of *table_name*.
+
+        ``table_name == super_name`` is this module's sentinel for "the whole
+        lake": the aggregate branches fan out over :meth:`_get_all_tables` and
+        merge metadata from every table in it. Checking that against the
+        role's *table* map under the *lake's* name was a namespace confusion
+        — it handed the cross-table aggregate to any role holding a table
+        coincidentally named after the lake.
+
+        Scoping the aggregate to ``"*"`` is equivalent-or-tighter for every
+        other role, because ``_resolve_table_entry`` is
+        ``get(table_name) or get("*")``: a role without a table named after
+        the lake already fell through to the wildcard entry. The only
+        behaviour that changes is the coincidence.
+        """
+        return "*" if table_name == self.super_table.super_name else table_name
+
     def get_tables(self, role_name: str) -> List[str]:
         """Tables in this SuperTable that *role_name* may see.
 
@@ -209,7 +227,7 @@ class MetaReader:
                 super_name=self.super_table.super_name,
                 organization=self.super_table.organization,
                 role_name=role_name,
-                table_name=table_name,
+                table_name=self._meta_scope(table_name),
             )
 
             schema_items: Set[Tuple[str, Any]] = set()
@@ -278,7 +296,7 @@ class MetaReader:
             super_name=self.super_table.super_name,
             organization=self.super_table.organization,
             role_name=role_name,
-            table_name=table_name,
+            table_name=self._meta_scope(table_name),
         )
 
         try:
@@ -306,7 +324,7 @@ class MetaReader:
             super_name=self.super_table.super_name,
             organization=self.super_table.organization,
             role_name=role_name,
-            table_name=table_name,
+            table_name=self._meta_scope(table_name),
         )
 
         keys_to_remove = {"previous_snapshot", "schema", "location"}
@@ -354,7 +372,10 @@ class MetaReader:
             super_name=self.super_table.super_name,
             organization=self.super_table.organization,
             role_name=role_name,
-            table_name=self.super_table.super_name,
+            # Always the lake-level aggregate: the body below merges metadata
+            # from every table via _get_all_tables(), so a lake-wide grant is
+            # the honest requirement. See _meta_scope.
+            table_name="*",
         )
 
         t_access = time.perf_counter()
@@ -552,7 +573,12 @@ def list_supers(organization: str, role_name: str) -> List[str]:
                 super_name=super_name,
                 organization=organization,
                 role_name=role_name,
-                table_name=super_name,
+                # "*" not super_name: this asks "may this role see this lake
+                # at all", and looking the lake's name up in the role's table
+                # map only ever matched by coincidence. A role without such a
+                # table already fell through to the wildcard entry, so this is
+                # equivalent-or-tighter.
+                table_name="*",
             )
             result.append(super_name)
         except PermissionError:
@@ -580,6 +606,9 @@ def list_tables(organization: str, super_name: str, role_name: str) -> List[str]
                 super_name=super_name,
                 organization=organization,
                 role_name=role_name,
+                # A real table name, checked per item — this is a listing, so
+                # no lake-level sentinel applies. (Not `self._meta_scope`:
+                # this is a module-level function, not a method.)
                 table_name=table_name,
             )
             result.append(table_name)

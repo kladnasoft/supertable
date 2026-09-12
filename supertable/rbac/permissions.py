@@ -53,7 +53,7 @@ from typing import Dict, List, Optional, Set
 
 class Permission(Enum):
     RBAC = auto()      # administer roles and users
-    CONTROL = auto()   # drop tables, drop SuperTables
+    CONTROL = auto()   # drop a whole SuperTable (NOT a single table)
     WRITE = auto()     # insert/update/delete rows; create a table by writing
     READ = auto()      # SELECT rows
     META = auto()      # schemas, stats, listings — no row data
