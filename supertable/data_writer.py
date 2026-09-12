@@ -485,7 +485,26 @@ class DataWriter:
             mark("lock")
 
             # --- Read last snapshot (via leaf pointer) ------------------------
-            simple_table = SimpleTable(self.super_table, simple_name)
+            # Open, do not bootstrap.  Creating a table is a decision, not a
+            # fallback: with the default ``create_if_missing=True`` any answer
+            # of "no leaf" — including one invented by a swallowed Redis error
+            # — silently materialised an empty snapshot over a live table and
+            # returned success (AUDIT_BUGS C3).  ``leaf_exists`` now
+            # propagates ``RedisError`` rather than answering ``False``, and
+            # this call refuses to create, so the only way to reach the
+            # bootstrap below is a catalog that positively reported the leaf
+            # absent.
+            try:
+                simple_table = SimpleTable(
+                    self.super_table, simple_name, create_if_missing=False,
+                )
+            except TableNotFoundError:
+                # Explicit table creation: first write to a new name. Logged
+                # because creating a table is a material event, not a detail.
+                logger.info(lp("table does not exist → creating it (first write)"))
+                simple_table = SimpleTable(
+                    self.super_table, simple_name, create_if_missing=True,
+                )
             last_simple_table, last_simple_table_path = simple_table.get_simple_table_snapshot()
             mark("snapshot")
 

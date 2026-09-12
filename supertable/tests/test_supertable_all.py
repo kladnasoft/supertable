@@ -32,6 +32,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from supertable.storage.tests.fake_object_store import FakeObjectStore
+
 
 # ---------------------------------------------------------------------------
 # Fixtures & helpers
@@ -692,23 +694,31 @@ class TestSimpleTableDelete:
     @patch("supertable.simple_table.RedisCatalog")
     @patch("supertable.simple_table.check_write_access")
     def test_delete_calls_storage_and_catalog(self, mock_access, mock_catalog_cls):
+        """Asserts the bucket is empty afterwards, not that delete() was called.
+
+        With a MagicMock storage this passed while the real backend deleted
+        nothing: ``exists(folder)`` is False on any object store (AUDIT_BUGS C2).
+        """
         from supertable.simple_table import SimpleTable
 
         mock_catalog = MagicMock()
         mock_catalog.leaf_exists.return_value = True
         mock_catalog_cls.return_value = mock_catalog
 
+        store = FakeObjectStore().seed(
+            "org/super/tables/del_table/snapshots/v0.json",
+            "org/super/tables/del_table/data/part-0.parquet",
+        )
         mock_super = MagicMock()
         mock_super.organization = "org"
         mock_super.super_name = "super"
-        mock_super.storage = MagicMock()
-        mock_super.storage.exists.return_value = True
+        mock_super.storage = store
 
         st = SimpleTable(mock_super, "del_table")
         st.delete(role_name="test_role")
 
         mock_access.assert_called_once()
-        mock_super.storage.delete.assert_called_once()
+        assert store.keys() == []
         mock_catalog.delete_simple_table.assert_called_once_with("org", "super", "del_table")
 
     @patch("supertable.simple_table.RedisCatalog")
@@ -723,9 +733,7 @@ class TestSimpleTableDelete:
         mock_super = MagicMock()
         mock_super.organization = "org"
         mock_super.super_name = "super"
-        mock_super.storage = MagicMock()
-        mock_super.storage.exists.return_value = True
-        mock_super.storage.delete.side_effect = FileNotFoundError("gone")
+        mock_super.storage = FakeObjectStore()  # nothing under the prefix
 
         st = SimpleTable(mock_super, "del_table")
         # Should not raise
@@ -870,10 +878,17 @@ class TestSuperTableDelete:
     @patch("supertable.super_table.RedisCatalog")
     @patch("supertable.super_table.get_storage")
     def test_delete_removes_storage_and_redis(self, mock_get_storage, mock_catalog_cls, mock_role, mock_user):
+        """Asserts the bucket is empty afterwards, not that delete() was called.
+
+        See AUDIT_BUGS C2 — with a MagicMock this passed while nothing was
+        removed on any object store.
+        """
         from supertable.super_table import SuperTable
 
-        mock_storage = MagicMock()
-        mock_storage.exists.return_value = True
+        mock_storage = FakeObjectStore().seed(
+            "o/s/super/meta.json",
+            "o/s/tables/t/data/part-0.parquet",
+        )
         mock_get_storage.return_value = mock_storage
 
         mock_catalog = MagicMock()
@@ -882,7 +897,7 @@ class TestSuperTableDelete:
 
         st = SuperTable("s", "o")
         st.delete(role_name="admin")
-        mock_storage.delete.assert_called_once()
+        assert mock_storage.keys() == []
         mock_catalog.delete_super_table.assert_called_once_with("o", "s")
 
     @patch("supertable.super_table.UserManager")
@@ -890,11 +905,11 @@ class TestSuperTableDelete:
     @patch("supertable.super_table.RedisCatalog")
     @patch("supertable.super_table.get_storage")
     def test_delete_handles_missing_storage(self, mock_get_storage, mock_catalog_cls, mock_role, mock_user):
+        """A key that vanishes mid-wipe (lost race) is still "gone"."""
         from supertable.super_table import SuperTable
 
-        mock_storage = MagicMock()
-        mock_storage.exists.return_value = True
-        mock_storage.delete.side_effect = FileNotFoundError("gone")
+        mock_storage = FakeObjectStore().seed("o/s/super/meta.json")
+        mock_storage.delete = MagicMock(side_effect=FileNotFoundError("gone"))
         mock_get_storage.return_value = mock_storage
 
         mock_catalog = MagicMock()
@@ -913,8 +928,7 @@ class TestSuperTableDelete:
     def test_delete_when_storage_not_exists(self, mock_get_storage, mock_catalog_cls, mock_role, mock_user):
         from supertable.super_table import SuperTable
 
-        mock_storage = MagicMock()
-        mock_storage.exists.return_value = False
+        mock_storage = FakeObjectStore()  # prefix lists nothing
         mock_get_storage.return_value = mock_storage
 
         mock_catalog = MagicMock()
@@ -923,7 +937,7 @@ class TestSuperTableDelete:
 
         st = SuperTable("s", "o")
         st.delete(role_name="admin")
-        mock_storage.delete.assert_not_called()
+        assert mock_storage.deleted_keys == []
         mock_catalog.delete_super_table.assert_called_once()
 
 

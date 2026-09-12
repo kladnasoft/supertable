@@ -17,11 +17,13 @@ Covers:
      - Path does not exist → FileNotFoundError
      - File exists but size == 0 → ValueError
      - storage.read_json exception propagates
-  4. SuperTable.delete
-     - Happy path: storage exists → delete storage + delete Redis keys
-     - Storage does not exist → still deletes Redis keys
-     - Storage delete raises FileNotFoundError → still deletes Redis keys
-     - Storage delete raises other exception → propagates, Redis NOT deleted
+  4. SuperTable.delete   (run against FakeObjectStore, not MagicMock — see
+                          AUDIT_BUGS C2: MagicMock().exists() is truthy, so
+                          these assertions were vacuous)
+     - Happy path: every object under org/super removed + Redis keys deleted
+     - Prefix already empty → still deletes Redis keys
+     - A key deleted concurrently → still deletes Redis keys
+     - Storage delete fails → propagates, Redis NOT deleted
 """
 
 from __future__ import annotations
@@ -29,6 +31,8 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch, call
 
 import pytest
+
+from supertable.storage.tests.fake_object_store import FakeObjectStore
 
 
 # ---------------------------------------------------------------------------
@@ -296,59 +300,80 @@ class TestReadSimpleTableSnapshot:
 # ===========================================================================
 
 class TestDelete:
+    """Storage here is a FakeObjectStore, not a MagicMock.
+
+    A bucket answers ``exists("org/sup")`` with False no matter how much data
+    is under that prefix, so the old assertions ("delete was called with the
+    folder path") were satisfied by a mock while the real backend deleted
+    nothing — AUDIT_BUGS C2.  These assert on bucket contents instead.
+    """
+
+    def _seeded(self, sup="sup", org="org"):
+        store = FakeObjectStore().seed(
+            f"{org}/{sup}/super/meta.json",
+            f"{org}/{sup}/tables/events/snapshots/v0.json",
+            f"{org}/{sup}/tables/events/data/part-0.parquet",
+        )
+        return _make_super(sup, org, storage=store), store
 
     def test_happy_path_deletes_storage_and_redis(self):
-        st = _make_super("sup", "org")
-        st.storage.exists.return_value = True
+        st, store = self._seeded()
 
         st.delete(role_name="admin")
 
-        st.storage.exists.assert_called_once_with("org/sup")
-        st.storage.delete.assert_called_once_with("org/sup")
+        assert store.keys() == [], "every object under org/sup must be gone"
         st.catalog.delete_super_table.assert_called_once_with("org", "sup")
 
     def test_storage_not_exists_still_deletes_redis(self):
-        st = _make_super("sup", "org")
-        st.storage.exists.return_value = False
+        st = _make_super("sup", "org", storage=FakeObjectStore())
 
         st.delete(role_name="admin")
 
-        st.storage.delete.assert_not_called()
         st.catalog.delete_super_table.assert_called_once_with("org", "sup")
 
     def test_storage_delete_file_not_found_still_deletes_redis(self):
-        st = _make_super("sup", "org")
-        st.storage.exists.return_value = True
-        st.storage.delete.side_effect = FileNotFoundError("gone")
+        """Losing a delete race still satisfies the post-condition."""
+        st, store = self._seeded()
+        real_delete = store.delete
+
+        def racy(path):
+            if path.endswith("meta.json"):
+                raise FileNotFoundError("gone")
+            real_delete(path)
+
+        store.delete = racy
 
         st.delete(role_name="admin")
 
         st.catalog.delete_super_table.assert_called_once_with("org", "sup")
 
     def test_storage_delete_other_exception_propagates(self):
-        st = _make_super("sup", "org")
-        st.storage.exists.return_value = True
-        st.storage.delete.side_effect = PermissionError("forbidden")
+        st, store = self._seeded()
+        store.delete = MagicMock(side_effect=PermissionError("forbidden"))
 
         with pytest.raises(PermissionError, match="forbidden"):
             st.delete(role_name="admin")
 
-        # Redis should NOT be deleted when storage delete fails with non-FileNotFoundError
+        # Redis must NOT be deleted while the data is still there.
         st.catalog.delete_super_table.assert_not_called()
 
     def test_delete_uses_correct_base_dir(self):
         """base_dir = org/super_name (no /super suffix)."""
-        st = _make_super("my_sup", "my_org")
-        st.storage.exists.return_value = True
+        st, store = self._seeded("my_sup", "my_org")
+        store.seed("my_org/my_sup_archive/super/meta.json", "other_org/my_sup/super/meta.json")
 
         st.delete(role_name="admin")
 
-        st.storage.exists.assert_called_once_with("my_org/my_sup")
-        st.storage.delete.assert_called_once_with("my_org/my_sup")
+        assert store.keys() == [
+            "my_org/my_sup_archive/super/meta.json",
+            "other_org/my_sup/super/meta.json",
+        ], "the wipe must be bounded by org/super_name"
 
-    def test_storage_exists_exception_propagates(self):
-        st = _make_super()
-        st.storage.exists.side_effect = ConnectionError("storage down")
+    def test_storage_listing_exception_propagates(self):
+        st, store = self._seeded()
+        store.get_directory_structure = MagicMock(
+            side_effect=ConnectionError("storage down")
+        )
 
         with pytest.raises(ConnectionError, match="storage down"):
             st.delete(role_name="admin")
@@ -356,8 +381,7 @@ class TestDelete:
         st.catalog.delete_super_table.assert_not_called()
 
     def test_redis_delete_exception_propagates(self):
-        st = _make_super()
-        st.storage.exists.return_value = False
+        st = _make_super(storage=FakeObjectStore())
         st.catalog.delete_super_table.side_effect = ConnectionError("redis down")
 
         with pytest.raises(ConnectionError, match="redis down"):
@@ -365,8 +389,7 @@ class TestDelete:
 
     def test_role_name_parameter_accepted(self):
         """delete() accepts role_name param (used by caller for RBAC, not enforced here)."""
-        st = _make_super()
-        st.storage.exists.return_value = False
+        st = _make_super(storage=FakeObjectStore())
 
         # Should not raise
         st.delete(role_name="some_role")

@@ -7,6 +7,7 @@ from typing import Dict, Any
 
 # never remove the homedir, it is mandatory be there
 from supertable.config.homedir import app_home
+from supertable.config.defaults import logger
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager
 from supertable.errors import SuperTableNotFoundError
@@ -125,12 +126,20 @@ class SuperTable:
         base_dir = os.path.join(self.organization, self.super_name)
 
         # Delete storage first; if this fails (other than missing), do not remove Redis meta.
-        try:
-            if self.storage.exists(base_dir):
-                self.storage.delete(base_dir)
-        except FileNotFoundError:
-            # Missing storage is fine; still delete Redis meta
-            pass
+        #
+        # The invariant above is what the old ``if self.storage.exists(base_dir)``
+        # guard defeated: on object storage a prefix is not an object, so
+        # ``exists()`` answers False for a bucket full of data exactly as it
+        # does for a missing one, and the wipe never ran while the Redis meta
+        # was dropped anyway (AUDIT_BUGS C2).  ``delete_tree`` lists the prefix
+        # instead of stat-ing it and deletes every key it finds; any key it
+        # cannot remove raises, so reaching the next line means the data is
+        # gone and the pointer to it may safely go too.
+        removed = self.storage.delete_tree(base_dir)
 
         # Best-effort delete all Redis keys under this supertable prefix
         self.catalog.delete_super_table(self.organization, self.super_name)
+
+        logger.info(
+            f"Deleted SuperTable (storage): {base_dir} ({removed} object(s) removed)"
+        )

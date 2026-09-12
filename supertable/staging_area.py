@@ -275,17 +275,30 @@ class Staging:
         )
 
         def _op():
-            if self.storage.exists(self.stage_dir):
-                self.storage.delete_recursive(self.stage_dir)
+            # Prefix-listed wipe, not an existence-guarded one.  The old shape
+            # was broken twice over: ``exists(stage_dir)`` is False on object
+            # storage however many staged files are under it (AUDIT_BUGS C2),
+            # and ``delete_recursive`` is implemented by no backend at all, so
+            # on LOCAL — the one place the guard was True — it raised
+            # AttributeError (AUDIT_BUGS H7).  ``delete_tree`` covers both.
+            removed = self.storage.delete_tree(self.stage_dir)
 
+            # The flat index lives NEXT TO the stage folder
+            # ({stage}_files.json under the staging root), not inside it, so
+            # the tree wipe above does not reach it.  It is a single exact
+            # key; "already gone" is a legitimate outcome here.
             if self.storage.exists(self.files_index_path):
                 self.storage.delete(self.files_index_path)
 
+            # Storage is provably gone — only now drop the Redis meta.
             self.catalog.delete_staging_meta(
                 self.organization,
                 self.super_name,
                 self.staging_name,  # type: ignore[arg-type]
             )
-            logger.info(f"[staging] deleted {self.staging_name} folder, index, and redis keys")
+            logger.info(
+                f"[staging] deleted {self.staging_name} folder "
+                f"({removed} object(s)), index, and redis keys"
+            )
 
         self._with_lock(_op)

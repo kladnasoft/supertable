@@ -212,24 +212,32 @@ class SimpleTable:
             table_name=self.simple_name,
         )
 
-        # Remove folder (heavy data) from storage
+        # Remove folder (heavy data) from storage.
+        #
+        # Delete by prefix listing, never by existence: on object storage a
+        # folder is not an object, so ``exists(folder)`` is False with the
+        # whole table still under it and an ``if exists(...)`` guard silently
+        # skips the wipe (AUDIT_BUGS C2).  ``delete_tree`` lists the prefix
+        # and removes every key it finds; a return of 0 means the listing came
+        # back empty, which is the only reading of "already gone" that is not
+        # a guess.  Any failure raises and the catalog pointer below is left
+        # in place, because a table whose data still exists must remain
+        # findable.
         simple_table_folder = os.path.join(
             self.super_table.organization, self.super_table.super_name, self.identity, self.simple_name
         )
-        try:
-            if self.storage.exists(simple_table_folder):
-                self.storage.delete(simple_table_folder)
-        except FileNotFoundError:
-            pass
+        removed = self.storage.delete_tree(simple_table_folder)
 
-        # Remove Redis meta (leaf pointer + lock)
+        # Storage is provably gone — only now is it safe to drop the pointer.
         self.catalog.delete_simple_table(
             self.super_table.organization,
             self.super_table.super_name,
             self.simple_name,
         )
 
-        logger.info(f"Deleted Table (storage): {simple_table_folder}")
+        logger.info(
+            f"Deleted Table (storage): {simple_table_folder} ({removed} object(s) removed)"
+        )
 
     def get_simple_table_snapshot(self):
         """

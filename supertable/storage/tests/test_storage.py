@@ -160,7 +160,9 @@ from supertable.storage.storage_interface import StorageInterface
 from supertable.storage.local_storage import LocalStorage
 from supertable.storage.minio_storage import MinioStorage
 from supertable.storage.s3_storage import S3Storage
-from supertable.storage.storage_factory import get_storage, _require
+from supertable.storage.storage_factory import (
+    get_storage, _require, reset_storage_cache,
+)
 from supertable.config.defaults import default
 from supertable.config.settings import settings as _settings
 from supertable.storage import minio_storage as _minio_module
@@ -1921,8 +1923,65 @@ class TestS3Storage(unittest.TestCase):
             paginator.paginate.return_value = [page]
             client.get_paginator.return_value = paginator
             with patch.object(s, "_call") as mock_call:
+                # delete_objects returns a response body that the production
+                # code now reads (see test_delete_prefix_partial_failure_raises);
+                # a bare MagicMock is not a response shape.
+                mock_call.return_value = {}
                 s.delete("prefix")
                 mock_call.assert_called_once()
+
+    def test_delete_prefix_partial_failure_raises(self):
+        """AUDIT_BUGS M5: DeleteObjects reports per-key failures in the body.
+
+        A request that removed one of two keys still returns HTTP 200 and
+        botocore raises nothing, so ignoring ``Errors`` reports a partial wipe
+        as a success — the caller drops its catalog pointer and the survivors
+        are orphaned.
+        """
+        s, client = self._make_storage()
+        with patch.object(s, "_object_exists", return_value=False):
+            paginator = MagicMock()
+            paginator.paginate.return_value = [
+                {"Contents": [{"Key": "prefix/a.txt"}, {"Key": "prefix/b.txt"}]}
+            ]
+            client.get_paginator.return_value = paginator
+            response = {
+                "Errors": [
+                    {"Key": "prefix/b.txt", "Code": "AccessDenied",
+                     "Message": "Access Denied"},
+                ]
+            }
+            with patch.object(s, "_call", return_value=response):
+                with self.assertRaises(OSError) as ctx:
+                    s.delete("prefix")
+            msg = str(ctx.exception)
+            self.assertIn("prefix/b.txt", msg)
+            self.assertIn("AccessDenied", msg)
+            self.assertIn("1 of 2", msg)
+
+    def test_delete_prefix_empty_errors_array_succeeds(self):
+        """An empty ``Errors`` array is a complete delete, not a failure."""
+        s, client = self._make_storage()
+        with patch.object(s, "_object_exists", return_value=False):
+            paginator = MagicMock()
+            paginator.paginate.return_value = [{"Contents": [{"Key": "prefix/a.txt"}]}]
+            client.get_paginator.return_value = paginator
+            resp = {"Deleted": [{"Key": "prefix/a.txt"}], "Errors": []}
+            with patch.object(s, "_call", return_value=resp):
+                s.delete("prefix")  # must not raise
+
+    def test_delete_prefix_failure_in_a_full_batch_raises(self):
+        """The >1000-key batching path reads its response too."""
+        s, client = self._make_storage()
+        with patch.object(s, "_object_exists", return_value=False):
+            contents = [{"Key": f"prefix/file{i}.txt"} for i in range(1500)]
+            paginator = MagicMock()
+            paginator.paginate.return_value = [{"Contents": contents}]
+            client.get_paginator.return_value = paginator
+            response = {"Errors": [{"Key": "prefix/file7.txt", "Code": "InternalError"}]}
+            with patch.object(s, "_call", return_value=response):
+                with self.assertRaises(OSError):
+                    s.delete("prefix")
 
     def test_delete_not_found(self):
         s, client = self._make_storage()
@@ -2137,6 +2196,15 @@ class TestS3Storage(unittest.TestCase):
 
 class TestStorageFactory(unittest.TestCase):
 
+    def setUp(self):
+        # get_storage memoizes per process, so a backend built by one test —
+        # in this class, usually a MagicMock standing in for a cloud SDK —
+        # would otherwise be handed to the next test that resolves the same
+        # configuration.  Clear on both sides so neither the order of these
+        # tests nor a leak into a later module can matter.
+        reset_storage_cache()
+        self.addCleanup(reset_storage_cache)
+
     # ---- _require ----
 
     def test_require_installed_module(self):
@@ -2317,6 +2385,42 @@ class TestStorageFactory(unittest.TestCase):
         finally:
             default.STORAGE_TYPE = original
         self.assertIsInstance(s, LocalStorage)
+
+    # ---- memoization ----
+    #
+    # Building a backend is not free: the MinIO and S3 constructors each end in
+    # a live HeadBucket, and get_storage() is called once per DataReader, once
+    # per SuperTable and once per table inside the estimator loop — N+1 times
+    # per query for a configuration that cannot change mid-process.
+
+    def test_same_config_returns_the_same_backend(self):
+        _patch_settings(self, STORAGE_TYPE="LOCAL")
+        self.assertIs(get_storage(), get_storage())
+
+    def test_changed_config_is_not_served_from_the_cache(self):
+        _patch_settings(self, STORAGE_TYPE="LOCAL", STORAGE_BUCKET="bucket-a")
+        first = get_storage()
+        _patch_settings(self, STORAGE_TYPE="LOCAL", STORAGE_BUCKET="bucket-b")
+        self.assertIsNot(get_storage(), first)
+
+    def test_explicit_kwargs_are_never_cached(self):
+        # kwargs can carry a live client object the caller chose; the result
+        # has to stay exactly the object that call constructed.
+        with patch("supertable.storage.storage_factory._require"):
+            with patch("supertable.storage.storage_factory.importlib") as mock_importlib:
+                mock_mod = MagicMock()
+                mock_importlib.import_module.return_value = mock_mod
+                mock_importlib.util.find_spec.return_value = True
+                mock_mod.S3Storage.side_effect = [MagicMock(), MagicMock()]
+                a = get_storage(kind="S3", bucket_name="custom")
+                b = get_storage(kind="S3", bucket_name="custom")
+        self.assertIsNot(a, b)
+
+    def test_reset_storage_cache_forces_a_rebuild(self):
+        _patch_settings(self, STORAGE_TYPE="LOCAL")
+        first = get_storage()
+        reset_storage_cache()
+        self.assertIsNot(get_storage(), first)
 
 
 def tearDownModule():

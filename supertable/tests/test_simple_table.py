@@ -14,11 +14,14 @@ Covers:
      - makedirs exception swallowed
      - Writes initial snapshot JSON
      - CAS payload → fallback to CAS path
-  5. SimpleTable.delete
+  5. SimpleTable.delete   (run against FakeObjectStore, not MagicMock — see
+                           AUDIT_BUGS C2: MagicMock().exists() is truthy, so
+                           these assertions were vacuous)
      - RBAC check enforced
-     - Storage folder deleted + Redis leaf deleted
-     - Storage missing → still deletes Redis
-     - Storage.delete FileNotFoundError swallowed
+     - Every object under the table prefix deleted + Redis leaf deleted
+     - Storage prefix already empty → still deletes Redis
+     - A key deleted concurrently is tolerated
+     - A failed wipe leaves the Redis leaf in place
   6. SimpleTable.get_simple_table_snapshot
      - Redis leaf has payload with resources → returns directly (no storage read)
      - Redis leaf has payload.snapshot with resources → returns nested snapshot
@@ -41,6 +44,8 @@ from typing import Any, Dict, List
 from unittest.mock import MagicMock, patch, call, PropertyMock
 
 import pytest
+
+from supertable.storage.tests.fake_object_store import FakeObjectStore
 
 
 # ---------------------------------------------------------------------------
@@ -411,11 +416,28 @@ class TestInitSimpleTable:
 # ===========================================================================
 
 class TestSimpleTableDelete:
+    """Storage here is a FakeObjectStore, not a MagicMock.
+
+    ``MagicMock().exists()`` returns a truthy Mock for any argument, so the
+    previous versions of these tests asserted that ``delete()`` was *called* on
+    a folder path and never that anything was actually removed.  On a real
+    bucket ``exists(folder)`` is False and the call never happened — AUDIT_BUGS
+    C2.  The assertions below are on the resulting bucket contents instead.
+    """
+
+    def _seeded(self, simple_name="events", org="org", sup="sup"):
+        store = FakeObjectStore().seed(
+            f"{org}/{sup}/tables/{simple_name}/snapshots/v0.json",
+            f"{org}/{sup}/tables/{simple_name}/data/part-0.parquet",
+            f"{org}/{sup}/tables/{simple_name}/data/year=2026/part-1.parquet",
+        )
+        st = _mock_super(org, sup)
+        st.storage = store
+        return _make_simple(simple_name, org, sup, mock_st=st), store
 
     @patch(_P_CHECK_WRITE)
     def test_rbac_checked(self, mock_check):
-        obj = _make_simple("events", "org", "sup")
-        obj.storage.exists.return_value = False
+        obj, _ = self._seeded()
 
         obj.delete(role_name="admin")
 
@@ -429,40 +451,46 @@ class TestSimpleTableDelete:
     @patch(_P_CHECK_WRITE)
     def test_rbac_denied_propagates(self, mock_check):
         mock_check.side_effect = PermissionError("denied")
-        obj = _make_simple()
+        obj, store = self._seeded()
 
         with pytest.raises(PermissionError, match="denied"):
             obj.delete(role_name="viewer")
 
-        obj.storage.exists.assert_not_called()
+        assert len(store.keys()) == 3, "denied delete must not touch storage"
         obj.catalog.delete_simple_table.assert_not_called()
 
     @patch(_P_CHECK_WRITE)
     def test_happy_path_deletes_storage_and_redis(self, mock_check):
-        obj = _make_simple("events", "org", "sup")
-        obj.storage.exists.return_value = True
+        obj, store = self._seeded()
 
         obj.delete(role_name="admin")
 
-        obj.storage.exists.assert_called_once_with("org/sup/tables/events")
-        obj.storage.delete.assert_called_once_with("org/sup/tables/events")
+        assert store.keys() == [], "every object under the table must be gone"
         obj.catalog.delete_simple_table.assert_called_once_with("org", "sup", "events")
 
     @patch(_P_CHECK_WRITE)
     def test_storage_not_exists_still_deletes_redis(self, mock_check):
-        obj = _make_simple("events", "org", "sup")
-        obj.storage.exists.return_value = False
+        """An empty listing is the one safe reading of "already gone"."""
+        st = _mock_super("org", "sup")
+        st.storage = FakeObjectStore()
+        obj = _make_simple("events", "org", "sup", mock_st=st)
 
         obj.delete(role_name="admin")
 
-        obj.storage.delete.assert_not_called()
         obj.catalog.delete_simple_table.assert_called_once()
 
     @patch(_P_CHECK_WRITE)
     def test_storage_file_not_found_swallowed(self, mock_check):
-        obj = _make_simple("events", "org", "sup")
-        obj.storage.exists.return_value = True
-        obj.storage.delete.side_effect = FileNotFoundError("gone")
+        """Losing a delete race still satisfies the post-condition."""
+        obj, store = self._seeded()
+        real_delete = store.delete
+
+        def racy(path):
+            if path.endswith("part-0.parquet"):
+                raise FileNotFoundError("gone")
+            real_delete(path)
+
+        store.delete = racy
 
         obj.delete(role_name="admin")
 
@@ -470,25 +498,25 @@ class TestSimpleTableDelete:
 
     @patch(_P_CHECK_WRITE)
     def test_storage_other_exception_propagates(self, mock_check):
-        obj = _make_simple("events", "org", "sup")
-        obj.storage.exists.return_value = True
-        obj.storage.delete.side_effect = PermissionError("forbidden")
+        obj, store = self._seeded()
+        store.delete = MagicMock(side_effect=PermissionError("forbidden"))
 
         with pytest.raises(PermissionError, match="forbidden"):
             obj.delete(role_name="admin")
 
-        # Redis should NOT be deleted when storage raises non-FileNotFoundError
+        # Redis must NOT be deleted while the data is still there.
         obj.catalog.delete_simple_table.assert_not_called()
 
     @patch(_P_CHECK_WRITE)
     def test_delete_folder_path_matches_simple_dir(self, mock_check):
         """delete builds its own path from org/sup/identity/simple — matches simple_dir."""
-        obj = _make_simple("my_tbl", "my_org", "my_sup")
-        obj.storage.exists.return_value = True
+        obj, store = self._seeded("my_tbl", "my_org", "my_sup")
+        store.seed("my_org/my_sup/tables/my_tbl_archive/data/keep.parquet")
 
         obj.delete(role_name="admin")
 
-        obj.storage.delete.assert_called_once_with("my_org/my_sup/tables/my_tbl")
+        assert store.keys() == ["my_org/my_sup/tables/my_tbl_archive/data/keep.parquet"], \
+            "the wipe must be bounded by the simple_dir prefix"
 
 
 # ===========================================================================

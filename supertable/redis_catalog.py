@@ -373,12 +373,19 @@ return 1
             raise
 
     def root_exists(self, org: str, sup: str) -> bool:
-        """Check existence of meta:root key."""
+        """Does the ``meta:root`` key exist?  Raises if that cannot be decided.
+
+        The supertable-level twin of :meth:`_leaf_exists_raw`, and wrong for
+        the same reason: ``SuperTable.__init__`` reads ``False`` as "bootstrap
+        it", so a Redis error used to re-run ``init_super_table`` plus the
+        ``RoleManager``/``UserManager`` RBAC scaffolding against a live lake.
+        A check that failed is not a negative result.
+        """
         try:
             return bool(self.r.exists(RK.meta_root(org, sup)))
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] root_exists error: {e}")
-            return False
+            raise
 
     def leaf_exists(self, org: str, sup: str, simple: str) -> bool:
         """Check existence of meta:leaf key for a simple table (replica-aware)."""
@@ -391,11 +398,21 @@ return 1
         return self._leaf_exists_raw(org, sup, simple)
 
     def _leaf_exists_raw(self, org: str, sup: str, simple: str) -> bool:
+        """Does the ``meta:leaf`` key exist?  Raises if that cannot be decided.
+
+        This answers a question whose two outcomes are not symmetric: callers
+        act on ``False`` by *creating* the table, so returning ``False`` for a
+        Redis error converts "I could not check" into "it does not exist" and
+        lets a 0.5 s Sentinel socket timeout bootstrap an empty snapshot over
+        a live table — 6 rows to 1, version 3 to 1, and ``write()`` reporting
+        success (AUDIT_BUGS C3).  The error propagates instead: a caller that
+        cannot reach the catalog must fail, not guess.
+        """
         try:
             return bool(self.r.exists(RK.meta_leaf(org, sup, simple)))
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] leaf_exists error: {e}")
-            return False
+            raise
 
     def get_root(self, org: str, sup: str) -> Optional[Dict]:
         try:

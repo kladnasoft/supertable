@@ -1,6 +1,6 @@
 # route: supertable.storage.storage_interface
 import abc
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 import pyarrow as pa
 
 class StorageInterface(abc.ABC):
@@ -76,6 +76,80 @@ class StorageInterface(abc.ABC):
         Raises FileNotFoundError if the path does not exist.
         """
         pass
+
+    # -------------------------
+    # Recursive deletion (prefix-listed, not existence-guarded)
+    # -------------------------
+    def delete_tree(self, path: str) -> int:
+        """Delete *path* and every object beneath it.
+
+        Object storage has no directories.  A "folder" is just a set of keys
+        sharing a prefix, and ``exists(folder)`` is a HEAD on a key that was
+        never created, so it is ``False`` on S3/MinIO/Azure/GCS however much
+        data sits underneath.  Guarding a wipe with ``if exists(folder)``
+        therefore skips the wipe everywhere except a local filesystem, where
+        the guard happens to be ``os.path.isdir`` — the shape of AUDIT_BUGS
+        C2.  This lists the prefix instead of stat-ing it, and deletes what
+        the listing returns.
+
+        Enumeration goes through :meth:`get_directory_structure` rather than
+        :meth:`list_files` for two reasons: it is the only interface method
+        that is recursive on every backend (``list_files`` returns a single
+        delimited level), and it reports paths *relative* to ``path``, so the
+        keys can be rejoined with the caller's logical path without
+        re-applying ``base_prefix`` — which ``list_files`` returns baked into
+        its result (AUDIT_BUGS M4).  It is also a single listing pass rather
+        than one per directory level.
+
+        Each key is removed with an exact-key :meth:`delete`.  The backends'
+        prefix-recursive ``delete()`` convenience is deliberately not used:
+        the four disagree about an already-empty prefix (S3 returns silently,
+        MinIO/Azure/GCS raise ``FileNotFoundError``), and depending on it
+        would make this method's contract backend-specific.
+
+        Returns:
+            The number of objects removed.  ``0`` means the prefix listed
+            nothing, which is the only condition under which an absent folder
+            may be read as success.  Anything that fails to delete raises, so
+            a caller that reaches the next statement knows the data is gone
+            and may drop its catalog pointer to it.
+        """
+        removed = 0
+        for key in self._iter_tree_keys(path):
+            if self._delete_if_present(key):
+                removed += 1
+
+        # ``path`` itself: an exact object when a key and a prefix collide on
+        # a flat namespace, or — on a local filesystem — the directory tree
+        # that is now empty.  Either way it must go.
+        if self.exists(path) and self._delete_if_present(path) and removed == 0:
+            removed = 1
+
+        return removed
+
+    def _iter_tree_keys(self, path: str) -> Iterator[str]:
+        """Yield every object key beneath *path*, as logical (un-prefixed) paths."""
+        base = path.rstrip("/")
+        stack = [(base, self.get_directory_structure(path))]
+        while stack:
+            parent, node = stack.pop()
+            if not isinstance(node, dict):
+                continue
+            for name, child in node.items():
+                full = f"{parent}/{name}" if parent else name
+                if isinstance(child, dict):
+                    stack.append((full, child))
+                else:
+                    yield full
+
+    def _delete_if_present(self, path: str) -> bool:
+        """``delete(path)``, tolerating only "it was already gone"."""
+        try:
+            self.delete(path)
+            return True
+        except FileNotFoundError:
+            # Lost a race with another deleter; the post-condition still holds.
+            return False
 
     @abc.abstractmethod
     def get_directory_structure(self, path: str) -> dict:

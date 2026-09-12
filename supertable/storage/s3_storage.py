@@ -536,20 +536,44 @@ class S3Storage(StorageInterface):
                 found_any = True
                 batch.append({"Key": obj["Key"]})
                 if len(batch) >= 1000:
-                    self._call("delete_objects",
-                               Bucket=self.bucket_name,
-                               Delete={"Objects": batch, "Quiet": True},
-                               )
+                    self._delete_objects(batch)
                     batch = []
 
         if batch:
-            self._call("delete_objects",
-                       Bucket=self.bucket_name,
-                       Delete={"Objects": batch, "Quiet": True},
-                       )
+            self._delete_objects(batch)
 
         if not found_any:
             raise FileNotFoundError(f"File or folder not found: {path}")
+
+    def _delete_objects(self, batch: List[Dict[str, str]]) -> None:
+        """Issue one ``DeleteObjects`` and fail loudly on a partial delete.
+
+        S3 reports per-key failures in the response body, not as an exception:
+        a request that removed 999 of 1000 keys still returns HTTP 200, and
+        botocore raises nothing.  Ignoring the ``Errors`` array therefore
+        turns a partial wipe into a reported success — the caller drops its
+        catalog pointer and the survivors are orphaned and billed forever
+        (AUDIT_BUGS M5).  ``Quiet=True`` already restricts the response to
+        failures, so a non-empty ``Errors`` is the whole signal.
+        """
+        resp = self._call("delete_objects",
+                          Bucket=self.bucket_name,
+                          Delete={"Objects": batch, "Quiet": True},
+                          )
+        errors = (resp or {}).get("Errors") or []
+        if not errors:
+            return
+        shown = ", ".join(
+            " ".join(
+                str(part) for part in (e.get("Key"), e.get("Code"), e.get("Message")) if part
+            )
+            for e in errors[:5]
+        )
+        more = f" (+{len(errors) - 5} more)" if len(errors) > 5 else ""
+        raise OSError(
+            f"delete_objects removed only {len(batch) - len(errors)} of {len(batch)} "
+            f"key(s) from s3://{self.bucket_name}: {shown}{more}"
+        )
 
     # -------------------------
     # Directory structure
