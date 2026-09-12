@@ -25,6 +25,7 @@ from supertable.engine.engine_common import (
     apply_runtime_pragmas,
     create_rbac_view,
     create_tombstone_view,
+    widen_projection_for_row_filter,
     TombstoneCache,
 )
 
@@ -169,6 +170,7 @@ class DuckDBEngine:
             explain: bool = False,
             explain_options: str = "",
             expose_rowid: bool = False,
+            alias_to_filter_only: Optional[dict] = None,
     ):
         """Build reflection -> tombstone -> RBAC views and rewrite the query.
 
@@ -181,6 +183,10 @@ class DuckDBEngine:
         ``created_views`` and ``acquired_dv_keys`` are appended in place so the
         CALLER owns teardown: a buffered query tears down when it returns, a
         stream only when its reader is closed.
+
+        ``alias_to_filter_only`` names, per alias, the columns that are in the
+        reflection ONLY so the RBAC/share row filter can bind. The RBAC view
+        drops them again, so a widened projection never reaches the caller.
 
         Returns ``(executing_query, tried_presign)``.
         """
@@ -229,13 +235,18 @@ class DuckDBEngine:
 
         # RBAC views (column + row filtering) on top of stripped data.
         rbac_views = getattr(reflection, "rbac_views", None) or {}
+        filter_only = alias_to_filter_only or {}
         if rbac_views:
             for alias in list(query_alias_to_name.keys()):
                 view_def = rbac_views.get(alias)
                 if view_def:
                     source = query_alias_to_name[alias]
                     view = f"rbac_{source}_{query_suffix}"
-                    create_rbac_view(con, source, view, view_def)
+                    create_rbac_view(
+                        con, source, view, view_def,
+                        projected_columns=alias_to_columns.get(alias),
+                        filter_only_columns=filter_only.get(alias),
+                    )
                     created_views.append(view)
                     query_alias_to_name[alias] = view
 
@@ -319,7 +330,9 @@ class DuckDBEngine:
         snapshots_by_key = {
             (sup.super_name, sup.simple_name): sup for sup in reflection.supers
         }
+        rbac_views = getattr(reflection, "rbac_views", None) or {}
         alias_to_table_name, alias_to_files, alias_to_columns = {}, {}, {}
+        alias_to_filter_only: dict = {}
         for td in parser.get_table_tuples():
             sup = snapshots_by_key.get((td.super_name, td.simple_name))
             if not sup:
@@ -330,6 +343,20 @@ class DuckDBEngine:
                 for c in (ROWID_SYSTEM_COL, TIMESTAMP_SYSTEM_COL):
                     if c not in lower:
                         cols.append(c)
+                # The RBAC/share row filter is applied ABOVE this projection,
+                # on a relation that only has what we read here — so a filter
+                # on a column the query never named could not bind and every
+                # projected query under a row-filtered role failed. Read it
+                # too, then let create_rbac_view drop it again.
+                cols, extra = widen_projection_for_row_filter(
+                    cols, rbac_views.get(td.alias), sup.columns, td.alias,
+                )
+                if extra:
+                    alias_to_filter_only[td.alias] = extra
+                    logger.debug(
+                        f"{log_prefix}[rbac] projection widened for "
+                        f"'{td.alias}' with row-filter column(s) {extra}"
+                    )
             alias_to_table_name[td.alias] = hashed_table_name(
                 sup.super_name, sup.simple_name, sup.simple_version, cols,
             )
@@ -348,7 +375,7 @@ class DuckDBEngine:
                 con, reflection, parser, alias_to_table_name, alias_to_files,
                 alias_to_columns, created_views, acquired_dv_keys,
                 timer_capture, log_prefix, explain, explain_options,
-                expose_rowid,
+                expose_rowid, alias_to_filter_only,
             )
             apply_runtime_pragmas(con, engine_config)
 

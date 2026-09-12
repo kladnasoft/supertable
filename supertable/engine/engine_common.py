@@ -6,7 +6,9 @@ import hashlib
 import os
 import threading
 import time
+import weakref
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -189,6 +191,59 @@ def _derive_thread_count(
 # httpfs / S3 configuration
 # =========================================================
 
+# Which settings this DuckDB build accepts.  The answer is a property of the
+# binary plus the httpfs extension, both fixed for the life of the process, but
+# asking costs a 160-row scan measured at 5.1 ms — a third of the whole
+# configuration call.  Keyed by DuckDB version so a rebuilt venv cannot reuse a
+# stale answer; only a successful scan is cached, so the hardcoded fallback
+# below never poisons it.
+_SUPPORTED_SETTINGS_LOCK = threading.Lock()
+_SUPPORTED_SETTINGS: Dict[str, frozenset] = {}
+
+# Per-connection record of the configuration already applied, so a query that
+# names three tables configures once instead of once per alias.  A
+# WeakKeyDictionary rather than a dict keyed by id(): a closed connection drops
+# out on its own, and no entry can outlive the connection it describes and be
+# handed to an unrelated one that reuses its address.
+_HTTPFS_APPLIED_LOCK = threading.Lock()
+_HTTPFS_APPLIED: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _httpfs_fingerprint() -> tuple:
+    """The exact values ``configure_httpfs_and_s3`` would apply, as a key.
+
+    ``for_paths`` is deliberately absent: it only decides *whether* to
+    configure, never *what* is configured, so two aliases of the same query
+    produce byte-identical settings.  Everything below is re-read on each call,
+    which is what makes "re-apply when the environment changes" still true
+    after memoization.
+    """
+    endpoint = detect_endpoint()
+    access_key, secret_key, session_token = detect_creds()
+    return (
+        endpoint, access_key, secret_key, session_token,
+        detect_region(), detect_url_style(), detect_ssl(),
+        settings.SUPERTABLE_DUCKDB_HTTP_TIMEOUT,
+        settings.SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE,
+        settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE,
+        settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR,
+        settings.SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD,
+        get_app_home(),
+    )
+
+
+def reset_httpfs_configuration() -> None:
+    """Forget which connections are configured, and the capability scan.
+
+    For tests that change storage settings and then assert on the SQL a fresh
+    configuration emits.
+    """
+    with _HTTPFS_APPLIED_LOCK:
+        _HTTPFS_APPLIED.clear()
+    with _SUPPORTED_SETTINGS_LOCK:
+        _SUPPORTED_SETTINGS.clear()
+
+
 def configure_httpfs_and_s3(
         con: duckdb.DuckDBPyConnection, for_paths: List[str]
 ) -> None:
@@ -202,6 +257,15 @@ def configure_httpfs_and_s3(
     Load guard: tries LOAD first; only falls back to INSTALL+LOAD when the
     extension is not yet present.  Avoids a network round-trip to the
     extension repository on every call.
+
+    Idempotent, and now cheap about it: a connection that already carries this
+    exact configuration returns immediately.  ``DuckDBEngine`` has a
+    thread-local gate for the same purpose, but the per-alias call sites in the
+    view chain sit outside it and re-ran the whole setup — ~16 ms each — for
+    every table a query names.  Holding the record here covers those, the
+    presign retry, and the write-side pooled probe alike.  The fingerprint is
+    still recomputed from the environment on every call, so a credential change
+    is applied on the next call exactly as before.
     """
     if not for_paths:
         return
@@ -218,6 +282,16 @@ def configure_httpfs_and_s3(
     any_http = any(str(p).lower().startswith(("http://", "https://")) for p in for_paths)
     if not (any_s3 or any_http):
         return
+
+    # Already configured, with exactly these values, on exactly this
+    # connection?  Then every statement below would be a no-op SET of the value
+    # already in place, and the scan that decides which of them are legal is
+    # itself the most expensive part.  Recorded only after the configuration
+    # succeeds, so a failed LOAD is retried rather than remembered.
+    fingerprint = _httpfs_fingerprint()
+    with _HTTPFS_APPLIED_LOCK:
+        if _HTTPFS_APPLIED.get(con) == fingerprint:
+            return
 
     # Load httpfs.  It is baked into the image and seeded into the DuckDB
     # extension dir (see the container entrypoint), so LOAD normally succeeds
@@ -257,21 +331,32 @@ def configure_httpfs_and_s3(
                 f"one-time online install. Underlying DuckDB error: {load_err}"
             ) from load_err
 
-    try:
-        supported = {
-            name for (name,) in con.execute(
-                "SELECT name FROM duckdb_settings()"
-            ).fetchall()
-        }
-    except Exception:
-        supported = {
-            "s3_endpoint", "s3_region", "s3_access_key_id",
-            "s3_secret_access_key", "s3_session_token",
-            "s3_url_style", "s3_use_ssl",
-            "http_timeout", "enable_http_metadata_cache",
-            "enable_external_file_cache", "external_file_cache_max_size",
-            "external_file_cache_directory",
-        }
+    # Scanned once per process (post-LOAD, so the httpfs-registered s3_* names
+    # are present) and reused; see _SUPPORTED_SETTINGS.
+    build_key = duckdb.__version__
+    supported = _SUPPORTED_SETTINGS.get(build_key)
+    if supported is None:
+        try:
+            supported = frozenset(
+                name for (name,) in con.execute(
+                    "SELECT name FROM duckdb_settings()"
+                ).fetchall()
+            )
+            if supported:
+                # An empty answer is not a real DuckDB build's answer; caching
+                # it would silently disable every SET for the rest of the
+                # process, so leave the cache cold and ask again next time.
+                with _SUPPORTED_SETTINGS_LOCK:
+                    _SUPPORTED_SETTINGS[build_key] = supported
+        except Exception:
+            supported = frozenset({
+                "s3_endpoint", "s3_region", "s3_access_key_id",
+                "s3_secret_access_key", "s3_session_token",
+                "s3_url_style", "s3_use_ssl",
+                "http_timeout", "enable_http_metadata_cache",
+                "enable_external_file_cache", "external_file_cache_max_size",
+                "external_file_cache_directory",
+            })
 
     def set_if_supported(param: str, value_sql: str):
         if param in supported:
@@ -343,6 +428,12 @@ def configure_httpfs_and_s3(
         )
     else:
         set_if_supported("enable_external_file_cache", "false")
+
+    # Configuration applied in full — only now is it safe to skip the next
+    # call.  Anything above that raised leaves no record, so the next call
+    # retries rather than assuming a half-configured connection is ready.
+    with _HTTPFS_APPLIED_LOCK:
+        _HTTPFS_APPLIED[con] = fingerprint
 
 
 # =========================================================
@@ -1192,11 +1283,133 @@ def run_engine_diagnostics(cfg=None, engine: str = "lite") -> Dict[str, Any]:
 # RBAC view creation
 # =========================================================
 
+def row_filter_columns(where_clause: str) -> Optional[List[str]]:
+    """Columns a row-filter predicate references, or ``None`` if unparsable.
+
+    The predicate arrives as SQL text — built by ``FilterBuilder`` for a role,
+    or handed over verbatim as a linked share's ``_row_filter`` — so the
+    columns it needs can only be recovered by parsing it.  sqlglot already
+    parses every query on this path; a regex would mis-read quoted
+    identifiers, string literals containing a column name, and function calls.
+
+    A column nested inside a subquery is deliberately skipped: it binds to
+    that subquery's own FROM, not to the relation the filter sits on, so
+    projecting it here would name a column of a different table.
+
+    ``None`` means "the clause did not parse" and the caller must widen to
+    the full projection rather than guess — a narrower projection would
+    fail to bind, which is the bug this exists to prevent.
+    """
+    clause = (where_clause or "").strip()
+    if not clause:
+        return []
+    cached = _row_filter_columns_cached(clause)
+    return None if cached is None else list(cached)
+
+
+@lru_cache(maxsize=512)
+def _row_filter_columns_cached(clause: str) -> Optional[tuple]:
+    """Memoised body of :func:`row_filter_columns`.
+
+    A pure function of the clause text, and the clause is the same string on
+    every query by the same role against the same table — while sqlglot costs
+    ~1.8 ms to parse even this little. Bounded so an unusual share filter
+    cannot grow it without limit.
+    """
+    try:
+        tree = sqlglot.parse_one(clause, read="duckdb")
+    except Exception as e:
+        logger.warning(f"[rbac] row filter did not parse ({e}); "
+                       f"reflection widened to all columns")
+        return None
+    if tree is None:
+        return None
+
+    out: List[str] = []
+    seen: set = set()
+    for col in tree.find_all(exp.Column):
+        name = col.name
+        if not name or name == "*":
+            continue
+        node, nested = col.parent, False
+        while node is not None:
+            if isinstance(node, exp.Select):
+                nested = True
+                break
+            node = node.parent
+        if nested:
+            continue
+        if name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        out.append(name)
+    return tuple(out)
+
+
+def widen_projection_for_row_filter(
+        columns: Optional[List[str]],
+        rbac_view_def,
+        table_columns: Optional[Any] = None,
+        alias: str = "",
+) -> "tuple[Optional[List[str]], List[str]]":
+    """Add a row filter's own columns to a reflection projection.
+
+    Returns ``(projection, filter_only)``.  ``filter_only`` are the columns
+    added purely so ``WHERE`` can bind; they are threaded through the
+    reflection and stripped again by :func:`create_rbac_view`, exactly the way
+    ``create_tombstone_view`` threads ``__rowid__`` through and then strips it.
+
+    Without this the reflection projects only the columns the QUERY named
+    while the RBAC view filters on a column of the ROLE's choosing, so
+    ``SELECT sum(amount) FROM orders`` under a ``region = 'EU'`` role raised
+    ``Binder Error: Referenced column "region" not found in FROM clause``.
+
+    An empty ``columns`` already means "every column" (``SELECT *``), so it is
+    returned untouched — there is nothing to widen and nothing to strip.
+    A filter naming a column the table does not have raises: the role or share
+    is misconfigured and a read must say so, not silently scan wider.
+    """
+    if not columns:
+        return columns, []
+    where_clause = getattr(rbac_view_def, "where_clause", "") if rbac_view_def else ""
+    if not where_clause:
+        return columns, []
+
+    refs = row_filter_columns(where_clause)
+    if refs is None:
+        # Unparsable predicate: fall back to the full projection so the filter
+        # still binds.  RBAC's own column list keeps masking it.
+        return [], []
+
+    known = {str(c).lower() for c in (table_columns or [])}
+    system = {ROWID_COL, TIMESTAMP_COL}
+    have = {c.lower() for c in columns}
+    widened = list(columns)
+    filter_only: List[str] = []
+
+    for ref in refs:
+        low = ref.lower()
+        if low in have or low in system:
+            continue
+        if known and low not in known:
+            raise ValueError(
+                f"Row filter for '{alias or 'table'}' references column "
+                f"'{ref}', which does not exist in the table."
+            )
+        have.add(low)
+        widened.append(ref)
+        filter_only.append(ref)
+
+    return widened, filter_only
+
+
 def create_rbac_view(
         con: duckdb.DuckDBPyConnection,
         base_table_name: str,
         view_name: str,
         rbac_view_def,
+        projected_columns: Optional[List[str]] = None,
+        filter_only_columns: Optional[List[str]] = None,
 ) -> None:
     """
     Create a filtered view on top of a reflection table for RBAC enforcement.
@@ -1210,14 +1423,49 @@ def create_rbac_view(
         base_table_name: the underlying reflection table name
         view_name: the view name to create (query will reference this)
         rbac_view_def: RbacViewDef with allowed_columns and where_clause
+        projected_columns: the columns the reflection underneath actually
+            projects.  Empty/None means the reflection is ``SELECT *`` and
+            every column of the table is reachable — then the role's allowed
+            list is emitted verbatim, as it always was.  When the reflection
+            is narrowed to the query's columns, the allowed list is
+            intersected with it: emitting an allowed column the reflection
+            never read is a bind error, which is why a column-masked role
+            could not run ``SELECT <one of its allowed columns>``.
+        filter_only_columns: columns present in the reflection ONLY so the
+            ``WHERE`` clause can bind.  They are removed from this view's
+            output, so a widened projection never reaches the caller.
     """
+    hidden = {c.lower() for c in (filter_only_columns or [])}
+    reflected = [c for c in (projected_columns or []) if c.lower() not in hidden]
+    # System columns are always appended to a narrowed projection, so they are
+    # not what makes one narrowed — but they stay *available* to the allowed
+    # list, which is how an OData role that grants __rowid__ keeps it.
+    public = [c for c in reflected if c not in (ROWID_COL, TIMESTAMP_COL)]
+
     # Column filter
     if rbac_view_def.allowed_columns == ["*"]:
-        select_cols = "*"
+        if hidden:
+            # Same trick as create_tombstone_view: thread the extra column
+            # through for the WHERE, then drop it by name.  COLUMNS() keeps
+            # the source order, so the output is what it would have been had
+            # the filter column never been added.  lower() rather than a bare
+            # comparison because the projection carries the TABLE's spelling.
+            lits = ", ".join(
+                "'" + c.replace("'", "''") + "'" for c in sorted(hidden)
+            )
+            select_cols = f"COLUMNS(c -> lower(c) NOT IN ({lits}))"
+        else:
+            select_cols = "*"
     else:
-        select_cols = ", ".join(
-            quote_if_needed(c) for c in rbac_view_def.allowed_columns
-        )
+        allowed = list(rbac_view_def.allowed_columns)
+        if public:
+            available = {c.lower() for c in reflected}
+            keep = [c for c in allowed if c.lower() in available]
+            # An empty intersection means the query asked for nothing this
+            # role may see.  Keep the old shape so it fails closed at bind
+            # time rather than emitting an empty projection.
+            allowed = keep or allowed
+        select_cols = ", ".join(quote_if_needed(c) for c in allowed)
 
     # Row filter
     where_sql = ""
