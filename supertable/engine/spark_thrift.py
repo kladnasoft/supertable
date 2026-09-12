@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 
 import polars as pl
 import pyarrow as pa
+import sqlglot
 
 from supertable.config.defaults import logger
 from supertable.config.settings import settings
@@ -152,6 +153,40 @@ def _spark_table_name(super_name: str, simple_name: str, version: int) -> str:
     return f"spark_{digest}_v{version}"
 
 
+
+def _to_spark_predicate(clause: str) -> str:
+    """Re-render a DuckDB-dialect predicate for Spark.
+
+    RBAC and share filters are built once, dialect-neutrally in intent but
+    DuckDB-quoted in fact: FilterBuilder emits `"region" = 'EU'`. DuckDB reads
+    the double quotes as an IDENTIFIER. Spark reads them as a STRING LITERAL,
+    so that predicate becomes the comparison `'region' = 'EU'` — constant
+    false. The filter therefore matched nothing, and its negation matched
+    EVERYTHING: a row filter that removed the restriction instead of applying
+    it. Confirmed against sqlglot's two dialects, which parse the same text as
+    Column and Literal respectively.
+
+    Transpiled rather than string-substituted, so every other dialect
+    difference is handled too and a predicate that is not valid SQL is caught
+    here instead of becoming a silently wrong view. A clause that cannot be
+    parsed RAISES: dropping it would serve the full table, which is the exact
+    failure this exists to prevent.
+    """
+    text = (clause or "").strip()
+    if not text:
+        return ""
+    try:
+        return sqlglot.parse_one(text, read="duckdb").sql(dialect="spark")
+    except sqlglot.errors.ParseError as e:
+        # Narrow on purpose: a NameError or a typo here would otherwise be
+        # reported as "bad filter", which sends the reader hunting the wrong
+        # thing. Only a genuine parse failure is a filter problem.
+        raise ValueError(
+            f"cannot render row filter for Spark, refusing to serve unfiltered "
+            f"rows: {text!r}: {e}"
+        ) from e
+
+
 def _spark_create_parquet_view(cursor, table_name: str, files: List[str]) -> List[str]:
     """Register parquet files as a Spark temp view via Thrift.
 
@@ -240,7 +275,7 @@ def _spark_create_rbac_view(
 
     where_sql = ""
     if rbac_view_def.where_clause:
-        where_sql = f" WHERE {rbac_view_def.where_clause}"
+        where_sql = f" WHERE {_to_spark_predicate(rbac_view_def.where_clause)}"
 
     sql = (
         f"CREATE OR REPLACE TEMPORARY VIEW {view_name} AS "
@@ -274,8 +309,16 @@ def _spark_create_tombstone_view(
     try:
         cursor.execute(f"DESCRIBE {source_table}")
         src_cols = [row[0] for row in cursor.fetchall()]
-    except Exception:
-        src_cols = []
+    except Exception as e:
+        # FAIL, do not guess. Swallowing this set src_cols = [], which then
+        # made has_rowid False and skipped the deletion-vector anti-join
+        # below entirely — deleted rows came back — while also falling back to
+        # src.* and leaking the system columns. Two controls lost to one
+        # swallowed error.
+        raise RuntimeError(
+            f"cannot describe {source_table}, so the deletion vector cannot be "
+            f"applied: {e}"
+        ) from e
 
     user_cols = [c for c in src_cols if c not in _SPARK_SYSTEM_COLS]
     if user_cols:
