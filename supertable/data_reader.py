@@ -228,10 +228,15 @@ class DataReader:
         # Build parser with the correct dialect for the chosen engine. For
         # EXPLAIN, parse only the inner SELECT so estimation/RBAC/reflection
         # behave exactly as for the equivalent plain SELECT.
+        # Reuse the AST admission already built, but ONLY for the dialect it
+        # was parsed with. Admission always parses as duckdb; handing that to a
+        # spark-dialect parser would silently reinterpret the query.
         parser = SQLParser(
             super_name=self.super_name,
             query=command.sql,
             dialect=engine.dialect,
+            parsed=(command.parsed
+                    if getattr(engine, "dialect", None) == "duckdb" else None),
         )
         tables = parser.get_table_tuples()
         physical_tables = parser.get_physical_tables()

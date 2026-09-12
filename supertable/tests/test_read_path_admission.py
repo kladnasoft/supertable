@@ -137,3 +137,60 @@ def test_show_stats_still_classifies():
 def test_empty_query_defers_to_the_parser():
     """Unchanged: the canonical 'non-empty SQL string' error is the parser's."""
     assert classify_query("", SUPER).kind is CommandKind.SELECT
+
+
+# --------------------------------------------------------------------------
+# The guard must not make the reader parse twice
+# --------------------------------------------------------------------------
+
+def test_admission_hands_its_ast_to_the_caller():
+    """Admission parses every query; nobody should parse it again.
+
+    The guard used to discard its AST, so SQLParser re-parsed the same text.
+    On a query with a 1,000-value IN list that second parse cost 103ms —
+    sqlglot rebuilds every literal node — which showed up as a 16.6% read
+    regression on the benchmark's random_1000_by_key scenario.
+    """
+    cmd = classify_query("SELECT a FROM orders WHERE id IN (1, 2, 3)", SUPER)
+    assert cmd.parsed is not None
+    # It is the statement, not a fragment.
+    assert cmd.parsed.sql(dialect="duckdb").lower().startswith("select")
+
+
+def test_explain_also_hands_over_its_inner_ast():
+    cmd = classify_query("EXPLAIN SELECT a FROM orders", SUPER)
+    assert cmd.parsed is not None
+
+
+def test_show_stats_has_no_ast_to_hand_over():
+    """It is matched by regex and never reaches the parser."""
+    assert classify_query("SHOW STATS orders", SUPER).parsed is None
+
+
+def test_sqlparser_accepts_a_handed_over_ast_without_reparsing():
+    import sqlglot
+    from supertable.utils import sql_parser as sp
+
+    sql = "SELECT a FROM orders WHERE id IN (1, 2, 3)"
+    ast = classify_query(sql, SUPER).parsed
+
+    calls = []
+    original = sp.sqlglot.parse_one
+
+    def counted(*a, **k):
+        calls.append(a[0] if a else None)
+        return original(*a, **k)
+
+    sp.sqlglot.parse_one = counted
+    try:
+        handed = sp.SQLParser(super_name=SUPER, query=sql, dialect="duckdb",
+                              parsed=ast)
+        assert not calls, "a handed-over AST must not be re-parsed"
+        fresh = sp.SQLParser(super_name=SUPER, query=sql, dialect="duckdb")
+        assert calls, "without one, it must parse"
+    finally:
+        sp.sqlglot.parse_one = original
+
+    # Same answers either way — the reuse must be invisible.
+    assert ([(t.super_name, t.simple_name) for t in handed.get_physical_tables()]
+            == [(t.super_name, t.simple_name) for t in fresh.get_physical_tables()])

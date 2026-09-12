@@ -30,7 +30,7 @@ from sqlglot.errors import ParseError
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 
 class CommandKind(Enum):
@@ -53,6 +53,13 @@ class SystemCommand:
     """
     kind: CommandKind
     sql: str = ""
+    #: The sqlglot AST of ``sql``, parsed with the duckdb dialect during
+    #: admission. Handed on so ``SQLParser`` does not parse the same text a
+    #: second time — on a query with a 1,000-value IN list that second parse
+    #: cost 103ms. Ownership transfers with it: admission keeps no reference,
+    #: so there is one owner and no shared mutable AST. ``None`` when the
+    #: statement was not parsed (SHOW STATS, or an empty query).
+    parsed: Any = None
     explain: bool = False
     explain_options: str = ""
     super_name: Optional[str] = None
@@ -94,7 +101,7 @@ def _unquote(ident: str) -> str:
 _READ_ROOTS = (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.Subquery)
 
 
-def assert_read_only(sql: str) -> None:
+def assert_read_only(sql: str):
     """Refuse anything that is not a plain read of real tables.
 
     WHY THIS EXISTS
@@ -130,10 +137,13 @@ def assert_read_only(sql: str) -> None:
     test, and it holds for forms nobody has thought of yet.
 
     Raises ValueError, which the reader already turns into Status.ERROR.
+
+    Returns the parsed statement so the caller can reuse it rather than parse
+    the same text again.
     """
     text = (sql or "").strip()
     if not text:
-        return                      # empty defers to SQLParser's own error
+        return None                 # empty defers to SQLParser's own error
 
     try:
         statements = [st for st in sqlglot.parse(text, read="duckdb") if st]
@@ -143,7 +153,7 @@ def assert_read_only(sql: str) -> None:
         raise ValueError(f"could not parse query: {e}") from e
 
     if not statements:
-        return
+        return None
     if len(statements) > 1:
         # One request is one statement. Anything else is a chain, and a chain is
         # how an injected payload arrives.
@@ -169,6 +179,8 @@ def assert_read_only(sql: str) -> None:
                 "only named tables may be queried; table functions such as "
                 f"{name.lower()}() are not permitted on the read path"
             )
+
+    return root
 
 
 def classify_query(query: str, default_super: str) -> SystemCommand:
@@ -215,11 +227,12 @@ def classify_query(query: str, default_super: str) -> SystemCommand:
             raise ValueError("EXPLAIN is only supported for SELECT statements.")
         # EXPLAIN reaches the same engine with the same text, so it is admitted
         # on the same terms — otherwise it is a hole the shape of the guard.
-        assert_read_only(inner)
+        inner_ast = assert_read_only(inner)
         options = "ANALYZE" if m.group("opts") else ""
         return SystemCommand(
             kind=CommandKind.EXPLAIN,
             sql=inner,
+            parsed=inner_ast,
             explain=True,
             explain_options=options,
         )
@@ -227,5 +240,5 @@ def classify_query(query: str, default_super: str) -> SystemCommand:
     # Ordinary query. Admission-checked first: until this guard existed, any
     # text that named one real table ran verbatim, which put DuckDB's file
     # functions inside the read path and outside every access control.
-    assert_read_only(raw)
-    return SystemCommand(kind=CommandKind.SELECT, sql=raw)
+    return SystemCommand(kind=CommandKind.SELECT, sql=raw,
+                         parsed=assert_read_only(raw))

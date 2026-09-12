@@ -208,7 +208,8 @@ class SQLParser:
 
     SUPPORTED_DIALECTS = ("duckdb", "spark")
 
-    def __init__(self, super_name: str, query: str, dialect: str):
+    def __init__(self, super_name: str, query: str, dialect: str,
+                 parsed: Optional[exp.Expression] = None):
         if not super_name or not isinstance(super_name, str):
             raise ValueError("Parameter 'super_name' must be a non-empty string.")
 
@@ -223,8 +224,21 @@ class SQLParser:
         self.default_super_name: str = super_name
         self.original_query: str = query
 
-        # Internal parsed expression
-        self._parsed: exp.Expression = self._parse_query(query, dialect)
+        # Internal parsed expression.
+        #
+        # `parsed` lets a caller hand over a statement it has ALREADY parsed,
+        # so the same text is not parsed twice. Read-path admission
+        # (system_query.assert_read_only) parses every query before it is
+        # allowed to run; re-parsing here cost 103ms on a query with a
+        # 1,000-value IN list, because sqlglot rebuilds every literal node.
+        #
+        # The caller is responsible for only passing an AST parsed with THIS
+        # dialect — duckdb and spark disagree about enough syntax that reusing
+        # across them would silently change what the query means. data_reader
+        # checks that before passing.
+        self._parsed: exp.Expression = (
+            parsed if parsed is not None else self._parse_query(query, dialect)
+        )
 
         # alias -> (supertable, table)
         self._alias_to_table: Dict[str, Tuple[str, str]] = {}
