@@ -70,12 +70,22 @@ def _stats_for(paths: list[str]) -> pl.DataFrame:
 
 
 def _duckdb_result(query: str, table_files: dict[str, list[str]]) -> pd.DataFrame:
-    """Run *query* with each table view backed by exactly *table_files[t]*."""
+    """Run *query* with each table view backed by exactly *table_files[t]*.
+
+    ``union_by_name=TRUE`` mirrors ``create_reflection_view``, which sets it so
+    a lake whose files gained a column after an evolution still binds. Without
+    it the first file's schema wins here but not in production, so a test of
+    heterogeneous files would fail against a harness limitation rather than
+    against the code.
+    """
     con = duckdb.connect()
     try:
         for tbl, files in table_files.items():
             flist = "[" + ", ".join("'" + f + "'" for f in files) + "]"
-            con.execute(f'CREATE VIEW "{tbl}" AS SELECT * FROM read_parquet({flist})')
+            con.execute(
+                f'CREATE VIEW "{tbl}" AS SELECT * FROM '
+                f'read_parquet({flist}, union_by_name=TRUE)'
+            )
         return con.execute(query).fetchdf()
     finally:
         con.close()
@@ -266,11 +276,50 @@ class TestSingleTableDifferential:
         pruned = _assert_differential(q, orders_ds["files"], orders_ds["stats"])
         assert len(pruned["orders"]) == 3
 
-    def test_empty_result_retains_all_files(self, orders_ds):
-        # Would prune everything → guard keeps all files, executor returns empty.
+    def test_empty_result_keeps_only_enough_files_to_bind_the_schema(self, orders_ds):
+        """Pruning everything must not mean scanning everything.
+
+        The list cannot come back empty — ``create_reflection_view`` raises on
+        one — so something has to be handed back. That used to be *every*
+        file, which meant a query proven to return nothing opened the whole
+        table. It is now the smallest subset exposing the same columns; the
+        query keeps its own WHERE, so those files yield no rows anyway.
+
+        All three files here share a schema, so one suffices. The property
+        that must not move is the last assertion: still empty, still correct.
+        """
         q = "SELECT id FROM orders WHERE amount > 9999"
         pruned = _assert_differential(q, orders_ds["files"], orders_ds["stats"])
-        assert len(pruned["orders"]) == 3
+
+        assert pruned["orders"], "never empty — the scan cannot be built from one"
+        assert len(pruned["orders"]) == 1, (
+            f"uniform schema needs one file to bind, got {len(pruned['orders'])}"
+        )
+        assert _duckdb_result(q, pruned).empty
+
+    def test_empty_result_still_binds_a_column_only_some_files_have(
+        self, orders_ds, tmp_path,
+    ):
+        """The reason the subset is schema-aware rather than ``files[:1]``.
+
+        One file carries a column the others lack. Prune everything away: if
+        the retained subset dropped that file, projecting its column would
+        fail to bind and the query would error instead of returning empty.
+        """
+        extra = _write(tmp_path, "o4.parquet",
+                       pl.DataFrame({"id": [901], "amount": [901],
+                                     "region": ["US"], "note": ["late"]}),
+                       row_group_size=50)
+        files = {"orders": orders_ds["f"] + [extra]}
+        stats = _stats_for(files["orders"])
+
+        q = "SELECT id, note FROM orders WHERE amount > 9999"
+        pruned = _assert_differential(q, files, stats)
+
+        assert extra in pruned["orders"], (
+            "the only file with 'note' must be retained, or the projection "
+            "cannot bind"
+        )
         assert _duckdb_result(q, pruned).empty
 
     def test_row_group_level_retained(self, orders_ds):

@@ -2866,12 +2866,96 @@ def prune_files_by_predicates(
         else:
             kept.append(fk)
 
-    # Never empty a table's file list — pruning is an optimisation, and the
-    # estimator treats zero files as an error.  Retain all if we pruned all.
+    # Pruning proved no file can match.  The reflection scan cannot be built
+    # from an empty list (``create_reflection_view`` raises), so SOMETHING has
+    # to be handed back — but handing back everything means a query we have
+    # proven returns nothing opens the whole table.  Measured on the generated
+    # corpus: 33 of 595 time-predicate queries, 792 files, 18.6% of their wall
+    # time, all to produce zero rows.
+    #
+    # Hand back the smallest set that still exposes the same schema instead.
+    # The query keeps its own WHERE clause, so those files yield no rows on
+    # their own; the only thing they are needed for is binding column names.
     if not kept:
-        return file_keys
+        covering = _schema_covering_subset(file_keys, stored_stats_df)
+        p.add("read_pruned_files", len(file_keys) - len(covering))
+        p.add("read_prune_emptied", 1)
+        return covering
     p.add("read_pruned_files", pruned)
     return kept
+
+
+def _schema_covering_subset(
+        file_keys: List[str],
+        stored_stats_df: Optional[polars.DataFrame],
+) -> List[str]:
+    """Smallest subset of *file_keys* exposing every column the full set does.
+
+    Used only when pruning excluded every file. One file is almost always
+    enough — but not always, and that is the whole difficulty. The reflection
+    scan runs with ``union_by_name=TRUE`` precisely because a lake's files can
+    carry different schemas after an evolution, so a query projecting a column
+    that only the newer files have would fail to bind against an arbitrary
+    single file. Covering the union keeps any projection that bound against
+    the unpruned set binding against this one.
+
+    Greedy set cover, which is not guaranteed minimal but is within a log
+    factor and runs on a handful of files in the only case that reaches here.
+    Ties break on the caller's ordering, so the result is deterministic.
+
+    Falls back to the full list whenever the columns cannot be established —
+    a missing stats frame, or files absent from it. Returning too many is
+    slow; returning too few fails the query.
+    """
+    if stored_stats_df is None or stored_stats_df.height == 0:
+        return file_keys
+
+    try:
+        grouped = (
+            stored_stats_df
+            .select(["file_path", "column_name"])
+            .group_by("file_path")
+            .agg(polars.col("column_name").unique())
+        )
+        cols_by_file = {
+            row["file_path"]: set(row["column_name"])
+            for row in grouped.iter_rows(named=True)
+        }
+    except Exception:                                  # pragma: no cover
+        return file_keys
+
+    # Only reason about files we actually have column information for. A file
+    # with none could be hiding any column, so its presence forces the safe
+    # answer rather than a guess.
+    if any(fk not in cols_by_file for fk in file_keys):
+        return file_keys
+
+    universe: Set[str] = set()
+    for fk in file_keys:
+        universe |= cols_by_file[fk]
+    if not universe:
+        return file_keys
+
+    chosen: List[str] = []
+    covered: Set[str] = set()
+    remaining = list(file_keys)
+    while covered != universe and remaining:
+        best = max(remaining, key=lambda fk: len(cols_by_file[fk] - covered))
+        gain = cols_by_file[best] - covered
+        if not gain:
+            break            # no file adds anything; cannot cover the union
+        chosen.append(best)
+        covered |= gain
+        remaining.remove(best)
+
+    if covered != universe or not chosen:
+        return file_keys     # could not prove the schema is preserved
+
+    # Restore the caller's ordering: downstream matches these against the
+    # stats frame and against resolved paths, and a stable order keeps plans
+    # and seals reproducible.
+    order = {fk: i for i, fk in enumerate(file_keys)}
+    return sorted(chosen, key=order.__getitem__)
 
 
 # ===========================================================================
