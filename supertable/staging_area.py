@@ -127,7 +127,15 @@ class Staging:
             super_name=self.super_name,
             organization=self.organization,
             role_name=role_name,
-            table_name=self.super_name,
+            # "*" — a staging area is lake-level, not table-scoped: it is a
+            # landing zone that may feed any number of tables through pipes,
+            # so there is no one table to check against. This passed
+            # ``self.super_name``, which looked up the *SuperTable's* name in
+            # the role's *table* map — a namespace confusion that granted
+            # access to any role holding a table coincidentally named after
+            # the lake, and otherwise fell through to "*" anyway. Requiring
+            # "*" says what was already almost true, and says it on purpose.
+            table_name="*",
         )
         # Ensure base exists (read-only; no lock)
         base_exists = self.storage.exists(self.base_staging_dir)
@@ -228,7 +236,15 @@ class Staging:
             super_name=self.super_name,
             organization=self.organization,
             role_name=role_name,
-            table_name=self.super_name,
+            # "*" — a staging area is lake-level, not table-scoped: it is a
+            # landing zone that may feed any number of tables through pipes,
+            # so there is no one table to check against. This passed
+            # ``self.super_name``, which looked up the *SuperTable's* name in
+            # the role's *table* map — a namespace confusion that granted
+            # access to any role holding a table coincidentally named after
+            # the lake, and otherwise fell through to "*" anyway. Requiring
+            # "*" says what was already almost true, and says it on purpose.
+            table_name="*",
         )
 
         def _op():
@@ -258,7 +274,15 @@ class Staging:
             super_name=self.super_name,
             organization=self.organization,
             role_name=role_name,
-            table_name=self.super_name,
+            # "*" — a staging area is lake-level, not table-scoped: it is a
+            # landing zone that may feed any number of tables through pipes,
+            # so there is no one table to check against. This passed
+            # ``self.super_name``, which looked up the *SuperTable's* name in
+            # the role's *table* map — a namespace confusion that granted
+            # access to any role holding a table coincidentally named after
+            # the lake, and otherwise fell through to "*" anyway. Requiring
+            # "*" says what was already almost true, and says it on purpose.
+            table_name="*",
         )
         if not self.storage.exists(self.files_index_path):
             return []
@@ -271,7 +295,15 @@ class Staging:
             super_name=self.super_name,
             organization=self.organization,
             role_name=role_name,
-            table_name=self.super_name,
+            # "*" — a staging area is lake-level, not table-scoped: it is a
+            # landing zone that may feed any number of tables through pipes,
+            # so there is no one table to check against. This passed
+            # ``self.super_name``, which looked up the *SuperTable's* name in
+            # the role's *table* map — a namespace confusion that granted
+            # access to any role holding a table coincidentally named after
+            # the lake, and otherwise fell through to "*" anyway. Requiring
+            # "*" says what was already almost true, and says it on purpose.
+            table_name="*",
         )
 
         def _op():

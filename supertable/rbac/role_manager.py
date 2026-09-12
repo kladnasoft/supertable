@@ -96,11 +96,55 @@ class RoleManager:
         super_name: str,
         organization: str,
         redis_catalog: Optional[RedisCatalog] = None,
+        actor_role_name: Optional[str] = None,
     ):
+        """
+        ``actor_role_name`` is the role on whose authority this instance
+        administers roles. It is required to *mutate* — ``create_role``,
+        ``update_role`` and ``delete_role`` all demand
+        :attr:`Permission.RBAC`, which only the admin tiers hold — and
+        unnecessary to *read*, so the access-control layer can keep building
+        throwaway instances to resolve a role without supplying one.
+
+        The check is in the mutating methods rather than here on purpose.
+        Two reasons, both structural:
+
+        * ``__init__`` bootstraps. It mints this SuperTable's ``superadmin``
+          role, so a constructor that demanded RBAC could never run the
+          first time — the role that would authorise it is created by the
+          call needing it.
+        * ``check_rbac_access`` resolves the actor by building a
+          ``RoleManager``. If the constructor validated, that inner instance
+          would validate too, and so on without bound.
+        """
         self.super_name = super_name
         self.organization = organization
         self._catalog = redis_catalog or RedisCatalog()
+        self._actor_role_name = actor_role_name
         self._init_role_storage()
+
+    def _require_rbac(self, action: str) -> None:
+        """Demand :attr:`Permission.RBAC` from this instance's actor.
+
+        Fails closed when no actor was supplied. The alternative — treating
+        a missing actor as "unrestricted" — would mean the gate protected
+        only callers who had already opted into being checked.
+        """
+        if not self._actor_role_name:
+            raise PermissionError(
+                f"Cannot {action}: no actor role was supplied. Construct "
+                f"RoleManager(..., actor_role_name=<role>) with a role that "
+                f"holds the RBAC permission."
+            )
+        # Local import: access_control imports this module, so a top-level
+        # import here would be circular.
+        from supertable.rbac.access_control import check_rbac_access
+
+        check_rbac_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=self._actor_role_name,
+        )
 
     # ── bootstrap ───────────────────────────────────────────────────── #
 
@@ -132,7 +176,10 @@ class RoleManager:
                         "role_name": "superadmin",
                         "tables": {"*": {"columns": ["*"], "filters": ["*"]}},
                     }
-                    role_id = self.create_role(sysadmin_data, allow_reserved=True)
+                    # _create_role, not create_role: the bootstrap has no
+                    # actor to be authorised by — it is what creates the
+                    # first role able to authorise anything.
+                    role_id = self._create_role(sysadmin_data, allow_reserved=True)
                     logger.info(f"Default superadmin role created: {role_id}")
             finally:
                 if lock_token:
@@ -168,6 +215,9 @@ class RoleManager:
         ``allow_reserved`` is for the library's own bootstrap only; tenant
         callers must not set it.
 
+        Requires :attr:`Permission.RBAC` from this instance's
+        ``actor_role_name``.
+
         Table definition format::
 
             {
@@ -178,6 +228,16 @@ class RoleManager:
                     "customers": {"columns": ["*"], "filters": ["*"]}
                 }
             }
+        """
+        self._require_rbac("create a role")
+        return self._create_role(data, allow_reserved=allow_reserved)
+
+    def _create_role(self, data: dict, allow_reserved: bool = False) -> str:
+        """Create a role with no authorisation check.
+
+        The body of :meth:`create_role`, split out so the bootstrap can mint
+        the first ``superadmin`` role — which by definition happens before
+        any role exists to authorise it.
         """
         org, sup = self.organization, self.super_name
         role_name = data.get("role_name")
@@ -221,6 +281,12 @@ class RoleManager:
 
         self._catalog.rbac_create_role(org, sup, role_id, role_doc)
         logger.debug(f"Role created: {role_id} ({rcs.role.value})")
+
+        # Creating a role was the only RBAC mutation that emitted nothing,
+        # while update and delete both did — so an audit trail could show a
+        # grant being widened or revoked but not granted in the first place.
+        _audit_rbac(org, sup, Actions.ROLE_CREATE, role_id,
+                    role_name=role_name or "", role_type=rcs.role.value)
         return role_id
 
     def update_role(self, role_id: str, data: dict) -> str:
@@ -230,7 +296,10 @@ class RoleManager:
         Only the fields present in ``data`` are changed.
         ``role_id`` remains stable.  If ``role_name`` is being changed,
         validates format and checks uniqueness.
+
+        Requires :attr:`Permission.RBAC`.
         """
+        self._require_rbac("update a role")
         org, sup = self.organization, self.super_name
         existing = self._catalog.get_role_details(org, sup, role_id)
         if not existing:
@@ -318,7 +387,10 @@ class RoleManager:
         Delete a role and atomically strip it from all users.
 
         The superadmin role cannot be deleted.
+
+        Requires :attr:`Permission.RBAC`.
         """
+        self._require_rbac("delete a role")
         org, sup = self.organization, self.super_name
         existing = self._catalog.get_role_details(org, sup, role_id)
         if existing and existing.get("role") == "superadmin":

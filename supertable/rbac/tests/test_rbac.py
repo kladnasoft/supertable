@@ -762,7 +762,7 @@ class TestRoleManager(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def test_superadmin_created_on_init(self):
         sa_id = self.rm.get_superadmin_role_id()
@@ -855,8 +855,8 @@ class TestUserManager(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
-        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
+        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def test_superuser_created_on_init(self):
         uid = self.um.get_or_create_default_user()
@@ -1068,7 +1068,7 @@ class TestAccessControl(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def _patch_manager(self):
         """Patch RoleManager constructor to return our instance."""
@@ -1211,8 +1211,8 @@ class TestIntegrationEdgeCases(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
-        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
+        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def test_role_update_visible_to_existing_users(self):
         """Update a role's columns — user's resolved permissions change instantly."""
@@ -1307,8 +1307,8 @@ class TestBulkOperations(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
-        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
+        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def test_create_50_roles(self):
         ids = []
@@ -1384,8 +1384,8 @@ class TestCascadeAndDependency(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
-        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
+        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def test_delete_role_removes_from_type_index(self):
         rid = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
@@ -1469,8 +1469,8 @@ class TestUsernameEdgeCases(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
-        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
+        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def test_username_with_spaces_rejected(self):
         """Spaces in usernames are now rejected.
@@ -1527,8 +1527,8 @@ class TestBackwardCompatAliases(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
-        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
+        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def test_get_superadmin_role_hash_alias(self):
         sa_id = self.rm.get_superadmin_role_hash()
@@ -1611,8 +1611,8 @@ class TestVersionTracking(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
-        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
+        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def _get_role_meta_version(self):
         from supertable import redis_keys as RK
@@ -1682,10 +1682,10 @@ class TestCrossOrgIsolation(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm_a = RoleManager(super_name="sup_a", organization="org_a", redis_catalog=self.cat)
-        self.rm_b = RoleManager(super_name="sup_b", organization="org_b", redis_catalog=self.cat)
-        self.um_a = UserManager(super_name="sup_a", organization="org_a", redis_catalog=self.cat)
-        self.um_b = UserManager(super_name="sup_b", organization="org_b", redis_catalog=self.cat)
+        self.rm_a = RoleManager(super_name="sup_a", organization="org_a", redis_catalog=self.cat, actor_role_name="superadmin")
+        self.rm_b = RoleManager(super_name="sup_b", organization="org_b", redis_catalog=self.cat, actor_role_name="superadmin")
+        self.um_a = UserManager(super_name="sup_a", organization="org_a", redis_catalog=self.cat, actor_role_name="superadmin")
+        self.um_b = UserManager(super_name="sup_b", organization="org_b", redis_catalog=self.cat, actor_role_name="superadmin")
 
     def test_roles_isolated_between_orgs(self):
         r_a = self.rm_a.create_role({"role": "reader", "tables": {"org_a_table": {}}})
@@ -1723,8 +1723,8 @@ class TestRedisCatalogReadMethods(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
-        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
+        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def test_get_roles_returns_list_with_deserialized_fields(self):
         self.rm.create_role({"role": "reader", "tables": {"t1": {"columns": ["a"]}, "t2": {"columns": ["a"]}}})
@@ -1758,7 +1758,7 @@ class TestAccessControlAdvanced(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def _patch_manager(self):
         return patch("supertable.rbac.access_control.RoleManager", return_value=self.rm)
@@ -1837,8 +1837,8 @@ class TestGetOrCreateDefaultUser(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
-        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
+        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def test_returns_existing_superuser(self):
         uid = self.um.get_or_create_default_user()
@@ -1860,7 +1860,7 @@ class TestRoleTypeUpdate(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def test_update_role_tables(self):
         rid = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})
@@ -1939,8 +1939,8 @@ class TestModifyUserCombined(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
-        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
+        self.um = UserManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def test_modify_username_and_roles_together(self):
         r1 = self.rm.create_role({"role": "reader", "tables": {"t1": {}}})

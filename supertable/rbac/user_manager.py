@@ -23,11 +23,47 @@ class UserManager:
         super_name: str,
         organization: str,
         redis_catalog: Optional[RedisCatalog] = None,
+        actor_role_name: Optional[str] = None,
     ):
+        """
+        ``actor_role_name`` is the role on whose authority this instance
+        administers users. Required to *mutate* — creating, modifying or
+        deleting a user, and granting or revoking a role, all demand
+        :attr:`Permission.RBAC` — and unnecessary to *read*.
+
+        Checked in the mutating methods rather than here because
+        ``__init__`` bootstraps: it creates the default ``superuser`` and
+        binds the ``superadmin`` role to it, which must work before any
+        actor exists. See :meth:`RoleManager.__init__` for the full
+        reasoning, including the recursion it avoids.
+        """
         self.super_name = super_name
         self.organization = organization
         self._catalog = redis_catalog or RedisCatalog()
+        self._actor_role_name = actor_role_name
         self._init_user_storage()
+
+    def _require_rbac(self, action: str) -> None:
+        """Demand :attr:`Permission.RBAC` from this instance's actor.
+
+        Fails closed when no actor was supplied: granting a role is how a
+        principal gains every other permission, so an unauthenticated path
+        to it would make the rest of the model advisory.
+        """
+        if not self._actor_role_name:
+            raise PermissionError(
+                f"Cannot {action}: no actor role was supplied. Construct "
+                f"UserManager(..., actor_role_name=<role>) with a role that "
+                f"holds the RBAC permission."
+            )
+        # Local import: access_control -> role_manager -> ... would cycle.
+        from supertable.rbac.access_control import check_rbac_access
+
+        check_rbac_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=self._actor_role_name,
+        )
 
     # ── bootstrap ───────────────────────────────────────────────────── #
 
@@ -63,7 +99,9 @@ class UserManager:
                 logger.info(f"Added superadmin role to existing superuser: {existing_id}")
         else:
             try:
-                user_id = self.create_user({
+                # _create_user: the bootstrap has no actor. It creates the
+                # account that the superadmin role is bound to.
+                user_id = self._create_user({
                     "username": "superuser",
                     "roles": [superadmin_role_id],
                 })
@@ -79,6 +117,17 @@ class UserManager:
 
         If a user with the same username already exists, returns the
         existing ``user_id`` (idempotent).
+
+        Requires :attr:`Permission.RBAC`.
+        """
+        self._require_rbac("create a user")
+        return self._create_user(data)
+
+    def _create_user(self, data: dict) -> str:
+        """Create a user with no authorisation check.
+
+        The body of :meth:`create_user`, split out so the bootstrap can
+        create the default ``superuser`` before any actor exists.
         """
         if "username" not in data:
             raise ValueError("username is required")
@@ -131,7 +180,12 @@ class UserManager:
         return self.get_user(user_id)
 
     def modify_user(self, user_id: str, data: dict) -> None:
-        """Modify an existing user.  Supported fields: ``username``, ``display_name``, ``roles``."""
+        """Modify an existing user.  Supported fields: ``username``, ``display_name``, ``roles``.
+
+        Requires :attr:`Permission.RBAC` — ``roles`` is assignable here, so
+        this is a privilege-granting path as much as ``add_role`` is.
+        """
+        self._require_rbac("modify a user")
         org, sup = self.organization, self.super_name
         existing = self._catalog.get_user_details(org, sup, user_id)
         if existing is None:
@@ -166,7 +220,11 @@ class UserManager:
             self._catalog.rbac_update_user(org, sup, user_id, update_fields)
 
     def delete_user(self, user_id: str) -> None:
-        """Delete a user. The default superuser cannot be deleted."""
+        """Delete a user. The default superuser cannot be deleted.
+
+        Requires :attr:`Permission.RBAC`.
+        """
+        self._require_rbac("delete a user")
         org, sup = self.organization, self.super_name
         user = self._catalog.get_user_details(org, sup, user_id)
         if user is None:
@@ -183,20 +241,41 @@ class UserManager:
     # ── role assignment helpers ─────────────────────────────────────── #
 
     def add_role(self, user_id: str, role_id: str) -> bool:
-        """Add a role to a user (atomic, idempotent)."""
+        """Add a role to a user (atomic, idempotent).
+
+        Requires :attr:`Permission.RBAC`. This is the single most powerful
+        call in the subsystem: binding a role is how a principal acquires
+        every permission that role holds, and the superadmin role's id is
+        discoverable through the public ``get_superadmin_role_id()``. Ungated,
+        ``add_role(me, get_superadmin_role_id())`` was a two-line takeover.
+        """
+        self._require_rbac("grant a role to a user")
         org, sup = self.organization, self.super_name
         if not self._catalog.rbac_role_exists(org, sup, role_id):
             raise ValueError(f"Role {role_id} does not exist")
         return self._catalog.rbac_add_role_to_user(org, sup, user_id, role_id)
 
     def remove_role(self, user_id: str, role_id: str) -> bool:
-        """Remove a role from a user (atomic)."""
+        """Remove a role from a user (atomic).
+
+        Requires :attr:`Permission.RBAC`. Revocation is gated as well as
+        granting: stripping an administrator's role is a denial-of-service
+        on the lake's administration, and in the limit locks everyone out.
+        """
+        self._require_rbac("revoke a role from a user")
         return self._catalog.rbac_remove_role_from_user(
             self.organization, self.super_name, user_id, role_id
         )
 
     def get_or_create_default_user(self) -> Optional[str]:
-        """Return the default superuser's user_id, creating it if needed."""
+        """Return the default superuser's user_id, creating it if needed.
+
+        Deliberately ungated. It repairs the bootstrap account and nothing
+        else: the username is fixed, the role is whatever bootstrap already
+        minted, and no part of either comes from the caller. Gating it would
+        also make it unusable in the one situation it exists for — a lake
+        whose superuser is missing, where no actor can be resolved.
+        """
         org, sup = self.organization, self.super_name
         user_id = self._catalog.rbac_get_user_id_by_username(org, sup, "superuser")
         if not user_id:
@@ -211,7 +290,11 @@ class UserManager:
         return self.get_user_by_name(user_name)
 
     def remove_role_from_users(self, role_id: str) -> None:
-        """Deprecated: ``RoleManager.delete_role`` handles this atomically."""
+        """Deprecated: ``RoleManager.delete_role`` handles this atomically.
+
+        Requires :attr:`Permission.RBAC`.
+        """
+        self._require_rbac("revoke a role from every user")
         org, sup = self.organization, self.super_name
         for uid in self._catalog.rbac_list_user_ids(org, sup):
             self._catalog.rbac_remove_role_from_user(org, sup, uid, role_id)

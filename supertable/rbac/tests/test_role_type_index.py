@@ -42,7 +42,7 @@ def cat():
 
 @pytest.fixture()
 def rm(cat):
-    return RoleManager(super_name=SUP, organization=ORG, redis_catalog=cat)
+    return RoleManager(super_name=SUP, organization=ORG, redis_catalog=cat, actor_role_name="superadmin")
 
 
 def _index_membership(cat, role_id):

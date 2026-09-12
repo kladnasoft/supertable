@@ -90,13 +90,34 @@ class SuperPipe:
 
         return self._with_lock(_op)
 
+    def _pipe_table(self, pipe_name: str) -> str:
+        """The table a pipe feeds, for scoping its access check.
+
+        ``create`` checks against ``simple_name`` — the table the pipe writes
+        into — but the other three methods checked against ``self.super_name``,
+        looking up the *SuperTable's* name in the role's *table* map. That
+        granted pipe control to any role holding a table coincidentally named
+        after the lake, and meant a role granted one table could disable or
+        delete pipes feeding tables it had no grant on. A pipe's definition
+        records its target, so the correct scope was always available.
+
+        A pipe that does not exist falls back to ``"*"``, so only a lake-wide
+        grant learns that it is missing; a narrower role is refused instead of
+        being told. The caller gets ``FileNotFoundError`` from the operation
+        itself once it is past the gate.
+        """
+        meta = self.catalog.get_pipe_meta(
+            self.organization, self.super_name, self.staging_name, pipe_name,
+        )
+        return (meta or {}).get("simple_name") or "*"
+
     def set_enabled(self, pipe_name: str, enabled: bool, role_name: str) -> None:
         """Updates the enabled status of a pipe in Redis."""
         check_write_access(
             super_name=self.super_name,
             organization=self.organization,
             role_name=role_name,
-            table_name=self.super_name,
+            table_name=self._pipe_table(pipe_name),
         )
 
         def _op():
@@ -123,7 +144,7 @@ class SuperPipe:
             super_name=self.super_name,
             organization=self.organization,
             role_name=role_name,
-            table_name=self.super_name,
+            table_name=self._pipe_table(pipe_name),
         )
 
         def _op():
@@ -141,7 +162,7 @@ class SuperPipe:
             super_name=self.super_name,
             organization=self.organization,
             role_name=role_name,
-            table_name=self.super_name,
+            table_name=self._pipe_table(pipe_name),
         )
         meta = self.catalog.get_pipe_meta(self.organization, self.super_name, self.staging_name, pipe_name)
         if not meta:

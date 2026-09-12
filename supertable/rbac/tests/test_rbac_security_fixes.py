@@ -45,7 +45,7 @@ class TestC4EmptyGrantSetIsNoGrant(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def _patch_manager(self):
         return patch("supertable.rbac.access_control.RoleManager", return_value=self.rm)
@@ -156,7 +156,7 @@ class TestS9RestrictReadAccessDenies(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def _patch_manager(self):
         return patch("supertable.rbac.access_control.RoleManager", return_value=self.rm)
@@ -217,7 +217,7 @@ class TestS11ReservedNamesAndCollisions(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def test_cannot_mint_a_role_named_superadmin(self):
         for name in ("superadmin", "SuperAdmin", "SUPERADMIN", " superadmin "):
@@ -317,7 +317,7 @@ class TestS7MixedWildcardColumns(unittest.TestCase):
 
     def setUp(self):
         self.cat = fresh_catalog()
-        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat)
+        self.rm = RoleManager(super_name=SUP, organization=ORG, redis_catalog=self.cat, actor_role_name="superadmin")
 
     def _patch_manager(self):
         return patch("supertable.rbac.access_control.RoleManager", return_value=self.rm)

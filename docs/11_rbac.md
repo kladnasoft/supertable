@@ -124,7 +124,6 @@ Demotion is blocked for a less obvious reason: `delete_role` refuses by
 reading the document's type, so changing the type first made "cannot be
 deleted" bypassable in two calls -- leaving a lake with no superadmin and no
 way to mint a replacement.
-```
 
 ---
 
@@ -139,8 +138,44 @@ It is scoped to a `(super_name, organization)` pair and backed by a
 ### 11.3.1  Initialisation
 
 ```python
-RoleManager(super_name: str, organization: str, redis_catalog: Optional[RedisCatalog] = None)
+RoleManager(
+    super_name: str,
+    organization: str,
+    redis_catalog: Optional[RedisCatalog] = None,
+    actor_role_name: Optional[str] = None,
+)
 ```
+
+`actor_role_name` is the role on whose authority this instance administers
+roles. It is **required to mutate** and unnecessary to read:
+
+| Operation | Needs an actor? |
+|-----------|-----------------|
+| `create_role`, `update_role`, `delete_role` | yes — `Permission.RBAC` |
+| `get_role`, `get_role_by_name`, `list_roles`, `get_roles_by_type`, `get_superadmin_role_id` | no |
+
+Omitting it fails **closed**: mutations raise `PermissionError`. Treating a
+missing actor as unrestricted would mean the gate only protected callers who
+had already opted into being checked.
+
+The check lives in the mutating methods rather than the constructor, for two
+structural reasons:
+
+* **`__init__` bootstraps.** It mints this SuperTable's `superadmin` role, so
+  a constructor demanding RBAC could never run the first time — the role that
+  would authorise it is created by the call that needs it.
+* **`check_rbac_access` builds a `RoleManager`** to resolve the actor. A
+  validating constructor would validate its own helper, without bound.
+
+This is why the access-control layer can keep constructing throwaway
+instances to resolve a role without supplying an actor.
+
+> **Trust boundary.** The actor is a role-name string supplied by the caller.
+> This library has no sessions and no identity of its own, so the gate is
+> exactly as strong as the host's binding of authenticated principal to role
+> name — the same trust model as every other gate here. It does not replace
+> the host authenticating; it is what makes that authentication mean
+> something inside SuperTable.
 
 On construction, `_init_role_storage()` runs a fast-path check: if the Redis
 meta key `supertable:{org}:lakes:{sup}:rbac:roles:meta` already exists and a
@@ -210,10 +245,46 @@ Deletes a role and atomically strips it from all users who hold it.
 
 ### 11.4.1  Initialisation
 
+```python
+UserManager(
+    super_name: str,
+    organization: str,
+    redis_catalog: Optional[RedisCatalog] = None,
+    actor_role_name: Optional[str] = None,
+)
+```
+
 On construction, `_init_user_storage()` ensures the default **superuser**
 account exists and holds the superadmin role.  If the superuser account exists
 but lacks the superadmin role (e.g. after a role reset), the role is
 automatically re-attached.
+
+`actor_role_name` follows the same rule as `RoleManager` (§11.3.1): required
+to mutate, unnecessary to read, fails closed when absent.
+
+| Operation | Needs an actor? |
+|-----------|-----------------|
+| `create_user`, `modify_user`, `delete_user` | yes — `Permission.RBAC` |
+| `add_role`, `remove_role`, `remove_role_from_users` | yes — `Permission.RBAC` |
+| `get_user`, `get_user_by_name`, `list_users` | no |
+| `get_or_create_default_user` | no — bootstrap repair only (see below) |
+
+`add_role` is the most powerful call in the subsystem: binding a role is how
+a principal acquires every permission that role holds, and the superadmin
+role's id is discoverable through the public `get_superadmin_role_id()`.
+Ungated, `add_role(me, get_superadmin_role_id())` was a two-line takeover.
+`modify_user` accepts a `roles` list, so it is a granting path too — gating
+one without the other would have left the door open.
+
+Revocation is gated as well as granting: stripping an administrator's role is
+a denial of service on the lake's administration, and in the limit locks
+everyone out.
+
+`get_or_create_default_user` is deliberately ungated. It repairs the
+bootstrap account and nothing else — the username is fixed, the role is
+whatever bootstrap already minted, and no part of either comes from the
+caller. Gating it would also make it unusable in the one situation it exists
+for: a lake whose superuser is missing, where no actor can be resolved.
 
 ### 11.4.2  `create_user(data: dict) -> str`
 
@@ -380,17 +451,64 @@ query engine.
 
 ### 11.8.1  Operation-Scoped Checks
 
-| Function | Permission Required | Description |
-|----------|-------------------|-------------|
-| `check_control_access(super_name, org, role_name, table_name)` | `CONTROL` | DDL operations (DROP, TRUNCATE). |
-| `check_write_access(super_name, org, role_name, table_name)` | `WRITE` | INSERT / UPDATE / DELETE. |
-| `check_meta_access(super_name, org, role_name, table_name)` | `META` | ALTER / metadata changes. |
+| Function | Permission Required | Table-scoped? | Description |
+|----------|-------------------|:---:|-------------|
+| `check_rbac_access(super_name, org, role_name)` | `RBAC` | no | Administer roles and users. |
+| `check_control_access(super_name, org, role_name, table_name)` | `CONTROL` | yes | Drop a SuperTable (scoped `"*"`). |
+| `check_write_access(super_name, org, role_name, table_name)` | `WRITE` | yes | INSERT / UPDATE / DELETE, create and drop a table. |
+| `check_meta_access(super_name, org, role_name, table_name)` | `META` | yes | Metadata and statistics reads. |
 
 Each function:
 1. Calls `_check_readonly_guard()` to block mutations on read-only
    SuperTables (snapshot clones, replicas, locked instances).
-2. Calls `_check_operation_access()` which resolves the role, validates the
-   `RoleType`, checks the permission matrix, and verifies table coverage.
+2. Resolves the role, validates the `RoleType`, and checks the permission
+   matrix — `_check_scope_access()`.
+3. For the table-scoped checks only, verifies table coverage —
+   `_check_operation_access()` adds this on top of step 2.
+
+`check_rbac_access` stops at step 2. A role grants access *to tables*, so
+"which table is this role change about" has no answer; inventing one would
+mean checking the actor's grants against a table that does not exist.
+
+### 11.8.1.1  What table scoping means
+
+`_resolve_table_entry` is `role_tables.get(table_name) or role_tables.get("*")`
+— a plain dict lookup with a wildcard **fallback**, not a glob. So:
+
+* a role with `tables={"*": ...}` passes for any table name, including one
+  that does not exist yet (which is how a writer creates tables);
+* a role with `tables={"orders": ...}` passes only for `orders`;
+* passing `"*"` as the `table_name` requires the role to hold the wildcard
+  entry — which is why `SuperTable.delete` uses it. Destroying every table at
+  once must not be reachable by a role granted one of them.
+
+Passing a **SuperTable** name where a table name is expected is a namespace
+confusion, not a lake-wide check: it grants access to any role holding a
+table coincidentally named after the lake, and otherwise falls through to
+`"*"` anyway. Staging areas (lake-level, scoped `"*"`) and pipes (scoped to
+the table the pipe feeds, read from its definition) used to do this.
+
+### 11.8.1.2  Denial semantics
+
+A denial is an exception, not an empty result — with one deliberate
+exception, list filtering:
+
+| Shape | Behaviour on denial |
+|-------|---------------------|
+| Named single object (`get_table_schema`, `get_table_stats`, `get_super_meta`, `collect_simple_table_schema`) | raises `PermissionError` |
+| Listing (`get_tables`, `list_supers`, `list_tables`) | omits the item, returns the rest |
+
+Filtering a listing is correct: "which tables can I see" has a right answer
+even when it is a subset, and the caller asked for a list rather than for one
+named thing. Returning `None`/`[]` from the *single-object* calls was not —
+a caller could not tell a denial from an absence, so an API layer mapping
+exceptions to 403 answered `200` with an empty body and the client read
+"forbidden" as "does not exist".
+
+The listing filters catch `PermissionError` **only**. Catching every
+exception made a Redis failure mid-check drop the item exactly as a narrow
+grant would, so an outage was indistinguishable from a permission boundary
+and the caller got a short list with no indication anything had failed.
 
 ### 11.8.2  Read Access with Filtering
 
@@ -436,6 +554,10 @@ executors to create a filtered view on top of each reflection table.  The
 * `"read-only clone"` -- has `cloned_from` attribute
 * `"locked"` -- generic read-only lock
 
+It is called by `check_rbac_access`, `check_control_access`,
+`check_write_access` and `check_meta_access`, but **not** by
+`restrict_read_access` — reads are exactly what a read-only replica is for.
+
 ### 11.8.5  Role Resolution
 
 `_resolve_role()` fetches a role by name and checks two conditions:
@@ -455,14 +577,22 @@ operations from Python code:
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager
 
-rm = RoleManager(super_name=super_name, organization=organization)
+# Mutating requires an actor holding Permission.RBAC. The bootstrap role is
+# named "superadmin"; a host should pass whatever role it has bound to the
+# authenticated principal, never a value the client chose.
+rm = RoleManager(super_name=super_name, organization=organization,
+                 actor_role_name="superadmin")
 rm.create_role({"role": "reader", "tables": {"facts": {"columns": ["*"], "filters": []}}})
-rm.list_roles()
-rm.get_role(role_id)
 rm.update_role(role_id, {...})
 rm.delete_role(role_id)
 
-um = UserManager(super_name=super_name, organization=organization)
+# Reads need no actor.
+rm_ro = RoleManager(super_name=super_name, organization=organization)
+rm_ro.list_roles()
+rm_ro.get_role(role_id)
+
+um = UserManager(super_name=super_name, organization=organization,
+                 actor_role_name="superadmin")
 um.create_user({"username": "alice", "roles": [role_id]})
 um.list_users()
 um.get_user(user_id)
@@ -472,7 +602,9 @@ um.delete_user(user_id)
 um.get_or_create_default_user()
 ```
 
-Valid role types: `superadmin`, `admin`, `writer`, `reader`, `meta`.
+Valid role types: `superadmin`, `admin`, `writer`, `reader`, `meta`. The
+`superadmin` *type* is reserved — see §11.2. Only `superadmin` and `admin`
+can administer roles and users at all.
 
 Role IDs and user IDs are 32-character hex strings matching `^[a-f0-9]{32}$`.
 

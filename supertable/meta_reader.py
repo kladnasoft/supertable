@@ -172,6 +172,18 @@ class MetaReader:
             return []
 
     def get_tables(self, role_name: str) -> List[str]:
+        """Tables in this SuperTable that *role_name* may see.
+
+        A per-item denial filters that table out rather than failing the call:
+        "which tables can I see" has a correct answer even when it is a subset,
+        and the caller asked for a list, not for one named table.
+
+        Only ``PermissionError`` filters. This previously caught every
+        exception, so a Redis failure mid-check dropped the table from the
+        result as if the role were not allowed to see it — an infrastructure
+        outage was indistinguishable from a narrow grant, and the caller got
+        a short list with no indication anything had gone wrong.
+        """
         tables = self._get_all_tables()
         result = []
         for table in tables:
@@ -179,25 +191,26 @@ class MetaReader:
                 check_meta_access(super_name=self.super_table.super_name, organization=self.super_table.organization,
                               role_name=role_name, table_name=table)
                 result.append(table)
-            except Exception as e:
+            except PermissionError:
                 logger.warning(f"No permission for the user: {role_name} to table: {table}")
 
         return result
 
     def get_table_schema(self, table_name: str, role_name: str) -> Optional[List[Dict[str, Any]]]:
-            try:
-                check_meta_access(
-                    super_name=self.super_table.super_name,
-                    organization=self.super_table.organization,
-                    role_name=role_name,
-                    table_name=table_name,
-                )
-            except PermissionError as e:
-                logger.warning(
-                    "[get_table_schema] Access denied for user '%s' on table '%s': %s",
-                    role_name, table_name, str(e)
-                )
-                return None
+            """Schema of one named table.
+
+            Raises ``PermissionError`` when the role lacks META on it. This
+            used to log and return ``None``, which a caller could not tell
+            apart from "the table has no schema" — so an API layer mapping
+            exceptions to 403 returned 200 with an empty body instead, and
+            the client read a denial as an absence.
+            """
+            check_meta_access(
+                super_name=self.super_table.super_name,
+                organization=self.super_table.organization,
+                role_name=role_name,
+                table_name=table_name,
+            )
 
             schema_items: Set[Tuple[str, Any]] = set()
 
@@ -255,19 +268,18 @@ class MetaReader:
             return [distinct_schema]
 
     def collect_simple_table_schema(self, schemas: set, table_name: str, role_name: str) -> None:
-        try:
-            check_meta_access(
-                super_name=self.super_table.super_name,
-                organization=self.super_table.organization,
-                role_name=role_name,
-                table_name=table_name,
-            )
-        except PermissionError as e:
-            logger.warning(
-                "[collect_simple_table_schema] Access denied for user '%s' on table '%s': %s",
-                role_name, table_name, str(e)
-            )
-            return
+        """Add one table's schema tuple to *schemas*.
+
+        Raises ``PermissionError`` when the role lacks META on the table. It
+        used to return silently, leaving the caller's set short with no way
+        to know a table had been skipped for access rather than for absence.
+        """
+        check_meta_access(
+            super_name=self.super_table.super_name,
+            organization=self.super_table.organization,
+            role_name=role_name,
+            table_name=table_name,
+        )
 
         try:
             simple_table = SimpleTable(
@@ -283,19 +295,19 @@ class MetaReader:
         schemas.add(schema_tuple)
 
     def get_table_stats(self, table_name: str, role_name: str) -> List[Dict[str, Any]]:
-        try:
-            check_meta_access(
-                super_name=self.super_table.super_name,
-                organization=self.super_table.organization,
-                role_name=role_name,
-                table_name=table_name,
-            )
-        except PermissionError as e:
-            logger.warning(
-                "[get_table_stats] Access denied for user '%s' on table '%s': %s",
-                role_name, table_name, str(e)
-            )
-            return []
+        """Snapshot statistics for one named table.
+
+        Raises ``PermissionError`` when the role lacks META on it. Returning
+        ``[]`` made a denial look identical to an empty table, which for a
+        stats endpoint is the difference between "you may not ask" and "the
+        answer is nothing".
+        """
+        check_meta_access(
+            super_name=self.super_table.super_name,
+            organization=self.super_table.organization,
+            role_name=role_name,
+            table_name=table_name,
+        )
 
         keys_to_remove = {"previous_snapshot", "schema", "location"}
         stats: List[Dict[str, Any]] = []
@@ -332,20 +344,18 @@ class MetaReader:
         debug_timings = settings.SUPERTABLE_DEBUG_TIMINGS
         t0 = time.perf_counter()
 
-        try:
-            # Checking meta access for the super table itself
-            check_meta_access(
-                super_name=self.super_table.super_name,
-                organization=self.super_table.organization,
-                role_name=role_name,
-                table_name=self.super_table.super_name,
-            )
-        except PermissionError as e:
-            logger.warning(
-                "[get_super_meta] Access denied for user '%s' on super '%s': %s",
-                role_name, self.super_table.super_name, str(e)
-            )
-            return None
+        # Checking meta access for the super table itself.
+        #
+        # Raises ``PermissionError`` on denial. It used to return ``None``,
+        # which callers reasonably read as "no such SuperTable" — so a role
+        # without META on a lake was told the lake did not exist, and any
+        # caller that treated None as 404 reported the wrong thing.
+        check_meta_access(
+            super_name=self.super_table.super_name,
+            organization=self.super_table.organization,
+            role_name=role_name,
+            table_name=self.super_table.super_name,
+        )
 
         t_access = time.perf_counter()
 

@@ -44,7 +44,7 @@ def rm():
     )
     catalog = RedisCatalog()
     manager = RoleManager(super_name=SUP, organization=ORG,
-                          redis_catalog=catalog)
+                          redis_catalog=catalog, actor_role_name="superadmin")
     return manager
 
 

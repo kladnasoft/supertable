@@ -11,7 +11,7 @@ from supertable.rbac.user_manager import UserManager
 from supertable.demo.quickstart.defaults import super_name, organization
 
 
-role_manager = RoleManager(super_name=super_name, organization=organization)
+role_manager = RoleManager(super_name=super_name, organization=organization, actor_role_name="superadmin")
 
 # Discover already-created roles so we can attach them to users.
 admin_role_id = writer_role_id = reader_role_id = meta_role_id = superadmin_role_id = None
@@ -30,7 +30,7 @@ for role in role_manager.list_roles():
     logger.info(f"role: {role['role']} id={role['role_id']}")
 
 
-user_manager = UserManager(super_name=super_name, organization=organization)
+user_manager = UserManager(super_name=super_name, organization=organization, actor_role_name="superadmin")
 
 # Alice: admin + writer
 alice_id = user_manager.create_user({

@@ -575,6 +575,27 @@ class TestGetTables:
         assert reader.get_tables("viewer") == ["public"]
 
     @patch(_P_CHECK_META)
+    def test_an_infrastructure_error_is_not_silently_a_denial(self, mock_check):
+        """Only PermissionError filters a table out.
+
+        This caught every exception, so a Redis failure mid-check dropped
+        the table from the result exactly as a narrow grant would. The caller
+        got a short list and no indication anything had failed — an outage
+        was indistinguishable from a permission boundary. Infrastructure
+        errors now propagate.
+        """
+        reader = _make_reader()
+        _wire_catalog_scan(
+            reader.catalog,
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t2",
+        )
+        mock_check.side_effect = ConnectionError("redis down")
+
+        with pytest.raises(ConnectionError, match="redis down"):
+            reader.get_tables("admin")
+
+    @patch(_P_CHECK_META)
     def test_all_denied_returns_empty(self, mock_check):
         reader = _make_reader()
         _wire_catalog_scan(
@@ -601,11 +622,18 @@ class TestGetTables:
 class TestGetTableSchema:
 
     @patch(_P_CHECK_META)
-    def test_rbac_denied_returns_none(self, mock_check):
+    def test_rbac_denied_raises(self, mock_check):
+        """A denial must not read as "this table has no schema".
+
+        This returned None, which a caller cannot distinguish from an absent
+        schema — so an API layer that maps exceptions to 403 answered 200 with
+        an empty body, and the client read a denial as an absence.
+        """
         reader = _make_reader()
         mock_check.side_effect = PermissionError("denied")
 
-        assert reader.get_table_schema("events", "viewer") is None
+        with pytest.raises(PermissionError, match="denied"):
+            reader.get_table_schema("events", "viewer")
 
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_META)
@@ -732,12 +760,19 @@ class TestGetTableSchema:
 class TestCollectSimpleTableSchema:
 
     @patch(_P_CHECK_META)
-    def test_rbac_denied_returns_without_modifying_set(self, mock_check):
+    def test_rbac_denied_raises_and_leaves_the_set_alone(self, mock_check):
+        """Returning silently left the caller's set short with no signal.
+
+        A skipped table looked identical to a table with nothing to add.
+        """
         mock_check.side_effect = PermissionError("denied")
         reader = _make_reader()
         schemas = set()
-        reader.collect_simple_table_schema(schemas, "secret", "viewer")
-        assert schemas == set()
+
+        with pytest.raises(PermissionError, match="denied"):
+            reader.collect_simple_table_schema(schemas, "secret", "viewer")
+
+        assert schemas == set(), "nothing may be added on a denial"
 
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_META)
@@ -787,10 +822,17 @@ class TestCollectSimpleTableSchema:
 class TestGetTableStats:
 
     @patch(_P_CHECK_META)
-    def test_rbac_denied_returns_empty(self, mock_check):
+    def test_rbac_denied_raises(self, mock_check):
+        """``[]`` made a denial identical to an empty table.
+
+        For a stats endpoint that is the difference between "you may not
+        ask" and "the answer is nothing".
+        """
         mock_check.side_effect = PermissionError("denied")
         reader = _make_reader()
-        assert reader.get_table_stats("secret", "viewer") == []
+
+        with pytest.raises(PermissionError, match="denied"):
+            reader.get_table_stats("secret", "viewer")
 
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_META)
@@ -884,10 +926,17 @@ class TestGetSuperMeta:
             mod._SUPER_META_CACHE.clear()
 
     @patch(_P_CHECK_META)
-    def test_rbac_denied_returns_none(self, mock_check):
+    def test_rbac_denied_raises(self, mock_check):
+        """None told the caller the SuperTable did not exist.
+
+        Any caller treating None as 404 reported "no such lake" to a role
+        that simply lacked META on it.
+        """
         mock_check.side_effect = PermissionError("no")
         reader = _make_reader()
-        assert reader.get_super_meta("viewer") is None
+
+        with pytest.raises(PermissionError, match="no"):
+            reader.get_super_meta("viewer")
 
     @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
     @patch(_P_SIMPLE_TABLE)
