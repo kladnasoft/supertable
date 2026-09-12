@@ -53,10 +53,12 @@ os.environ.setdefault("SUPERTABLE_SUPERUSER_TOKEN", "test_token")
 
 from supertable.processing import (  # noqa: E402
     _align_to_schema,
+    _has_dtype_conflict,
     _union_schema,
     _union_schema_many,
     concat_with_union,
     concat_many_with_union,
+    concat_fold_equivalent,
 )
 
 
@@ -473,3 +475,146 @@ class TestProductionErrorRegression:
             pl.col("event_name") == "page_view"
         )["param_chosen_payment_method"].null_count()
         assert b_rows_with_null_pcm == 2
+
+
+# ===========================================================================
+# 8. concat_fold_equivalent — the merge used by compact_resources
+# ===========================================================================
+#
+# ``compact_resources`` used to fold ``concat_with_union`` over the candidate
+# files, re-projecting and re-copying the whole accumulator on every file.  It
+# now buffers the survivors and merges them once via
+# ``concat_fold_equivalent``.  The output must be IDENTICAL to the fold — not
+# merely equivalent — because compaction rewrites the data files.
+#
+# ``concat_many_with_union`` is NOT a drop-in replacement for the fold, which
+# is why it stayed unused: ``_resolve_unified_dtype`` is not associative, and
+# the fold's intermediate casts are value-visible.  These tests pin both the
+# divergence (so nobody "simplifies" the helper away) and the equivalence.
+
+def _fold(frames: List[pl.DataFrame]) -> pl.DataFrame:
+    """The pre-change accumulator loop, verbatim."""
+    acc = None
+    for f in frames:
+        if acc is None or acc.height == 0:
+            acc = f if acc is None else concat_with_union(acc, f)
+        else:
+            acc = concat_with_union(acc, f)
+    return acc
+
+
+def _identical(a: pl.DataFrame, b: pl.DataFrame) -> bool:
+    return a.columns == b.columns and a.dtypes == b.dtypes and a.equals(b)
+
+
+class TestConcatManyIsNotFoldEquivalent:
+    """Why ``concat_many_with_union`` cannot simply replace the fold."""
+
+    def test_intermediate_casts_are_value_visible(self):
+        # One column carried as Int64 / Float64 / Utf8 across three files.
+        # Fold: Int64 -> Float64 -> Utf8 == '1.0'.  N-way: Int64 -> Utf8 == '1'.
+        frames = [
+            pl.DataFrame({"x": pl.Series([1], dtype=pl.Int64)}),
+            pl.DataFrame({"x": pl.Series([2.5], dtype=pl.Float64)}),
+            pl.DataFrame({"x": pl.Series(["s"], dtype=pl.Utf8)}),
+        ]
+        assert _fold(frames)["x"].to_list() == ["1.0", "2.5", "s"]
+        assert concat_many_with_union(frames)["x"].to_list() == ["1", "2.5", "s"]
+
+    def test_dtype_resolution_is_not_associative(self):
+        # {Null, Boolean} -> Utf8, then {Utf8, Int64} -> Utf8;
+        # but {Null, Boolean, Int64} resolved in one shot -> Int64.
+        frames = [
+            pl.DataFrame({"x": pl.Series([None, None], dtype=pl.Null)}),
+            pl.DataFrame({"x": pl.Series([True, False], dtype=pl.Boolean)}),
+            pl.DataFrame({"x": pl.Series([1, 2], dtype=pl.Int64)}),
+        ]
+        assert _fold(frames).schema["x"] == pl.Utf8
+        assert concat_many_with_union(frames).schema["x"] == pl.Int64
+
+    def test_n_way_can_raise_where_the_fold_succeeds(self):
+        # {Boolean, Binary} folds to Utf8 and then absorbs Int64; the N-way
+        # union resolves {Boolean, Binary, Int64} to Int64, and BinaryView
+        # cannot be cast to Int64.
+        frames = [
+            pl.DataFrame({"x": pl.Series([True, False], dtype=pl.Boolean)}),
+            pl.DataFrame({"x": pl.Series([b"a", b"b"], dtype=pl.Binary)}),
+            pl.DataFrame({"x": pl.Series([1, 2], dtype=pl.Int64)}),
+        ]
+        assert _fold(frames).schema["x"] == pl.Utf8
+        with pytest.raises(Exception):
+            concat_many_with_union(frames)
+
+
+class TestConcatFoldEquivalent:
+    """``concat_fold_equivalent`` must reproduce the fold exactly."""
+
+    @pytest.mark.parametrize("frames", [
+        # uniform schema (the fast path)
+        [_df(a=[1, 2], b=["x", "y"]), _df(a=[3], b=["z"])],
+        # different column subsets, one dtype per column (single-pass path)
+        [_df(a=[1], b=["x"]), _df(b=["y"], c=[2.0]), _df(a=[3], c=[4.0], d=[True])],
+        # same columns, different ORDER
+        [_df(a=[1], b=["x"]), pl.DataFrame({"b": ["y"], "a": [2]})],
+        # dtype conflicts (the fallback path)
+        [pl.DataFrame({"x": pl.Series([1], dtype=pl.Int64)}),
+         pl.DataFrame({"x": pl.Series([2.5], dtype=pl.Float64)}),
+         pl.DataFrame({"x": pl.Series(["s"], dtype=pl.Utf8)})],
+        [pl.DataFrame({"x": pl.Series([None], dtype=pl.Null)}),
+         pl.DataFrame({"x": pl.Series([True], dtype=pl.Boolean)}),
+         pl.DataFrame({"x": pl.Series([1], dtype=pl.Int64)})],
+        # empty frames interleaved
+        [_df(a=[1]), pl.DataFrame(schema={"a": pl.Int64, "b": pl.Utf8}), _df(a=[2], b=["x"])],
+        # single frame
+        [_df(a=[1], b=["x"])],
+    ])
+    def test_matches_the_pairwise_fold(self, frames):
+        assert _identical(_fold(frames), concat_fold_equivalent(frames))
+
+    def test_all_empty_stays_empty(self):
+        frames = [pl.DataFrame(schema={"a": pl.Int64}), pl.DataFrame(schema={"b": pl.Utf8})]
+        assert concat_fold_equivalent(frames).height == 0
+
+    def test_no_frames(self):
+        assert concat_fold_equivalent([]).height == 0
+
+    def test_row_order_is_input_order(self):
+        frames = [_df(a=[1, 2]), _df(a=[3]), _df(a=[4, 5])]
+        assert concat_fold_equivalent(frames)["a"].to_list() == [1, 2, 3, 4, 5]
+
+    def test_randomised_differential_against_the_fold(self):
+        """Random column subsets / orders / dtypes — always identical."""
+        pool = {
+            "i32": pl.Series([1, 2], dtype=pl.Int32),
+            "i64": pl.Series([3, 4], dtype=pl.Int64),
+            "f64": pl.Series([5.5, 6.5], dtype=pl.Float64),
+            "str": pl.Series(["a", "b"], dtype=pl.Utf8),
+            "bool": pl.Series([True, False], dtype=pl.Boolean),
+        }
+        rng = random.Random(20260912)
+        for _ in range(300):
+            frames = []
+            for _f in range(rng.randint(2, 5)):
+                cols = rng.sample(["x", "y", "z"], rng.randint(1, 3))
+                frames.append(pl.DataFrame(
+                    {c: pool[rng.choice(list(pool))] for c in cols}))
+            try:
+                expected = _fold(frames)
+            except Exception:
+                continue  # the fold itself cannot merge these — not our contract
+            assert _identical(expected, concat_fold_equivalent(frames))
+
+
+class TestDtypeConflictDetection:
+    def test_no_conflict(self):
+        assert not _has_dtype_conflict([_df(a=[1], b=["x"]), _df(b=["y"], c=[2.0])])
+
+    def test_conflict(self):
+        assert _has_dtype_conflict([
+            pl.DataFrame({"a": pl.Series([1], dtype=pl.Int64)}),
+            pl.DataFrame({"a": pl.Series([1.0], dtype=pl.Float64)}),
+        ])
+
+    def test_column_order_difference_is_not_a_conflict(self):
+        assert not _has_dtype_conflict(
+            [_df(a=[1], b=["x"]), pl.DataFrame({"b": ["y"], "a": [2]})])

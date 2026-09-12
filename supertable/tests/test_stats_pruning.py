@@ -626,3 +626,286 @@ class TestBareStringTimestampPredicates:
     def test_bounded_range_prunes_both_ends(self):
         got = self._run(PredInterval("string", "2025-05-01", True, "2025-07-01", True))
         assert got == ["f1.parquet"], f"expected only the June file, got {got}"
+
+
+# ===========================================================================
+# The pruner must decide the way the ENGINE decides
+# ---------------------------------------------------------------------------
+# Two lanes compared values differently from the engine that would execute the
+# query. Both dropped files holding matching rows, and both returned Status.OK
+# with a short answer and no warning.
+# ===========================================================================
+
+
+def _lane_stats(lane: str, rows):
+    """A stats frame with one file per (min, max) pair, populated in *lane*."""
+    import polars as pl
+    from supertable.processing import STATS_SCHEMA
+
+    physical = {"bigint": "INT64", "double": "DOUBLE", "string": "BYTE_ARRAY"}[lane]
+    base = {k: None for k in STATS_SCHEMA}
+    out = []
+    for i, (lo, hi) in enumerate(rows):
+        r = dict(base)
+        r.update(file_path=f"f{i}.parquet", row_group_id=0, column_name="c",
+                 physical_type=physical, logical_type="", null_count=0,
+                 row_group_rows=10, stats_available=True,
+                 min_is_exact=True, max_is_exact=True)
+        r[f"min_{lane}"] = lo
+        r[f"max_{lane}"] = hi
+        out.append(r)
+    return pl.DataFrame(out, schema=STATS_SCHEMA)
+
+
+# A last file whose range spans everything the tests ask about, so it is always
+# retained. Without it a test that prunes its only file hits the "never empty
+# the list" guard in prune_files_by_predicates, which puts every file back --
+# and the test then passes no matter how unsound the comparison was. That guard
+# is precisely why the 4,388-query corpus reported zero mismatches.
+_ANCHOR = {"string": ("!", "~"), "bigint": (-(2 ** 63), 2 ** 63 - 1),
+           "double": (-1e300, 1e300)}
+
+
+def _prune(lane, rows, pred):
+    """Files kept, EXCLUDING the anchor -- which must always survive."""
+    from supertable.processing import prune_files_by_predicates
+
+    rows = list(rows) + [_ANCHOR[lane]]
+    anchor = f"f{len(rows) - 1}.parquet"
+    keys = [f"f{i}.parquet" for i in range(len(rows))]
+    kept = prune_files_by_predicates(keys, _lane_stats(lane, rows), [{"c": pred}])
+    assert anchor in kept, (
+        "the anchor file was pruned, so this assertion is measuring the "
+        "empty-result guard rather than the comparison")
+    return [k for k in kept if k != anchor]
+
+
+class TestNocaseStringPruning:
+    """`WHERE name = 'BANANA'` must not drop the file holding 'banana'.
+
+    Every read runs with ``PRAGMA default_collation='nocase'``, so the engine
+    matches strings case-insensitively. The pruner compared the same strings
+    byte-wise against the parquet footer min/max, where `'BANANA' < 'apple'` --
+    so an all-lowercase file was proved "cannot match" and dropped. The 4,388
+    query corpus could not see it because every string value in the dataset was
+    lowercase and every literal matched that case.
+    """
+
+    # One file per case style, the shape a column ingested from two source
+    # systems has. Byte-wise these three ranges live in different parts of the
+    # ASCII map; to the engine they are the same five values.
+    FILES = [("acme", "zenith"), ("ACME", "ZENITH"), ("Acme", "Zenith")]
+    ALL = ["f0.parquet", "f1.parquet", "f2.parquet"]
+
+    @pytest.mark.parametrize("literal", ["BOREALIS", "borealis", "Borealis",
+                                         "bOREALIS", "CYGNUS", "cygnus"])
+    def test_equality_keeps_every_file_whatever_the_case(self, literal):
+        """All three files hold a value the engine matches, in some case."""
+        got = _prune("string", self.FILES,
+                     PredInterval("string", literal, True, literal, True))
+        assert got == self.ALL, (
+            f"{literal!r} dropped {set(self.ALL) - set(got)}, which hold the "
+            f"same value in a different case")
+
+    @pytest.mark.parametrize("lo,hi", [("BOREALIS", "DELTA"),
+                                       ("borealis", "delta"),
+                                       ("Borealis", "Delta")])
+    def test_range_keeps_every_file_whatever_the_case(self, lo, hi):
+        got = _prune("string", self.FILES, PredInterval("string", lo, True, hi, True))
+        assert got == self.ALL, f"[{lo}, {hi}] dropped {set(self.ALL) - set(got)}"
+
+    def test_lower_bound_keeps_files_whose_bytes_sort_below_it(self):
+        """`>= 'B'` matches 'borealis' and 'zenith' -- in every file."""
+        got = _prune("string", self.FILES, PredInterval("string", "B", True, None, True))
+        assert got == self.ALL
+
+    def test_a_file_mixing_cases_is_never_excluded_by_its_own_bounds(self):
+        """Byte min 'ZZZ' with byte max 'apple' folds to an INVERTED interval.
+
+        Folding the two endpoints and comparing them would exclude every
+        predicate; the envelope has to widen instead.
+        """
+        got = _prune("string", [("ZZZ", "apple")],
+                     PredInterval("string", "zzz", True, "zzz", True))
+        assert got == ["f0.parquet"]
+
+    def test_soundness_over_every_case_combination(self):
+        """The property, stated directly: a file that CAN match is retained.
+
+        Ground truth is the engine's own rule -- lowercase both sides, compare.
+        """
+        from supertable.tests.pruning.dataset import VENDORS, cased
+
+        for file_index in range(3):
+            values = cased(VENDORS, file_index)
+            rows = [(min(values), max(values))]
+            for base in VENDORS:
+                for lit in (base, base.upper(), base.capitalize()):
+                    for pred, matches in (
+                        (PredInterval("string", lit, True, lit, True),
+                         lambda v, L=lit: v.lower() == L.lower()),
+                        (PredInterval("string", lit, True, None, True),
+                         lambda v, L=lit: v.lower() >= L.lower()),
+                        (PredInterval("string", None, True, lit, True),
+                         lambda v, L=lit: v.lower() <= L.lower()),
+                        (PredInterval("string", lit, False, None, True),
+                         lambda v, L=lit: v.lower() > L.lower()),
+                    ):
+                        kept = _prune("string", rows, pred)
+                        if any(matches(v) for v in values):
+                            assert kept == ["f0.parquet"], (
+                                f"dropped {rows[0]} though it holds a value "
+                                f"matching {pred}")
+
+    def test_envelope_brackets_every_value_it_claims_to(self):
+        """Exhaustive over the ASCII boundary folding gets wrong.
+
+        The alphabet straddles it: ``'Z'`` (90) folds to ``'z'`` (122), jumping
+        over ``'['`` (91) and ``'_'`` (95), so byte order and folded order
+        disagree in both directions. ``'İ'`` is in it because it is the one
+        character that folds to something SMALLER and LONGER than itself —
+        a value that can sit between two ASCII bounds and fold outside them.
+        For every range of these words, every word inside it must fold within
+        the bounds the pruner claims; a predicate landing outside them drops a
+        file holding a match.
+        """
+        import itertools
+        from supertable.processing import (_fold_lower_envelope,
+                                           _fold_upper_envelope)
+
+        words = sorted("".join(p) for n in (1, 2)
+                       for p in itertools.product("ABZ[_abzİ", repeat=n))
+        ascii_words = [w for w in words if w.isascii()]
+        for s_min in ascii_words:
+            for s_max in ascii_words:
+                if s_min > s_max:
+                    continue
+                text, open_ended = _fold_upper_envelope(s_min, s_max)
+                floor = _fold_lower_envelope(s_min, s_max)
+                for v in words:
+                    if not (s_min <= v <= s_max):
+                        continue
+                    folded = v.lower()
+                    assert folded >= floor, (
+                        f"{v!r} folds to {folded!r}, below the envelope floor "
+                        f"{floor!r} of [{s_min!r}, {s_max!r}]")
+                    within = (folded < text or folded.startswith(text)
+                              if open_ended else folded <= text)
+                    assert within, (
+                        f"{v!r} folds to {folded!r}, above the envelope "
+                        f"{text!r}{'+' if open_ended else ''} of "
+                        f"[{s_min!r}, {s_max!r}]")
+
+    def test_uppercase_keys_still_prune(self):
+        """The floor must be folded, not the raw stored minimum.
+
+        `s_min` on its own is a sound floor, but for an UPPERCASE column it
+        sits 32 code points below every folded literal, so no file is ever
+        excluded from below. Over 100 files of disjoint uppercase keys that
+        took the prune rate from 99.0% to 49.5% — correct, and useless.
+        """
+        rows = [(f"{c}0AAA", f"{c}0ZZZ") for c in "ABCDEFGH"]
+        for i, c in enumerate("ABCDEFGH"):
+            for literal in (f"{c}0MMM", f"{c}0mmm"):
+                got = _prune("string", rows,
+                             PredInterval("string", literal, True, literal, True))
+                assert got == [f"f{i}.parquet"], (
+                    f"{literal!r} should reach exactly one file, got {got}")
+
+    def test_pruning_still_happens(self):
+        """Correctness by never pruning is not a fix."""
+        rows = [("acme", "delta"), ("ACME", "DELTA"), ("wagon", "zulu")]
+        # Above everything the first two files can fold to.
+        assert _prune("string", rows,
+                      PredInterval("string", "zzzz", True, "zzzz", True)) == ["f2.parquet"]
+        # Below the third file's minimum, whatever case it is written in.
+        assert _prune("string", rows,
+                      PredInterval("string", "ACME", True, "ACME", True)) == [
+            "f0.parquet", "f1.parquet"]
+        assert _prune("string", rows,
+                      PredInterval("string", "WAGON", True, None, True)) == ["f2.parquet"]
+
+    def test_non_ascii_bounds_stop_pruning_rather_than_guess(self):
+        """The engine folds Unicode too, and 180 code points fold DOWNWARDS."""
+        assert _prune("string", [("\u00e1rv\u00edz", "zebra")],
+                      PredInterval("string", "zzzz", True, "zzzz", True)) == ["f0.parquet"]
+        assert _prune("string", [("acme", "delta")],
+                      PredInterval("string", "\u00c4rger", True, "\u00c4rger", True)) == ["f0.parquet"]
+
+
+class TestInt64PruningAboveFloatPrecision:
+    """`WHERE ts_ns > <edge>` must not lose the rows just past the edge.
+
+    The bounds were pushed through ``float()``. A float64 holds 53 bits, so
+    past 2^53 it cannot separate adjacent integers -- at epoch-nanosecond scale
+    one double spans 256 int64 values. The file's max and an exclusive bound
+    one nanosecond below it rounded onto the same double, the range collapsed
+    to a point, and ``low == high`` with ``low_incl=False`` proved the file
+    could not match. This is the keyset-pagination shape, so it is reachable
+    from the OData continuation path.
+    """
+
+    # 2026-01-01T00:00:00Z in epoch nanoseconds, and a 4-second file after it.
+    NS_LO = 1_767_225_600_000_000_000
+    NS_HI = NS_LO + 3_999_000_000
+
+    def test_strict_bound_one_below_the_file_max(self):
+        assert float(self.NS_HI) == float(self.NS_HI - 1), (
+            "precondition: the two bounds must be indistinguishable as float64")
+        got = _prune("bigint", [(self.NS_LO, self.NS_HI)],
+                     PredInterval("numeric", self.NS_HI - 1, False, None, True))
+        assert got == ["f0.parquet"], "the row at the file max was pruned away"
+
+    def test_upper_bound_one_above_the_file_min(self):
+        got = _prune("bigint", [(self.NS_LO, self.NS_HI)],
+                     PredInterval("numeric", None, True, self.NS_LO + 1, False))
+        assert got == ["f0.parquet"]
+
+    def test_snowflake_scale_ids(self):
+        """The same shape on 2^60 ids -- `WHERE id > :last_seen` pagination."""
+        base = 1 << 60
+        got = _prune("bigint", [(base - 10, base + 1)],
+                     PredInterval("numeric", base, False, None, True))
+        assert got == ["f0.parquet"]
+
+    def test_soundness_across_the_precision_boundary(self):
+        """A file holding a matching value is retained, at every scale."""
+        for scale in (1 << 40, 1 << 53, 1 << 60, 1 << 62, self.NS_LO):
+            for span in (1, 3, 255, 1_000_000):
+                lo, hi = scale, scale + span
+                for bound in (lo - 1, lo, lo + 1, hi - 1, hi, hi + 1):
+                    for pred, matches in (
+                        (PredInterval("numeric", bound, False, None, True),
+                         lambda v, b=bound: v > b),
+                        (PredInterval("numeric", bound, True, None, True),
+                         lambda v, b=bound: v >= b),
+                        (PredInterval("numeric", None, True, bound, False),
+                         lambda v, b=bound: v < b),
+                        (PredInterval("numeric", None, True, bound, True),
+                         lambda v, b=bound: v <= b),
+                        (PredInterval("numeric", bound, True, bound, True),
+                         lambda v, b=bound: v == b),
+                    ):
+                        kept = _prune("bigint", [(lo, hi)], pred)
+                        if any(matches(v) for v in (lo, (lo + hi) // 2, hi)):
+                            assert kept == ["f0.parquet"], (
+                                f"[{lo}, {hi}] dropped for {pred}")
+
+    def test_pruning_still_happens(self):
+        rows = [(self.NS_LO, self.NS_HI), (self.NS_HI + 10, self.NS_HI + 20)]
+        got = _prune("bigint", rows,
+                     PredInterval("numeric", self.NS_HI + 15, True, None, True))
+        assert got == ["f1.parquet"], "the file below the bound should be gone"
+
+    def test_float_literal_against_a_bigint_column(self):
+        """A genuinely float bound still compares, and still prunes."""
+        rows = [(10, 20), (30, 40)]
+        assert _prune("bigint", rows,
+                      PredInterval("numeric", 25.5, True, None, True)) == ["f1.parquet"]
+        assert _prune("bigint", rows,
+                      PredInterval("numeric", None, True, 25.5, True)) == ["f0.parquet"]
+
+    def test_double_lane_is_untouched(self):
+        rows = [(1.5, 2.5), (10.0, 20.0)]
+        assert _prune("double", rows,
+                      PredInterval("numeric", 3, True, None, True)) == ["f1.parquet"]

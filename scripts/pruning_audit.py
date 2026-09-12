@@ -27,8 +27,7 @@ from typing import Any, Dict, List, Optional
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("STORAGE_TYPE", "LOCAL")
 
-import numpy as np
-import pandas as pd
+import math
 
 # Floating-point SUM re-associates when files are read in a different order, so
 # an exact compare would flag ~1 ULP differences as corruption. Measured drift
@@ -80,8 +79,14 @@ def run_one(sql: str, fullscan: bool, retries: int = 5):
     raise last
 
 
-def same(a: pd.DataFrame, b: pd.DataFrame) -> Optional[str]:
-    """None when the two results are equal; otherwise why they differ."""
+def same(a, b) -> Optional[str]:
+    """None when the two results are equal; otherwise why they differ.
+
+    The reader returns a polars frame. Ints are compared EXACTLY — an int64
+    above 2^53 is precisely the value a float tolerance would smear over, and
+    that is one of the bugs this audit exists to find. Only genuine floats get
+    the re-association tolerance.
+    """
     if list(a.columns) != list(b.columns):
         return f"columns {list(a.columns)} vs {list(b.columns)}"
     if len(a) != len(b):
@@ -91,26 +96,24 @@ def same(a: pd.DataFrame, b: pd.DataFrame) -> Optional[str]:
 
     cols = list(a.columns)
     # The read path guarantees no ordering, so compare as sets of rows.
-    sa = a.sort_values(cols, kind="mergesort").reset_index(drop=True)
-    sb = b.sort_values(cols, kind="mergesort").reset_index(drop=True)
+    sa, sb = a.sort(cols), b.sort(cols)
+    if sa.equals(sb):
+        return None
 
     for c in cols:
-        x, y = sa[c], sb[c]
-        if pd.api.types.is_float_dtype(x) or pd.api.types.is_float_dtype(y):
-            xv = pd.to_numeric(x, errors="coerce").astype(float).to_numpy()
-            yv = pd.to_numeric(y, errors="coerce").astype(float).to_numpy()
-            if not np.allclose(xv, yv, rtol=FLOAT_RTOL, atol=1e-9,
-                               equal_nan=True):
-                bad = int(np.argmax(~np.isclose(xv, yv, rtol=FLOAT_RTOL,
-                                                atol=1e-9, equal_nan=True)))
-                return (f"column {c!r}: row {bad} {xv[bad]!r} vs {yv[bad]!r} "
-                        f"(sum {np.nansum(xv)!r} vs {np.nansum(yv)!r})")
-        else:
-            if not x.equals(y):
-                ne = (x != y) & ~(x.isna() & y.isna())
-                if ne.any():
-                    i = int(np.argmax(ne.to_numpy()))
-                    return f"column {c!r}: row {i} {x.iloc[i]!r} vs {y.iloc[i]!r}"
+        xs, ys = sa[c].to_list(), sb[c].to_list()
+        for i, (x, y) in enumerate(zip(xs, ys)):
+            if x is None and y is None:
+                continue
+            if isinstance(x, float) and isinstance(y, float):
+                if math.isnan(x) and math.isnan(y):
+                    continue
+                if math.isclose(x, y, rel_tol=FLOAT_RTOL, abs_tol=1e-9):
+                    continue
+                return (f"column {c!r}: row {i} {x!r} vs {y!r} "
+                        f"(rel {abs(x - y) / max(abs(x), 1e-300):.3e})")
+            if x != y:
+                return f"column {c!r}: row {i} {x!r} vs {y!r}"
     return None
 
 

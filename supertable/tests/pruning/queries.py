@@ -19,6 +19,12 @@ The generator is deliberately biased toward where bugs actually live:
   * **cross-table filters.** A predicate on one table should be able to prune
     files of ANOTHER table through a join edge. That is the hardest thing to
     get right and the easiest to get silently wrong.
+  * **the comparison itself.** Pruning is only sound while the pruner's notion
+    of "could match" agrees with the ENGINE's. Two families exist solely to
+    attack that agreement: ``mixed_case`` varies the CASE of a string literal
+    against a case-insensitive engine, and ``bigint_ns`` puts the literal one
+    nanosecond off a file edge at 1.77e18, where float64 cannot tell two
+    adjacent integers apart.
 
 Every query is tagged with a family so a failure points at a mechanism rather
 than at one string.
@@ -237,6 +243,106 @@ def _functions_in_predicate() -> Iterator[Query]:
                f"SELECT count(*) AS n FROM facts WHERE {expr}")
 
 
+def _mixed_case_strings() -> Iterator[Query]:
+    """The same value, written in a different case than the file stores it.
+
+    The engine reads with ``default_collation='nocase'``, so every one of these
+    literals matches rows regardless of how they are cased on disk. A pruner
+    that compares bytes sees ``'BOREALIS' < 'acme'`` and proves an all-lowercase
+    file "cannot match" — the file is dropped and its rows vanish from the
+    answer with no error.
+
+    Case is varied INDEPENDENTLY of the stored case on purpose: a corpus whose
+    literals always match the storage case can never observe the disagreement.
+    """
+    n = 0
+    forms = (("lower", str.lower), ("upper", str.upper),
+             ("cap", str.capitalize), ("swap", lambda v: v[:2].upper() + v[2:]))
+    for base in D.VENDORS:
+        for form_name, style in forms:
+            lit = style(base)
+            for op in ("=", "<>", ">=", "<=", ">", "<"):
+                n += 1
+                yield (f"case_vendor_{form_name}_{op}_{n}", "mixed_case",
+                       f"SELECT count(*) AS n, sum(qty) AS q FROM facts "
+                       f"WHERE vendor {op} '{lit}'")
+        n += 1
+        yield (f"case_vendor_between_{n}", "mixed_case",
+               f"SELECT count(*) AS n FROM facts "
+               f"WHERE vendor BETWEEN '{base.upper()}' AND '{base.upper()}zzz'")
+        n += 1
+        yield (f"case_vendor_in_{n}", "mixed_case",
+               f"SELECT count(*) AS n FROM facts WHERE vendor IN "
+               f"('{base.upper()}', '{base.capitalize()}')")
+        n += 1
+        yield (f"case_vendor_notin_{n}", "mixed_case",
+               f"SELECT count(*) AS n FROM facts WHERE vendor NOT IN "
+               f"('{base.upper()}', '{base.capitalize()}')")
+    # Mixed case through a join edge: the filter is on the DIMENSION, and it is
+    # the dimension's files that must not be dropped.
+    for base in D.CONTACTS:
+        for form_name, style in forms[:3]:
+            lit = style(base)
+            n += 1
+            yield (f"case_contact_{form_name}_{n}", "mixed_case_join",
+                   f"SELECT count(*) AS n FROM facts f "
+                   f"JOIN customers c ON f.cust_id = c.cust_id "
+                   f"WHERE c.contact = '{lit}'")
+            n += 1
+            yield (f"case_contact_range_{form_name}_{n}", "mixed_case_join",
+                   f"SELECT count(*) AS n FROM customers "
+                   f"WHERE contact >= '{lit}' AND tier <> 'free'")
+    # Combined with a time predicate, so the string lane has to stay sound when
+    # another lane is already pruning.
+    for t in _spread(4):
+        n += 1
+        yield (f"case_mixed_and_time_{n}", "mixed_case",
+               f"SELECT count(*) AS n FROM facts "
+               f"WHERE vendor = 'CYGNUS' AND event_ts >= '{t}'")
+
+
+def _bigint_nanoseconds() -> Iterator[Query]:
+    """int64 epoch nanoseconds, with the literal sitting ON the file edge.
+
+    ``ts_ns`` lives between 2^60 and 2^61, where one float64 covers 256
+    consecutive integers. A pruner that compares the stored min/max as floats
+    cannot separate ``edge`` from ``edge - 1``, so a strict ``>`` collapses the
+    file's range to a single point and excludes it — losing exactly the rows
+    just past the bound. That is the keyset-pagination shape (``WHERE ts_ns >
+    :last_seen``), which is how the OData continuation path pages.
+    """
+    n = 0
+    # Not the last file: a predicate past the final edge prunes every file, and
+    # the "never empty the list" guard then retains them all and hides the bug.
+    for i in (0, 1, 7, 13, 19):
+        lo, hi = D.ns_bounds(i)
+        for label, v in (("lo", lo), ("lo_m1", lo - 1), ("lo_p1", lo + 1),
+                         ("hi", hi), ("hi_m1", hi - 1), ("hi_p1", hi + 1)):
+            for op in (">", ">=", "<", "<=", "="):
+                n += 1
+                yield (f"ns_{label}_{op}_{n}", "bigint_ns",
+                       f"SELECT count(*) AS n, min(ts_ns) AS lo, "
+                       f"max(ts_ns) AS hi FROM facts WHERE ts_ns {op} {v}")
+        n += 1
+        yield (f"ns_between_{n}", "bigint_ns",
+               f"SELECT count(*) AS n FROM facts "
+               f"WHERE ts_ns BETWEEN {hi - 1} AND {hi + D.NS_ROW_STEP}")
+        n += 1
+        yield (f"ns_window_{n}", "bigint_ns",
+               f"SELECT count(*) AS n FROM facts "
+               f"WHERE ts_ns > {hi - 1} AND ts_ns < {hi + 2 * D.NS_ROW_STEP}")
+        n += 1
+        yield (f"ns_keyset_{n}", "bigint_ns",
+               f"SELECT count(*) AS n, min(ts_ns) AS lo FROM ("
+               f"SELECT ts_ns FROM facts WHERE ts_ns > {hi - 1} "
+               f"ORDER BY ts_ns LIMIT 50) k")
+        n += 1
+        yield (f"ns_with_time_{n}", "bigint_ns",
+               f"SELECT count(*) AS n FROM facts "
+               f"WHERE ts_ns > {hi - 1} AND event_ts >= '2025-01-01'")
+    return
+
+
 def _joins() -> Iterator[Query]:
     """Cross-table filters: a predicate on one side should prune the other."""
     n = 0
@@ -413,8 +519,8 @@ def _aggregates_and_sets() -> Iterator[Query]:
 
 _FAMILIES = (
     _time_predicates, _time_ranges, _numeric_and_string, _null_semantics,
-    _in_lists, _compound, _functions_in_predicate, _joins, _subqueries,
-    _ctes, _aggregates_and_sets,
+    _in_lists, _compound, _functions_in_predicate, _mixed_case_strings,
+    _bigint_nanoseconds, _joins, _subqueries, _ctes, _aggregates_and_sets,
 )
 
 

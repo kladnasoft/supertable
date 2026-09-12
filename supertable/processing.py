@@ -209,6 +209,86 @@ def concat_many_with_union(frames: List[polars.DataFrame]) -> polars.DataFrame:
     return polars.concat(aligned, how="vertical_relaxed")
 
 
+def _has_dtype_conflict(frames: List[polars.DataFrame]) -> bool:
+    """True when any column carries more than one dtype across *frames*.
+
+    This is the exact condition under which an N-way union (one schema over
+    all frames) can differ from folding :func:`concat_with_union` pairwise —
+    see :func:`concat_fold_equivalent` for why.
+    """
+    seen: Dict[str, polars.DataType] = {}
+    for f in frames:
+        for c, dt in f.schema.items():
+            prev = seen.get(c)
+            if prev is None:
+                seen[c] = dt
+            elif prev != dt:
+                return True
+    return False
+
+
+def concat_fold_equivalent(frames: List[polars.DataFrame]) -> polars.DataFrame:
+    """Concatenate *frames* producing EXACTLY what folding pairwise produces.
+
+    ``acc = f0; acc = concat_with_union(acc, f_i)`` re-derives the union schema
+    and re-projects the whole accumulator on every step, so merging F files is
+    O(F x rows) of pure copying — O(F^2) work when the files are similar sizes.
+    This helper collapses the fold into a single pass **without changing the
+    result**, which is not the same thing as calling
+    :func:`concat_many_with_union` — that helper is NOT fold-equivalent:
+
+      * ``_resolve_unified_dtype`` is not associative.  Folding
+        ``{Boolean, Binary}`` yields ``Utf8`` and then ``{Utf8, Int64}`` stays
+        ``Utf8``; resolving ``{Boolean, Binary, Int64}`` in one shot yields
+        ``Int64`` — which then raises ``InvalidOperationError`` (BinaryView
+        cannot cast to Int64).  The N-way form can hard-fail where the fold
+        succeeds.
+      * Even when the final dtype agrees, the fold casts through the
+        intermediate types, and the intermediate casts are value-visible.
+        Frames carrying ``Int64 / Float64 / Utf8`` for one column fold to
+        ``'1.0'`` (Int64 -> Float64 -> Utf8) but resolve N-way to ``'1'``
+        (Int64 -> Utf8).
+
+    Both divergences require a column to carry **more than one dtype** across
+    the frames: with one dtype per column every ``_resolve_unified_dtype`` call
+    sees a singleton set and returns it unchanged, so every intermediate target
+    equals the final one, no cast is ever emitted, and the union column order
+    (first appearance, in both forms) coincides.  So:
+
+      * no dtype conflict -> single-pass alignment + one ``polars.concat``
+        (and, when every frame already shares one schema, not even that);
+      * dtype conflict    -> fall back to the exact pairwise fold, which is
+        bit-identical to the previous behaviour by construction.
+
+    Empty frames are skipped, mirroring ``concat_with_union``'s short-circuits;
+    a single surviving frame is returned verbatim, exactly as the fold's seed
+    step does.
+    """
+    non_empty = [f for f in frames if f.height > 0]
+    if not non_empty:
+        # The fold's accumulator ends up holding the last frame it saw; every
+        # caller gates its use on ``height > 0``, so any empty frame will do.
+        return frames[-1] if frames else polars.DataFrame()
+    if len(non_empty) == 1:
+        # The fold seeds the accumulator with the frame itself — no projection.
+        return non_empty[0]
+    if _has_dtype_conflict(non_empty):
+        acc = non_empty[0]
+        for f in non_empty[1:]:
+            acc = concat_with_union(acc, f)
+        return acc
+    first_cols = non_empty[0].columns
+    first_dtypes = non_empty[0].dtypes
+    if all(f.columns == first_cols and f.dtypes == first_dtypes for f in non_empty[1:]):
+        # Identical schemas: ``_align_to_schema`` would be an identity
+        # projection on every frame, so skip it entirely.
+        return polars.concat(non_empty, how="vertical_relaxed")
+    target = _union_schema_many(non_empty)
+    return polars.concat(
+        [_align_to_schema(f, target) for f in non_empty], how="vertical_relaxed"
+    )
+
+
 # =========================
 # Safe storage I/O helpers
 # =========================
@@ -492,14 +572,14 @@ def compact_resources(
       - Each source file is read **exactly once** via
         ``_read_parquet_safe`` (which returns ``None`` for races where
         another writer already sunset the file).
-      - The merge is a row-preserving ``concat_with_union`` — no
+      - The merge is a row-preserving ``concat_fold_equivalent`` — no
         deduplication, no row drops. Tombstone-driven row removal is a
         **separate** pre-step performed by ``compact_tombstones`` in
         the caller (so this function only sees the post-tombstone
         survivors when ``DataWriter.compact()`` invokes it).
       - All columns from every source file are preserved: missing
         columns in any input are filled with ``null`` via
-        ``concat_with_union``, never silently dropped.
+        ``concat_fold_equivalent``, never silently dropped.
       - Source files are added to ``sunset_files`` **only after** their
         rows have been successfully buffered into ``merged_df``. If a
         read fails (``_read_parquet_safe`` returns ``None``), the file
@@ -536,7 +616,15 @@ def compact_resources(
     sunset_files: Set[str] = set()
     total_rows = 0
     chunk_size_bytes = 0
-    chunk_df: Optional[polars.DataFrame] = None
+    # Survivor frames for the chunk currently being buffered.  They are merged
+    # ONCE, at flush, by ``concat_fold_equivalent`` — folding them pairwise
+    # here re-projected and re-copied the whole accumulated buffer on every
+    # file, which is O(F x rows) of pure copying (O(F^2) for similar-sized
+    # files) and fires precisely when there are many small files to merge.
+    # The flush boundary is unaffected: it is driven by ``chunk_size_bytes``,
+    # accumulated from each file's on-disk size, never from the merged frame —
+    # so the same set of frames is resident either way.
+    chunk_frames: List[polars.DataFrame] = []
 
     # Normalise the deletion-vector to a one-column frame ONCE, outside the
     # loop.  It used to be a Python set that was re-listed per file
@@ -571,39 +659,38 @@ def compact_resources(
         if dead_ids_df is not None and ROWID_COL in existing_df.columns:
             existing_df = existing_df.join(dead_ids_df, on=ROWID_COL, how="anti")
 
-        if chunk_df is None or chunk_df.height == 0:
-            # Seed the buffer with the first survivor. Using
-            # ``concat_with_union`` even for the seed keeps the schema
-            # behaviour identical to the merge path (no column drop on
-            # the first file).
-            chunk_df = (
-                existing_df if chunk_df is None
-                else concat_with_union(chunk_df, existing_df)
-            )
-        else:
-            chunk_df = concat_with_union(chunk_df, existing_df)
+        # Buffer the survivor.  Zero-row frames are dropped here because that
+        # is exactly what the pairwise fold did with them: ``concat_with_union``
+        # returns the other side untouched when either side is empty, so an
+        # empty file never contributed rows *or* columns to the merged schema.
+        if existing_df.height > 0:
+            chunk_frames.append(existing_df)
 
         sunset_files.add(file_path)
         chunk_size_bytes += int(file_size or 0)
 
         # Flush when the buffered chunk exceeds the per-table memory cap.
         if chunk_size_bytes >= max_mem:
-            total_rows += chunk_df.shape[0]
-            # No overwrite columns for plain compaction — we don't need to pin
-            # a specific key for the resulting file.
-            write_parquet_and_collect_resources(
-                write_df=chunk_df,
-                overwrite_columns=[],
-                data_dir=data_dir,
-                new_resources=new_resources,
-                compression_level=compression_level,
-                profiler=p,
-            )
-            chunk_df = None
+            if chunk_frames:
+                chunk_df = concat_fold_equivalent(chunk_frames)
+                total_rows += chunk_df.shape[0]
+                # No overwrite columns for plain compaction — we don't need to
+                # pin a specific key for the resulting file.
+                write_parquet_and_collect_resources(
+                    write_df=chunk_df,
+                    overwrite_columns=[],
+                    data_dir=data_dir,
+                    new_resources=new_resources,
+                    compression_level=compression_level,
+                    profiler=p,
+                )
+                chunk_df = None
+            chunk_frames = []
             chunk_size_bytes = 0
 
     # Final flush — if anything remains in the buffer, write it out.
-    if chunk_df is not None and chunk_df.height > 0:
+    if chunk_frames:
+        chunk_df = concat_fold_equivalent(chunk_frames)
         total_rows += chunk_df.shape[0]
         write_parquet_and_collect_resources(
             write_df=chunk_df,
@@ -2407,6 +2494,223 @@ def _floor_text_lower_bound_to_day(plo):
     return plo
 
 
+# ===========================================================================
+# String pruning under the engine's case-insensitive collation
+# ---------------------------------------------------------------------------
+# Every read runs on a connection that has done
+#
+#     PRAGMA default_collation='nocase'        (engine/engine_common.py)
+#
+# so the ENGINE matches `WHERE name = 'BANANA'` against a stored 'banana'.
+# Measured against DuckDB 1.5, that collation is exactly "lowercase both sides,
+# then compare code points" — `'_' < 'A'` is true under it and false byte-wise,
+# and `ORDER BY` returns `_under, A1, a_, apple, APPLE, Banana, zebra, ZZZ`,
+# which is the code-point order of the lowercased values.
+#
+# The stats artifact, by contrast, carries the parquet footer's min/max, which
+# are BYTE-ordered.  Comparing a literal against those byte-wise proved files
+# "cannot match" that the engine would have matched, and they were dropped with
+# no error: 'BANANA' < 'apple' byte-wise, so an all-lowercase file was excluded.
+#
+# Folding the two stored endpoints is NOT enough, and is in fact worse: the
+# footer min/max are the extremes under the BYTE order, and folding does not
+# preserve that order, so the folded endpoints need not bracket the folded
+# values.  A file holding {'ZZZ', 'apple'} has byte min 'ZZZ' and byte max
+# 'apple'; folded that is ['zzz', 'apple'] — an inverted interval that excludes
+# every file.  So the endpoints are turned into a provable ENVELOPE instead:
+#
+#   * upper — the largest `lower(v)` reachable by any v in `[s_min, s_max]`,
+#     computed greedily below.  It is deliberately loose where it has to be:
+#     'bZebra' sorts below 'banana' byte-wise but folds ABOVE it, so a file
+#     with max 'banana' genuinely can hold a value folding to 'bz…'.
+#   * lower — the smallest, by the mirror of the same walk.  `s_min` itself is
+#     already a sound floor (folding never decreases an ASCII character, so
+#     `lower(v) >= v >= s_min`), but it sits 32 code points low for uppercase
+#     data: measured over 100 files of disjoint uppercase keys, the raw floor
+#     took the prune rate from 99.0% to 49.5%, because every file's UPPERCASE
+#     minimum sorts below any folded literal.  The walk gives it back.
+#
+# Widening is the right direction here: pruning is an optimisation and may keep
+# a file it did not need to; it may never drop one it did.
+# ===========================================================================
+
+_FOLD_SHIFT = 32
+_ORD_UPPER_A, _ORD_UPPER_Z = ord("A"), ord("Z")
+#: Highest ordinal that folding leaves untouched below 'A'.
+_ORD_BELOW_UPPER = _ORD_UPPER_A - 1
+_ORD_MAX = 0x10FFFF
+#: Smallest character whose fold is SMALLER than itself.  180 code points fold
+#: downwards — U+0130 to 'i', U+212A KELVIN SIGN to 'k' — and U+0130 is both
+#: the first of them and the one with the smallest result, so nothing above
+#: ASCII can fold below 'i'.  A range topping out below U+0130 need not
+#: consider the case at all.
+_ORD_FIRST_SHRINKING = 0x130
+_ORD_FOLD_FLOOR = ord("i")
+
+
+def _nocase_fold(value: str) -> str:
+    """The engine's comparison key for a string."""
+    return value.lower()
+
+
+def _max_fold_ordinal(lo: int, hi: int) -> Tuple[int, int]:
+    """``(best, arg)`` — the largest ordinal ``lower(chr(b))`` can take for
+    ``lo <= b <= hi``, and the SMALLEST ``b`` that attains it.
+
+    Folding is not monotone (``'Z'`` folds to ``'z'``, which is above ``'['``),
+    so the maximum has to be taken over three separate runs rather than read off
+    the top of the range.  The smallest attaining ``b`` is returned on purpose:
+    whenever the maximum is reachable strictly below ``hi``, everything after
+    that position is unconstrained, and the caller must widen rather than keep
+    walking.
+    """
+    best = arg = None
+
+    def offer(value: int, at: int) -> None:
+        nonlocal best, arg
+        if best is None or value > best or (value == best and at < arg):
+            best, arg = value, at
+
+    below = min(hi, _ORD_BELOW_UPPER)          # unchanged by folding
+    if lo <= below:
+        offer(below, below)
+    a, z = max(lo, _ORD_UPPER_A), min(hi, _ORD_UPPER_Z)
+    if a <= z:                                  # 'A'..'Z' -> +32
+        offer(z + _FOLD_SHIFT, z)
+    if hi > _ORD_UPPER_Z and lo <= hi:          # '[' and above, unchanged
+        offer(hi, hi)
+    return best, arg
+
+
+def _fold_upper_envelope(s_min: str, s_max: str) -> Tuple[str, bool]:
+    """``(text, open_ended)`` bounding ``lower(v)`` for every ``s_min<=v<=s_max``.
+
+    ``open_ended`` False means ``lower(v) <= text``.  True means the bound is
+    ``text`` followed by anything — reached as soon as a position can be filled
+    strictly below ``s_max``'s character, because then every later position is
+    free (and may hold non-ASCII, which folds anywhere).
+    """
+    out: List[str] = []
+    tight_lo = True
+    for i, ch in enumerate(s_max):
+        hi_c = ord(ch)
+        if tight_lo and i < len(s_min):
+            lo_c = ord(s_min[i])
+        else:
+            lo_c, tight_lo = 0, False
+        if lo_c > hi_c:                         # inverted stats — bound nothing
+            return "", True
+        best, arg = _max_fold_ordinal(lo_c, hi_c)
+        out.append(chr(best))
+        if arg < hi_c:
+            return "".join(out), True
+        tight_lo = tight_lo and arg == lo_c
+    return "".join(out), False
+
+
+def _min_fold_ordinal(lo: int, hi: int) -> Tuple[int, int]:
+    """``(best, arg)`` — the smallest ordinal ``lower(chr(b))`` can start with
+    for ``lo <= b <= hi``, and the LARGEST ``b`` that attains it.
+
+    The mirror of :func:`_max_fold_ordinal`, with one extra run: once the range
+    reaches past ASCII it can contain a character that folds DOWNWARDS, and the
+    floor for those is ``'i'``.  A fold that expands to several characters only
+    appends, so its first character is the whole story for a minimum.  The
+    largest attaining ``b`` is returned so that a minimum reachable strictly
+    above ``lo`` ends the walk — everything after it is then free.
+    """
+    best = arg = None
+
+    def offer(value: int, at: int) -> None:
+        nonlocal best, arg
+        if best is None or value < best or (value == best and at > arg):
+            best, arg = value, at
+
+    if lo <= min(hi, _ORD_BELOW_UPPER):         # unchanged by folding
+        offer(lo, lo)
+    a, z = max(lo, _ORD_UPPER_A), min(hi, _ORD_UPPER_Z)
+    if a <= z:                                  # 'A'..'Z' -> +32
+        offer(a + _FOLD_SHIFT, a)
+    if hi > _ORD_UPPER_Z:                       # '[' and above, unchanged
+        offer(max(lo, _ORD_UPPER_Z + 1), max(lo, _ORD_UPPER_Z + 1))
+    if hi >= _ORD_FIRST_SHRINKING:              # ...unless it folds downwards
+        offer(_ORD_FOLD_FLOOR, hi)
+    return best, arg
+
+
+def _fold_lower_envelope(s_min: str, s_max: str) -> str:
+    """Lower bound on ``lower(v)`` for every ``s_min <= v <= s_max``."""
+    out: List[str] = []
+    tight_hi = True
+    for i, ch in enumerate(s_min):
+        lo_c = ord(ch)
+        if not tight_hi:
+            hi_c = _ORD_MAX
+        elif i < len(s_max):
+            hi_c = ord(s_max[i])
+        else:
+            break                               # v would have to exceed s_max
+        if lo_c > hi_c:                         # inverted stats — bound nothing
+            return ""
+        best, arg = _min_fold_ordinal(lo_c, hi_c)
+        out.append(chr(best))
+        if arg > lo_c:
+            break                               # tail unconstrained below
+        tight_hi = tight_hi and arg == hi_c
+    return "".join(out)
+
+
+def _string_lane_overlaps(pred: PredInterval, s_min: str, s_max: str) -> bool:
+    """String-lane overlap, decided the way the engine's collation decides it.
+
+    Returns True (retain) on anything it cannot bound.  A non-ASCII BOUND is
+    one of those: the engine folds Unicode as well (``'Ä' = 'ä'`` holds), and
+    Python's ``lower()`` is not always the same fold — DuckDB makes
+    ``'İ' = 'i'`` true while ``'İ'.lower()`` is two characters — so outside
+    ASCII the two comparisons cannot be relied on to agree and the column
+    simply stops pruning.
+
+    A non-ASCII VALUE between two ASCII bounds is a different matter, and is
+    handled rather than excluded: it can only occur at a position where the
+    stored max no longer constrains the value, and both walks account for that
+    — the ceiling goes open-ended, and the floor drops to ``'i'``, below
+    anything a character can fold down to.
+    """
+    for raw in (s_min, s_max, pred.lo, pred.hi):
+        if raw is None:
+            continue
+        if not isinstance(raw, str) or not raw.isascii():
+            return True
+
+    plo = None if pred.lo is None else _nocase_fold(pred.lo)
+    phi = None if pred.hi is None else _nocase_fold(pred.hi)
+
+    # A predicate that folds to an empty range (`x > 'B' AND x < 'b'`) matches
+    # nothing anywhere.
+    if plo is not None and phi is not None:
+        if plo > phi or (plo == phi and not (pred.lo_incl and pred.hi_incl)):
+            return False
+
+    # Lower side: nothing in the file folds below the envelope, so a predicate
+    # capped below that cannot be met.
+    if phi is not None:
+        floor = _fold_lower_envelope(s_min, s_max)
+        if phi < floor or (phi == floor and not pred.hi_incl):
+            return False
+
+    # Upper side: nothing in the file folds above the envelope.
+    if plo is not None:
+        text, open_ended = _fold_upper_envelope(s_min, s_max)
+        if open_ended:
+            if plo > text and not plo.startswith(text):
+                return False
+        else:
+            if plo > text or (plo == text and not pred.lo_incl):
+                return False
+
+    return True
+
+
 def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]) -> bool:
     """True if a value in the stored row-group range ``[s_min, s_max]`` could
     satisfy the predicate interval *pred*.
@@ -2418,14 +2722,31 @@ def _pred_overlaps_stored(pred: PredInterval, stored: Tuple[str, object, object]
     p_lane = pred.lane
     s_lane, s_min, s_max = stored
     if p_lane == "numeric" and s_lane in ("bigint", "double"):
-        smin, smax = float(s_min), float(s_max)
-        plo = None if pred.lo is None else float(pred.lo)
-        phi = None if pred.hi is None else float(pred.hi)
+        # Compared AS THEY ARE, never through float().  A float64 has 53 bits of
+        # mantissa, so past 2^53 it cannot separate adjacent integers: at the
+        # epoch-nanosecond scale (~1.77e18) one double covers 256 consecutive
+        # int64 values.  Rounding a file's max and an exclusive bound one nano
+        # below it onto the same double collapsed the range to a single point,
+        # and `low == high` with `low_incl=False` then PROVED the file could not
+        # match — dropping exactly the rows just past the bound.  That is the
+        # keyset-pagination shape (`WHERE ts_ns > :last_seen`), so it is
+        # reachable from the OData continuation path.
+        #
+        # Python compares int and float exactly across the whole int64 range
+        # (it does not coerce the int), so a mixed bigint-column/float-literal
+        # predicate stays correct without any widening of our own.  The twin of
+        # this bug, and the same resolution, is in engine/arrow_result.py.
+        smin, smax = s_min, s_max
+        plo, phi = pred.lo, pred.hi
     elif p_lane == "timestamp" and s_lane == "timestamp":
         smin, smax = s_min, s_max
         plo, phi = _widen_naive_timestamp_bounds(pred.lo, pred.hi)
     elif p_lane == "string" and s_lane == "string":
-        smin, smax, plo, phi = s_min, s_max, pred.lo, pred.hi
+        # Decided separately: the engine compares strings case-insensitively,
+        # so the generic interval arithmetic below (which assumes the stored
+        # endpoints bracket the stored values in the SAME order the predicate
+        # is compared in) does not apply.  See _string_lane_overlaps.
+        return _string_lane_overlaps(pred, s_min, s_max)
     elif p_lane == "string" and s_lane == "timestamp":
         # A date/time literal written WITHOUT a cast — `event_ts >= '2025-12-01'`
         # — parses as a string, because the lane is taken from the literal and
@@ -2815,6 +3136,24 @@ def compact_tombstones(
     )
     p.add("tombstone_files_total", len(files_with_deletes))
 
+    # Split the deletion-vector by data file ONCE.  Selecting a file's dead
+    # row-ids with ``tombstone_df.filter(col(__file__) == file_path)`` inside
+    # the loop re-scans the WHOLE vector per file — O(vector x files), and the
+    # vector runs to ``MAX_TOMBSTONE_ROWS`` (1 M by default) while ``compact()``
+    # always drains it in full.  One ``partition_by`` is O(vector) total.
+    # ``include_key=False`` keeps the (wide, repeated) path column out of the
+    # partitions; each partition is therefore already the single ``__rowid__``
+    # column the anti-join needs.
+    with p.span("tombstone.partition_vector"):
+        dead_by_file: Dict[str, polars.DataFrame] = {
+            (key[0] if isinstance(key, tuple) else key): part
+            for key, part in tombstone_df.select(
+                [TOMBSTONE_FILE_COL, ROWID_COL]
+            ).partition_by(
+                TOMBSTONE_FILE_COL, as_dict=True, include_key=False
+            ).items()
+        }
+
     for file_path in files_with_deletes:
         resource = by_path.get(file_path)
         if not resource:
@@ -2836,11 +3175,12 @@ def compact_tombstones(
         if existing_df is None or ROWID_COL not in existing_df.columns:
             continue
 
-        dead_ids = (
-            tombstone_df.filter(polars.col(TOMBSTONE_FILE_COL) == file_path)
-            .select(ROWID_COL)
-            .unique()
-        )
+        part = dead_by_file.get(file_path)
+        if part is None:
+            # Cannot happen: every key of ``files_with_deletes`` came from the
+            # same column the partition was built on.  Treated as "no deletes".
+            continue
+        dead_ids = part.unique()
         with p.span("tombstone.anti_join"):
             kept_df = existing_df.join(dead_ids, on=ROWID_COL, how="anti")
         difference = existing_df.height - kept_df.height
