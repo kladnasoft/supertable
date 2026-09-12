@@ -11,8 +11,13 @@ Rules (see ``docs/16_redis_layout.md``):
      ``f"audit:..."`` / ``f"registry:..."`` / ``f"shares:..."`` /
      ``f"lakes:..."`` / ``f"_apps_:..."`` literals.
   3. Position 2 under ``supertable:{org}:`` is always a closed-set
-     SDK literal (``system``, ``lakes``, or ``monitor``). User input
-     lives at position 3 under ``lakes:``.
+     SDK literal (``system``, ``lakes``, ``monitor`` or ``query``).
+     User input lives at position 3 under ``lakes:``.
+
+     ``system``, ``monitor`` and ``query`` are company-level: a query may
+     span supertables and monitoring aggregates across them, so neither
+     can be filed under one. ``lakes`` is the level below, and everything
+     under it names its supertable at position 3.
   4. User-supplied segments are validated via ``_safe(...)``. Sentinel
      pattern (``^_..._$``) and explicit reserved sets reject reserved
      names.
@@ -586,3 +591,200 @@ def test_the_appending_guard_actually_catches_the_shape():
         "keys = [RK.meta_leaf(org, sup, t) for t in tables]",
     ):
         assert not _PREFIX_APPEND.search(good), good
+
+
+# ---------------------------------------------------------------------------
+# 9. Structural properties of the namespace as a whole
+#
+# The tests above check one constructor at a time against a hand-written
+# expected string. That catches a typo in a key someone remembered to add to
+# the table, and nothing else. These check properties of the whole set, by
+# reflection, so a constructor added next year is covered the day it lands.
+# ---------------------------------------------------------------------------
+
+#: Argument values by parameter NAME. Reflection can't guess what a parameter
+#: means, but the module is consistent about naming, so one entry per distinct
+#: parameter name covers every constructor.
+_ARG_BY_NAME = {
+    "org": ORG, "sup": SUP, "simple": SIMPLE, "table": SIMPLE,
+    "user_id": USER_ID, "role_id": ROLE_ID, "share_id": SHARE,
+    "staging_name": STAGING, "stage_name": STAGING, "pipe_name": PIPE,
+    "instance_id": INSTANCE, "app_name": APP, "job_id": "job_1",
+    "rule_id": "rule_1", "kind": "pending", "part": "p1",
+    "monitor_type": "plans", "date": "2026-06-09",
+    "link_id": LINK, "role_type": "admin",
+    "service_type": "api", "host": "host1", "pid": 1234,
+}
+
+
+def _is_key_constructor(fn) -> bool:
+    """Key constructors return a key. Predicates like ``is_sentinel`` don't.
+
+    Keyed off the return annotation rather than a name list, so a new
+    predicate doesn't have to be remembered here to avoid tripping the
+    reachability guard.
+    """
+    import inspect
+
+    return inspect.signature(fn).return_annotation not in ("bool", bool)
+
+
+def _reflect_keys() -> dict[str, str]:
+    """Call every constructor with sample args; return ``{name: key}``.
+
+    Constructors whose parameters aren't all in ``_ARG_BY_NAME`` are skipped
+    rather than guessed at — and ``test_every_constructor_is_reachable``
+    below fails if that skip list ever grows, so a new parameter name can't
+    quietly drop a key out of these checks.
+    """
+    import inspect
+
+    out: dict[str, str] = {}
+    for name, fn in sorted(vars(RK).items()):
+        if not inspect.isfunction(fn) or name.startswith("_"):
+            continue
+        if name.startswith(("parse_", "assert_")) or not _is_key_constructor(fn):
+            continue
+        args, resolvable = [], True
+        for p in inspect.signature(fn).parameters.values():
+            if p.kind is p.VAR_KEYWORD:
+                continue
+            if p.kind is p.VAR_POSITIONAL:
+                # *parts: pass one, since the zero-part form is an error for
+                # exactly the reason test_quality_doc_refuses_to_degenerate
+                # covers — it would return the namespace prefix.
+                args.append("part1")
+                continue
+            if p.name in _ARG_BY_NAME:
+                args.append(_ARG_BY_NAME[p.name])
+            elif p.default is not p.empty:
+                continue
+            else:
+                resolvable = False
+                break
+        if not resolvable:
+            continue
+        try:
+            key = fn(*args)
+        except Exception:
+            continue
+        if isinstance(key, str) and key.startswith(("supertable:", "dataisland:")):
+            out[name] = key
+    return out
+
+
+def test_every_constructor_is_reachable_by_reflection():
+    """No constructor may be invisible to the structural checks below.
+
+    If this fails, a parameter name was introduced that ``_ARG_BY_NAME``
+    doesn't know, and that key silently stopped being checked for clashes
+    and correct scope placement.
+    """
+    import inspect
+
+    expected = {
+        n for n, f in vars(RK).items()
+        if inspect.isfunction(f) and not n.startswith("_")
+        and not n.startswith(("parse_", "assert_"))
+        and _is_key_constructor(f)
+    }
+    missing = expected - set(_reflect_keys())
+    assert not missing, (
+        "constructors not reachable by reflection — add their parameter "
+        f"names to _ARG_BY_NAME: {sorted(missing)}"
+    )
+
+
+def test_no_two_constructors_produce_the_same_key():
+    """Distinct constructors must name distinct keys.
+
+    Two names for one key is not a style problem: one caller's write is the
+    other caller's read, and a delete through either name destroys both.
+    """
+    from collections import defaultdict
+
+    by_key = defaultdict(list)
+    for name, key in _reflect_keys().items():
+        if "*" in key:
+            continue  # patterns are meant to overlap keys; checked separately
+        by_key[key].append(name)
+
+    clashes = {k: v for k, v in by_key.items() if len(v) > 1}
+    assert not clashes, "constructors producing identical keys:\n" + "\n".join(
+        f"  {k}  <-  {sorted(v)}" for k, v in sorted(clashes.items())
+    )
+
+
+def test_quality_doc_refuses_to_degenerate_into_its_own_prefix():
+    """``quality_doc(org, sup)`` with no parts once returned the bare prefix.
+
+    Which is exactly ``quality_prefix(org, sup)`` — so an empty parts list
+    addressed the namespace root instead of a document inside it. Guard the
+    specific shape, since the clash test above can't call a variadic with
+    zero args and still know what it should have produced.
+    """
+    with pytest.raises(ValueError, match="at least one path segment"):
+        RK.quality_doc(ORG, SUP)
+    assert RK.quality_doc(ORG, SUP, "pending", SIMPLE) != RK.quality_prefix(ORG, SUP)
+
+
+def test_scope_segment_is_a_closed_set():
+    """Position 2 under ``supertable:{org}:`` is always an SDK literal.
+
+    Documented as rule 3 since v2 and never enforced. User input must not
+    reach this position — a supertable named ``system`` that landed here
+    would address platform state.
+    """
+    allowed = {"system", "lakes", "monitor", "query"}
+    offenders = {
+        name: key for name, key in _reflect_keys().items()
+        if key.startswith("supertable:")
+        and len(key.split(":")) > 2
+        and key.split(":")[2] not in allowed
+    }
+    assert not offenders, (
+        f"scope segment outside {sorted(allowed)}:\n"
+        + "\n".join(f"  {n} = {k}" for n, k in sorted(offenders.items()))
+    )
+
+
+def test_org_level_scopes_carry_no_supertable_segment():
+    """``monitor``, ``query`` and ``system`` are company-level.
+
+    A query may span supertables and monitoring aggregates across them, so
+    neither can be filed under one. If a supertable name appeared in these
+    keys the data would shard per-table and every cross-table read would
+    silently see a fraction of it.
+    """
+    offenders = []
+    for name, key in _reflect_keys().items():
+        parts = key.split(":")
+        if len(parts) > 2 and parts[2] in ("monitor", "query", "system"):
+            if SUP in parts:
+                offenders.append(f"  {name} = {key}")
+    assert not offenders, (
+        "org-level key filed under a supertable:\n" + "\n".join(offenders)
+    )
+
+
+def test_lake_scoped_keys_name_their_supertable():
+    """Everything under ``lakes:`` is per-supertable, one level below org.
+
+    The exceptions are the scope root and the patterns that deliberately
+    wildcard the supertable to enumerate across them; they are listed
+    explicitly so a new key cannot join them by accident.
+    """
+    cross_lake = {
+        "lakes_scope", "lakes_pattern",
+        "meta_root_pattern_for_org", "meta_root_pattern_all_orgs",
+    }
+    offenders = []
+    for name, key in _reflect_keys().items():
+        parts = key.split(":")
+        if len(parts) > 2 and parts[2] == "lakes" and name not in cross_lake:
+            if len(parts) < 4 or parts[3] != SUP:
+                offenders.append(f"  {name} = {key}")
+    assert not offenders, (
+        "lake-scoped key that does not name its supertable at position 3:\n"
+        + "\n".join(offenders)
+    )

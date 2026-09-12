@@ -874,7 +874,19 @@ def quality_doc(org: str, sup: str, *parts: str) -> str:
 
     Replaces ``quality_prefix(...) + ":".join(parts)`` in ``quality/config.py``,
     which joined caller-supplied parts with no validation at all.
+
+    At least one part is required. With none it returned the bare prefix —
+    identical to ``quality_prefix()`` — so a caller that passed an empty list
+    would have written to the namespace root itself rather than to a document
+    in it. That is the only key collision in the whole scheme, and it is a
+    degenerate case rather than two entities disagreeing, but a constructor
+    that can silently produce a different key's name is worth closing.
     """
+    if not parts or not any(parts):
+        raise ValueError(
+            "quality_doc requires at least one path segment; with none it "
+            "would return the namespace prefix itself"
+        )
     return quality_prefix(org, sup) + ":".join(
         _safe("part", p) for p in parts if p
     )
