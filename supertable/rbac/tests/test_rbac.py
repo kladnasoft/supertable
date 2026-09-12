@@ -110,7 +110,39 @@ class FakeScript:
         keys = keys or []
         args = args or []
 
-        if "HINCRBY" in self._src and "last_updated_ms" in self._src and "cjson" not in self._src:
+        # NOTE: this dispatch matches on substrings of the Lua source, so a
+        # new script whose text happens to contain an earlier branch's markers
+        # is silently routed to the wrong emulation. The update-role script
+        # below contains both "HINCRBY" and "last_updated_ms", so it must be
+        # matched BEFORE the bump-meta branch or it would be treated as a
+        # meta bump: fields never written, a version number returned instead
+        # of 1, and the caller none the wiser.
+        if "type_prefix" in self._src:
+            role_doc_key, role_meta_key = keys[0], keys[1]
+            role_id, now_ms = args[0], args[1]
+            type_prefix, new_type = args[2], args[3]
+
+            if not self._store.exists(role_doc_key):
+                return 0
+
+            old_type = self._store.hget(role_doc_key, "role") or ""
+
+            fields = {}
+            for i in range(4, len(args) - 1, 2):
+                fields[args[i]] = args[i + 1]
+            fields["modified_ms"] = now_ms
+            self._store.hset(role_doc_key, mapping=fields)
+
+            if new_type and new_type != old_type:
+                if old_type:
+                    self._store.srem(f"{type_prefix}{old_type}", role_id)
+                self._store.sadd(f"{type_prefix}{new_type}", role_id)
+
+            self._store.hincrby(role_meta_key, "version", 1)
+            self._store.hset(role_meta_key, mapping={"last_updated_ms": now_ms})
+            return 1
+
+        elif "HINCRBY" in self._src and "last_updated_ms" in self._src and "cjson" not in self._src:
             key = keys[0]
             now = args[0]
             v = self._store.hincrby(key, "version", 1)

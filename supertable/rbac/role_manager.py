@@ -253,12 +253,13 @@ class RoleManager:
         # The superadmin type is immutable in both directions.
         #
         # Promotion was the same hole as create_role: nothing stopped
-        # ``update_role(some_reader_id, {"role": "superadmin"})``, and because
-        # ``rbac_update_role`` only rewrites the document — it never moves the
-        # role between the ``roles:type:doc:*`` index sets — the promoted role
-        # stayed filed under its old type. It was fully effective at
-        # enforcement time and invisible to ``get_superadmin_role_id()``, the
-        # only "who is superadmin" listing the library offers.
+        # ``update_role(some_reader_id, {"role": "superadmin"})``. It was also
+        # invisible, because ``rbac_update_role`` rewrote the document without
+        # moving the role between the ``roles:type:doc:*`` index sets, so a
+        # promoted role stayed filed under its old type — effective at
+        # enforcement, absent from ``get_superadmin_role_id()``. The index is
+        # now moved atomically with the document, but the promotion itself is
+        # refused here regardless: one superadmin role, minted by bootstrap.
         #
         # Demotion mattered just as much, because it made "the superadmin role
         # cannot be deleted" bypassable in two steps: demote it to reader, at

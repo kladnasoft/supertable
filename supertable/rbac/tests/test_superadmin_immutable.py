@@ -138,24 +138,28 @@ def test_a_refused_promotion_leaves_the_role_untouched(rm):
     assert rm.get_role(role_id)["role"] == before["role"] == "reader"
 
 
-def test_promotion_would_not_have_shown_up_in_the_type_index(rm):
-    """Why promotion was worse than it looked.
+def test_a_type_change_is_reflected_in_the_type_listing(rm):
+    """Promotion used to be invisible as well as effective.
 
-    ``rbac_update_role`` rewrites the document but never moves the role
-    between the per-type index sets, so a promoted role stayed filed under
-    its old type — effective at enforcement, invisible to the only listing
-    that answers "who is superadmin". Asserted via the legitimate path
-    (a type change between two ordinary types) to show the index does not
-    follow the document.
+    ``rbac_update_role`` rewrote the document without moving the role between
+    the per-type index sets, so a promoted role stayed filed under its old
+    type: fully effective at enforcement, absent from the only listing that
+    answers "who holds this type". Both halves are now consistent, shown here
+    through the legitimate path — a change between two ordinary types.
+
+    Note ``get_roles_by_type`` returns role *documents*, not ids. An earlier
+    version of this test asserted ``role_id not in get_roles_by_type(...)``,
+    comparing a string against a list of dicts — vacuously true, and so a
+    test that could not fail either way.
     """
     role_id = rm.create_role(_reader(role_name="analyst"))
+    assert [r["role_id"] for r in rm.get_roles_by_type("reader")] == [role_id]
+
     rm.update_role(role_id, {"role": "writer"})
 
     assert rm.get_role(role_id)["role"] == "writer"
-    assert role_id not in rm.get_roles_by_type("writer"), (
-        "index followed the document — if this now passes, the index is "
-        "being maintained and this note is stale"
-    )
+    assert [r["role_id"] for r in rm.get_roles_by_type("writer")] == [role_id]
+    assert [r["role_id"] for r in rm.get_roles_by_type("reader")] == []
 
 
 # --------------------------------------------------------------------------

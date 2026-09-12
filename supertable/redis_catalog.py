@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover
     from redis_connector import RedisConnector, RedisOptions
 
 from supertable.locking.redis_lock import RedisLocking
+from supertable.rbac.permissions import RoleType as _RoleType
 from supertable import redis_keys as RK
 
 
@@ -58,6 +59,20 @@ LOGIN_TOKEN_PREFIX = "st_login_"
 # admin scripts, migrations, tests using ``cat.rbac_create_role`` — can't
 # bypass it. Two write paths, one rule.
 SAFE_ROLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_\-. ]{0,126}$")
+
+
+# ---------------------------------------------------------------------------
+# Valid role types
+# ---------------------------------------------------------------------------
+#
+# Derived from the enum rather than duplicated, so a new RoleType is accepted
+# the moment it is declared — the set of valid types *is* the enum, unlike the
+# permission grants in ROLE_PERMISSIONS, which must be decided per role.
+#
+# Needed here because ``rbac_update_role`` puts the type into a key name that
+# is assembled inside a Lua script, where ``_safe()`` cannot run. Importing
+# ``rbac.permissions`` is safe: it is a leaf module with no supertable imports.
+_VALID_ROLE_TYPES = frozenset(rt.value for rt in _RoleType)
 
 
 def validate_role_name(role_name: str) -> None:
@@ -224,6 +239,49 @@ return v
     #   KEYS[4] role_meta_key
     #   KEYS[5] user_index_key
     #   KEYS[6] rolename_to_id_key
+    # Update a role document and, if the update changes its type, move it
+    # between the per-type index sets in the same atomic step.
+    #
+    # In Lua rather than a pipeline because the OLD type has to be read to know
+    # which index set to leave, and reading it from Python first opens a window:
+    # a concurrent type change between the read and the write would make the
+    # SREM target the wrong set, leaving the role listed under a type it no
+    # longer has. Reading it inside the script closes that window.
+    #
+    # KEYS[1] role doc, KEYS[2] role meta
+    # ARGV[1] role_id, ARGV[2] now_ms, ARGV[3] type-index key prefix,
+    # ARGV[4] new type ('' when this update does not touch the type),
+    # ARGV[5..] flattened field/value pairs for the document
+    _LUA_RBAC_UPDATE_ROLE = """
+local role_id      = ARGV[1]
+local now_ms       = ARGV[2]
+local type_prefix  = ARGV[3]
+local new_type     = ARGV[4]
+
+if redis.call('EXISTS', KEYS[1]) == 0 then
+    return 0
+end
+
+local old_type = redis.call('HGET', KEYS[1], 'role')
+if not old_type then old_type = '' end
+
+for i = 5, #ARGV, 2 do
+    redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1])
+end
+redis.call('HSET', KEYS[1], 'modified_ms', now_ms)
+
+if new_type ~= '' and new_type ~= old_type then
+    if old_type ~= '' then
+        redis.call('SREM', type_prefix .. old_type, role_id)
+    end
+    redis.call('SADD', type_prefix .. new_type, role_id)
+end
+
+redis.call('HINCRBY', KEYS[2], 'version', 1)
+redis.call('HSET', KEYS[2], 'last_updated_ms', now_ms)
+return 1
+"""
+
     _LUA_RBAC_DELETE_ROLE = """
 local role_id              = ARGV[1]
 local now_ms               = ARGV[2]
@@ -328,6 +386,7 @@ return 1
 
         # RBAC Lua scripts
         self._rbac_bump_meta = self.r.register_script(self._LUA_RBAC_BUMP_META)
+        self._rbac_update_role = self.r.register_script(self._LUA_RBAC_UPDATE_ROLE)
         self._rbac_delete_role = self.r.register_script(self._LUA_RBAC_DELETE_ROLE)
         self._rbac_remove_role_from_user = self.r.register_script(self._LUA_RBAC_REMOVE_ROLE_FROM_USER)
         self._rbac_add_role_to_user = self.r.register_script(self._LUA_RBAC_ADD_ROLE_TO_USER)
@@ -815,16 +874,59 @@ return 1
 
         Validates ``role_name`` (when the update touches it) so direct
         callers can't introduce unsafe names via a partial update either.
+
+        When the update changes ``role``, the role is moved between the
+        per-type index sets in the same atomic step. It previously was not:
+        this method only rewrote the document, while ``rbac_create_role``
+        adds to the index and ``rbac_delete_role`` removes from it. So a
+        ``reader`` promoted to ``writer`` stayed listed under ``reader``, and
+        ``rbac_get_role_ids_by_type`` answered from an index that no longer
+        described the documents — it would both omit the role from its real
+        type and report it under its old one.
         """
         if "role_name" in fields:
             validate_role_name(fields.get("role_name", ""))
-        key = RK.rbac_role_doc(org, sup, role_id)
-        if not self.r.exists(key):
+
+        new_type = ""
+        if "role" in fields:
+            new_type = str(fields.get("role") or "").strip()
+            # The type becomes part of a key name assembled inside Lua, which
+            # cannot run _safe(). Restricting it to the known RoleType values
+            # is stricter than _safe would be and rejects anything that could
+            # reshape the key.
+            #
+            # The empty string is rejected too, not treated as "no change".
+            # An update that says ``{"role": ""}`` is asking to blank the
+            # type: the document would be written with no role — which
+            # ``access_control`` reads as a denial — while the index kept
+            # pointing at the old type, breaking the very agreement this
+            # method exists to maintain. A caller that does not mean to
+            # change the type omits the key.
+            if new_type not in _VALID_ROLE_TYPES:
+                raise ValueError(
+                    f"Unknown role type {new_type!r}; expected one of "
+                    f"{sorted(_VALID_ROLE_TYPES)}"
+                )
+
+        args: List[str] = [
+            role_id,
+            str(_now_ms()),
+            RK.rbac_role_type_index_prefix(org, sup),
+            new_type,
+        ]
+        for field, value in fields.items():
+            args.append(str(field))
+            args.append(self._rbac_serialize(value))
+
+        result = self._rbac_update_role(
+            keys=[
+                RK.rbac_role_doc(org, sup, role_id),
+                RK.rbac_role_meta(org, sup),
+            ],
+            args=args,
+        )
+        if int(result or 0) != 1:
             raise ValueError(f"Role {role_id} does not exist")
-        redis_data = {k: self._rbac_serialize(v) for k, v in fields.items()}
-        redis_data["modified_ms"] = str(_now_ms())
-        self.r.hset(key, mapping=redis_data)
-        self._rbac_bump(RK.rbac_role_meta(org, sup))
 
     def rbac_delete_role(self, org: str, sup: str, role_id: str) -> bool:
         """Atomically delete a role, strip from users, and clean name→id mapping."""

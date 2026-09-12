@@ -814,6 +814,26 @@ def rbac_role_type_index(org: str, sup: str, role_type: str) -> str:
     )
 
 
+def rbac_role_type_index_prefix(org: str, sup: str) -> str:
+    """Prefix for :func:`rbac_role_type_index`, for use inside Lua.
+
+    A role-type change has to leave one index set and join another, and the
+    set it leaves is only knowable by reading the stored type — which must
+    happen inside the same atomic step as the move, so the key is assembled
+    in Lua from this prefix.
+
+    The appended segment is a role type, and the caller is responsible for
+    rejecting anything that is not a known ``RoleType`` value before passing
+    it (``RedisCatalog.rbac_update_role`` does). That is the same contract
+    ``_safe('role_type', ...)`` enforces above, moved to the call site because
+    Lua cannot run it.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac:roles:type:doc:"
+    )
+
+
 # --- Schema ---------------------------------------------------------------- #
 
 def schema(org: str, sup: str, simple: str) -> str:
