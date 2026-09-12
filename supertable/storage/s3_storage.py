@@ -301,6 +301,23 @@ class S3Storage(StorageInterface):
             self.secure = parsed.scheme != "http"
 
     def _call(self, method: str, **kwargs: Any) -> Any:
+        # A file-like Body is consumed by the first attempt, so a retry that
+        # re-sends it uploads ZERO BYTES and reports success — measured as
+        # [6049, 0] across the two attempts. put_object returns an ETag either
+        # way, so nothing downstream notices until the object is read back.
+        #
+        # Only write_parquet passes a stream (write_bytes/write_json pass real
+        # bytes, which are re-sendable), which is why this only ever corrupted
+        # data files. Recording the start offset lets the retry rewind; a body
+        # that cannot be rewound is refused rather than silently truncated.
+        body = kwargs.get("Body")
+        body_start = None
+        if body is not None and hasattr(body, "seek") and hasattr(body, "tell"):
+            try:
+                body_start = body.tell()
+            except Exception:
+                body_start = None
+
         attempts = 0
         while True:
             try:
@@ -311,6 +328,17 @@ class S3Storage(StorageInterface):
 
                 error_resp = e.response.get("Error", {}) or {}
                 code = error_resp.get("Code")
+
+                if body is not None and not isinstance(body, (bytes, bytearray)):
+                    if body_start is None:
+                        # Not rewindable: retrying would upload nothing. Fail
+                        # with the original error rather than store an empty
+                        # object and call it a success.
+                        raise
+                    try:
+                        body.seek(body_start)
+                    except Exception:
+                        raise e from None
 
                 # Check for redirect codes.
                 if code not in (

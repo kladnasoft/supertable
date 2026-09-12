@@ -433,7 +433,11 @@ def test_streamed_query_is_recorded_in_monitoring_on_close():
         dr.extend_execution_plan = original
 
     assert len(seen) == 1, f"expected one monitoring entry, got {len(seen)}"
-    assert seen[0]["result_shape"] == (rows, 11), seen[0]["result_shape"]
+    # Column count read from the schema, not hardcoded: the fixture table gains
+    # columns when the pruning corpus is extended, and a literal here breaks on
+    # a change that has nothing to do with monitoring.
+    assert seen[0]["result_shape"] == (rows, len(handle.schema)), (
+        seen[0]["result_shape"])
     assert rows == D.table_row_counts()["facts"]
 
 
@@ -558,3 +562,75 @@ def test_shutdown_is_safe_with_nothing_running():
         assert shutdown(timeout=1.0) == 0
     finally:
         _SHUTTING_DOWN.clear()
+
+
+# --------------------------------------------------------------------------
+# Duplicate column names (audit H3)
+# --------------------------------------------------------------------------
+
+def test_join_with_duplicate_column_names_works_both_ways():
+    """The same query must not succeed streamed and fail buffered.
+
+    Arrow permits duplicate field names and DuckDB produces them routinely —
+    a join on a shared key yields two columns of that name. polars refuses to
+    build a frame from that, so execute() raised DuplicateError while stream()
+    returned the rows: identical SQL, two outcomes, decided only by how the
+    caller asked. A regression from the pandas->polars move.
+    """
+    from supertable.data_reader import DataReader, engine
+    from supertable.engine.arrow_result import materialize
+
+    sql = ("SELECT * FROM facts f JOIN customers c ON f.cust_id = c.cust_id "
+           "LIMIT 5")
+
+    buffered, status, msg = DataReader(
+        super_name=D.SUPER, organization=D.ORG, query=sql, source="sdk",
+    ).execute(role_name=D.ROLE, with_scan=False, engine=engine.AUTO)
+    assert str(status).endswith("OK"), msg
+
+    streamed = materialize(DataReader(
+        super_name=D.SUPER, organization=D.ORG, query=sql, source="sdk",
+    ).stream(role_name=D.ROLE))
+
+    assert len(buffered) == len(streamed) == 5
+    assert list(buffered.columns) == list(streamed.columns)
+
+
+def test_the_duplicate_is_suffixed_not_dropped():
+    """Both columns carry real and different data, so neither may be lost.
+
+    The first keeps the bare name so an unambiguous reference still resolves.
+    """
+    from supertable.data_reader import DataReader, engine
+
+    df, status, msg = DataReader(
+        super_name=D.SUPER, organization=D.ORG,
+        query="SELECT * FROM facts f JOIN customers c ON f.cust_id = c.cust_id "
+              "LIMIT 3",
+        source="sdk",
+    ).execute(role_name=D.ROLE, with_scan=False, engine=engine.AUTO)
+
+    assert str(status).endswith("OK"), msg
+    assert "cust_id" in df.columns and "cust_id_1" in df.columns
+    assert len(set(df.columns)) == len(df.columns), "names must be unique"
+
+
+def test_unique_column_names_are_left_alone():
+    """The common case must be untouched — no suffixes, no renaming."""
+    from supertable.engine.arrow_result import deduplicate_column_names
+    import pyarrow as pa
+
+    table = pa.table({"a": [1], "b": [2]})
+    assert deduplicate_column_names(table) is table
+
+
+def test_a_suffix_that_would_collide_is_skipped():
+    """If `id_1` already exists, the duplicate `id` must not overwrite it."""
+    from supertable.engine.arrow_result import deduplicate_column_names
+    import pyarrow as pa
+
+    table = pa.table({"id": [1], "id_1": [2]}).append_column(
+        "id", pa.array([3]))
+    out = deduplicate_column_names(table)
+    assert len(set(out.schema.names)) == 3
+    assert out.schema.names[1] == "id_1", "the pre-existing column keeps its name"

@@ -2461,3 +2461,85 @@ def tearDownModule():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRetryDoesNotTruncateTheBody(unittest.TestCase):
+    """Audit H5 — the redirect retry uploaded zero bytes and reported success.
+
+    A file-like Body is consumed by the first attempt. The retry re-sent the
+    same exhausted stream, so put_object stored an EMPTY object and returned an
+    ETag; nothing noticed until the file was read back. Measured as [6049, 0]
+    across the two attempts.
+
+    Only write_parquet passes a stream — write_bytes and write_json pass real
+    bytes, which are re-sendable — so this only ever corrupted data files.
+    """
+
+    def _storage(self, put):
+        from supertable.storage.s3_storage import S3Storage
+
+        st = S3Storage.__new__(S3Storage)
+        st.client = MagicMock()
+        st.client.put_object = put
+        st.bucket_name = "b"
+        st.region = "us-east-1"
+        st._endpoint_url_arg = None
+        st._extract_expected_region_from_error = lambda e: "eu-west-1"
+        st._probe_bucket_region = lambda: None
+        st._extract_expected_endpoint_url_from_error = lambda e: None
+        st._extract_expected_endpoint_url_from_location_header = lambda e: None
+        st._aws_endpoint_region = lambda u: None
+        st._rebuild_client = lambda *a, **k: None
+        st._build_client = lambda *a, **k: st.client
+        return st
+
+    def _redirect_once(self, sent):
+        from botocore.exceptions import ClientError
+
+        def put(**kw):
+            body = kw["Body"]
+            data = body.read() if hasattr(body, "read") else body
+            sent.append(len(data))
+            if len(sent) == 1:
+                raise ClientError(
+                    {"Error": {"Code": "PermanentRedirect"}}, "PutObject")
+            return {"ETag": "ok"}
+
+        return put
+
+    def test_retry_resends_the_whole_body(self):
+        sent = []
+        st = self._storage(self._redirect_once(sent))
+        st._call("put_object", Bucket="b", Key="k",
+                 Body=io.BytesIO(b"x" * 6049))
+        self.assertEqual(sent, [6049, 6049],
+                         "the retry must re-send the body, not an empty stream")
+
+    def test_bytes_body_is_unaffected(self):
+        """write_bytes/write_json pass real bytes and were never at risk."""
+        sent = []
+        st = self._storage(self._redirect_once(sent))
+        st._call("put_object", Bucket="b", Key="k", Body=b"y" * 100)
+        self.assertEqual(sent, [100, 100])
+
+    def test_an_unrewindable_body_fails_rather_than_truncating(self):
+        """A stream that cannot seek would upload nothing on the retry.
+
+        Failing with the original error is correct; storing an empty object and
+        calling it a success is what this fix exists to stop.
+        """
+        from botocore.exceptions import ClientError
+
+        class NoSeek:
+            def __init__(self):
+                self._data = b"z" * 10
+
+            def read(self, *a):
+                data, self._data = self._data, b""
+                return data
+
+        sent = []
+        st = self._storage(self._redirect_once(sent))
+        with self.assertRaises(ClientError):
+            st._call("put_object", Bucket="b", Key="k", Body=NoSeek())
+        self.assertEqual(len(sent), 1, "it must not retry an unrewindable body")

@@ -88,6 +88,42 @@ def normalize_arrow_types(table: pa.Table, *, for_pandas: bool = False) -> pa.Ta
             return table          # leave it as Decimal rather than lose data
 
 
+def deduplicate_column_names(table: pa.Table) -> pa.Table:
+    """Give repeated column names a suffix, as SQL engines do.
+
+    Arrow permits duplicate field names and DuckDB produces them routinely —
+    ``SELECT * FROM a JOIN b ON a.id = b.id`` yields two columns called ``id``.
+    polars refuses to build a frame from that, so an ordinary join raised
+    DuplicateError through ``execute()`` while ``stream()`` returned the rows
+    unbothered: the same query, two different outcomes, depending only on how
+    the caller asked for it.
+
+    Renaming rather than dropping, because both columns carry real and
+    different data. The first occurrence keeps the bare name so an unambiguous
+    reference still resolves; later ones take ``_1``, ``_2``, which is what the
+    pandas path did before the polars migration. A suffix that would itself
+    collide is skipped rather than silently overwriting.
+    """
+    names = table.schema.names
+    if len(set(names)) == len(names):
+        return table                       # the overwhelmingly common case
+
+    taken = set()
+    renamed: List[str] = []
+    for name in names:
+        if name not in taken:
+            renamed.append(name)
+            taken.add(name)
+            continue
+        n = 1
+        while f"{name}_{n}" in taken or f"{name}_{n}" in names:
+            n += 1
+        renamed.append(f"{name}_{n}")
+        taken.add(f"{name}_{n}")
+    logger.debug(f"[arrow] duplicate column names resolved: {names} -> {renamed}")
+    return table.rename_columns(renamed)
+
+
 def batches_to_polars(batches: List[pa.RecordBatch],
                       schema: Optional[pa.Schema] = None):
     """Assemble streamed batches into one polars frame.
@@ -101,11 +137,11 @@ def batches_to_polars(batches: List[pa.RecordBatch],
     if not batches:
         if schema is None:
             return pl.DataFrame()
-        return pl.from_arrow(
-            normalize_arrow_types(schema.empty_table(), for_pandas=False))
+        return pl.from_arrow(deduplicate_column_names(
+            normalize_arrow_types(schema.empty_table(), for_pandas=False)))
     table = normalize_arrow_types(pa.Table.from_batches(batches, schema=schema),
                                   for_pandas=False)
-    return pl.from_arrow(table)
+    return pl.from_arrow(deduplicate_column_names(table))
 
 
 def materialize(handle):

@@ -38,6 +38,29 @@ from typing import List, Tuple
 
 
 
+class ReadAccessUnavailable(RuntimeError):
+    """A control the read depends on could not be established.
+
+    Raised instead of returning rows when the deletion vector or a share row
+    filter cannot be resolved. Both are enforced by views the reader builds, so
+    failing to build one does not degrade the result — it removes the control
+    entirely, and the rows it would have hidden are exactly the rows nobody is
+    supposed to see.
+
+    A subclass per control so a caller can tell "stale deletes may be visible"
+    from "another tenant's rows may be visible"; the second is the more urgent
+    page.
+    """
+
+
+class DeletionVectorUnavailable(ReadAccessUnavailable):
+    """The deletion vector could not be read; deleted rows would reappear."""
+
+
+class ShareFilterUnavailable(ReadAccessUnavailable):
+    """A share row filter could not be read; the full table would be served."""
+
+
 class DataReader:
     """
     Facade — preserves the original interface; now delegates:
@@ -354,7 +377,19 @@ class DataReader:
                                     cache_key=str(tomb_path),
                                 )
                     except Exception as te:
-                        logger.debug(self._lp(f"[tombstone] leaf lookup failed for {td.alias}: {te}"))
+                        # FAIL THE READ. This lookup establishes the deletion
+                        # vector; without it the executor has nothing to
+                        # anti-join and every deleted row comes back. Swallowing
+                        # it returned resurrected rows under Status.OK with a
+                        # DEBUG line nobody reads — a Redis hiccup silently
+                        # undid every delete the table had ever recorded.
+                        #
+                        # "Could not determine the deletion vector" is not
+                        # "there is no deletion vector".
+                        raise DeletionVectorUnavailable(
+                            f"cannot establish the deletion vector for "
+                            f"{td.super_name}.{td.simple_name}: {te}"
+                        ) from te
 
                     # Linked-share row filter: the provider may have set a
                     # row_filter on the share.  Inject it as a synthetic RBAC
@@ -376,9 +411,28 @@ class DataReader:
                                         where_clause=share_row_filter,
                                     )
                     except Exception as rf_err:
-                        logger.debug(self._lp(f"[share-filter] row filter injection failed for {td.alias}: {rf_err}"))
+                        # FAIL THE READ, for the same reason and more sharply:
+                        # a share row filter is what keeps one tenant's rows out
+                        # of another's result. Dropping it on an exception
+                        # served the full table. odata/policy.py calls this
+                        # "the one direction this must never fail in" — the
+                        # fingerprint obeyed that; this did not.
+                        raise ShareFilterUnavailable(
+                            f"cannot establish the share row filter for "
+                            f"{td.super_name}.{td.simple_name}: {rf_err}"
+                        ) from rf_err
 
+            except ReadAccessUnavailable:
+                # A control could not be established. The two handlers inside
+                # this block raise deliberately; catching them here would
+                # restore exactly the fail-open behaviour they exist to remove
+                # — the reason H2 needed THREE handlers fixed, not two.
+                raise
             except Exception as e:
+                # Everything else here is genuinely optional (dedup config),
+                # so degrading is correct: it changes which rows are shown
+                # only in ways the caller asked for, not which rows are
+                # ALLOWED to be shown.
                 logger.warning(self._lp(f"[dedup] config lookup failed, skipping dedup: {e}"))
 
             if not reflection.supers:
