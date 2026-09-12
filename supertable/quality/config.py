@@ -48,7 +48,7 @@ from supertable import redis_keys as RK
 
 
 def _dq_key(org: str, sup: str, *parts: str) -> str:
-    return RK.quality_prefix(org, sup) + ":".join(parts)
+    return RK.quality_doc(org, sup, *parts)
 
 
 # ──────────────────────────────────────────────────────────────────────

@@ -523,3 +523,66 @@ def test_no_raw_fstring_keys_outside_redis_keys():
         "Move every key constructor to supertable/redis_keys.py.\n"
         + "\n".join(f"  {p}:{ln}: {ln_text}" for p, ln, ln_text in offenders)
     )
+
+
+# ---------------------------------------------------------------------------
+# The other way to build a key: append to a validated prefix
+# ---------------------------------------------------------------------------
+
+_PREFIX_APPEND = re.compile(
+    r"RK\.\w*prefix\w*\s*\([^)]*\)\s*(?:\+|%)"       # RK.x_prefix(...) + ...
+    r"|RK\.\w*prefix\w*\s*\([^)]*\)\s*\.\s*(?:join|format)\b"
+)
+
+
+def test_no_key_built_by_appending_to_a_prefix():
+    """A validated prefix plus unvalidated text is still an unvalidated key.
+
+    The f-string guard above scans for the literal ``supertable:``, so it only
+    sees keys written out in full. It missed three real offenders that took a
+    correctly-built prefix and appended to it:
+
+        RK.quality_prefix(org, sup) + f"pending:{table}"
+        RK.quality_prefix(org, sup) + ":".join(parts)
+
+    The prefix is safe; the appended segment never passed ``_safe``. A table
+    name containing a colon would write outside its own namespace, and one
+    containing a glob character would make a later SCAN match keys it does not
+    own — which is how a cleanup deletes someone else's data.
+
+    Key construction belongs in redis_keys.py in full, not in halves.
+    """
+    offenders: list[tuple[str, int, str]] = []
+    for path in _iter_source_files():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if line.lstrip().startswith("#"):
+                continue
+            if _PREFIX_APPEND.search(line):
+                offenders.append((str(path), lineno, line.strip()))
+
+    assert not offenders, (
+        "Redis keys built by appending to a prefix — the appended segment is "
+        "never validated. Add a constructor in supertable/redis_keys.py that "
+        "builds the whole key through _safe().\n"
+        + "\n".join(f"  {p}:{ln}: {t}" for p, ln, t in offenders)
+    )
+
+
+def test_the_appending_guard_actually_catches_the_shape():
+    """Guard the guard: a rule nobody has seen fire is not a rule."""
+    for bad in (
+        'return RK.quality_prefix(org, sup) + f"pending:{table}"',
+        'return RK.quality_prefix(org, sup) + ":".join(parts)',
+        'key = RK.audit_prefix(org) % table',
+    ):
+        assert _PREFIX_APPEND.search(bad), bad
+    for good in (
+        "return RK.quality_table_key(org, sup, 'pending', table)",
+        "prefix = RK.quality_prefix(org, sup)",
+        "keys = [RK.meta_leaf(org, sup, t) for t in tables]",
+    ):
+        assert not _PREFIX_APPEND.search(good), good

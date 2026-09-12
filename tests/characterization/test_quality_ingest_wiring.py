@@ -35,6 +35,8 @@ import uuid
 import pyarrow as pa
 import pytest
 
+from supertable import redis_keys as RK
+
 from supertable.data_writer import DataWriter
 from supertable.quality import scheduler as dq_scheduler
 from supertable.quality.config import DQConfig
@@ -119,7 +121,7 @@ def test_repeated_writes_keep_single_pending_flag(hermetic_fakeredis):
                  overwrite_columns=[])
 
     # One scalar key for the table — not one per write.
-    matches = fake.keys(_pending_key(ORG, SUPER, "*"))
+    matches = fake.keys(RK.quality_table_pattern(ORG, SUPER, "pending"))
     assert matches == [key], matches
 
 
@@ -165,7 +167,7 @@ def test_write_sets_no_pending_flag_by_default(hermetic_fakeredis):
              overwrite_columns=[])
 
     assert fake.get(_pending_key(ORG, SUPER, simple)) is None
-    assert fake.keys(_pending_key(ORG, SUPER, "*")) == []
+    assert fake.keys(RK.quality_table_pattern(ORG, SUPER, "pending")) == []
 
 
 def test_default_schedule_reports_disabled(hermetic_fakeredis):

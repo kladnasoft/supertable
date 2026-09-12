@@ -741,15 +741,15 @@ from supertable import redis_keys as RK
 
 
 def _pending_key(org: str, sup: str, table: str) -> str:
-    return RK.quality_prefix(org, sup) + f"pending:{table}"
+    return RK.quality_table_key(org, sup, "pending", table)
 
 
 def _running_key(org: str, sup: str, table: str) -> str:
-    return RK.quality_prefix(org, sup) + f"running:{table}"
+    return RK.quality_table_key(org, sup, "running", table)
 
 
 def _cooldown_key(org: str, sup: str, table: str) -> str:
-    return RK.quality_prefix(org, sup) + f"cooldown:{table}"
+    return RK.quality_table_key(org, sup, "cooldown", table)
 
 
 # ──────────────────────────────────────────────────────────────────────

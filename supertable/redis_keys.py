@@ -131,8 +131,10 @@ SYSTEM_SCOPE: str = "system"
 # ``supertable:{org}:lakes:{sup}:*``.
 LAKES_SCOPE: str = "lakes"
 
-#: Org-level scope for streaming query jobs. A query may span supertables, so
-#: a job cannot live under any single lake.
+#: Org-level scope for streaming query jobs, alongside SYSTEM_SCOPE,
+#: LAKES_SCOPE and MONITOR_SCOPE. Org-level rather than lake-level because a
+#: query may span supertables — a qualified join across two of them resolves to
+#: both — so a job cannot live under any single lake.
 QUERY_SCOPE: str = "query"
 
 # Position-2 literal under ``supertable:{org}:`` for org-wide runtime
@@ -661,17 +663,32 @@ def query_job_cancel(org: str, job_id: str) -> str:
 
 
 def query_job_index(org: str) -> str:
-    """Set of live job ids in this organization (SET)."""
-    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{QUERY_SCOPE}:job:index"
+    """Set of live job ids in this organization (SET).
+
+    Under ``jobs:`` (plural), NOT ``job:``. It is a registry OF jobs, not a key
+    belonging to one, and the distinction is load-bearing: ``query_job_pattern``
+    sweeps ``job:*`` to find every job key, and with the index inside that
+    namespace a cleanup would have deleted the registry for every job in the
+    organization along with the one it meant to remove.
+    """
+    return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{QUERY_SCOPE}:jobs:index"
 
 
 def query_job_pattern(org: str) -> str:
-    """SCAN pattern matching every key belonging to any job in this org."""
+    """SCAN pattern matching every key belonging to any job in this org.
+
+    Deliberately does not match the index, which lives under ``jobs:``.
+    """
     return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{QUERY_SCOPE}:job:*"
 
 
 def query_job_subkey_pattern(org: str, job_id: str) -> str:
-    """SCAN pattern matching every key belonging to ONE job."""
+    """SCAN pattern matching every key belonging to ONE job.
+
+    Every job key ends in the job id, and the index does not — it lives under
+    ``jobs:`` rather than ``job:`` precisely so a job-shaped pattern cannot
+    reach it.
+    """
     return (f"{SUPERTABLE_PREFIX}:{_safe('org', org)}"
             f":{QUERY_SCOPE}:job:*:{_safe('job_id', job_id)}")
 
@@ -826,6 +843,42 @@ def linked_share_doc(org: str, sup: str, link_id: str) -> str:
 
 
 # --- Data Quality (dataisland-core quality module owns its sub-structure) #
+
+def quality_table_key(org: str, sup: str, kind: str, table: str) -> str:
+    """A per-table data-quality key: pending / running / cooldown.
+
+    These lived in ``quality/scheduler.py`` as ``quality_prefix(...) +
+    f"pending:{table}"``. Appending to the prefix looks harmless but skips
+    ``_safe``, so the one segment that comes from a caller — the table name —
+    was the only unvalidated segment in the whole key scheme. A name containing
+    a colon or a glob character would have written outside its own namespace,
+    or made a later SCAN match keys it does not own.
+    """
+    return (f"{quality_prefix(org, sup)}"
+            f"{_safe('kind', kind)}:{_safe('simple', table)}")
+
+
+def quality_table_pattern(org: str, sup: str, kind: str) -> str:
+    """SCAN pattern over every table's key of one data-quality kind.
+
+    A pattern is built HERE rather than by passing ``"*"`` as a table name.
+    That distinction is the whole point of validating segments: a value slot
+    that accepts a glob is a value slot that can be made to match keys the
+    caller does not own. Callers that want a wildcard have to ask for one.
+    """
+    return f"{quality_prefix(org, sup)}{_safe('kind', kind)}:*"
+
+
+def quality_doc(org: str, sup: str, *parts: str) -> str:
+    """A data-quality document key built from validated segments.
+
+    Replaces ``quality_prefix(...) + ":".join(parts)`` in ``quality/config.py``,
+    which joined caller-supplied parts with no validation at all.
+    """
+    return quality_prefix(org, sup) + ":".join(
+        _safe("part", p) for p in parts if p
+    )
+
 
 def quality_prefix(org: str, sup: str) -> str:
     """Per-supertable data-quality namespace prefix (with trailing colon).

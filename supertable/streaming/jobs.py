@@ -208,7 +208,19 @@ class JobStore:
         key = RK.query_job_doc(rec.organization, rec.job_id)
         mapping = {k: ("1" if v is True else "0" if v is False else str(v))
                    for k, v in fields.items()}
-        self._r.hset(key, mapping=mapping)
+        # The TTL is refreshed on every update, so it measures time since the
+        # job last made progress rather than time since it started. Without
+        # this the doc expired a fixed interval after creation no matter how
+        # long the export was still running — and `reap()` treats a missing doc
+        # as an orphan, so it would delete a LIVE export's spilled chunks out
+        # from under the consumer reading them.
+        #
+        # A job that genuinely stalls still expires, because a stalled job
+        # stops calling update().
+        pipe = self._r.pipeline()
+        pipe.hset(key, mapping=mapping)
+        pipe.expire(key, settings.SUPERTABLE_STREAM_JOB_TTL_SEC)
+        pipe.execute()
 
     def set_state(self, rec: JobRecord, state: str, error: str = "") -> None:
         self.update(rec, state=state, error=error[:2000])
