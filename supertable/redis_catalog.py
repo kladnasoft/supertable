@@ -26,6 +26,26 @@ def _now_ms() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Login-token marker
+# ---------------------------------------------------------------------------
+#
+# Every credential minted by :meth:`RedisCatalog.create_auth_token` starts with
+# this. Two reasons, neither of them cryptographic:
+#
+#   * a leaked token is identifiable as a SuperTable credential without having
+#     to try it against a server, so it can be revoked by whoever finds it;
+#   * secret scanners (GitHub, GitLab, trufflehog) match on fixed prefixes, so
+#     a token committed to a repo gets caught at push time.
+#
+# Validation deliberately does NOT require the prefix. Token verification is
+# ``sha256(whatever the caller presents)`` against a stored digest, so tokens
+# issued before this marker existed keep working untouched — the alternative
+# would be a flag day that logs out every existing session to gain nothing.
+# The prefix is a property of NEW tokens, not a format rule for old ones.
+LOGIN_TOKEN_PREFIX = "st_login_"
+
+
+# ---------------------------------------------------------------------------
 # Role-name safety check
 # ---------------------------------------------------------------------------
 #
@@ -1029,8 +1049,13 @@ return 1
         time, ``validate_auth_token_full`` returns None.  ``None`` (default)
         means the token never expires by time alone — it can still be
         disabled via ``enabled=False``.
+
+        The plaintext carries the :data:`LOGIN_TOKEN_PREFIX` marker so that a
+        leaked token is recognisable as a SuperTable credential on sight and by
+        secret scanners.  The prefix is not a secret and adds no entropy; the
+        192 bits after it are the whole of the strength.
         """
-        token = secrets.token_urlsafe(24)
+        token = LOGIN_TOKEN_PREFIX + secrets.token_urlsafe(24)
         token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
         meta = {
             "token_id": token_id,
