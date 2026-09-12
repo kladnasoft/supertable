@@ -2,8 +2,15 @@
 
 from typing import Any, Dict, List, Tuple
 
+import redis as _redis
+
 from supertable.config.defaults import logger
 from supertable.data_classes import TableDefinition
+# Imported at module scope, not per call: ``_check_readonly_guard`` runs on
+# every write, and both of these were function-local — a needless sys.modules
+# lookup and frame setup on the hot path. No cycle: ``redis_catalog`` imports
+# ``rbac.permissions`` (a leaf) and never imports this module.
+from supertable.redis_catalog import RedisCatalog
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.permissions import has_permission, Permission, RoleType
 from supertable.rbac.filter_builder import FilterBuilder
@@ -156,10 +163,7 @@ def _check_readonly_guard(super_name: str, organization: str, label: str) -> Non
     normally because it reads a different key. An unverifiable flag is not an
     absent flag.
     """
-    import redis as _redis
-
     try:
-        from supertable.redis_catalog import RedisCatalog
         root = RedisCatalog().get_root(organization, super_name)
     except _redis.RedisError:
         return  # Redis is down; the role lookup below will fail too.
