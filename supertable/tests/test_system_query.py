@@ -17,7 +17,7 @@ from supertable.system_query import classify_query, CommandKind, SystemCommand
 # SELECT fall-through — everything that isn't EXPLAIN/SHOW STATS
 # ---------------------------------------------------------------------------
 
-class TestSelectFallThrough:
+class TestNonReadsAreRefused:
 
     def test_plain_select_preserved_verbatim(self):
         raw = "SELECT id, value FROM s.t WHERE id > 5"
@@ -58,23 +58,28 @@ class TestSelectFallThrough:
         cmd = classify_query("   \t\n ", "ds")
         assert cmd.kind is CommandKind.SELECT
 
-    def test_non_select_dml_falls_through_unchanged(self):
-        # DELETE/INSERT are NOT special-cased here; they fall through to the
-        # SELECT path and are rejected downstream exactly as before.
-        raw = "DELETE FROM t WHERE id = 1"
-        cmd = classify_query(raw, "ds")
-        assert cmd.kind is CommandKind.SELECT
-        assert cmd.sql == raw
+    def test_non_select_dml_is_refused_here(self):
+        # WAS: "falls through to the SELECT path and is rejected downstream".
+        # That fall-through is exactly what made the read path unsafe — any
+        # text naming one real table ran verbatim, which put DuckDB's file
+        # functions inside the read path and outside every access control.
+        # Non-reads are refused at admission now, before the engine sees them.
+        with pytest.raises(ValueError, match="not permitted on the read path"):
+            classify_query("DELETE FROM t WHERE id = 1", "ds")
 
     def test_show_statsfoo_not_misclassified(self):
-        # Word-boundary guard: SHOW STATSFOO is not SHOW STATS.
-        cmd = classify_query("SHOW STATSFOO", "ds")
-        assert cmd.kind is CommandKind.SELECT
+        # Word-boundary guard: SHOW STATSFOO is not SHOW STATS. It is also not
+        # a read, so admission refuses it — the point of the test is that it
+        # does not become a SHOW STATS command, which still holds.
+        with pytest.raises(ValueError):
+            classify_query("SHOW STATSFOO", "ds")
 
-    def test_explain_alone_no_inner_falls_through(self):
-        # "EXPLAIN" with no following statement does not match the EXPLAIN rule.
-        cmd = classify_query("EXPLAIN", "ds")
-        assert cmd.kind is CommandKind.SELECT
+    def test_explain_alone_does_not_match_the_explain_rule(self):
+        # "EXPLAIN" with no following statement is not an EXPLAIN command. It is
+        # also not a read, so admission refuses it rather than passing the bare
+        # word to the engine.
+        with pytest.raises(ValueError):
+            classify_query("EXPLAIN", "ds")
 
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,10 @@ behaviour of ordinary queries — it only *adds* the two new prefixes.
 
 from __future__ import annotations
 
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import ParseError
+
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -81,6 +85,92 @@ def _unquote(ident: str) -> str:
     return ident
 
 
+# ---------------------------------------------------------------------------
+# Read-path admission control
+# ---------------------------------------------------------------------------
+
+#: Statement roots a read may have. Anything else — COPY, ATTACH, INSTALL, SET,
+#: PRAGMA, CALL, EXPORT, DDL, DML — is not a read and is refused outright.
+_READ_ROOTS = (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.Subquery)
+
+
+def assert_read_only(sql: str) -> None:
+    """Refuse anything that is not a plain read of real tables.
+
+    WHY THIS EXISTS
+
+    Everything that protects a row or a column in this library lives in a VIEW
+    the reader builds: the deletion vector is an anti-join, RBAC is a filtered
+    view over the reflection, and a share filter is merged into that view. A
+    query that never references those views is not restricted by them — it is
+    simply outside the system.
+
+    DuckDB can read files directly, so before this guard existed a query could
+    step around the whole chain:
+
+        SELECT p.* FROM read_parquet(['<data file>']) p
+         WHERE EXISTS (SELECT 1 FROM orders)
+
+    The EXISTS clause names one real table, which was enough for the query to be
+    accepted; the projection then came from the raw parquet. That returned a
+    masked column, __rowid__, and a row the deletion vector had removed. On
+    object storage it reads with the engine's own credentials, so it crosses
+    tenants. ``read_csv('/etc/hostname')`` and ``COPY ... TO`` were reachable the
+    same way.
+
+    ALLOW-LIST, NOT BLOCK-LIST
+
+    Naming the dangerous functions would be a losing game — DuckDB adds more,
+    and an extension adds its own. The rule is instead positive and small: the
+    statement must be a read, and every FROM/JOIN source must be a named table.
+
+    The AST makes that distinction cleanly. A real table parses as
+    ``Table(this=Identifier)``; every table function parses as ``Table`` whose
+    ``this`` is a function node instead. So "is this an identifier" is the whole
+    test, and it holds for forms nobody has thought of yet.
+
+    Raises ValueError, which the reader already turns into Status.ERROR.
+    """
+    text = (sql or "").strip()
+    if not text:
+        return                      # empty defers to SQLParser's own error
+
+    try:
+        statements = [st for st in sqlglot.parse(text, read="duckdb") if st]
+    except ParseError as e:
+        # Unparseable SQL is refused here rather than handed to the engine:
+        # "the parser could not read it" must not mean "let DuckDB try".
+        raise ValueError(f"could not parse query: {e}") from e
+
+    if not statements:
+        return
+    if len(statements) > 1:
+        # One request is one statement. Anything else is a chain, and a chain is
+        # how an injected payload arrives.
+        raise ValueError(
+            "only a single statement may be submitted; found "
+            f"{len(statements)}"
+        )
+
+    root = statements[0]
+    if not isinstance(root, _READ_ROOTS):
+        raise ValueError(
+            f"{type(root).__name__.upper()} is not permitted on the read path; "
+            f"only SELECT queries are"
+        )
+
+    for table in root.find_all(exp.Table):
+        inner = table.this
+        if not isinstance(inner, exp.Identifier):
+            # A table function: read_parquet, read_csv, glob, an extension's
+            # own, or one that does not exist yet.
+            name = type(inner).__name__ if inner is not None else "?"
+            raise ValueError(
+                "only named tables may be queried; table functions such as "
+                f"{name.lower()}() are not permitted on the read path"
+            )
+
+
 def classify_query(query: str, default_super: str) -> SystemCommand:
     """Classify *query* into an allowed read-path command.
 
@@ -123,6 +213,9 @@ def classify_query(query: str, default_super: str) -> SystemCommand:
         inner = m.group("inner").strip()
         if not _SELECT_INNER_RE.match(inner):
             raise ValueError("EXPLAIN is only supported for SELECT statements.")
+        # EXPLAIN reaches the same engine with the same text, so it is admitted
+        # on the same terms — otherwise it is a hole the shape of the guard.
+        assert_read_only(inner)
         options = "ANALYZE" if m.group("opts") else ""
         return SystemCommand(
             kind=CommandKind.EXPLAIN,
@@ -131,5 +224,8 @@ def classify_query(query: str, default_super: str) -> SystemCommand:
             explain_options=options,
         )
 
-    # Ordinary query — unchanged SELECT path (raw text preserved verbatim).
+    # Ordinary query. Admission-checked first: until this guard existed, any
+    # text that named one real table ran verbatim, which put DuckDB's file
+    # functions inside the read path and outside every access control.
+    assert_read_only(raw)
     return SystemCommand(kind=CommandKind.SELECT, sql=raw)
