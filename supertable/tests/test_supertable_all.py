@@ -873,6 +873,16 @@ class TestSuperTableReadSnapshot:
 class TestSuperTableDelete:
     """Tests for SuperTable.delete."""
 
+    @pytest.fixture(autouse=True)
+    def _allow_control(self, monkeypatch):
+        """Stub the CONTROL gate; these assert storage/catalog effects.
+
+        ``delete`` requires CONTROL, resolved against a real Redis. The gate
+        is covered in ``test_super_table.py::TestDeleteAuthorization``.
+        """
+        monkeypatch.setattr("supertable.super_table.check_control_access",
+                            lambda **kwargs: None)
+
     @patch("supertable.super_table.UserManager")
     @patch("supertable.super_table.RoleManager")
     @patch("supertable.super_table.RedisCatalog")

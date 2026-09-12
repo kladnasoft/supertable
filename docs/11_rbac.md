@@ -11,17 +11,48 @@ HIPAA, SOX) demand fine-grained, auditable access control.
 
 Permissions are defined in `supertable.rbac.permissions` as an `enum.Enum`:
 
-| Permission | `auto()` value | Meaning |
-|------------|---------------|---------|
-| `CONTROL`  | 1             | Destructive DDL -- DROP TABLE, TRUNCATE, etc. |
-| `CREATE`   | 2             | Create new tables or staging areas. |
-| `WRITE`    | 3             | INSERT / UPDATE / DELETE on data rows. |
-| `READ`     | 4             | SELECT -- query data. |
-| `META`     | 5             | Read-only metadata and statistics. |
+| Permission | Meaning | Enforced by |
+|------------|---------|-------------|
+| `RBAC`     | Create / update / delete roles and users. | `check_rbac_access` |
+| `CONTROL`  | Drop an entire SuperTable. | `check_control_access` |
+| `WRITE`    | INSERT / UPDATE / DELETE rows, **create and drop a table**, configure limits, compact. | `check_write_access` |
+| `READ`     | SELECT -- query data. | `restrict_read_access` |
+| `META`     | Read-only metadata and statistics. | `check_meta_access` |
 
 The helper function `has_permission(role_type, permission)` checks whether a
 given `RoleType` includes the requested `Permission` by looking it up in the
 static `ROLE_PERMISSIONS` map.
+
+### There is no CREATE permission
+
+A table is created by writing to a name that does not exist, so `WRITE` is
+what creates it. A role trusted to fill a table is also trusted to drop it,
+so `WRITE` covers the whole table lifecycle. What bounds that power is the
+role's **table grants**, not the permission tier: a writer granted
+`{"orders": ...}` can only ever create or drop `orders`.
+
+`CONTROL` exists for exactly one operation -- dropping the SuperTable --
+because that is the only act which destroys things the writer never created:
+every other table in the lake, and the RBAC configuration itself.
+
+Earlier versions declared a `CREATE` permission and documented it as gating
+table creation for the admin tiers only. It was never checked anywhere, and
+the behaviour it described was never the behaviour: writers have always been
+able to create tables. The enum member has been removed rather than enforced,
+because enforcing it would have broken the intended model.
+
+### Creating a SuperTable cannot be gated
+
+`SuperTable(name, org)` creates the lake if it does not exist, and takes no
+`role_name` at all. This is deliberate and unavoidable: constructing a
+SuperTable is what bootstraps its `superadmin` role, so requiring a role to
+authorise the call is unsatisfiable for the first call -- the role that would
+grant permission is created *by* the operation needing it.
+
+Deciding **whether a given tenant may create a SuperTable at all** is therefore
+the host application's responsibility; this library cannot express it.
+Deleting one is a different matter and *is* gated (`CONTROL`), because by then
+the roles exist.
 
 ---
 
@@ -30,24 +61,69 @@ static `ROLE_PERMISSIONS` map.
 Role types are the coarse-grained privilege tiers.  Each maps to a fixed set
 of permissions:
 
-| RoleType      | Enum value     | Permissions granted | Description |
-|---------------|----------------|---------------------|-------------|
-| `SUPERADMIN`  | `"superadmin"` | ALL (CONTROL, CREATE, WRITE, READ, META) | Unrestricted; bypasses row/column filters. |
-| `ADMIN`       | `"admin"`      | ALL (CONTROL, CREATE, WRITE, READ, META) | Same permissions as SUPERADMIN. |
-| `WRITER`      | `"writer"`     | META, READ, WRITE   | Read and mutate data; no DDL. |
-| `READER`      | `"reader"`     | META, READ          | Read-only with row/column security applied. |
-| `META`        | `"meta"`       | META                | Statistical / metadata access only. |
+| RoleType      | Enum value     | RBAC | CONTROL | WRITE | READ | META | Description |
+|---------------|----------------|:----:|:-------:|:-----:|:----:|:----:|-------------|
+| `SUPERADMIN`  | `"superadmin"` | YES | YES | YES | YES | YES | Unrestricted; bypasses row/column filters. |
+| `ADMIN`       | `"admin"`      | YES | YES | YES | YES | YES | Identical to SUPERADMIN by design. |
+| `WRITER`      | `"writer"`     | --  | --  | YES | YES | YES | Owns its granted tables: create, write, drop. |
+| `READER`      | `"reader"`     | --  | --  | --  | YES | YES | Read-only with row/column security applied. |
+| `META`        | `"meta"`       | --  | --  | --  | --  | YES | Statistical / metadata access only. |
 
-The `ROLE_PERMISSIONS` dict in `permissions.py` encodes this matrix:
+`SUPERADMIN` and `ADMIN` hold identical permissions. That is a decision, not
+an oversight: both tiers administer roles and users, and no operation is
+reserved to one. Both names are kept because roles of type `admin` already
+exist in deployments, and a host may want the distinction for its own
+bookkeeping even though this library draws none.
+
+Each tier is a superset of the one below, so no role can do something a
+nominally higher role cannot.
+
+The `ROLE_PERMISSIONS` dict in `permissions.py` encodes this matrix, with
+every grant written out:
 
 ```python
 ROLE_PERMISSIONS = {
-    RoleType.SUPERADMIN: set(Permission),
-    RoleType.ADMIN:      set(Permission),
-    RoleType.WRITER:     {Permission.META, Permission.READ, Permission.WRITE},
-    RoleType.READER:     {Permission.META, Permission.READ},
+    RoleType.SUPERADMIN: {Permission.RBAC, Permission.CONTROL,
+                          Permission.WRITE, Permission.READ, Permission.META},
+    RoleType.ADMIN:      {Permission.RBAC, Permission.CONTROL,
+                          Permission.WRITE, Permission.READ, Permission.META},
+    RoleType.WRITER:     {Permission.WRITE, Permission.READ, Permission.META},
+    RoleType.READER:     {Permission.READ, Permission.META},
     RoleType.META:       {Permission.META},
 }
+```
+
+The admin tiers are spelled out rather than written `set(Permission)`, which
+is how `CREATE` came to be granted to them without anyone deciding it should
+be: the set comprehension picked up every member the enum declared. A new
+permission must now be granted deliberately, role by role, or it is granted
+to no one.
+
+### The superadmin role is immutable
+
+`_init_role_storage` mints exactly one role of type `superadmin` per
+SuperTable at bootstrap. It cannot be created, promoted to, demoted, or
+deleted by any caller:
+
+| Attempt | Result |
+|---------|--------|
+| `create_role({"role": "superadmin", ...})` | `ValueError` -- the type is reserved |
+| `create_role({"role_name": "superadmin", ...})` | `ValueError` -- the name is reserved |
+| `update_role(other_id, {"role": "superadmin"})` | `ValueError` -- no promotion |
+| `update_role(superadmin_id, {"role": "reader"})` | `ValueError` -- no demotion |
+| `delete_role(superadmin_id)` | `ValueError` -- cannot be deleted |
+
+Both halves of the reservation matter. The **name** was reserved first, but
+the **type** is what enforcement reads: `access_control` takes
+`role_info["role"]` and, for `superadmin`, returns an empty view set -- no row
+filters, no column masks. A role stored as
+`{"role": "superadmin", "role_name": "quarterly_report_viewer"}` passed the
+name check and then had its own `tables` restriction discarded at read time.
+
+Demotion is blocked for a less obvious reason: `delete_role` refuses by
+reading the document's type, so changing the type first made "cannot be
+deleted" bypassable in two calls -- leaving a lake with no superadmin and no
+way to mint a replacement.
 ```
 
 ---

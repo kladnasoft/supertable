@@ -308,6 +308,19 @@ class TestDelete:
     nothing — AUDIT_BUGS C2.  These assert on bucket contents instead.
     """
 
+    @pytest.fixture(autouse=True)
+    def _allow_control(self, monkeypatch):
+        """Stub the CONTROL gate; these tests are about storage, not authz.
+
+        ``delete`` requires CONTROL, and the gate resolves the role through a
+        real ``RoleManager`` against a real Redis — which these tests have no
+        business standing up. Authorization is covered by
+        :class:`TestDeleteAuthorization`, which asserts the gate is reached
+        and that a denial actually stops the deletion.
+        """
+        monkeypatch.setattr("supertable.super_table.check_control_access",
+                            lambda **kwargs: None)
+
     def _seeded(self, sup="sup", org="org"):
         store = FakeObjectStore().seed(
             f"{org}/{sup}/super/meta.json",
@@ -387,10 +400,66 @@ class TestDelete:
         with pytest.raises(ConnectionError, match="redis down"):
             st.delete(role_name="admin")
 
-    def test_role_name_parameter_accepted(self):
-        """delete() accepts role_name param (used by caller for RBAC, not enforced here)."""
-        st = _make_super(storage=FakeObjectStore())
 
-        # Should not raise
-        st.delete(role_name="some_role")
-        st.catalog.delete_super_table.assert_called_once()
+class TestDeleteAuthorization:
+    """``delete`` must require CONTROL, and a denial must stop it.
+
+    This replaces a test called ``test_role_name_parameter_accepted``, whose
+    docstring read "used by caller for RBAC, not enforced here" and which
+    asserted that passing an arbitrary role name deleted the lake anyway. It
+    was an accurate description of the behaviour and encoded the hole as
+    intended: dropping a whole SuperTable was unauthenticated, while dropping
+    one table inside it required WRITE.
+    """
+
+    def test_the_control_gate_is_reached_with_the_right_scope(self):
+        st = _make_super("sup", "org", storage=FakeObjectStore())
+        seen = {}
+
+        with patch("supertable.super_table.check_control_access",
+                   side_effect=lambda **kw: seen.update(kw)):
+            st.delete(role_name="ops_admin")
+
+        assert seen == {
+            "super_name": "sup",
+            "organization": "org",
+            "role_name": "ops_admin",
+            # "*" — this destroys every table at once, so a role granted
+            # specific tables must not qualify.
+            "table_name": "*",
+        }
+
+    def test_a_denial_deletes_nothing(self):
+        """The gate has to run BEFORE the wipe, not alongside it."""
+        store = FakeObjectStore().seed("org/sup/super/meta.json",
+                                       "org/sup/tables/events/data/p0.parquet")
+        st = _make_super("sup", "org", storage=store)
+
+        with patch("supertable.super_table.check_control_access",
+                   side_effect=PermissionError("nope")):
+            with pytest.raises(PermissionError, match="nope"):
+                st.delete(role_name="writer_bot")
+
+        assert store.keys() == [
+            "org/sup/super/meta.json",
+            "org/sup/tables/events/data/p0.parquet",
+        ], "a denied delete must leave every object in place"
+        st.catalog.delete_super_table.assert_not_called()
+
+    def test_control_is_not_held_by_writer_or_below(self):
+        """The model half of the same guarantee, without Redis.
+
+        Pins which role types can reach ``delete`` at all, so a future change
+        to ROLE_PERMISSIONS that hands CONTROL to writers fails here as well
+        as in the RBAC matrix test.
+        """
+        from supertable.rbac.permissions import (
+            Permission, RoleType, has_permission,
+        )
+
+        for role_type in (RoleType.WRITER, RoleType.READER, RoleType.META):
+            assert not has_permission(role_type, Permission.CONTROL), (
+                f"{role_type.value} must not be able to drop a SuperTable"
+            )
+        for role_type in (RoleType.ADMIN, RoleType.SUPERADMIN):
+            assert has_permission(role_type, Permission.CONTROL)

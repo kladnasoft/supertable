@@ -170,6 +170,17 @@ class TestSimpleTableDropWipesStorage:
 
 class TestSuperTableDropWipesStorage:
 
+    @pytest.fixture(autouse=True)
+    def _allow_control(self, monkeypatch):
+        """Stub the CONTROL gate — this file is about object-store wipes.
+
+        ``SuperTable.delete`` requires CONTROL, which resolves the role
+        against a real Redis. The gate itself is covered in
+        ``test_super_table.py::TestDeleteAuthorization``.
+        """
+        monkeypatch.setattr("supertable.super_table.check_control_access",
+                            lambda **kwargs: None)
+
     def test_every_object_under_the_supertable_is_deleted(self):
         storage = FakeObjectStore().seed(
             *_TABLE_KEYS,

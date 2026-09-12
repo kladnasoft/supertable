@@ -1270,10 +1270,14 @@ Three layers, **no deny rules anywhere** — absence of an entry is the only den
 
 | RoleType | Permissions |
 |---|---|
-| `superadmin`, `admin` | CONTROL, CREATE, WRITE, READ, META |
+| `superadmin`, `admin` | RBAC, CONTROL, WRITE, READ, META |
 | `writer` | META, READ, WRITE |
 | `reader` | META, READ |
 | `meta` | META |
+
+There is no `CREATE` permission: `WRITE` creates a table by writing to a name
+that does not exist, and drops it too. `CONTROL` gates only dropping the whole
+SuperTable. See [docs/11_rbac.md](docs/11_rbac.md) §11.1.
 
 **Layer 2 — per-table map.** `_normalize_tables` accepts a dict, coerces a legacy list to
 `{t: {"columns": ["*"], "filters": ["*"]}}`, and turns **anything else (including a

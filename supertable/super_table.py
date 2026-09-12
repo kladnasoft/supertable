@@ -8,6 +8,7 @@ from typing import Dict, Any
 # never remove the homedir, it is mandatory be there
 from supertable.config.homedir import app_home
 from supertable.config.defaults import logger
+from supertable.rbac.access_control import check_control_access
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.user_manager import UserManager
 from supertable.errors import SuperTableNotFoundError
@@ -118,11 +119,30 @@ class SuperTable:
 
 
     # ------------------------------------------------------------------ delete
-    def delete(self, role_name) -> None:
+    def delete(self, role_name: str) -> None:
         """Delete this SuperTable's Redis metadata and underlying storage folder.
 
         WARNING: This is destructive and intended for admin flows.
+
+        Requires CONTROL over the whole SuperTable. ``role_name`` was accepted
+        and never read, so dropping an entire lake was unauthenticated while
+        dropping one table inside it required WRITE — the more destructive
+        operation was the cheaper one.
+
+        The table scope is ``"*"`` because this destroys every table at once:
+        a role granted specific tables must not be able to take the lake with
+        it, so only a lake-wide grant qualifies. Unlike *creating* a
+        SuperTable — which cannot be gated, since the role that would
+        authorise it is bootstrapped by that very call — deletion happens when
+        the roles already exist, so there is no chicken-and-egg here.
         """
+        check_control_access(
+            super_name=self.super_name,
+            organization=self.organization,
+            role_name=role_name,
+            table_name="*",
+        )
+
         base_dir = os.path.join(self.organization, self.super_name)
 
         # Delete storage first; if this fails (other than missing), do not remove Redis meta.

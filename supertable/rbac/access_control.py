@@ -93,6 +93,31 @@ def _check_operation_access(
 
     Raises ``PermissionError`` on any failure.
     """
+    role_info = _check_scope_access(
+        super_name, organization, role_name, permission, label,
+    )
+    role_tables = _normalize_tables(role_info.get("tables", {}))
+    _check_table_access(role_tables, table_name, label)
+
+
+def _check_scope_access(
+    super_name: str,
+    organization: str,
+    role_name: str,
+    permission: Permission,
+    label: str,
+) -> dict:
+    """Resolve a role and require *permission*, without any table scoping.
+
+    The SuperTable-wide half of :func:`_check_operation_access`. Split out
+    because some operations are not table-scoped at all — administering roles
+    and users is a property of the SuperTable, and passing a table name for it
+    would mean inventing one and then checking the role's grants against a
+    table that does not exist.
+
+    Returns the role document so a table-scoped caller can go on to check
+    grants against it.
+    """
     role_manager = RoleManager(super_name=super_name, organization=organization)
     role_info = _resolve_role(role_manager, role_name)
 
@@ -111,8 +136,7 @@ def _check_operation_access(
         logger.error(f"Role '{role_name}' does not have {permission.name} permission.")
         raise PermissionError(f"You don't have permission to {label}.")
 
-    role_tables = _normalize_tables(role_info.get("tables", {}))
-    _check_table_access(role_tables, table_name, label)
+    return role_info
 
 
 def _check_readonly_guard(super_name: str, organization: str, label: str) -> None:
@@ -155,6 +179,26 @@ def check_control_access(
     _check_operation_access(
         super_name, organization, role_name, table_name,
         Permission.CONTROL, "control this table",
+    )
+
+
+def check_rbac_access(
+    super_name: str,
+    organization: str,
+    role_name: str,
+) -> None:
+    """Check whether *role_name* may administer roles and users.
+
+    Requires :attr:`Permission.RBAC`, which only ``SUPERADMIN`` holds. Not
+    table-scoped: a role grants access to tables, so checking "which table is
+    this role change about" has no answer.
+
+    Raises ``PermissionError`` if the role may not administer access.
+    """
+    _check_readonly_guard(super_name, organization, "administer roles and users")
+    _check_scope_access(
+        super_name, organization, role_name,
+        Permission.RBAC, "administer roles and users",
     )
 
 

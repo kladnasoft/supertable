@@ -316,33 +316,109 @@ SUP = "test_super"
 #  1. Permissions tests                                                      #
 # ═══════════════════════════════════════════════════════════════════════════ #
 
+#: The permission matrix, written out independently of the implementation.
+#:
+#: Asserted in BOTH directions — every ``True`` must be granted and every
+#: ``False`` must be denied. The previous tests only checked a handful of
+#: positives per role, so widening a grant (the actual risk) passed silently:
+#: ``set(Permission)`` for the admin tiers meant a newly declared permission
+#: was granted to them the moment it was declared, and no test objected.
+#:
+#: Deliberately a literal, not derived from ROLE_PERMISSIONS — a test that
+#: reads the thing it is testing asserts only that the file parses.
+EXPECTED_MATRIX = {
+    #                     RBAC   CONTROL  WRITE   READ    META
+    RoleType.SUPERADMIN: (True,  True,    True,   True,   True),
+    RoleType.ADMIN:      (True,  True,    True,   True,   True),
+    RoleType.WRITER:     (False, False,   True,   True,   True),
+    RoleType.READER:     (False, False,   False,  True,   True),
+    RoleType.META:       (False, False,   False,  False,  True),
+}
+
+_MATRIX_ORDER = (Permission.RBAC, Permission.CONTROL, Permission.WRITE,
+                 Permission.READ, Permission.META)
+
+
 class TestPermissions(unittest.TestCase):
 
-    def test_superadmin_has_all_permissions(self):
-        for perm in Permission:
-            self.assertTrue(has_permission(RoleType.SUPERADMIN, perm))
+    def test_the_matrix_holds_in_both_directions(self):
+        for role_type, expected in EXPECTED_MATRIX.items():
+            for permission, should_have in zip(_MATRIX_ORDER, expected):
+                with self.subTest(role=role_type.value, perm=permission.name):
+                    self.assertEqual(
+                        has_permission(role_type, permission), should_have,
+                        f"{role_type.value} / {permission.name}: expected "
+                        f"{should_have}, got {not should_have}",
+                    )
 
-    def test_admin_has_all_permissions(self):
-        for perm in Permission:
-            self.assertTrue(has_permission(RoleType.ADMIN, perm))
+    def test_the_matrix_covers_every_permission_and_role(self):
+        """A permission or role added without a matrix row is a silent gap."""
+        self.assertEqual(set(_MATRIX_ORDER), set(Permission),
+                         "EXPECTED_MATRIX columns do not cover Permission")
+        self.assertEqual(set(EXPECTED_MATRIX), set(RoleType),
+                         "EXPECTED_MATRIX rows do not cover RoleType")
+        self.assertEqual(set(ROLE_PERMISSIONS), set(RoleType),
+                         "ROLE_PERMISSIONS does not cover RoleType")
 
-    def test_writer_permissions(self):
-        self.assertTrue(has_permission(RoleType.WRITER, Permission.READ))
+    def test_rbac_is_held_by_the_admin_tiers_only(self):
+        """Administering roles and users is an admin act, not a writer's."""
+        holders = {rt for rt in RoleType if has_permission(rt, Permission.RBAC)}
+        self.assertEqual(holders, {RoleType.SUPERADMIN, RoleType.ADMIN})
+
+    def test_control_is_held_by_the_admin_tiers_only(self):
+        """CONTROL exists for exactly one operation: dropping the lake."""
+        holders = {rt for rt in RoleType
+                   if has_permission(rt, Permission.CONTROL)}
+        self.assertEqual(holders, {RoleType.SUPERADMIN, RoleType.ADMIN})
+
+    def test_admin_and_superadmin_are_deliberately_equal(self):
+        """Pinned as intent, not left to be inferred from the table.
+
+        An earlier revision split them (RBAC to SUPERADMIN only). They are
+        equal by decision, so a future reader finding identical sets does not
+        have to guess whether it is a bug.
+        """
+        self.assertEqual(ROLE_PERMISSIONS[RoleType.ADMIN],
+                         ROLE_PERMISSIONS[RoleType.SUPERADMIN])
+
+    def test_writer_owns_its_tables_end_to_end(self):
+        """Create, fill and drop are all WRITE — no tier gap mid-lifecycle.
+
+        A writer that could create a table but not drop it would leave ETL
+        needing an admin to rebuild, which is why drop is WRITE.
+        """
         self.assertTrue(has_permission(RoleType.WRITER, Permission.WRITE))
-        self.assertTrue(has_permission(RoleType.WRITER, Permission.META))
         self.assertFalse(has_permission(RoleType.WRITER, Permission.CONTROL))
-        self.assertFalse(has_permission(RoleType.WRITER, Permission.CREATE))
 
-    def test_reader_permissions(self):
-        self.assertTrue(has_permission(RoleType.READER, Permission.READ))
-        self.assertTrue(has_permission(RoleType.READER, Permission.META))
-        self.assertFalse(has_permission(RoleType.READER, Permission.WRITE))
-        self.assertFalse(has_permission(RoleType.READER, Permission.CONTROL))
+    def test_permissions_are_nested(self):
+        """Each tier holds a superset of the one below it.
 
-    def test_meta_permissions(self):
-        self.assertTrue(has_permission(RoleType.META, Permission.META))
-        self.assertFalse(has_permission(RoleType.META, Permission.READ))
-        self.assertFalse(has_permission(RoleType.META, Permission.WRITE))
+        Non-strict at the top, where ADMIN and SUPERADMIN are equal by
+        design. Losing nesting elsewhere would mean some role can do
+        something a nominally-higher role cannot.
+        """
+        tiers = [RoleType.META, RoleType.READER, RoleType.WRITER,
+                 RoleType.ADMIN, RoleType.SUPERADMIN]
+        for lower, higher in zip(tiers, tiers[1:]):
+            self.assertLessEqual(
+                ROLE_PERMISSIONS[lower], ROLE_PERMISSIONS[higher],
+                f"{lower.value} is not a subset of {higher.value}",
+            )
+        # and strict everywhere below the admin tiers
+        for lower, higher in zip(tiers[:3], tiers[1:4]):
+            self.assertLess(
+                ROLE_PERMISSIONS[lower], ROLE_PERMISSIONS[higher],
+                f"{lower.value} should be a strict subset of {higher.value}",
+            )
+
+    def test_create_permission_is_gone(self):
+        """WRITE creates a table by writing to it; there is no CREATE.
+
+        Pinned because the enum member existed for a long time, was never
+        checked anywhere, and the docs claimed it gated table creation for
+        admins only — which contradicted the actual behaviour.
+        """
+        self.assertFalse(hasattr(Permission, "CREATE"))
 
     def test_role_type_enum_values(self):
         self.assertEqual(RoleType.SUPERADMIN.value, "superadmin")

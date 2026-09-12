@@ -205,6 +205,15 @@ class SimpleTable:
             )
 
     def delete(self, role_name: str) -> None:
+        """Drop this table: its data, then its catalog pointer.
+
+        Requires WRITE, the same permission that created it. A writer owns the
+        tables it was granted — it can create them by writing, fill them, and
+        drop them. The bound on that power is the role's table grants, not the
+        permission tier: a writer granted ``{"orders": ...}`` can only ever
+        drop ``orders``. Dropping the *lake* is CONTROL and lives on
+        :meth:`SuperTable.delete`.
+        """
         check_write_access(
             super_name=self.super_table.super_name,
             organization=self.super_table.organization,

@@ -36,6 +36,31 @@ def _check_reserved_role_name(role_name: Optional[str]) -> None:
         )
 
 
+#: The role *type* the library owns, as distinct from the name above.
+#:
+#: Reserving the name alone left the type open, and the type is what the
+#: enforcement path reads: ``access_control`` resolves a role, takes
+#: ``role_info["role"]``, and for ``superadmin`` returns an empty view set —
+#: no row filters, no column masks. So a role created as
+#: ``{"role": "superadmin", "role_name": "quarterly_report_viewer"}`` passed
+#: the name check and then had its own ``tables`` restriction discarded at
+#: read time. There is exactly one superadmin role and ``_init_role_storage``
+#: makes it; nothing else may mint one (S11).
+RESERVED_ROLE_TYPE = "superadmin"
+
+
+def _check_reserved_role_type(role_type: Optional[str]) -> None:
+    """Raise ``ValueError`` if *role_type* is the reserved superadmin type."""
+    if not role_type:
+        return
+    if str(role_type).strip().lower() == RESERVED_ROLE_TYPE:
+        raise ValueError(
+            f"Role type {RESERVED_ROLE_TYPE!r} is reserved by SuperTable. It "
+            f"is created once at initialisation and cannot be created, "
+            f"assigned, or promoted to by a tenant."
+        )
+
+
 def _audit_rbac(organization: str, super_name: str, action, resource_id: str,
                 severity=None, **detail_kwargs) -> None:
     """Emit an RBAC audit event.  Never raises."""
@@ -164,6 +189,9 @@ class RoleManager:
         validate_role_name(role_name)
         if not allow_reserved:
             _check_reserved_role_name(role_name)
+            # The type too, not just the name. Reserving one without the other
+            # left the enforcement-relevant half open — see RESERVED_ROLE_TYPE.
+            _check_reserved_role_type(data.get("role"))
 
         rcs = RowColumnSecurity(**{k: v for k, v in data.items() if k != "role_name"})
         rcs.prepare()
@@ -221,6 +249,34 @@ class RoleManager:
                 conflicting_id = self._catalog.rbac_get_role_id_by_name(org, sup, new_name)
                 if conflicting_id and conflicting_id != role_id:
                     raise ValueError(f"Role name '{new_name}' is already taken by role {conflicting_id}")
+
+        # The superadmin type is immutable in both directions.
+        #
+        # Promotion was the same hole as create_role: nothing stopped
+        # ``update_role(some_reader_id, {"role": "superadmin"})``, and because
+        # ``rbac_update_role`` only rewrites the document — it never moves the
+        # role between the ``roles:type:doc:*`` index sets — the promoted role
+        # stayed filed under its old type. It was fully effective at
+        # enforcement time and invisible to ``get_superadmin_role_id()``, the
+        # only "who is superadmin" listing the library offers.
+        #
+        # Demotion mattered just as much, because it made "the superadmin role
+        # cannot be deleted" bypassable in two steps: demote it to reader, at
+        # which point ``delete_role``'s type check no longer matches and the
+        # delete succeeds. Guarding only the delete left the lake reachable
+        # with no superadmin at all and no way to mint a replacement.
+        new_role_type = data.get("role")
+        old_role_type = str(existing.get("role") or "").strip().lower()
+        if new_role_type is not None:
+            requested = str(new_role_type).strip().lower()
+            if requested != old_role_type:
+                _check_reserved_role_type(requested)
+                if old_role_type == RESERVED_ROLE_TYPE:
+                    raise ValueError(
+                        "The superadmin role's type cannot be changed. It is "
+                        "created at initialisation and is the only role that "
+                        "can restore access if others are misconfigured."
+                    )
 
         # A role document with no ``tables`` field has no grant — updating an
         # unrelated field must not invent one.  The old fallback here was the
