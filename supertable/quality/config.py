@@ -55,19 +55,23 @@ def _dq_key(org: str, sup: str, *parts: str) -> str:
 # Default built-in check definitions
 # ──────────────────────────────────────────────────────────────────────
 
+#: Every built-in check ships **disabled**.  Profiling a lake costs a scan, so
+#: an organization that has never opened the Data Quality page must not have
+#: work scheduled on its behalf — an operator opts in per check.  This mirrors
+#: the schedule document, whose ``enabled`` also defaults to ``False``.
 BUILTIN_CHECKS: Dict[str, Dict[str, Any]] = {
     # Table-level
-    "T1": {"name": "Row count delta",       "level": "table",  "group": "quick", "enabled": True,  "threshold": 30,   "unit": "%",     "description": "Alert when row count changes by more than threshold %"},
-    "T2": {"name": "Freshness",             "level": "table",  "group": "quick", "enabled": True,  "threshold": 24,   "unit": "hours", "description": "Alert when table not updated within threshold hours"},
-    "T3": {"name": "Schema drift",          "level": "table",  "group": "quick", "enabled": True,  "threshold": None, "unit": None,    "description": "Alert on any column addition, removal, or type change"},
-    "T5": {"name": "Table size trend",      "level": "table",  "group": "quick", "enabled": True,  "threshold": 50,   "unit": "%",     "description": "Alert when storage size changes by more than threshold %"},
+    "T1": {"name": "Row count delta",       "level": "table",  "group": "quick", "enabled": False, "threshold": 30,   "unit": "%",     "description": "Alert when row count changes by more than threshold %"},
+    "T2": {"name": "Freshness",             "level": "table",  "group": "quick", "enabled": False, "threshold": 24,   "unit": "hours", "description": "Alert when table not updated within threshold hours"},
+    "T3": {"name": "Schema drift",          "level": "table",  "group": "quick", "enabled": False, "threshold": None, "unit": None,    "description": "Alert on any column addition, removal, or type change"},
+    "T5": {"name": "Table size trend",      "level": "table",  "group": "quick", "enabled": False, "threshold": 50,   "unit": "%",     "description": "Alert when storage size changes by more than threshold %"},
     # Column-level quick
-    "C1": {"name": "NULL rate",             "level": "column", "group": "quick", "enabled": True,  "threshold": 5,    "unit": "pp",    "description": "Alert when NULL rate spikes by more than threshold percentage points"},
-    "C2": {"name": "Distinct count shift",  "level": "column", "group": "quick", "enabled": True,  "threshold": 50,   "unit": "%",     "description": "Alert when distinct value count changes by more than threshold %"},
-    "C3": {"name": "Min/Max breach",        "level": "column", "group": "quick", "enabled": True,  "threshold": None, "unit": None,    "description": "Alert when values exceed previously observed min/max boundaries"},
+    "C1": {"name": "NULL rate",             "level": "column", "group": "quick", "enabled": False, "threshold": 5,    "unit": "pp",    "description": "Alert when NULL rate spikes by more than threshold percentage points"},
+    "C2": {"name": "Distinct count shift",  "level": "column", "group": "quick", "enabled": False, "threshold": 50,   "unit": "%",     "description": "Alert when distinct value count changes by more than threshold %"},
+    "C3": {"name": "Min/Max breach",        "level": "column", "group": "quick", "enabled": False, "threshold": None, "unit": None,    "description": "Alert when values exceed previously observed min/max boundaries"},
     "C4": {"name": "Uniqueness ratio",      "level": "column", "group": "quick", "enabled": False, "threshold": None, "unit": None,    "description": "Track uniqueness ratio trend (distinct / non-null)"},
-    "C5": {"name": "Zero/negative rate",    "level": "column", "group": "quick", "enabled": True,  "threshold": 5,    "unit": "pp",    "description": "Alert when zero or negative value rate spikes (numeric columns)"},
-    "C6": {"name": "Mean + Stddev drift",   "level": "column", "group": "quick", "enabled": True,  "threshold": 2.0,  "unit": "σ",     "description": "Alert when mean drifts beyond threshold standard deviations"},
+    "C5": {"name": "Zero/negative rate",    "level": "column", "group": "quick", "enabled": False, "threshold": 5,    "unit": "pp",    "description": "Alert when zero or negative value rate spikes (numeric columns)"},
+    "C6": {"name": "Mean + Stddev drift",   "level": "column", "group": "quick", "enabled": False, "threshold": 2.0,  "unit": "σ",     "description": "Alert when mean drifts beyond threshold standard deviations"},
     # Column-level deep
     "D1": {"name": "String length stats",   "level": "column", "group": "deep",  "enabled": False, "threshold": None, "unit": None,    "description": "Track avg/min/max/median string length over time"},
     "D2": {"name": "Shannon entropy",       "level": "column", "group": "deep",  "enabled": False, "threshold": 20,   "unit": "%",     "description": "Alert when entropy changes by more than threshold %"},

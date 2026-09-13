@@ -164,6 +164,7 @@ class Executor:
         explain: bool = False,
         explain_options: str = "",
         expose_rowid: bool = False,
+        plan_stats: Optional[PlanStats] = None,
     ):
         """Return an open Arrow stream for this query.
 
@@ -173,11 +174,23 @@ class Executor:
 
         AUTO routes the same way a buffered query would, so a caller does not
         get a different engine merely for asking to stream.
+
+        ``plan_stats`` is optional only so an older caller keeps working, but a
+        stream that omits it records no ``ENGINE`` stat — which leaves that
+        read's monitoring row saying ``engine: "unknown"`` and strips
+        ``actual_engine`` from the caller's result provenance.
         """
         cfgs = resolve_engine_configs(self.organization, self._get_catalog())
         duck_cfg = cfgs["lite"]
         chosen = engine if engine != Engine.AUTO else self._auto_pick(
             reflection, duck_cfg)
+
+        # Recorded before the handle is returned: AUTO has resolved by this
+        # point, and the caller consumes batches long after this frame exits.
+        if plan_stats is not None:
+            plan_stats.add_stat({
+                "ENGINE": "spark_sql" if chosen == Engine.SPARK_SQL else "duckdb",
+            })
 
         def timer_capture(evt: str):
             timer.capture_and_reset_timing(evt)

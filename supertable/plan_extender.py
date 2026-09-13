@@ -12,6 +12,86 @@ from supertable.monitoring_writer import MonitoringWriter
 logger = logging.getLogger(__name__)
 
 
+#: Comfortably larger than any hand-written query while staying an order of
+#: magnitude below a typical 512 KB per-entry monitoring budget.  The ceiling
+#: exists so one generated statement cannot push a row past the reader-side
+#: per-entry limit, which drops the *whole* record rather than just the SQL.
+_DEFAULT_MONITOR_SQL_MAX_CHARS = 64_000
+
+
+def _monitor_sql_max_chars() -> int:
+    """Character ceiling for the ``sql`` field of a ``plans`` monitoring row.
+
+    ``0`` or a negative value disables truncation entirely.
+    """
+    raw = str(os.environ.get("SUPERTABLE_MONITOR_SQL_MAX_CHARS", "")).strip()
+    try:
+        return int(raw) if raw else _DEFAULT_MONITOR_SQL_MAX_CHARS
+    except (TypeError, ValueError):
+        return _DEFAULT_MONITOR_SQL_MAX_CHARS
+
+
+def _monitor_sql_raw_allowed(organization: str) -> bool:
+    """Whether *organization* may store un-redacted SQL in monitoring.
+
+    Monitoring rows live in a plain Redis partition with a 7-day TTL and are
+    **not** passed through the audit encryption helper, so a literal in a
+    ``WHERE`` clause is a literal on disk.  Storing the query shape instead is
+    therefore the default, and recording the real statement is something an
+    operator turns on for a named organization that has accepted it.
+
+    ``SUPERTABLE_MONITOR_SQL_RAW`` takes a comma-separated list of
+    organizations, or ``1``/``true``/``all`` to allow every one.  Unset (the
+    default) allows none.
+    """
+    raw = str(os.environ.get("SUPERTABLE_MONITOR_SQL_RAW", "")).strip()
+    if not raw:
+        return False
+    if raw.lower() in {"1", "true", "yes", "all", "*"}:
+        return True
+    return organization in {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _sql_shape(text: str) -> str:
+    """Return the SQL structure with every literal replaced by a placeholder.
+
+    Falls back to the empty string rather than the raw statement: a shape that
+    cannot be parsed must not silently degrade into the un-redacted query it
+    was supposed to replace.
+    """
+    try:
+        import sqlglot
+        from sqlglot import exp
+
+        def erase(node):
+            if isinstance(node, (exp.Literal, exp.Boolean, exp.Null)):
+                return exp.Placeholder()
+            return node
+
+        root = sqlglot.parse_one(text, read="duckdb")
+        return root.transform(erase, copy=True).sql(dialect="duckdb", pretty=False)
+    except Exception:  # noqa: BLE001 - any parse failure redacts completely
+        return ""
+
+
+def _monitor_sql(query_plan_manager: QueryPlanManager) -> str:
+    """Return the SQL to record on the monitoring row, bounded and redacted.
+
+    Redaction is decided per organization by :func:`_monitor_sql_raw_allowed`;
+    the length ceiling applies either way.
+    """
+    sql = getattr(query_plan_manager, "query", "") or ""
+    if not sql:
+        return ""
+    organization = getattr(query_plan_manager, "organization", "") or ""
+    if not _monitor_sql_raw_allowed(organization):
+        sql = _sql_shape(sql)
+    limit = _monitor_sql_max_chars()
+    if limit > 0 and len(sql) > limit:
+        return sql[:limit]
+    return sql
+
+
 def _query_targets_sink_table(original_table: str) -> bool:
     """True if any of the comma-joined targets in ``original_table``
     is a monitoring sink table.
@@ -126,7 +206,7 @@ def extend_execution_plan(
             "source_type": getattr(query_plan_manager, "source_type", "api"),
             "recorded_at": datetime.now(timezone.utc).isoformat(),
             "table_name": getattr(query_plan_manager, "original_table", ""),
-            "sql": getattr(query_plan_manager, "query", "")[:500],
+            "sql": _monitor_sql(query_plan_manager),
             "engine": _engine_used,
             "status": status,
             "message": message,

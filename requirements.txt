@@ -1,7 +1,10 @@
 # -------- Core data stack --------
+# pandas is deliberately absent: no runtime module imports it.  Readers return
+# polars frames and the engine works in Arrow.  Only a few of this package's
+# own tests use pandas, and a test-only import does not belong in the metadata
+# a consumer resolves against.
 numpy>=1.26,<3.0
-pandas>=2.1,<2.3
-pyarrow>=16,<19
+pyarrow>=16,<24
 pytz>=2023.3
 tzdata>=2023.3
 

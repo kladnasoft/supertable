@@ -460,6 +460,7 @@ class DataReader:
                     engine=exec_engine,
                     batch_rows=self._stream_out.get("batch_rows", 0),
                     expose_rowid=self._stream_out.get("expose_rowid", False),
+                    plan_stats=self.plan_stats,
                 )
                 self.timer.capture_and_reset_timing(event="EXECUTING_QUERY")
 
@@ -637,6 +638,15 @@ def query_sql(
         if qpm is not None:
             out["query_id"] = qpm.query_id
             out["query_hash"] = qpm.query_hash
+        # Report which backend actually ran the statement.  AUTO resolves at
+        # plan time, so a caller cannot infer it from the ``engine`` it passed
+        # in, and consumers key result provenance off this value.
+        out["requested_engine"] = getattr(engine, "value", None) or str(engine or "auto")
+        for _entry in getattr(getattr(reader, "plan_stats", None), "stats", None) or []:
+            if isinstance(_entry, dict) and "ENGINE" in _entry:
+                out["actual_engine"] = str(_entry["ENGINE"])
+                out.setdefault("selected_engine", out["actual_engine"])
+                break
 
     if status == Status.ERROR:
         raise RuntimeError(f"Query execution failed: {message}")
