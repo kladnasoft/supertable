@@ -30,7 +30,29 @@ from supertable.processing import (
     _MAX_UTC_OFFSET_WEST,
     _pred_overlaps_stored,
     _widen_naive_timestamp_bounds,
+    reset_session_timezone,
+    set_session_timezone,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_session_timezone():
+    """Every test in this module states its own timezone assumption.
+
+    The pruner narrows its padding once the engine reports which zone it
+    resolves naive literals in, and that report lands in a module global. Any
+    test in the same process that opens a DuckDB connection publishes it — so
+    without this reset these tests would measure whatever zone the host
+    machine happens to be in, and pass or fail by geography. That is not
+    hypothetical: it is how they first failed.
+
+    The tests below exercise the *unknown-zone* fallback, whose contract is
+    unchanged — cover every offset on earth. ``TestKnownSessionZone`` sets a
+    zone explicitly and asserts the narrower one.
+    """
+    reset_session_timezone()
+    yield
+    reset_session_timezone()
 
 
 class _Pred:
@@ -175,3 +197,219 @@ def test_flooring_does_not_disable_pruning():
     stored = ("timestamp", _ts(2025, 1, 1), _ts(2025, 1, 5))
     assert _pred_overlaps_stored(
         _Pred("string", lo="2025-04-05 23:59:59"), stored) is False
+
+
+# --------------------------------------------------------------------------
+# When the engine reports its zone, the padding narrows to that zone
+# --------------------------------------------------------------------------
+
+class TestKnownSessionZone:
+    """The padding above is sound but blunt: 26 hours to cover every zone.
+
+    A server does not run in every zone at once. Once the engine reports the
+    one it resolves naive literals in, the padding collapses to that zone's
+    own offset range — 2 hours on Europe/Budapest, none at all on UTC. The
+    saving is largest exactly where it matters: a 24-hour window was scanning
+    50 hours of range, 2.08x what was asked for.
+
+    Soundness is unchanged in kind. A naive literal ``L`` still denotes either
+    ``L`` (naive column) or ``L - offset`` (zone-aware column), and the bound
+    still has to contain both. It just no longer has to contain offsets the
+    session can never produce.
+    """
+
+    LITERAL = datetime(2026, 7, 15, 12, 0, 0)      # summer: DST in play
+
+    @pytest.mark.parametrize("zone,lo_pad_h,hi_pad_h", [
+        ("UTC", 0, 0),
+        ("Europe/London", 1, 0),            # +0/+1
+        ("Europe/Budapest", 2, 0),          # +1/+2
+        ("Asia/Kolkata", 5.5, 0),           # +5:30, no DST
+        ("Asia/Tokyo", 9, 0),               # +9, no DST
+        ("Pacific/Kiritimati", 14, 0),      # +14, the eastern extreme
+        ("America/New_York", 0, 5),         # -5/-4
+        ("America/St_Johns", 0, 3.5),       # -3:30/-2:30
+        ("Pacific/Midway", 0, 11),          # -11
+    ])
+    def test_padding_matches_the_zones_own_offset_range(self, zone, lo_pad_h,
+                                                        hi_pad_h):
+        set_session_timezone(zone)
+        lo, hi = _widen_naive_timestamp_bounds(self.LITERAL, self.LITERAL)
+
+        assert (self.LITERAL - lo) == timedelta(hours=lo_pad_h)
+        assert (hi - self.LITERAL) == timedelta(hours=hi_pad_h)
+
+    @pytest.mark.parametrize("zone", [
+        "UTC", "Europe/London", "Europe/Budapest", "Asia/Kolkata",
+        "Asia/Tokyo", "Pacific/Kiritimati", "America/New_York",
+        "America/St_Johns", "Pacific/Midway", "Australia/Lord_Howe",
+    ])
+    def test_the_bound_still_contains_every_reading_of_the_literal(self, zone):
+        """The soundness property itself, per zone.
+
+        Both readings must fall inside the bound: the literal as a naive
+        instant, and the literal resolved in this zone — at either DST state,
+        since the padding window can straddle a transition.
+        """
+        from zoneinfo import ZoneInfo
+
+        set_session_timezone(zone)
+        lo, hi = _widen_naive_timestamp_bounds(self.LITERAL, self.LITERAL)
+
+        z = ZoneInfo(zone)
+        readings = [self.LITERAL]                       # naive column
+        for probe in (self.LITERAL, self.LITERAL.replace(month=1),
+                      self.LITERAL.replace(month=7)):
+            readings.append(self.LITERAL - z.utcoffset(probe))   # tz-aware
+
+        for instant in readings:
+            assert lo <= instant <= hi, (
+                f"{zone}: {instant} escapes [{lo}, {hi}] — a file holding a "
+                f"matching row could be pruned"
+            )
+
+    def test_a_dst_transition_inside_the_window_is_covered(self):
+        """Europe/Budapest switches on the last Sunday of October.
+
+        A literal landing on the transition must still be padded by the wider
+        of the two offsets, or the hour that moves is unprotected.
+        """
+        set_session_timezone("Europe/Budapest")
+        on_transition = datetime(2026, 10, 25, 2, 30, 0)
+        lo, _ = _widen_naive_timestamp_bounds(on_transition, on_transition)
+
+        assert (on_transition - lo) == timedelta(hours=2), "must use +2, not +1"
+
+    def test_the_real_production_file_is_still_retained(self):
+        """The regression this whole guard exists for, under the narrow bound.
+
+        Budapest is exactly the +01:00 session where 1,323 rows went missing.
+        Narrowing the padding must not bring that back.
+        """
+        set_session_timezone("Europe/Budapest")
+        stored = ("timestamp", _ts(2025, 11, 29, 0, 0),
+                  _ts(2025, 12, 1, 23, 59, 51))
+        assert _pred_overlaps_stored(
+            _Pred("timestamp", lo=_ts(2025, 12, 2, 0, 0)), stored) is True
+
+    def test_utc_needs_no_padding_at_all(self):
+        """The common server deployment pays nothing for this ambiguity."""
+        set_session_timezone("UTC")
+        assert _widen_naive_timestamp_bounds(self.LITERAL, self.LITERAL) == (
+            self.LITERAL, self.LITERAL)
+
+    def test_the_narrow_bound_prunes_strictly_more(self):
+        """The point of the change, stated as file counts.
+
+        Hourly files, a "from hour 48" predicate: the planet-wide bound keeps
+        everything from hour 34 onward, the zone-aware one from hour 46.
+        """
+        base = datetime(2026, 1, 15, 0, 0)
+        files = [("timestamp", base + timedelta(hours=h),
+                  base + timedelta(hours=h + 1)) for h in range(72)]
+        pred = _Pred("timestamp", lo=base + timedelta(hours=48))
+
+        reset_session_timezone()
+        wide = sum(1 for f in files if _pred_overlaps_stored(pred, f))
+        set_session_timezone("Europe/Budapest")
+        narrow = sum(1 for f in files if _pred_overlaps_stored(pred, f))
+
+        assert narrow < wide, f"expected fewer files, got {narrow} vs {wide}"
+        assert (wide, narrow) == (39, 27)
+
+    @pytest.mark.parametrize("bad", ["Not/AZone", "", "   ", None])
+    def test_an_unusable_zone_falls_back_to_the_planet_wide_bound(self, bad):
+        set_session_timezone(bad)
+        lo, hi = _widen_naive_timestamp_bounds(self.LITERAL, self.LITERAL)
+        assert (self.LITERAL - lo) == _MAX_UTC_OFFSET_EAST
+        assert (hi - self.LITERAL) == _MAX_UTC_OFFSET_WEST
+
+    def test_two_conflicting_zones_revert_to_the_planet_wide_bound(self):
+        """One global cannot describe two sessions, so it stops guessing."""
+        set_session_timezone("UTC")
+        set_session_timezone("Asia/Tokyo")
+        lo, hi = _widen_naive_timestamp_bounds(self.LITERAL, self.LITERAL)
+        assert (self.LITERAL - lo) == _MAX_UTC_OFFSET_EAST
+        assert (hi - self.LITERAL) == _MAX_UTC_OFFSET_WEST
+
+    def test_the_same_zone_reported_twice_is_not_a_conflict(self):
+        """Every connection reports; that must not disable the optimisation."""
+        set_session_timezone("UTC")
+        set_session_timezone("UTC")
+        assert _widen_naive_timestamp_bounds(self.LITERAL, self.LITERAL) == (
+            self.LITERAL, self.LITERAL)
+
+    def test_a_zone_aware_bound_is_still_left_alone(self):
+        """An explicit offset is unambiguous; padding it would be wrong."""
+        set_session_timezone("Europe/Budapest")
+        aware = datetime(2026, 7, 15, 12, 0, 0, tzinfo=timezone.utc)
+        assert _widen_naive_timestamp_bounds(aware, aware) == (aware, aware)
+
+
+class TestEnginePublishesItsZone:
+    """The link between the engine and the pruner, which unit tests cannot see.
+
+    Everything above sets the zone by hand. If the engine never reported one,
+    all of it would still pass while production quietly stayed on the
+    planet-wide bound — the optimisation present in tests and absent in fact.
+    """
+
+    def test_opening_a_connection_publishes_the_session_zone(self):
+        import tempfile
+
+        from supertable.engine.engine_common import new_duckdb_connection
+        from supertable.processing import _session_timezone_name
+
+        reset_session_timezone()
+        con = new_duckdb_connection(tempfile.mkdtemp())
+        try:
+            reported = con.execute("SELECT current_setting('TimeZone')").fetchone()[0]
+        finally:
+            con.close()
+
+        from supertable import processing as _p
+        assert _p._session_timezone_name == reported, (
+            "the engine must publish the zone it actually resolves literals "
+            "in, or the pruner silently keeps the widest possible bound"
+        )
+
+    def test_the_published_zone_actually_narrows_the_bound(self):
+        """Publishing is only useful if the pruner then uses it."""
+        import tempfile
+
+        from supertable.engine.engine_common import new_duckdb_connection
+        from supertable import processing as _p
+
+        reset_session_timezone()
+        wide_lo, wide_hi = _widen_naive_timestamp_bounds(
+            datetime(2026, 7, 15, 12, 0), datetime(2026, 7, 15, 12, 0))
+
+        con = new_duckdb_connection(tempfile.mkdtemp())
+        con.close()
+        lo, hi = _widen_naive_timestamp_bounds(
+            datetime(2026, 7, 15, 12, 0), datetime(2026, 7, 15, 12, 0))
+
+        assert (hi - lo) <= (wide_hi - wide_lo), (
+            "publishing a zone must never widen the bound"
+        )
+        if _p._session_timezone_name not in (None, "UTC"):
+            assert (hi - lo) < (wide_hi - wide_lo), (
+                f"zone {_p._session_timezone_name} should narrow 26h, got "
+                f"{(hi - lo).total_seconds() / 3600:.1f}h"
+            )
+
+    def test_a_publish_failure_leaves_the_safe_bound(self):
+        """Connection setup must not depend on this, and must not half-apply."""
+        from unittest.mock import MagicMock
+
+        from supertable.engine.engine_common import _publish_session_timezone
+
+        reset_session_timezone()
+        broken = MagicMock()
+        broken.execute.side_effect = RuntimeError("no such setting")
+
+        _publish_session_timezone(broken)          # must not raise
+
+        lo, hi = _widen_naive_timestamp_bounds(
+            datetime(2026, 7, 15, 12, 0), datetime(2026, 7, 15, 12, 0))
+        assert (hi - lo) == _MAX_UTC_OFFSET_EAST + _MAX_UTC_OFFSET_WEST

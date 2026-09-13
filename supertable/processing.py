@@ -10,6 +10,7 @@ import threading
 import uuid
 from collections import OrderedDict
 from datetime import datetime, date, timedelta, timezone
+from functools import lru_cache
 from typing import Callable, Dict, List, Set, Tuple, Optional
 
 import polars
@@ -2436,6 +2437,118 @@ _MAX_UTC_OFFSET_EAST = timedelta(hours=14)
 _MAX_UTC_OFFSET_WEST = timedelta(hours=12)
 
 
+# ---------------------------------------------------------------------------
+# Session timezone, as reported by the engine that will run the query
+# ---------------------------------------------------------------------------
+#
+# The bound above is sound but blunt: 26 hours of padding on every naive
+# literal, to cover a planet's worth of zones. On a server in Europe/Budapest
+# (+1/+2) that turns a 24-hour window into a 50-hour scan — 2.08x the range
+# actually asked for. Wide windows barely notice; narrow ones pay double, and
+# narrow ones are the common shape (dashboards, "last 24h", keyset paging).
+#
+# Knowing the session's real zone collapses the padding to that zone's own
+# offset range. The zone is NOT guessed from this process's locale — DuckDB
+# resolves its own default and a caller may SET it — so the ENGINE reports
+# what it actually resolved (``engine_common._publish_session_timezone``) and
+# the pruner reads it here.
+#
+# Unknown zone, unloadable zone, or a process that has seen two different
+# ones: fall back to the planet-wide bound. This can only tighten the padding
+# from a provably safe starting point, never loosen it past what the engine
+# really does.
+_session_timezone_name: Optional[str] = None
+_session_timezone_conflict = False
+_session_timezone_lock = threading.Lock()
+
+
+def set_session_timezone(name: Optional[str]) -> None:
+    """Record the timezone the query engine resolves naive literals in.
+
+    Called by the engine once per connection setup. If two different zones are
+    ever reported into one process the pruner stops trusting either and goes
+    back to the planet-wide bound: one global cannot describe two sessions,
+    and being wrong here drops rows.
+    """
+    global _session_timezone_name, _session_timezone_conflict
+    if not name:
+        return
+    name = str(name).strip()
+    if not name:
+        return
+    with _session_timezone_lock:
+        if _session_timezone_name is None:
+            _session_timezone_name = name
+        elif _session_timezone_name != name:
+            if not _session_timezone_conflict:
+                # module convention here is the logging module directly
+                logging.warning(
+                    "[prune.tz] two session timezones seen in one process "
+                    "(%s, %s); reverting to the planet-wide timestamp bound",
+                    _session_timezone_name, name,
+                )
+            _session_timezone_conflict = True
+
+
+def reset_session_timezone() -> None:
+    """Forget the recorded zone. For tests and engine teardown."""
+    global _session_timezone_name, _session_timezone_conflict
+    with _session_timezone_lock:
+        _session_timezone_name = None
+        _session_timezone_conflict = False
+
+
+@lru_cache(maxsize=512)
+def _offset_span_for_day(name: str, year: int, month: int, day: int):
+    """The (min, max) UTC offset *name* uses around that calendar day.
+
+    Cached: this is called once per predicate bound, and a filtered read can
+    evaluate thousands. Offsets only change at DST transitions, so the answer
+    depends on the day and not the time — a few hundred entries cover any
+    realistic query mix, and the tz database does not change under a running
+    process.
+
+    Probes several instants rather than just the day: a transition can fall
+    inside the padding window itself, and the padding is what this is sizing.
+    The literal's day, a day either side, and midwinter/midsummer of that year
+    cover both DST states and any transition adjacent to the bound.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        zone = ZoneInfo(name)
+    except Exception:
+        return None   # unknown zone name, or no tz database on this host
+
+    at = datetime(year, month, day)
+    probes = []
+    for candidate in (at, at - timedelta(days=1), at + timedelta(days=1),
+                      at.replace(month=1, day=15), at.replace(month=7, day=15)):
+        try:
+            offset = zone.utcoffset(candidate)
+        except Exception:
+            continue
+        if offset is not None:
+            probes.append(offset)
+    if not probes:
+        return None
+    return min(probes), max(probes)
+
+
+def _session_offset_span(at: datetime):
+    """The (min, max) UTC offset the session zone uses around *at*.
+
+    Returns None when no zone is known or it cannot be loaded, which sends the
+    caller back to the planet-wide bound.
+    """
+    with _session_timezone_lock:
+        name = _session_timezone_name
+        conflict = _session_timezone_conflict
+    if not name or conflict:
+        return None
+    return _offset_span_for_day(name, at.year, at.month, at.day)
+
+
 def _widen_naive_timestamp_bounds(plo, phi):
     """Widen naive predicate bounds to cover every timezone they could mean.
 
@@ -2457,11 +2570,46 @@ def _widen_naive_timestamp_bounds(plo, phi):
     keep a file it did not need to; it may never drop one it did.
 
     An already zone-aware bound is unambiguous and is left alone.
+
+    WHEN THE SESSION ZONE IS KNOWN
+    ------------------------------
+    The engine reports the zone it actually resolves literals in (see
+    :func:`set_session_timezone`), which collapses the padding from a planet
+    to one zone's offset range.
+
+    A naive literal ``L`` can denote either of two things, and the bound must
+    cover both because the stats lane cannot say which:
+
+      * the column is naive      -> the instant is ``L`` itself;
+      * the column is zone-aware -> the instant is ``L - offset``, for any
+        offset the zone uses near that date.
+
+    So the union is ``[L - max(o_max, 0), L + max(-o_min, 0)]``:
+
+      Europe/Budapest,  o in {+1h, +2h}  ->  [L - 2h,  L     ]
+      America/New_York, o in {-5h, -4h}  ->  [L,       L + 5h]
+      UTC,              o = 0            ->  [L,       L     ]
+
+    Each is a superset of both readings, which is the only property that
+    matters — pruning may keep a file it did not need to, never drop one it
+    did. Note the padding is one-sided for any given zone: an eastern zone can
+    only move the instant earlier, a western one only later. Having to pad
+    both directions at once is most of why the planet-wide bound is so wide.
     """
+    lo_pad, hi_pad = _MAX_UTC_OFFSET_EAST, _MAX_UTC_OFFSET_WEST
+
+    anchor = plo if isinstance(plo, datetime) else phi
+    if isinstance(anchor, datetime):
+        span = _session_offset_span(anchor)
+        if span is not None:
+            o_min, o_max = span
+            lo_pad = max(o_max, timedelta(0))
+            hi_pad = max(-o_min, timedelta(0))
+
     if isinstance(plo, datetime) and plo.tzinfo is None:
-        plo = plo - _MAX_UTC_OFFSET_EAST
+        plo = plo - lo_pad
     if isinstance(phi, datetime) and phi.tzinfo is None:
-        phi = phi + _MAX_UTC_OFFSET_WEST
+        phi = phi + hi_pad
     return plo, phi
 
 

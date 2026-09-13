@@ -863,6 +863,40 @@ def init_connection(
     except Exception:
         pass
 
+    _publish_session_timezone(con)
+
+
+def _publish_session_timezone(con) -> None:
+    """Tell the pruner which timezone this session resolves naive literals in.
+
+    The file pruner compares predicate bounds against UTC statistics. A naive
+    ``TIMESTAMP`` literal only denotes an instant once a zone is chosen, and
+    the zone that matters is *this connection's* — not the host process's
+    locale, because DuckDB resolves its own default and a caller may SET it.
+    Asking the connection is the only way to know.
+
+    Without this the pruner pads every naive bound by -14h/+12h to cover every
+    zone on earth, which turns a 24-hour window into a 50-hour scan. With it,
+    the padding is the reported zone's own offset range — 2 hours on
+    Europe/Budapest, none at all on UTC.
+
+    Never raises and never blocks connection setup: a failure here leaves the
+    pruner on its planet-wide bound, which is correct, only slower.
+    """
+    try:
+        row = con.execute("SELECT current_setting('TimeZone')").fetchone()
+    except Exception as e:                                    # pragma: no cover
+        logger.debug(f"[duckdb.init] could not read session TimeZone: {e}")
+        return
+    if not row or not row[0]:
+        return
+    try:
+        from supertable.processing import set_session_timezone
+
+        set_session_timezone(str(row[0]))
+    except Exception as e:                                    # pragma: no cover
+        logger.debug(f"[duckdb.init] could not publish session TimeZone: {e}")
+
 
 def new_duckdb_connection(
         temp_dir: str,
