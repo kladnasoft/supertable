@@ -21,6 +21,7 @@ import, so running in-process from the repo would compare against the repo's
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -53,12 +54,13 @@ print("@@" + json.dumps([
 
 
 def _divergences() -> list[list[str]]:
+    probe_paths = [str(_REPO_ROOT), *(str(Path(path).resolve()) for path in sys.path if path)]
     with tempfile.TemporaryDirectory(dir="/tmp") as cwd:
         proc = subprocess.run(
             [sys.executable, "-c", _PROBE],
             cwd=cwd,                                  # no .env above this
             env={"PATH": "/usr/bin:/bin", "HOME": cwd,
-                 "PYTHONPATH": str(_REPO_ROOT)},
+                 "PYTHONPATH": os.pathsep.join(dict.fromkeys(probe_paths))},
             capture_output=True, text=True, timeout=180,
         )
     if proc.returncode != 0:
@@ -92,6 +94,13 @@ def test_intentional_exceptions_are_still_divergent():
     assert not stale, (
         f"these no longer diverge and should be dropped from _INTENTIONAL: {stale}"
     )
+
+
+def test_probe_ignores_parent_setting_overrides(monkeypatch):
+    monkeypatch.setenv("SUPERTABLE_DUCKDB_MEMORY_LIMIT", "37GB")
+    monkeypatch.setenv("STORAGE_TYPE", "S3")
+
+    assert {d[0] for d in _divergences()} == _INTENTIONAL
 
 
 def test_external_file_cache_default_is_not_empty():

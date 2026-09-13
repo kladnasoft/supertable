@@ -1491,21 +1491,35 @@ class TestQuerySqlDataReaderConstruction:
 
         assert MockDR.call_args.kwargs["source"] == "mcp"
 
+    @pytest.mark.parametrize("actual_engine", [None, "duckdb", "spark_sql"])
     @patch(f"{_MOD}.DataReader")
     @patch(f"{_MOD}._ensure_sql_limit")
-    def test_out_dict_receives_query_identity(self, mock_ensure, MockDR):
+    def test_out_dict_receives_query_identity(self, mock_ensure, MockDR, actual_engine):
         mock_ensure.return_value = "SELECT * FROM t"
-        from supertable.data_reader import Status, query_sql
+        from supertable.data_reader import Status, engine, query_sql
+        from supertable.engine.plan_stats import PlanStats
+
         mock_reader = MagicMock()
         mock_reader.execute.return_value = (pl.DataFrame(), Status.OK, None)
         mock_reader.query_plan_manager.query_id = "qid-123"
         mock_reader.query_plan_manager.query_hash = "qh-abc"
+        mock_reader.plan_stats = PlanStats()
+        mock_reader.plan_stats.add_stat({"REFLECTIONS": 2})
+        if actual_engine is not None:
+            mock_reader.plan_stats.add_stat({"ENGINE": actual_engine})
         MockDR.return_value = mock_reader
 
         out = {}
-        query_sql("o", "s", "SELECT * FROM t", 10, MagicMock(), "admin", source="mcp", out=out)
+        query_sql("o", "s", "SELECT * FROM t", 10, engine.AUTO, "admin", source="mcp", out=out)
 
-        assert out == {"query_id": "qid-123", "query_hash": "qh-abc"}
+        expected = {
+            "query_id": "qid-123",
+            "query_hash": "qh-abc",
+            "requested_engine": "auto",
+        }
+        if actual_engine is not None:
+            expected.update(actual_engine=actual_engine, selected_engine=actual_engine)
+        assert out == expected
 
 
 # ====================================================================

@@ -459,3 +459,216 @@ def restrict_read_access(
             )
 
     return rbac_views
+
+
+# ---------------------------------------------------------------------------
+# Table-policy enforcement for platform callers
+#
+# These were public in 2.5.x and removed in 3.4.0, but the decisions they make
+# are still needed by any service that authorizes an object without building a
+# SQL view for it -- staging files, catalog entries, metadata pages.  They are
+# restored here rather than reimplemented by the caller: an authorization rule
+# that exists in two places eventually disagrees with itself.  Each one is a
+# thin composition over the internals above, so there is one implementation of
+# "does this role reach this table/column" in the process.
+# ---------------------------------------------------------------------------
+
+import hashlib as _hashlib
+import json as _json
+from dataclasses import dataclass as _dataclass
+from typing import Iterable as _Iterable, Optional as _Optional
+
+
+@_dataclass(frozen=True)
+class RoleAccessContext:
+    """One fully validated role policy for one SuperTable namespace."""
+
+    role_info: dict
+    role_type: RoleType
+    tables: Dict[str, dict]
+    fingerprint: str
+
+
+def _entry_allows_access(entry: _Optional[dict]) -> bool:
+    return isinstance(entry, dict) and entry.get("access", "allow") != "deny"
+
+
+def _requested_columns_denied(
+    entry: dict,
+    columns: _Optional[_Iterable[str]],
+    table_name: str,
+) -> None:
+    """Case-insensitive include-minus-exclude, matching the read path."""
+    if columns is None:
+        return
+    requested = {str(name).casefold() for name in columns}
+    allowed = entry.get("columns", ["*"])
+    excluded = {str(name).casefold() for name in entry.get("exclude_columns", [])}
+    denied = requested & excluded
+    if allowed != ["*"]:
+        denied |= requested - {str(name).casefold() for name in allowed}
+    if denied:
+        raise PermissionError(
+            f"You don't have permission to columns: {sorted(denied)} "
+            f"in table '{table_name}'."
+        )
+
+
+def resolve_role_access_context(
+    super_name: str,
+    organization: str,
+    role_name: str,
+    permission: Permission = Permission.META,
+    label: str = "META data",
+) -> RoleAccessContext:
+    """Validate a role once and return its policy plus a stable fingerprint.
+
+    The fingerprint covers role id, type, enabled flag and the whole table map,
+    so a caller can cache against it and have the cache fall out of date the
+    moment the grant changes.
+    """
+    role_manager = RoleManager(super_name=super_name, organization=organization)
+    role_info = _resolve_role(role_manager, role_name)
+    raw_type = role_info.get("role")
+    role_type: _Optional[RoleType] = None
+    if isinstance(raw_type, str):
+        try:
+            role_type = RoleType(raw_type)
+        except (TypeError, ValueError):
+            role_type = None
+    if role_type is None:
+        logger.error("Persisted role type is invalid")
+        raise PermissionError(f"You don't have permission to {label}.")
+    if not has_permission(role_type, permission):
+        raise PermissionError(f"You don't have permission to {label}.")
+    tables = _normalize_tables(role_info.get("tables"))
+    identity = {
+        "role_id": role_info.get("role_id", ""),
+        "role": role_type.value,
+        "enabled": role_info.get("enabled", True),
+        "tables": tables,
+    }
+    fingerprint = _hashlib.sha256(
+        _json.dumps(
+            identity,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    return RoleAccessContext(role_info, role_type, tables, fingerprint)
+
+
+def resolve_table_policy(
+    context: RoleAccessContext,
+    table_name: str,
+    permission_label: str = "access",
+) -> dict:
+    """Return the effective policy for one table, or deny it.
+
+    SUPERADMIN is the unconditional control-plane bypass.  ADMIN keeps every
+    operation permission but an explicitly scoped ADMIN still honours the same
+    table and column denies as any other role.
+    """
+    if context.role_type is RoleType.SUPERADMIN:
+        return {"columns": ["*"], "filters": ["*"]}
+    entry = _resolve_table_entry(context.tables, table_name)
+    if not _entry_allows_access(entry):
+        raise PermissionError(
+            f"You don't have permission to {permission_label} table '{table_name}'."
+        )
+    return entry
+
+
+def check_requested_columns(
+    entry: dict,
+    columns: _Optional[_Iterable[str]],
+    table_name: str,
+) -> None:
+    """Enforce one resolved table policy against requested columns.
+
+    Obtain ``entry`` from :func:`resolve_table_policy` first.
+    """
+    _requested_columns_denied(entry, columns, table_name)
+
+
+def visible_columns_for_policy(
+    entry: dict,
+    available_columns: _Iterable[str],
+) -> List[str]:
+    """Resolve include-minus-exclude against the schema's actual spellings."""
+    available = [str(name) for name in available_columns]
+    folded_available: Dict[str, str] = {}
+    for name in available:
+        folded = name.casefold()
+        if folded in folded_available:
+            raise PermissionError("Schema contains case-colliding columns")
+        folded_available[folded] = name
+    allowed = entry.get("columns", ["*"])
+    excluded = {str(name).casefold() for name in entry.get("exclude_columns", [])}
+    if allowed == ["*"]:
+        allowed_set = set(folded_available)
+    else:
+        allowed_set = {str(name).casefold() for name in allowed}
+    return [
+        name for name in available
+        if name.casefold() in allowed_set and name.casefold() not in excluded
+    ]
+
+
+def check_read_access(
+    super_name: str,
+    organization: str,
+    role_name: str,
+    table_name: str,
+    columns: _Optional[_Iterable[str]] = None,
+    *,
+    require_unfiltered: bool = False,
+) -> None:
+    """Authorize a direct bounded read without constructing SQL views.
+
+    Most reads go through :func:`restrict_read_access` because they need row
+    and column policy views.  Control-plane objects such as staging files have
+    no SQL table of their own, but exposing their row values still requires
+    READ, never merely META.  ``require_unfiltered`` refuses a scoped policy
+    outright, because a staging object cannot have a row filter applied to it.
+    """
+    if type(require_unfiltered) is not bool:
+        raise TypeError("require_unfiltered must be a boolean")
+    context = resolve_role_access_context(
+        super_name, organization, role_name,
+        Permission.READ, "read this table",
+    )
+    entry = resolve_table_policy(context, table_name, "read")
+    _requested_columns_denied(entry, columns, table_name)
+    if require_unfiltered and (
+        entry.get("columns", ["*"]) != ["*"]
+        or bool(entry.get("exclude_columns"))
+        or entry.get("filters", ["*"]) != ["*"]
+    ):
+        raise PermissionError(
+            f"Scoped table policy for '{table_name}' cannot read an "
+            "unfiltered staging object."
+        )
+
+
+def check_create_access(
+    super_name: str,
+    organization: str,
+    role_name: str,
+    table_name: str,
+    columns: _Optional[_Iterable[str]] = None,
+) -> None:
+    """Authorize creating a table, plus the target table/column policy.
+
+    3.4.0's ``Permission`` enum has no CREATE member -- creation is authorized
+    as WRITE, which is what ``SimpleTable`` itself checks.
+    """
+    _check_readonly_guard(super_name, organization, "create this table")
+    context = resolve_role_access_context(
+        super_name, organization, role_name,
+        Permission.WRITE, "create this table",
+    )
+    entry = resolve_table_policy(context, table_name, "create")
+    _requested_columns_denied(entry, columns, table_name)
