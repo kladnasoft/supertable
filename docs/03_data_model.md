@@ -1,437 +1,141 @@
-# 03 -- Data Model
+# Data model
 
-## Business Context
+SuperTable stores table contents in Parquet, snapshot documents in the selected storage backend, and current metadata in Redis. This chapter describes the objects written by the active Python implementation.
 
-SuperTable is a multi-tenant analytical data platform that organizes data into a three-level hierarchy: **Organization > SuperTable > SimpleTable**. This structure enables enterprises to isolate data by business unit (organization), group related datasets under a logical umbrella (SuperTable), and manage individual table lifecycles independently (SimpleTable). Every write to a SimpleTable produces an immutable, versioned snapshot -- giving teams point-in-time reproducibility, safe rollbacks, and concurrent read/write access without locks on the read path.
+## Namespaces and objects
 
-The metadata layer lives entirely in Redis for sub-millisecond lookups, while the heavy payload (Parquet data files and snapshot JSON) is persisted on pluggable object storage (local disk, S3, MinIO, Azure Blob, or GCS). This separation means the system can serve metadata-intensive operations (schema introspection, table listing, RBAC checks) at Redis speed, and defer to object storage only when actual data must be read.
+| Object | Identity | Responsibility |
+| --- | --- | --- |
+| Organization | `organization` | Namespace for SuperTables and organization-level services. |
+| SuperTable | `(organization, super_name)` | Redis root, table namespace, roles, users, configuration. |
+| SimpleTable | `(organization, super_name, simple_name)` | Versioned resource list and associated schema, statistics, and deletion vector. |
+| Resource | Storage path in a snapshot | A Parquet file with physical row, column, and byte counts. |
+| Snapshot | Unique JSON storage path | State of one SimpleTable at one update. |
 
----
+`SuperTable(..., create_if_missing=True)` creates a missing root and initializes the default role/user records. `SimpleTable(..., create_if_missing=True)` writes an initial snapshot and publishes its leaf pointer. Passing `False` makes these constructors raise a typed lookup error for an absent object. Constructing `DataWriter` uses the creating SuperTable constructor; constructing `MetaReader` uses the noncreating constructor.
 
-## Three-Level Hierarchy
+The writer's local validation checks table names of 1–128 characters against `^[A-Za-z_][A-Za-z0-9_]*$` and rejects a SimpleTable name equal to its SuperTable name. Redis key construction imposes additional constraints: ordinary segments are lowercase and at most 64 characters, with a separate double-underscore form for internal names. For an ordinary SimpleTable name that passes both layers, use `[a-z][a-z0-9_]{0,63}`. Uppercase names, ordinary leading underscores, and names longer than 64 characters can pass writer validation but fail catalog key construction. See [Redis layout](16_redis_layout.md) for the complete segment rules.
 
-```
-Organization (tenant boundary)
- +-- SuperTable  (logical dataset group)
-      +-- SimpleTable  (individual versioned table)
-      +-- SimpleTable
-      +-- ...
- +-- SuperTable
-      +-- ...
-```
+Reserved SuperTable names are checked by `is_reserved_super_name`; organization and SuperTable segments also pass through Redis key validation. These checks belong to their named entry points and do not establish a general schema constraint on every low-level operation.
 
-### Organization
+Sources: [SuperTable](../supertable/super_table.py), [SimpleTable](../supertable/simple_table.py), [writer validation](../supertable/data_writer.py), [reserved namespaces](../supertable/redis_keys.py).
 
-The top-level isolation boundary. Every Redis key and every storage path is prefixed with the organization identifier, ensuring complete tenant separation. Organizations are implicit -- they are established the first time a SuperTable is created under a given org name.
+## Storage layout
 
-### SuperTable
+Paths below are logical paths supplied to the storage backend. Cloud backends can add their configured object prefix. Local paths are normally relative to the application home selected at import time.
 
-A logical grouping of related SimpleTables. Represented by the `SuperTable` class in `supertable/super_table.py`.
-
-```python
-class SuperTable:
-    def __init__(self, super_name: str, organization: str)
-```
-
-Key responsibilities:
-
-| Concern | Detail |
-|---------|--------|
-| **Storage bootstrap** | Creates the base directory `{organization}/{super_name}/super` on first use. |
-| **Redis root pointer** | Ensures a `meta:root` key exists via `RedisCatalog.ensure_root()`. |
-| **RBAC scaffolding** | Initializes `RoleManager` and `UserManager` on first creation. |
-| **Snapshot reading** | `read_simple_table_snapshot(path)` reads the heavy JSON from storage. |
-| **Deletion** | `delete(role_name)` removes both storage data and all Redis keys under the supertable prefix. |
-
-The `identity` field is always `"super"`, used in path construction:
-
-```
-{organization}/{super_name}/super/
+```text
+<organization>/<super_name>/
+  super/
+  tables/<simple_name>/
+    snapshots/<milliseconds>_<random>_tables.json
+    data/year=YYYY/month=MM/day=DD/<milliseconds>_<random>_data.parquet
+    tombstone/year=YYYY/month=MM/day=DD/hour=HH/<milliseconds>_<random>_deleted.parquet
+    stats/year=YYYY/month=MM/day=DD/hour=HH/<milliseconds>_<random>_stats.parquet
 ```
 
-**Fast-path optimization**: If `meta:root` already exists in Redis, the constructor skips storage directory creation entirely, avoiding unnecessary I/O on repeated instantiation.
+Data files receive a daily UTC path when the frame contains `__timestamp__`; otherwise the writer uses the supplied data directory directly. The path date is the current write date, including during compaction, rather than a partition extracted from business data. Tombstone and statistics artifacts use the current UTC hour. Snapshot names contain milliseconds and eight random bytes encoded as hexadecimal.
 
-### SimpleTable
+Sources: [Parquet and artifact writers](../supertable/processing.py), [filename and partition helpers](../supertable/utils/helper.py), [storage](04_storage.md).
 
-An individual versioned table within a SuperTable. Represented by the `SimpleTable` class in `supertable/simple_table.py`.
+## Snapshot document
 
-```python
-class SimpleTable:
-    def __init__(self, super_table: SuperTable, simple_name: str)
-```
+The initial snapshot contains the following fields:
 
-Key responsibilities:
+| Field | Initial value / meaning |
+| --- | --- |
+| `simple_name` | SimpleTable name. |
+| `location` | Logical table directory. |
+| `snapshot_version` | `0`; incremented by `SimpleTable.update`. |
+| `last_updated_ms` | Timestamp in milliseconds. |
+| `previous_snapshot` | `None` initially; previous snapshot path after an update. |
+| `schema` | Empty list initially; normally a name-to-Polars-type dictionary after a write. |
+| `resources` | Empty list initially; current Parquet resources after writes. |
+| `tombstone` | `None`, a legacy single path, or a list of deletion-vector part paths. |
+| `tombstone_rows` | Number of row IDs represented by the current deletion vector. |
+| `stats_file` | Statistics Parquet path, or `None`. |
+| `stats_rows` | Number of rows in the statistics artifact, not data rows. |
 
-| Concern | Detail |
-|---------|--------|
-| **Directory layout** | Creates `data/` and `snapshots/` subdirectories under `{org}/{super}/{tables}/{simple_name}/`. |
-| **Initial snapshot** | Bootstraps version 0 with an empty resource list and writes it to storage + Redis leaf. |
-| **Snapshot reading** | `get_simple_table_snapshot()` resolves the Redis leaf pointer and returns `(snapshot_dict, path)`. |
-| **Snapshot writing** | `update(new_resources, sunset_files, model_df, ...)` builds a new snapshot, increments the version, and writes it to storage. |
-| **Schema tracking** | Each snapshot stores a schema list (Delta-compatible `{name, type, nullable, metadata}` format) plus a `schemaString` in Spark StructType JSON. |
-| **Data lineage** | Optional `lineage` dict is stored in the snapshot JSON for provenance tracking. |
-| **Deletion** | `delete(role_name)` checks write access via RBAC, removes the storage folder, and deletes Redis meta. |
+Updates may also add:
 
-The `identity` field is `"tables"`, producing paths like:
+- `lineage`: caller-provided dictionary or a writer-generated operation description.
+- `rowid_high_watermark`: highest reserved incoming row ID recorded by the writer.
+- `schemaString`: JSON serialization with `type="struct"` and `fields` set to the collected schema. Since the usual collector returns a dictionary, this field is not guaranteed to be a Spark-compatible field list.
 
-```
-{organization}/{super_name}/tables/{simple_name}/
-  +-- data/           # Parquet data files
-  +-- snapshots/      # Versioned snapshot JSON files
-```
-
----
-
-## Versioned Snapshots
-
-Every write produces a new immutable snapshot file. Snapshots are never overwritten -- they form a linked list via the `previous_snapshot` field.
-
-### Snapshot JSON Structure
+A typical resource entry is:
 
 ```json
 {
-  "simple_name": "orders",
-  "location": "acme/warehouse/tables/orders",
-  "snapshot_version": 5,
-  "last_updated_ms": 1713200000000,
-  "previous_snapshot": "acme/warehouse/tables/orders/snapshots/tables_20240414_v4.json",
-  "schema": [
-    {"name": "order_id", "type": "long", "nullable": true, "metadata": {}},
-    {"name": "amount",   "type": "double", "nullable": true, "metadata": {}}
-  ],
-  "schemaString": "{\"type\":\"struct\",\"fields\":[...]}",
-  "resources": [
-    {"file": "data/part-00001.parquet", "rows": 50000, "bytes": 1048576}
-  ],
-  "lineage": {
-    "source": "s3://raw-bucket/orders/",
-    "pipeline": "daily-etl"
-  }
+  "file": "acme/warehouse/tables/orders/data/year=2026/month=09/day=13/example_data.parquet",
+  "file_size": 16384,
+  "rows": 250,
+  "columns": 5
 }
 ```
 
-### Version Progression
+`columns` is a count in new resources written by `processing.py`. Some readers also accept older list-based representations. Resource rows are physical counts, including rows that remain in the file but have been tombstoned.
 
-1. **Version 0** -- Created by `SimpleTable.init_simple_table()`. Empty `schema` and `resources`.
-2. **Version N+1** -- Created by `SimpleTable.update()`. Merges new resources, removes sunset files, updates schema from the model DataFrame.
+`SimpleTable.update` merges retained and new resources, sets the predecessor path, writes a new JSON document, and returns `(snapshot_dict, snapshot_path)`. It does **not** publish the Redis pointer. `DataWriter` performs that later.
 
-### Schema Field Semantics — "Last Write Wins" (Intentional)
+Source: [snapshot construction and update](../supertable/simple_table.py).
 
-The snapshot's `schema` field follows a **"writer is the schema authority"**
-contract. Each call to `SimpleTable.update` **unconditionally overwrites** the
-new snapshot's `schema` field with the schema of the `model_df` passed in.
-It does **not** union with the prior snapshot's schema, and it does **not**
-preserve columns that aren't in the incoming `model_df`. This is deliberate
-— it just hadn't been documented anywhere outside the code, so reproducing
-it correctly without reading the source was effectively impossible.
+## Row identity and deletion
 
-#### Where this lives in code
+For non-delete writes, Redis reserves an integer range before acquiring the table lock. The writer assigns these values to `__rowid__` as `Int64` and sets `__timestamp__` to the write's current UTC time. Supplying columns with those names does not preserve their incoming values. Failed or filtered writes can leave gaps in allocated IDs.
 
-`supertable/simple_table.py`, inside `SimpleTable.update` (≈ lines 290–299):
+Overwrite keys identify existing rows to retire. An overwrite produces new data files plus deletion-vector rows with columns `file` and `__rowid__`. Reads apply the deletion vector to hide retired rows. A table's logical row-count estimate is:
 
-```python
-schema_list = collect_schema(model_df)
-if not schema_list:
-    # Fallback: derive schema from Polars dtypes if helper returns empty.
-    schema_list = _schema_list_from_polars_df(model_df)
-last_simple_table["schema"] = schema_list                  # ← overwrite, no union
-# Also store a Spark StructType JSON for downstream Delta mirrors.
-try:
-    last_simple_table["schemaString"] = json.dumps(
-        {"type": "struct", "fields": schema_list},
-        separators=(",", ":"),
-    )
-except Exception:
-    pass
+```text
+max(0, sum(resource.rows) - tombstone_rows)
 ```
 
-Step by step:
-
-1. `collect_schema(model_df)` (from `supertable/utils/helper.py`) turns the
-   incoming Polars DataFrame into a list of `{name, type, nullable, metadata}`
-   field dicts.
-2. If that returns empty (e.g. the helper can't introspect the dtype),
-   `_schema_list_from_polars_df` (local to `simple_table.py`) falls back to
-   walking `model_df.schema` and mapping each Polars dtype to a Spark/Delta
-   type string.
-3. The result is assigned directly onto `last_simple_table["schema"]` —
-   replacing whatever was there in the previous snapshot. There is no read
-   of the prior `schema` field at any point in this method.
-4. A Spark `StructType` mirror is written to `schemaString` so Delta-shaped
-   readers see the same fields.
-
-Because `last_simple_table` was built by mutating the previous snapshot
-dict, every other field (`resources`, `previous_snapshot`, etc.) carries
-forward — only `schema` and `schemaString` are wholesale-replaced.
-
-#### Caller contract
-
-- Every caller of `SimpleTable.update` must pass a `model_df` whose schema
-  is exactly the schema the new snapshot should record — **OR** pass
-  `model_df=None` to explicitly preserve the previous snapshot's schema.
-- For `DataWriter.write(...)` (non-delete), that's the incoming Arrow/Polars
-  data the caller supplied. Sending a DataFrame missing columns that exist
-  in older parquet files will shrink the snapshot's `schema` even though
-  the columns are still present on disk.
-- For `DataWriter.write(..., delete_only=True)`, the writer passes
-  `model_df=None`. **Deletes never change the schema** — only update paths
-  do. The incoming delete-predicate dataframe only carries the columns the
-  caller used to identify rows to remove (e.g. just the primary key); using
-  it as `model_df` would collapse `schema` / `schemaString` to that partial
-  shape, breaking every subsequent `SELECT col` against a column not in the
-  predicate. The on-disk parquet files written by `process_delete_only`
-  retain the full schema; the snapshot metadata must too.
-- For `DataWriter.compact(...)` and `SimpleTable.repair_schema()`, the
-  internal helpers derive `model_df` by reading the actual parquet files on
-  storage, so the schema reflects what's physically present.
-
-#### Why this design (and not append-only union)
-
-An alternative would have been "schema is the union of every column ever
-written, columns can only be added, never removed" (Iceberg and Delta lean
-that way). The chosen design instead lets the writer declare the canonical
-schema explicitly:
-
-| Design | Pros | Cons |
-|--------|------|------|
-| **"Last write wins" (the choice)** | Writer owns the schema; column drops and dtype changes are first-class operations expressed by passing a different `model_df`. No accumulating-forever metadata. Simple update semantics. | Caller must always pass a full-shape `model_df`. A partial `model_df` shrinks the snapshot metadata even though older parquet files still contain the missing columns. |
-| Append-only union | Snapshot metadata always reflects every column the table has ever had. Cannot be silently shrunk. | Need an explicit "drop column" operation to ever shrink the schema. More complex update semantics. |
-
-#### Read-time fallbacks
-
-A `SELECT col` against a column not in the snapshot's `schema` field will
-fail with `Missing required column(s):` because
-`DataEstimator.get_missing_columns` validates the requested columns against
-this field. That's the contract working as designed.
-
-To keep queries working when the snapshot `schema` has drifted from the
-parquet files (e.g. a caller passed a partial `model_df`, or the field was
-written empty by an older buggy code path), the SDK has two defensive
-fallbacks:
-
-1. **`DataEstimator` self-heal.** When the snapshot's schema is empty or
-   doesn't list a requested column, the estimator reads the first parquet
-   file's schema and augments the in-memory column set. Queries succeed
-   without anyone having to repair anything. A `WARNING` log line surfaces
-   the drift so it's not silent.
-2. **`SimpleTable.repair_schema()`.** A one-shot helper that derives the
-   schema from the first parquet file and rewrites the snapshot with it.
-   Use when you want to persistently fix the metadata rather than rely on
-   the self-heal at every read.
-
-These are recovery paths, not part of the contract — they keep queries
-running while the caller fixes the upstream `model_df`.
-
-### Snapshot Retention
-
-Snapshot JSONs accumulate over time — every write's
-`previous_snapshot` field forms a linked list back to v0 — and
-sunset parquet files (replaced during compaction) are left on
-storage. SuperTable does not delete either automatically; prune them
-out-of-band if storage growth becomes a concern.
-
-### CAS (Compare-and-Swap) Pointer Update
-
-The Redis leaf pointer is updated atomically via a Lua script (`_LUA_LEAF_CAS_SET` or `_LUA_LEAF_PAYLOAD_CAS_SET` in `RedisCatalog`). The script reads the current version, increments it, and writes the new value in a single atomic Redis operation, preventing lost updates under concurrency.
-
-Two CAS variants exist:
-
-- **`set_leaf_path_cas`** -- Stores only the path to the snapshot file. Readers must fetch the snapshot from storage.
-- **`set_leaf_payload_cas`** -- Stores the path *and* the full snapshot payload inline in Redis. Readers can serve metadata requests without hitting storage.
-
-### Schema Evolution
-
-Schema is captured from the model DataFrame at each write. The system uses a best-effort mapping from Polars dtypes to Spark/Delta type strings via `_spark_type_from_polars_dtype()`:
-
-| Polars Type | Spark Type |
-|-------------|------------|
-| `Utf8`, `String` | `string` |
-| `Boolean` | `boolean` |
-| `Int8` | `byte` |
-| `Int16` | `short` |
-| `Int32` | `integer` |
-| `Int64` | `long` |
-| `UInt8` | `short` |
-| `UInt16` | `integer` |
-| `UInt32` | `long` |
-| `UInt64` | `decimal(20,0)` |
-| `Float32` | `float` |
-| `Float64` | `double` |
-| `Date` | `date` |
-| `Datetime` | `timestamp` |
-| `Binary` | `binary` |
-| `Decimal(p,s)` | `decimal(p,s)` |
-
-Unknown types default to `string`.
-
----
-
-## Dataclass Definitions
-
-All dataclasses are defined in `supertable/data_classes.py`. They serve as typed transfer objects between the metadata layer and the query execution engines.
-
-### TableDefinition
-
-```python
-@dataclass
-class TableDefinition:
-    super_name: str
-    simple_name: str
-    alias: str
-    columns: List[str] = field(default_factory=list)
-```
-
-Identifies a single table within a query context. The `alias` allows the SQL engine to reference the table by a user-chosen name. `columns` lists the column names available in this table.
-
-### SuperSnapshot
-
-```python
-@dataclass
-class SuperSnapshot:
-    super_name: str
-    simple_name: str
-    simple_version: int
-    files: List[str] = field(default_factory=list)
-    columns: Set[str] = field(default_factory=set)
-```
-
-A resolved view of a single SimpleTable snapshot used during query planning. Contains the list of data files to scan and the column set for schema validation.
-
-### RbacViewDef
-
-```python
-@dataclass
-class RbacViewDef:
-    allowed_columns: List[str] = field(default_factory=lambda: ["*"])
-    where_clause: str = ""
-```
-
-Defines RBAC-based column and row filtering for a table alias. Produced by `restrict_read_access()` and consumed by query executors to create a filtered view. `["*"]` means unrestricted column access; a non-empty `where_clause` is injected as a SQL WHERE predicate.
-
-### DedupViewDef
-
-```python
-@dataclass
-class DedupViewDef:
-    primary_keys: List[str] = field(default_factory=list)
-    order_column: str = "__timestamp__"
-    visible_columns: List[str] = field(default_factory=list)
-```
-
-Defines dedup-on-read semantics. The query engine creates a `ROW_NUMBER()` window partitioned by `primary_keys` and ordered by `order_column` DESC, keeping only the latest row per key combination. `visible_columns` controls projection; when empty or `["*"]`, all columns except `__rn__` are exposed.
-
-### TombstoneDef
-
-```python
-@dataclass
-class TombstoneDef:
-    primary_keys: List[str] = field(default_factory=list)
-    deleted_keys: List = field(default_factory=list)
-```
-
-Defines soft-delete filtering. The executor builds a view that excludes rows whose primary-key tuple appears in `deleted_keys`. Each entry in `deleted_keys` is a list of scalar values matching the order of `primary_keys`.
-
-### Reflection
-
-```python
-@dataclass
-class Reflection:
-    storage_type: str
-    reflection_bytes: int
-    total_reflections: int
-    supers: List[SuperSnapshot]
-    freshness_ms: int = 0
-    rbac_views: Dict[str, RbacViewDef] = field(default_factory=dict)
-    dedup_views: Dict[str, DedupViewDef] = field(default_factory=dict)
-    tombstone_views: Dict[str, TombstoneDef] = field(default_factory=dict)
-```
-
-The top-level query plan object. Aggregates all resolved SuperSnapshots with their associated RBAC, dedup, and tombstone view definitions. Key fields:
-
-| Field | Purpose |
-|-------|---------|
-| `storage_type` | Backend identifier (e.g., `"LOCAL"`, `"S3"`, `"MINIO"`). |
-| `reflection_bytes` | Total bytes across all data files -- used for engine auto-selection. |
-| `total_reflections` | Count of data files to scan. |
-| `supers` | List of `SuperSnapshot` objects, one per SimpleTable involved. |
-| `freshness_ms` | Maximum `last_updated_ms` across snapshots -- helps the engine decide between caching and re-reading. |
-| `rbac_views` | Alias-keyed RBAC filter definitions. |
-| `dedup_views` | Alias-keyed dedup-on-read definitions. |
-| `tombstone_views` | Alias-keyed tombstone (soft-delete) definitions. |
-
----
-
-## Metadata-to-Redis Mapping
-
-All metadata is stored in Redis as JSON strings. The key schema follows the
-v2 hierarchy enforced by `supertable/redis_keys.py` (see
-[16 Redis Key Layout](16_redis_layout.md)):
-
-```
-supertable:{organization}:lakes:{super_name}:meta:root
-supertable:{organization}:lakes:{super_name}:meta:leaf:doc:{simple_name}
-supertable:{organization}:lakes:{super_name}:meta:mirrors
-supertable:{organization}:lakes:{super_name}:meta:table_config:doc:{simple_name}
-supertable:{organization}:lakes:{super_name}:meta:table_names
-```
-
-Built by `meta_root()`, `meta_leaf()`, `meta_mirrors()`,
-`meta_table_config()`, and `meta_table_names()` in
-`supertable/redis_keys.py`.
-
-### meta:root
-
-```json
-{"version": 3, "ts": 1713200000000}
-```
-
-Tracks the SuperTable's global version. Bumped on structural changes (new tables, deletes). May contain additional flags:
-
-- `read_only` (bool) -- marks the SuperTable as a read-only clone.
-- `cloned_from` (str) -- source SuperTable name for clones.
-- `clone_type` (str) -- `"replica"` for live-linked clones.
-- `replica_tables` (list) -- subset of tables exposed by a replica.
-
-### meta:leaf:{simple_name}
-
-```json
-{
-  "version": 5,
-  "ts": 1713200000000,
-  "path": "acme/warehouse/tables/orders/snapshots/tables_20240414.json",
-  "payload": { ... }
-}
-```
-
-Points to the current snapshot for a SimpleTable. The `payload` field (when present) holds the full snapshot data inline, allowing readers to skip the storage read.
-
-### meta:mirrors
-
-```json
-{"formats": ["DELTA", "ICEBERG"], "ts": 1713200000000}
-```
-
-Lists enabled mirror export formats for the SuperTable. Supported values: `DELTA`, `ICEBERG`, `PARQUET`.
-
-### meta:table_config:{simple_name}
-
-```json
-{
-  "dedup_mode": "latest",
-  "primary_keys": ["order_id"],
-  "modified_ms": 1713200000000
-}
-```
-
-Per-table configuration for dedup mode, primary keys, and other table-level settings.
-
----
-
-## MetaReader
-
-The `MetaReader` class (`supertable/meta_reader.py`) provides a read-only metadata API optimized for the query path. It wraps `SuperTable` and `RedisCatalog` to serve:
-
-- **`get_tables(role_name)`** -- Lists all SimpleTables visible to a role (RBAC-filtered).
-- **`get_table_schema(table_name, role_name)`** -- Returns the schema for a single table or an aggregate schema across all tables if querying at the SuperTable level.
-
-MetaReader includes an in-process cache (`_SUPER_META_CACHE`) with a configurable TTL (`SUPERTABLE_SUPER_META_CACHE_TTL_S`, default 1 second) to de-duplicate bursty reflection calls. Redis leaf values are parsed and normalized through helper functions (`_try_parse_leaf_meta`, `_leaf_to_snapshot_like`, `_schema_to_dict`) that handle bytes/string decoding and various payload shapes.
+This is the formula used by the metadata summary and the row-identity helper. It is based on metadata, not a fresh count of visible rows.
+
+`rowid_high_watermark` is carried forward and raised to cover newly reserved ranges. OData identity checks reject a missing or negative watermark and a live-row count larger than the watermark. This is a metadata consistency check; it does not scan all row IDs to prove uniqueness.
+
+Sources: [row allocation and mutations](../supertable/data_writer.py), [deletion-vector format](../supertable/processing.py), [identity checks](../supertable/odata/row_identity.py).
+
+## Schema behavior
+
+Ordinary writes record the incoming frame's schema, including system columns. They do not compute a complete schema union over every retained file. Explicit compaction and writes that perform small-file compaction construct a model schema from rewritten files, with a fallback to the prior schema. That metadata helper keeps the first observed type for a repeated column name; it does not reconcile types across all output files.
+
+When compaction combines frames, missing columns are filled with nulls. For mixed numeric types, the union helpers select `Int64` or `Float64` and use permissive casts; unsupported combinations can become strings. These conversions are not always lossless: for example, an unsigned value outside the `Int64` range can become null during a conflicting-integer cast. Native Parquet queries use name-based schema union; metadata schemas and the columns physically present across all files can therefore differ.
+
+There is no primary-key constraint or incoming-batch uniqueness check in `DataWriter.write`. Multiple incoming rows with the same overwrite key can survive together. `newer_than` compares incoming values against existing matching data; it does not choose a single winner within the incoming batch.
+
+Sources: [schema collection](../supertable/utils/helper.py), [schema union and overwrite matching](../supertable/processing.py), [write path](06_data_writer.md).
+
+## Statistics artifacts
+
+Statistics are extracted from Parquet row-group metadata. Each row identifies a data file, row group, and user column. The schema contains:
+
+- Identity/type fields: `file_path`, `row_group_id`, `column_name`, `physical_type`, `logical_type`.
+- Bound pairs: `min_bigint`/`max_bigint`, `min_double`/`max_double`, `min_timestamp`/`max_timestamp`, `min_string`/`max_string`.
+- Other metadata: `null_count`, `row_group_rows`, `compressed_bytes`, `stats_available`, `min_is_exact`, `max_is_exact`.
+
+`__rowid__` and `__timestamp__` are excluded from this artifact. Unsupported or unavailable bounds cannot establish that a file is irrelevant. Write-overlap pruning and read-predicate pruning use the stored bounds conservatively. Updating statistics removes entries for sunset resources and adds entries for newly written files.
+
+Source: [`STATS_SCHEMA`, extraction, and pruning](../supertable/processing.py).
+
+## Versions and historical files
+
+The Redis leaf document has its own version counter, separate from `snapshot_version`. The root has another counter updated after leaf publication. These counters describe different objects and should not be substituted for one another.
+
+Snapshot predecessor links preserve a chain of table states. Removing a resource from the current snapshot does not delete its physical object. The normal write and compact paths retain those old files; they do not implement a general vacuum or a transactional rollback API. Deleting a SimpleTable removes its native `tables/<simple_name>/` tree and catalog entries, but does not remove its separately located mirrors. Deleting the containing SuperTable removes the entire `<organization>/<super_name>/` tree, including mirrors.
+
+See [catalog publication](05_redis_catalog.md), [writer commit sequence](06_data_writer.md), and [known implementation gaps](TODO.md).
+
+## Query planning objects
+
+[`data_classes.py`](../supertable/data_classes.py) defines internal values used between parsing, estimation, and execution:
+
+| Type | Fields / use |
+| --- | --- |
+| `TableDefinition` | SuperTable, SimpleTable, SQL alias, referenced columns. |
+| `SuperSnapshot` | Table identity, leaf version, resolved file paths, referenced columns. |
+| `Reflection` | Storage type, estimated bytes, file count, snapshots, freshness, RBAC and tombstone view mappings. |
+| `RbacViewDef` | Allowed columns and SQL row predicate. |
+| `TombstoneDef` | Deletion-vector path(s) and cache key. |
+| `PredInterval` | Typed lower/upper predicate bounds and inclusivity. |
+
+These objects carry a query's resolved inputs; they are not the stored table snapshot format.

@@ -1,361 +1,136 @@
-# 04 -- Storage Layer
+# Storage
 
-## Business Context
+SuperTable stores Parquet data and JSON snapshots through `StorageInterface`. Redis stores the current table pointers and coordination state. Selecting local storage does not remove the Redis dependency.
 
-SuperTable decouples metadata (Redis) from heavy data (Parquet files, snapshot JSON) through a pluggable storage abstraction. This design lets organizations start on local disk during development, move to MinIO for self-hosted object storage, and scale to managed cloud services (AWS S3, Azure Blob Storage, Google Cloud Storage) in production -- all without changing application code. The storage layer is the single point of integration for reading and writing data files, and every backend implements the same interface so the rest of the system remains backend-agnostic.
+Implementation: [storage interface](../supertable/storage/storage_interface.py), [factory](../supertable/storage/storage_factory.py), [table layout](../supertable/simple_table.py). See [configuration](02_configuration.md) for settings and [catalog](05_redis_catalog.md) for publication semantics.
 
-The factory pattern ensures that backend selection is driven by configuration (environment variables or explicit arguments), while lazy imports keep cloud SDK dependencies optional. Teams only install the packages they need.
-
----
-
-## StorageInterface (Abstract Base Class)
-
-**Module**: `supertable/storage/storage_interface.py`
-
-All storage backends extend `StorageInterface`, which defines the complete contract for data operations. The class also provides a `base_prefix` mechanism -- when set, all paths are automatically prefixed, enabling a single bucket to host multiple SuperTable deployments.
-
-### Helper Method
+## Choose a backend
 
 ```python
-def _with_base(self, path: str) -> str
+from supertable.storage.storage_factory import get_storage
+
+storage = get_storage()
+storage.write_json("examples/run.json", {"state": "ready"})
+assert storage.read_json("examples/run.json")["state"] == "ready"
 ```
 
-Prepends `base_prefix` to the given path if set. No-op when `base_prefix` is empty. All backend implementations call this internally before operating on keys.
+`get_storage(kind=None, **kwargs)` chooses the explicit `kind`, then `settings.STORAGE_TYPE`. The factory recognizes these names:
 
-### Abstract Methods -- JSON Operations
+| Kind | Implementation | Optional dependency extra | Construction from settings |
+| --- | --- | --- | --- |
+| `LOCAL` | `LocalStorage` | None specific to this backend | Uses filesystem paths and the application working directory |
+| `S3` | `S3Storage` | `supertable[s3]` | Bucket, endpoint, region, access key, secret key, session token, addressing style, prefix |
+| `MINIO` | `MinioStorage` | `supertable[minio]` | Bucket, required HTTP(S) endpoint and access/secret keys, region, prefix |
+| `AZURE` | `AzureBlobStorage` | `supertable[azure]` | Blob endpoint/account, container, credentials, prefix |
+| `GCS` or `GCP` | `GCSStorage` | `supertable[gcp]` | Bucket, service-account credentials or default credentials, project, prefix |
 
-```python
-@abc.abstractmethod
-def read_json(self, path: str) -> Dict[str, Any]
-```
-Reads and returns parsed JSON data from the given path. Raises `FileNotFoundError` or `ValueError` on error.
+Unknown kinds raise `ValueError`. Missing provider dependencies raise an installation error. With no keyword arguments, the factory caches backend instances using backend and storage settings as the key. `reset_storage_cache()` clears that cache; it is also registered to run in forked children. Passing keyword arguments bypasses the cache and calls the backend constructor directly. Keyword arguments are constructor arguments, not environment-variable names.
 
-```python
-@abc.abstractmethod
-def write_json(self, path: str, data: Dict[str, Any]) -> None
-```
-Writes JSON data to the given path. Overwrites if the file already exists.
+## Paths and physical layout
 
-### Abstract Methods -- File System Operations
+Table code constructs relative logical paths:
 
-```python
-@abc.abstractmethod
-def exists(self, path: str) -> bool
-```
-Returns `True` if the given path exists. For cloud storage, the path may be a prefix or object key.
-
-```python
-@abc.abstractmethod
-def size(self, path: str) -> int
-```
-Returns the size in bytes of the object at the given path. Raises `FileNotFoundError` if not found.
-
-```python
-@abc.abstractmethod
-def makedirs(self, path: str) -> None
-```
-Creates directories (or the cloud equivalent) if needed. No-op if already present.
-
-```python
-@abc.abstractmethod
-def list_files(self, path: str, pattern: str = "*") -> List[str]
-```
-Returns a list of files/objects found under `path` matching the given glob pattern. Operates at a single directory level.
-
-```python
-@abc.abstractmethod
-def delete(self, path: str) -> None
-```
-Deletes a file/object at the given path. Raises `FileNotFoundError` if the path does not exist.
-
-```python
-@abc.abstractmethod
-def get_directory_structure(self, path: str) -> dict
-```
-Recursively builds and returns a nested dictionary representing the folder structure under the given path. Files map to `None`, directories map to nested dicts.
-
-### Abstract Methods -- Parquet Operations
-
-```python
-@abc.abstractmethod
-def write_parquet(self, table: pa.Table, path: str) -> None
-```
-Writes a PyArrow Table in Parquet format to the given path.
-
-```python
-@abc.abstractmethod
-def read_parquet(self, path: str) -> pa.Table
-```
-Reads and returns a PyArrow Table from the given Parquet path.
-
-### Abstract Methods -- Byte / Text / Copy Operations
-
-```python
-@abc.abstractmethod
-def write_bytes(self, path: str, data: bytes) -> None
-```
-Writes raw bytes to the given path. Creates parent directories/prefixes as needed.
-
-```python
-@abc.abstractmethod
-def read_bytes(self, path: str) -> bytes
-```
-Reads and returns raw bytes from the given path.
-
-```python
-@abc.abstractmethod
-def write_text(self, path: str, text: str, encoding: str = "utf-8") -> None
-```
-Writes a string to the given path using the specified encoding.
-
-```python
-@abc.abstractmethod
-def read_text(self, path: str, encoding: str = "utf-8") -> str
-```
-Reads and returns text from the given path using the specified encoding.
-
-```python
-@abc.abstractmethod
-def copy(self, src_path: str, dst_path: str) -> None
-```
-Copies an object from `src_path` to `dst_path` within the same storage backend.
-
-### Optional Methods (Not Abstract)
-
-```python
-def to_duckdb_path(self, key: str, prefer_httpfs: Optional[bool] = None) -> str
-```
-Returns a path usable by DuckDB readers. Implementations may return `s3://bucket/key` or HTTP(S) URLs. Raises `NotImplementedError` by default.
-
-```python
-def presign(self, key: str, expiry_seconds: int = 3600) -> str
-```
-Returns a presigned GET URL for the object. Raises `NotImplementedError` by default.
-
----
-
-## StorageFactory
-
-**Module**: `supertable/storage/storage_factory.py`
-
-The factory function `get_storage()` resolves and instantiates the correct backend.
-
-```python
-def get_storage(kind: Optional[str] = None, **kwargs: Any) -> StorageInterface
+```text
+<organization>/<super_name>/
+  super/
+  tables/<simple_name>/
+    data/
+    snapshots/
+    stats/
+    tombstone/
+  staging/
+    <staging_name>/
+    <staging_name>_files.json
 ```
 
-### Selection Logic (Priority Order)
+`data/` contains Parquet resources; `snapshots/` contains JSON versions of a simple table. Statistics and tombstones are separate Parquet resources when produced by writes. Staging data and its JSON file index live outside the simple-table directories. The `super/` directory is created for local storage; the super-table root metadata itself lives in Redis.
 
-| Priority | Source | Example |
-|----------|--------|---------|
-| 1 | Explicit `kind` argument | `get_storage(kind="S3")` |
-| 2 | `settings.STORAGE_TYPE` (from env `STORAGE_TYPE`) | `STORAGE_TYPE=MINIO` |
-| 3 | `default.STORAGE_TYPE` from defaults config | Configured at package level |
-| 4 | Fallback | `LOCAL` |
+Object backends prepend `SUPERTABLE_PREFIX`, if set, to the logical path. For example, prefix `warehouse` and path `acme/sales/tables/orders/data/part.parquet` address object key `warehouse/acme/sales/tables/orders/data/part.parquet` in the configured bucket or container. Supply paths without that prefix to ordinary read/write methods: `_with_base()` prepends it and does not detect an already-prefixed key.
 
-### Backend Resolution
+Local storage uses the supplied path directly, so absolute paths remain absolute. Importing [homedir](../supertable/config/homedir.py) resolves a writable application home and changes the process working directory to it. Relative local paths consequently resolve there. Local storage does not apply `SUPERTABLE_PREFIX` and does not restrict callers to the application home.
 
-| `STORAGE_TYPE` | Class | Module | Required Package |
-|----------------|-------|--------|------------------|
-| `LOCAL` | `LocalStorage` | `supertable.storage.local_storage` | None (built-in) |
-| `S3` | `S3Storage` | `supertable.storage.s3_storage` | `boto3` (`pip install 'supertable[s3]'`) |
-| `MINIO` | `MinioStorage` | `supertable.storage.minio_storage` | `minio` (`pip install 'supertable[minio]'`) |
-| `AZURE` | `AzureBlobStorage` | `supertable.storage.azure_storage` | `azure.storage.blob` (`pip install 'supertable[azure]'`) |
-| `GCS` / `GCP` | `GCSStorage` | `supertable.storage.gcp_storage` | `google.cloud.storage` (`pip install 'supertable[gcp]'`) |
+## Common operations
 
-All cloud modules are lazily imported via `importlib.import_module()`. Before importing, a `_require()` helper checks that the necessary SDK is installed and raises a user-friendly error with an install hint if it is missing.
+| Operation | Behavior |
+| --- | --- |
+| `read_json(path)`, `write_json(path, data)` | Load/store JSON; absent reads raise `FileNotFoundError`; empty or invalid JSON produces an error |
+| `read_bytes`, `write_bytes`, `read_text`, `write_text` | Read/store a complete payload; text defaults to UTF-8 |
+| `read_parquet(path, columns=None)` | Return a PyArrow table; optionally project columns |
+| `write_parquet(table, path)` | Write a PyArrow table using `pyarrow.parquet.write_table` |
+| `exists(path)` | Filesystem existence locally; exact object existence remotely |
+| `size(path)` | File or object bytes; missing resources raise `FileNotFoundError` |
+| `makedirs(path)` | Create local directories; a no-op for every object backend |
+| `list_files(path, pattern="*")` | Sorted immediate children matched by a glob pattern; may include child directories/prefixes |
+| `get_directory_structure(path)` | Recursively construct nested dictionaries, with files represented by `None` |
+| `copy(src_path, dst_path)` | Copy within the same storage backend |
+| `delete(path)` | Delete an exact file/object, or a directory/prefix when no exact object exists |
+| `delete_tree(path)` | Walk descendant objects and remove them; also remove an exact root object or remaining local directory; return a removal count |
 
-When `kwargs` are provided, they are forwarded directly to the backend constructor. When no `kwargs` are provided (the common case), cloud backends use their `from_env()` class method to build themselves from environment variables.
+Projection deliberately intersects requested names with available columns. If that intersection is empty, the implementation reads all columns. Passing `[]` also reads all columns. Callers needing strict schema validation must handle it before this method.
 
----
+The remote `read_parquet` implementations download the complete object into memory before applying the PyArrow projection. Their `write_parquet` implementations also construct an in-memory Parquet buffer. These adapter methods do not provide streaming range reads. Query engines can use a separate direct path or signed URL where supported.
 
-## Backend Details
+Remote listings include the configured base prefix in returned strings, while read/write methods add the prefix themselves. Do not blindly pass a returned listing path back into those methods when a prefix is configured. `delete_tree()` reconstructs logical descendant paths from `get_directory_structure()` to avoid this issue.
 
-### LocalStorage
+Remote `exists("folder")` can be false while objects exist under `folder/`. No object backend creates directory marker objects in `makedirs()`.
 
-**Module**: `supertable.storage.local_storage`
-**Class**: `LocalStorage`
+## Local filesystem behavior
 
-The default backend, requiring no external dependencies beyond PyArrow for Parquet support.
+[LocalStorage](../supertable/storage/local_storage.py) writes JSON to a temporary file in the destination directory, flushes and synchronizes the file, then replaces the destination with `os.replace()`. It attempts to synchronize the directory afterward. JSON reads retry empty files, parse failures, and files that disappear during the read up to five attempts with a 20 ms delay.
 
-```python
-class LocalStorage(StorageInterface):
-    pass  # No __init__ arguments; uses app_home as base directory
-```
+Parquet, bytes, and text writes write directly to the destination path; they do not use the JSON replacement procedure. Local Parquet reads disable Hive partition inference with `partitioning=None`. Copies use `shutil.copyfile`.
 
-**Key implementation details**:
+## S3
 
-- **Atomic JSON writes**: Uses `tempfile.mkstemp` in the same directory, writes + `fsync`, then `os.replace()` for an atomic swap. Directory is fsynced on POSIX systems for durability.
-- **Retry on read**: A micro-retry loop (5 attempts, 20 ms backoff) handles transient races with concurrent writers performing atomic replace.
-- **No authentication**: Operates on the local filesystem relative to `app_home`.
+[S3Storage](../supertable/storage/s3_storage.py) accepts an injected client or creates a Boto3 S3 client. Without explicit credentials, it leaves credential resolution to Boto3. An endpoint without a scheme is normalized to HTTPS; a bucket prefix in the endpoint hostname is removed before client construction.
 
-### S3Storage
+`STORAGE_FORCE_PATH_STYLE=true` selects path-style addressing when constructing from settings; otherwise virtual-host addressing is selected. S3 construction does not create the bucket. The implementation probes bucket location when needed and retries supported redirect/region errors once after rebuilding its client. A retried upload rewinds a seekable body; it refuses to retry a non-rewindable body.
 
-**Module**: `supertable.storage.s3_storage`
-**Class**: `S3Storage`
+Object reads close the response body after reading. Prefix deletion uses batches of at most 1,000 objects and checks the returned per-object errors. Partial deletion raises `OSError`. Copies use S3 `copy_object`.
 
-AWS S3 backend built on `boto3`.
+## MinIO
 
-```python
-class S3Storage(StorageInterface):
-    def __init__(
-        self,
-        bucket_name: str,
-        client=None,
-        endpoint_url: Optional[str] = None,
-        region: Optional[str] = None,
-        url_style: str = "vhost",
-        secure: Optional[bool] = None,
-        aws_access_key_id: Optional[str] = None,
-        aws_secret_access_key: Optional[str] = None,
-        aws_session_token: Optional[str] = None,
-        base_prefix: str = "",
-    )
+[MinioStorage](../supertable/storage/minio_storage.py) requires `STORAGE_ENDPOINT_URL`, `STORAGE_ACCESS_KEY`, and `STORAGE_SECRET_KEY` in `from_env()`. The endpoint must start with `http://` or `https://`; its scheme determines transport security. The configured bucket is checked and created if absent. Region-mismatch handling can rebuild the client using credentials retained during environment construction.
 
-    @classmethod
-    def from_env(cls) -> "S3Storage"
-```
+An injected-client constructor requires `bucket_name` and `client`; it does not run the environment constructor's bucket creation and endpoint setup. Object reads close and release the connection. Prefix deletion consumes the MinIO removal error iterator and raises if any objects failed. Copies use the MinIO copy API.
 
-**Authentication / Configuration via `from_env()`**:
+## Azure Blob Storage
 
-| Environment Variable | Purpose |
-|---------------------|---------|
-| `STORAGE_BUCKET` | S3 bucket name |
-| `STORAGE_REGION` | AWS region |
-| `STORAGE_ENDPOINT_URL` | Custom endpoint (for S3-compatible services) |
-| `STORAGE_ACCESS_KEY` | AWS access key ID |
-| `STORAGE_SECRET_KEY` | AWS secret access key |
-| `STORAGE_SESSION_TOKEN` | AWS session token (for temporary credentials) |
-| `SUPERTABLE_PREFIX` | Base prefix within the bucket |
-| `STORAGE_FORCE_PATH_STYLE` | Use path-style addressing (for S3-compatible services) |
+[AzureBlobStorage](../supertable/storage/azure_storage.py) resolves:
 
-**Notes**:
-- Automatically normalizes bucket-prefixed AWS endpoints (e.g., `https://bucket.s3.amazonaws.com`).
-- Supports both virtual-hosted and path-style addressing.
-- Secure (HTTPS) is auto-detected from the endpoint URL scheme.
+1. Container from `STORAGE_BUCKET`, then `AZURE_CONTAINER`, then `supertable`.
+2. Endpoint from `STORAGE_ENDPOINT_URL`, then `AZURE_BLOB_ENDPOINT`; otherwise from `AZURE_STORAGE_ACCOUNT`.
+3. Credentials from connection string, then `STORAGE_ACCESS_KEY`/`AZURE_STORAGE_KEY`, then SAS token, then `DefaultAzureCredential`.
 
-### MinioStorage
+The default `STORAGE_BUCKET=supertable` takes precedence over `AZURE_CONTAINER`. Set `STORAGE_BUCKET` explicitly to select an Azure container through the normal settings loader.
 
-**Module**: `supertable.storage.minio_storage`
-**Class**: `MinioStorage`
+The adapter can also parse an `abfss://<container>@<account>.dfs.core.windows.net/<prefix>` value from `SUPERTABLE_HOME` for missing account/endpoint/prefix values. The effective container has already been resolved, so the URI container does not override it. Application-home resolution separately treats `SUPERTABLE_HOME` as a filesystem path; explicit Azure settings keep those two responsibilities clear.
 
-MinIO backend using the official MinIO Python SDK.
+The default-credential branch imports `azure.identity`; the declared `azure` package extra lists `azure-storage-blob`, so this branch also needs `azure.identity` available in the environment. The constructor obtains an existing container client and does not create the container. Writes overwrite blobs. `copy()` downloads the source bytes and uploads them to the destination.
 
-```python
-class MinioStorage(StorageInterface):
-    def __init__(self, bucket_name: str, client: Minio, base_prefix: str = "")
+## Google Cloud Storage
 
-    @classmethod
-    def from_env(cls) -> "MinioStorage"
-```
+[GCSStorage](../supertable/storage/gcp_storage.py) resolves bucket from `GCS_BUCKET`, then `STORAGE_BUCKET`, then `supertable`. `from_env()` uses an existing `GOOGLE_APPLICATION_CREDENTIALS` file first, then inline `GCP_SA_JSON`, then default Google credentials. `GCP_PROJECT` is passed to the client when set.
 
-**Authentication / Configuration via `from_env()`**:
+The constructor obtains a bucket handle and does not create the bucket. Copies use the bucket copy API. `delete_prefix(path)` is an additional GCS method that removes descendants without requiring an exact object to exist.
 
-| Environment Variable | Purpose |
-|---------------------|---------|
-| `STORAGE_BUCKET` | Bucket name |
-| `STORAGE_ENDPOINT_URL` | MinIO endpoint (e.g., `http://localhost:9000`) |
-| `STORAGE_ACCESS_KEY` | MinIO access key |
-| `STORAGE_SECRET_KEY` | MinIO secret key |
-| `STORAGE_REGION` | Region (optional) |
-| `SUPERTABLE_PREFIX` | Base prefix within the bucket |
+## Engine paths and signed reads
 
-**Notes**:
-- Auto-creates the bucket if it does not exist (with region-aware retry).
-- Handles `AuthorizationHeaderMalformed` errors by extracting the expected region from the error message and rebuilding the client.
-- Exposes `endpoint_url`, `region`, `url_style`, and `secure` properties for downstream DuckDB integration.
-- Default `url_style` is `"path"`.
+Object adapters implement `to_duckdb_path(key, prefer_httpfs=None)` and `presign(key, expiry_seconds=3600)`. If `prefer_httpfs` is omitted, `SUPERTABLE_DUCKDB_USE_HTTPFS` selects URI style:
 
-### AzureBlobStorage
+| Backend | Default path | HTTP-style path |
+| --- | --- | --- |
+| S3 | `s3://<bucket>/<key>` | Configured endpoint with virtual-host or path addressing |
+| MinIO | `s3://<bucket>/<key>` | `<endpoint>/<bucket>/<key>` |
+| Azure | `azure://<container>/<key>` | Blob-service URL, container, key |
+| GCS | `gcs://<bucket>/<key>` | `https://storage.googleapis.com/<bucket>/<key>` |
 
-**Module**: `supertable.storage.azure_storage`
-**Class**: `AzureBlobStorage`
+The configured prefix is included in these paths. HTTP-style paths are ordinary resource URLs, not automatically signed URLs. `presign()` separately creates a read URL using provider credentials: S3 GET signing, MinIO GET signing, Azure read SAS, or GCS V4 GET signing. Azure can request a user-delegation key when an account key is unavailable. The provider may reject signing if the credential lacks the required capability.
 
-Azure Blob Storage backend using the Azure SDK.
+`LocalStorage` inherits the interface's `NotImplementedError` for both optional methods; query code resolves local filesystem paths separately. A method that formats a cloud URI does not itself install a query-engine extension or configure authentication. See [query engines](09_query_engine.md).
 
-```python
-class AzureBlobStorage(StorageInterface):
-    def __init__(self, container_name: str, blob_service_client: BlobServiceClient, base_prefix: str = "")
+## Deletion and consistency boundaries
 
-    @classmethod
-    def from_env(cls) -> "AzureBlobStorage"
-```
+`delete_tree()` removes descendants before an exact root object, including the case where both exist. It ignores `FileNotFoundError` for already-removed entries but propagates other errors. The count describes removals reported by this traversal; it is not a remote transaction result.
 
-**Authentication / Configuration via `from_env()`**:
-
-| Environment Variable | Purpose |
-|---------------------|---------|
-| `SUPERTABLE_HOME` | ABFSS URI: `abfss://{container}@{account}.dfs.core.windows.net/{prefix}` |
-| `STORAGE_BUCKET` / `AZURE_CONTAINER` | Container name |
-| `STORAGE_ENDPOINT_URL` / `AZURE_BLOB_ENDPOINT` | Blob endpoint URL |
-| `STORAGE_ACCESS_KEY` / `AZURE_STORAGE_KEY` | Account key |
-| `SUPERTABLE_PREFIX` | Base prefix within the container |
-| `AZURE_STORAGE_CONNECTION_STRING` | Full connection string |
-| `AZURE_STORAGE_ACCOUNT` | Storage account name |
-| `AZURE_SAS_TOKEN` | Shared Access Signature token |
-| `AZURE_AUTH_MODE` | When `AAD` with no secrets, uses `DefaultAzureCredential` |
-
-**ABFSS URI parsing**: The helper `_parse_abfss(uri)` extracts `(account, container, blob_endpoint, prefix)` from an `abfss://` URI. This allows a single `SUPERTABLE_HOME` variable to configure the entire Azure connection.
-
-**Authentication cascade**:
-1. Connection string (if provided)
-2. Account key
-3. SAS token
-4. `DefaultAzureCredential` (managed identity / AAD)
-
-### GCSStorage
-
-**Module**: `supertable.storage.gcp_storage`
-**Class**: `GCSStorage`
-
-Google Cloud Storage backend using the `google-cloud-storage` SDK.
-
-```python
-class GCSStorage(StorageInterface):
-    def __init__(
-        self,
-        bucket: str,
-        credentials_path: Optional[str] = None,
-        client: Optional[storage.Client] = None,
-        base_prefix: str = "",
-    )
-
-    @classmethod
-    def from_env(cls) -> "GCSStorage"
-```
-
-**Authentication / Configuration via `from_env()`**:
-
-| Environment Variable | Purpose |
-|---------------------|---------|
-| `GCS_BUCKET` / `STORAGE_BUCKET` | Bucket name (default: `supertable`) |
-| `SUPERTABLE_PREFIX` | Base prefix within the bucket |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Path to service account JSON file |
-| `GCP_SA_JSON` | Raw JSON string (alternative to file path) |
-| `GCP_PROJECT` | Optional GCP project override |
-
-**Authentication cascade**:
-1. Service account JSON file (via `GOOGLE_APPLICATION_CREDENTIALS`)
-2. Inline service account JSON string (via `GCP_SA_JSON`)
-3. Application Default Credentials (ADC) -- works with GKE workload identity, Cloud Run, etc.
-
-**Notes**:
-- GCS uses a flat namespace; directories are simulated by common prefixes.
-- One-level listing uses `delimiter="/"` for parity with local storage behavior.
-
----
-
-## Configuration Summary
-
-All backends share a common configuration pattern:
-
-```
-STORAGE_TYPE=<LOCAL|S3|MINIO|AZURE|GCS|GCP>
-STORAGE_BUCKET=<bucket or container name>
-STORAGE_ENDPOINT_URL=<endpoint URL>
-STORAGE_ACCESS_KEY=<access key>
-STORAGE_SECRET_KEY=<secret key>
-SUPERTABLE_PREFIX=<optional base prefix>
-```
-
-Cloud-specific variables extend this base set. The `from_env()` class methods on each backend read these variables through the centralized `settings` object, ensuring consistent precedence and defaults across the system.
+`SuperTable.delete()` removes storage first and then asks Redis to delete the namespace. `SimpleTable.delete()` follows the same storage-first ordering for its table. Neither operation is a transaction across storage and Redis. A storage failure can leave some objects removed while metadata remains. The storage interface provides no distributed transaction, compare-and-swap object write, or automatic rollback.

@@ -1,605 +1,138 @@
-# 12 -- Audit Logging
+# Audit events
 
-SuperTable provides an immutable, append-only audit trail for every
-security-relevant action.  The subsystem lives under `supertable.audit` and
-is designed for regulated environments that must satisfy DORA, SOC 2, and
-similar compliance frameworks.
+The audit package accepts structured events and attempts to write each batch independently to Redis Streams and Parquet storage. It is disabled by default. Delivery is asynchronous and best effort; an application operation can succeed even when its audit event is dropped or one storage destination fails.
 
----
+Implementation: [audit package](../supertable/audit/__init__.py), [events](../supertable/audit/events.py), [logger](../supertable/audit/logger.py), [Redis writer](../supertable/audit/writer_redis.py), and [Parquet writer](../supertable/audit/writer_parquet.py).
 
-## 12.1  AuditEvent Data Model
+## 1. Enable and emit events
 
-**Module:** `supertable.audit.events`
+Enable auditing before starting the process:
 
-`AuditEvent` is a frozen dataclass (`@dataclass(frozen=True)`) -- events are
-immutable once created.
-
-### 12.1.1  Field Groups
-
-| Group | Fields | Description |
-|-------|--------|-------------|
-| **Identity** | `event_id`, `timestamp_ms` | Time-ordered UUID v7-like ID and Unix-ms timestamp. |
-| **Classification** | `category`, `action`, `severity` | What kind of event (see enums below). |
-| **Actor** | `actor_type`, `actor_id`, `actor_username`, `actor_ip`, `actor_user_agent` | Who triggered the event. |
-| **Context** | `organization`, `super_name`, `correlation_id`, `session_id`, `server` | Tenant, request trace, server identity. |
-| **Resource** | `resource_type`, `resource_id` | What was acted upon. |
-| **Operation** | `detail`, `outcome`, `reason` | Action-specific JSON payload, result, and failure reason. |
-| **Integrity** | `chain_hash` | Set by the writer (not the emitter) for tamper detection. |
-| **Instance** | `instance_id` | `hostname-PID`, stable per process. |
-
-### 12.1.2  Event ID Generation (`_uuid7`)
-
-Event IDs are time-ordered for lexicographic = chronological sorting:
-
-```
-{unix_ms_hex:012x}-{counter_hex:04x}-{random_hex:8}
+```sh
+export SUPERTABLE_AUDIT_ENABLED=true
 ```
 
-### 12.1.3  Serialisation Methods
-
-| Method | Output | Use Case |
-|--------|--------|----------|
-| `to_dict()` | Flat dict | Redis XADD, Parquet row. |
-| `to_json()` | Compact JSON string | Log lines, export. |
-| `event_hash()` | SHA-256 hex | Chain input (excludes `chain_hash` and `instance_id`). |
-| `from_dict(d)` | `AuditEvent` | Reconstruct from storage. |
-
----
-
-## 12.2  Classification Enums
-
-### 12.2.1  EventCategory
+Applications can emit additional events explicitly:
 
 ```python
-class EventCategory(str, Enum):
-    AUTHENTICATION  = "authentication"
-    AUTHORIZATION   = "authorization"
-    DATA_ACCESS     = "data_access"
-    DATA_MUTATION   = "data_mutation"
-    RBAC_CHANGE     = "rbac_change"
-    CONFIG_CHANGE   = "config_change"
-    TOKEN_MGMT      = "token_management"
-    SYSTEM          = "system"
-    EXPORT          = "export"
-    SECURITY_ALERT  = "security_alert"
-```
-
-### 12.2.2  Severity
-
-```python
-class Severity(str, Enum):
-    INFO     = "info"
-    WARNING  = "warning"
-    CRITICAL = "critical"
-```
-
-Severity drives alerting thresholds and retention priority.
-
-### 12.2.3  Outcome
-
-```python
-class Outcome(str, Enum):
-    SUCCESS = "success"
-    FAILURE = "failure"
-    DENIED  = "denied"
-```
-
-### 12.2.4  ActorType
-
-```python
-class ActorType(str, Enum):
-    USER      = "user"
-    SUPERUSER = "superuser"
-    API_TOKEN = "api_token"
-    SYSTEM    = "system"
-    MCP       = "mcp"
-```
-
----
-
-## 12.3  Actions Constants
-
-The `Actions` class contains every canonical action verb grouped by category.
-All `emit()` calls must reference one of these constants.
-
-### Authentication
-`LOGIN_SUCCESS`, `LOGIN_FAILURE`, `LOGOUT`, `SESSION_EXPIRED`,
-`TOKEN_AUTH_SUCCESS`, `TOKEN_AUTH_FAILURE`, `MCP_AUTH_SUCCESS`,
-`MCP_AUTH_FAILURE`
-
-### Authorization
-`ACCESS_GRANTED`, `ACCESS_DENIED`, `ROW_FILTER_APPLIED`,
-`COLUMN_FILTER_APPLIED`
-
-### Data Access
-`QUERY_EXECUTE`, `TABLE_READ`, `TABLE_LIST`, `METADATA_READ`, `SCHEMA_READ`
-
-### Data Mutation
-`DATA_WRITE`, `DATA_DELETE`, `TABLE_CREATE`, `TABLE_DELETE`,
-`TABLE_CONFIG_CHANGE`, `STAGING_CREATE`, `STAGING_DELETE`,
-`PIPE_CREATE`, `PIPE_UPDATE`, `PIPE_DELETE`, `PIPE_ENABLE`, `PIPE_DISABLE`,
-`PIPE_EXECUTE`, `FILE_UPLOAD`, `SUPERTABLE_CREATE`, `SUPERTABLE_DELETE`,
-`SUPERTABLE_CLONE_READONLY`, `SUPERTABLE_CLONE_WRITABLE`,
-`SUPERTABLE_CLONE_REPLICA`, `SUPERTABLE_TOGGLE_READONLY`,
-`SUPERTABLE_PROMOTE`, `SUPERTABLE_DETACH`, `TABLE_CLONE`
-
-### Data Sharing
-`SHARE_CREATE`, `SHARE_REVOKE`, `SHARE_MANIFEST_ACCESS`, `SHARE_LINK`,
-`SHARE_UNLINK`, `SHARE_MATERIALIZE`, `PUBLICATION_CREATE`,
-`PUBLICATION_REVOKE`, `PUBLICATION_ACCEPT`
-
-### RBAC Changes
-`ROLE_CREATE`, `ROLE_UPDATE`, `ROLE_DELETE`, `ROLE_ENABLE`, `ROLE_DISABLE`,
-`ROLE_CLONE`, `USER_CREATE`, `USER_UPDATE`, `USER_DELETE`, `USER_ENABLE`,
-`USER_DISABLE`, `USER_ROLE_ASSIGN`, `USER_ROLE_REMOVE`,
-`AUDITOR_ROLE_CREATE`, `AUDITOR_ROLE_REVOKE`
-
-### Configuration Changes
-`ENGINE_CONFIG_CHANGE`, `MIRROR_ENABLE`, `MIRROR_DISABLE`, `SETTING_CHANGE`
-
-### Token Management
-`TOKEN_CREATE`, `TOKEN_DELETE`, `TOKEN_REGENERATE`
-
-### System
-`SERVICE_START`, `SERVICE_STOP`, `HEALTH_CHECK_FAILURE`, `AUDIT_GAP`
-
-### Export
-`ODATA_ACCESS`, `AUDIT_EXPORT`
-
-### Retention & Legal Hold
-`RETENTION_EXECUTE`, `LEGAL_HOLD_CHANGE`
-
-### Garbage Collection
-`GC_EXECUTE`, `GC_PREVIEW`
-
-### Snapshot History
-`SNAPSHOT_HISTORY_READ`
-
-### Security Alerts
-`BRUTE_FORCE_DETECTED`, `PRIVILEGE_ESCALATION`, `UNUSUAL_ACCESS_PATTERN`
-
----
-
-## 12.4  Emitting Events -- Public API
-
-**Module:** `supertable.audit` (`__init__.py`)
-
-The primary interface is the `emit()` convenience function:
-
-```python
-from supertable.audit import emit, EventCategory, Actions, Severity, make_detail
+from supertable.audit import Actions, EventCategory, emit, get_audit_logger
 
 emit(
-    category=EventCategory.RBAC_CHANGE,
-    action=Actions.ROLE_CREATE,
+    category=EventCategory.SYSTEM,
+    action=Actions.SERVICE_START,
     organization="acme",
-    actor_type="superuser",
-    actor_id="abc123",
-    actor_username="admin",
-    resource_type="role",
-    resource_id="role_456",
-    detail=make_detail(role_name="analyst", role_type="viewer"),
-    severity=Severity.WARNING,
+    actor_id="loader",
+    resource_type="service",
+    resource_id="daily_import",
+    detail={"source": "orders.csv"},
 )
+get_audit_logger("acme").flush(timeout_s=2.0)
 ```
 
-All parameters are keyword-only.  The function constructs an `AuditEvent` and
-passes it to the background logger for the given organization.
+`emit` requires keyword arguments `category`, `action`, and `organization`. An empty organization is ignored. Optional fields include actor identity, username, IP and user agent, resource type and ID, `super_name`, correlation and session IDs, server, outcome, reason, severity, and detail. A dictionary detail is JSON-encoded; a string is retained. User agents are truncated to 256 characters. Defaults are system actor, successful outcome, and info severity.
 
-### `audit_context(request)` Helper
+`AuditEvent` is an immutable dataclass with an event ID, millisecond timestamp, and process instance ID (`hostname-pid`). The ID is built from a timestamp, counter, and random suffix. Treat it as an opaque string.
 
-Extracts actor, correlation, and session info from a FastAPI `Request`:
+## 2. Event coverage in this package
+
+The active call sites emit:
+
+- `data_write` after table writes and compaction; the latter includes `operation="compact"` in detail.
+- Role creation, update, and deletion events.
+- User creation, update, deletion, and role assignment/removal events.
+- Audit configuration changes, legal-hold changes, and retention execution events.
+
+The many names in `Actions` are available vocabulary; defining an action does not install an event producer. `DataReader` does not emit read/query audit events, and staging and mirroring do not emit their corresponding action names automatically in this package. Write and RBAC helpers mostly leave the actor at its default and put role information in detail when provided.
+
+`AuditMiddleware(app, server="api")` can be installed by a Starlette-compatible application. It emits authentication failure for HTTP 401, access denial for 403, and critical system events for exceptions and HTTP 5xx responses. It skips health, favicon, and static paths. It does not audit every successful request. `audit_context(request)` extracts session and request fields for application-level emitters. The current checkout does not include an application that installs this middleware.
+
+## 3. Configuration and live changes
+
+Defaults below are from [settings.py](../supertable/config/settings.py). Constructing `AuditConfig()` directly has different defaults for `hash_chain`, `log_queries`, `log_reads`, and `siem_enabled` (all false); `get_audit_logger` uses settings-based configuration.
+
+| Environment variable | Default | Current use |
+| --- | --- | --- |
+| `SUPERTABLE_AUDIT_ENABLED` | `false` | Enables logger creation. |
+| `SUPERTABLE_AUDIT_BATCH_SIZE` | `1000` | Maximum normal worker batch. |
+| `SUPERTABLE_AUDIT_FLUSH_INTERVAL_SEC` | `60` | Worker queue-wait setting, capped at five seconds. |
+| `SUPERTABLE_AUDIT_REDIS_STREAM_MAXLEN` | `100000` | Approximate stream length limit on `XADD`. |
+| `SUPERTABLE_AUDIT_REDIS_STREAM_TTL_HOURS` | `24` | Loaded into logger configuration; the logger does not schedule trimming from it. |
+| `SUPERTABLE_AUDIT_HASH_CHAIN` | `true` | Adds a per-instance batch hash chain. |
+| `SUPERTABLE_AUDIT_LOG_QUERIES` | `true` | Configurable flag; no core read/query audit producer consumes it. |
+| `SUPERTABLE_AUDIT_LOG_READS` | `true` | Configurable flag; no core read/query audit producer consumes it. |
+| `SUPERTABLE_AUDIT_ALERT_WEBHOOK` | empty | POST critical events to this URL. |
+| `SUPERTABLE_AUDIT_FERNET_KEY` | empty | Key for explicit field-encryption helpers. |
+| `SUPERTABLE_AUDIT_RETENTION_DAYS` | `2555` | Cutoff used by manual retention enforcement. |
+| `SUPERTABLE_AUDIT_LEGAL_HOLD` | `false` | Fallback legal-hold state when no Redis override is available. |
+| `SUPERTABLE_AUDIT_SIEM_ENABLED` | `true` | Configurable flag; consumer helpers do not enforce it. |
+| `SUPERTABLE_AUDIT_SIEM_MAX_CONSUMERS` | `10` | Loaded setting; consumer helpers do not enforce this limit. |
+
+[admin.py](../supertable/audit/admin.py) provides `get_audit_config(org)` and `set_audit_config(org, *, enabled=None, log_queries=None, log_reads=None, hash_chain=None, siem_enabled=None, updated_by="")`. Redis overrides are per organization and merged with settings defaults.
+
+The logger caches resolved configuration for 30 seconds. `invalidate_audit_config_cache(org)` clears that resolution cache; `set_audit_config` does not call it. An already-running logger retains its original configuration for fields other than the enable/disable decision. Use a controlled `shutdown_all()` and subsequent logger creation to load a complete changed configuration. Disabling an organization stops its existing logger when `get_audit_logger` next observes the change.
+
+These administration, read, export, and consumer functions have no role parameter or internal RBAC gate. They are APIs for trusted application code.
+
+## 4. Delivery and storage
+
+Each organization has a cached logger with a daemon worker and a queue of at most 10,000 events. A full queue drops the new event. The worker takes an event as soon as it is available, drains already queued events for up to 50 ms, and writes a batch. The flush interval is not a periodic archival schedule. `flush` drains queued events but is not a barrier for a batch already taken by the worker. `shutdown_all()` stops loggers and attempts a final flush; it is not automatically registered with `atexit` by the audit package.
+
+Redis uses the organization's system audit stream, produced by `redis_keys.audit_stream(org)`, and creates the internal consumer group `__archival__` starting at `0`. Each event field is stored as a string. Writes use `XADD` with approximate `MAXLEN`; no `EXPIRE` is applied to the stream. The group name does not imply an archival worker: the logger writes Parquet directly, and no consumer loop for this group is implemented here.
+
+Parquet batches use the configured storage backend and a fixed event schema, with Snappy compression:
+
+```text
+<organization>/__audit__/year=YYYY/month=MM/day=DD/
+  audit_<timestamp>_<instance>_<random>.parquet
+```
+
+Partitions follow the UTC time of batch writing, not each event's timestamp. Redis failure does not prevent a Parquet attempt, and Parquet failure does not reverse the Redis write. Failed batches are not requeued. `total_written` counts Redis results only; `total_dropped` includes events absent from those results even if Parquet succeeded. The Parquet writer logs a failed `write_bytes` but still returns its intended path and byte count, so that return value is not a persistence acknowledgement.
+
+Critical events additionally start a daemon thread that sends an HTTP POST to the configured webhook. This requires `httpx`, uses a ten-second timeout with a five-second connection timeout, and has no retry queue.
+
+## 5. Read and export
 
 ```python
-emit(**audit_context(request), category=..., action=..., ...)
+import time
+from supertable.audit.reader import query_audit_log
+from supertable.audit.export import export_events
+
+now_ms = int(time.time() * 1000)
+events = query_audit_log(
+    "acme",
+    start_ms=now_ms - 3600_000,
+    end_ms=now_ms,
+    category="data_mutation",
+    limit=500,
+    source="redis",
+)
+json_lines = export_events(events, output_format="json")
 ```
 
-Extracted fields: `correlation_id`, `actor_ip`, `actor_user_agent`,
-`actor_username`, `actor_id`, `session_id`, `actor_type`
-(resolves `SUPERUSER` vs `USER` from session state).
+`query_audit_log` accepts `start_ms`, `end_ms`, `category`, `action`, `actor_id`, `resource_type`, `resource_id`, `outcome`, `severity`, `correlation_id`, `limit=500`, and `source="auto"`. Results are sorted newest first after filtering. Source choices are `redis`, `parquet`, and automatic selection.
 
-### `make_detail(**kwargs)` Helper
+Automatic selection uses a fixed 24-hour boundary. A missing or recent start time queries Redis only. Older requests read Parquet first and then use remaining capacity for recent Redis events, deduplicating by event ID. It does not fall back to Parquet when a recent Redis query fails.
 
-Serialises action-specific fields to a compact JSON string for the `detail`
-field:
+Source reads are limited before most filters run, so filtered results can contain fewer than `limit` records even when more matches exist. Parquet scanning proceeds from the requested start day forward and stops after at most 367 calendar days or the raw event limit. Always supply a start time for Parquet reads: without it, scanning begins at the Unix epoch. Partition selection by query dates can also miss events written into a later partition than their event timestamp.
 
-```python
-detail = make_detail(sql_hash="abc", row_count=42, duration_ms=123)
-# -> '{"sql_hash":"abc","row_count":42,"duration_ms":123}'
-```
+`export_events(events, output_format="json")` returns UTF-8 JSON Lines; `"csv"` returns CSV with columns taken from the first event. Other format strings also use JSON Lines. `export_dora_incident_report` is a bounded time-range event export; its `incident_id` is not used to filter the results. `export_soc2_evidence` filters by a built-in criteria mapping and uses a 50,000-event query limit. These functions produce event extracts, with the same query limits as the reader.
 
-`None` values are silently dropped.
+## 6. Integrity verification limits
 
----
+[chain.py](../supertable/audit/chain.py) defines SHA-256 event, batch, and chain helpers. Event hashes exclude `chain_hash` and `instance_id`. The logger combines sorted event hashes into a content hash, combines that with sorted event IDs into a batch hash, and advances the process chain. Chain heads and batch counts are stored in Redis per organization and sanitized instance ID. Every event in a batch receives the same chain hash.
 
-## 12.5  Background Logger Worker
+`verify_chain_integrity(organization, date)` reads Parquet batches for `YYYY-MM-DD` or `YYYYMMDD`. Its current implementation is not consistent with the logger: it reconstructs each batch hash using event IDs and an empty content hash. Multiple normally content-hashed batches can therefore be reported as invalid. It also accepts the first batch hash as an anchor, skips empty chain hashes, and returns `valid=True` when no data is found. It does not authenticate event contents or establish that all events were retained.
 
-**Module:** `supertable.audit.logger`
+`MerkleProof`, `save_chain_proof`, and `verify_merkle_proof` are lower-level helpers. The root is a SHA-256 over sorted instance heads. The proof verifier recomputes the supplied proof's root; it does not bind those heads to the events read for a day. No daily proof-producing job is present in this package. Neither a successful proof check nor the high-level `valid` field establishes complete, tamper-proof audit history.
 
-### 12.5.1  Architecture
+## 7. Retention, consumers, and encryption
 
-The `AuditLogger` follows a producer-consumer pattern identical to
-`monitoring_writer.py`:
+`enforce_retention(organization)` is an explicit call. It skips deletion when legal hold is active, treats nonpositive retention days as disabled, and otherwise enumerates dated Parquet partitions older than the cutoff. It calls `storage.delete(partition_path)`, not `delete_tree`; complete cleanup depends on that backend's deletion behavior. It does not delete chain proofs or trim the Redis stream, and no retention scheduler is included.
 
-1. `emit(event)` enqueues to a bounded `queue.Queue` (max 10,000 entries)
-   and returns immediately (< 50us).
-2. A background daemon thread drains the queue in batches.
-3. Batches are written to Redis Streams (hot tier) and Parquet (warm tier).
-4. One `AuditLogger` instance per organization (singleton cache via
-   `get_audit_logger(org)`).
+`set_legal_hold(enabled, organization="")` stores the override in Redis and returns a result dictionary. Organization defaults to configured `SUPERTABLE_ORGANIZATION` when omitted. Redis hold values take precedence; failed lookups fall back to the settings value, and only failure to obtain both falls back to holding data.
 
-### 12.5.2  `AuditConfig`
+`RedisAuditWriter.trim_acknowledged(ttl_hours=24)` explicitly trims stream IDs older than the cutoff. It skips trimming for a group only when that group has both pending entries and positive lag. This is not a comprehensive acknowledgement guarantee, and approximate `MAXLEN` trimming on writes applies independently. No code schedules this method automatically.
 
-Configuration is loaded lazily from settings:
+`create_consumer(org, group_name, start_from="$")`, `list_consumers(org)`, and `delete_consumer(org, group_name)` wrap Redis consumer-group administration. `$` starts at new events; `"0"` includes retained history. The internal `__archival__` group cannot be deleted by these helpers. External consumers must implement their own stream reading, acknowledgement, and recovery; the helpers provide no delivery loop.
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `SUPERTABLE_AUDIT_ENABLED` | `True` | Master switch. |
-| `SUPERTABLE_AUDIT_BATCH_SIZE` | `1000` | Events per write batch. |
-| `SUPERTABLE_AUDIT_FLUSH_INTERVAL_SEC` | `60` | Max seconds between flushes. |
-| `SUPERTABLE_AUDIT_REDIS_STREAM_TTL_HOURS` | `24` | Hot-tier TTL. |
-| `SUPERTABLE_AUDIT_REDIS_STREAM_MAXLEN` | `100,000` | Max stream entries (approximate trimming). |
-| `SUPERTABLE_AUDIT_HASH_CHAIN` | `True` | Enable SHA-256 chain. |
-| `SUPERTABLE_AUDIT_LOG_QUERIES` | `True` | Log query executions. |
-| `SUPERTABLE_AUDIT_LOG_READS` | `True` | Log read operations. |
-| `SUPERTABLE_AUDIT_ALERT_WEBHOOK` | `""` | Webhook URL for critical alerts. |
-| `SUPERTABLE_AUDIT_FERNET_KEY` | `""` | Fernet encryption key for sensitive fields. |
-| `SUPERTABLE_AUDIT_SIEM_ENABLED` | `True` | Enable SIEM consumer groups. |
-| `SUPERTABLE_AUDIT_SIEM_MAX_CONSUMERS` | `10` | Max external consumer groups. |
-
-### 12.5.3  NullAuditLogger
-
-When auditing is disabled, a `NullAuditLogger` is returned -- all methods
-(`emit`, `flush`, `stop`) are no-ops.
-
-### 12.5.4  Queue Backpressure
-
-If the queue reaches 10,000 entries, `emit()` drops the event and logs a
-warning.  The `_stats` dict tracks `total_emitted`, `total_written`,
-`total_dropped`, and `batches_written`.
-
----
-
-## 12.6  Hash Chain -- Tamper-Evident Integrity
-
-**Module:** `supertable.audit.chain`
-
-The hash chain provides cryptographic tamper detection for the audit trail.
-If any event is modified, inserted, or deleted after the fact, the chain
-verification will fail.
-
-### 12.6.1  Chain Computation
-
-```
-batch_hash  = SHA-256(sorted(event_ids) + "\n" + parquet_file_hash)
-chain_hash  = SHA-256(previous_chain_hash + batch_hash)
-```
-
-* Event IDs are sorted to ensure deterministic ordering.
-* The chain starts from `GENESIS_HASH = "0" * 64`.
-
-### 12.6.2  `InstanceChain`
-
-Each server instance maintains its own chain:
-
-```python
-@dataclass
-class InstanceChain:
-    instance_id: str
-    head: str = GENESIS_HASH    # Current chain head
-    batch_count: int = 0
-
-    def advance(self, event_ids: List[str], file_hash: str = "") -> str: ...
-```
-
-`advance()` appends a batch and returns the new head.  The `AuditLogger`
-holds a lock when calling `advance()` for thread safety.
-
-### 12.6.3  Daily Merkle Proof
-
-`MerkleProof` aggregates all instance chains into a single verifiable root:
-
-```python
-@dataclass
-class MerkleProof:
-    date: str               # "2025-01-15"
-    instances: Dict[str, Dict[str, Any]]
-    merkle_root: str
-    total_events: int
-    created_ms: int
-```
-
-`compute_root()` sorts instance heads by `instance_id` and computes a
-SHA-256 over the concatenation -- deterministic regardless of insertion
-order.
-
-### 12.6.4  Verification Functions
-
-| Function | Input | Output |
-|----------|-------|--------|
-| `verify_batch_chain(batches, expected_head, starting_hash)` | List of batch dicts | `{"valid": bool, "batches_checked": int, "gaps": [...], "computed_head": str}` |
-| `verify_merkle_proof(proof)` | `MerkleProof` | `{"valid": bool, "computed_root": str, "recorded_root": str}` |
-
-`verify_batch_chain` replays the chain from `starting_hash` and reports any
-gaps where `computed != recorded`.  It continues past gaps (using the
-recorded hash) to detect further tampering.
-
----
-
-## 12.7  Dual-Tier Storage
-
-### 12.7.1  Hot Tier -- Redis Streams
-
-**Module:** `supertable.audit.writer_redis`
-
-Each organization gets its own Redis Stream:
-
-```
-supertable:{org}:system:audit:stream
-```
-
-(built by `redis_keys.audit_stream(org)` — the `system:` segment
-groups every org-level system surface alongside `shares:`, `auth:`,
-and `spark:`).
-
-**`RedisAuditWriter`** manages writes and consumer groups:
-
-* `write_batch(events)` -- pipelined `XADD` with `MAXLEN~` (approximate
-  trimming) for bounded memory.
-* Chain head is persisted at `supertable:{org}:system:audit:chain_head:doc:{instance_id}` (built by `redis_keys.audit_chain_head(org, instance_id)`).
-* An `__archival__` consumer group is created automatically for the internal
-  archival worker.
-* External SIEM consumer groups are created on demand (see Section 12.9).
-
-### 12.7.2  Warm/Cold Tier -- Parquet
-
-**Module:** `supertable.audit.writer_parquet`
-
-Parquet is the system of record.  Files are append-only, partitioned by date,
-and named with `instance_id` + UUID for safe concurrent writes.
-
-**Partition layout:**
-
-```
-{storage_root}/{org}/__audit__/year=YYYY/month=MM/day=DD/
-    audit_{date}_{time}_{instance_id}_{uuid8}.parquet
-```
-
-**Chain proofs:**
-
-```
-{storage_root}/{org}/__audit__/_chain/chain_{date}.json
-```
-
-The Parquet schema mirrors `AuditEvent` exactly -- 21 columns, all string
-or int64 types, built as a PyArrow schema.
-
-`compute_file_hash(data: bytes)` produces a SHA-256 of the raw Parquet file
-content, which feeds into the chain as `file_hash`.
-
----
-
-## 12.8  HTTP Middleware
-
-**Module:** `supertable.audit.middleware`
-
-`AuditMiddleware` is a Starlette `BaseHTTPMiddleware` that provides a safety
-net for events that might not have explicit audit calls in endpoint handlers.
-
-**Captures:**
-* Authentication failures (HTTP 401)
-* Authorization denials (HTTP 403)
-* Server errors (HTTP 500+, severity: `CRITICAL`)
-* Service identification (`api` / `webui` / `mcp`)
-
-**Excludes:** `/healthz`, `/health`, `/favicon.ico`, `/static/*`
-
-**Organisation extraction** tries three sources in priority order:
-1. `request.state.session_org`
-2. Query parameters (`?organization=` or `?org=`)
-3. Global default from `settings.SUPERTABLE_ORGANIZATION`
-
-Installation:
-
-```python
-from supertable.audit.middleware import AuditMiddleware
-app.add_middleware(AuditMiddleware, server="api")
-```
-
----
-
-## 12.9  SIEM Consumer Groups
-
-**Module:** `supertable.audit.consumers`
-
-External SIEM tools (Splunk, Microsoft Sentinel, ELK, Datadog) register
-Redis Stream consumer groups to consume audit events independently of the
-internal archival worker.
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `create_consumer` | `(organization, group_name, start_from="$")` | Create an external consumer group. `start_from="$"` = new events only; `"0"` = replay from beginning. |
-| `delete_consumer` | `(organization, group_name)` | Remove a consumer group. |
-| `list_consumers` | `(organization)` | List all consumer groups with lag info. |
-
-Each function instantiates a `RedisAuditWriter` and delegates to its
-consumer group management methods.  The maximum number of external consumers
-is governed by `SUPERTABLE_AUDIT_SIEM_MAX_CONSUMERS` (default: 10).
-
----
-
-## 12.10  Retention Policies
-
-**Module:** `supertable.audit.retention`
-
-### 12.10.1  Default Retention
-
-The default retention period is **2,555 days (approximately 7 years)**,
-configured via `SUPERTABLE_AUDIT_RETENTION_DAYS`.  This satisfies the DORA
-Art. 12 minimum of 5 years with a comfortable margin.
-
-Retention enforcement deletes Parquet partitions (Hive-style
-`year=YYYY/month=MM/day=DD`) older than the retention threshold.
-
-Partition dates are parsed from paths using the regex:
-
-```
-year=(\d{4})[/\\]month=(\d{2})[/\\]day=(\d{2})/?$
-```
-
-### 12.10.2  Legal Hold
-
-Legal hold is a global kill switch that prevents **all** audit deletions for
-an organization.
-
-**Resolution order:**
-1. Redis runtime override at key `supertable:{org}:system:audit:legal_hold`
-   (built by `redis_keys.audit_legal_hold(org)`, set by `set_legal_hold()`).
-2. Settings default (`SUPERTABLE_AUDIT_LEGAL_HOLD`).
-
-**Fail-safe:** if both lookups fail, legal hold defaults to **active** (True)
-so that data is never accidentally deleted.
-
-Legal hold state is persisted in Redis (not in the frozen Settings dataclass)
-so it can be toggled at runtime without a restart.
-
-All deletions are recorded as audit events (meta-event: the audit log audits
-its own cleanup).
-
----
-
-## 12.11  Fernet Encryption
-
-When `SUPERTABLE_AUDIT_FERNET_KEY` is configured, sensitive fields within the
-`detail` payload can be encrypted at rest using the Python `cryptography`
-library's Fernet symmetric encryption (AES-128-CBC with HMAC-SHA256).
-
-This protects PII and other sensitive data in the audit trail while still
-allowing authorised tooling to decrypt and inspect events.
-
----
-
-## 12.12  Export for Compliance Reporting
-
-**Module:** `supertable.audit.export`
-
-### 12.12.1  Generic Export
-
-```python
-def export_events(events: List[Dict], output_format: str = "json") -> bytes:
-```
-
-Supported formats:
-* `"json"` -- JSON-lines (one JSON object per line).
-* `"csv"` -- CSV with header row.
-
-### 12.12.2  DORA Incident Reports
-
-```python
-def export_dora_incident_report(
-    organization: str,
-    incident_id: str,
-    start_ms: int,
-    end_ms: int,
-    output_format: str = "json",
-) -> bytes:
-```
-
-Exports audit events for a specific time window aligned to DORA RTS/ITS
-incident reporting templates (Regulation 2024/1772).
-
-### 12.12.3  SOC 2 Evidence Packages
-
-```python
-def export_soc2_evidence(
-    organization: str,
-    criteria: str,
-    period_start_ms: int,
-    period_end_ms: int,
-    output_format: str = "json",
-) -> bytes:
-```
-
-Maps each SOC 2 Trust Services Criterion to specific event categories and
-actions.  Supported criteria:
-
-| Criterion | Category Mapped |
-|-----------|-----------------|
-| `CC6.1` | `authentication` (all auth events) |
-| `CC6.2` | `authorization` |
-| `CC7.1` | Monitoring events |
-| `CC7.3` | Incident response (spans all categories) |
-| `CC8.1` | Change management |
-| `PI1.3` | Processing integrity |
-| `A1.2` | Availability |
-
----
-
-## 12.13  Compliance Mapping
-
-The audit subsystem is designed to satisfy the following regulatory
-requirements:
-
-### DORA (Digital Operational Resilience Act, Regulation 2022/2554)
-
-| Article | Requirement | How SuperTable Satisfies It |
-|---------|-------------|---------------------------|
-| Art. 6(5) | ICT risk management documentation | All security-relevant events are captured with full actor/resource context. |
-| Art. 10 | Detection and monitoring | Real-time Redis Streams with SIEM consumer groups for external monitoring tools. |
-| Art. 11 | Response and recovery | DORA-aligned incident report export. |
-| Art. 12 | Record keeping (5+ year retention) | Default 7-year retention; Parquet cold storage; legal hold prevents accidental deletion. |
-
-### SOC 2 Type II
-
-| Criterion | Requirement | How SuperTable Satisfies It |
-|-----------|-------------|---------------------------|
-| CC6.1 | Logical access security | Authentication events (login success/failure, token auth). |
-| CC7.1 | System monitoring | AuditMiddleware captures all auth failures and server errors; background logger provides continuous monitoring. |
-| CC7.3 | Forensic integrity | SHA-256 hash chain with daily Merkle proofs; `verify_batch_chain()` and `verify_merkle_proof()` for tamper detection. |
-| CC8.1 | Change management | CONFIG_CHANGE and RBAC_CHANGE event categories track all configuration and permission changes. |
-| A1.2 | Availability | SYSTEM events track service start/stop and health check failures. |
-
-### Business Context
-
-The audit subsystem provides:
-
-* **Non-repudiation** -- every action is attributed to a specific actor
-  (user, API token, system) with IP address and user agent.
-* **Tamper evidence** -- the SHA-256 hash chain and daily Merkle proofs
-  ensure that any modification to the audit trail is detectable.
-* **Real-time visibility** -- Redis Streams provide sub-second event
-  availability for monitoring dashboards and SIEM integrations.
-* **Long-term archival** -- Parquet files provide efficient columnar storage
-  for years of audit data, with date-based partitioning for fast range
-  queries.
-
-## 12.14  Enable / disable at runtime
-
-Audit is **OFF by default** (`SUPERTABLE_AUDIT_ENABLED=false`).  Each
-organization can be toggled independently from the WebUI:
-
-> **WebUI → /ui/audit → Compliance tab → Audit logging card**
-
-Behind the toggle, the master switch and four sub-toggles (`log_queries`,
-`log_reads`, `hash_chain`, `siem_enabled`) are persisted in Redis at
-`supertable:{org}:system:audit:config` (HASH, built by
-`redis_keys.audit_config(org)`), and surfaced via:
-
-```
-GET  /api/v1/audit/config?organization=<org>
-POST /api/v1/audit/config   { "organization": "<org>", "enabled": true, ... }
-```
-
-Both endpoints require **superuser** authentication (same gate as legal
-hold).  Flipping the toggle:
-
-* **OFF → ON**: a new `AuditLogger` is lazily created on the next
-  `emit()` and starts writing to `supertable:{org}:system:audit:stream`.
-* **ON → OFF**: the running logger is drained and stopped, replaced
-  with a `NullAuditLogger`; subsequent emits are no-ops.
-
-Every config write emits a `CONFIG_CHANGE` audit event so that
-disabling auditing is itself recorded.  In a multi-instance
-deployment, a 30-second per-org cache TTL bounds how long peer
-instances take to pick up the change; the responding instance applies
-it immediately via cache invalidation.
+[crypto.py](../supertable/audit/crypto.py) exposes `encrypt_field`, `decrypt_field`, and `is_encryption_available`. Encryption is opt-in per caller; the logger does not encrypt arbitrary event fields. A missing/invalid key, missing `cryptography` dependency, or encryption failure returns plaintext. Decryption failure returns the input unchanged. The key is loaded once per process. No core query emitter invokes these helpers automatically.

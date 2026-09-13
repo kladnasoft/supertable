@@ -1,481 +1,240 @@
-# Data Reader
+# Data reader
 
-## Overview
+`DataReader` executes a read against the current catalog snapshots. It accepts SQL and a role name, applies access rules and deletion vectors, and returns either a materialized Polars DataFrame or an Arrow stream handle.
 
-The `DataReader` class is the central facade for executing SQL queries against SuperTable data. It orchestrates the full query lifecycle: parsing SQL, enforcing access control, resolving data files, estimating data size, selecting the execution engine, building the view chain, executing the query, and recording the execution plan.
+Implementation: [data_reader.py](../supertable/data_reader.py), [system_query.py](../supertable/system_query.py), [Arrow result conversion](../supertable/engine/arrow_result.py), [streaming jobs](../supertable/streaming/jobs.py), and [streaming runner](../supertable/streaming/runner.py). See [Query engine](09_query_engine.md) for planning and execution details and [RBAC](11_rbac.md) for role definitions.
 
-The class lives in `supertable/data_reader.py` and is consumed by the API server, OData server, MCP server, and the SQL editor UI.
-
-## Query Execution Flow
-
-Every query follows the same pipeline, regardless of which server initiates it:
-
-```
-User SQL
-    |
-    v
-[1] Parse          -- SQLParser extracts tables, columns, aliases
-    |
-    v
-[2] RBAC check     -- restrict_read_access() validates permissions
-    |
-    v
-[3] Pre-flight     -- _assert_targets_exist() refuses to create on read
-    |
-    v
-[4] Estimate       -- DataEstimator resolves files and byte totals
-    |
-    v
-[5] Build views    -- dedup, tombstone, RBAC views attached to Reflection
-    |
-    v
-[6] Select engine  -- AUTO picks Lite/Pro/Spark based on size + freshness
-    |
-    v
-[7] Execute        -- Executor runs query against chosen backend
-    |
-    v
-[8] Record plan    -- extend_execution_plan() writes timing + stats
-    |
-    v
-[9] Return         -- (DataFrame, Status, message)
-```
-
-## Reads Never Create Tables
-
-The SDK enforces an invariant: **reads never mint catalog entries**.
-Two layers protect this:
-
-1. **`DataReader._assert_targets_exist()`** runs immediately inside
-   the `try` block in `execute()`. For each `(super_name, simple_name)`
-   pair in `physical_tables`, it checks `catalog.root_exists(...)` and
-   `catalog.leaf_exists(...)` in Redis. A miss raises a typed
-   exception which the surrounding `except` turns into the standard
-   `(empty_df, Status.ERROR, "SuperTable not found: …")` /
-   `(empty_df, Status.ERROR, "Table not found: …")` tuple. No
-   side-effects land before the check.
-
-2. **Constructor opt-out:** `SuperTable.__init__` and
-   `SimpleTable.__init__` both accept `create_if_missing: bool = True`
-   (default preserves the writer's auto-create behaviour). Every
-   read-side caller — `DataEstimator`, `MetaReader.__init__`, every
-   `SimpleTable(...)` call in `meta_reader.py` — passes
-   `create_if_missing=False`. If any future code path forgets the
-   edge check, the constructor still refuses to materialise.
-
-### Public exceptions
+## 1. Execute a query
 
 ```python
-from supertable import (
-    SupertableLookupError,
-    SuperTableNotFoundError,
-    TableNotFoundError,
+from supertable.data_reader import DataReader, Status
+from supertable.engine.engine_enum import Engine
+
+reader = DataReader(
+    super_name="warehouse",
+    organization="example_org",
+    query="SELECT order_id, total FROM orders WHERE total >= 100 ORDER BY order_id",
 )
+
+frame, status, message = reader.execute(
+    role_name="sales_reader",
+    engine=Engine.DUCKDB,
+)
+if status is Status.ERROR:
+    raise RuntimeError(message)
+
+print(frame)
 ```
 
-All three live in `supertable/errors.py` and inherit from the stdlib
-`LookupError` (so legacy `except LookupError` / `except KeyError`
-callers keep working).
-
-| Class | When raised | Attributes |
-|-------|-------------|-----------|
-| `SupertableLookupError` | base class (do not instantiate directly) | `organization` |
-| `SuperTableNotFoundError` | the supertable's `meta:root` is missing | `organization`, `super_name` |
-| `TableNotFoundError` | the simple table's `meta:leaf:doc:{simple}` is missing | `organization`, `super_name`, `simple_name` |
-
-The string representation is the canonical form
-`SuperTable not found: org/super` or
-`Table not found: org/super/simple` — safe to surface in API responses.
-
-## The DataReader Class
+This example assumes the SuperTable, table, columns, and named role already exist. Construction selects the configured storage implementation. It does not create a missing target table.
 
 ### Constructor
 
-```python
-class DataReader:
-    def __init__(self, super_name: str, organization: str, query: str):
-        self.super_name = super_name
-        self.organization = organization
-        self.query = query
-        self.storage: StorageInterface = get_storage()
-        self.timer: Optional[Timer] = None
-        self.plan_stats: Optional[PlanStats] = None
-        self.query_plan_manager: Optional[QueryPlanManager] = None
+```text
+DataReader(super_name: str, organization: str, query: str, source: str = "sdk")
 ```
 
-The constructor accepts the SuperTable name, organization (tenant), and raw SQL query. It initializes the storage backend via `get_storage()` from the storage factory.
+`source` labels the query in monitoring. The reader exposes `timer`, `plan_stats`, and `query_plan_manager` after the corresponding execution stages have run. A query rejected before planning may leave `query_plan_manager` unset.
 
-### The `execute()` Method
+### Materialized execution
 
-```python
-def execute(
-    self,
+```text
+reader.execute(
     role_name: str,
     with_scan: bool = False,
     engine: Engine = Engine.AUTO,
-) -> Tuple[pd.DataFrame, Status, Optional[str]]:
+    fullscan: bool = False,
+) -> tuple[polars.DataFrame, Status, str | None]
 ```
 
-This is the primary entry point. It returns a tuple of:
-- `pd.DataFrame`: the query results (empty on error).
-- `Status`: an enum with values `OK` or `ERROR`.
-- `Optional[str]`: error message (None on success).
+| Argument | Behavior |
+| --- | --- |
+| `role_name` | Name of the role to resolve in this organization and SuperTable |
+| `engine` | An `Engine` enum member; the method reads its `dialect` property |
+| `fullscan` | Bypasses SuperTable's statistics-based file pruning |
+| `with_scan` | Accepted by the current signature but not used in the execution body |
 
-### Step-by-Step Walkthrough
+`Status.OK.value` is `"ok"`; `Status.ERROR.value` is `"error"`. A successful ordinary query normally returns `message=None`. Execution failures caught inside the main execution block return an empty DataFrame with `Status.ERROR` and the exception text.
 
-**Step 1 -- Parse the SQL**
+Authorization and parser construction occur before that broad execution handler. Callers must also handle exceptions such as `PermissionError`, invalid parser inputs, and catalog failures during preflight; an error is not always represented by the status tuple.
+
+`execute()` does not add a row limit. Materialization consumes the complete result into memory. Choose SQL `LIMIT` or `stream()` when the expected result is large.
+
+The current Spark executor has a return-value defect that discards its stream handle, described in [Query engine](09_query_engine.md#5-spark-execution-and-current-limitation). Explicit DuckDB avoids that path; AUTO can select Spark when a registered cluster meets the estimated size threshold.
+
+## 2. Accepted SQL and table preflight
+
+An unqualified name such as `orders` uses the constructor's `super_name`. A qualified name such as `archive.orders` selects another SuperTable within the same organization. The reader checks each distinct physical target in Redis before estimating files:
+
+- Missing root: `SuperTableNotFoundError`, returned as `Status.ERROR` with its message.
+- Missing leaf: `TableNotFoundError`, returned as `Status.ERROR` with its message.
+- Missing source columns or absent Parquet resources: execution error during estimation.
+
+The read gate permits one read statement and rejects writes, multiple statements, and table functions. SELECT queries may contain CTEs, joins, subqueries, and set operations subject to the parser and selected engine. A query with no named source table fails parser validation.
+
+The SQL role is supplied directly by the caller. `DataReader` does not authenticate a username, select a user's role, or verify a bearer token. An application exposing it must resolve the caller's permitted role before invoking this API.
+
+## 3. EXPLAIN and SHOW STATS
+
+Use materialized `execute()` for these commands.
 
 ```python
-parser = SQLParser(
-    super_name=self.super_name,
-    query=self.query,
-    dialect=engine.dialect,
+explain_reader = DataReader(
+    super_name="warehouse",
+    organization="example_org",
+    query="EXPLAIN SELECT order_id FROM orders WHERE total >= 100",
 )
-tables = parser.get_table_tuples()
-physical_tables = parser.get_physical_tables()
-```
-
-`SQLParser` uses sqlglot to parse the query with the correct dialect (`"duckdb"` or `"spark"`). It extracts:
-- `tables`: all table references including CTE aliases, as `TableDefinition` objects.
-- `physical_tables`: only real tables (excludes CTE aliases), used for file resolution.
-
-**Step 2 -- RBAC Check**
-
-```python
-rbac_views = restrict_read_access(
-    super_name=self.super_name,
-    organization=self.organization,
-    role_name=role_name,
-    tables=tables,
-    physical_tables=physical_tables,
-)
-```
-
-`restrict_read_access()` validates that the role has permission to read the requested tables and returns per-alias `RbacViewDef` objects describing column and row filters. If access is denied, this function raises an exception.
-
-**Step 3 -- Pre-flight catalog check**
-
-```python
-self._assert_targets_exist(physical_tables)
-```
-
-Two Redis `EXISTS` calls per referenced `(super, simple)` pair —
-`root_exists(...)` and `leaf_exists(...)`. On a miss this raises
-`SuperTableNotFoundError` / `TableNotFoundError`, which the
-surrounding `except` turns into the same
-`(empty_df, Status.ERROR, message)` shape as every other read
-failure. Microseconds of cost; **zero catalog state is touched
-before the check.**
-
-This is the edge that guarantees the "reads never create tables"
-invariant — without it, the `SuperTable(super_name, organization)`
-construction inside `DataEstimator.estimate()` would silently
-bootstrap a missing supertable as a side effect of resolving the
-query.
-
-**Step 4 -- Estimate Data Size**
-
-```python
-estimator = DataEstimator(
-    organization=self.organization,
-    storage=self.storage,
-    tables=physical_tables,
-)
-reflection = estimator.estimate()
-```
-
-The `DataEstimator` walks the Redis catalog to find the current
-snapshot for each table, collects parquet file paths, sums byte
-sizes, and produces a `Reflection` dataclass. Only `physical_tables`
-are passed (not CTE aliases) so the estimator resolves actual data
-files. Internally the estimator constructs `SuperTable(...,
-create_if_missing=False)` as defence in depth — even if a future
-code path skipped the edge check, the constructor would refuse to
-materialise.
-
-**Step 5 -- Build View Definitions**
-
-After estimation, the `DataReader` attaches view definitions to the `Reflection` object for the executor to consume:
-
-**RBAC views:**
-```python
-reflection.rbac_views = rbac_views
-```
-
-**Dedup-on-read views** (from table config in Redis):
-```python
-catalog = RedisCatalog()
-for td in tables:
-    tbl_cfg = catalog.get_table_config(
-        self.organization, td.super_name, td.simple_name,
-    )
-    if tbl_cfg and tbl_cfg.get("dedup_on_read"):
-        pk = tbl_cfg.get("primary_keys", [])
-        if pk:
-            reflection.dedup_views[td.alias] = DedupViewDef(
-                primary_keys=pk,
-                order_column="__timestamp__",
-                visible_columns=list(td.columns or []),
-            )
-```
-
-**Tombstone views** (from snapshot metadata in Redis):
-```python
-leaf = catalog.get_leaf(
-    self.organization, td.super_name, td.simple_name,
-)
-payload = (leaf or {}).get("payload")
-tomb_block = payload.get("tombstones")
-if tomb_block:
-    reflection.tombstone_views[td.alias] = TombstoneDef(
-        primary_keys=tomb_block.get("primary_keys", []),
-        deleted_keys=tomb_block.get("deleted_keys", []),
-    )
-```
-
-**Linked-share row filters** (provider-side row filter on shared tables):
-```python
-share_row_filter = payload.get("_row_filter")
-if share_row_filter:
-    # Merged with existing RBAC where_clause via AND
-    reflection.rbac_views[td.alias] = RbacViewDef(
-        allowed_columns=["*"],
-        where_clause=share_row_filter,
-    )
-```
-
-**Step 6 -- Select Engine and Execute**
-
-```python
-executor = Executor(storage=self.storage, organization=self.organization)
-result_df, engine_used = executor.execute(
-    engine=engine,
-    reflection=reflection,
-    parser=parser,
-    query_manager=self.query_plan_manager,
-    timer=self.timer,
-    plan_stats=self.plan_stats,
-    log_prefix=self._lp(""),
+plan, status, message = explain_reader.execute(
+    role_name="sales_reader",
+    engine=Engine.DUCKDB,
 )
 ```
 
-The `Executor` applies the AUTO selection logic (documented in the Query Engine chapter) and delegates to the chosen backend.
-
-**Step 7 -- Record Execution Plan**
+`EXPLAIN SELECT ...` and `EXPLAIN ANALYZE SELECT ...` pass through the same table preflight and RBAC checks as the inner query. `EXPLAIN` forces DuckDB execution even if another engine was requested. `ANALYZE` executes the query while gathering its explanation. `WITH` is also accepted after the EXPLAIN prefix.
 
 ```python
-extend_execution_plan(
-    query_plan_manager=self.query_plan_manager,
-    role_name=role_name,
-    timing=self.timer.timings,
-    plan_stats=self.plan_stats,
-    status=str(status.value),
-    message=message,
-    result_shape=result_df.shape,
+stats_reader = DataReader(
+    super_name="warehouse",
+    organization="example_org",
+    query="SHOW STATS orders",
+)
+stats, status, message = stats_reader.execute(role_name="sales_reader")
+```
+
+`SHOW STATS [super.]simple` checks table existence and READ authorization, then loads the latest snapshot's `stats_file`. It accepts identifier quoting with double quotes or backticks. It does not use the ordinary SQL execution engine.
+
+Statistics contain file paths, row-group IDs, column names, physical/logical types, typed minima/maxima, null counts, row-group row counts, compressed bytes, availability, and exactness flags. If no statistics are present, the command returns `Status.OK` with an empty DataFrame whose statistics columns are UTF-8 strings.
+
+The current implementation checks read authorization but does not apply the returned row/column restriction views to statistics. Thus a restricted role that passes READ checks can receive raw statistics for columns or rows outside its query projection. Do not treat `SHOW STATS` as a row-filtered data result.
+
+`stream()` does not implement these command results correctly: SHOW STATS produces no stream handle, and the streaming branch does not pass the EXPLAIN flag into the executor. Use `execute()` for both commands.
+
+## 4. Read Arrow batches
+
+```python
+reader = DataReader(
+    super_name="warehouse",
+    organization="example_org",
+    query="SELECT order_id, total FROM orders ORDER BY order_id",
+)
+with reader.stream(
+    role_name="sales_reader",
+    engine=Engine.DUCKDB,
+    batch_rows=8192,
+) as handle:
+    schema = handle.schema
+    for batch in handle.batches():
+        print(batch.num_rows)
+```
+
+```text
+reader.stream(
+    role_name: str,
+    engine=None,
+    fullscan: bool = False,
+    batch_rows: int = 0,
+    expose_rowid: bool = False,
 )
 ```
 
-The execution plan captures timing breakdowns (CONNECTING, EXECUTING_QUERY, EXTENDING_PLAN, TOTAL_EXECUTE), engine choice, file counts, byte totals, and result shape for debugging and monitoring.
+`engine=None` resolves to AUTO. `batch_rows=0` uses `SUPERTABLE_STREAM_BATCH_ROWS`, default `65536`. The handle provides `schema`, `batches()`, `cancel()`, `close()`, and context-manager cleanup. `batches()` closes resources in its `finally` block; explicit context management also cleans up when a consumer stops early.
 
-## SQL Sanitization
+`cancel()` interrupts the active cursor; `close()` releases resources. These are separate operations. A failed stream preparation raises `RuntimeError` rather than returning a status tuple. Exceptions may also arise while batches are consumed.
 
-### LIMIT Enforcement
+Streaming uses the same table, role, share-filter, and deletion-vector preparation as materialized execution. The ordinary public view hides `__rowid__` and `__timestamp__`. `expose_rowid=True` requests visibility of `__rowid__` in DuckDB's deletion-filtered view for service-level paging; RBAC's allowed-column view can still restrict it.
 
-`_ensure_sql_limit(sql, default_limit)` in `data_reader.py` appends
-`LIMIT <default_limit>` only if the outermost query has no LIMIT clause. Uses
-regex to detect existing LIMIT patterns, avoiding interference with subqueries
-or CTEs.
+If an exception escapes the leaf getter during per-table deletion-vector lookup, the reader wraps it in `DeletionVectorUnavailable` and fails the read. An exception while establishing a share predicate uses `ShareFilterUnavailable`; both derive from `ReadAccessUnavailable`. A share predicate is combined with an existing role predicate using `AND`.
 
-### SQL String Escaping
+`RedisCatalog` converts Redis-specific errors in its leaf/root getters to `None`, so those failures do not necessarily reach the exception handling above. A failed control lookup after successful planning can therefore look like an absent payload and skip controls.
 
-In `engine_common.py`:
-- `sanitize_sql_string()` escapes single quotes in SQL string literals used in SET statements.
-- `escape_parquet_path()` escapes file paths embedded in SQL.
-- `quote_if_needed()` quotes column names containing special characters, handling the `*` wildcard.
+A path-only leaf is a related limitation: the estimator can recover resources from its snapshot file, but the control lookup reads tombstones and share predicates only from the embedded leaf payload. When that payload is absent, neither executor reloads the missing controls from the snapshot. The writer can publish a path-only leaf after a payload-publication failure, so that fallback can omit deletion/share filtering on a later read. See [implementation gaps](TODO.md).
 
-## The `query_sql()` Convenience Function
+The close callback writes monitoring using the number of consumed rows. It currently records an OK stream completion even when a consumer closes early, so that metric alone does not establish that every result row was consumed.
 
-For callers that want a simpler columnar interface, `data_reader.py` exports
-`query_sql()`:
+## 5. Convert results to rows and column metadata
 
 ```python
-def query_sql(
+from supertable.data_reader import query_sql
+
+query_info = {}
+columns, rows, columns_meta = query_sql(
+    organization="example_org",
+    super_name="warehouse",
+    sql="SELECT order_id, total FROM orders",
+    limit=100,
+    engine=Engine.DUCKDB,
+    role_name="sales_reader",
+    out=query_info,
+)
+```
+
+```text
+query_sql(
     organization: str,
     super_name: str,
     sql: str,
     limit: int,
-    engine: Any,
+    engine,
     role_name: str,
-) -> Tuple[List[str], List[List[Any]], List[Dict[str, Any]]]:
+    source: str = "sdk",
+    out: dict | None = None,
+) -> tuple[list[str], list[list], list[dict]]
 ```
 
-This function:
-1. Applies `_ensure_sql_limit()` to cap result size.
-2. Creates a `DataReader` and calls `execute()`.
-3. Converts the DataFrame to columnar format: `(columns, rows, columns_meta)`.
-4. Sanitizes pandas NA variants (`pd.NA`, `pd.NaT`, `np.nan`) to Python `None` for JSON serialization.
+For ordinary SELECT queries the helper appends a default LIMIT unless a trailing numeric `LIMIT` with an optional numeric `OFFSET` is already recognized. It does not cap an existing limit. Its detection is textual, not a complete rewrite of arbitrary SQL; omit a trailing semicolon when relying on the appended limit because the current helper appends to the original SQL text.
 
-Returns:
-- `columns`: list of column name strings.
-- `rows`: list of row lists (each row is a list of scalar values).
-- `columns_meta`: list of dicts with `name`, `type`, and `nullable` for each column.
+The helper converts NaN values to nulls where Polars permits it and returns rows as lists. Each column metadata entry contains `name`, the string form of its Polars `type`, and `nullable=True`; nullability is not inferred. The optional `out` dictionary receives `query_id` and `query_hash` if planning occurred. `Status.ERROR` becomes `RuntimeError("Query execution failed: ...")`.
 
-## Snapshot Linked List
+## 6. Persist a query stream as a job
 
-Every write to a SimpleTable creates a new snapshot that references the
-previous snapshot via the `previous_snapshot` field. This forms a linked list:
-
-```
-[current snapshot v7] --previous_snapshot--> [v6] --> [v5] --> ... --> [v1]
-```
-
-Redis stores only the current leaf pointer. Historical snapshots are JSON
-files on the configured storage backend, which can be inspected directly with
-`SuperTable.read_simple_table_snapshot(path)` to drive ad-hoc point-in-time
-queries against the parquet files listed in each snapshot.
-
-## View Chain
-
-The view chain is a stack of SQL views built on top of raw parquet files. Each layer adds a data integrity or security concern:
-
-```
-[Base]  parquet_scan(files) -> reflection table
-   |
-   v
-[RBAC]  SELECT allowed_columns FROM base WHERE role_filter
-   |
-   v
-[Tombstone]  SELECT * FROM rbac WHERE NOT EXISTS (deleted_keys)
-   |
-   v
-[Dedup]  SELECT visible_cols FROM (ROW_NUMBER() OVER ...) WHERE __rn__=1
-   |
-   v
-  User query references the top-most view
-```
-
-### Base Layer
-
-The reflection table (or view) registers parquet files with the query engine:
-
-```sql
-SELECT <columns> FROM parquet_scan(
-    ['s3://bucket/file1.parquet', 's3://bucket/file2.parquet'],
-    union_by_name=TRUE,
-    HIVE_PARTITIONING=FALSE
-);
-```
-
-`union_by_name=TRUE` handles schema evolution across parquet files with different column sets.
-
-### RBAC Layer
-
-Applies column-level and row-level security based on the authenticated role:
-
-- **Column filtering**: projects only the columns the role is allowed to see.
-- **Row filtering**: applies a WHERE clause from the role's filter definition.
-- **Share filters**: linked-share row filters are merged with RBAC filters via AND.
-
-### Tombstone Layer
-
-Excludes soft-deleted rows using an anti-join against a VALUES list of deleted composite keys. Positioned after RBAC (so deleted rows are never visible) and before dedup (so deleted rows do not participate in the ROW_NUMBER window).
-
-### Dedup Layer
-
-Keeps only the latest row per primary key combination using `ROW_NUMBER() OVER (PARTITION BY pk ORDER BY __timestamp__ DESC)`. Only `visible_columns` are projected in the outer SELECT, hiding internal columns (`__rn__`, `__timestamp__`) from the user query.
-
-## Data Classes
-
-The data classes used throughout the query pipeline are defined in `supertable/data_classes.py`:
-
-### `TableDefinition`
+The streaming package stores job metadata and chunk references in Redis and Arrow IPC stream chunks in the configured storage.
 
 ```python
-@dataclass
-class TableDefinition:
-    super_name: str
-    simple_name: str
-    alias: str
-    columns: List[str] = field(default_factory=list)
+from supertable.streaming.jobs import JobStore
+from supertable.streaming.runner import submit_and_run, iter_job_batches
+
+store = JobStore()
+job = submit_and_run(
+    organization="example_org",
+    super_name="warehouse",
+    sql="SELECT order_id, total FROM orders",
+    role_name="sales_reader",
+    deadline_sec=600,
+    batch_rows=8192,
+    store=store,
+)
+
+for batch in iter_job_batches("example_org", job.job_id, store=store):
+    print(batch.num_rows)
+
+finished = store.get("example_org", job.job_id)
+print(finished.state if finished else "expired metadata")
 ```
 
-Represents a table reference extracted from the SQL query by `SQLParser`.
+`submit_and_run(..., background=True, deadline_sec=None, batch_rows=0, fullscan=False, store=None)` starts a daemon thread by default. `background=False` runs in the caller. The job runner invokes `DataReader.stream()` with AUTO; this helper currently has no engine argument, so the Spark limitation also applies when AUTO selects Spark.
 
-### `SuperSnapshot`
+Job states are `pending`, `running`, `done`, `failed`, `cancelled`, and `expired`. Chunk paths are `<organization>/_query_jobs/<job_id>/chunk-000000.arrow`, with zero-based chunk indices. The record tracks rows, serialized bytes, chunk count, acknowledgement position, owner, deadline, error, and serialized Arrow schema.
 
-```python
-@dataclass
-class SuperSnapshot:
-    super_name: str
-    simple_name: str
-    simple_version: int
-    files: List[str] = field(default_factory=list)
-    columns: Set[str] = field(default_factory=set)
-```
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| `SUPERTABLE_STREAM_CHUNK_BYTES` | `33554432` | Flush target based on accumulated batch size; chunks can exceed it by a batch |
+| `SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS` | `0` | Zero disables producer waiting for acknowledgements |
+| `SUPERTABLE_STREAM_MAX_SPILL_BYTES` | `0` | Zero disables the stored-byte cap |
+| `SUPERTABLE_STREAM_DEADLINE_SEC` | `3600` | Default job execution deadline |
+| `SUPERTABLE_STREAM_JOB_TTL_SEC` | `3600` | Redis record/chunk-reference TTL, refreshed on updates |
 
-Represents a resolved table with its parquet file list and available columns.
+`iter_job_batches(..., follow=True, poll_interval=0.1, timeout=None, acknowledge=True)` reads available chunks in order and follows running jobs. It acknowledges each consumed chunk by default. Failed jobs raise after their available chunks are consumed; cancelled and expired jobs end without that failure exception, so inspect the final job record when completeness matters.
 
-### `RbacViewDef`
+`JobStore.cancel()` sets a cancellation marker. The runner checks cancellation and deadlines while consuming results and uses a watcher to interrupt the handle. Buffered batches not yet written as a chunk are discarded on cancellation; previously written chunks remain available.
 
-```python
-@dataclass
-class RbacViewDef:
-    allowed_columns: List[str] = field(default_factory=lambda: ["*"])
-    where_clause: str = ""
-```
+`JobStore.delete(..., storage=storage)` attempts to delete referenced chunks and removes Redis records. `reap()` removes index entries for jobs whose records have expired. Redis TTL expiration does not itself delete storage objects, and once chunk references expire the reaper may no longer know their paths. These helpers do not implement role checks for reading or cancelling stored jobs; services must enforce job ownership/access before calling them.
 
-Column and row filter definitions produced by `restrict_read_access()`.
+## 7. OData service helpers
 
-### `DedupViewDef`
+[odata/stream.py](../supertable/odata/stream.py) provides `query_odata_sql_stream()` around the reader, and [odata/policy.py](../supertable/odata/policy.py) computes role and effective-policy fingerprints from column restrictions and row predicates.
 
-```python
-@dataclass
-class DedupViewDef:
-    primary_keys: List[str] = field(default_factory=list)
-    order_column: str = "__timestamp__"
-    visible_columns: List[str] = field(default_factory=list)
-```
+The OData helper can accept an expected effective-policy fingerprint; a mismatch raises `ODataPolicyChanged` before streaming. It supports a maximum total row limit, caller cancellation event, timeout, and continuation boundary. Boundaries contain ordered columns, directions, values, and a row identity used as a tie breaker. Missing row identity or null sort values are rejected.
 
-Dedup-on-read configuration from the table config in Redis.
+The helper compares current policy and opens a current-snapshot query. This does not pin a snapshot across pages or guarantee a stable result while underlying data changes. [row_identity.py](../supertable/odata/row_identity.py) separately checks snapshot `rowid_high_watermark` metadata and live-row counts; the stream helper itself does not perform that identity check.
 
-### `TombstoneDef`
-
-```python
-@dataclass
-class TombstoneDef:
-    primary_keys: List[str] = field(default_factory=list)
-    deleted_keys: List = field(default_factory=list)
-```
-
-Soft-delete keys from the snapshot metadata.
-
-### `Reflection`
-
-```python
-@dataclass
-class Reflection:
-    storage_type: str
-    reflection_bytes: int
-    total_reflections: int
-    supers: List[SuperSnapshot]
-    freshness_ms: int = 0
-    rbac_views: Dict[str, RbacViewDef] = field(default_factory=dict)
-    dedup_views: Dict[str, DedupViewDef] = field(default_factory=dict)
-    tombstone_views: Dict[str, TombstoneDef] = field(default_factory=dict)
-```
-
-The aggregate result of data estimation, carrying everything the executor needs to build views and run the query.
-
-## Business Context
-
-The `DataReader` is the single point through which all data leaves SuperTable. This design provides several guarantees:
-
-- **Uniform security enforcement**: every query path passes through the same RBAC check and view chain. There is no way to bypass column or row restrictions by using a different interface.
-
-- **Consistent data view**: dedup-on-read and tombstone filtering ensure that all consumers see the same logical state of the data, even when the underlying parquet files contain historical duplicates or soft-deleted rows.
-
-- **Auditable execution**: every query produces an execution plan with timing breakdowns, engine choice, file counts, and result shape. This enables performance debugging and compliance auditing.
-
-- **Snapshot linked list for compliance**: every write chains via `previous_snapshot`, so older parquet sets remain reachable for point-in-time inspection without maintaining separate historical tables.
-
-- **Tenant isolation**: the `organization` parameter scopes every operation to a single tenant. Combined with RBAC, this prevents cross-tenant data access even when multiple organizations share the same SuperTable deployment.
+Current limits are visible in the implementation: the OData helper accepts `engine` but does not pass it to `DataReader.stream()`, and its selected-engine diagnostic can fall back to `duckdb` without evidence that DuckDB executed. Its timeout checks occur during batch iteration, after stream setup. Use these as service integration helpers, with paging order, authorization, identity checks, and snapshot policy established by the calling service.

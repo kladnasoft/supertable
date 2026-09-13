@@ -1,448 +1,157 @@
-# 05 -- Redis Catalog
+# Redis catalog
 
-## Business Context
+`RedisCatalog` stores current table pointers, root versions, table settings, RBAC records, staging and pipe definitions, sharing records, and engine configuration. Its data lives in ordinary Redis strings, hashes, and sets. Parquet data and historical snapshot JSON live in the selected storage backend.
 
-Redis serves as the metadata backbone of SuperTable. Every table pointer, version counter, RBAC identity, staging definition, auth token, and sharing link is stored in Redis as JSON strings. This gives the system sub-millisecond metadata lookups, atomic version increments via Lua scripts, and a single source of truth for coordination across concurrent writers.
+Sources: [RedisCatalog](../supertable/redis_catalog.py), [RedisConnector](../supertable/redis_connector.py), [key builders](../supertable/redis_keys.py). Read [Redis layout](16_redis_layout.md) for exact keys and [locking](08_locking.md) for concurrency behavior.
 
-The catalog is split into two layers:
-
-- **RedisConnector** (`supertable/redis_connector.py`) -- handles connection establishment, supporting direct connections, Redis URL connections, and Redis Sentinel for high availability.
-- **RedisCatalog** (`supertable/redis_catalog.py`) -- the application-level API that all other modules call. It owns key naming, Lua scripts, locking, RBAC, sharing, staging/pipe management, Spark cluster registration, and engine configuration.
-
----
-
-## Connection Modes (RedisConnector)
-
-**Module**: `supertable/redis_connector.py`
-
-### RedisOptions Dataclass
+## Connection setup
 
 ```python
-@dataclass(frozen=True)
-class RedisOptions:
-    host: str           # SUPERTABLE_REDIS_HOST (default: localhost)
-    port: int           # SUPERTABLE_REDIS_PORT (default: 6379)
-    db: int             # SUPERTABLE_REDIS_DB (default: 0)
-    password: Optional[str]  # SUPERTABLE_REDIS_PASSWORD
-    use_ssl: bool       # SUPERTABLE_REDIS_SSL (default: false)
-    decode_responses: bool  # Always True (JSON text)
+from supertable.redis_catalog import RedisCatalog
 
-    # Sentinel fields
-    is_sentinel: bool       # SUPERTABLE_REDIS_SENTINEL (true/false)
-    sentinel_hosts: List[tuple]  # SUPERTABLE_REDIS_SENTINELS="host1:26379,host2:26379"
-    sentinel_master: str    # SUPERTABLE_REDIS_SENTINEL_MASTER="mymaster"
-    sentinel_password: Optional[str]  # SUPERTABLE_REDIS_SENTINEL_PASSWORD
-    sentinel_strict: bool   # Always True (no silent fallback)
+catalog = RedisCatalog()
+if not catalog.ping():
+    raise ConnectionError("Redis is unavailable")
+root = catalog.get_root("acme", "sales")
+leaf = catalog.get_leaf("acme", "sales", "orders")
 ```
 
-All fields are populated from environment variables via the `settings` object. The dataclass is frozen (immutable).
+The main connector reads host, port, database, password, SSL, and Sentinel settings from the imported settings object. It shares clients through a process-local configuration-keyed cache. `close_all_redis_clients()` clears the cache, disconnects pools, and closes clients. Responses are always decoded to text.
 
-### Mode 1: Direct Connection (Default)
+`RedisOptions` derives connection attributes in `__post_init__`; its host and similar fields are not constructor override arguments. It forces `decode_responses=True` and `sentinel_strict=True`. The main connector does not consume the URL or username settings. See [configuration](02_configuration.md) for the distinction between declared settings and connector behavior.
 
-When Sentinel is not enabled, `create_redis_client()` creates a standard `redis.Redis` connection:
+With Sentinel enabled and at least one parsed `host:port`, the connector discovers the configured master and retries `PING` for roughly three seconds. Discovery failure raises under the forced strict mode. Enabling Sentinel without any parsed hosts falls back to the direct connection. The Sentinel construction branch does not pass the direct connection's SSL flag.
+
+## Root and leaf records
+
+A root is a JSON string at `meta:root` within a lake namespace:
+
+```json
+{"version": 0, "ts": 1770000000000}
+```
+
+`ensure_root()` creates that record if an existence check finds no key. Additional root flags can include `read_only`, `clone_type`, `cloned_from`, and `replica_tables`. `update_root_flags()` reads the document, merges supplied fields, and writes it back. `bump_root()` uses Lua to increment `version` and replace `ts` while retaining existing fields.
+
+A leaf at `meta:leaf:doc:<simple>` identifies the current simple-table snapshot:
+
+```json
+{
+  "version": 4,
+  "ts": 1770000000000,
+  "path": "acme/sales/tables/orders/snapshots/tables_example.json",
+  "payload": {
+    "simple_name": "orders",
+    "snapshot_version": 4,
+    "previous_snapshot": "acme/sales/tables/orders/snapshots/tables_previous.json",
+    "resources": []
+  }
+}
+```
+
+The example is a reduced record. The payload produced by the table writer also includes schema, tombstone and statistics references, timestamps, location, and optional lineage. `version` is the Redis leaf update counter; `snapshot_version` is maintained in the JSON snapshot. They are separate fields, not one shared counter.
+
+`get_leaf()` returns the decoded record or `None`. `SimpleTable.get_simple_table_snapshot()` first uses an inline payload with a list-valued `resources` field, including an accepted nested `payload.snapshot` shape. Otherwise it reads `path` from storage. The pointer must still contain a path even when the payload is inline.
+
+## Publication and atomic operations
+
+The methods named `set_leaf_path_cas()` and `set_leaf_payload_cas()` atomically increment and replace a leaf using Lua. They do not accept an expected version, compare against a caller's previous value, or verify a lock token. For a missing leaf, their initial result is version `0`; for an existing valid leaf, it is the old version plus one.
+
+| Operation | Atomic portion | Separate work |
+| --- | --- | --- |
+| `set_leaf_path_cas()` | Read version and replace `{version, ts, path}` in one Lua script | Does not retain an existing inline payload |
+| `set_leaf_payload_cas()` | Read version and replace `{version, ts, path, payload}` in one Lua script | Payload JSON is encoded before the script; serialization failure supplies `{}` |
+| `bump_root()` | Read, increment, preserve flags, and replace root in one Lua script | Independent of leaf publication |
+| `reserve_rowids(count)` | Redis `INCRBY` reserves a contiguous range | No rollback when subsequent file creation fails |
+| `ensure_root()` | Individual `EXISTS` and `SET` commands | The check and creation are separate operations |
+| `update_root_flags()` | Individual read and write commands | Concurrent updates can overwrite one another |
+
+For positive `count`, `reserve_rowids()` returns the first ID in the reserved range. An unused sequence starts at `1`; nonpositive counts return `0` without incrementing it.
+
+The writer's publication sequence is:
+
+1. Acquire the simple-table lock and load the current snapshot.
+2. Write new data, tombstones/statistics as needed, and a new snapshot JSON object.
+3. Verify the lock, then publish the leaf with inline payload; if that call raises, attempt path-only publication.
+4. Bump the super-table root version.
+5. Update schema and table-name acceleration keys, then attempt mirrors.
+6. Release the lock and enqueue monitoring outside the lock.
+
+Each Lua invocation is atomic in Redis. The sequence as a whole is not a transaction: storage writes, leaf publication, root bump, acceleration keys, and mirrors are separate actions. A failed root bump can follow a successful leaf publication; files written before failed publication can remain unreferenced. Schema/table-name updates and mirror errors are handled without rolling the leaf back. Table readers should derive the current snapshot from the leaf, rather than infer a transaction from matching counters.
+
+## Snapshot history
+
+Every `SimpleTable.update()` sets `previous_snapshot` to the prior snapshot path, increments `snapshot_version`, and writes a new JSON snapshot. Redis retains the current leaf rather than a history list.
+
+A caller can follow the chain through storage:
 
 ```python
-redis.Redis(
-    host=opts.host,
-    port=opts.port,
-    db=opts.db,
-    password=opts.password,
-    decode_responses=True,
-    ssl=opts.use_ssl,
-)
+from supertable.simple_table import SimpleTable
+from supertable.super_table import SuperTable
+
+st = SuperTable("sales", "acme", create_if_missing=False)
+table = SimpleTable(st, "orders", create_if_missing=False)
+snapshot, path = table.get_simple_table_snapshot()
+seen = set()
+
+while path and path not in seen:
+    seen.add(path)
+    print(snapshot["snapshot_version"], path)
+    path = snapshot.get("previous_snapshot")
+    if path:
+        snapshot = st.read_simple_table_snapshot(path)
 ```
 
-**Environment variables**: `SUPERTABLE_REDIS_HOST`, `SUPERTABLE_REDIS_PORT`, `SUPERTABLE_REDIS_DB`, `SUPERTABLE_REDIS_PASSWORD`, `SUPERTABLE_REDIS_SSL`.
+The snapshot chain is metadata history. Following it can raise if a previous JSON object was removed, and referenced Parquet resources must still exist to read historical data. This catalog does not provide a historical-version selector or a transaction that pins a snapshot chain and its objects.
 
-### Mode 2: Redis Sentinel (High Availability)
+## Replica reads
 
-When `SUPERTABLE_REDIS_SENTINEL=true` and sentinel hosts are configured:
+When a root has `clone_type="replica"` and a different nonempty `cloned_from`, `get_leaf()`, `leaf_exists()`, and leaf scanning read the source super-table's leaves. A nonempty list in `replica_tables` filters permitted simple names; a missing or empty list means no table-name restriction here.
 
-1. Creates a `Sentinel` object with the configured sentinel nodes.
-2. Obtains a master connection via `sentinel.master_for()`.
-3. Performs a fail-fast probe with a 3-second deadline (repeated `ping()` calls with 200 ms sleep between retries).
-4. If the probe succeeds, returns the sentinel-backed client.
-5. If the probe fails and `sentinel_strict=True` (always), raises the error immediately.
+Root retrieval remains at the requested namespace. Replica lookup is a single source redirection, not recursive source resolution. `find_readonly_clones()` scans roots in one organization and returns those whose `read_only` flag is truthy and whose `cloned_from` matches the source. These catalog primitives read and write metadata; they do not perform storage copying themselves.
 
-**Sentinel environment variables**: `SUPERTABLE_REDIS_SENTINELS`, `SUPERTABLE_REDIS_SENTINEL_MASTER`, `SUPERTABLE_REDIS_SENTINEL_PASSWORD`.
+## Enumeration and failure behavior
 
-**Password sharing**: When `SUPERTABLE_REDIS_PASSWORD` is not set but `SUPERTABLE_REDIS_SENTINEL_PASSWORD` is, the sentinel password is reused for Redis auth (common in single-password deployments).
+`scan_leaf_keys()` uses Redis `SCAN` with the lake's leaf pattern. `scan_leaf_items()` batches `GET` calls and yields dictionaries containing `simple`, `version`, `ts`, `path`, and `payload`. Missing or malformed entries in those batches are skipped. `SCAN` is incremental and is not a consistent snapshot of a changing namespace.
 
-### RedisConnector Class
+Failure handling varies by method:
 
-```python
-class RedisConnector:
-    def __init__(self, options: Optional[RedisOptions] = None):
-        self.r = create_redis_client(options)
-```
+| Methods | Redis failure behavior |
+| --- | --- |
+| `root_exists()`, raw leaf existence, `ensure_root()`, leaf publication, `bump_root()` | Log and raise |
+| `ping()` | Return false |
+| `get_root()`, raw leaf retrieval | Return `None` on Redis errors; malformed JSON is not covered by that Redis-only catch |
+| Leaf scans and batches | Log and stop/skip the failed operation, potentially yielding partial results |
+| Many metadata getters | Return `None`, an empty list, or defaults |
+| Several metadata mutation helpers | Return false or a partial deletion count |
 
-A thin wrapper that holds the connected `redis.Redis` instance. Used by `RedisCatalog.__init__()`.
+A missing result from a getter is therefore not universally proof that the resource is absent. Existence checks deliberately propagate connection errors. Callers should use the method's actual contract when deciding whether creation is appropriate.
 
----
+## Table, mirror, and engine configuration
 
-## Key Naming Taxonomy
+`set_table_config()` stores the supplied dictionary with `modified_ms`; `get_table_config()` reads it. The catalog does not validate writer tuning fields here. `DataWriter.configure_table()` validates positive values for its supported thresholds before calling it.
 
-All keys follow a hierarchical namespace. Below is the complete list of key patterns found in the codebase.
+Mirror settings are a JSON object containing `formats` and `ts`. Only `DELTA`, `ICEBERG`, and `PARQUET` are retained, uppercased and deduplicated in input order. Unknown values are ignored. `enable_mirror()` and `disable_mirror()` perform a read followed by a write and can race with each other. See [mirroring](13_mirroring.md).
 
-> **v2 layout (SDK ≥ 2.1.0).** Every user supertable lives under
-> `supertable:{org}:lakes:{sup}:`, and every org-level platform key
-> (audit, shares, spark, auth) lives under `supertable:{org}:system:`.
-> See `docs/16_redis_layout.md` for the canonical layout, design
-> invariants, and segment-validation contract.
+Engine configuration is organization-scoped. `set_engine_config()` accepts only engine `lite` and these fields: `duckdb_memory_limit`, `duckdb_io_multiplier`, `duckdb_threads`, `duckdb_http_timeout`, and `duckdb_external_cache_size`. It replaces the stored section with the supplied nonempty supported values. Memory strings are normalized. The runtime resolver can read additional shared routing fields and a `pro` section from stored data; the setter does not expose all fields understood by that resolver.
 
-### Core Metadata Keys
+Spark cluster and plug registries are hashes keyed by cluster/plug ID, with JSON configuration values. Selection and routing are described in [query engines](09_query_engine.md).
 
-| Pattern | Type | Purpose |
-|---------|------|---------|
-| `supertable:{org}:lakes:{sup}:meta:root` | STRING (JSON) | SuperTable root pointer -- version, timestamp, clone flags |
-| `supertable:{org}:lakes:{sup}:meta:leaf:doc:{simple}` | STRING (JSON) | SimpleTable leaf pointer -- version, timestamp, path, optional payload |
-| `supertable:{org}:lakes:{sup}:meta:mirrors` | STRING (JSON) | Enabled mirror export formats (DELTA, ICEBERG, PARQUET) |
-| `supertable:{org}:lakes:{sup}:meta:table_config:doc:{simple}` | STRING (JSON) | Per-table config (dedup mode, primary keys, etc.) |
-| `supertable:{org}:lakes:{sup}:meta:table_names` | SET | All simple table names in this supertable |
+## RBAC and authentication records
 
-### Lock Keys
+Users and roles use hash documents, set indexes, case-insensitive name-to-ID hashes, and version metadata hashes. The catalog serializes list/dictionary fields as JSON. Creation writes document/index/name entries in a Redis pipeline, then bumps version metadata separately.
 
-| Pattern | Type | Purpose |
-|---------|------|---------|
-| `supertable:{org}:lakes:{sup}:lock:leaf:doc:{simple}` | STRING (token) | Distributed write lock for a SimpleTable (SET NX EX) |
-| `supertable:{org}:lakes:{sup}:lock:stage:doc:{stage_name}` | STRING (token) | Distributed lock for staging/pipe operations |
+Role update uses Lua to update fields, maintain the role-type set, and bump role metadata together. Role deletion uses Lua to remove the role from indexed users, delete the role and its name/type/index entries, and bump role metadata. Adding or removing a user's role also uses Lua to avoid replacing concurrent role-list changes. Higher-level authority checks are described in [RBAC](11_rbac.md).
 
-### RBAC Keys (UUID-Based Identity)
+Organization login tokens are generated with the `st_login_` prefix. Redis stores SHA-256 token IDs as hash fields and JSON metadata as values; the plaintext token is returned at creation. `validate_auth_token()` only tests whether that hash field exists. `validate_auth_token_full()` loads metadata and checks enabled/expiry state. Use the full validation contract where those controls must be enforced. Expiry is checked from `expires_ms`, not an individual Redis field TTL.
 
-| Pattern | Type | Purpose |
-|---------|------|---------|
-| `supertable:{org}:lakes:{sup}:rbac:users:meta` | HASH | User meta -- version counter, last_updated_ms, initialized flag |
-| `supertable:{org}:lakes:{sup}:rbac:users:index` | SET | Set of all user_ids |
-| `supertable:{org}:lakes:{sup}:rbac:users:doc:{user_id}` | HASH | User document -- username, roles (JSON array), timestamps |
-| `supertable:{org}:lakes:{sup}:rbac:users:name_to_id` | HASH | Mapping: lowercase username -> user_id |
-| `supertable:{org}:lakes:{sup}:rbac:roles:meta` | HASH | Role meta -- version counter, last_updated_ms, initialized flag |
-| `supertable:{org}:lakes:{sup}:rbac:roles:index` | SET | Set of all role_ids |
-| `supertable:{org}:lakes:{sup}:rbac:roles:doc:{role_id}` | HASH | Role document -- role_name, role type, tables, columns, filters |
-| `supertable:{org}:lakes:{sup}:rbac:roles:type:doc:{role_type}` | SET | Set of role_ids belonging to a specific role type (e.g., superadmin) |
-| `supertable:{org}:lakes:{sup}:rbac:roles:name_to_id` | HASH | Mapping: lowercase role_name -> role_id |
+## Staging, pipes, and sharing
 
-### Auth Token Keys
+Staging and pipe upserts store JSON documents and add names to set indexes in a pipeline. They add scope fields if absent and replace `updated_at_ms` on every upsert. Lists primarily use those indexes. Pipe listing has a scan fallback, but its fallback name extraction splits on `:pipe:` while current keys contain `:pipes:doc:`; an absent index can therefore produce full keys rather than pipe names. Maintain the indexes through the provided upsert/delete operations.
 
-| Pattern | Type | Purpose |
-|---------|------|---------|
-| `supertable:{org}:system:auth:tokens` | HASH | Mapping: token_id (sha256) -> JSON metadata. Lives under the `system` namespace; user lakes are under `lakes:` at the same level, so this never collides with a user-named supertable. |
+Share and linked-share creation similarly write JSON plus index membership through pipelines. These records store supplied metadata; storage exports and refresh behavior are responsibilities of their callers.
 
-### Service Registry Keys (per organization)
+## Deletion scope
 
-| Pattern | Type | Purpose |
-|---------|------|---------|
-| `dataisland:{org}:registry:{service_type}:{host}:{pid}` | STRING (JSON) | Heartbeat record for one running service instance (TTL 30s, refreshed every 15s). `service_type` ∈ `{api, webui, odata, mcp, sdk, lighthouse}`. |
-| `dataisland:_apps_:doc:{app_name}:master_mcp` | STRING (JSON) | Per-app bootstrap entry telling an app (Lighthouse, …) which master MCP to connect to. Written via `POST /api/v1/apps/{app}/master-mcp`. |
+`delete_leaf()` removes only the leaf key. `delete_simple_table()` removes the leaf and its lock; it does not remove the row-ID sequence, schema key, table-name set membership, table settings, or quality records. It returns true if its Redis delete command executes, even when no keys existed.
 
-### Data Sharing Keys
-
-| Pattern | Type | Purpose |
-|---------|------|---------|
-| `supertable:{org}:system:shares:doc:{share_id}` | STRING (JSON) | Share definition document (provider side) |
-| `supertable:{org}:system:shares:index` | SET | Set of share_ids for an organization |
-| `supertable:{org}:lakes:{sup}:linked_shares:doc:{link_id}` | STRING (JSON) | Linked share document (consumer side) |
-| `supertable:{org}:lakes:{sup}:linked_shares:index` | SET | Set of link_ids for a SuperTable |
-
-### Audit Keys
-
-| Pattern | Type | Purpose |
-|---------|------|---------|
-| `supertable:{org}:system:audit:stream` | STREAM | Audit event stream (hash-chained) |
-| `supertable:{org}:system:audit:chain_head:doc:{instance_id}` | HASH | Per-instance audit hash-chain state |
-| `supertable:{org}:system:audit:config` | HASH | Runtime audit toggle (enable, sub-flags) |
-
-### Staging / Pipe Keys
-
-| Pattern | Type | Purpose |
-|---------|------|---------|
-| `supertable:{org}:lakes:{sup}:meta:staging:index` | SET | Set of staging names for fast listing |
-| `supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:meta` | STRING (JSON) | Staging area metadata blob |
-| `supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:pipes:index` | SET | Set of pipe names for a staging area |
-| `supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:pipes:doc:{pipe_name}` | STRING (JSON) | Pipe metadata within a staging area |
-
-### Engine Keys
-
-All query-engine state is unified under one org-level `system:engine:` namespace.
-
-| Pattern | Type | Purpose |
-|---------|------|---------|
-| `supertable:{org}:system:engine:thrifts` | HASH | Mapping: cluster_id -> JSON cluster config (Spark Thrift servers) |
-| `supertable:{org}:system:engine:plugs` | HASH | Mapping: plug_id -> JSON plug config (PySpark notebook runtimes) |
-| `supertable:{org}:system:engine:duckdb` | STRING (JSON) | DuckDB Lite/Pro runtime config + shared auto-pick thresholds (memory, threads, thresholds) |
-
-### Schema Keys
-
-| Pattern | Type | Purpose |
-|---------|------|---------|
-| `supertable:{org}:lakes:{sup}:schema:doc:{simple}` | STRING (JSON) | Table schema JSON for one simple table |
-
-### Monitoring Keys (org-level, daily-partitioned)
-
-Monitoring is **org-wide telemetry**, not per-supertable. A
-cross-supertable query records one canonical entry whose payload
-includes a `supertables: [str]` field for attribution. The shape is
-**daily-partitioned** so Redis growth is bounded — yesterday's data
-is drained to internal sink tables (`__reads__`, `__writes__`,
-`__mcp__`) by an external orchestrator (chap. 14).
-
-| Pattern | Type | Purpose |
-|---------|------|---------|
-| `supertable:{org}:monitor:{monitor_type}:doc:{YYYY-MM-DD}` | LIST | Today's monitoring partition. `monitor_type` ∈ closed set `{plans, writes, mcp, odata, errors, locks}`. Each entry's JSON payload carries `supertables: [str]`. The writer (`MonitoringWriter`) computes `today` per batch ship so writes that cross midnight UTC roll naturally. |
-| `supertable:{org}:monitor:{monitor_type}:doc:{YYYY-MM-DD}:_drain` | LIST | In-progress drain handle. Created by `drain_partition` / `iter_partition_chunks` via `RENAME` so the snapshot is atomic against any straggler write. Deleted when the drain completes. |
-
----
-
-## RedisCatalog Class
-
-**Module**: `supertable/redis_catalog.py`
-
-```python
-class RedisCatalog:
-    def __init__(self, options: Optional[RedisOptions] = None)
-```
-
-On initialization, the catalog:
-1. Creates a Redis connection via `RedisConnector`.
-2. Registers all Lua scripts (CAS leaf update, root bump, RBAC mutations).
-3. Initializes a `RedisLocking` instance for distributed lock operations.
-
-### Methods Grouped by Domain
-
----
-
-#### Health Check
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `ping` | `() -> bool` | Tests Redis connectivity via PING. |
-
----
-
-#### Locking
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `acquire_simple_lock` | `(org, sup, simple, ttl_s=30, timeout_s=30) -> Optional[str]` | Acquires a distributed lock on a SimpleTable. Returns a token string or None. |
-| `release_simple_lock` | `(org, sup, simple, token) -> bool` | Releases a lock using compare-and-delete via Lua. |
-| `acquire_stage_lock` | `(org, sup, stage_name, ttl_s=30, timeout_s=30) -> Optional[str]` | Acquires a distributed lock for staging/pipe operations. |
-
----
-
-#### SuperTable Operations (Root)
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `ensure_root` | `(org, sup) -> None` | Initializes `meta:root` with `{"version": 0, "ts": ...}` if missing. |
-| `root_exists` | `(org, sup) -> bool` | Checks existence of the `meta:root` key. |
-| `get_root` | `(org, sup) -> Optional[Dict]` | Reads and returns the root JSON document. |
-| `update_root_flags` | `(org, sup, flags) -> bool` | Merges flags (e.g., `read_only`, `cloned_from`) into the root document. |
-| `find_readonly_clones` | `(org, source_sup) -> List[str]` | Scans all roots to find SuperTables that are read-only clones of the source. |
-| `bump_root` | `(org, sup, now_ms=None) -> int` | Atomically increments the root version via Lua script. Returns new version. |
-| `delete_super_table` | `(org, sup, count=1000) -> int` | Deletes ALL Redis keys matching `supertable:{org}:lakes:{sup}:*` via SCAN. Returns count deleted. |
-
----
-
-#### Replica Resolution
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `_resolve_replica_info` | `(org, sup) -> Optional[tuple]` | If `sup` is a replica clone, returns `(source_name, allowed_tables)`. Returns None for non-replicas. Single-level only. |
-| `_resolve_replica_source` | `(org, sup) -> Optional[str]` | Backward-compatible wrapper; returns only the source name. |
-
----
-
-#### Leaf (SimpleTable) Operations
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `leaf_exists` | `(org, sup, simple) -> bool` | Checks existence of the leaf key (replica-aware). |
-| `get_leaf` | `(org, sup, simple) -> Optional[Dict]` | Reads the leaf pointer (replica-aware). Returns `{version, ts, path, payload}`. |
-| `delete_leaf` | `(org, sup, simple) -> bool` | Deletes a leaf pointer key. |
-| `set_leaf_path_cas` | `(org, sup, simple, path, now_ms=None) -> int` | Atomically sets the leaf pointer to a new path via Lua CAS script. Returns new version. |
-| `set_leaf_payload_cas` | `(org, sup, simple, payload, path, now_ms=None) -> int` | Atomically sets the leaf pointer with path AND inline snapshot payload. Returns new version. |
-| `delete_simple_table` | `(org, sup, simple) -> bool` | Deletes the leaf key and its associated lock key. |
-| `scan_leaf_keys` | `(org, sup, count=1000) -> Iterator[str]` | Yields all `meta:leaf:*` keys via SCAN (replica-aware). |
-| `scan_leaf_items` | `(org, sup, count=1000) -> Iterator[Dict]` | Iterates leaf keys and fetches values in pipeline batches. Yields `{simple, version, ts, path, payload}`. |
-
----
-
-#### Mirror Format Management
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `get_mirrors` | `(org, sup) -> List[str]` | Reads enabled mirror formats. Validates against `DELTA`, `ICEBERG`, `PARQUET`. |
-| `set_mirrors` | `(org, sup, formats, now_ms=None) -> List[str]` | Atomically sets the enabled mirror formats. |
-| `enable_mirror` | `(org, sup, fmt) -> List[str]` | Adds a format to the enabled list (idempotent). |
-| `disable_mirror` | `(org, sup, fmt) -> List[str]` | Removes a format from the enabled list. |
-
----
-
-#### RBAC -- Role Operations
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `rbac_init_role_meta` | `(org, sup) -> None` | Ensures the role meta HASH exists. Idempotent. |
-| `rbac_create_role` | `(org, sup, role_id, role_data) -> None` | Persists a new role document, updates index SET and name-to-id HASH. Bumps role meta version. |
-| `rbac_update_role` | `(org, sup, role_id, fields) -> None` | Updates specific fields of an existing role in-place. |
-| `rbac_delete_role` | `(org, sup, role_id) -> bool` | Atomically deletes a role via Lua: strips from all users, removes from indexes and name-to-id map. |
-| `rbac_role_exists` | `(org, sup, role_id) -> bool` | Checks if a role document key exists. |
-| `rbac_get_role_ids_by_type` | `(org, sup, role_type) -> List[str]` | Returns role_ids belonging to a specific type (e.g., `"superadmin"`). |
-| `rbac_get_superadmin_role_id` | `(org, sup) -> Optional[str]` | Shortcut: returns the first superadmin role_id. |
-| `rbac_get_role_id_by_name` | `(org, sup, role_name) -> Optional[str]` | Looks up role_id from role_name (case-insensitive). |
-| `get_roles` | `(org, sup) -> List[Dict]` | Gets all roles via pipeline batch (SMEMBERS + batched HGETALL). |
-| `get_role_details` | `(org, sup, role_id) -> Optional[Dict]` | Gets detailed role info by role_id. |
-
----
-
-#### RBAC -- User Operations
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `rbac_init_user_meta` | `(org, sup) -> None` | Ensures the user meta HASH exists. Idempotent. |
-| `rbac_create_user` | `(org, sup, user_id, user_data) -> None` | Persists a new user document, updates index SET and username-to-id HASH. |
-| `rbac_update_user` | `(org, sup, user_id, fields) -> None` | Updates specific fields of an existing user in-place. |
-| `rbac_rename_user` | `(org, sup, user_id, old_username, new_username) -> None` | Atomically updates the username-to-id mapping. |
-| `rbac_delete_user` | `(org, sup, user_id) -> None` | Deletes user document and removes from all indexes. |
-| `rbac_get_user_id_by_username` | `(org, sup, username) -> Optional[str]` | Looks up user_id from username (case-insensitive). |
-| `rbac_list_user_ids` | `(org, sup) -> List[str]` | Returns all user_ids from the index SET. |
-| `get_users` | `(org, sup) -> List[Dict]` | Gets all users via pipeline batch (SMEMBERS + batched HGETALL). |
-| `get_user_details` | `(org, sup, user_id) -> Optional[Dict]` | Gets detailed user info by user_id. |
-
----
-
-#### RBAC -- Role-User Mutations
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `rbac_add_role_to_user` | `(org, sup, user_id, role_id) -> bool` | Atomically adds a role to a user's role list via Lua (no-op if already present). |
-| `rbac_remove_role_from_user` | `(org, sup, user_id, role_id) -> bool` | Atomically removes a role from a user's role list via Lua. |
-
----
-
-#### Auth Token Management
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `list_auth_tokens` | `(org) -> List[Dict]` | Lists all auth tokens for an org. Sorted by `created_ms` descending. Tokens are stored hashed. |
-| `create_auth_token` | `(org, created_by, label=None, enabled=True, username="", user_id="") -> Dict` | Creates a new token. Returns the plaintext token ONLY once. Redis stores `sha256(token)` as the key. |
-| `delete_auth_token` | `(org, token_id) -> bool` | Deletes a token by its token_id (sha256 hash). |
-| `validate_auth_token` | `(org, token) -> bool` | Validates a plaintext token by hashing and checking existence. |
-| `validate_auth_token_full` | `(org, token) -> Optional[Dict]` | Validates and returns full token metadata (including linked username/user_id). |
-
----
-
-#### Data Sharing -- Provider Side
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `create_share` | `(org, share_id, share_doc) -> None` | Stores a share definition and adds to the org-level index SET. |
-| `get_share` | `(org, share_id) -> Optional[Dict]` | Retrieves a share definition by ID. |
-| `delete_share` | `(org, share_id) -> bool` | Deletes a share definition and removes from index. |
-| `list_shares` | `(org) -> List[Dict]` | Lists all share definitions for an organization. |
-
----
-
-#### Data Sharing -- Consumer Side (Linked Shares)
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `create_linked_share` | `(org, sup, link_id, link_doc) -> None` | Stores a linked share and adds to the SuperTable-level index SET. |
-| `get_linked_share` | `(org, sup, link_id) -> Optional[Dict]` | Retrieves a linked share by ID. |
-| `update_linked_share` | `(org, sup, link_id, doc) -> bool` | Replaces a linked share document. |
-| `delete_linked_share` | `(org, sup, link_id) -> bool` | Deletes a linked share and removes from index. |
-| `list_linked_shares` | `(org, sup) -> List[Dict]` | Lists all linked shares for a SuperTable. |
-
----
-
-#### Staging / Pipe Management
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `upsert_staging_meta` | `(org, sup, staging_name, meta) -> bool` | Upserts staging metadata and adds to the staging index SET. |
-| `get_staging_meta` | `(org, sup, staging_name) -> Optional[Dict]` | Retrieves staging metadata. |
-| `list_stagings` | `(org, sup, count=1000) -> List[str]` | Lists staging names. Prefers index SET; falls back to SCAN. |
-| `delete_staging_meta` | `(org, sup, staging_name, count=1000) -> int` | Deletes staging and all related keys (pipes, pipe meta). Returns count deleted. |
-| `upsert_pipe_meta` | `(org, sup, staging_name, pipe_name, meta) -> bool` | Upserts pipe metadata and adds to the pipe index SET. |
-| `get_pipe_meta` | `(org, sup, staging_name, pipe_name) -> Optional[Dict]` | Retrieves pipe metadata. |
-| `list_pipes` | `(org, sup, staging_name, count=1000) -> List[str]` | Lists pipe names for a staging. Prefers index SET; falls back to SCAN. |
-| `list_pipe_metas` | `(org, sup, staging_name, count=1000) -> List[Dict]` | Lists full pipe metadata objects for a staging area. |
-| `delete_pipe_meta` | `(org, sup, staging_name, pipe_name) -> int` | Deletes a pipe meta key and removes from index. |
-
----
-
-#### Spark Cluster Management
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `register_spark_cluster` | `(org, cluster_id, config) -> None` | Registers or updates a Spark Thrift cluster. Config includes host, port, name, min/max bytes, status, s3_enabled. |
-| `list_spark_clusters` | `(org) -> List[Dict]` | Returns all registered Spark Thrift clusters for an org. |
-| `select_spark_cluster` | `(org, job_bytes, force=False) -> Optional[Dict]` | Selects the best cluster for a job size. Filters by status/size; prefers tightest fit. |
-| `register_spark_plug` | `(org, plug_id, config) -> None` | Registers a Spark Plug (PySpark notebook runtime). Config includes spark_master, ws_url, webui_url, status. |
-
----
-
-#### Table Configuration
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `set_table_config` | `(org, sup, simple, config) -> bool` | Stores per-table configuration (primary keys, dedup mode). Full replacement. |
-| `get_table_config` | `(org, sup, simple) -> Optional[Dict]` | Retrieves per-table configuration. |
-
----
-
-#### Engine Configuration
-
-| Method | Signature | Description |
-|--------|-----------|-------------|
-| `set_engine_config` | `(org, sup, config) -> bool` | Stores engine runtime configuration. Only whitelisted fields are persisted. |
-| `get_engine_config` | `(org, sup) -> Optional[Dict]` | Retrieves engine runtime configuration. |
-
-**Whitelisted engine config fields** (defined in `ENGINE_CONFIG_FIELDS`):
-
-| Field | Environment Variable Fallback |
-|-------|-------------------------------|
-| `engine_lite_max_bytes` | `SUPERTABLE_ENGINE_LITE_MAX_BYTES` |
-| `engine_spark_min_bytes` | `SUPERTABLE_ENGINE_SPARK_MIN_BYTES` |
-| `engine_freshness_sec` | `SUPERTABLE_ENGINE_FRESHNESS_SEC` |
-| `duckdb_memory_limit` | `SUPERTABLE_DUCKDB_MEMORY_LIMIT` |
-| `duckdb_io_multiplier` | `SUPERTABLE_DUCKDB_IO_MULTIPLIER` |
-| `duckdb_threads` | `SUPERTABLE_DUCKDB_THREADS` |
-| `duckdb_http_timeout` | `SUPERTABLE_DUCKDB_HTTP_TIMEOUT` |
-| `duckdb_external_cache_size` | `SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE` |
-
----
-
-## CAS (Compare-and-Swap) Operations
-
-The catalog uses server-side Lua scripts to achieve atomic read-modify-write semantics without client-side locking.
-
-### Leaf CAS Set (`_LUA_LEAF_CAS_SET`)
-
-1. Reads the current value at the leaf key.
-2. Extracts the current version (or defaults to -1 if the key does not exist).
-3. Increments the version.
-4. Writes `{version, ts, path}` atomically.
-5. Returns the new version number.
-
-### Leaf Payload CAS Set (`_LUA_LEAF_PAYLOAD_CAS_SET`)
-
-Same as above, but also embeds a `payload` field containing the full snapshot data. This allows read operations to skip the storage round-trip for metadata-only queries.
-
-### Root Bump (`_LUA_ROOT_BUMP`)
-
-1. Reads the current root value.
-2. Extracts the current version (or defaults to -1).
-3. Increments the version.
-4. Writes `{version, ts}` atomically.
-5. Returns the new version number.
-
-### RBAC Lua Scripts
-
-| Script | Purpose |
-|--------|---------|
-| `_LUA_RBAC_BUMP_META` | Atomically increments the version field and updates `last_updated_ms` on an RBAC meta HASH. |
-| `_LUA_RBAC_DELETE_ROLE` | Atomically deletes a role document, strips the role_id from all user documents, removes from index SET, type SET, and name-to-id HASH. All in a single atomic operation. |
-| `_LUA_RBAC_REMOVE_ROLE_FROM_USER` | Atomically removes a role_id from a single user's roles JSON array, updates timestamps and meta version. |
-| `_LUA_RBAC_ADD_ROLE_TO_USER` | Atomically adds a role_id to a user's roles JSON array (no-op if already present), updates timestamps and meta version. |
-
-All Lua scripts are registered once during `RedisCatalog.__init__()` and invoked through Redis script objects, ensuring the scripts are cached server-side after the first call.
+`delete_super_table()` scans and deletes the entire `supertable:<org>:lakes:<sup>:*` namespace in batches, returning a count. It does not remove organization system keys, query jobs, monitoring partitions, or storage objects. Redis errors can produce a partial count. The higher-level `SuperTable.delete()` removes storage before invoking it. No catalog deletion helper coordinates with active writers through a namespace-wide lock.

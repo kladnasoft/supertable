@@ -1,400 +1,229 @@
-# 15. Python SDK
+# Python SDK
 
-## Overview
+This guide uses the public Python classes in the current source tree. It assumes Redis is reachable and the configured storage backend is available. The examples use a dedicated `acme/warehouse` namespace and the `superadmin` role created during SuperTable initialization.
 
-The `supertable` Python package is a versioned data warehouse library for SQL
-analytics. It provides the core data management classes
-(`SuperTable`, `SimpleTable`, `DataWriter`, `DataReader`, `MetaReader`,
-`RedisCatalog`, `RoleManager`, `UserManager`) and pluggable backends for
-storage, query engines, locking, mirroring, and audit logging.
+Sources: [package exports](../supertable/__init__.py), [project metadata](../pyproject.toml).
 
-The current version is published as `__version__` on the top-level package:
+## Install and configure
 
-```python
-import supertable
-print(supertable.__version__)   # "2.1.1"
-```
-
-All public classes can be imported directly from the top-level package:
-
-```python
-from supertable import (
-    SuperTable, SimpleTable,
-    DataWriter, DataReader, engine,
-    MetaReader, list_supers, list_tables,
-    Staging, SuperPipe,
-    RedisCatalog,
-    RoleManager, UserManager,
-    # Read-side lookup errors — raised when a SELECT or MetaReader
-    # references a supertable/table that doesn't exist. All inherit
-    # from LookupError so legacy ``except LookupError`` keeps working.
-    SupertableLookupError, SuperTableNotFoundError, TableNotFoundError,
-)
-```
-
-The monitoring drain primitives live in their own subpackage so
-deployments that don't need them don't pay the import cost:
-
-```python
-from supertable.monitoring import (
-    list_drainable_partitions, drain_partition, iter_partition_chunks,
-    read_recent, MonitorPartition,
-    MONITORING_SINK_TABLE_FOR, MONITORING_SINK_TABLES,
-)
-```
-
-## Installation
-
-### Basic Install
+Python 3.10 or newer is declared by the package. From the repository directory:
 
 ```bash
-pip install supertable
+python -m pip install -e .
 ```
 
-### With Cloud Storage Backends
+Cloud extras are `s3`, `minio`, `azure`, `gcp`, `all-cloud`, and `all`; for example, `python -m pip install -e '.[s3]'`. The base dependencies include PyArrow, Polars, DuckDB, Redis, and SQLGlot. See [configuration](02_configuration.md) and [storage](04_storage.md) for backend options.
+
+Set environment variables before importing the package:
 
 ```bash
-pip install "supertable[s3]"     # AWS S3
-pip install "supertable[minio]"  # MinIO
-pip install "supertable[azure]"  # Azure Blob Storage
-pip install "supertable[gcp]"    # Google Cloud Storage
-pip install "supertable[all]"    # everything
+export SUPERTABLE_HOME=/tmp/supertable-sdk-example
+export STORAGE_TYPE=LOCAL
+export SUPERTABLE_REDIS_HOST=localhost
+export SUPERTABLE_REDIS_PORT=6379
+export SUPERTABLE_REDIS_DB=0
 ```
 
-### Optional Extras
+Settings are loaded into a process-wide object. Importing the home-directory module, including through normal package imports, creates/resolves the application home and changes the process working directory to it. Use absolute paths when your application must retain a reference to its original directory. Local storage still requires Redis for metadata and locks.
 
-| Extra | Packages | Description |
-|-------|----------|-------------|
-| `s3` | `boto3>=1.34,<2.0` | AWS S3 storage backend |
-| `minio` | `minio>=7.2,<8.0` | MinIO storage backend |
-| `azure` | `azure-storage-blob>=12.26.0` | Azure Blob Storage backend |
-| `gcp` | `google-cloud-storage>=3.1.0` | Google Cloud Storage backend |
-| `all` | All extras | Full installation |
+`pyproject.toml` and `supertable.__version__` identify this source as `3.3.0`; `setup.py` also contains a separate `3.0.7` literal. Use the checked-out APIs as the reference for this guide.
 
-### Requirements
-
-- Python >= 3.10
-- Redis 6+ reachable from the host
-- Object storage backend (or local disk)
-
-## Core Classes
-
-### SuperTable
-
-The main coordination object. Ensures storage and Redis metadata are
-initialised.
+## Create and write a table
 
 ```python
-from supertable.super_table import SuperTable
+import pyarrow as pa
+from supertable import SuperTable, DataWriter, DataReader, engine
+from supertable.data_reader import Status
 
-st = SuperTable(super_name="example", organization="my-org")
-```
+organization = "acme"
+super_name = "warehouse"
+role_name = "superadmin"
 
-| Attribute | Type | Description |
-|-----------|------|-------------|
-| `super_name` | `str` | SuperTable name |
-| `organization` | `str` | Organization namespace |
-| `storage` | `StorageInterface` | Storage backend instance |
-| `catalog` | `RedisCatalog` | Redis catalog instance |
+super_table = SuperTable(super_name=super_name, organization=organization)
+writer = DataWriter(super_name=super_name, organization=organization)
 
-| Method | Description |
-|--------|-------------|
-| `read_simple_table_snapshot(path)` | Read a snapshot JSON from storage |
-| `delete(role_name)` | Drop the SuperTable. Destructive. Requires `CONTROL` with a lake-wide (`"*"`) table grant -- so `superadmin`/`admin` only. |
-
-### DataWriter
-
-Writes Arrow tables into a SimpleTable.
-
-```python
-from supertable.data_writer import DataWriter
-
-dw = DataWriter(super_name="example", organization="my-org")
-columns, rows, inserted, deleted = dw.write(
-    role_name="superadmin",
-    simple_name="facts",
-    data=arrow_table,
-    overwrite_columns=["day", "client"],
-)
-```
-
-`write()` returns a tuple `(total_columns, total_rows, inserted, deleted)`.
-Optional kwargs: `compression_level=1`, `newer_than=None`, `delete_only=False`,
-`lineage=None` (dict with conventional keys — see the
-`DataWriter.write` docstring).
-
-#### `DataWriter.compact()` — explicit manual compaction
-
-For scheduled / on-demand compaction outside the natural write
-cadence (chap. 06 §Explicit Compaction):
-
-```python
-stats = dw.compact(
-    role_name="admin",
+columns, rows, inserted, deleted = writer.write(
+    role_name=role_name,
     simple_name="orders",
-    force_tombstones=True,   # default — physically clean tombstones now
-    small_only=True,         # default — only touch files < max_memory_chunk_size
-    compression_level=1,
+    data=pa.table({"order_id": [1, 2], "amount": [12.5, 18.0]}),
+    overwrite_columns=["order_id"],
 )
-# stats: dict with files_before/after, files_compacted,
-# tombstone_rows_removed, new_resources, sunset_files,
-# total_rows_written, duration, lineage, query_id, …
-```
+print({"columns": columns, "inserted": inserted, "deleted": deleted})
 
-Same lock, same atomic-CAS commit pattern, same GC enqueue and
-monitoring as `write()` — but with no incoming data. Refuses to
-bootstrap a missing table (raises `TableNotFoundError`). Emits
-`monitor_type="compact"` metrics; sink table is `__compact__`.
-
-### DataReader
-
-Executes SQL queries against the SuperTable.
-
-```python
-from supertable.data_reader import DataReader, engine
-
-dr = DataReader(
-    super_name="example",
-    organization="my-org",
-    query="SELECT day, client, sum(value) AS total FROM facts GROUP BY day, client LIMIT 10",
+reader = DataReader(
+    super_name=super_name,
+    organization=organization,
+    query="SELECT order_id, amount FROM orders ORDER BY order_id",
 )
-df, status, message = dr.execute(role_name="superadmin", engine=engine.AUTO)
-print(f"rows={df.shape[0]} cols={df.shape[1]} status={status}")
-print(f"timings: {dr.timer.timings}")
-print(f"plan_stats: {dr.plan_stats.stats}")
+frame, status, message = reader.execute(role_name=role_name, engine=engine.DUCKDB)
+if status is not Status.OK:
+    raise RuntimeError(message)
+print(frame)
 ```
 
-Engine values: `engine.AUTO`, `engine.DUCKDB_LITE`, `engine.DUCKDB_PRO`,
-`engine.SPARK_SQL`.
+`write` takes Arrow input and returns `(incoming_column_count, inserted_rows, inserted_rows, deleted_rows)`. This is not the final table row count. Reads return a Polars DataFrame, a `Status` enum, and an optional message. Some authorization, parsing, or catalog errors can raise before the reader's execution exception handler, so callers must also handle exceptions.
 
-### MetaReader
+`overwrite_columns=[]` appends. A nonempty list replaces existing matches through tombstones. It does not enforce uniqueness within the incoming batch. For conditional replacement, delete-only calls, configuration, and compaction, see [data writer](06_data_writer.md).
 
-Inspects metadata.
-
-```python
-from supertable.meta_reader import MetaReader, list_supers, list_tables
-
-list_supers(organization="my-org")
-list_tables(organization="my-org", super_name="example")
-
-mr = MetaReader(organization="my-org", super_name="example")
-mr.get_super_meta(role_name="superadmin")
-mr.get_table_schema("facts", role_name="superadmin")
-mr.get_table_stats("facts", role_name="superadmin")
-```
-
-### RoleManager / UserManager
+## Stream Arrow batches
 
 ```python
-from supertable.rbac.role_manager import RoleManager
-from supertable.rbac.user_manager import UserManager
-
-# Mutating roles or users requires an actor holding Permission.RBAC
-# (superadmin or admin). Reads need no actor. Omitting it raises
-# PermissionError -- see docs/11_rbac.md 11.3.1.
-rm = RoleManager(super_name="example", organization="my-org",
-                 actor_role_name="superadmin")
-rm.create_role({"role": "reader", "tables": {"facts": {"columns": ["*"], "filters": []}}})
-
-um = UserManager(super_name="example", organization="my-org",
-                 actor_role_name="superadmin")
-um.create_user({"username": "alice", "roles": [role_id]})
-```
-
-### Read-side errors
-
-`DataReader.execute()` and `MetaReader.__init__()` fail fast against
-missing supertables / tables — they do **not** silently bootstrap as
-a side effect of opening the reader.
-
-```python
-from supertable import (
-    DataReader, MetaReader,
-    SuperTableNotFoundError, TableNotFoundError,
+reader = DataReader(
+    super_name=super_name,
+    organization=organization,
+    query="SELECT order_id, amount FROM orders ORDER BY order_id",
 )
-
-# SELECT against a missing supertable returns Status.ERROR with a
-# typed message — the catalog state is not touched.
-dr = DataReader(super_name="ghost", organization="acme",
-                query="SELECT 1 FROM users")
-df, status, message = dr.execute(role_name="superadmin")
-# status == Status.ERROR
-# message == "SuperTable not found: acme/ghost"
-
-# MetaReader is read-only by contract — opening one against a missing
-# name raises SuperTableNotFoundError directly.
+handle = reader.stream(
+    role_name=role_name,
+    engine=engine.DUCKDB,
+    batch_rows=10_000,
+)
 try:
-    mr = MetaReader(super_name="ghost", organization="acme")
-except SuperTableNotFoundError as e:
-    print(e.organization, e.super_name)   # "acme" "ghost"
+    for batch in handle.batches():
+        print(batch.num_rows)
+finally:
+    handle.close()
 ```
 
-Both errors inherit from the stdlib `LookupError` so existing
-`except LookupError` / `except KeyError` catchers keep working.
+Close a handle even if iteration ends early. The handle releases its query resources and triggers its completion callback on close. Normal reads hide `__rowid__` and `__timestamp__`; DuckDB streaming with `expose_rowid=True` can expose the row ID, subject to the role's allowed-column view.
 
-### Constructor opt-out for read-only sessions
+Use `engine.DUCKDB` for these examples. `engine.AUTO` can select a registered Spark cluster for sufficiently large estimates, and the current Spark streaming return path has a defect described in [query engines](09_query_engine.md). `DataReader` instances hold mutable execution/stream state; create a separate reader for independent queries.
 
-`SuperTable.__init__` and `SimpleTable.__init__` both accept
-`create_if_missing: bool = True`. The default preserves the writer's
-auto-create behaviour; **read-side code passes `False`** so a missing
-name surfaces as `SuperTableNotFoundError` / `TableNotFoundError`
-instead of being materialised by the constructor:
+## Return JSON-friendly rows
 
 ```python
-from supertable.super_table import SuperTable
-from supertable.simple_table import SimpleTable
+from supertable.data_reader import query_sql
 
-# Writer-style: bootstrap if missing (default).
-st = SuperTable("acme", "my-org")
-
-# Reader-style: refuse to bootstrap.
-try:
-    st = SuperTable("ghost", "my-org", create_if_missing=False)
-except SuperTableNotFoundError:
-    ...
-```
-
-### Monitoring orchestration
-
-Recent-tail reads (UI "last 100"):
-
-```python
-from supertable.monitoring import read_recent
-from supertable.redis_catalog import RedisCatalog
-
-last_100 = read_recent(
-    RedisCatalog(),
-    organization="acme",
-    monitor_type="writes",
+query_info = {}
+column_names, result_rows, column_metadata = query_sql(
+    organization=organization,
+    super_name=super_name,
+    sql="SELECT order_id, amount FROM orders",
     limit=100,
-    max_days_back=7,   # default; clamp [1, 90]
+    engine=engine.DUCKDB,
+    role_name=role_name,
+    out=query_info,
 )
-# newest first, list[dict], read-only, never raises
 ```
 
-Drain orchestration — flush yesterday's partitions into internal
-sink tables (your service owns the loop; the SDK only provides
-primitives):
+`query_sql` returns names, lists of row values, and dictionaries containing `name`, `type`, and `nullable`. It attempts to turn NaN into null and can populate `query_id` and `query_hash` in `out`. This is not a guarantee that every value is directly serializable by the standard JSON encoder; datetime and other typed values can remain.
+
+For SELECT queries the helper appends a default limit unless its trailing-limit pattern already matches. An explicit existing limit is not capped by `limit`. Prefer SQL without a trailing semicolon when allowing the helper to append a limit. See [reader helper behavior](10_data_reader.md).
+
+## Inspect metadata and snapshots
 
 ```python
-from supertable.monitoring import (
-    list_drainable_partitions, drain_partition,
-    MONITORING_SINK_TABLE_FOR,
-)
-from supertable.data_writer import DataWriter
+from supertable import MetaReader, SimpleTable, list_tables
 
-for part in list_drainable_partitions(catalog, organization="acme"):
-    rows = drain_partition(
-        catalog,
-        organization=part.organization,
-        monitor_type=part.monitor_type,
-        date=part.date,
-    )
-    if not rows:
-        continue
-    sink_table = MONITORING_SINK_TABLE_FOR.get(part.monitor_type)
-    if sink_table is None:
-        continue
-    DataWriter(internal_super, part.organization).write(
-        role_name="system", simple_name=sink_table,
-        data=to_arrow(rows), overwrite_columns=[],
-    )
+meta = MetaReader(super_name=super_name, organization=organization)
+visible_tables = meta.get_tables(role_name=role_name)
+schema = meta.get_table_schema(table_name="orders", role_name=role_name)
+table_stats = meta.get_table_stats(table_name="orders", role_name=role_name)
+summary = meta.get_super_meta(role_name=role_name)
+
+same_tables = list_tables(
+    organization=organization,
+    super_name=super_name,
+    role_name=role_name,
+)
+table = SimpleTable(super_table, "orders", create_if_missing=False)
+snapshot, snapshot_path = table.get_simple_table_snapshot()
 ```
 
-For huge partitions, swap `drain_partition` for `iter_partition_chunks`
-to stream in memory-bounded slices. See chap. 14 for atomicity and
-crash-recovery semantics.
+`MetaReader` requires an existing SuperTable. Metadata methods require `META` access. Table listing filters out tables without a matching grant; aggregate schema/statistics and `get_super_meta` require a `"*"` table grant. Metadata methods do not apply READ row/column filters. `get_table_schema` returns a one-element list containing a name-to-type mapping. Passing the SuperTable name in place of `table_name` requests the aggregate schema or statistics. `get_table_stats` returns snapshot information with `previous_snapshot`, `schema`, and `location` removed.
 
-### Staging / SuperPipe
+`get_super_meta` returns a `{"super": ...}` wrapper with totals and per-table summaries. Its row totals subtract tombstones, and its byte totals sum the current resource list's physical file sizes, including bytes occupied by tombstoned rows until compaction. Neither measures actual query I/O. The summary cache checks the root version and its configured TTL.
+
+`get_simple_table_snapshot` is a low-level storage/catalog method without a role argument. It returns the embedded leaf payload when usable and otherwise reads the snapshot JSON. A historical chain can be traversed by reading each `previous_snapshot` path through `super_table.read_simple_table_snapshot(path)`. The high-level reader has no snapshot-version/as-of parameter.
+
+Sources: [metadata API](../supertable/meta_reader.py), [snapshot API](../supertable/simple_table.py).
+
+## Manage roles and users
 
 ```python
-from supertable.staging_area import Staging
-from supertable.super_pipe import SuperPipe
+from supertable import RoleManager, UserManager
 
-stage = Staging(organization="my-org", super_name="example", staging_name="stage_demo")
-stage.save_as_parquet(role_name="superadmin", arrow_table=arrow_table, base_file_name="batch_1")
+roles = RoleManager(
+    super_name=super_name,
+    organization=organization,
+    actor_role_name="superadmin",
+)
+role_id = roles.create_role({
+    "role_name": "order_reader",
+    "role": "reader",
+    "tables": {
+        "orders": {"columns": ["order_id", "amount"], "filters": ["*"]}
+    },
+})
+users = UserManager(
+    super_name=super_name,
+    organization=organization,
+    actor_role_name="superadmin",
+)
+user_id = users.create_user({"username": "analyst", "roles": [role_id]})
+```
 
-pipe = SuperPipe(organization="my-org", super_name="example", staging_name="stage_demo")
-pipe.create(
-    role_name="superadmin",
-    pipe_name="pipe_01",
-    simple_name="facts",
-    user_hash=user_hash,
-    overwrite_columns=["day"],
+Manager mutations require `actor_role_name` with the `RBAC` permission. User role assignments contain role IDs, while read/write calls accept a role name. The SDK does not authenticate a caller merely because it was given a user ID or `role_name`; an application must select the authorized role. See [RBAC](11_rbac.md) for permissions, filters, tokens, and the boundaries of low-level access.
+
+## Stage input
+
+```python
+from supertable import Staging
+
+stage = Staging(
+    organization=organization,
+    super_name=super_name,
+    staging_name="incoming",
+)
+filename = stage.save_as_parquet(
+    role_name=role_name,
+    arrow_table=pa.table({"order_id": [3], "amount": [9.0]}),
+    base_file_name="orders.parquet",
 )
 ```
 
-## Demos
+This writes a staged file and updates its index. It does not publish table data. `SuperPipe` manages Redis pipe definitions; this package contains no worker that consumes those definitions and ingests the files. See [ingestion and result jobs](07_ingestion.md).
 
-The package ships two runnable demos under `supertable.demo`:
+## Quality rules
 
-- `supertable.demo.quickstart` — numbered API tutorial. Run via the
-  `supertable-demo-quickstart` console script or `python -m
-  supertable.demo.quickstart`.
-- `supertable.demo.webshop` — synthetic webshop dataset generator + loader.
-  Console scripts: `supertable-demo-webshop-generate`,
-  `supertable-demo-webshop-load`, `supertable-demo-webshop-topup`.
+```python
+from supertable import RedisCatalog
+from supertable.quality.config import DQConfig
 
-Each individual quickstart step can also be invoked directly, e.g.
-`python -m supertable.demo.quickstart.s03_08_read_snapshot_history`.
+quality = DQConfig(
+    RedisCatalog().r,
+    organization,
+    super_name,
+    actor_role_name="superadmin",
+)
+rule = quality.create_rule({
+    "table_name": "orders",
+    "rule_type": "column_min",
+    "column_name": "amount",
+    "threshold": 0,
+})
+```
 
-### Quickstart index
+Creating, updating, or deleting rules requires `WRITE` authority on the target table and records the acting role for later execution. Rule creation stores metadata; it does not immediately run the query. The scheduler must be explicitly started and configured as described in [monitoring and quality](14_monitoring.md).
 
-| Module | Description |
-|--------|-------------|
-| `controller` | Run all quickstart steps in order (used by `python -m supertable.demo.quickstart`) |
-| `s01_01_01_create_super_table` | Create a SuperTable |
-| `s01_01_02_enable_mirroring_formats` | Enable Delta / Iceberg mirroring |
-| `s01_02_create_roles` | Create RBAC roles |
-| `s01_03_create_users` | Create users + default superuser |
-| `s02_01_write_dummy_data` | Write 7 fixtures into the same SimpleTable |
-| `s02_02_write_single_data` | Single write with `lineage` dict |
-| `s02_03_01_write_staging` | Save Arrow table into a staging area |
-| `s02_03_02_create_pipe` | Configure an automated ingestion pipe |
-| `s02_04_01_write_monitoring_simple` | Single metric via MonitoringWriter |
-| `s02_04_02_write_monitoring_parallel` | Parallel metric writes |
-| `s02_05_write_tombstone` | Soft-delete via `delete_only=True` |
-| `s03_01_read_data_error` | Read returning an error response |
-| `s03_02_01_read_super_data_ok` | Read with `engine.AUTO` and `engine.SPARK_SQL` |
-| `s03_02_02_read_table_data_ok` | Aggregation query against `facts` |
-| `s03_03_read_meta` | Schema and stats via `MetaReader` |
-| `s03_04_read_staging` | List files in a staging area |
-| `s03_06_01_read_roles` | Inspect roles via `RoleManager` |
-| `s03_06_02_read_user` | Inspect users via `UserManager` |
-| `s03_07_01_estimate_read` | Pre-flight bytes estimate |
-| `s03_07_02_estimate_files` | Pre-flight file breakdown |
-| `s03_08_read_snapshot_history` | Walk the snapshot linked list |
-| `s04_01_03_delete_pipe` | Delete an ingestion pipe |
-| `s05_01_delete_table` | Drop a SimpleTable (destructive) |
-| `s05_02_delete_super_table` | Drop a SuperTable (destructive) |
+The checker builds SQL for `column_min`, `column_max`, `null_rate_max`, `row_count_min`, `distinct_in`, and `custom_sql`. Numeric threshold rules count violations or compare an aggregate with the threshold. `custom_sql` evaluates the first value of the first returned row against an optional maximum threshold. Unknown rule types produce no generated SQL. A successful metadata write does not validate that a rule's SQL will execute successfully.
 
-`supertable.demo.quickstart.defaults` centralises the constants used by
-every script (`organization`, `super_name`, `simple_name`, `role_name`,
-`staging_name`, `overwrite_columns`).
+Sources: [quality configuration](../supertable/quality/config.py), [rule SQL and evaluation](../supertable/quality/checker.py).
 
-## Project Metadata
+## Export, compact, and delete
 
-| Field | Value |
-|-------|-------|
-| Package name | `supertable` |
-| Python | `>=3.10` |
-| License | Super Table Public Use License (STPUL) v1.0 |
-| Homepage | https://github.com/kladnasoft/supertable |
+| Call | Behavior |
+| --- | --- |
+| `writer.configure_table(role_name, "orders", ...)` | Set positive per-table compaction limits. |
+| `writer.compact(role_name, "orders", small_only=True)` | Drain nonempty tombstones and rewrite selected resources under the table lock. |
+| `table.export_to(target_dir, compression_level=3, small_only=False)` | Write compacted Parquet to a target directory and return `files`, `files_written`, `total_rows`, `total_bytes`. |
+| `table.delete(role_name)` | Require `WRITE`, remove the table storage tree, then its catalog metadata. |
+| `super_table.delete(role_name)` | Require `CONTROL` for `*`, remove the SuperTable storage tree, then its catalog metadata. |
 
-## Source Files
+Export does not publish a table snapshot, and its method has no authorization parameter. It loads tombstones when available and passes dead IDs to compaction, but uses permissive artifact reads; it is not a strict verification/export transaction. Deletion removes storage before catalog metadata, so failures can leave a partially completed operation.
 
-- `pyproject.toml` — package metadata and extras.
-- `supertable/super_table.py` — `SuperTable` class (`create_if_missing` kwarg).
-- `supertable/simple_table.py` — `SimpleTable` class (`create_if_missing` kwarg).
-- `supertable/data_writer.py` — `DataWriter` class + monitoring-sink loop guard + GC enqueue post-CAS.
-- `supertable/data_reader.py` — `DataReader` class with `_assert_targets_exist` pre-flight, `query_sql()` helper.
-- `supertable/meta_reader.py` — `MetaReader`, `list_supers`, `list_tables` (read-only by contract).
-- `supertable/errors.py` — `SupertableLookupError`, `SuperTableNotFoundError`, `TableNotFoundError`.
-- `supertable/redis_catalog.py` — `RedisCatalog` class.
-- `supertable/staging_area.py` — `Staging` class.
-- `supertable/super_pipe.py` — `SuperPipe` class.
-- `supertable/rbac/` — `RoleManager`, `UserManager`, filter / permission utilities.
-- `supertable/monitoring/partitions.py` — drain orchestration primitives (`list_drainable_partitions`, `drain_partition`, `iter_partition_chunks`, `read_recent`), `MonitorPartition` NamedTuple, `MONITORING_SINK_TABLES` / `MONITORING_SINK_TABLE_FOR` constants.
-- `supertable/monitoring_writer.py` — `MonitoringWriter` (daily-partitioned RPUSH), `get_monitoring_logger` singleton factory, `NullMonitoringLogger` fallback.
-- `supertable/demo/quickstart/` — numbered API tutorial steps.
-- `supertable/demo/webshop/` — synthetic webshop dataset demo.
+## Import reference
+
+The package root exports `SuperTable`, `SimpleTable`, `DataWriter`, `DataReader`, `engine`, `MetaReader`, `list_supers`, `list_tables`, `Staging`, `SuperPipe`, `RedisCatalog`, `RoleManager`, `UserManager`, and the lookup/lock-loss errors. `Status` and `query_sql` must be imported from `supertable.data_reader`.
+
+The root lazily resolves `query_odata_sql_stream` and `query_sql_policy_fingerprint` through `supertable.odata`. These helpers prepare query streams and policy metadata; they do not create an HTTP server. Their requirements and engine limitations are described in [data reader](10_data_reader.md).

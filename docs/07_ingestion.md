@@ -1,327 +1,144 @@
-# Ingestion
+# Ingestion, staging, and result streaming
 
-## Business Context
+The ingestion building blocks are direct table writes, Parquet staging, and Redis pipe definitions. The current package does not include a worker that executes pipe definitions or automatically transfers staged files into tables. The `streaming` package runs SQL queries and stores their results in Arrow chunks.
 
-SuperTable's ingestion subsystem provides a structured, auditable workflow for loading data into the platform. Rather than writing directly to tables, users upload files into **staging areas** -- temporary holding zones where data can be previewed, validated, and reviewed before committing to permanent storage. For automated, repeatable data flows, **pipes** define transformation and routing rules that map staged files to target tables.
+Implementation: [staging_area.py](../supertable/staging_area.py), [super_pipe.py](../supertable/super_pipe.py), [streaming/jobs.py](../supertable/streaming/jobs.py), and [streaming/runner.py](../supertable/streaming/runner.py).
 
-This two-tier design (staging + pipes) separates the concerns of data arrival from data commitment, giving teams control over quality gates, schema validation, and approval workflows before data enters the production data lake.
+## 1. Write directly to a table
 
----
-
-## Module Locations
-
-| Module | Purpose |
-|---|---|
-| `supertable/staging_area.py` | `Staging` class -- physical stage lifecycle (create, upload, list, delete) |
-| `supertable/super_pipe.py` | `SuperPipe` class -- pipe definition management (CRUD in Redis) |
-
----
-
-## Staging Areas
-
-A staging area is a named, temporary folder within a SuperTable's storage namespace where files are uploaded before being committed to a target SimpleTable.
-
-### Physical Layout
-
-```
-{organization}/{super_name}/staging/{staging_name}/          # uploaded files
-{organization}/{super_name}/staging/{staging_name}_files.json # flat file index
-```
-
-### Redis Metadata
-
-```
-supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:meta   # per-stage metadata (STRING)
-supertable:{org}:lakes:{sup}:meta:staging:index                     # index set of all staging names (SET)
-```
-
-Built by `redis_keys.staging_doc(org, sup, staging_name)` and
-`redis_keys.staging_index(org, sup)`.
-
-### Staging Class
+Use `DataWriter.write(role_name, simple_name, data, overwrite_columns, compression_level=1, newer_than=None, delete_only=False, lineage=None)` to publish data immediately. Staging is optional. Writes return `(column_count, row_count, inserted, deleted)`; overwrite keys and deletion behavior are described in [writing data](06_data_writer.md).
 
 ```python
-class Staging:
-    def __init__(
-        self,
-        *,
-        organization: str,
-        super_name: Optional[str] = None,
-        super_table: Any = None,       # backward-compat alternative to super_name
-        staging_name: Optional[str] = None,
-    )
+import pyarrow as pa
+from supertable import DataWriter, SuperTable
+
+lake = SuperTable(super_name="warehouse", organization="acme")
+writer = DataWriter(super_name="warehouse", organization="acme")
+writer.write(
+    role_name="superadmin",
+    simple_name="orders",
+    data=pa.table({"order_id": [1, 2], "amount": [12.5, 30.0]}),
+    overwrite_columns=["order_id"],
+)
 ```
 
-The `Staging` class supports two modes of operation:
+Use an existing role with write access to the target table. The examples use the built-in `superadmin` role for a locally administered lake.
 
-**Manager mode** (when `staging_name` is not provided):
-- Used for inspecting the staging area structure and listing all stages.
-- Call `.open(staging_name)` to get a stage-mode instance.
-- Call `.get_directory_structure(role_name)` to retrieve a full inventory of all stages with file counts and Redis metadata.
-
-**Stage mode** (when `staging_name` is provided):
-- Used for file operations within a specific stage.
-- On construction, the stage directory is created (if it does not exist), the stage is registered in Redis, and the file index JSON is initialized.
-
-### Staging Lifecycle
-
-```
-create --> upload files --> review --> commit to table / discard
-```
-
-#### 1. Create
-
-Instantiating `Staging(organization=..., super_name=..., staging_name="my_stage")` triggers `_init_stage()` under a Redis lock:
+## 2. Create or open staging
 
 ```python
-def _init_stage(self) -> None:
-    # 1. Create physical folder
-    if not self.storage.exists(self.stage_dir):
-        self.storage.makedirs(self.stage_dir)
+from supertable import Staging
 
-    # 2. Register in Redis
-    self.catalog.upsert_staging_meta(org, sup, staging_name,
-        meta={"path": self.stage_dir, "created_at_ms": int(time.time() * 1000)})
-
-    # 3. Initialize file index
-    if not self.storage.exists(self.files_index_path):
-        self.storage.write_json(self.files_index_path, [])
+stages = Staging(organization="acme", super_name="warehouse")
+stage = stages.open("incoming_orders")
+filename = stage.save_as_parquet(
+    role_name="superadmin",
+    arrow_table=pa.table({"order_id": [3], "amount": [8.0]}),
+    base_file_name="orders.parquet",
+)
+print(stage.list_files(role_name="superadmin"))
+print(stages.get_directory_structure(role_name="superadmin"))
 ```
 
-#### 2. Upload Files
+The constructor is keyword-only:
+
+```text
+Staging(*, organization, super_name=None, super_table=None, staging_name=None)
+```
+
+Provide a name or a `SuperTable` object. The root must already exist in Redis. Omitting `staging_name` creates a manager; call `open(name)` before saving, listing, or deleting files. Opening a named stage initializes its directory, Redis metadata, and index if absent.
+
+The storage layout is relative to the configured storage backend:
+
+```text
+acme/warehouse/staging/
+  incoming_orders/
+    orders_<time_ns>.parquet
+  incoming_orders_files.json
+```
+
+`save_as_parquet` returns a filename, not a full path. It accepts `source="upload"`, `duration_ms=0`, `pipe_name=""`, and `pipe_id=""`. The JSON index records filename, nanosecond write time, row count, source, rounded duration, pipe metadata, and `status="ok"`. It is the source for `list_files`; that method does not scan storage for unindexed files.
+
+Saving and deleting require write access on `table_name="*"`; listing files and directory structure require metadata access on `"*"`. Stage initialization itself has no role parameter. Initialization, saving, and deletion use a Redis `SET NX EX` lock with a 30-second lease and token-checked release. A busy stage raises `RuntimeError`; this lock has no lease renewal. Writing a file and rewriting its JSON index are separate storage operations.
+
+`stage.delete(role_name=...)` deletes the stage directory, its index, and staging metadata, including pipe subkeys. It does not delete destination tables.
+
+## 3. Store a pipe definition
 
 ```python
-def save_as_parquet(
-    self,
-    *,
-    role_name: str,
-    arrow_table: pa.Table,
-    base_file_name: str,
-    source: str = "upload",
-    duration_ms: float = 0,
-    pipe_name: str = "",
-    pipe_id: str = "",
-) -> str
+from supertable import SuperPipe
+
+pipes = SuperPipe(
+    organization="acme",
+    super_name="warehouse",
+    staging_name="incoming_orders",
+)
+reference = pipes.create(
+    role_name="superadmin",
+    pipe_name="load_orders",
+    simple_name="orders",
+    user_hash="loader_identity",
+    overwrite_columns=["order_id"],
+    enabled=True,
+)
+print(reference)
+print(pipes.read("load_orders", role_name="superadmin"))
+pipes.set_enabled("load_orders", False, role_name="superadmin")
 ```
 
-Writes a PyArrow table as a Parquet file into the stage directory. The file is named with a nanosecond timestamp suffix to avoid collisions: `{clean_name}_{timestamp_ns}.parquet`. After writing, the file index JSON is updated with metadata:
+Construction requires the stage's Redis metadata to exist. `create` stores `staging_name`, `pipe_name`, `user_hash`, `simple_name`, `overwrite_columns`, `transformation=[]`, `updated_at_ns`, and `enabled`. It returns `redis://<organization>/<super_name>/<staging_name>/<pipe_name>` as an identifier.
 
-```json
-{
-  "file": "orders_1713192000000000000.parquet",
-  "written_at_ns": 1713192000000000000,
-  "rows": 50000,
-  "source": "upload",
-  "duration_ms": 1234,
-  "pipe_name": null,
-  "pipe_id": null,
-  "status": "ok"
-}
-```
+Creation checks write access for both the new destination and any destination already associated with that pipe name. Changing `enabled` and deleting check write access for the stored destination; reading checks metadata access. Missing destination metadata falls back to `"*"`. Pipe mutations share the stage lock key with staging, using a 10-second lease without renewal.
 
-All operations are protected by a Redis lock on the stage (30-second TTL).
+`create` rejects another pipe with the same destination and an equal overwrite-column configuration. The comparison uses the supplied value before storing `None` as `[]`, so omitted and empty overwrite lists are not handled consistently by this duplicate check. Creating the same pipe name updates its definition. `delete(pipe_name, role_name)` returns a boolean; `read` and `set_enabled` raise `FileNotFoundError` for a missing pipe.
 
-#### 3. Review
+These methods manage definitions only. `enabled=True` does not start execution; no transformation execution, file acknowledgement, retry queue, or staged-file ingestion worker is implemented in this package.
+
+## 4. Stream SQL results through stored jobs
+
+The job runner executes `DataReader.stream` using the recorded role and writes Arrow IPC streams to storage. It is useful when consuming query results in batches across a process boundary.
 
 ```python
-def list_files(self, role_name: str) -> List[str]
+from supertable.streaming.jobs import JobStore
+from supertable.streaming.runner import iter_job_batches, submit_and_run
+
+store = JobStore()
+job = submit_and_run(
+    organization="acme",
+    super_name="warehouse",
+    sql="SELECT order_id, amount FROM warehouse.orders",
+    role_name="superadmin",
+    deadline_sec=300,
+    store=store,
+)
+for batch in iter_job_batches("acme", job.job_id, store=store, timeout=300):
+    print(batch.to_pydict())
+
+finished = store.get("acme", job.job_id)
+print(finished.state if finished else "metadata expired")
 ```
 
-Returns a list of file names from the file index. Requires meta-read access (RBAC).
+`submit_and_run(..., background=True, deadline_sec=None, batch_rows=0, fullscan=False, store=None)` creates Redis metadata and starts a daemon thread. With `background=False`, execution completes before returning. `JobStore.create` creates metadata without starting execution; `run_job(rec, store=None, storage=None, poll_every_batches=4, on_chunk=None)` runs a record explicitly. There is no distributed work queue or automatic ownership takeover.
 
-The manager-mode method `get_directory_structure(role_name)` provides a comprehensive view across all stages:
+Job states are `pending`, `running`, `done`, `failed`, `cancelled`, and `expired`. Metadata includes the SQL, role, owner, deadline, accumulated row/chunk/byte counts, acknowledgement count, and serialized Arrow schema encoded as hex in `schema_json`. Chunk references contain `index`, `path`, `rows`, and `bytes`. Chunk paths are:
 
-```python
-{
-    "organization": "acme",
-    "super_name": "analytics",
-    "base_staging_dir": "acme/analytics/staging",
-    "base_exists": True,
-    "stages": [
-        {
-            "name": "q1_import",
-            "path": "acme/analytics/staging/q1_import",
-            "exists": True,
-            "files_index_path": "acme/analytics/staging/q1_import_files.json",
-            "files_index_exists": True,
-            "file_count": 3,
-            "files": ["orders_1713192000.parquet", ...],
-            "redis_meta": {"path": "...", "created_at_ms": 1713192000000}
-        }
-    ],
-    "stage_count": 1
-}
+```text
+<organization>/_query_jobs/<job_id>/chunk-000000.arrow
 ```
 
-#### 4. Commit
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `SUPERTABLE_STREAM_BATCH_ROWS` | `65536` | Default engine batch size when `batch_rows=0`. |
+| `SUPERTABLE_STREAM_CHUNK_BYTES` | `33554432` | Flush when accumulated Arrow batch memory reaches this target; one batch may overshoot. |
+| `SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS` | `0` | Producer waits for acknowledgements when nonzero; zero disables this limit. |
+| `SUPERTABLE_STREAM_MAX_SPILL_BYTES` | `0` | Stops production after the configured spill threshold is exceeded; zero disables the check. |
+| `SUPERTABLE_STREAM_DEADLINE_SEC` | `3600` | Default execution deadline; explicit `deadline_sec=0` removes it. |
+| `SUPERTABLE_STREAM_JOB_TTL_SEC` | `3600` | Redis record and chunk-index expiration, refreshed by updates. |
 
-Committing staged data to a target table is handled by the API layer. The staging area provides the files; the `DataWriter.write()` method handles the actual table write with full overlap detection, dedup, and catalog update.
+`iter_job_batches(organization, job_id, ..., follow=True, poll_interval=0.1, timeout=None, acknowledge=True)` reads from chunk zero, polls for new chunks, and acknowledges each fully consumed chunk. `follow=False` reads available chunks and returns when caught up. The timeout is measured from iterator start, not reset after each chunk, and is checked while waiting without available chunks. Transient Redis errors have a bounded retry helper.
 
-#### 5. Discard
+`store.cancel(organization, job_id)` sets a Redis cancellation flag. The runner checks deadlines while processing batches and also starts a one-second watcher that cancels the engine handle. Deadline and spill-limit cancellation set `expired`; explicit cancellation sets `cancelled`. Unflushed pending batches are discarded on cancellation. The iterator raises for `failed` after delivering published chunks, but returns normally for `cancelled` and `expired`; inspect the final job record to distinguish these outcomes.
 
-```python
-def delete(self, role_name: str) -> None
-```
+The spill cap is checked after threshold-triggered flushes, not after the final remainder flush, and is not a strict storage quota. Acknowledgements advance a count; they do not delete chunks. Redis expiration does not delete object-storage data. Use `store.delete(organization, job_id, storage=...)` while chunk references still exist to attempt both kinds of cleanup. `reap` removes orphaned Redis index entries, but cannot recover paths after the chunk index has expired.
 
-Deletes the entire stage: removes the physical directory (recursive), the file index JSON, and all Redis metadata. Runs under a Redis lock.
-
-### Locking
-
-All mutating stage operations (`_init_stage`, `save_as_parquet`, `delete`) are wrapped in `_with_lock()`:
-
-```python
-def _with_lock(self, fn):
-    lock_key = f"supertable:{org}:{sup}:lock:stage:{staging_name}"
-    token = uuid.uuid4().hex
-    acquired = self.catalog.r.set(lock_key, token, nx=True, ex=30)
-    # ... execute fn() ...
-    # Release via Lua compare-and-delete script
-```
-
-The lock uses a 30-second TTL with a Lua-script-based atomic release (compare token, then delete).
-
----
-
-## Pipes
-
-Pipes are named, persistent configurations that define how staged data should be routed to target SimpleTables. They are stored entirely in Redis (no filesystem artifacts).
-
-### SuperPipe Class
-
-```python
-class SuperPipe:
-    def __init__(
-        self,
-        *,
-        organization: str,
-        super_name: str,
-        staging_name: str,
-    )
-```
-
-On construction, `SuperPipe` validates that the referenced staging area exists in Redis. All pipe operations are protected by the same staging-level Redis lock used by `Staging._with_lock()` (10-second TTL for pipe operations).
-
-### Pipe Definition
-
-A pipe definition stored in Redis contains:
-
-```json
-{
-  "staging_name": "daily_import",
-  "pipe_name": "orders_pipe",
-  "user_hash": "abc123",
-  "simple_name": "orders",
-  "overwrite_columns": ["order_id"],
-  "transformation": [],
-  "updated_at_ns": 1713192000000000000,
-  "enabled": true
-}
-```
-
-### CRUD Operations
-
-#### Create
-
-```python
-def create(
-    self,
-    *,
-    role_name: str,
-    pipe_name: str,
-    simple_name: str,
-    user_hash: str,
-    overwrite_columns: List[str] = None,
-    enabled: bool = True,
-) -> str
-```
-
-Creates a new pipe definition. Before saving, it checks for semantic duplicates: if another pipe already targets the same `simple_name` with the same `overwrite_columns`, a `ValueError` is raised. Returns a URI string: `redis://{org}/{sup}/{staging}/{pipe_name}`.
-
-#### Read
-
-```python
-def read(self, pipe_name: str, role_name: str) -> Dict[str, Any]
-```
-
-Returns the full pipe metadata from Redis. Raises `FileNotFoundError` if the pipe does not exist.
-
-#### Enable/Disable
-
-```python
-def set_enabled(self, pipe_name: str, enabled: bool, role_name: str) -> None
-```
-
-Updates the `enabled` flag and `updated_at_ns` timestamp.
-
-#### Delete
-
-```python
-def delete(self, pipe_name: str, role_name: str) -> bool
-```
-
-Removes the pipe from Redis. Returns `True` if the pipe existed and was deleted.
-
-### Redis Keys for Pipes
-
-```
-supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:pipes:doc:{pipe_name}   # pipe definition (STRING)
-supertable:{org}:lakes:{sup}:meta:staging:doc:{staging_name}:pipes:index             # index set of pipe names (SET)
-```
-
----
-
-## File Formats
-
-SuperTable ingestion accepts data as PyArrow tables. `Staging.save_as_parquet()` writes files in Parquet format directly. Callers that start from another format (CSV, JSON, Excel) must convert to PyArrow before invoking the staging API.
-
-All staged files are written as Parquet with the storage backend's default settings. The final commit to a target table goes through `DataWriter`, which applies zstd compression, dictionary encoding, and optimized row-group sizing (122,880 rows).
-
----
-
-## Data Flow Summary
-
-```
-User/API                  Staging Area              Pipe Config           DataWriter
-   |                          |                         |                    |
-   |-- upload file ---------->|                         |                    |
-   |   (CSV/JSON/Parquet)     |                         |                    |
-   |                          |-- save_as_parquet() --->|                    |
-   |                          |   (Parquet in stage)    |                    |
-   |                          |                         |                    |
-   |-- review files --------->|                         |                    |
-   |   (list_files)           |                         |                    |
-   |                          |                         |                    |
-   |-- commit --------------->|-- read staged files --->|                    |
-   |   (with pipe config)     |                         |-- resolve target ->|
-   |                          |                         |   simple_name      |
-   |                          |                         |   overwrite_cols   |
-   |                          |                         |                    |
-   |                          |                         |                    |-- write()
-   |                          |                         |                    |   (full pipeline)
-   |                          |                         |                    |
-   |-- discard (optional) --->|                         |                    |
-   |   (delete stage)         |-- delete() ------------>|                    |
-```
-
----
-
-## RBAC Integration
-
-All staging and pipe operations enforce role-based access control:
-
-- **Write operations** (`save_as_parquet`, `delete`, `create pipe`, `delete pipe`, `set_enabled`): require `check_write_access()`.
-- **Read operations** (`list_files`, `get_directory_structure`, `read pipe`): require `check_meta_access()`.
-
-Both checks are scoped to a *table*, and what that table is differs:
-
-* **Staging** is lake-level -- a landing zone that may feed any number of
-  tables through pipes -- so it is checked against `"*"`, i.e. a lake-wide
-  grant is required.
-* **Pipes** are checked against the table the pipe feeds, read from the pipe's
-  own definition. `create` additionally requires the same on the pipe's
-  *current* target, because it is an upsert: without that, a role with WRITE
-  on one table could repoint or destroy a pipe feeding another.
-
-Both previously passed the *SuperTable's* name where a table name was
-expected, which only ever matched a role holding a table coincidentally named
-after the lake, and otherwise fell through to `"*"` anyway.
+The low-level job store and chunk iterator do not perform role checks themselves. Query execution delegates access control to `DataReader`; applications exposing job lookup, cancellation, deletion, or chunk access must restrict those operations to the appropriate users. The module's `shutdown(timeout=5.0)` cancels tracked local jobs and is registered with `atexit`.

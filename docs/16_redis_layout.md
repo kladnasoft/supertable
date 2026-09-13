@@ -1,270 +1,193 @@
-# 16  Redis Key Layout (v2)
+# Redis key layout
 
-This page is the canonical reference for **every** Redis key produced by
-SuperTable + the platform layer (dataisland-core). v2 is the current
-on-disk shape (SDK ≥ 2.1.0). There is no v1 ↔ v2 migration; v1 data is
-inaccessible from v2 code.
+[redis_keys.py](../supertable/redis_keys.py) builds the key names used by the Python package. Prefixes are constants: `supertable` for table/runtime state and `dataisland` for service/application registry keys. `SUPERTABLE_PREFIX` configures object-storage keys and does not change Redis key names.
 
-## 16.1  Rule
+This reference gives exact builder output. A builder defines a name; it does not, by itself, create the key or enforce a Redis data type. Types below are identified from the catalog and subsystem operations that write them.
 
-> **Every Redis key in the platform is constructed inside
-> `supertable/redis_keys.py`.**
->
-> Two recognised root prefixes:
->
-> * `supertable:` — SuperTable SDK state (catalog, RBAC, locks, audit,
->   share federation, table meta, lakes / supertables).
-> * `dataisland:` — platform / dataisland-core state that is not the
->   SDK's concern (service registry, app bootstrap).
->
-> Per-app config keys (`lighthouse:*`, `gatekeeper:*`, `studio:*`, …)
-> live under their own app-name prefix and are written via the MCP
-> server's `store_app_config` tool — they do **not** go through
-> `redis_keys.py`.
->
-> The regression test `tests/test_redis_key_prefix.py` enforces this:
-> no other source file in the codebase may contain a literal
-> `f"supertable:..."`, `f"dataisland:..."`, `f"monitor:..."`,
-> `f"spark:..."`, `f"audit:..."`, `f"shares:..."`, `f"lakes:..."`,
-> `f"_apps_:..."`, or `f"registry:..."` Redis key.
+## Scope notation
 
-## 16.2  Hierarchy
+The tables below use these abbreviations:
 
-```
-dataisland:                                    ── platform / dataisland-core
-  _apps_:                                      ── app-bootstrap sentinel (no org)
-    doc:{app_name}:
-      master_mcp                               STRING  per-app master MCP coords
-  {org}:                                       ── organization scope
-    registry:
-      {service_type}:{host}:{pid}              STRING  service heartbeat (TTL 30s)
+| Symbol | Expansion |
+| --- | --- |
+| `S` | `supertable:<org>:system` |
+| `L` | `supertable:<org>:lakes:<sup>` |
+| `Q` | `supertable:<org>:query` |
+| `M` | `supertable:<org>:monitor` |
 
-supertable:                                    ── SuperTable SDK state
-  {org}:                                       ── organization scope
-    system:                                    ── org-level system namespace
-      auth:tokens                              HASH    org login tokens
-      audit:
-        stream                                 STREAM  audit events
-        chain_head:doc:{instance_id}           HASH    per-instance chain state
-        config                                 HASH    runtime audit toggle
-      shares:
-        doc:{share_id}                         STRING  share definition
-        index                                  SET     share IDs
-      engine:
-        thrifts                                HASH    Spark Thrift clusters
-        plugs                                  HASH    Spark Plug runtimes
-        duckdb                                 STRING  DuckDB runtime config
-    lakes:                                     ── user-data sentinel
-      {sup}:                                   ── supertable scope (user-named)
-        meta:
-          root                                 STRING  root pointer
-          mirrors                              STRING  enabled mirror formats
-          table_names                          SET     all simple table names
-          leaf:
-            doc:{simple}                       STRING  leaf snapshot pointer
-          table_config:
-            doc:{simple}                       STRING  per-table config
-          staging:
-            index                              SET     staging names
-            doc:{staging_name}:                ── per-staging scope
-              meta                             STRING  staging metadata blob
-              pipes:
-                index                          SET     pipe names
-                doc:{pipe_name}                STRING  pipe definition
-        lock:
-          leaf:
-            doc:{simple}                       STRING  per-table lock token
-          stage:
-            doc:{stage_name}                   STRING  per-staging lock token
-        rbac:
-          users:
-            meta                               HASH    version, last_updated_ms
-            index                              SET     all user_ids
-            name_to_id                         HASH    username → user_id
-            doc:{user_id}                      HASH    user document
-          roles:
-            meta                               HASH    version, last_updated_ms
-            index                              SET     all role_ids
-            name_to_id                         HASH    role_name → role_id
-            doc:{role_id}                      HASH    role document
-            type:
-              doc:{role_type}                  SET     role IDs by type
-        schema:
-          doc:{simple}                         STRING  table schema JSON
-        linked_shares:
-          index                                SET     linked share IDs
-          doc:{link_id}                        STRING  consumer-side linked share
-    monitor:                                   ── org-wide telemetry (position 2)
-      {monitor_type}:                          ── plans|writes|mcp|odata|errors|locks
-        doc:{YYYY-MM-DD}                       LIST    daily-partitioned metrics
-        doc:{YYYY-MM-DD}:_drain                LIST    in-progress drain handle
-                                                       Each entry's payload carries
-                                                       ``supertables: [str]`` for
-                                                       per-sup attribution under
-                                                       cross-supertable queries.
+Angle-bracket names represent validated caller-supplied segments, except date and registry-host fields, which have their own validators. Actual examples are `supertable:acme:lakes:sales:meta:root` and `supertable:acme:query:job:doc:abc123`.
+
+## Name validation
+
+Most user-supplied segments must match:
+
+```text
+^(__[a-z0-9][a-z0-9_-]{0,59}__|[a-z0-9][a-z0-9_-]{0,63})$
 ```
 
-### Why `monitor:` lives at position 2, not under `system:`
+Ordinary names start with a lowercase letter or digit and contain lowercase letters, digits, underscores, or hyphens, up to 64 characters. The separate double-underscore form permits internal names such as `__global__`. `_safe()` does not lowercase or trim names. Uppercase letters, spaces, colons, wildcard characters, empty strings, and nonstrings are rejected.
 
-Monitoring is **org-wide runtime telemetry** — high-volume, append-only,
-event-stream-y. Audit / shares / spark / auth are **org-wide system
-state** — low-volume identity / federation / compliance. Different
-shape, different lifecycle. Putting them under different position-2
-labels makes the distinction explicit.
+The sentinel pattern `^_[a-z0-9][a-z0-9_-]*_$` is reserved. `is_reserved_org_name()` also treats `apps` as reserved; `is_reserved_super_name()` recognizes sentinel names. These reservation helpers are distinct from `_safe()`: the generic segment validator alone does not reject the ordinary string `apps`.
 
-Cross-supertable queries are also why monitoring can't live under
-`lakes:{sup}:`: a single query touching `sales` and `customers` is
-one event, not two. The org-level shape lets us record it once and
-attribute it via the `supertables` payload field. Per-supertable
-views filter the org list at read time.
+`assert_prefixed()` checks only that a string begins with `supertable:` or `dataisland:`. It does not validate the remaining hierarchy. `parse_lake_key()` recognizes the lake prefix and returns `(org, sup)`; it is a parser, not full segment validation.
 
-### Daily partitions under `monitor:`
+## Lake metadata
 
-The writer pushes JSON payloads to a key suffixed with the current UTC
-date — `RPUSH supertable:{org}:monitor:{type}:doc:{YYYY-MM-DD} <json>`.
-Once midnight passes the writer rolls into the new day's key
-automatically; yesterday's partition is frozen and safe for an
-external orchestrator to drain. The `:_drain` handle is created by
-`drain_partition` / `iter_partition_chunks` via `RENAME` so the
-drain is atomic against any straggler write (chap. 14). This bounds
-Redis growth to roughly one day per (org, monitor_type) rather than
-the unbounded append behaviour of the legacy single-LIST shape.
+| Builder | Key | Redis type / contents |
+| --- | --- | --- |
+| `meta_root` | `L:meta:root` | JSON string: version, timestamp, optional root flags |
+| `meta_mirrors` | `L:meta:mirrors` | JSON string: `formats`, `ts` |
+| `meta_namespace_deletion_intent` | `L:meta:deletion-intent` | Builder-defined namespace marker; core table deletion does not currently set it |
+| `meta_table_names` | `L:meta:table_names` | Set of simple-table names, populated by writer acceleration updates |
+| `meta_leaf` | `L:meta:leaf:doc:<simple>` | JSON string: version, timestamp, snapshot path, optional inline payload |
+| `meta_rowid_seq` | `L:meta:rowid_seq:doc:<simple>` | Integer string incremented with `INCRBY` |
+| `meta_table_config` | `L:meta:table_config:doc:<simple>` | JSON string: per-table configuration and `modified_ms` |
+| `schema` | `L:schema:doc:<simple>` | JSON string: schema acceleration data |
 
-## 16.3  Design invariants
+Root and leaf versions are independent. Snapshot history is linked by `previous_snapshot` inside storage JSON documents; there is no Redis history-list key for table versions. See [catalog](05_redis_catalog.md).
 
-1. **Two root prefixes only.** `supertable:` (SDK state) and
-   `dataisland:` (platform state). Both are enforced by
-   `assert_prefixed()`.
-2. **Position 2 under `supertable:{org}:`** is *always* a literal
-   closed-set SDK literal (`system`, `lakes`, or `monitor`). User input never lives at
-   position 2 — it lives at position 3, behind a sentinel that names
-   it (`lakes:{sup}` for supertables).
-3. **Position 1 under `dataisland:`** is *always* an org name or the
-   `_apps_` sentinel. The `apps` org name is reserved
-   (`RESERVED_ORG_NAMES`) as defence in depth.
-4. **Where user input lives at the same level as a literal sibling,
-   the literal is wrapped in `:doc:` / `:index`** to disambiguate.
-   This is the pattern used by `shares:`, `linked_shares:`,
-   `staging:`, `pipes:`, `rbac:*:doc:`, etc.
-5. **Underscore-wrapped names (`^_..._$`)** are sentinels and are
-   never accepted as user-supplied identifiers (org, sup, simple,
-   staging_name, pipe_name, app_name, etc.).
-6. **Every constructor validates its segments via `_safe(label, value)`.**
-   Lowercase alphanumeric + `-` + `_`, leading char `[a-z0-9]`,
-   length 1–64. Sentinel pattern rejected.
-7. **Single source of truth.** The only file in the codebase that
-   may construct keys under `supertable:` or `dataisland:` is
-   `supertable/redis_keys.py`.
+## Locks
 
-## 16.4  Reservations
+| Builder | Key | Redis type / contents |
+| --- | --- | --- |
+| `lock_leaf` | `L:lock:leaf:doc:<simple>` | Expiring string: UUID-hex owner token |
+| `lock_stage` | `L:lock:stage:doc:<stage>` | Expiring string: UUID-hex owner token |
 
-### 16.4.1  Sentinel pattern (universal)
+`lock_leaf_prefix()` returns `L:lock:leaf:doc:`. Locks are leases, not version counters. Stage and pipe mutations share the stage key. See [locking](08_locking.md).
 
-```python
-SENTINEL_RE = re.compile(r"^_[a-z0-9][a-z0-9_-]*_$")
-```
+## Staging and pipes
 
-Anything matching this pattern is a sentinel and is rejected as a
-user-supplied identifier (org, super_name, simple table, staging
-name, pipe name, app name, role type, share/user/role/link/instance
-id).
+| Builder | Key | Redis type / contents |
+| --- | --- | --- |
+| `staging_index` | `L:meta:staging:index` | Set of stage names |
+| `staging_doc` | `L:meta:staging:doc:<stage>:meta` | JSON string: stage metadata |
+| `pipe_index` | `L:meta:staging:doc:<stage>:pipes:index` | Set of pipe names |
+| `pipe_doc` | `L:meta:staging:doc:<stage>:pipes:doc:<pipe>` | JSON string: pipe definition |
 
-### 16.4.2  Explicit reservations
+The stage's data-file index is a storage JSON file, `<org>/<sup>/staging/<stage>_files.json`, rather than a Redis list. See [ingestion](07_ingestion.md).
 
-```python
-RESERVED_ORG_NAMES   = frozenset({"apps"})            # plus sentinel pattern
-RESERVED_SUPER_NAMES = frozenset()                    # sentinel regex covers it
-```
+## RBAC
 
-- `apps` as an org name would land at `dataisland:apps:registry:*`
-  — same first three segments as `dataisland:_apps_:doc:*`. The
-  reservation is defence in depth.
-- Underscore-wrapped names (`_foo_`) are rejected as super_name by the sentinel pattern;
-  it stays in the explicit list for backward compat with
-  `SuperTable(super_name=...).` callers.
+| Builder | Key | Redis type / contents |
+| --- | --- | --- |
+| `rbac_user_meta` | `L:rbac:users:meta` | Hash: version, last-updated timestamp, initialization state |
+| `rbac_user_index` | `L:rbac:users:index` | Set of user IDs |
+| `rbac_username_to_id` | `L:rbac:users:name_to_id` | Hash: lowercase username → user ID |
+| `rbac_user_doc` | `L:rbac:users:doc:<user_id>` | Hash: user fields; list/dictionary fields are JSON strings |
+| `rbac_role_meta` | `L:rbac:roles:meta` | Hash: version, last-updated timestamp, initialization state |
+| `rbac_role_index` | `L:rbac:roles:index` | Set of role IDs |
+| `rbac_rolename_to_id` | `L:rbac:roles:name_to_id` | Hash: lowercase role name → role ID |
+| `rbac_role_doc` | `L:rbac:roles:doc:<role_id>` | Hash: role fields; structured fields are JSON strings |
+| `rbac_role_type_index` | `L:rbac:roles:type:doc:<role_type>` | Set of role IDs of that type |
 
-### 16.4.3  Segment-validation regex
+`rbac_user_doc_prefix()` and `rbac_role_type_index_prefix()` expose the respective prefixes for Lua operations. Human-readable usernames and role names are hash fields, not key segments, and have separate validators. See [RBAC](11_rbac.md).
 
-```python
-_SAFE_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-```
+## Organization system state
 
-Applied to: `org`, `sup`, `simple`, `staging_name`, `pipe_name`,
-`app_name`, `share_id`, `link_id`, `user_id`, `role_id`, `role_type`,
-`instance_id`.
+| Builder | Key | Redis type / contents |
+| --- | --- | --- |
+| `auth_tokens` | `S:auth:tokens` | Hash: SHA-256 token ID → JSON token metadata |
+| `audit_stream` | `S:audit:stream` | Redis stream of audit event field maps |
+| `audit_chain_head` | `S:audit:chain_head:doc:<instance_id>` | Hash: `head`, `batch_count`, `updated_ms` |
+| `audit_config` | `S:audit:config` | Hash: audit setting overrides |
+| `audit_legal_hold` | `S:audit:legal_hold` | String `1` or `0` |
+| `share_doc` | `S:shares:doc:<share_id>` | JSON string: supplied share metadata |
+| `share_index` | `S:shares:index` | Set of share IDs |
+| `engine_thrifts` | `S:engine:thrifts` | Hash: Spark cluster ID → JSON configuration |
+| `engine_plugs` | `S:engine:plugs` | Hash: Spark plug ID → JSON configuration |
+| `engine_duckdb` | `S:engine:duckdb` | JSON string: engine configuration sections and modification time |
 
-Closed-set inputs (`service_type`, `monitor_type`) are validated
-against their own enumerations, not via `_safe()`.
+Audit instance IDs are normalized by the audit writer before calling the key builder. Audit consumer groups are Redis stream metadata, not independent top-level keys. The internal archival group is named `__archival__`. See [audit](12_audit.md).
 
-The `monitor_partition` family additionally validates the `date`
-segment against `^\d{4}-\d{2}-\d{2}$` (`_DATE_RE`) — anything else is
-rejected at key-build time so a malformed value can't land in storage
-as a key the parser cannot recover.
+Login token expiry is a field in the stored metadata and is checked by the full token validator; creating a token does not attach a Redis expiry to its hash field.
 
-## 16.5  Audit toggle (runtime)
+## Linked shares
 
-Audit is **OFF by default** (`SUPERTABLE_AUDIT_ENABLED=false`). A
-per-organization runtime override is persisted in
-`supertable:{org}:system:audit:config` (HASH) with fields:
+| Builder | Key | Redis type / contents |
+| --- | --- | --- |
+| `linked_share_index` | `L:linked_shares:index` | Set of link IDs |
+| `linked_share_doc` | `L:linked_shares:doc:<link_id>` | JSON string: linked-share metadata |
 
-```
-enabled       "true" | "false"
-log_queries   "true" | "false"
-log_reads     "true" | "false"
-hash_chain    "true" | "false"
-siem_enabled  "true" | "false"
-updated_ms    str(int)
-updated_by    str
-```
+Organization share definitions and lake-local linked shares have different scopes and different indexes.
 
-Read/write via `supertable.audit.admin.{get,set}_audit_config`, which
-is exposed over HTTP at `GET / POST /api/v1/audit/config` and bound
-to the **Compliance** tab on `/ui/audit`. Toggles propagate within
-the in-process cache TTL (30 s); the API endpoint invalidates the
-cache for the affected org so the change is immediate on the
-responding instance.
+## Streaming query jobs
 
-Every config write itself emits a `CONFIG_CHANGE` audit event so
-that turning auditing OFF is recorded — DORA Art. 6 / SOC 2 CC8.1.
+| Builder | Key | Redis type / contents |
+| --- | --- | --- |
+| `query_job_doc` | `Q:job:doc:<job_id>` | Hash: job record |
+| `query_job_chunks` | `Q:job:chunks:<job_id>` | List: appended JSON chunk references |
+| `query_job_cancel` | `Q:job:cancel:<job_id>` | Expiring string `1` requesting cancellation |
+| `query_job_index` | `Q:jobs:index` | Set of job IDs |
 
-## 16.6  Adding a new key
+[JobStore](../supertable/streaming/jobs.py) applies `SUPERTABLE_STREAM_JOB_TTL_SEC` to job records, chunk lists, and cancellation markers. The default is 3,600 seconds. Updates refresh record expiry and chunk appends refresh list expiry. The index itself has no TTL, so expired job hashes can leave index members until explicit cleanup. Chunk contents live in storage; the Redis list contains references.
 
-1. Add a function to `supertable/redis_keys.py` that returns the key
-   string. Validate every user-supplied segment with `_safe(label, value)`.
-   Make sure the key starts with `supertable:` or `dataisland:`.
-2. Add a parametric entry to `tests/test_redis_key_prefix.py` so the
-   regression suite covers the new shape.
-3. Use the function from every call site (no inline f-strings).
-4. Re-run `pytest supertable/tests/test_redis_key_prefix.py` — it
-   must pass with the new helper enumerated.
-5. Update §16.2 of this page.
+## Quality state
 
-## 16.7  Out-of-policy namespaces in `dataisland-core` (Phase 2)
+`quality_prefix(org, sup)` returns `L:quality:`. `quality_doc()` joins one or more validated nonempty segments beneath that prefix. `quality_table_key()` generates `L:quality:<kind>:<table>`.
 
-A small set of per-supertable namespaces currently live outside
-`redis_keys.py` and are built via inline f-strings inside
-`dataisland-core/services/`:
+The current quality subsystem writes these shapes:
 
-| Namespace                                | Where it's built                                            | Purpose |
-|------------------------------------------|-------------------------------------------------------------|---------|
-| `supertable:{org}:{sup}:catalog:*`       | `services/common/domain/catalog.py`                          | Per-supertable catalog cache |
-| `supertable:{org}:{sup}:odata:*`         | `services/common/domain/security.py`                         | OData endpoint registry |
-| `supertable:odata:token:{token_hash}`    | `services/common/domain/security.py`                         | OData bearer-token reverse index |
-| `supertable:{org}:{sup}:dq:*`            | `services/common/domain/quality/config.py`                   | Data-quality config/runs |
-| `supertable:{org}:{sup}:runs:*`          | `services/common/domain/runs.py`                             | Job-run tracking |
-| `supertable:rate:{client_ip}:{minute}`   | `services/common/middleware/rate_limit.py`                   | Rate-limit buckets (root-level) |
-| `supertable:{org}:{sup}:meta:users:*`    | `services/common/server.py` (`_list_users_legacy`)           | v0 legacy fallback (read-only) |
-| `supertable:{org}:{sup}:meta:roles:*`    | `services/common/server.py` (`read_role` fallback)           | v0 legacy fallback (read-only) |
+| Key | Redis type / contents |
+| --- | --- |
+| `L:quality:config:__global__` | JSON string: global checks configuration |
+| `L:quality:config:<table>` | JSON string: table overrides |
+| `L:quality:rules:index` | Set of rule IDs |
+| `L:quality:rules:doc:<rule_id>` | JSON string: a rule definition |
+| `L:quality:schedule` | JSON string: global schedule |
+| `L:quality:schedule:<table>` | JSON string: table schedule |
+| `L:quality:latest:<table>` | JSON string: latest table result |
+| `L:quality:latest:<table>:<column>` | JSON string: latest column result |
+| `L:quality:anomalies:<table>` | JSON string: anomaly results |
+| `L:quality:history` | List: newest history rows pushed to the head |
+| `L:quality:pending:<table>` | Expiring timestamp string; pending work, default 600 seconds |
+| `L:quality:running:<table>` | Expiring owner-token string; active work, default 300 seconds |
+| `L:quality:cooldown:<table>` | Expiring timestamp string; cooldown, default 300 seconds |
 
-These do **not** collide with v2 SDK keys (they sit at position 2 =
-`{sup}` rather than under `lakes:`), so they continue to function.
-However, they remain inconsistent with v2 hierarchy discipline and
-the position-2 user-input pattern.
+These names come from [quality configuration](../supertable/quality/config.py), [history](../supertable/quality/history.py), and [scheduler](../supertable/quality/scheduler.py). Table and column segments passed through these builders must satisfy the key validator.
 
-**Phase 2 plan** (separate session): fold these namespaces into
-`redis_keys.py` (under `lakes:{sup}:catalog:*`, `lakes:{sup}:odata:*`,
-`lakes:{sup}:dq:*`, `lakes:{sup}:runs:*`), and add a `_globals_`
-sentinel under `dataisland:` for the rate-limit buckets and the
-OData token reverse index. The `meta:users:*` / `meta:roles:*`
-fallbacks are deletable — primary code paths read from
-`rbac:users:*` / `rbac:roles:*`.
+## Monitoring partitions
+
+| Builder | Key | Redis type / contents |
+| --- | --- | --- |
+| `monitor_partition` | `M:<type>:doc:<YYYY-MM-DD>` | List of JSON monitoring entries |
+| `monitor_partition_drain` | `M:<type>:doc:<YYYY-MM-DD>:_drain` | Temporary list used while draining a partition |
+
+Accepted types are `plans`, `writes`, `mcp`, `odata`, `errors`, `locks`, and `compact`. The date validator checks the shape `YYYY-MM-DD`; it does not validate calendar correctness. `parse_monitor_partition_key()` accepts the six-part primary partition key and rejects a drain key with its additional suffix. Partition processing and retention are described in [monitoring](14_monitoring.md).
+
+## Service and application registry builders
+
+| Builder | Key |
+| --- | --- |
+| `registry` | `dataisland:<org>:registry:<service_type>:<host>:<pid>` |
+| `app_master_mcp` | `dataisland:_apps_:doc:<app_name>:master_mcp` |
+
+Registry service types are `api`, `webui`, `odata`, `mcp`, `sdk`, and `lighthouse`. Host must be a nonempty string without a colon; it is not validated using the ordinary segment regex. PID must convert to a positive integer. `parse_registry_key()` extracts `(org, service_type, host, pid)` as strings from a matching prefix.
+
+These builders do not choose a Redis type, expiry, heartbeat interval, or payload. A service using them must supply those behaviors.
+
+## Scan patterns and deletion boundaries
+
+| Builder | Output |
+| --- | --- |
+| `system_scope_pattern(org)` | `supertable:<org>:system:*` |
+| `lakes_pattern(org)` | `supertable:<org>:lakes:*` |
+| `super_table_pattern(org, sup)` | `L:*` |
+| `meta_root_pattern_for_org(org)` | `supertable:<org>:lakes:*:meta:root` |
+| `meta_root_pattern_all_orgs()` | `supertable:*:lakes:*:meta:root` |
+| `meta_leaf_pattern(org, sup)` | `L:meta:leaf:doc:*` |
+| `lock_leaf_pattern(org, sup)` | `L:lock:leaf:doc:*` |
+| `staging_pattern(org, sup)` | `L:meta:staging:doc:*:meta` |
+| `staging_subkey_pattern(org, sup, stage)` | `L:meta:staging:doc:<stage>:*` |
+| `pipe_pattern(org, sup, stage)` | `L:meta:staging:doc:<stage>:pipes:doc:*` |
+| `query_job_pattern(org)` | `Q:job:*` |
+| `query_job_subkey_pattern(org, job)` | `Q:job:*:<job>` |
+| `quality_table_pattern(org, sup, kind)` | `L:quality:<kind>:*` |
+| `monitor_partition_pattern(org, type)` | `M:<type>:doc:*` |
+| `monitor_partition_pattern_for_org(org)` | `M:*:doc:*` |
+| `registry_pattern_for_org(org)` | `dataisland:<org>:registry:*` |
+| `registry_pattern()` | `dataisland:*:registry:*` |
+| `app_scope_pattern()` | `dataisland:_apps_:doc:*` |
+
+`system_scope()` and `lakes_scope()` return scope prefixes without a trailing wildcard. Query-job patterns cover job keys but not `Q:jobs:index`. Monitoring patterns can match drain keys; the parser is used to identify primary partitions.
+
+Deleting a lake namespace with `L:*` covers its metadata, locks, RBAC, staging/pipe metadata, linked shares, and quality state. It leaves organization system, query, monitor, service registry, and application keys. The catalog's simple-table delete is narrower: it deletes only the leaf and leaf lock. See [catalog deletion](05_redis_catalog.md) before relying on a cleanup operation to remove related indexes or configuration.

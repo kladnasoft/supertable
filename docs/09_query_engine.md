@@ -1,431 +1,130 @@
-# Query Engine
+# Query engine
 
-## Overview
+SuperTable reads the Parquet resources listed in current table snapshots. The read pipeline parses named SQL tables, checks access, estimates the selected files, creates engine views, and executes the rewritten SQL. The materialized public result is a Polars DataFrame; DuckDB can also return Arrow record batches.
 
-SuperTable's query engine is a multi-backend execution layer that automatically selects the optimal SQL engine based on data size, data freshness, and runtime availability. It supports three execution backends -- DuckDB Lite, DuckDB Pro, and Spark SQL -- unified behind a single `Executor` facade.
+Implementation: [executor](../supertable/engine/executor.py), [estimator](../supertable/engine/data_estimator.py), [SQL parser](../supertable/utils/sql_parser.py), [DuckDB](../supertable/engine/duckdb.py), and [Spark Thrift](../supertable/engine/spark_thrift.py). See [Data reader](10_data_reader.md) for the public API and [RBAC](11_rbac.md) for access rules.
 
-The engine layer lives in `supertable/engine/` and is invoked by `DataReader` after the query has been parsed, access control checked, and file lists resolved.
+## 1. Parse and resolve the query
 
-## Engine Selection
+`Engine` in `supertable.engine.engine_enum` has three values:
 
-### The `Engine` Enum
+| Member | Value | Parser dialect |
+| --- | --- | --- |
+| `Engine.AUTO` | `auto` | DuckDB |
+| `Engine.DUCKDB` | `duckdb` | DuckDB |
+| `Engine.SPARK_SQL` | `spark_sql` | Spark |
 
-Defined in `supertable/engine/engine_enum.py`, the `Engine` enum declares four members:
+The read gate first validates ordinary queries using the DuckDB SQL parser. It accepts one read statement, including SELECT queries with CTEs and set operations, and rejects writes and table functions such as direct `read_parquet(...)` calls. SQL must ultimately reference a named table: a table-free `SELECT 1` does not pass `SQLParser`.
 
-```python
-class Engine(Enum):
-    AUTO       = "auto"
-    DUCKDB_LITE = "duckdb_lite"
-    DUCKDB_PRO  = "duckdb_pro"
-    SPARK_SQL   = "spark_sql"
+An unqualified table name resolves inside the reader's `super_name`. `other_super.orders` resolves `orders` in `other_super`, using the same organization. CTE names are excluded from the physical table list. Repeated physical table references are merged for schema validation and resource estimation. Distinct aliases identify query views, so use explicit, distinct aliases for joins and nested references.
+
+The parser collects source columns from projections and expressions, including predicates and join conditions. A wildcard is represented internally by an empty column list. This requests the full source schema; it does not represent an empty projection.
+
+## 2. Read current snapshots and estimate resources
+
+`DataEstimator(organization, storage, tables, predicate_constraints=None, plan_stats=None, fullscan=False)` scans the Redis leaf entries for each selected SuperTable. It uses a leaf's embedded snapshot payload when that payload contains a resource list; otherwise it reads the referenced snapshot file from storage. Resource entries supply Parquet paths and file sizes, and snapshot schemas supply known column names and types.
+
+`estimate()` returns a `Reflection` containing:
+
+- Storage implementation name, estimated bytes, total file count, and latest selected leaf update time.
+- A `SuperSnapshot` for each selected table, including its version, files, and schema columns.
+- Separate dictionaries to which the reader attaches RBAC and deletion-vector definitions.
+
+Missing requested columns, no selected snapshots, or a selected table without Parquet files raise an execution error. An existing but resource-free table is therefore different from a populated table whose SQL predicate returns zero rows.
+
+The estimator has an aggregation branch when a simple name equals its SuperTable name: it selects all non-internal leaves. The public reader still performs its ordinary root/leaf existence checks first; do not assume that a bare SuperTable name automatically forms a queryable union in every catalog state.
+
+### Predicate pruning
+
+Pruning is enabled by default through `SUPERTABLE_READ_PRUNING_ENABLED=true`. `fullscan=True` bypasses this SuperTable file-pruning step; the SQL engine still evaluates the original query and can perform its own scan optimizations.
+
+The parser extracts direct column-to-literal comparisons (`=`, `<`, `<=`, `>`, `>=`), `BETWEEN`, and literal `IN` lists from conjunctions in SELECT `WHERE` clauses. An `IN` list becomes its minimum/maximum interval. Reversed comparisons are normalized. Numeric, boolean, string, and supported date/timestamp literals have separate comparison handling.
+
+Unsupported expressions are left to SQL execution. For example, OR branches, functions applied to columns, column-to-column comparisons, and JOIN predicates do not supply these file constraints. An unqualified predicate is resolved only when its scope has one unambiguous source.
+
+The pruner compares constraints with stored row-group statistics. It removes a file only when every table occurrence excludes all of that file's indexed row groups. A self-join or repeated CTE reference with an unrestricted occurrence prevents pruning for that physical table. Missing or unusable statistics retain the file. ASCII string ranges account for DuckDB's case-insensitive collation; non-ASCII values conservatively retain files. Timestamp comparisons widen bounds to account for session timezone uncertainty.
+
+If pruning would remove every file, the implementation retains a subset covering the available schema. The SQL engine evaluates the original predicate against that subset and produces the empty result while still binding schema-dependent expressions. Statistics extraction, range handling, and this schema-covering fallback are implemented in [processing.py](../supertable/processing.py).
+
+### Estimated bytes
+
+With `SUPERTABLE_READ_PROJECTION_SIZING_ENABLED=true`, an explicit column projection reduces the size estimate. The estimator first uses selected columns' recorded `compressed_bytes`; when those are unavailable it approximates a proportion from schema type widths. Without projection sizing it sums complete surviving file sizes.
+
+The estimate is a routing input, not measured peak memory or a billed byte count. It can differ from actual reads, particularly when system columns and columns needed only by row filters are added later.
+
+Plan statistics include `REFLECTIONS`, `REFLECTION_SIZE`, and `REFLECTION_SIZE_RAW`. When pruning is enabled, they also include `FILES_BEFORE_PRUNE`, `FILES_PRUNED`, `FILES_KEPT`, `PRUNE_DURATION_MS`, and available pruning counters.
+
+## 3. Select an engine
+
+AUTO examines active Spark cluster registrations for the organization:
+
+1. If none are active, it selects DuckDB.
+2. Otherwise it compares the estimate with the minimum `min_bytes` among active clusters.
+3. At or above that minimum it selects Spark; below it, DuckDB.
+
+Spark's subsequent cluster selection also enforces each cluster's `max_bytes` when positive and selects randomly among eligible active clusters. AUTO's first decision does not check the maximum ranges, so it can select Spark and then fail because no cluster accepts that job size. It does not automatically retry the query on DuckDB.
+
+Explicit `Engine.DUCKDB` bypasses routing. Explicit `Engine.SPARK_SQL` in the materialized executor requests a cluster with `force=True`, bypassing cluster byte ranges while still requiring an active cluster. The streaming executor does not pass that force flag.
+
+`engine_lite_max_bytes` and `engine_freshness_sec` are present in configuration but do not participate in `Executor._auto_pick()`. The current executor always uses the `lite` DuckDB configuration; it does not select a separate `pro` execution implementation.
+
+## 4. DuckDB execution
+
+DuckDB keeps a connection in thread-local state. Each query creates views over its selected Parquet files with `union_by_name=TRUE` and `HIVE_PARTITIONING=FALSE`.
+
+The view chain is:
+
+```mermaid
+flowchart LR
+    P[Selected Parquet resources] --> V[Reflection view]
+    V --> D[Deletion-vector anti join]
+    D --> R[Allowed columns and row predicate]
+    R --> Q[Rewritten user query]
+    Q --> A[Arrow batches]
 ```
 
-Each variant exposes a `dialect` property used by `SQLParser` to select the correct sqlglot grammar. `SPARK_SQL` returns `"spark"`; all others return `"duckdb"`.
+The reflection projection includes `__rowid__` and `__timestamp__` when needed for internal processing. A deletion vector removes row IDs through an anti join, and the public view normally hides both system columns. RBAC views then restrict rows and columns. Columns needed only to evaluate a row filter are available inside the filter and hidden from the resulting projection.
 
-### AUTO Mode Decision Matrix
+View names are derived from the table, snapshot version, and projection; query-specific suffixes distinguish control views. On handle closure the engine closes the Arrow reader and cursor, drops query views, and releases deletion-vector cache references. The shared connection remains available for later queries.
 
-When the engine is set to `AUTO` (the default), the `Executor._auto_pick()` method in `supertable/engine/executor.py` applies a two-dimensional decision matrix based on **data size** and **data freshness**.
+Deletion-vector tables are cached with a configured capacity and TTL, defaulting to 8 entries and 300 seconds. Referenced cache entries are released when the stream closes.
 
-```
-                          Data Freshness
-                     FRESH (<threshold)    STABLE (>=threshold)
-                +-----------------------+-----------------------+
-  Small         |       LITE            |       LITE            |
-  (<100 MB)     |  cheap anyway         |  cheap anyway         |
-                +-----------------------+-----------------------+
-  Medium        |       LITE            |       PRO             |
-  (100 MB-10 GB)|  cache would churn    |  cache pays off       |
-                +-----------------------+-----------------------+
-  Large         |       SPARK *         |       SPARK *         |
-  (>=10 GB)     |  too big for DuckDB   |  too big for DuckDB   |
-                +-----------------------+-----------------------+
+### Configuration
 
-  * Spark only if pyspark is available; falls back to PRO otherwise.
-```
+Organization engine configuration is resolved from Redis first, then environment variables, then defaults. Shared fields live at the configuration root; DuckDB fields live in the `lite` or `pro` section. `resolve_engine_config_provenance()` reports each field's source.
 
-**Size thresholds** are read from the `Reflection.reflection_bytes` field (total bytes across all referenced parquet files) and compared against configurable limits:
+| Environment variable | Default | Use |
+| --- | --- | --- |
+| `SUPERTABLE_DUCKDB_MEMORY_LIMIT` | `1GB` | DuckDB memory limit |
+| `SUPERTABLE_DUCKDB_THREADS` | empty | Explicit thread count; otherwise derived from CPU, memory, and multiplier |
+| `SUPERTABLE_DUCKDB_IO_MULTIPLIER` | `3` | Multiplier used by automatic thread sizing |
+| `SUPERTABLE_DUCKDB_HTTP_TIMEOUT` | empty | Optional positive HTTP timeout |
+| `SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE` | `5GB` | Enables the external file cache and requests a size cap where supported |
+| `SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR` | empty | Uses the application home's `duckdb_cache` directory where supported |
+| `SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE` | `true` | HTTP metadata caching |
+| `SUPERTABLE_DUCKDB_PRESIGNED` | `false` | Prefer storage presigned paths during estimation |
+| `SUPERTABLE_DUCKDB_USE_HTTPFS` | `false` | Use constructed HTTP URLs instead of S3 URLs when resolving object-store keys |
+| `SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD` | `false` | Permit installing `httpfs` if it is not already available |
+| `SUPERTABLE_STREAM_BATCH_ROWS` | `65536` | Default Arrow batch row count |
 
-| Threshold | Environment Variable | Default |
-|-----------|---------------------|---------|
-| Lite upper bound | `SUPERTABLE_ENGINE_LITE_MAX_BYTES` | 100 MB (104,857,600 bytes) |
-| Spark lower bound | `SUPERTABLE_ENGINE_SPARK_MIN_BYTES` | 10 GB (10,737,418,240 bytes) |
+Memory values accept positive numbers with units such as `MB`, `GB`, `MiB`, and `GiB`; a bare number is interpreted as GB. Invalid memory limits fall back to `1GB`. Thread derivation uses approximately one thread per 400 MB, capped by CPU count times the I/O multiplier.
 
-### Freshness-Aware Routing
+Initialization sets the default collation to `nocase`, disables insertion-order preservation where supported, and configures a spill directory under the application home. Add `ORDER BY` when output order matters.
 
-Freshness prevents cache thrashing. The `Reflection.freshness_ms` field carries the maximum `last_updated_ms` across all snapshots referenced by the query. The engine computes the age of the data:
+Remote S3 and HTTP reads require DuckDB's `httpfs` extension. Missing local extensions cause a clear runtime error unless online installation is enabled. Storage paths resolve through storage URL helpers where available. Certain HTTP/authentication failures during reflection creation trigger one retry using presigned paths. Optional DuckDB settings are applied only where supported, so a dedicated external-cache cap depends on the installed DuckDB build.
 
-```python
-age_s = (time.time() * 1000 - reflection.freshness_ms) / 1000.0
-data_is_fresh = age_s < freshness_threshold_s
-```
+## 5. Spark execution and current limitation
 
-| Setting | Environment Variable | Default |
-|---------|---------------------|---------|
-| Freshness threshold | `SUPERTABLE_ENGINE_FRESHNESS_SEC` | 300 seconds (5 minutes) |
+The Spark implementation uses PyHive to connect to a registered Thrift endpoint. Cluster configuration supplies `thrift_host`, `thrift_port` (default `10000`), `auth` (default `NONE`), and optional credentials. Missing PyHive or an eligible active cluster raises an error.
 
-**Routing logic for the medium tier:**
+The executor builds temporary Parquet views, combines multiple files with `UNION ALL`, applies deletion and RBAC views, rewrites SQL to Spark syntax, and attempts to capture `EXPLAIN EXTENDED`. S3 paths are converted to `s3a://`; optional presigning is controlled by `SUPERTABLE_SPARK_PRESIGNED`. Defaults are 300 seconds for query execution, 120 seconds per statement, and 30 seconds for the connection setting.
 
-- **Fresh data** (age < threshold): routed to **LITE**, because the data is still being updated frequently and cached views in Pro would be invalidated before they pay off.
-- **Stable data** (age >= threshold): routed to **PRO**, because the persistent connection and cached views will be reused across multiple queries, amortizing the setup cost.
+**Current return-value defect:** `SparkThriftExecutor.execute()` returns a stream handle inside its `try`, but a bare `return` in its streaming `finally` branch overrides that handle with `None`. The materialized executor currently converts this into an empty DataFrame, while `DataReader.stream()` reports that no reader was produced. Use `Engine.DUCKDB` when a working result is required until that implementation is corrected. Setting AUTO does not avoid this defect when AUTO selects Spark.
 
-When freshness is unknown (`freshness_ms == 0`), the data is assumed stable so that Pro gets a chance to cache.
+## 6. Results and monitoring
 
-## The Executor
+Materialization consumes Arrow batches into a Polars DataFrame and always closes the handle. Duplicate column names gain numeric suffixes. Decimal values with scale zero are normalized toward integers, with a floating-point fallback if the exact cast fails.
 
-The `Executor` class in `supertable/engine/executor.py` is instantiated per request and dispatches to the appropriate backend.
+`QueryPlanManager` assigns a UUID query ID and a 16-character hash derived from the query plus its metadata-path input. This hash is not a snapshot version or query-result cache key. Temporary plan paths live under the application home, and old plans for the same hash are capped at 200 during initialization.
 
-```python
-class Executor:
-    def __init__(self, storage=None, organization=""):
-        self.storage = storage
-        self.organization = organization
-        self.lite_exec = DuckDBLite(storage=storage)
-        self.spark_exec = None  # lazily initialized
-
-    def execute(
-        self,
-        engine: Engine,
-        reflection: Reflection,
-        parser: SQLParser,
-        query_manager: QueryPlanManager,
-        timer: Timer,
-        plan_stats: PlanStats,
-        log_prefix: str,
-    ) -> Tuple[pd.DataFrame, str]:
-```
-
-Key behaviors:
-
-- If `engine == Engine.AUTO`, calls `_auto_pick()` to resolve the actual engine.
-- **DuckDB Lite**: uses a per-Executor `DuckDBLite` instance.
-- **DuckDB Pro**: uses a **module-level singleton** (`_pro_singleton`) so the persistent connection and view cache survive across Executor instances (which are per-request). A threading lock guards creation.
-- **Spark SQL**: lazily imports `SparkThriftExecutor` (avoiding import cost when Spark is not needed). Passes `force=True` when the user explicitly requested Spark (not via AUTO).
-- Records the engine used in `PlanStats` for query plan reporting.
-
-## DuckDB Lite
-
-**Module**: `supertable/engine/duckdb_lite.py`
-**Class**: `DuckDBLite`
-
-DuckDB Lite is the lightweight, transient execution path optimized for small datasets and frequently-changing data.
-
-### Characteristics
-
-- **Single persistent connection**: created lazily and reused across all queries to preserve DuckDB's HTTP metadata cache and external file cache between requests.
-- **No materialized state**: VIEWs are created with unique (hashed) names and dropped in the `finally` block after each query. No TABLE state is retained between queries.
-- **Thread-safe**: a lock guards connection creation and httpfs initialization only. DuckDB allows concurrent reads on the same connection, so query execution runs outside the lock.
-
-### Cache Layers
-
-1. **DuckDB external file cache** -- disk-level data block cache (DuckDB >= 1.3)
-2. **DuckDB HTTP metadata cache** -- connection-level parquet footer cache (in-memory)
-3. **ParquetMetadataCache** -- module-level Python dict, version-aware
-
-### Execution Flow
-
-1. Acquire (or create) the persistent connection via `_get_connection()`.
-2. Configure httpfs once per connection lifetime via `_ensure_httpfs()`.
-3. For each table referenced in the query:
-   - Generate a hashed table name via `hashed_table_name()`.
-   - Create a reflection table or view from the resolved parquet files using `create_reflection_table_with_presign_retry()`.
-   - Optionally layer dedup, tombstone, and RBAC views on top.
-4. Rewrite the user's SQL to reference the hashed table names via `rewrite_query_with_hashed_tables()`.
-5. Execute the rewritten SQL, fetch results into a pandas DataFrame.
-6. Drop all created views/tables in the `finally` block.
-
-### Connection Recovery
-
-If the connection encounters an unrecoverable error, `_reset_connection()` closes and discards it. The next query will create a fresh connection.
-
-## DuckDB Pro
-
-**Module**: `supertable/engine/duckdb_pro.py`
-**Class**: `DuckDBPro`
-
-DuckDB Pro is the persistent, caching execution path optimized for stable datasets queried repeatedly.
-
-### Characteristics
-
-- **Module-level singleton**: the `DuckDBPro` instance is created once and shared across all request-scoped `Executor` instances via `_get_pro()`.
-- **Version-based view caching**: views are created on first access and reused across queries as long as the data version is unchanged. Because views are lazy (no data is materialized at creation time), DuckDB applies full projection and predicate pushdown on every query.
-- **Graceful version transitions**: when a new version is detected, a new view is created alongside the old one. Old views are dropped only when their reference count reaches zero, preventing in-flight queries from breaking.
-
-### Cache Registry
-
-The internal `_ProCacheEntry` dataclass tracks each cached view:
-
-```python
-@dataclass
-class _ProCacheEntry:
-    table_name: str       # DuckDB view name (e.g. pro_a3f8c1_v5)
-    super_name: str
-    simple_name: str
-    version: int
-    ref_count: int = 0    # in-flight queries using this view
-    stale: bool = False    # marked for removal when ref_count hits 0
-```
-
-The registry is keyed by `(super_name, simple_name)` and may hold multiple entries per key when an old version still has in-flight queries.
-
-### Table Naming
-
-Pro uses `pro_table_name()` from `engine_common.py`:
-
-```python
-def pro_table_name(super_name, simple_name, simple_version) -> str:
-    key = f"{super_name}_{simple_name}"
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
-    return f"pro_{digest}_v{simple_version}"
-```
-
-### Connection Management
-
-- Memory limit is controlled by `SUPERTABLE_DUCKDB_MEMORY_LIMIT` (shared with Lite).
-- On unrecoverable error, `_reset_connection()` closes the connection and clears the entire registry.
-- httpfs is configured lazily on the first query (same pattern as Lite).
-
-## Spark Thrift
-
-**Module**: `supertable/engine/spark_thrift.py`
-**Class**: `SparkThriftExecutor`
-
-Spark Thrift is the distributed execution path for datasets too large for a single-node DuckDB instance.
-
-### Characteristics
-
-- Connects to a Spark Thrift Server via PyHive's HiveServer2 interface.
-- Converts S3/HTTP paths to `s3a://` paths for Spark compatibility via `_to_s3a_path()`.
-- Creates temporary parquet views using `CREATE OR REPLACE TEMPORARY VIEW ... USING parquet OPTIONS (path ...)`.
-- Batches large file lists: individual file views are created per batch, unioned into batch views, then all batch views are unioned into the final view. Batch size is controlled by `SUPERTABLE_SPARK_BATCH_SIZE`.
-- Intermediate views are kept alive until the final query completes (Spark's lazy view resolution requires this).
-
-### Timeouts
-
-| Setting | Environment Variable | Default |
-|---------|---------------------|---------|
-| Overall query timeout | `SUPERTABLE_SPARK_QUERY_TIMEOUT` | 300 seconds |
-| Per-statement timeout | `SUPERTABLE_SPARK_STATEMENT_TIMEOUT` | 120 seconds |
-
-### Table Naming
-
-```python
-def _spark_table_name(super_name, simple_name, version) -> str:
-    key = f"{super_name}_{simple_name}"
-    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
-    return f"spark_{digest}_v{version}"
-```
-
-### Verbose Logging Suppression
-
-PyHive and Thrift libraries log every SQL statement at INFO level. The module suppresses this by setting the log level to WARNING for `pyhive`, `pyhive.hive`, `TCLIService`, `thrift`, and `thrift_sasl`.
-
-## Data Size Estimation
-
-**Module**: `supertable/engine/data_estimator.py`
-**Class**: `DataEstimator`
-
-The `DataEstimator` resolves which parquet files will be read for a query and calculates total byte size. This information feeds the engine auto-picker.
-
-```python
-class DataEstimator:
-    def __init__(self, organization, storage, tables: List[TableDefinition]):
-        self.organization = organization
-        self.storage = storage
-        self.tables = tables
-        self.catalog = RedisCatalog()
-```
-
-### Output
-
-The estimator produces a `Reflection` dataclass:
-
-```python
-@dataclass
-class Reflection:
-    storage_type: str              # storage backend identifier
-    reflection_bytes: int          # total bytes across all parquet files
-    total_reflections: int         # number of parquet files
-    supers: List[SuperSnapshot]    # per-table file lists and metadata
-    freshness_ms: int = 0          # max last_updated_ms across snapshots
-    rbac_views: Dict[str, RbacViewDef] = {}
-    dedup_views: Dict[str, DedupViewDef] = {}
-    tombstone_views: Dict[str, TombstoneDef] = {}
-```
-
-### Column Validation
-
-The `get_missing_columns()` function validates that columns requested by the query actually exist in the available snapshots. It performs case-insensitive matching and skips validation for `SELECT *` queries (where `columns == []`).
-
-## View Chain Construction
-
-Each engine constructs a layered view chain on top of the raw parquet data. The chain is built bottom-up, with each layer wrapping the previous one:
-
-```
-parquet files
-    |
-    v
-[1] Base reflection table/view  (parquet_scan of all files)
-    |
-    v
-[2] RBAC view                   (column + row filtering)
-    |
-    v
-[3] Tombstone view              (exclude soft-deleted rows)
-    |
-    v
-[4] Dedup view                  (ROW_NUMBER to keep latest per PK)
-    |
-    v
-  User query executes against the top-most view
-```
-
-### Base Reflection Table/View
-
-Created by `create_reflection_table()` or `create_reflection_view()` in `engine_common.py`:
-
-```sql
-CREATE TABLE st_<hash> AS
-SELECT <columns>
-FROM parquet_scan(['file1.parquet', 'file2.parquet', ...],
-     union_by_name=TRUE, HIVE_PARTITIONING=FALSE);
-```
-
-- `union_by_name=TRUE` handles schema evolution (columns may appear in some files but not others).
-- `HIVE_PARTITIONING=FALSE` disables hive-style partition inference.
-
-### RBAC View Injection
-
-Created by `create_rbac_view()` when the `Reflection.rbac_views` dict has an entry for the table alias:
-
-```sql
-CREATE OR REPLACE VIEW rbac_<base_table> AS
-SELECT <allowed_columns>
-FROM <base_table>
-WHERE <where_clause>;
-```
-
-The `RbacViewDef` dataclass carries:
-- `allowed_columns`: list of visible columns, or `["*"]` for unrestricted.
-- `where_clause`: SQL predicate from role filters, or empty string.
-
-View naming uses `rbac_view_name()`: `f"rbac_{base_table_name}"`.
-
-### Tombstone View
-
-Created by `create_tombstone_view()` when the snapshot's metadata includes a tombstones block:
-
-```sql
-CREATE OR REPLACE VIEW <view_name> AS
-SELECT * FROM <source_table>
-WHERE NOT EXISTS (
-  SELECT 1 FROM (VALUES (k1, k2), ...) AS __tombstones__(pk1, pk2)
-  WHERE <source_table>.pk1 = __tombstones__.pk1
-    AND <source_table>.pk2 = __tombstones__.pk2
-);
-```
-
-This anti-join pattern handles NULLs correctly and avoids column name collisions. Tombstone lists are bounded by the compaction threshold (typically <= 1000 keys).
-
-### Dedup View
-
-Created by `create_dedup_view()` when the table has `dedup_on_read` enabled in its config:
-
-```sql
-CREATE OR REPLACE VIEW <view_name> AS
-SELECT <visible_columns> FROM (
-  SELECT *, ROW_NUMBER() OVER (
-    PARTITION BY <primary_keys>
-    ORDER BY <order_column> DESC
-  ) AS __rn__
-  FROM <source_table>
-) sub WHERE __rn__ = 1;
-```
-
-The `DedupViewDef` dataclass controls:
-- `primary_keys`: columns forming the composite dedup key.
-- `order_column`: column for ordering (default `__timestamp__`).
-- `visible_columns`: columns exposed to the user query. When empty or `["*"]`, all source columns except `__rn__` are exposed using DuckDB's `EXCLUDE` syntax.
-
-## Query Rewriting
-
-After the view chain is built, the user's original SQL must reference the hashed physical table names instead of the logical table names. The `rewrite_query_with_hashed_tables()` function in `engine_common.py` handles this:
-
-1. Parses the SQL using sqlglot.
-2. Walks all `Table` nodes in the AST.
-3. Replaces each table's physical name with the corresponding hashed name from `alias_to_table`.
-4. Preserves or injects table aliases so qualified column references (e.g., `t.col`) remain valid.
-5. Serializes back to DuckDB SQL dialect.
-
-## Common Infrastructure
-
-### Connection Initialization
-
-The `init_connection()` function in `engine_common.py` applies standard PRAGMA settings to every DuckDB connection:
-
-| Setting | Purpose | Default |
-|---------|---------|---------|
-| `memory_limit` | Cap DuckDB RAM to enable disk spilling | `SUPERTABLE_DUCKDB_MEMORY_LIMIT` or `"1GB"` |
-| `temp_directory` | Absolute path for spill files | Resolved under `SUPERTABLE_HOME/tmp/` |
-| `default_collation` | Case-insensitive string comparisons | `nocase` |
-| `preserve_insertion_order` | Reduce memory pressure during scans | `false` |
-| `threads` | Parallel execution threads | Auto-derived or `SUPERTABLE_DUCKDB_THREADS` |
-
-### Thread Count Derivation
-
-When `SUPERTABLE_DUCKDB_THREADS` is not set, the thread count is derived from memory and CPU:
-
-```
-io_threads   = cpu_count * SUPERTABLE_DUCKDB_IO_MULTIPLIER  (default 3)
-memory_floor = max(1, memory_mb // 400)   -- ~400 MB per thread minimum
-result       = min(io_threads, memory_floor)
-```
-
-This prevents OOM on large-CPU hosts with small memory limits.
-
-### httpfs and S3 Configuration
-
-The `configure_httpfs_and_s3()` function loads the httpfs extension and configures S3 credentials, endpoint, region, URL style, SSL, and caches. It reads from settings:
-
-- `STORAGE_ENDPOINT_URL`, `STORAGE_ACCESS_KEY`, `STORAGE_SECRET_KEY`, `STORAGE_SESSION_TOKEN`
-- `STORAGE_REGION`, `STORAGE_FORCE_PATH_STYLE`, `STORAGE_USE_SSL`
-- `SUPERTABLE_DUCKDB_HTTP_TIMEOUT` (default 30 seconds)
-- `SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE` -- parquet footer caching across queries
-- `SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE` -- enables disk-level data block cache (DuckDB >= 1.3)
-- `SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR` -- cache directory (defaults to `SUPERTABLE_HOME/duckdb_cache`)
-
-### SQL Helpers
-
-- `quote_if_needed(col)`: quotes column names containing special characters.
-- `sanitize_sql_string(value)`: escapes single quotes in SQL string literals.
-- `escape_parquet_path(path)`: escapes file paths for SQL string literals.
-- `hashed_table_name(super_name, simple_name, version, columns)`: generates deterministic `st_<sha1_prefix>` table names.
-
-## Configuration Reference
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `SUPERTABLE_ENGINE_LITE_MAX_BYTES` | Upper bound for Lite engine selection | 104,857,600 (100 MB) |
-| `SUPERTABLE_ENGINE_SPARK_MIN_BYTES` | Lower bound for Spark engine selection | 10,737,418,240 (10 GB) |
-| `SUPERTABLE_ENGINE_FRESHNESS_SEC` | Age threshold for fresh vs. stable data | 300 (5 minutes) |
-| `SUPERTABLE_DUCKDB_MEMORY_LIMIT` | DuckDB memory limit (shared by Lite and Pro) | `"1GB"` |
-| `SUPERTABLE_DUCKDB_THREADS` | Explicit DuckDB thread count (overrides auto-derive) | Auto |
-| `SUPERTABLE_DUCKDB_IO_MULTIPLIER` | CPU multiplier for IO thread calculation | 3 |
-| `SUPERTABLE_DUCKDB_HTTP_TIMEOUT` | httpfs HTTP timeout in seconds | 30 |
-| `SUPERTABLE_DUCKDB_HTTP_METADATA_CACHE` | Enable parquet footer caching | true |
-| `SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE` | External file cache size (e.g. `"2GB"`) | Disabled |
-| `SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR` | External file cache directory | `SUPERTABLE_HOME/duckdb_cache` |
-| `SUPERTABLE_SPARK_QUERY_TIMEOUT` | Overall Spark query timeout | 300 seconds |
-| `SUPERTABLE_SPARK_STATEMENT_TIMEOUT` | Per-statement Spark timeout | 120 seconds |
-| `SUPERTABLE_SPARK_BATCH_SIZE` | Files per Spark view creation batch | Configurable |
-
-## Business Context
-
-The multi-engine architecture addresses a fundamental tradeoff in data analytics: **small queries should be fast and cheap, while large queries should be possible at all**.
-
-- **DuckDB Lite** handles the majority of interactive queries (dashboards, ad-hoc exploration) with sub-second latency and zero infrastructure overhead. It is the default path for datasets under 100 MB.
-- **DuckDB Pro** adds persistent view caching for medium-sized stable datasets. This is the sweet spot for production reporting where the same tables are queried repeatedly and the data updates infrequently. The version-aware cache eliminates redundant parquet file downloads.
-- **Spark SQL** enables queries over datasets that exceed single-node memory limits. It requires a Spark Thrift Server but handles arbitrarily large data volumes.
-
-The freshness-aware routing prevents a common failure mode: caching data that is still being actively ingested. Without this, a dashboard querying a table mid-ingestion would populate the Pro cache, only to invalidate it seconds later when the next batch lands.
-
-The view chain (base, RBAC, tombstone, dedup) ensures that security filtering and data consistency are enforced at the engine level, not the application level. This means every query path -- SQL editor, API, OData, MCP -- gets identical security and consistency guarantees without duplicating logic.
+The plan extension records timings, estimated resources, status, result shape, source, query identifiers, and available engine profile in monitoring. Queries targeting monitoring sink tables skip recursive plan logging. Failures to log monitoring are non-fatal. Materialized execution records the engine; the streaming path currently does not add that engine statistic and records completion when its handle closes.
