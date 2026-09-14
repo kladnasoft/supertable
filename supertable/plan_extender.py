@@ -56,21 +56,29 @@ def _sql_shape(text: str) -> str:
     """Return the SQL structure with every literal replaced by a placeholder.
 
     Falls back to the empty string rather than the raw statement: a shape that
-    cannot be parsed must not silently degrade into the un-redacted query it
+    cannot be produced must not silently degrade into the un-redacted query it
     was supposed to replace.
+
+    Redacted by token span, not by rewriting the parse tree. Parsing the query,
+    deep-copying the AST to replace each literal node and re-rendering it cost
+    470ms on a query carrying a 1,000-value IN list — 3.5x a bare parse — and it
+    ran on every read, synchronously, before ``execute`` returned. That is what
+    made the read benchmark's random_1000_by_key scenario 61% slower (915 ->
+    1477ms) at ca0da6c. The tokenizer already identifies the literal spans,
+    which is the only thing this needs to know.
+
+    One visible consequence: the shape keeps the caller's own spelling and
+    spacing instead of SQLGlot's normalised rendering, so a shape recorded
+    before this change and one recorded after will not group together. The
+    monitoring rows carry a 7-day TTL, so that resolves itself; the property
+    that matters — no literal is ever written to a monitoring row — is
+    unchanged.
     """
+    from supertable.utils.sql_compat import redact_literals
+
     try:
-        import sqlglot
-        from sqlglot import exp
-
-        def erase(node):
-            if isinstance(node, (exp.Literal, exp.Boolean, exp.Null)):
-                return exp.Placeholder()
-            return node
-
-        root = sqlglot.parse_one(text, read="duckdb")
-        return root.transform(erase, copy=True).sql(dialect="duckdb", pretty=False)
-    except Exception:  # noqa: BLE001 - any parse failure redacts completely
+        return redact_literals(text, dialect="duckdb") or ""
+    except Exception:  # noqa: BLE001 - any failure redacts completely
         return ""
 
 

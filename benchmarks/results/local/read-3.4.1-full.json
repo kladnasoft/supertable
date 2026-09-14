@@ -2,14 +2,14 @@
   "suite": "read",
   "profile": "local",
   "scale": "full",
-  "started_at": "2026-09-14T22:23:31.768142+00:00",
-  "finished_at": "2026-09-14T22:24:10.216637+00:00",
-  "duration_s": 38.45,
+  "started_at": "2026-09-14T22:56:57.808754+00:00",
+  "finished_at": "2026-09-14T22:57:33.126296+00:00",
+  "duration_s": 35.32,
   "environment": {
     "profile": "local",
     "supertable_version": "3.4.1",
-    "git_commit": "b9dcdfb25fa4ba6c17d8793d0325ecd94b76e782",
-    "git_describe": "v3.4.1-9-gb9dcdfb",
+    "git_commit": "3fe254f0b15577d2c76b9e7a2a7b3ac5f7bc040d",
+    "git_describe": "v3.4.1-10-g3fe254f-dirty",
     "git_dirty": true,
     "python": "3.10.12",
     "duckdb": "1.5.4",
@@ -46,12 +46,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 1455.413,
-        "p50": 1581.576,
-        "p95": 1684.245,
-        "max": 1684.245,
-        "mean": 1579.201,
-        "stdev": 97.747
+        "min": 1021.12,
+        "p50": 1107.285,
+        "p95": 1114.273,
+        "max": 1114.273,
+        "mean": 1090.915,
+        "stdev": 39.327
       },
       "rows": 1000,
       "seal": {
@@ -77,7 +77,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 0,
         "FILES_KEPT": 100,
-        "PRUNE_DURATION_MS": 5.022,
+        "PRUNE_DURATION_MS": 4.68,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read.prune.n": 1
@@ -96,12 +96,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 170.999,
-        "p50": 205.596,
-        "p95": 242.526,
-        "max": 242.526,
-        "mean": 210.283,
-        "stdev": 31.865
+        "min": 148.525,
+        "p50": 184.364,
+        "p95": 235.819,
+        "max": 235.819,
+        "mean": 190.267,
+        "stdev": 36.587
       },
       "rows": 12,
       "seal": {
@@ -122,7 +122,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 89,
         "FILES_KEPT": 11,
-        "PRUNE_DURATION_MS": 7.919,
+        "PRUNE_DURATION_MS": 6.974,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read_pruned_files": 89,
@@ -148,12 +148,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 126.118,
-        "p50": 139.816,
-        "p95": 189.83,
-        "max": 189.83,
-        "mean": 154.516,
-        "stdev": 30.135
+        "min": 107.122,
+        "p50": 141.084,
+        "p95": 191.905,
+        "max": 191.905,
+        "mean": 148.659,
+        "stdev": 36.352
       },
       "rows": 12,
       "seal": {
@@ -173,7 +173,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 99,
         "FILES_KEPT": 1,
-        "PRUNE_DURATION_MS": 4.961,
+        "PRUNE_DURATION_MS": 6.063,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read_pruned_files": 99,
@@ -199,12 +199,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 771.255,
-        "p50": 777.116,
-        "p95": 904.202,
-        "max": 904.202,
-        "mean": 805.846,
-        "stdev": 56.456
+        "min": 732.337,
+        "p50": 831.911,
+        "p95": 971.87,
+        "max": 971.87,
+        "mean": 843.048,
+        "stdev": 110.447
       },
       "rows": 1000,
       "seal": {
@@ -230,7 +230,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 0,
         "FILES_KEPT": 100,
-        "PRUNE_DURATION_MS": 0.027,
+        "PRUNE_DURATION_MS": 0.02,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read.prune.n": 1
@@ -249,12 +249,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 1141.057,
-        "p50": 1280.379,
-        "p95": 1506.852,
-        "max": 1506.852,
-        "mean": 1289.178,
-        "stdev": 143.243
+        "min": 1229.498,
+        "p50": 1269.896,
+        "p95": 1321.869,
+        "max": 1321.869,
+        "mean": 1270.13,
+        "stdev": 33.721
       },
       "rows": 10000,
       "seal": {
@@ -280,7 +280,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 0,
         "FILES_KEPT": 100,
-        "PRUNE_DURATION_MS": 0.026,
+        "PRUNE_DURATION_MS": 0.046,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read.prune.n": 1
@@ -299,12 +299,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 150.711,
-        "p50": 201.359,
-        "p95": 228.387,
-        "max": 228.387,
-        "mean": 190.041,
-        "stdev": 32.98
+        "min": 130.638,
+        "p50": 140.888,
+        "p95": 198.346,
+        "max": 198.346,
+        "mean": 149.08,
+        "stdev": 28.247
       },
       "rows": 1,
       "seal": {
@@ -341,12 +341,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 104.627,
-        "p50": 147.602,
-        "p95": 162.163,
-        "max": 162.163,
-        "mean": 135.818,
-        "stdev": 28.481
+        "min": 95.564,
+        "p50": 105.612,
+        "p95": 163.53,
+        "max": 163.53,
+        "mean": 116.032,
+        "stdev": 27.484
       },
       "rows": 1,
       "seal": {
@@ -372,7 +372,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 99,
         "FILES_KEPT": 1,
-        "PRUNE_DURATION_MS": 4.885,
+        "PRUNE_DURATION_MS": 4.651,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read_pruned_files": 99,
@@ -392,12 +392,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 204.078,
-        "p50": 224.989,
-        "p95": 265.115,
-        "max": 265.115,
-        "mean": 228.746,
-        "stdev": 23.332
+        "min": 218.681,
+        "p50": 220.769,
+        "p95": 295.951,
+        "max": 295.951,
+        "mean": 244.46,
+        "stdev": 35.305
       },
       "rows": 1,
       "seal": {
@@ -415,7 +415,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 89,
         "FILES_KEPT": 11,
-        "PRUNE_DURATION_MS": 4.518,
+        "PRUNE_DURATION_MS": 6.581,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read_pruned_files": 89,
@@ -435,12 +435,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 258.331,
-        "p50": 335.14,
-        "p95": 405.954,
-        "max": 405.954,
-        "mean": 325.81,
-        "stdev": 61.762
+        "min": 261.858,
+        "p50": 268.201,
+        "p95": 317.055,
+        "max": 317.055,
+        "mean": 284.927,
+        "stdev": 27.904
       },
       "rows": 1,
       "seal": {
@@ -459,7 +459,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 0,
         "FILES_KEPT": 100,
-        "PRUNE_DURATION_MS": 10.483,
+        "PRUNE_DURATION_MS": 8.945,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read.prune.n": 1
@@ -478,12 +478,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 210.239,
-        "p50": 247.393,
-        "p95": 269.81,
-        "max": 269.81,
-        "mean": 247.746,
-        "stdev": 23.894
+        "min": 180.519,
+        "p50": 188.461,
+        "p95": 246.167,
+        "max": 246.167,
+        "mean": 199.852,
+        "stdev": 27.024
       },
       "rows": 60,
       "seal": {
@@ -504,7 +504,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 89,
         "FILES_KEPT": 11,
-        "PRUNE_DURATION_MS": 5.652,
+        "PRUNE_DURATION_MS": 6.129,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read_pruned_files": 89,
@@ -524,12 +524,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 109.353,
-        "p50": 129.021,
-        "p95": 167.781,
-        "max": 167.781,
-        "mean": 133.199,
-        "stdev": 22.592
+        "min": 102.928,
+        "p50": 114.666,
+        "p95": 169.567,
+        "max": 169.567,
+        "mean": 121.642,
+        "stdev": 27.286
       },
       "rows": 1,
       "seal": {
@@ -548,7 +548,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 98,
         "FILES_KEPT": 2,
-        "PRUNE_DURATION_MS": 7.396,
+        "PRUNE_DURATION_MS": 4.676,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read_pruned_files": 98,
@@ -568,12 +568,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 213.514,
-        "p50": 225.174,
-        "p95": 228.516,
-        "max": 228.516,
-        "mean": 221.895,
-        "stdev": 7.235
+        "min": 222.334,
+        "p50": 233.508,
+        "p95": 276.929,
+        "max": 276.929,
+        "mean": 240.75,
+        "stdev": 22.602
       },
       "rows": 1000,
       "seal": {
@@ -594,7 +594,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 89,
         "FILES_KEPT": 11,
-        "PRUNE_DURATION_MS": 10.634,
+        "PRUNE_DURATION_MS": 7.308,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read_pruned_files": 89,
@@ -614,12 +614,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 125.756,
-        "p50": 129.005,
-        "p95": 173.71,
-        "max": 173.71,
-        "mean": 140.255,
-        "stdev": 20.244
+        "min": 115.058,
+        "p50": 126.804,
+        "p95": 180.432,
+        "max": 180.432,
+        "mean": 143.541,
+        "stdev": 29.483
       },
       "rows": 1,
       "seal": {
@@ -637,7 +637,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 89,
         "FILES_KEPT": 11,
-        "PRUNE_DURATION_MS": 6.29,
+        "PRUNE_DURATION_MS": 6.029,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read_pruned_files": 89,
@@ -669,12 +669,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 91.406,
-        "p50": 99.603,
-        "p95": 113.252,
-        "max": 113.252,
-        "mean": 100.928,
-        "stdev": 8.479
+        "min": 85.888,
+        "p50": 93.357,
+        "p95": 142.73,
+        "max": 142.73,
+        "mean": 109.207,
+        "stdev": 26.442
       },
       "rows": 1,
       "seal": {
@@ -692,7 +692,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 99,
         "FILES_KEPT": 1,
-        "PRUNE_DURATION_MS": 5.233,
+        "PRUNE_DURATION_MS": 5.313,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read_pruned_files": 99,
@@ -724,12 +724,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 83.85,
-        "p50": 92.102,
-        "p95": 126.462,
-        "max": 126.462,
-        "mean": 97.334,
-        "stdev": 16.674
+        "min": 81.057,
+        "p50": 90.892,
+        "p95": 138.525,
+        "max": 138.525,
+        "mean": 98.673,
+        "stdev": 22.783
       },
       "rows": 1,
       "seal": {
@@ -747,7 +747,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 99,
         "FILES_KEPT": 1,
-        "PRUNE_DURATION_MS": 3.758,
+        "PRUNE_DURATION_MS": 5.929,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read_pruned_files": 99,
@@ -779,12 +779,12 @@
       "error": null,
       "timings_ms": {
         "n": 5,
-        "min": 135.28,
-        "p50": 141.621,
-        "p95": 149.728,
-        "max": 149.728,
-        "mean": 142.584,
-        "stdev": 6.332
+        "min": 135.262,
+        "p50": 144.147,
+        "p95": 148.709,
+        "max": 148.709,
+        "mean": 143.565,
+        "stdev": 5.305
       },
       "rows": 1,
       "seal": {
@@ -802,7 +802,7 @@
         "FILES_BEFORE_PRUNE": 100,
         "FILES_PRUNED": 0,
         "FILES_KEPT": 100,
-        "PRUNE_DURATION_MS": 0.024,
+        "PRUNE_DURATION_MS": 0.019,
         "PRUNE_COUNTS": {
           "stats_cache_hit": 1,
           "read.prune.n": 1
