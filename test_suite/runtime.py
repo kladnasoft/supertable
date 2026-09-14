@@ -142,6 +142,9 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="test_suite",
         description="SuperTable write/read correctness suite (hermetic).",
+        epilog="Any other argument is forwarded to pytest, e.g. "
+               "-k EXPR to select tests, -x to stop on first failure, "
+               "-v for per-test output, --co to list without running.",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--all", action="store_true", help="run both halves (default)")
@@ -154,9 +157,17 @@ def main(argv=None) -> int:
                         help="override the number of write transactions")
     parser.add_argument("--keep", action="store_true",
                         help="keep the workspace on disk for inspection")
-    parser.add_argument("pytest_args", nargs="*",
-                        help="extra arguments forwarded to pytest (e.g. -k, -x)")
-    args = parser.parse_args(argv)
+    # Everything this parser does not recognise is forwarded to pytest, in the
+    # order it was given.
+    #
+    # Deliberately NOT a positional with nargs="*": argparse never hands such a
+    # positional an argument beginning with a dash — it exits with "unrecognized
+    # arguments" — so `--read -k foo` was rejected outright. Collecting the
+    # extras alongside a positional does not work either, because the positional
+    # consumes `foo` before `-k` is seen and the pair arrives at pytest reversed
+    # and therefore broken. parse_known_args on its own preserves both the
+    # arguments and their order.
+    args, pytest_args = parser.parse_known_args(argv)
 
     if args.write:
         selected = SELECTIONS["write"]
@@ -182,7 +193,7 @@ def main(argv=None) -> int:
             # modules (and through them supertable) only once the environment
             # above is already pinned.
             import pytest
-            code = pytest.main([*targets, "-q", "-p", "no:randomly", *args.pytest_args])
+            code = pytest.main([*targets, "-q", "-p", "no:randomly", *pytest_args])
     finally:
         if args.keep:
             print(f"workspace kept: {workspace_root}")
