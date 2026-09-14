@@ -457,6 +457,12 @@ class StreamHandle:
         self._dv_keys = dv_keys
         self._cache = cache
         self._closed = False
+        #: Memoized ``(schema, cast_needed)``, settled once: what the consumer
+        #: was told must not change between batches. See ``_prepare``.
+        self._schema_cache = None
+        #: The batch ``_prepare`` peeked to settle the schema, held so the
+        #: first consumer receives it rather than it being consumed twice.
+        self._pending = None
         # Guards cancel/close against each other. Without it a watcher thread
         # can call interrupt() on a cursor the main thread has already closed,
         # which is a use-after-free in DuckDB's C++ layer and aborts the
@@ -471,18 +477,119 @@ class StreamHandle:
 
     @property
     def schema(self):
-        return self.reader.schema if self.reader is not None else None
+        """The schema the consumer sees — normalized, like a buffered read.
+
+        DuckDB types an integer ``SUM`` as ``decimal128(38, 0)``. The buffered
+        path casts that to int64 (see ``arrow_result``), so the same query
+        returned a Python ``int`` through ``execute`` and a ``Decimal`` through
+        ``stream`` — one value described by two types, decided only by how the
+        caller asked for it. The rule is shared rather than re-implemented, so
+        the two paths cannot drift apart again.
+        """
+        if self.reader is None:
+            return None
+        return self._prepare()[0]
+
+    def _prepare(self):
+        """Settle the declared schema, from the first batch. ``(schema, cast)``.
+
+        The decision is made against real data rather than the type alone,
+        because int64 cannot hold every ``decimal128(38, 0)``: an integer sum
+        past 2**63 does not fit. The buffered path can discover that late and
+        widen the whole table to float64, but a stream has already told its
+        consumer what to expect, so it has to know *before* it answers.
+
+        Peeking one batch is what makes that possible. If it casts, int64 is
+        advertised and every batch is cast to it; if it does not, the raw
+        decimal is advertised and nothing is touched — which is exactly the
+        behaviour that existed before, so an oversized sum still reaches
+        ``normalize_arrow_types`` and still widens to float there.
+
+        The peeked batch is held and handed to the first consumer, so nothing
+        is consumed twice and the read stays as lazy as one batch.
+        """
+        if self._schema_cache is not None:
+            return self._schema_cache
+
+        from supertable.engine.arrow_result import normalize_arrow_schema
+
+        raw = self.reader.schema
+        normalized, changed = normalize_arrow_schema(raw, for_pandas=False)
+        if not changed:
+            self._schema_cache = (raw, False)
+            return self._schema_cache
+
+        try:
+            self._pending = next(iter(self.reader))
+        except StopIteration:
+            # No rows: nothing can contradict the normalized schema, and an
+            # empty result still needs its columns to have the right types.
+            self._schema_cache = (normalized, True)
+            return self._schema_cache
+
+        conformed = self._conform(self._pending, normalized)
+        if conformed is None:
+            # A value outside int64. Advertise what DuckDB gave us and leave
+            # the data alone, rather than promise a type it does not fit.
+            logger.debug(
+                "[duckdb.stream] scale-zero decimal exceeds int64; "
+                "streaming the raw decimal type"
+            )
+            self._schema_cache = (raw, False)
+        else:
+            self._pending = conformed
+            self._schema_cache = (normalized, True)
+        return self._schema_cache
 
     def batches(self):
-        """Yield record batches until exhausted, then release resources."""
+        """Yield record batches until exhausted, then release resources.
+
+        Every batch matches :attr:`schema`, because a consumer that builds a
+        frame from ``(batches, schema)`` — which is what ``materialize`` does —
+        fails outright if a batch disagrees with it.
+        """
         if self.reader is None:
             return
         try:
-            for batch in self.reader:
+            target, cast_needed = self._prepare()
+            if self._pending is not None:
+                batch, self._pending = self._pending, None
                 self.rows_streamed += batch.num_rows
                 yield batch
+            for batch in self.reader:
+                self.rows_streamed += batch.num_rows
+                if not cast_needed:
+                    yield batch
+                    continue
+                conformed = self._conform(batch, target)
+                if conformed is None:
+                    # The first batch fit int64 and a later one does not, so the
+                    # consumer already holds a schema this value contradicts.
+                    # Nothing can be salvaged silently at that point.
+                    raise ValueError(
+                        "a streamed value does not fit the column type this "
+                        "result already declared (an integer SUM beyond 2**63 "
+                        "is the usual cause). Select CAST(SUM(col) AS DOUBLE), "
+                        "or SUM over a DECIMAL column, to choose a type that "
+                        "holds it."
+                    )
+                yield conformed
         finally:
             self.close()
+
+    @staticmethod
+    def _conform(batch, target):
+        """Cast *batch* to *target*, or ``None`` when a value does not fit."""
+        import pyarrow as pa
+
+        try:
+            return pa.RecordBatch.from_arrays(
+                [column.cast(field.type)
+                 for column, field in zip(batch.columns, target)],
+                schema=target,
+            )
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+            return None
 
     def cancel(self) -> None:
         """Interrupt the in-flight read. Safe to call from another thread.

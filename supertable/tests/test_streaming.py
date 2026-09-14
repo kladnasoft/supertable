@@ -99,33 +99,56 @@ def test_streamed_equals_buffered(sql):
 
 
 def test_streaming_preserves_exact_integer_sums():
-    """Streaming is not just faster here — it is more CORRECT.
+    """An integer SUM stays an exact integer, in BOTH paths.
 
     DuckDB types ``SUM`` of a BIGINT as ``decimal128(38, 0)``: exact, 128-bit.
-    ``execute`` goes through ``fetchdf()``, which converts that to float64, and
-    above 2**53 float64 cannot represent consecutive integers. Verified against
-    DuckDB directly:
+    Neither path may reduce that to float64, which cannot represent consecutive
+    integers above 2**53 — so this test constructs a total that float64
+    provably cannot hold and requires both paths to return it exactly.
 
-        sum -> 9007199254740995   (arrow, decimal128)
-        sum -> 9007199254740996   (fetchdf, float64)   off by one
-
-    So a buffered read can return a wrong total on a large integer sum, and a
-    streamed read cannot. That makes this a reason to prefer streaming for
-    exports, not merely a dtype curiosity — and a thing to check before
-    "simplifying" the stream by routing it through pandas.
+    This used to assert instead that the streamed type was ``decimal`` while
+    the buffered one was float, on the grounds that ``execute`` went through
+    ``fetchdf()``. It no longer does — buffered assembles Arrow into polars and
+    casts a scale-zero decimal to int64, which is exact to 2**63 — so that
+    asymmetry was not a property worth sealing: it meant one query answered
+    with two different types depending only on how it was called. The stream
+    now normalises the same way (``StreamHandle._prepare``), and what is worth
+    sealing is the exactness both paths owe, which is what this checks.
     """
-    import pyarrow as pa
+    total_sql = "SELECT sum(qty) AS q FROM facts"
+    base = int(_buffered(total_sql)["q"].to_list()[0])
 
-    sql = "SELECT region, sum(qty) AS q FROM facts GROUP BY region ORDER BY region"
+    # Offset the real total past 2**53 and make it odd, so float64 cannot
+    # represent it: if either path went through float, the value comes back
+    # changed. Asserted below rather than assumed.
+    offset = 9007199254740993 - (base % 2)
+    expected = base + offset
+    assert int(float(expected)) != expected, (
+        f"{expected} is representable in float64, so this test would not "
+        f"detect a float round-trip; adjust the offset"
+    )
+
+    sql = f"SELECT sum(qty) + {offset} AS q FROM facts"
     streamed = _streamed(sql)
-    assert pa.types.is_decimal(streamed.schema.field("q").type), (
-        f"expected an exact decimal sum, got {streamed.schema.field('q').type}")
-
-    # Same values, exactly, at this magnitude — the divergence only appears
-    # past 2**53, which the dataset does not reach.
     buffered = _buffered(sql)
-    assert ([int(v) for v in streamed.column("q").to_pylist()]
-            == [int(v) for v in buffered["q"].to_list()])
+
+    streamed_value = streamed.column("q").to_pylist()[0]
+    buffered_value = buffered["q"].to_list()[0]
+
+    assert int(streamed_value) == expected, (
+        f"streamed sum lost exactness: {streamed_value} != {expected}")
+    assert int(buffered_value) == expected, (
+        f"buffered sum lost exactness: {buffered_value} != {expected}")
+
+    # And the same type, so a caller cannot tell the paths apart by dtype.
+    assert not isinstance(streamed_value, float), (
+        f"streamed integer sum came back as float: {streamed_value!r}")
+    assert not isinstance(buffered_value, float), (
+        f"buffered integer sum came back as float: {buffered_value!r}")
+    assert type(streamed_value) is type(buffered_value), (
+        f"same query, different types: streamed {type(streamed_value).__name__} "
+        f"vs buffered {type(buffered_value).__name__}"
+    )
 
 
 def test_select_star_is_not_limited():

@@ -347,4 +347,18 @@ def build_cases() -> List[ReadCase]:
     add(_c("tombstone_no_duplicate_keys", "tombstone", """
         SELECT COUNT(*) AS total, COUNT(DISTINCT fid) AS distinct_keys FROM facts"""))
 
+    # ---------------- type consistency across modes ----------------
+    # An integer SUM is decimal128(38, 0) in DuckDB. Both paths must reduce it
+    # to the same thing, or one query answers with two types depending only on
+    # how it was called. all_modes is the point of these, not incidental.
+    add(_c("types_integer_sum", "types",
+           "SELECT SUM(qty) AS total FROM facts", all_modes=True))
+    add(_c("types_mixed_aggregates", "types", """
+        SELECT SUM(qty) AS int_sum, COUNT(*) AS n, AVG(qty) AS mean,
+               SUM(amount) AS float_sum, MIN(event_date) AS first_day
+        FROM facts""", all_modes=True))
+    add(_c("types_grouped_integer_sum", "types", """
+        SELECT grp, SUM(qty) AS total FROM facts GROUP BY grp ORDER BY grp""",
+           ordered=True, all_modes=True))
+
     return cases

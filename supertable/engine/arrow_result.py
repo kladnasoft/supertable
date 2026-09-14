@@ -39,6 +39,31 @@ import pyarrow as pa
 from supertable.config.defaults import logger
 
 
+def normalize_arrow_schema(schema: pa.Schema, *, for_pandas: bool = False):
+    """Apply the type rule to a schema alone. Returns ``(schema, changed)``.
+
+    Split out so the buffered and streamed paths cannot drift: a stream must
+    declare its schema before it has seen any data, so it needs the rule
+    without a table to apply it to, and every batch is then cast to what this
+    returned. See :func:`normalize_arrow_types` for the rule itself.
+    """
+    fields, changed = [], False
+    for field in schema:
+        target = field.type
+        if pa.types.is_decimal(field.type):
+            if field.type.scale == 0:
+                target = pa.int64()
+                changed = True
+            elif for_pandas:
+                target = pa.float64()
+                changed = True
+        if target is not field.type:
+            fields.append(pa.field(field.name, target, field.nullable))
+        else:
+            fields.append(field)
+    return (pa.schema(fields) if changed else schema), changed
+
+
 def normalize_arrow_types(table: pa.Table, *, for_pandas: bool = False) -> pa.Table:
     """Cast columns whose Arrow type converts badly to the target frame.
 
@@ -56,20 +81,8 @@ def normalize_arrow_types(table: pa.Table, *, for_pandas: bool = False) -> pa.Ta
     if table.num_columns == 0:
         return table
 
-    fields, changed = [], False
-    for field in table.schema:
-        target = field.type
-        if pa.types.is_decimal(field.type):
-            if field.type.scale == 0:
-                target = pa.int64()
-                changed = True
-            elif for_pandas:
-                target = pa.float64()
-                changed = True
-        if target is not field.type:
-            fields.append(pa.field(field.name, target, field.nullable))
-        else:
-            fields.append(field)
+    target_schema, changed = normalize_arrow_schema(table.schema, for_pandas=for_pandas)
+    fields = list(target_schema)
     if not changed:
         return table
 

@@ -66,11 +66,14 @@ def _normalise(value: Any) -> Any:
     if isinstance(value, bool):
         return value
     if isinstance(value, decimal.Decimal):
-        # SUM over int64 is int128 in DuckDB. The buffered path hands that back
-        # as a Python int while streaming preserves it as a Decimal, so the two
-        # modes describe the same total with different types. Folded together
-        # here because this suite is about values; the type difference is a
-        # separate, cosmetic concern.
+        # Folded to a number so a Decimal and an equal int/float compare equal
+        # here, because this comparison is about values.
+        #
+        # The read path no longer differs on this — a scale-zero decimal (an
+        # integer SUM) is int64 in both the buffered and streamed paths. That
+        # equivalence is asserted on the RAW values by
+        # test_an_integer_sum_has_the_same_python_type_in_every_mode, precisely
+        # because this folding would otherwise hide a regression in it.
         integral = value.to_integral_value()
         return int(integral) if integral == value else round(float(value), 9)
     if isinstance(value, float):
@@ -321,13 +324,84 @@ def test_deleted_rows_are_gone_and_updates_are_current(dataset):
 # the catalogue has to be worth running
 # ---------------------------------------------------------------------------
 
+def test_an_integer_sum_has_the_same_python_type_in_every_mode(dataset):
+    """The same query must not answer with two types.
+
+    DuckDB types an integer SUM as decimal128(38, 0). The buffered path casts
+    that to int64; the streamed path used to hand the raw decimal to the
+    caller, so ``execute`` returned ``int`` and ``stream`` returned ``Decimal``
+    for one query — a difference decided only by how it was called.
+
+    Asserted on the raw values rather than through ``_normalise``, which
+    deliberately folds the two together so the rest of the suite compares
+    values rather than representations. That folding would hide exactly this.
+    """
+    from supertable.data_reader import DataReader, Status, engine, query_sql
+
+    sql = f"SELECT SUM(qty) AS total FROM {FACTS}"
+
+    reader = DataReader(super_name=SUPER, organization=ORG, query=sql)
+    frame, status, message = reader.execute(role_name=ROLE, engine=engine.DUCKDB)
+    assert status is Status.OK, message
+    buffered = list(frame.iter_rows())[0][0]
+
+    streaming_reader = DataReader(super_name=SUPER, organization=ORG, query=sql)
+    handle = streaming_reader.stream(ROLE, engine=engine.DUCKDB, batch_rows=17)
+    try:
+        declared = handle.schema.field("total").type
+        streamed = [r["total"] for b in handle.batches() for r in b.to_pylist()][0]
+    finally:
+        handle.close()
+
+    _columns, helper_rows, _meta = query_sql(
+        ORG, SUPER, sql, 100_000, engine.DUCKDB, ROLE, source="test_suite")
+    helper = helper_rows[0][0]
+
+    expected = sum(r["qty"] for r in logical_rows())
+    assert buffered == streamed == helper == expected, (
+        f"integer SUM disagrees: buffered={buffered!r} streamed={streamed!r} "
+        f"helper={helper!r} expected={expected!r}"
+    )
+    assert type(buffered) is type(streamed) is int, (
+        f"an integer SUM should be int in both paths; got "
+        f"buffered {type(buffered).__name__}, streamed {type(streamed).__name__} "
+        f"(stream declared {declared})"
+    )
+
+
+def test_a_scaled_decimal_column_is_not_coerced_to_int(dataset):
+    """The scale-zero rule must not touch a genuine DECIMAL.
+
+    ``DECIMAL(12, 3)`` has a scale, so it is a real decimal and casting it to
+    an integer would silently drop the fraction. Guards the blast radius of the
+    scale-zero normalisation above.
+    """
+    import decimal as _decimal
+
+    import pyarrow as pa
+
+    from supertable.engine.arrow_result import normalize_arrow_schema
+
+    schema = pa.schema([
+        ("int_sum", pa.decimal128(38, 0)),     # an integer SUM -> becomes int64
+        ("money", pa.decimal128(12, 3)),       # a real decimal -> untouched
+        ("plain", pa.int64()),
+    ])
+    normalized, changed = normalize_arrow_schema(schema, for_pandas=False)
+    assert changed
+    assert normalized.field("int_sum").type == pa.int64()
+    assert normalized.field("money").type == pa.decimal128(12, 3)
+    assert normalized.field("plain").type == pa.int64()
+    assert _decimal  # the type a scaled decimal must still produce
+
+
 def test_the_catalogue_covers_the_features_it_claims():
     """A guard against the suite quietly shrinking."""
     features = {c.feature for c in CASES}
     required = {
         "aggregate", "group_by", "grouping_sets", "window", "date", "join",
         "set_ops", "subquery", "cte", "expression", "null_semantics",
-        "string", "cast", "distinct", "row_bounds", "tombstone",
+        "string", "cast", "distinct", "row_bounds", "tombstone", "types",
     }
     assert required <= features, f"missing feature coverage: {required - features}"
     assert len(CASES) >= 80, f"only {len(CASES)} cases"
