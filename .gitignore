@@ -71,7 +71,15 @@ tests/perf_results/
 # Deliberately NOT a blanket `audit/` ignore: audit/AUDIT_*.md and
 # audit/detail/*.md are hand-written and tracked, and a blanket rule would also
 # swallow future ones.
+# ``**`` rather than a single level: a run nests copies of these under
+# runs/ and historical_original_expectations/, and an anchored pattern misses
+# them — which is how 108 KB of nested payload reached the first commit.
+audit/sql_read_matrix*/**/runs/
 audit/sql_read_matrix*/runs/
+audit/sql_read_matrix*/**/results.json
+audit/sql_read_matrix*/**/expectations.json
+audit/sql_read_matrix*/**/original_expectations.json
+audit/sql_read_matrix*/**/case_results.csv
 audit/sql_read_matrix*/results.json
 audit/sql_read_matrix*/expectations.json
 audit/sql_read_matrix*/original_expectations.json
