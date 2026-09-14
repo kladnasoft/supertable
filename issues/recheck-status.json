@@ -1,0 +1,585 @@
+{
+  "audit": "2026-09-14 recheck",
+  "report": "../audit/sql_read_matrix_recheck_2026-09-14/FINDINGS.md",
+  "issues": [
+    {
+      "id": "STREAD-001",
+      "file": "001-snapshot-fallback-loses-deletions-and-share-filters.md",
+      "title": "Snapshot fallback exposes deleted rows and ignores share filters",
+      "status": "verified_fixed",
+      "summary": "Verified fixed in the 2026-09-14 recheck",
+      "priority": "P1"
+    },
+    {
+      "id": "STREAD-002",
+      "file": "002-query-helper-overwrites-row-limits.md",
+      "title": "query_sql silently overwrites valid row limits",
+      "status": "verified_fixed",
+      "summary": "Verified fixed in the 2026-09-14 recheck",
+      "priority": "P1"
+    },
+    {
+      "id": "STREAD-003",
+      "file": "003-query-helper-appends-limit-after-semicolon.md",
+      "title": "query_sql appends LIMIT after a statement terminator",
+      "status": "partially_verified_remaining_case_blocked",
+      "summary": "Semicolon fix verified; literal-query sample remains unsupported",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-004",
+      "file": "004-date-diff-rewrite-corrupts-arguments.md",
+      "title": "SQL rewriting corrupts DuckDB DATE_DIFF arguments",
+      "status": "verified_fixed",
+      "summary": "Verified fixed in the 2026-09-14 recheck",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-005",
+      "file": "005-grouping-extensions-with-limit-rejected.md",
+      "title": "GROUPING SETS, ROLLUP, and CUBE with LIMIT are rejected",
+      "status": "verified_fixed",
+      "summary": "Verified fixed in the 2026-09-14 recheck",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-006",
+      "file": "006-is-unknown-rejected.md",
+      "title": "Boolean IS UNKNOWN is rejected during SQL admission",
+      "status": "verified_fixed",
+      "summary": "Verified fixed in the 2026-09-14 recheck",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-007",
+      "file": "007-limit-all-treated-as-column.md",
+      "title": "LIMIT ALL is treated as a required table column",
+      "status": "verified_fixed",
+      "summary": "Verified fixed in the 2026-09-14 recheck",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-008",
+      "file": "008-trailing-comment-counted-as-statement.md",
+      "title": "A trailing comment is counted as a second SQL statement",
+      "status": "verified_fixed",
+      "summary": "Verified fixed in the 2026-09-14 recheck",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-009",
+      "file": "009-table-free-selects-unsupported.md",
+      "title": "Table-free SELECTs and literal CTEs cannot execute",
+      "status": "unsupported_original_expectations",
+      "summary": "Unsupported in the current implementation",
+      "priority": "P3"
+    },
+    {
+      "id": "STREAD-010",
+      "file": "010-empty-tables-cannot-be-read.md",
+      "title": "Existing empty tables fail projections and aggregates",
+      "status": "verified_fixed",
+      "summary": "Verified fixed in the 2026-09-14 recheck",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-011",
+      "file": "011-decimal-ingestion-statistics-failure.md",
+      "title": "Decimal ingestion fails while extracting Parquet statistics",
+      "status": "verified_fixed",
+      "summary": "Verified fixed in the 2026-09-14 recheck",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-012",
+      "file": "012-query-helper-changes-rejection-diagnostics.md",
+      "title": "query_sql changes forbidden-statement rejection diagnostics",
+      "status": "verified_fixed",
+      "summary": "Verified fixed in the 2026-09-14 recheck",
+      "priority": "P3"
+    },
+    {
+      "id": "STREAD-013",
+      "file": "013-denied-cte-column-produces-binder-error.md",
+      "title": "Denied columns inside a CTE produce binder errors",
+      "status": "verified_fixed",
+      "summary": "Verified fixed in the 2026-09-14 recheck",
+      "priority": "P3"
+    },
+    {
+      "id": "STREAD-014",
+      "file": "014-group-by-select-alias-treated-as-column.md",
+      "title": "GROUP BY treats SELECT aliases as physical columns",
+      "status": "open",
+      "summary": "Open: seven cases, 35 failed assertions",
+      "priority": "P2"
+    }
+  ],
+  "current_failure_count": 35,
+  "current_failures": [
+    {
+      "issue": "STREAD-014",
+      "case_id": "temporal_date_aggregate_year",
+      "mode": "pruned",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_dates: yr",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/temporal_date_aggregate_year.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "temporal_date_aggregate_year",
+      "mode": "fullscan",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_dates: yr",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/temporal_date_aggregate_year.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "temporal_date_aggregate_year",
+      "mode": "stream",
+      "error": "RuntimeError: stream failed: Missing required column(s): warehouse.temporal_dates: yr",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/temporal_date_aggregate_year.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "temporal_date_aggregate_year",
+      "mode": "auto",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_dates: yr",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/temporal_date_aggregate_year.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "temporal_date_aggregate_year",
+      "mode": "query_sql",
+      "error": "RuntimeError: Query execution failed: Missing required column(s): warehouse.temporal_dates: yr",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/temporal_date_aggregate_year.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "temporal_timestamp_aggregate_year",
+      "mode": "pruned",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_naive: yr",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/temporal_timestamp_aggregate_year.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "temporal_timestamp_aggregate_year",
+      "mode": "fullscan",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_naive: yr",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/temporal_timestamp_aggregate_year.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "temporal_timestamp_aggregate_year",
+      "mode": "stream",
+      "error": "RuntimeError: stream failed: Missing required column(s): warehouse.temporal_naive: yr",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/temporal_timestamp_aggregate_year.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "temporal_timestamp_aggregate_year",
+      "mode": "auto",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_naive: yr",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/temporal_timestamp_aggregate_year.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "temporal_timestamp_aggregate_year",
+      "mode": "query_sql",
+      "error": "RuntimeError: Query execution failed: Missing required column(s): warehouse.temporal_naive: yr",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/temporal_timestamp_aggregate_year.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_date_quoted",
+      "mode": "pruned",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_dates: Calendar Year",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_date_quoted.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_date_quoted",
+      "mode": "fullscan",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_dates: Calendar Year",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_date_quoted.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_date_quoted",
+      "mode": "stream",
+      "error": "RuntimeError: stream failed: Missing required column(s): warehouse.temporal_dates: Calendar Year",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_date_quoted.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_date_quoted",
+      "mode": "auto",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_dates: Calendar Year",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_date_quoted.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_date_quoted",
+      "mode": "query_sql",
+      "error": "RuntimeError: Query execution failed: Missing required column(s): warehouse.temporal_dates: Calendar Year",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_date_quoted.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_timestamp_quoted",
+      "mode": "pruned",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_naive: Calendar Year",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_timestamp_quoted.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_timestamp_quoted",
+      "mode": "fullscan",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_naive: Calendar Year",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_timestamp_quoted.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_timestamp_quoted",
+      "mode": "stream",
+      "error": "RuntimeError: stream failed: Missing required column(s): warehouse.temporal_naive: Calendar Year",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_timestamp_quoted.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_timestamp_quoted",
+      "mode": "auto",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_naive: Calendar Year",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_timestamp_quoted.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_timestamp_quoted",
+      "mode": "query_sql",
+      "error": "RuntimeError: Query execution failed: Missing required column(s): warehouse.temporal_naive: Calendar Year",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_timestamp_quoted.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_direct",
+      "mode": "pruned",
+      "error": "RuntimeError: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_direct.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_direct",
+      "mode": "fullscan",
+      "error": "RuntimeError: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_direct.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_direct",
+      "mode": "stream",
+      "error": "RuntimeError: stream failed: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_direct.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_direct",
+      "mode": "auto",
+      "error": "RuntimeError: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_direct.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_direct",
+      "mode": "query_sql",
+      "error": "RuntimeError: Query execution failed: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_direct.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_expression",
+      "mode": "pruned",
+      "error": "RuntimeError: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_expression.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_expression",
+      "mode": "fullscan",
+      "error": "RuntimeError: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_expression.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_expression",
+      "mode": "stream",
+      "error": "RuntimeError: stream failed: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_expression.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_expression",
+      "mode": "auto",
+      "error": "RuntimeError: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_expression.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_expression",
+      "mode": "query_sql",
+      "error": "RuntimeError: Query execution failed: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_expression.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_rollup",
+      "mode": "pruned",
+      "error": "RuntimeError: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_rollup.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_rollup",
+      "mode": "fullscan",
+      "error": "RuntimeError: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_rollup.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_rollup",
+      "mode": "stream",
+      "error": "RuntimeError: stream failed: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_rollup.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_rollup",
+      "mode": "auto",
+      "error": "RuntimeError: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_rollup.json"
+    },
+    {
+      "issue": "STREAD-014",
+      "case_id": "alias_number_rollup",
+      "mode": "query_sql",
+      "error": "RuntimeError: Query execution failed: Missing required column(s): warehouse.numbers: category",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/failures/alias_number_rollup.json"
+    }
+  ],
+  "remaining_original_expectation_failures": [
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_select",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_select.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_select",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_select.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_select",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_select.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_select",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_select.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_select",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_select.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_select_semicolon.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_select_semicolon.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_select_semicolon.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_select_semicolon.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-003",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_select_semicolon.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_cte",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_cte.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_cte",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_cte.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_cte",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_cte.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_cte",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_cte.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_cte",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_cte.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_union",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_union.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_union",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_union.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_union",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_union.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_union",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_union.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_union",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_union.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_scalar_subquery.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_scalar_subquery.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_scalar_subquery.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_scalar_subquery.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_scalar_subquery.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_cte_declared_columns.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_cte_declared_columns.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_cte_declared_columns.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_cte_declared_columns.json"
+    },
+    {
+      "issue": "STREAD-009",
+      "original_issue": "STREAD-009",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_recheck_2026-09-14/historical_original_expectations/failures/syntax_literal_cte_declared_columns.json"
+    }
+  ],
+  "original_query_outcomes": {
+    "pass": 72,
+    "unsupported_original_expectation": 30
+  },
+  "original_additional_outcomes": {
+    "pass": 5
+  }
+}

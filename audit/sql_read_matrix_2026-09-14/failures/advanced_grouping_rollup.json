@@ -1,0 +1,344 @@
+{
+  "case": {
+    "case_id": "advanced_grouping_rollup",
+    "category": "grouping_sets",
+    "sql": "\n            SELECT region, status, GROUPING(region) AS region_total,\n                   GROUPING(status) AS status_total, COUNT(*) AS n, SUM(amount) AS total_amount\n            FROM warehouse.orders GROUP BY ROLLUP (region, status)\n        ",
+    "columns": [
+      "region",
+      "status",
+      "region_total",
+      "status_total",
+      "n",
+      "total_amount"
+    ],
+    "expected": [
+      [
+        "apac",
+        "cancelled",
+        0,
+        0,
+        14,
+        3610
+      ],
+      [
+        "apac",
+        "new",
+        0,
+        0,
+        15,
+        2443
+      ],
+      [
+        "apac",
+        "paid",
+        0,
+        0,
+        13,
+        2060
+      ],
+      [
+        "apac",
+        "shipped",
+        0,
+        0,
+        15,
+        3675
+      ],
+      [
+        "apac",
+        null,
+        0,
+        0,
+        4,
+        793
+      ],
+      [
+        "apac",
+        null,
+        0,
+        1,
+        61,
+        12581
+      ],
+      [
+        "eu",
+        "cancelled",
+        0,
+        0,
+        20,
+        4166
+      ],
+      [
+        "eu",
+        "new",
+        0,
+        0,
+        20,
+        4860
+      ],
+      [
+        "eu",
+        "paid",
+        0,
+        0,
+        21,
+        5413
+      ],
+      [
+        "eu",
+        "shipped",
+        0,
+        0,
+        20,
+        3315
+      ],
+      [
+        "eu",
+        null,
+        0,
+        0,
+        8,
+        2287
+      ],
+      [
+        "eu",
+        null,
+        0,
+        1,
+        89,
+        20041
+      ],
+      [
+        "us",
+        "cancelled",
+        0,
+        0,
+        21,
+        4532
+      ],
+      [
+        "us",
+        "new",
+        0,
+        0,
+        21,
+        4477
+      ],
+      [
+        "us",
+        "paid",
+        0,
+        0,
+        21,
+        4387
+      ],
+      [
+        "us",
+        "shipped",
+        0,
+        0,
+        21,
+        5240
+      ],
+      [
+        "us",
+        null,
+        0,
+        0,
+        6,
+        1379
+      ],
+      [
+        "us",
+        null,
+        0,
+        1,
+        90,
+        20015
+      ],
+      [
+        null,
+        null,
+        1,
+        1,
+        240,
+        52637
+      ]
+    ],
+    "ordered": false,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": ""
+  },
+  "reference": {
+    "status": "pass",
+    "row_count": 19
+  },
+  "runs": [
+    {
+      "mode": "pruned",
+      "status": "pass",
+      "row_count": 19,
+      "columns": [
+        "region",
+        "status",
+        "region_total",
+        "status_total",
+        "n",
+        "total_amount"
+      ],
+      "types": {
+        "region": "String",
+        "status": "String",
+        "region_total": "Int64",
+        "status_total": "Int64",
+        "n": "Int64",
+        "total_amount": "Int64"
+      },
+      "mismatch": null,
+      "plan_stats": {
+        "REFLECTIONS": 8,
+        "REFLECTION_SIZE": 3427,
+        "REFLECTION_SIZE_RAW": 45542,
+        "FILES_BEFORE_PRUNE": 8,
+        "FILES_PRUNED": 0,
+        "FILES_KEPT": 8,
+        "PRUNE_DURATION_MS": 0.026,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb"
+      },
+      "duration_ms": 123.699
+    },
+    {
+      "mode": "fullscan",
+      "status": "pass",
+      "row_count": 19,
+      "columns": [
+        "region",
+        "status",
+        "region_total",
+        "status_total",
+        "n",
+        "total_amount"
+      ],
+      "types": {
+        "region": "String",
+        "status": "String",
+        "region_total": "Int64",
+        "status_total": "Int64",
+        "n": "Int64",
+        "total_amount": "Int64"
+      },
+      "mismatch": null,
+      "plan_stats": {
+        "REFLECTIONS": 8,
+        "REFLECTION_SIZE": 3427,
+        "REFLECTION_SIZE_RAW": 45542,
+        "FILES_BEFORE_PRUNE": 8,
+        "FILES_PRUNED": 0,
+        "FILES_KEPT": 8,
+        "PRUNE_DURATION_MS": 0.017,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb"
+      },
+      "duration_ms": 109.185
+    },
+    {
+      "mode": "stream",
+      "status": "pass",
+      "batches": 2,
+      "row_count": 19,
+      "columns": [
+        "region",
+        "status",
+        "region_total",
+        "status_total",
+        "n",
+        "total_amount"
+      ],
+      "types": {
+        "region": "String",
+        "status": "String",
+        "region_total": "Int64",
+        "status_total": "Int64",
+        "n": "Int64",
+        "total_amount": "Decimal(precision=38, scale=0)"
+      },
+      "mismatch": null,
+      "plan_stats": {
+        "REFLECTIONS": 8,
+        "REFLECTION_SIZE": 3427,
+        "REFLECTION_SIZE_RAW": 45542,
+        "FILES_BEFORE_PRUNE": 8,
+        "FILES_PRUNED": 0,
+        "FILES_KEPT": 8,
+        "PRUNE_DURATION_MS": 0.013,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb"
+      },
+      "duration_ms": 127.388
+    },
+    {
+      "mode": "auto",
+      "status": "pass",
+      "row_count": 19,
+      "columns": [
+        "region",
+        "status",
+        "region_total",
+        "status_total",
+        "n",
+        "total_amount"
+      ],
+      "types": {
+        "region": "String",
+        "status": "String",
+        "region_total": "Int64",
+        "status_total": "Int64",
+        "n": "Int64",
+        "total_amount": "Int64"
+      },
+      "mismatch": null,
+      "plan_stats": {
+        "REFLECTIONS": 8,
+        "REFLECTION_SIZE": 3427,
+        "REFLECTION_SIZE_RAW": 45542,
+        "FILES_BEFORE_PRUNE": 8,
+        "FILES_PRUNED": 0,
+        "FILES_KEPT": 8,
+        "PRUNE_DURATION_MS": 0.018,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb"
+      },
+      "duration_ms": 143.726
+    },
+    {
+      "mode": "query_sql",
+      "status": "fail",
+      "error": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 5, Col: 12.\n  ) AS total_amount\n            FROM warehouse.orders GROUP BY ROLLUP (region, status)\n        \nLIMIT \u001b[4m100000\u001b[0m",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 41, in execute_case\n    handle.close()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 652, in query_sql\n    raise RuntimeError(f\"Query execution failed: {message}\")\nRuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 5, Col: 12.\n  ) AS total_amount\n            FROM warehouse.orders GROUP BY ROLLUP (region, status)\n        \nLIMIT \u001b[4m100000\u001b[0m\n",
+      "duration_ms": 11.194
+    }
+  ],
+  "dataset": "../dataset.json",
+  "fixture_manifest": "../fixture_manifest.json",
+  "evidence_run": "runs/01_supertable-sql-matrix-discovery"
+}

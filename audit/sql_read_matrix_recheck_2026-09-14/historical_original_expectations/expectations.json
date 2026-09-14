@@ -1,0 +1,134 @@
+[
+  {
+    "case_id": "syntax_literal_select",
+    "category": "sql_literal_source",
+    "sql": "SELECT 42 AS answer, CAST(NULL AS INTEGER) AS missing, TRUE AS flag",
+    "columns": [
+      "answer",
+      "missing",
+      "flag"
+    ],
+    "expected": [
+      [
+        42,
+        null,
+        true
+      ]
+    ],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": "",
+    "session_timezone": "UTC"
+  },
+  {
+    "case_id": "syntax_literal_select_semicolon",
+    "category": "sql_literal_source",
+    "sql": "SELECT 6 * 7 AS answer;",
+    "columns": [
+      "answer"
+    ],
+    "expected": [
+      [
+        42
+      ]
+    ],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": "",
+    "session_timezone": "UTC"
+  },
+  {
+    "case_id": "syntax_literal_cte",
+    "category": "sql_literal_source",
+    "sql": "WITH constants AS (SELECT 6 AS n, 7 AS m) SELECT n * m AS answer FROM constants",
+    "columns": [
+      "answer"
+    ],
+    "expected": [
+      [
+        42
+      ]
+    ],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": "",
+    "session_timezone": "UTC"
+  },
+  {
+    "case_id": "syntax_literal_union",
+    "category": "sql_literal_source",
+    "sql": "SELECT 3 AS n UNION ALL SELECT 1 AS n UNION ALL SELECT 2 AS n ORDER BY n",
+    "columns": [
+      "n"
+    ],
+    "expected": [
+      [
+        1
+      ],
+      [
+        2
+      ],
+      [
+        3
+      ]
+    ],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": "",
+    "session_timezone": "UTC"
+  },
+  {
+    "case_id": "syntax_literal_scalar_subquery",
+    "category": "sql_literal_source",
+    "sql": "SELECT (SELECT 9) + 1 AS answer",
+    "columns": [
+      "answer"
+    ],
+    "expected": [
+      [
+        10
+      ]
+    ],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": "",
+    "session_timezone": "UTC"
+  },
+  {
+    "case_id": "syntax_literal_cte_declared_columns",
+    "category": "sql_literal_source",
+    "sql": "WITH constants(n, label) AS (SELECT 5, 'fixed') SELECT n + 2 AS value, label FROM constants",
+    "columns": [
+      "value",
+      "label"
+    ],
+    "expected": [
+      [
+        7,
+        "fixed"
+      ]
+    ],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": "",
+    "session_timezone": "UTC"
+  }
+]

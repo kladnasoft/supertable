@@ -1,0 +1,179 @@
+{
+  "case": {
+    "case_id": "advanced_date_date_diff",
+    "category": "date_timestamp",
+    "sql": "SELECT eid, DATE_DIFF('day', event_date, DATE '2024-03-15') AS result FROM warehouse.events ORDER BY eid",
+    "columns": [
+      "eid",
+      "result"
+    ],
+    "expected": [
+      [
+        1,
+        16
+      ],
+      [
+        2,
+        15
+      ],
+      [
+        3,
+        14
+      ],
+      [
+        4,
+        13
+      ],
+      [
+        5,
+        12
+      ],
+      [
+        6,
+        11
+      ],
+      [
+        7,
+        10
+      ],
+      [
+        8,
+        9
+      ],
+      [
+        9,
+        8
+      ],
+      [
+        10,
+        7
+      ],
+      [
+        11,
+        6
+      ],
+      [
+        12,
+        5
+      ],
+      [
+        13,
+        4
+      ],
+      [
+        14,
+        3
+      ],
+      [
+        15,
+        2
+      ],
+      [
+        16,
+        1
+      ],
+      [
+        17,
+        0
+      ],
+      [
+        18,
+        -1
+      ],
+      [
+        19,
+        -2
+      ],
+      [
+        20,
+        -3
+      ],
+      [
+        21,
+        -4
+      ],
+      [
+        22,
+        -5
+      ],
+      [
+        23,
+        -6
+      ],
+      [
+        24,
+        -7
+      ]
+    ],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": ""
+  },
+  "reference": {
+    "status": "pass",
+    "row_count": 24
+  },
+  "runs": [
+    {
+      "mode": "pruned",
+      "status": "fail",
+      "error": "RuntimeError: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 47, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\nRuntimeError: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^\n",
+      "duration_ms": 89.969
+    },
+    {
+      "mode": "fullscan",
+      "status": "fail",
+      "error": "RuntimeError: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 47, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\nRuntimeError: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^\n",
+      "duration_ms": 71.754
+    },
+    {
+      "mode": "stream",
+      "status": "fail",
+      "error": "RuntimeError: stream failed: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 27, in execute_case\n    try:\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 564, in stream\n    raise RuntimeError(f\"stream failed: {message}\")\nRuntimeError: stream failed: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^\n",
+      "duration_ms": 67.988
+    },
+    {
+      "mode": "auto",
+      "status": "fail",
+      "error": "RuntimeError: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 47, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\nRuntimeError: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^\n",
+      "duration_ms": 88.617
+    },
+    {
+      "mode": "query_sql",
+      "status": "fail",
+      "error": "RuntimeError: Query execution failed: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 41, in execute_case\n    handle.close()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 652, in query_sql\n    raise RuntimeError(f\"Query execution failed: {message}\")\nRuntimeError: Query execution failed: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^\n",
+      "duration_ms": 110.864
+    }
+  ],
+  "dataset": "../dataset.json",
+  "fixture_manifest": "../fixture_manifest.json",
+  "evidence_run": "runs/01_supertable-sql-matrix-discovery"
+}

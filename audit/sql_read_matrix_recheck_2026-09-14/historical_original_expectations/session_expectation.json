@@ -1,0 +1,25 @@
+{
+  "case_id": "session_timezone_probe",
+  "category": "session_verification",
+  "sql": "SELECT current_setting('TimeZone') AS zone, CAST(TIMESTAMPTZ '2024-01-01 00:00:00+00' AS DATE) AS local_day FROM orders LIMIT 1",
+  "columns": [
+    "zone",
+    "local_day"
+  ],
+  "expected": [
+    [
+      "UTC",
+      {
+        "type": "date",
+        "value": "2024-01-01"
+      }
+    ]
+  ],
+  "ordered": false,
+  "role": "superadmin",
+  "error_contains": [],
+  "expected_types": {},
+  "min_pruned_files": 0,
+  "note": "",
+  "session_timezone": "UTC"
+}

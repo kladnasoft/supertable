@@ -1,0 +1,2420 @@
+{
+  "evidence_runs": {
+    "runs/01_supertable-sql-matrix-discovery": {
+      "tables": {
+        "orders": {
+          "path": "sqlmatrix/warehouse/tables/orders/snapshots/1789375521521_e125941f715020cb_tables.json",
+          "ts": 1789375521526,
+          "version": 8,
+          "payload": {
+            "rowid_high_watermark": 240,
+            "snapshot_version": 8,
+            "schema": {
+              "created": "Date",
+              "note": "String",
+              "score": "Float64",
+              "region": "String",
+              "code": "String",
+              "happened": "Datetime(time_unit='us', time_zone=None)",
+              "active": "Boolean",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "__rowid__": "Int64",
+              "amount": "Int64",
+              "status": "String",
+              "qty": "Int64",
+              "oid": "Int64",
+              "cid": "Int64"
+            },
+            "simple_name": "orders",
+            "last_updated_ms": 1789375521520,
+            "stats_rows": 96,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 12,
+              "source_type": "write",
+              "write_id": "38c4d4ce-db61-4978-87af-69521d270afe",
+              "incoming_rows": 30
+            },
+            "location": "sqlmatrix/warehouse/tables/orders",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/orders/snapshots/1789375521471_e05a6787f7314de7_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375521126_44d678ae432d57e3_data.parquet",
+                "rows": 30,
+                "file_size": 5648,
+                "columns": 14
+              },
+              {
+                "file_size": 5683,
+                "rows": 30,
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375521196_0b9d0743d447c693_data.parquet"
+              },
+              {
+                "rows": 30,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375521261_163cf5964a9a13e2_data.parquet",
+                "columns": 14,
+                "file_size": 5685
+              },
+              {
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375521319_1457dab7f6caceff_data.parquet",
+                "file_size": 5705,
+                "rows": 30
+              },
+              {
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375521364_39d52607d9634705_data.parquet",
+                "rows": 30,
+                "file_size": 5707,
+                "columns": 14
+              },
+              {
+                "file_size": 5695,
+                "rows": 30,
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375521411_288617bfcbcf93f2_data.parquet"
+              },
+              {
+                "rows": 30,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375521457_df4b6c4e8de852c0_data.parquet",
+                "columns": 14,
+                "file_size": 5689
+              },
+              {
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375521503_85a48283e30a3e3e_data.parquet",
+                "file_size": 5730,
+                "rows": 30
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/orders/stats/year=2026/month=09/day=14/hour=08/1789375521513_a0de4fcf899ddd24_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"oid\":\"Int64\",\"cid\":\"Int64\",\"region\":\"String\",\"status\":\"String\",\"amount\":\"Int64\",\"qty\":\"Int64\",\"score\":\"Float64\",\"active\":\"Boolean\",\"created\":\"Date\",\"happened\":\"Datetime(time_unit='us', time_zone=None)\",\"note\":\"String\",\"code\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "customers": {
+          "path": "sqlmatrix/warehouse/tables/customers/snapshots/1789375521694_11baca0baa12221d_tables.json",
+          "ts": 1789375521698,
+          "version": 4,
+          "payload": {
+            "rowid_high_watermark": 16,
+            "snapshot_version": 4,
+            "schema": {
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "name": "String",
+              "region": "String",
+              "__rowid__": "Int64",
+              "active": "Boolean",
+              "credit": "Int64",
+              "cid": "Int64"
+            },
+            "simple_name": "customers",
+            "last_updated_ms": 1789375521693,
+            "stats_rows": 20,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 5,
+              "source_type": "write",
+              "write_id": "3559e169-e2a9-4989-9cb9-db470f221344",
+              "incoming_rows": 1
+            },
+            "location": "sqlmatrix/warehouse/tables/customers",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/customers/snapshots/1789375521645_50909d34ab422fa5_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789375521563_cf8009abadbb871b_data.parquet",
+                "rows": 5,
+                "file_size": 2610,
+                "columns": 7
+              },
+              {
+                "file_size": 2613,
+                "rows": 5,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789375521595_59fa86af3c031345_data.parquet"
+              },
+              {
+                "rows": 5,
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789375521631_63fc87fde74d7c51_data.parquet",
+                "columns": 7,
+                "file_size": 2610
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789375521671_b628fa7b7e75664b_data.parquet",
+                "file_size": 2512,
+                "rows": 1
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/customers/stats/year=2026/month=09/day=14/hour=08/1789375521689_af2007c630cc72a3_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"cid\":\"Int64\",\"name\":\"String\",\"region\":\"String\",\"credit\":\"Int64\",\"active\":\"Boolean\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "items": {
+          "path": "sqlmatrix/warehouse/tables/items/snapshots/1789375522117_1691ee88e11bb94d_tables.json",
+          "ts": 1789375522123,
+          "version": 8,
+          "payload": {
+            "rowid_high_watermark": 480,
+            "snapshot_version": 8,
+            "schema": {
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "__rowid__": "Int64",
+              "oid": "Int64",
+              "price": "Int64",
+              "iid": "Int64",
+              "sku": "String",
+              "units": "Int64"
+            },
+            "simple_name": "items",
+            "last_updated_ms": 1789375522117,
+            "stats_rows": 40,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 5,
+              "source_type": "write",
+              "write_id": "ea6591c8-b5d0-4ae6-8500-c94545565a8c",
+              "incoming_rows": 60
+            },
+            "location": "sqlmatrix/warehouse/tables/items",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/items/snapshots/1789375522053_6d5f726e21f9532c_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375521734_ca29bacc79840145_data.parquet",
+                "rows": 60,
+                "file_size": 3093,
+                "columns": 7
+              },
+              {
+                "file_size": 3123,
+                "rows": 60,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375521773_2c8df48b5457f964_data.parquet"
+              },
+              {
+                "rows": 60,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375521818_11285c036a634b57_data.parquet",
+                "columns": 7,
+                "file_size": 3133
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375521865_164f9623768674b3_data.parquet",
+                "file_size": 3141,
+                "rows": 60
+              },
+              {
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375521910_7d1b7c6eaddb9128_data.parquet",
+                "rows": 60,
+                "file_size": 3257,
+                "columns": 7
+              },
+              {
+                "file_size": 3227,
+                "rows": 60,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375521962_7ac6ae0021424bf2_data.parquet"
+              },
+              {
+                "rows": 60,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375522031_15290d6f4aabfd4d_data.parquet",
+                "columns": 7,
+                "file_size": 3227
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375522103_8cd26ebd66fdec69_data.parquet",
+                "file_size": 3227,
+                "rows": 60
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/items/stats/year=2026/month=09/day=14/hour=08/1789375522112_2ae994477f7ee994_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"iid\":\"Int64\",\"oid\":\"Int64\",\"sku\":\"String\",\"units\":\"Int64\",\"price\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "numbers": {
+          "path": "sqlmatrix/warehouse/tables/numbers/snapshots/1789375522408_99773e7d99774681_tables.json",
+          "ts": 1789375522414,
+          "version": 4,
+          "payload": {
+            "rowid_high_watermark": 31,
+            "snapshot_version": 4,
+            "schema": {
+              "grp": "Int64",
+              "__rowid__": "Int64",
+              "label": "String",
+              "rid": "Int64",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "nullable_n": "Int64",
+              "n": "Int64"
+            },
+            "simple_name": "numbers",
+            "last_updated_ms": 1789375522408,
+            "stats_rows": 20,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 5,
+              "source_type": "write",
+              "write_id": "287f5b0a-c360-4f62-b9f5-23088cb95f1d",
+              "incoming_rows": 1
+            },
+            "location": "sqlmatrix/warehouse/tables/numbers",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/numbers/snapshots/1789375522339_f2348ef3b29896da_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789375522170_5f61326ef6706b70_data.parquet",
+                "rows": 10,
+                "file_size": 2772,
+                "columns": 7
+              },
+              {
+                "file_size": 2771,
+                "rows": 10,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789375522261_bfecb87bd9ecc800_data.parquet"
+              },
+              {
+                "rows": 10,
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789375522322_8cfcc7fd57d14040_data.parquet",
+                "columns": 7,
+                "file_size": 2772
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789375522390_5c55e8b851191fa8_data.parquet",
+                "file_size": 2502,
+                "rows": 1
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/numbers/stats/year=2026/month=09/day=14/hour=08/1789375522403_fc724bb6fa8b8781_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"rid\":\"Int64\",\"n\":\"Int64\",\"grp\":\"Int64\",\"nullable_n\":\"Int64\",\"label\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "events": {
+          "path": "sqlmatrix/warehouse/tables/events/snapshots/1789375522513_7e5ec03cd8628f03_tables.json",
+          "ts": 1789375522517,
+          "version": 1,
+          "payload": {
+            "rowid_high_watermark": 32,
+            "tombstone_rows": 0,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"event_date\":\"Date\",\"event_time\":\"Datetime(time_unit='us', time_zone=None)\",\"money\":\"Decimal(precision=12, scale=3)\",\"flag\":\"Boolean\",\"label\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone=None)\"}}",
+            "stats_file": "sqlmatrix/warehouse/tables/events/stats/year=2026/month=09/day=14/hour=08/1789375522507_7d347bf638b319cb_stats.parquet",
+            "last_updated_ms": 1789375522512,
+            "stats_rows": 18,
+            "tombstone": null,
+            "lineage": {
+              "source_type": "sql_matrix_fixture_fallback"
+            },
+            "previous_snapshot": "sqlmatrix/warehouse/tables/events/snapshots/1789375522465_b84c33a0da98f2d3_tables.json",
+            "resources": [
+              {
+                "file_size": 5767,
+                "file": "sqlmatrix/warehouse/tables/events/data/independent_arrow_fixture.parquet",
+                "columns": 8,
+                "rows": 24
+              }
+            ],
+            "location": "sqlmatrix/warehouse/tables/events",
+            "simple_name": "events",
+            "schema": {
+              "event_date": "Date",
+              "eid": "Int64",
+              "__rowid__": "Int64",
+              "label": "String",
+              "money": "Decimal(precision=12, scale=3)",
+              "__timestamp__": "Datetime(time_unit='us', time_zone=None)",
+              "flag": "Boolean",
+              "event_time": "Datetime(time_unit='us', time_zone=None)"
+            },
+            "snapshot_version": 1
+          }
+        },
+        "ledger": {
+          "path": "sqlmatrix/warehouse/tables/ledger/snapshots/1789375522975_8c3b3c8d9c7fbd17_tables.json",
+          "ts": 1789375522983,
+          "version": 6,
+          "payload": {
+            "rowid_high_watermark": 29,
+            "snapshot_version": 6,
+            "schema": {
+              "revision": "Int64",
+              "__rowid__": "Int64",
+              "value": "Int64",
+              "lid": "Int64",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+            },
+            "simple_name": "ledger",
+            "last_updated_ms": 1789375522975,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"lid\":\"Int64\",\"value\":\"Int64\",\"revision\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+            "tombstone": [
+              "sqlmatrix/warehouse/tables/ledger/tombstone/year=2026/month=09/day=14/hour=08/1789375522804_d3c508908588f7fb_deleted.parquet",
+              "sqlmatrix/warehouse/tables/ledger/tombstone/year=2026/month=09/day=14/hour=08/1789375522912_690dc88f5206b672_deleted.parquet"
+            ],
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 3,
+              "source_type": "write",
+              "write_id": "5cb6c7aa-edbe-400e-aea5-4c0aa045916d",
+              "incoming_rows": 2
+            },
+            "location": "sqlmatrix/warehouse/tables/ledger",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/ledger/snapshots/1789375522920_39865a4a9403d0da_tables.json",
+            "tombstone_rows": 5,
+            "resources": [
+              {
+                "rows": 8,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789375522562_7a93c73d9358bba5_data.parquet",
+                "columns": 5,
+                "file_size": 2045
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789375522605_9c7249b28585be5c_data.parquet",
+                "file_size": 2045,
+                "rows": 8
+              },
+              {
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789375522654_ed1e6e77e9f4537d_data.parquet",
+                "rows": 8,
+                "file_size": 2045,
+                "columns": 5
+              },
+              {
+                "file_size": 2012,
+                "rows": 3,
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789375522797_63942c42698c003b_data.parquet"
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789375522959_73b91b6e582b34e6_data.parquet",
+                "file_size": 1997,
+                "rows": 2
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/ledger/stats/year=2026/month=09/day=14/hour=08/1789375522971_a169f3c3ee8ae2fe_stats.parquet",
+            "stats_rows": 15
+          }
+        },
+        "evolving": {
+          "path": "sqlmatrix/warehouse/tables/evolving/snapshots/1789375523141_ce74656517d03ab7_tables.json",
+          "ts": 1789375523147,
+          "version": 2,
+          "payload": {
+            "rowid_high_watermark": 6,
+            "snapshot_version": 2,
+            "schema": {
+              "eid": "Int64",
+              "__rowid__": "Int64",
+              "extra": "String",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "value": "Int64"
+            },
+            "simple_name": "evolving",
+            "last_updated_ms": 1789375523141,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"value\":\"Int64\",\"extra\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 3,
+              "source_type": "write",
+              "write_id": "4e67e510-f582-493f-8dab-edfa1d527ca8",
+              "incoming_rows": 3
+            },
+            "location": "sqlmatrix/warehouse/tables/evolving",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/evolving/snapshots/1789375523085_b3154d75a796697f_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "rows": 3,
+                "file": "sqlmatrix/warehouse/tables/evolving/data/year=2026/month=09/day=14/1789375523064_3f6692b4275bec02_data.parquet",
+                "columns": 4,
+                "file_size": 1655
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/evolving/data/year=2026/month=09/day=14/1789375523127_2876691d5257b21e_data.parquet",
+                "file_size": 2004,
+                "rows": 3
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/evolving/stats/year=2026/month=09/day=14/hour=08/1789375523136_1e9145ef877720f8_stats.parquet",
+            "stats_rows": 5
+          }
+        },
+        "nulls": {
+          "path": "sqlmatrix/warehouse/tables/nulls/snapshots/1789375523415_7229df691ba94821_tables.json",
+          "ts": 1789375523424,
+          "version": 4,
+          "payload": {
+            "rowid_high_watermark": 8,
+            "snapshot_version": 4,
+            "schema": {
+              "nid": "Int64",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "__rowid__": "Int64",
+              "label": "String",
+              "value": "Int64"
+            },
+            "simple_name": "nulls",
+            "last_updated_ms": 1789375523414,
+            "stats_rows": 12,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 3,
+              "source_type": "write",
+              "write_id": "31427d4c-59c7-4ea2-89bb-03da98a5c4de",
+              "incoming_rows": 2
+            },
+            "location": "sqlmatrix/warehouse/tables/nulls",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/nulls/snapshots/1789375523353_c58b909095d1aeef_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789375523191_d77b41742214788a_data.parquet",
+                "rows": 2,
+                "file_size": 1799,
+                "columns": 5
+              },
+              {
+                "file_size": 1799,
+                "rows": 2,
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789375523262_33a8e7dad15e3d1e_data.parquet"
+              },
+              {
+                "rows": 2,
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789375523321_e766dda77f4f840d_data.parquet",
+                "columns": 5,
+                "file_size": 1799
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789375523402_cb0cb34c9556d7dc_data.parquet",
+                "file_size": 1799,
+                "rows": 2
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/nulls/stats/year=2026/month=09/day=14/hour=08/1789375523409_866e48c87b4d34f8_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"nid\":\"Int64\",\"value\":\"Int64\",\"label\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "empty_table": {
+          "path": "sqlmatrix/warehouse/tables/empty_table/snapshots/1789375523482_5b63c73ae925d374_tables.json",
+          "ts": 1789375523488,
+          "version": 1,
+          "payload": {
+            "rowid_high_watermark": 0,
+            "tombstone_rows": 0,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+            "stats_file": null,
+            "last_updated_ms": 1789375523482,
+            "stats_rows": 0,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 1,
+              "source_type": "write",
+              "write_id": "2d98edfc-cf56-4f3f-b078-e999f079d01c",
+              "incoming_rows": 0
+            },
+            "previous_snapshot": "sqlmatrix/warehouse/tables/empty_table/snapshots/1789375523472_5dcabf1001ed80f2_tables.json",
+            "resources": {},
+            "location": "sqlmatrix/warehouse/tables/empty_table",
+            "simple_name": "empty_table",
+            "schema": {
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "eid": "Int64"
+            },
+            "snapshot_version": 1
+          }
+        }
+      },
+      "setup_checks": [
+        {
+          "case_id": "ingest_orders",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_customers",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_items",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_numbers",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_events",
+          "status": "fail",
+          "error": "ArrowNotImplementedError: Cannot extract statistics for type ",
+          "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/runtime.py\", line 104, in prepare_tables\n    write_table(table_name, rows)\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/runtime.py\", line 100, in write_table\n    writer.write(\"superadmin\", table_name, pa.Table.from_pylist(rows[start:start + size], schema=schemas[table_name]), [])\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_writer.py\", line 1053, in write\n    new_stats_rows = extract_stats_rows(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/processing.py\", line 2109, in extract_stats_rows\n    all_rows.extend(_stats_rows_for_metadata(path, md))\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/processing.py\", line 2039, in _stats_rows_for_metadata\n    category, mn, mx = _route_stats(stat)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/processing.py\", line 1952, in _route_stats\n    mn, mx = stat.min, stat.max\n  File \"pyarrow/_parquet.pyx\", line 160, in pyarrow._parquet.Statistics.min.__get__\n  File \"pyarrow/_parquet.pyx\", line 303, in pyarrow._parquet._cast_statistics\n  File \"pyarrow/error.pxi\", line 92, in pyarrow.lib.check_status\npyarrow.lib.ArrowNotImplementedError: Cannot extract statistics for type \n",
+          "fallback": "Explicit PyArrow Parquet fixture + native snapshot/catalog publication"
+        },
+        {
+          "case_id": "ingest_ledger",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_evolving",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_nulls",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_empty_table",
+          "status": "pass",
+          "method": "DataWriter"
+        }
+      ]
+    },
+    "runs/02_supertable-sql-controls-reviewed": {
+      "tables": {
+        "orders": {
+          "path": "sqlmatrix/warehouse/tables/orders/snapshots/1789375812142_4904099cb78a3e07_tables.json",
+          "ts": 1789375812151,
+          "version": 8,
+          "payload": {
+            "rowid_high_watermark": 240,
+            "snapshot_version": 8,
+            "schema": {
+              "created": "Date",
+              "note": "String",
+              "score": "Float64",
+              "region": "String",
+              "code": "String",
+              "happened": "Datetime(time_unit='us', time_zone=None)",
+              "active": "Boolean",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "__rowid__": "Int64",
+              "amount": "Int64",
+              "status": "String",
+              "qty": "Int64",
+              "oid": "Int64",
+              "cid": "Int64"
+            },
+            "simple_name": "orders",
+            "last_updated_ms": 1789375812141,
+            "stats_rows": 96,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 12,
+              "source_type": "write",
+              "write_id": "761c68dc-1705-4545-834c-3e080bb10b3c",
+              "incoming_rows": 30
+            },
+            "location": "sqlmatrix/warehouse/tables/orders",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/orders/snapshots/1789375812068_f2ea408326fe331d_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375811585_fcd4dc66c0abe4ea_data.parquet",
+                "rows": 30,
+                "file_size": 5648,
+                "columns": 14
+              },
+              {
+                "file_size": 5683,
+                "rows": 30,
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375811665_a3059e5b90cc15fa_data.parquet"
+              },
+              {
+                "rows": 30,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375811746_c84ddefb9e5c6b8e_data.parquet",
+                "columns": 14,
+                "file_size": 5685
+              },
+              {
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375811825_bb58bbe02e5d9a31_data.parquet",
+                "file_size": 5705,
+                "rows": 30
+              },
+              {
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375811902_d69d2b58d87cc4d3_data.parquet",
+                "rows": 30,
+                "file_size": 5707,
+                "columns": 14
+              },
+              {
+                "file_size": 5695,
+                "rows": 30,
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375811972_3feb16424af5374f_data.parquet"
+              },
+              {
+                "rows": 30,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375812050_8ae01b0a421b29cc_data.parquet",
+                "columns": 14,
+                "file_size": 5689
+              },
+              {
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789375812109_922482d1525caef5_data.parquet",
+                "file_size": 5730,
+                "rows": 30
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/orders/stats/year=2026/month=09/day=14/hour=08/1789375812132_e12a80efab676c70_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"oid\":\"Int64\",\"cid\":\"Int64\",\"region\":\"String\",\"status\":\"String\",\"amount\":\"Int64\",\"qty\":\"Int64\",\"score\":\"Float64\",\"active\":\"Boolean\",\"created\":\"Date\",\"happened\":\"Datetime(time_unit='us', time_zone=None)\",\"note\":\"String\",\"code\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "customers": {
+          "path": "sqlmatrix/warehouse/tables/customers/snapshots/1789375812406_ab89627300b0cbad_tables.json",
+          "ts": 1789375812411,
+          "version": 4,
+          "payload": {
+            "rowid_high_watermark": 16,
+            "snapshot_version": 4,
+            "schema": {
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "name": "String",
+              "region": "String",
+              "__rowid__": "Int64",
+              "active": "Boolean",
+              "credit": "Int64",
+              "cid": "Int64"
+            },
+            "simple_name": "customers",
+            "last_updated_ms": 1789375812406,
+            "stats_rows": 20,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 5,
+              "source_type": "write",
+              "write_id": "29944425-a5f1-40d8-a2fd-d45ad7fd550c",
+              "incoming_rows": 1
+            },
+            "location": "sqlmatrix/warehouse/tables/customers",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/customers/snapshots/1789375812350_f8badec5e2d0ef8a_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789375812196_10021faba4fe74e0_data.parquet",
+                "rows": 5,
+                "file_size": 2610,
+                "columns": 7
+              },
+              {
+                "file_size": 2613,
+                "rows": 5,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789375812266_f99b61dad238591c_data.parquet"
+              },
+              {
+                "rows": 5,
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789375812333_a6336fe9a7c39a15_data.parquet",
+                "columns": 7,
+                "file_size": 2610
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789375812383_ac418b4cdcc605a0_data.parquet",
+                "file_size": 2512,
+                "rows": 1
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/customers/stats/year=2026/month=09/day=14/hour=08/1789375812398_5a125831acb8d014_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"cid\":\"Int64\",\"name\":\"String\",\"region\":\"String\",\"credit\":\"Int64\",\"active\":\"Boolean\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "items": {
+          "path": "sqlmatrix/warehouse/tables/items/snapshots/1789375812774_98543b8f9e0353e1_tables.json",
+          "ts": 1789375812781,
+          "version": 8,
+          "payload": {
+            "rowid_high_watermark": 480,
+            "snapshot_version": 8,
+            "schema": {
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "__rowid__": "Int64",
+              "oid": "Int64",
+              "price": "Int64",
+              "iid": "Int64",
+              "sku": "String",
+              "units": "Int64"
+            },
+            "simple_name": "items",
+            "last_updated_ms": 1789375812774,
+            "stats_rows": 40,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 5,
+              "source_type": "write",
+              "write_id": "1e4a8913-f328-49c4-8438-4e5f127830ec",
+              "incoming_rows": 60
+            },
+            "location": "sqlmatrix/warehouse/tables/items",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/items/snapshots/1789375812720_fc19f0c4fee4ccbc_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375812452_25a14f3694e9a99b_data.parquet",
+                "rows": 60,
+                "file_size": 3093,
+                "columns": 7
+              },
+              {
+                "file_size": 3123,
+                "rows": 60,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375812491_4edd1c21de386d1e_data.parquet"
+              },
+              {
+                "rows": 60,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375812527_74de197c6383e8e5_data.parquet",
+                "columns": 7,
+                "file_size": 3133
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375812567_08f9b314846285b8_data.parquet",
+                "file_size": 3141,
+                "rows": 60
+              },
+              {
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375812617_5808e027b79e75ec_data.parquet",
+                "rows": 60,
+                "file_size": 3257,
+                "columns": 7
+              },
+              {
+                "file_size": 3227,
+                "rows": 60,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375812657_c651cf74d21cca6f_data.parquet"
+              },
+              {
+                "rows": 60,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375812704_f53d32cc2db58dd2_data.parquet",
+                "columns": 7,
+                "file_size": 3227
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789375812752_c3973d79254db72d_data.parquet",
+                "file_size": 3227,
+                "rows": 60
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/items/stats/year=2026/month=09/day=14/hour=08/1789375812764_bbd0a0a500594d32_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"iid\":\"Int64\",\"oid\":\"Int64\",\"sku\":\"String\",\"units\":\"Int64\",\"price\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "numbers": {
+          "path": "sqlmatrix/warehouse/tables/numbers/snapshots/1789375813043_7f175338625943f3_tables.json",
+          "ts": 1789375813052,
+          "version": 4,
+          "payload": {
+            "rowid_high_watermark": 31,
+            "snapshot_version": 4,
+            "schema": {
+              "grp": "Int64",
+              "__rowid__": "Int64",
+              "label": "String",
+              "rid": "Int64",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "nullable_n": "Int64",
+              "n": "Int64"
+            },
+            "simple_name": "numbers",
+            "last_updated_ms": 1789375813043,
+            "stats_rows": 20,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 5,
+              "source_type": "write",
+              "write_id": "9a06cd8c-6a33-4b86-8689-148d041f6107",
+              "incoming_rows": 1
+            },
+            "location": "sqlmatrix/warehouse/tables/numbers",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/numbers/snapshots/1789375812985_f1391976a7a0b465_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789375812829_9a415aae89d83c3b_data.parquet",
+                "rows": 10,
+                "file_size": 2772,
+                "columns": 7
+              },
+              {
+                "file_size": 2771,
+                "rows": 10,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789375812910_c40ed4b4b36434fd_data.parquet"
+              },
+              {
+                "rows": 10,
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789375812970_33788c0fac15e13d_data.parquet",
+                "columns": 7,
+                "file_size": 2772
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789375813022_7cd3a23b857a713c_data.parquet",
+                "file_size": 2502,
+                "rows": 1
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/numbers/stats/year=2026/month=09/day=14/hour=08/1789375813036_8e4a58caaa3a5dec_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"rid\":\"Int64\",\"n\":\"Int64\",\"grp\":\"Int64\",\"nullable_n\":\"Int64\",\"label\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "events": {
+          "path": "sqlmatrix/warehouse/tables/events/snapshots/1789375813192_60edb694ff614709_tables.json",
+          "ts": 1789375813199,
+          "version": 1,
+          "payload": {
+            "rowid_high_watermark": 32,
+            "tombstone_rows": 0,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"event_date\":\"Date\",\"event_time\":\"Datetime(time_unit='us', time_zone=None)\",\"money\":\"Decimal(precision=12, scale=3)\",\"flag\":\"Boolean\",\"label\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone=None)\"}}",
+            "stats_file": "sqlmatrix/warehouse/tables/events/stats/year=2026/month=09/day=14/hour=08/1789375813173_004aaaef5dbedeba_stats.parquet",
+            "last_updated_ms": 1789375813192,
+            "stats_rows": 18,
+            "tombstone": null,
+            "lineage": {
+              "source_type": "sql_matrix_fixture_fallback"
+            },
+            "previous_snapshot": "sqlmatrix/warehouse/tables/events/snapshots/1789375813101_ffdb45de546bc397_tables.json",
+            "resources": [
+              {
+                "file_size": 5767,
+                "file": "sqlmatrix/warehouse/tables/events/data/independent_arrow_fixture.parquet",
+                "columns": 8,
+                "rows": 24
+              }
+            ],
+            "location": "sqlmatrix/warehouse/tables/events",
+            "simple_name": "events",
+            "schema": {
+              "event_date": "Date",
+              "eid": "Int64",
+              "__rowid__": "Int64",
+              "label": "String",
+              "money": "Decimal(precision=12, scale=3)",
+              "__timestamp__": "Datetime(time_unit='us', time_zone=None)",
+              "flag": "Boolean",
+              "event_time": "Datetime(time_unit='us', time_zone=None)"
+            },
+            "snapshot_version": 1
+          }
+        },
+        "ledger": {
+          "path": "sqlmatrix/warehouse/tables/ledger/snapshots/1789375813694_a8fd469d1f7343b0_tables.json",
+          "ts": 1789375813701,
+          "version": 6,
+          "payload": {
+            "rowid_high_watermark": 29,
+            "snapshot_version": 6,
+            "schema": {
+              "revision": "Int64",
+              "__rowid__": "Int64",
+              "value": "Int64",
+              "lid": "Int64",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+            },
+            "simple_name": "ledger",
+            "last_updated_ms": 1789375813693,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"lid\":\"Int64\",\"value\":\"Int64\",\"revision\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+            "tombstone": [
+              "sqlmatrix/warehouse/tables/ledger/tombstone/year=2026/month=09/day=14/hour=08/1789375813512_9804603074a2948d_deleted.parquet",
+              "sqlmatrix/warehouse/tables/ledger/tombstone/year=2026/month=09/day=14/hour=08/1789375813613_aea63c0ceb02cb0b_deleted.parquet"
+            ],
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 3,
+              "source_type": "write",
+              "write_id": "7dce8393-4cc5-4c06-b36a-22c06968d51a",
+              "incoming_rows": 2
+            },
+            "location": "sqlmatrix/warehouse/tables/ledger",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/ledger/snapshots/1789375813625_66cf4318acf0cb89_tables.json",
+            "tombstone_rows": 5,
+            "resources": [
+              {
+                "rows": 8,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789375813251_535d5c3738a254dc_data.parquet",
+                "columns": 5,
+                "file_size": 2045
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789375813305_091bc0d12e1b984e_data.parquet",
+                "file_size": 2045,
+                "rows": 8
+              },
+              {
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789375813375_685779dcf408c358_data.parquet",
+                "rows": 8,
+                "file_size": 2045,
+                "columns": 5
+              },
+              {
+                "file_size": 2012,
+                "rows": 3,
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789375813510_a091f255c0ca41f9_data.parquet"
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789375813668_97b195fb08e5c7ff_data.parquet",
+                "file_size": 1997,
+                "rows": 2
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/ledger/stats/year=2026/month=09/day=14/hour=08/1789375813682_f18c9bac1b772b28_stats.parquet",
+            "stats_rows": 15
+          }
+        },
+        "evolving": {
+          "path": "sqlmatrix/warehouse/tables/evolving/snapshots/1789375813835_d1dd2cf08b2e6cbc_tables.json",
+          "ts": 1789375813842,
+          "version": 2,
+          "payload": {
+            "rowid_high_watermark": 6,
+            "snapshot_version": 2,
+            "schema": {
+              "eid": "Int64",
+              "__rowid__": "Int64",
+              "extra": "String",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "value": "Int64"
+            },
+            "simple_name": "evolving",
+            "last_updated_ms": 1789375813835,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"value\":\"Int64\",\"extra\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 3,
+              "source_type": "write",
+              "write_id": "e7ac63fe-6b34-4189-a18a-550f46a86b8d",
+              "incoming_rows": 3
+            },
+            "location": "sqlmatrix/warehouse/tables/evolving",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/evolving/snapshots/1789375813773_8feeafaec7f00b71_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "rows": 3,
+                "file": "sqlmatrix/warehouse/tables/evolving/data/year=2026/month=09/day=14/1789375813759_995c35d9a5eba38a_data.parquet",
+                "columns": 4,
+                "file_size": 1655
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/evolving/data/year=2026/month=09/day=14/1789375813818_eef5d25272982a52_data.parquet",
+                "file_size": 2004,
+                "rows": 3
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/evolving/stats/year=2026/month=09/day=14/hour=08/1789375813831_f1b57dbe4bf706c3_stats.parquet",
+            "stats_rows": 5
+          }
+        },
+        "nulls": {
+          "path": "sqlmatrix/warehouse/tables/nulls/snapshots/1789375814105_dca714b3f5457a7c_tables.json",
+          "ts": 1789375814111,
+          "version": 4,
+          "payload": {
+            "rowid_high_watermark": 8,
+            "snapshot_version": 4,
+            "schema": {
+              "nid": "Int64",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "__rowid__": "Int64",
+              "label": "String",
+              "value": "Int64"
+            },
+            "simple_name": "nulls",
+            "last_updated_ms": 1789375814104,
+            "stats_rows": 12,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 3,
+              "source_type": "write",
+              "write_id": "23ad6ea4-720f-47de-8bd1-9304c60e700e",
+              "incoming_rows": 2
+            },
+            "location": "sqlmatrix/warehouse/tables/nulls",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/nulls/snapshots/1789375814032_dd47bb6f62ed680c_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789375813891_dbd69e16f31a94c1_data.parquet",
+                "rows": 2,
+                "file_size": 1799,
+                "columns": 5
+              },
+              {
+                "file_size": 1799,
+                "rows": 2,
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789375813939_0138e6fdc87090eb_data.parquet"
+              },
+              {
+                "rows": 2,
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789375814006_0518362490c486dd_data.parquet",
+                "columns": 5,
+                "file_size": 1799
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789375814080_715dbad61d4a4b62_data.parquet",
+                "file_size": 1799,
+                "rows": 2
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/nulls/stats/year=2026/month=09/day=14/hour=08/1789375814095_19b15629b008ebcd_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"nid\":\"Int64\",\"value\":\"Int64\",\"label\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "empty_table": {
+          "path": "sqlmatrix/warehouse/tables/empty_table/snapshots/1789375814156_ea98c8d9e67f0627_tables.json",
+          "ts": 1789375814166,
+          "version": 1,
+          "payload": {
+            "rowid_high_watermark": 0,
+            "tombstone_rows": 0,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+            "stats_file": null,
+            "last_updated_ms": 1789375814156,
+            "stats_rows": 0,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 1,
+              "source_type": "write",
+              "write_id": "ea54e2dc-19b1-47a3-a245-d2420968901c",
+              "incoming_rows": 0
+            },
+            "previous_snapshot": "sqlmatrix/warehouse/tables/empty_table/snapshots/1789375814145_0c8f5fedaf594a3b_tables.json",
+            "resources": {},
+            "location": "sqlmatrix/warehouse/tables/empty_table",
+            "simple_name": "empty_table",
+            "schema": {
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "eid": "Int64"
+            },
+            "snapshot_version": 1
+          }
+        }
+      },
+      "setup_checks": [
+        {
+          "case_id": "ingest_orders",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_customers",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_items",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_numbers",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_events",
+          "status": "fail",
+          "error": "ArrowNotImplementedError: Cannot extract statistics for type ",
+          "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/runtime.py\", line 104, in prepare_tables\n    write_table(table_name, rows)\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/runtime.py\", line 100, in write_table\n    writer.write(\"superadmin\", table_name, pa.Table.from_pylist(rows[start:start + size], schema=schemas[table_name]), [])\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_writer.py\", line 1053, in write\n    new_stats_rows = extract_stats_rows(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/processing.py\", line 2109, in extract_stats_rows\n    all_rows.extend(_stats_rows_for_metadata(path, md))\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/processing.py\", line 2039, in _stats_rows_for_metadata\n    category, mn, mx = _route_stats(stat)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/processing.py\", line 1952, in _route_stats\n    mn, mx = stat.min, stat.max\n  File \"pyarrow/_parquet.pyx\", line 160, in pyarrow._parquet.Statistics.min.__get__\n  File \"pyarrow/_parquet.pyx\", line 303, in pyarrow._parquet._cast_statistics\n  File \"pyarrow/error.pxi\", line 92, in pyarrow.lib.check_status\npyarrow.lib.ArrowNotImplementedError: Cannot extract statistics for type \n",
+          "fallback": "Explicit PyArrow Parquet fixture + native snapshot/catalog publication"
+        },
+        {
+          "case_id": "ingest_ledger",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_evolving",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_nulls",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_empty_table",
+          "status": "pass",
+          "method": "DataWriter"
+        }
+      ]
+    },
+    "runs/03_supertable-sql-syntax-followup": {
+      "tables": {
+        "orders": {
+          "path": "sqlmatrix/warehouse/tables/orders/snapshots/1789376057047_cbd2afea0b60665b_tables.json",
+          "ts": 1789376057054,
+          "version": 8,
+          "payload": {
+            "rowid_high_watermark": 240,
+            "snapshot_version": 8,
+            "schema": {
+              "created": "Date",
+              "note": "String",
+              "score": "Float64",
+              "region": "String",
+              "code": "String",
+              "happened": "Datetime(time_unit='us', time_zone=None)",
+              "active": "Boolean",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "__rowid__": "Int64",
+              "amount": "Int64",
+              "status": "String",
+              "qty": "Int64",
+              "oid": "Int64",
+              "cid": "Int64"
+            },
+            "simple_name": "orders",
+            "last_updated_ms": 1789376057046,
+            "stats_rows": 96,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 12,
+              "source_type": "write",
+              "write_id": "3cec0d38-3941-4e68-86f2-7745f61659b1",
+              "incoming_rows": 30
+            },
+            "location": "sqlmatrix/warehouse/tables/orders",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/orders/snapshots/1789376056977_014da206a5e13959_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376056390_e33426d7d3921284_data.parquet",
+                "rows": 30,
+                "file_size": 5648,
+                "columns": 14
+              },
+              {
+                "file_size": 5683,
+                "rows": 30,
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376056460_aaa1790de050d26d_data.parquet"
+              },
+              {
+                "rows": 30,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376056533_454a3407f49ef361_data.parquet",
+                "columns": 14,
+                "file_size": 5685
+              },
+              {
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376056698_a7c2f7e1b36fa8f1_data.parquet",
+                "file_size": 5705,
+                "rows": 30
+              },
+              {
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376056794_ab6a1b1c60acde22_data.parquet",
+                "rows": 30,
+                "file_size": 5707,
+                "columns": 14
+              },
+              {
+                "file_size": 5695,
+                "rows": 30,
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376056867_45d483292588ce24_data.parquet"
+              },
+              {
+                "rows": 30,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376056957_b0733597d48e6a8d_data.parquet",
+                "columns": 14,
+                "file_size": 5689
+              },
+              {
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376057020_5e9cb5099caef1be_data.parquet",
+                "file_size": 5730,
+                "rows": 30
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/orders/stats/year=2026/month=09/day=14/hour=08/1789376057040_31d71bbc894c6c85_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"oid\":\"Int64\",\"cid\":\"Int64\",\"region\":\"String\",\"status\":\"String\",\"amount\":\"Int64\",\"qty\":\"Int64\",\"score\":\"Float64\",\"active\":\"Boolean\",\"created\":\"Date\",\"happened\":\"Datetime(time_unit='us', time_zone=None)\",\"note\":\"String\",\"code\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "customers": {
+          "path": "sqlmatrix/warehouse/tables/customers/snapshots/1789376057346_32435f54de049c39_tables.json",
+          "ts": 1789376057352,
+          "version": 4,
+          "payload": {
+            "rowid_high_watermark": 16,
+            "snapshot_version": 4,
+            "schema": {
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "name": "String",
+              "region": "String",
+              "__rowid__": "Int64",
+              "active": "Boolean",
+              "credit": "Int64",
+              "cid": "Int64"
+            },
+            "simple_name": "customers",
+            "last_updated_ms": 1789376057346,
+            "stats_rows": 20,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 5,
+              "source_type": "write",
+              "write_id": "6d1105bf-e753-422b-bd99-f07e777bde8e",
+              "incoming_rows": 1
+            },
+            "location": "sqlmatrix/warehouse/tables/customers",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/customers/snapshots/1789376057282_251ee59ecebc0087_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789376057128_1ee85702c7d24f78_data.parquet",
+                "rows": 5,
+                "file_size": 2610,
+                "columns": 7
+              },
+              {
+                "file_size": 2613,
+                "rows": 5,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789376057198_b65b970ca136e73a_data.parquet"
+              },
+              {
+                "rows": 5,
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789376057261_d65d62fe54006896_data.parquet",
+                "columns": 7,
+                "file_size": 2610
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789376057325_8ec3766f5e00dab4_data.parquet",
+                "file_size": 2512,
+                "rows": 1
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/customers/stats/year=2026/month=09/day=14/hour=08/1789376057339_f08c6e74bc1c30fa_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"cid\":\"Int64\",\"name\":\"String\",\"region\":\"String\",\"credit\":\"Int64\",\"active\":\"Boolean\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "items": {
+          "path": "sqlmatrix/warehouse/tables/items/snapshots/1789376057852_640c3322234a29e6_tables.json",
+          "ts": 1789376057858,
+          "version": 8,
+          "payload": {
+            "rowid_high_watermark": 480,
+            "snapshot_version": 8,
+            "schema": {
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "__rowid__": "Int64",
+              "oid": "Int64",
+              "price": "Int64",
+              "iid": "Int64",
+              "sku": "String",
+              "units": "Int64"
+            },
+            "simple_name": "items",
+            "last_updated_ms": 1789376057851,
+            "stats_rows": 40,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 5,
+              "source_type": "write",
+              "write_id": "85f0d680-1d7b-4d7c-b5ee-a77f17f0c4ec",
+              "incoming_rows": 60
+            },
+            "location": "sqlmatrix/warehouse/tables/items",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/items/snapshots/1789376057801_3766692c69ef62a1_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376057419_4140b77ba21e1b0d_data.parquet",
+                "rows": 60,
+                "file_size": 3093,
+                "columns": 7
+              },
+              {
+                "file_size": 3123,
+                "rows": 60,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376057472_4b5cebb31c80cd85_data.parquet"
+              },
+              {
+                "rows": 60,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376057526_8b8b4ba8cbab3a0c_data.parquet",
+                "columns": 7,
+                "file_size": 3133
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376057585_242d8bb048a29c8b_data.parquet",
+                "file_size": 3141,
+                "rows": 60
+              },
+              {
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376057666_d179d920b0bac0b9_data.parquet",
+                "rows": 60,
+                "file_size": 3257,
+                "columns": 7
+              },
+              {
+                "file_size": 3227,
+                "rows": 60,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376057726_89c6fb7e4634070f_data.parquet"
+              },
+              {
+                "rows": 60,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376057785_be107c370475a455_data.parquet",
+                "columns": 7,
+                "file_size": 3227
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376057836_99018e232ac70831_data.parquet",
+                "file_size": 3227,
+                "rows": 60
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/items/stats/year=2026/month=09/day=14/hour=08/1789376057847_959fe2779017e91a_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"iid\":\"Int64\",\"oid\":\"Int64\",\"sku\":\"String\",\"units\":\"Int64\",\"price\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "numbers": {
+          "path": "sqlmatrix/warehouse/tables/numbers/snapshots/1789376058101_55158b97c2a0bb11_tables.json",
+          "ts": 1789376058107,
+          "version": 4,
+          "payload": {
+            "rowid_high_watermark": 31,
+            "snapshot_version": 4,
+            "schema": {
+              "grp": "Int64",
+              "__rowid__": "Int64",
+              "label": "String",
+              "rid": "Int64",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "nullable_n": "Int64",
+              "n": "Int64"
+            },
+            "simple_name": "numbers",
+            "last_updated_ms": 1789376058101,
+            "stats_rows": 20,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 5,
+              "source_type": "write",
+              "write_id": "856e9387-ff45-4a55-bc26-99013dcf2c33",
+              "incoming_rows": 1
+            },
+            "location": "sqlmatrix/warehouse/tables/numbers",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/numbers/snapshots/1789376058043_43350ccce060055b_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789376057913_ae3774dfc5282bfd_data.parquet",
+                "rows": 10,
+                "file_size": 2772,
+                "columns": 7
+              },
+              {
+                "file_size": 2771,
+                "rows": 10,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789376057966_040361c25cd707bc_data.parquet"
+              },
+              {
+                "rows": 10,
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789376058024_08e9ddfa0e9b2f1c_data.parquet",
+                "columns": 7,
+                "file_size": 2772
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789376058083_6779e033bcefb28a_data.parquet",
+                "file_size": 2502,
+                "rows": 1
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/numbers/stats/year=2026/month=09/day=14/hour=08/1789376058096_410190d2b837ddab_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"rid\":\"Int64\",\"n\":\"Int64\",\"grp\":\"Int64\",\"nullable_n\":\"Int64\",\"label\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "events": {
+          "path": "sqlmatrix/warehouse/tables/events/snapshots/1789376058199_2040f03a6a102595_tables.json",
+          "ts": 1789376058205,
+          "version": 1,
+          "payload": {
+            "rowid_high_watermark": 32,
+            "tombstone_rows": 0,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"event_date\":\"Date\",\"event_time\":\"Datetime(time_unit='us', time_zone=None)\",\"money\":\"Decimal(precision=12, scale=3)\",\"flag\":\"Boolean\",\"label\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone=None)\"}}",
+            "stats_file": "sqlmatrix/warehouse/tables/events/stats/year=2026/month=09/day=14/hour=08/1789376058192_79ea6549e6e3d02f_stats.parquet",
+            "last_updated_ms": 1789376058199,
+            "stats_rows": 18,
+            "tombstone": null,
+            "lineage": {
+              "source_type": "sql_matrix_fixture_fallback"
+            },
+            "previous_snapshot": "sqlmatrix/warehouse/tables/events/snapshots/1789376058146_e0812e2b67459daa_tables.json",
+            "resources": [
+              {
+                "file_size": 5767,
+                "file": "sqlmatrix/warehouse/tables/events/data/independent_arrow_fixture.parquet",
+                "columns": 8,
+                "rows": 24
+              }
+            ],
+            "location": "sqlmatrix/warehouse/tables/events",
+            "simple_name": "events",
+            "schema": {
+              "event_date": "Date",
+              "eid": "Int64",
+              "__rowid__": "Int64",
+              "label": "String",
+              "money": "Decimal(precision=12, scale=3)",
+              "__timestamp__": "Datetime(time_unit='us', time_zone=None)",
+              "flag": "Boolean",
+              "event_time": "Datetime(time_unit='us', time_zone=None)"
+            },
+            "snapshot_version": 1
+          }
+        },
+        "ledger": {
+          "path": "sqlmatrix/warehouse/tables/ledger/snapshots/1789376058663_b9988ba7cb24ef20_tables.json",
+          "ts": 1789376058670,
+          "version": 6,
+          "payload": {
+            "rowid_high_watermark": 29,
+            "snapshot_version": 6,
+            "schema": {
+              "revision": "Int64",
+              "__rowid__": "Int64",
+              "value": "Int64",
+              "lid": "Int64",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+            },
+            "simple_name": "ledger",
+            "last_updated_ms": 1789376058663,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"lid\":\"Int64\",\"value\":\"Int64\",\"revision\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+            "tombstone": [
+              "sqlmatrix/warehouse/tables/ledger/tombstone/year=2026/month=09/day=14/hour=08/1789376058498_eb72501f880b4a0e_deleted.parquet",
+              "sqlmatrix/warehouse/tables/ledger/tombstone/year=2026/month=09/day=14/hour=08/1789376058593_6027586623fbb2af_deleted.parquet"
+            ],
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 3,
+              "source_type": "write",
+              "write_id": "2ba5e7bb-ce63-4ac5-83e4-c2f01729b95e",
+              "incoming_rows": 2
+            },
+            "location": "sqlmatrix/warehouse/tables/ledger",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/ledger/snapshots/1789376058597_1a173e51c745a8df_tables.json",
+            "tombstone_rows": 5,
+            "resources": [
+              {
+                "rows": 8,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789376058248_1a36132d0d8e1a1a_data.parquet",
+                "columns": 5,
+                "file_size": 2045
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789376058300_b57304e83879b3aa_data.parquet",
+                "file_size": 2045,
+                "rows": 8
+              },
+              {
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789376058348_263cae361c89ca30_data.parquet",
+                "rows": 8,
+                "file_size": 2045,
+                "columns": 5
+              },
+              {
+                "file_size": 2012,
+                "rows": 3,
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789376058489_5ef03b6b35cdd6a5_data.parquet"
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789376058638_f6eac1d717d227ff_data.parquet",
+                "file_size": 1997,
+                "rows": 2
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/ledger/stats/year=2026/month=09/day=14/hour=08/1789376058650_a8b90a4c6d87645a_stats.parquet",
+            "stats_rows": 15
+          }
+        },
+        "evolving": {
+          "path": "sqlmatrix/warehouse/tables/evolving/snapshots/1789376058796_cbd292b617b88742_tables.json",
+          "ts": 1789376058808,
+          "version": 2,
+          "payload": {
+            "rowid_high_watermark": 6,
+            "snapshot_version": 2,
+            "schema": {
+              "eid": "Int64",
+              "__rowid__": "Int64",
+              "extra": "String",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "value": "Int64"
+            },
+            "simple_name": "evolving",
+            "last_updated_ms": 1789376058796,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"value\":\"Int64\",\"extra\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 3,
+              "source_type": "write",
+              "write_id": "cfd0c04f-4d62-431b-a673-e5389cc73617",
+              "incoming_rows": 3
+            },
+            "location": "sqlmatrix/warehouse/tables/evolving",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/evolving/snapshots/1789376058735_53be9f93a6ab4835_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "rows": 3,
+                "file": "sqlmatrix/warehouse/tables/evolving/data/year=2026/month=09/day=14/1789376058719_b66f6ad6227fabce_data.parquet",
+                "columns": 4,
+                "file_size": 1655
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/evolving/data/year=2026/month=09/day=14/1789376058781_9a60f50ae245e269_data.parquet",
+                "file_size": 2004,
+                "rows": 3
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/evolving/stats/year=2026/month=09/day=14/hour=08/1789376058791_b5004656fb8458e4_stats.parquet",
+            "stats_rows": 5
+          }
+        },
+        "nulls": {
+          "path": "sqlmatrix/warehouse/tables/nulls/snapshots/1789376059061_851b1f728cfad7fc_tables.json",
+          "ts": 1789376059069,
+          "version": 4,
+          "payload": {
+            "rowid_high_watermark": 8,
+            "snapshot_version": 4,
+            "schema": {
+              "nid": "Int64",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "__rowid__": "Int64",
+              "label": "String",
+              "value": "Int64"
+            },
+            "simple_name": "nulls",
+            "last_updated_ms": 1789376059061,
+            "stats_rows": 12,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 3,
+              "source_type": "write",
+              "write_id": "7e4be706-8fe4-45f0-ab86-d17494090d1e",
+              "incoming_rows": 2
+            },
+            "location": "sqlmatrix/warehouse/tables/nulls",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/nulls/snapshots/1789376059007_0d07627c8c1a3d5e_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789376058862_25f0c3103e1b09ca_data.parquet",
+                "rows": 2,
+                "file_size": 1799,
+                "columns": 5
+              },
+              {
+                "file_size": 1799,
+                "rows": 2,
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789376058924_db1e96ed93097dce_data.parquet"
+              },
+              {
+                "rows": 2,
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789376058992_613ebd0356beac58_data.parquet",
+                "columns": 5,
+                "file_size": 1799
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789376059042_dffa39920a7f568d_data.parquet",
+                "file_size": 1799,
+                "rows": 2
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/nulls/stats/year=2026/month=09/day=14/hour=08/1789376059054_5953ba189cd66bda_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"nid\":\"Int64\",\"value\":\"Int64\",\"label\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "empty_table": {
+          "path": "sqlmatrix/warehouse/tables/empty_table/snapshots/1789376059123_a0eb45da3786a4df_tables.json",
+          "ts": 1789376059129,
+          "version": 1,
+          "payload": {
+            "rowid_high_watermark": 0,
+            "tombstone_rows": 0,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+            "stats_file": null,
+            "last_updated_ms": 1789376059122,
+            "stats_rows": 0,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 1,
+              "source_type": "write",
+              "write_id": "8e65c696-c641-441b-83aa-c5675921d34f",
+              "incoming_rows": 0
+            },
+            "previous_snapshot": "sqlmatrix/warehouse/tables/empty_table/snapshots/1789376059112_0e62422fc75d81bb_tables.json",
+            "resources": {},
+            "location": "sqlmatrix/warehouse/tables/empty_table",
+            "simple_name": "empty_table",
+            "schema": {
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "eid": "Int64"
+            },
+            "snapshot_version": 1
+          }
+        }
+      },
+      "setup_checks": [
+        {
+          "case_id": "ingest_orders",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_customers",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_items",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_numbers",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_events",
+          "status": "fail",
+          "error": "ArrowNotImplementedError: Cannot extract statistics for type ",
+          "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/runtime.py\", line 104, in prepare_tables\n    write_table(table_name, rows)\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/runtime.py\", line 100, in write_table\n    writer.write(\"superadmin\", table_name, pa.Table.from_pylist(rows[start:start + size], schema=schemas[table_name]), [])\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_writer.py\", line 1053, in write\n    new_stats_rows = extract_stats_rows(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/processing.py\", line 2109, in extract_stats_rows\n    all_rows.extend(_stats_rows_for_metadata(path, md))\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/processing.py\", line 2039, in _stats_rows_for_metadata\n    category, mn, mx = _route_stats(stat)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/processing.py\", line 1952, in _route_stats\n    mn, mx = stat.min, stat.max\n  File \"pyarrow/_parquet.pyx\", line 160, in pyarrow._parquet.Statistics.min.__get__\n  File \"pyarrow/_parquet.pyx\", line 303, in pyarrow._parquet._cast_statistics\n  File \"pyarrow/error.pxi\", line 92, in pyarrow.lib.check_status\npyarrow.lib.ArrowNotImplementedError: Cannot extract statistics for type \n",
+          "fallback": "Explicit PyArrow Parquet fixture + native snapshot/catalog publication"
+        },
+        {
+          "case_id": "ingest_ledger",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_evolving",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_nulls",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_empty_table",
+          "status": "pass",
+          "method": "DataWriter"
+        }
+      ]
+    },
+    "runs/04_supertable-sql-numeric-review": {
+      "tables": {
+        "orders": {
+          "path": "sqlmatrix/warehouse/tables/orders/snapshots/1789376110808_152af86bed87567f_tables.json",
+          "ts": 1789376110814,
+          "version": 8,
+          "payload": {
+            "rowid_high_watermark": 240,
+            "snapshot_version": 8,
+            "schema": {
+              "created": "Date",
+              "note": "String",
+              "score": "Float64",
+              "region": "String",
+              "code": "String",
+              "happened": "Datetime(time_unit='us', time_zone=None)",
+              "active": "Boolean",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "__rowid__": "Int64",
+              "amount": "Int64",
+              "status": "String",
+              "qty": "Int64",
+              "oid": "Int64",
+              "cid": "Int64"
+            },
+            "simple_name": "orders",
+            "last_updated_ms": 1789376110807,
+            "stats_rows": 96,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 12,
+              "source_type": "write",
+              "write_id": "1dc3b69b-4de8-406a-8deb-a37668d3a6ef",
+              "incoming_rows": 30
+            },
+            "location": "sqlmatrix/warehouse/tables/orders",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/orders/snapshots/1789376110731_a15d09bfc5125472_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376110322_8a12d6319c0f9ec7_data.parquet",
+                "rows": 30,
+                "file_size": 5648,
+                "columns": 14
+              },
+              {
+                "file_size": 5683,
+                "rows": 30,
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376110402_1107f7b2a13f4a35_data.parquet"
+              },
+              {
+                "rows": 30,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376110463_b20ff4572768836d_data.parquet",
+                "columns": 14,
+                "file_size": 5685
+              },
+              {
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376110512_62f6f9d81f5fdee2_data.parquet",
+                "file_size": 5705,
+                "rows": 30
+              },
+              {
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376110579_913aa4a7e5bab890_data.parquet",
+                "rows": 30,
+                "file_size": 5707,
+                "columns": 14
+              },
+              {
+                "file_size": 5695,
+                "rows": 30,
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376110642_d81800ecf45ba979_data.parquet"
+              },
+              {
+                "rows": 30,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376110703_2d6bc081b7105991_data.parquet",
+                "columns": 14,
+                "file_size": 5689
+              },
+              {
+                "columns": 14,
+                "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789376110783_3dc0aa5c49f0de9c_data.parquet",
+                "file_size": 5730,
+                "rows": 30
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/orders/stats/year=2026/month=09/day=14/hour=08/1789376110799_e76a634eaa0b0bf9_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"oid\":\"Int64\",\"cid\":\"Int64\",\"region\":\"String\",\"status\":\"String\",\"amount\":\"Int64\",\"qty\":\"Int64\",\"score\":\"Float64\",\"active\":\"Boolean\",\"created\":\"Date\",\"happened\":\"Datetime(time_unit='us', time_zone=None)\",\"note\":\"String\",\"code\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "customers": {
+          "path": "sqlmatrix/warehouse/tables/customers/snapshots/1789376111091_7ae4270fd63727be_tables.json",
+          "ts": 1789376111099,
+          "version": 4,
+          "payload": {
+            "rowid_high_watermark": 16,
+            "snapshot_version": 4,
+            "schema": {
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "name": "String",
+              "region": "String",
+              "__rowid__": "Int64",
+              "active": "Boolean",
+              "credit": "Int64",
+              "cid": "Int64"
+            },
+            "simple_name": "customers",
+            "last_updated_ms": 1789376111090,
+            "stats_rows": 20,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 5,
+              "source_type": "write",
+              "write_id": "0495894c-c269-43a2-8d37-a240eb2a8c1a",
+              "incoming_rows": 1
+            },
+            "location": "sqlmatrix/warehouse/tables/customers",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/customers/snapshots/1789376111019_fc0b8580ecd0fd0d_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789376110873_353d3c779d0a56dc_data.parquet",
+                "rows": 5,
+                "file_size": 2610,
+                "columns": 7
+              },
+              {
+                "file_size": 2613,
+                "rows": 5,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789376110936_22d77653b9e480d4_data.parquet"
+              },
+              {
+                "rows": 5,
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789376111000_686948c704fa6894_data.parquet",
+                "columns": 7,
+                "file_size": 2610
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/customers/data/year=2026/month=09/day=14/1789376111068_2a7faac8447f6631_data.parquet",
+                "file_size": 2512,
+                "rows": 1
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/customers/stats/year=2026/month=09/day=14/hour=08/1789376111081_d9afd784657e1cb1_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"cid\":\"Int64\",\"name\":\"String\",\"region\":\"String\",\"credit\":\"Int64\",\"active\":\"Boolean\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "items": {
+          "path": "sqlmatrix/warehouse/tables/items/snapshots/1789376111636_4d56d325b2e18c49_tables.json",
+          "ts": 1789376111644,
+          "version": 8,
+          "payload": {
+            "rowid_high_watermark": 480,
+            "snapshot_version": 8,
+            "schema": {
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "__rowid__": "Int64",
+              "oid": "Int64",
+              "price": "Int64",
+              "iid": "Int64",
+              "sku": "String",
+              "units": "Int64"
+            },
+            "simple_name": "items",
+            "last_updated_ms": 1789376111636,
+            "stats_rows": 40,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 5,
+              "source_type": "write",
+              "write_id": "e7e0a5ac-942e-439d-ab6e-297f53d6a213",
+              "incoming_rows": 60
+            },
+            "location": "sqlmatrix/warehouse/tables/items",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/items/snapshots/1789376111572_c4b80cb7a3a72d0a_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376111165_32b0d9dfeff31af9_data.parquet",
+                "rows": 60,
+                "file_size": 3093,
+                "columns": 7
+              },
+              {
+                "file_size": 3123,
+                "rows": 60,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376111239_56fb7f86a9c25f65_data.parquet"
+              },
+              {
+                "rows": 60,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376111311_584853d2a15787c0_data.parquet",
+                "columns": 7,
+                "file_size": 3133
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376111372_353c3da8549e2cdf_data.parquet",
+                "file_size": 3141,
+                "rows": 60
+              },
+              {
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376111429_7a6fcc6f5afa36ad_data.parquet",
+                "rows": 60,
+                "file_size": 3257,
+                "columns": 7
+              },
+              {
+                "file_size": 3227,
+                "rows": 60,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376111489_8ababec29d89949d_data.parquet"
+              },
+              {
+                "rows": 60,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376111551_10d0f8dee68243f0_data.parquet",
+                "columns": 7,
+                "file_size": 3227
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789376111617_2a1b9dc8f53b8ab5_data.parquet",
+                "file_size": 3227,
+                "rows": 60
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/items/stats/year=2026/month=09/day=14/hour=08/1789376111631_e9adfc45c3ed45a1_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"iid\":\"Int64\",\"oid\":\"Int64\",\"sku\":\"String\",\"units\":\"Int64\",\"price\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "numbers": {
+          "path": "sqlmatrix/warehouse/tables/numbers/snapshots/1789376111912_f66409a751d3a72d_tables.json",
+          "ts": 1789376111920,
+          "version": 4,
+          "payload": {
+            "rowid_high_watermark": 31,
+            "snapshot_version": 4,
+            "schema": {
+              "grp": "Int64",
+              "__rowid__": "Int64",
+              "label": "String",
+              "rid": "Int64",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "nullable_n": "Int64",
+              "n": "Int64"
+            },
+            "simple_name": "numbers",
+            "last_updated_ms": 1789376111912,
+            "stats_rows": 20,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 5,
+              "source_type": "write",
+              "write_id": "3575e13a-e52f-4ef4-813f-aedee27e7a0e",
+              "incoming_rows": 1
+            },
+            "location": "sqlmatrix/warehouse/tables/numbers",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/numbers/snapshots/1789376111858_43d97de3aa2eb4e1_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789376111698_38ec7319186fe6fd_data.parquet",
+                "rows": 10,
+                "file_size": 2772,
+                "columns": 7
+              },
+              {
+                "file_size": 2771,
+                "rows": 10,
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789376111757_cd0509170ce46cec_data.parquet"
+              },
+              {
+                "rows": 10,
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789376111827_5593797629b9881d_data.parquet",
+                "columns": 7,
+                "file_size": 2772
+              },
+              {
+                "columns": 7,
+                "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789376111897_79bfc022bc3287e7_data.parquet",
+                "file_size": 2502,
+                "rows": 1
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/numbers/stats/year=2026/month=09/day=14/hour=08/1789376111907_4df72afe53e327db_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"rid\":\"Int64\",\"n\":\"Int64\",\"grp\":\"Int64\",\"nullable_n\":\"Int64\",\"label\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "events": {
+          "path": "sqlmatrix/warehouse/tables/events/snapshots/1789376112047_4a27b470100cde99_tables.json",
+          "ts": 1789376112055,
+          "version": 1,
+          "payload": {
+            "rowid_high_watermark": 32,
+            "tombstone_rows": 0,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"event_date\":\"Date\",\"event_time\":\"Datetime(time_unit='us', time_zone=None)\",\"money\":\"Decimal(precision=12, scale=3)\",\"flag\":\"Boolean\",\"label\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone=None)\"}}",
+            "stats_file": "sqlmatrix/warehouse/tables/events/stats/year=2026/month=09/day=14/hour=08/1789376112023_e222817d8deb233d_stats.parquet",
+            "last_updated_ms": 1789376112047,
+            "stats_rows": 18,
+            "tombstone": null,
+            "lineage": {
+              "source_type": "sql_matrix_fixture_fallback"
+            },
+            "previous_snapshot": "sqlmatrix/warehouse/tables/events/snapshots/1789376111966_ec20d9f3e0f0090a_tables.json",
+            "resources": [
+              {
+                "file_size": 5767,
+                "file": "sqlmatrix/warehouse/tables/events/data/independent_arrow_fixture.parquet",
+                "columns": 8,
+                "rows": 24
+              }
+            ],
+            "location": "sqlmatrix/warehouse/tables/events",
+            "simple_name": "events",
+            "schema": {
+              "event_date": "Date",
+              "eid": "Int64",
+              "__rowid__": "Int64",
+              "label": "String",
+              "money": "Decimal(precision=12, scale=3)",
+              "__timestamp__": "Datetime(time_unit='us', time_zone=None)",
+              "flag": "Boolean",
+              "event_time": "Datetime(time_unit='us', time_zone=None)"
+            },
+            "snapshot_version": 1
+          }
+        },
+        "ledger": {
+          "path": "sqlmatrix/warehouse/tables/ledger/snapshots/1789376112650_7b258065142812bc_tables.json",
+          "ts": 1789376112656,
+          "version": 6,
+          "payload": {
+            "rowid_high_watermark": 29,
+            "snapshot_version": 6,
+            "schema": {
+              "revision": "Int64",
+              "__rowid__": "Int64",
+              "value": "Int64",
+              "lid": "Int64",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+            },
+            "simple_name": "ledger",
+            "last_updated_ms": 1789376112650,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"lid\":\"Int64\",\"value\":\"Int64\",\"revision\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+            "tombstone": [
+              "sqlmatrix/warehouse/tables/ledger/tombstone/year=2026/month=09/day=14/hour=08/1789376112426_30b32e8419cdb700_deleted.parquet",
+              "sqlmatrix/warehouse/tables/ledger/tombstone/year=2026/month=09/day=14/hour=08/1789376112568_4e6047e6b3cf474f_deleted.parquet"
+            ],
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 3,
+              "source_type": "write",
+              "write_id": "ca65a437-1d53-4c6a-9f4c-3794150bc26b",
+              "incoming_rows": 2
+            },
+            "location": "sqlmatrix/warehouse/tables/ledger",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/ledger/snapshots/1789376112576_195b312f84d3b616_tables.json",
+            "tombstone_rows": 5,
+            "resources": [
+              {
+                "rows": 8,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789376112119_b60048b972d9f76d_data.parquet",
+                "columns": 5,
+                "file_size": 2045
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789376112171_2fe46676c9052406_data.parquet",
+                "file_size": 2045,
+                "rows": 8
+              },
+              {
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789376112253_92eddaae5c60b7c0_data.parquet",
+                "rows": 8,
+                "file_size": 2045,
+                "columns": 5
+              },
+              {
+                "file_size": 2012,
+                "rows": 3,
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789376112418_9e7e6f1e37bdf94e_data.parquet"
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789376112629_d9213cc61c642d9b_data.parquet",
+                "file_size": 1997,
+                "rows": 2
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/ledger/stats/year=2026/month=09/day=14/hour=08/1789376112646_cb591cc3d00e783c_stats.parquet",
+            "stats_rows": 15
+          }
+        },
+        "evolving": {
+          "path": "sqlmatrix/warehouse/tables/evolving/snapshots/1789376112779_873963cec9f319ef_tables.json",
+          "ts": 1789376112785,
+          "version": 2,
+          "payload": {
+            "rowid_high_watermark": 6,
+            "snapshot_version": 2,
+            "schema": {
+              "eid": "Int64",
+              "__rowid__": "Int64",
+              "extra": "String",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "value": "Int64"
+            },
+            "simple_name": "evolving",
+            "last_updated_ms": 1789376112779,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"value\":\"Int64\",\"extra\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 3,
+              "source_type": "write",
+              "write_id": "dc9454ba-01b9-45b2-9375-713dd1392a20",
+              "incoming_rows": 3
+            },
+            "location": "sqlmatrix/warehouse/tables/evolving",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/evolving/snapshots/1789376112727_f9cb2c593c6c3945_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "rows": 3,
+                "file": "sqlmatrix/warehouse/tables/evolving/data/year=2026/month=09/day=14/1789376112710_2111a24167f3b5dc_data.parquet",
+                "columns": 4,
+                "file_size": 1655
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/evolving/data/year=2026/month=09/day=14/1789376112764_6455b4bdb33e7379_data.parquet",
+                "file_size": 2004,
+                "rows": 3
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/evolving/stats/year=2026/month=09/day=14/hour=08/1789376112775_e7246dcccc15a724_stats.parquet",
+            "stats_rows": 5
+          }
+        },
+        "nulls": {
+          "path": "sqlmatrix/warehouse/tables/nulls/snapshots/1789376113036_14ee904749fd1225_tables.json",
+          "ts": 1789376113046,
+          "version": 4,
+          "payload": {
+            "rowid_high_watermark": 8,
+            "snapshot_version": 4,
+            "schema": {
+              "nid": "Int64",
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "__rowid__": "Int64",
+              "label": "String",
+              "value": "Int64"
+            },
+            "simple_name": "nulls",
+            "last_updated_ms": 1789376113035,
+            "stats_rows": 12,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 3,
+              "source_type": "write",
+              "write_id": "d4bb2689-1341-4ab1-8fca-e1c39a421195",
+              "incoming_rows": 2
+            },
+            "location": "sqlmatrix/warehouse/tables/nulls",
+            "previous_snapshot": "sqlmatrix/warehouse/tables/nulls/snapshots/1789376112973_884ea0f659d2b879_tables.json",
+            "tombstone_rows": 0,
+            "resources": [
+              {
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789376112840_041e3249f18e7876_data.parquet",
+                "rows": 2,
+                "file_size": 1799,
+                "columns": 5
+              },
+              {
+                "file_size": 1799,
+                "rows": 2,
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789376112898_75977989722d3b2c_data.parquet"
+              },
+              {
+                "rows": 2,
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789376112955_8eac527c59154251_data.parquet",
+                "columns": 5,
+                "file_size": 1799
+              },
+              {
+                "columns": 5,
+                "file": "sqlmatrix/warehouse/tables/nulls/data/year=2026/month=09/day=14/1789376113022_8046bba69853c7b5_data.parquet",
+                "file_size": 1799,
+                "rows": 2
+              }
+            ],
+            "stats_file": "sqlmatrix/warehouse/tables/nulls/stats/year=2026/month=09/day=14/hour=08/1789376113030_12efc36955fc69c3_stats.parquet",
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"nid\":\"Int64\",\"value\":\"Int64\",\"label\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+          }
+        },
+        "empty_table": {
+          "path": "sqlmatrix/warehouse/tables/empty_table/snapshots/1789376113091_5cfe698d457f1b02_tables.json",
+          "ts": 1789376113099,
+          "version": 1,
+          "payload": {
+            "rowid_high_watermark": 0,
+            "tombstone_rows": 0,
+            "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+            "stats_file": null,
+            "last_updated_ms": 1789376113091,
+            "stats_rows": 0,
+            "tombstone": null,
+            "lineage": {
+              "overwrite_columns": {},
+              "role_name": "superadmin",
+              "delete_only": false,
+              "incoming_columns": 1,
+              "source_type": "write",
+              "write_id": "719b5812-c3cd-4ec7-b38b-87559f6328e3",
+              "incoming_rows": 0
+            },
+            "previous_snapshot": "sqlmatrix/warehouse/tables/empty_table/snapshots/1789376113079_5b38e159cf748c00_tables.json",
+            "resources": {},
+            "location": "sqlmatrix/warehouse/tables/empty_table",
+            "simple_name": "empty_table",
+            "schema": {
+              "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')",
+              "eid": "Int64"
+            },
+            "snapshot_version": 1
+          }
+        }
+      },
+      "setup_checks": [
+        {
+          "case_id": "ingest_orders",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_customers",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_items",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_numbers",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_events",
+          "status": "fail",
+          "error": "ArrowNotImplementedError: Cannot extract statistics for type ",
+          "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/runtime.py\", line 104, in prepare_tables\n    write_table(table_name, rows)\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/runtime.py\", line 100, in write_table\n    writer.write(\"superadmin\", table_name, pa.Table.from_pylist(rows[start:start + size], schema=schemas[table_name]), [])\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_writer.py\", line 1053, in write\n    new_stats_rows = extract_stats_rows(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/processing.py\", line 2109, in extract_stats_rows\n    all_rows.extend(_stats_rows_for_metadata(path, md))\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/processing.py\", line 2039, in _stats_rows_for_metadata\n    category, mn, mx = _route_stats(stat)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/processing.py\", line 1952, in _route_stats\n    mn, mx = stat.min, stat.max\n  File \"pyarrow/_parquet.pyx\", line 160, in pyarrow._parquet.Statistics.min.__get__\n  File \"pyarrow/_parquet.pyx\", line 303, in pyarrow._parquet._cast_statistics\n  File \"pyarrow/error.pxi\", line 92, in pyarrow.lib.check_status\npyarrow.lib.ArrowNotImplementedError: Cannot extract statistics for type \n",
+          "fallback": "Explicit PyArrow Parquet fixture + native snapshot/catalog publication"
+        },
+        {
+          "case_id": "ingest_ledger",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_evolving",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_nulls",
+          "status": "pass",
+          "method": "DataWriter"
+        },
+        {
+          "case_id": "ingest_empty_table",
+          "status": "pass",
+          "method": "DataWriter"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "rowid_high_watermark": 6,
+  "tombstone_rows": 0,
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"value\":\"Int64\",\"extra\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+  "stats_file": "sqlmatrix/warehouse/tables/evolving/stats/year=2026/month=09/day=14/hour=14/1789396659040_36c9eb46a5505714_stats.parquet",
+  "last_updated_ms": 1789396659048,
+  "stats_rows": 5,
+  "tombstone": null,
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 3,
+    "incoming_columns": 3,
+    "write_id": "a561f283-f85c-4c51-9f0a-169a8f6b3241"
+  },
+  "previous_snapshot": "sqlmatrix/warehouse/tables/evolving/snapshots/1789396658978_2e1e778bd0d17489_tables.json",
+  "resources": [
+    {
+      "columns": 4,
+      "file": "sqlmatrix/warehouse/tables/evolving/data/year=2026/month=09/day=14/1789396658954_045b22bc86688979_data.parquet",
+      "file_size": 1655,
+      "rows": 3
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/evolving/data/year=2026/month=09/day=14/1789396659025_f5e8a9045f16d136_data.parquet",
+      "file_size": 2004,
+      "rows": 3,
+      "columns": 5
+    }
+  ],
+  "location": "sqlmatrix/warehouse/tables/evolving",
+  "simple_name": "evolving",
+  "schema": {
+    "eid": "Int64",
+    "value": "Int64",
+    "extra": "String",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "snapshot_version": 2
+}

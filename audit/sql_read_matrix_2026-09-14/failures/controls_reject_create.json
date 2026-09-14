@@ -1,0 +1,63 @@
+{
+  "case": {
+    "case_id": "controls_reject_create",
+    "category": "sql_admission",
+    "sql": "CREATE TABLE matrix_admission_probe (id INTEGER)",
+    "columns": [],
+    "expected": [],
+    "ordered": false,
+    "role": "superadmin",
+    "error_contains": [
+      "CREATE is not permitted on the read path"
+    ],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": ""
+  },
+  "reference": {
+    "status": "not_applicable",
+    "reason": "expected native admission/authorization rejection"
+  },
+  "runs": [
+    {
+      "mode": "pruned",
+      "status": "pass",
+      "error": "RuntimeError: CREATE is not permitted on the read path; only SELECT queries are",
+      "duration_ms": 2.655
+    },
+    {
+      "mode": "fullscan",
+      "status": "pass",
+      "error": "RuntimeError: CREATE is not permitted on the read path; only SELECT queries are",
+      "duration_ms": 2.265
+    },
+    {
+      "mode": "stream",
+      "status": "pass",
+      "error": "RuntimeError: stream failed: CREATE is not permitted on the read path; only SELECT queries are",
+      "duration_ms": 3.223
+    },
+    {
+      "mode": "auto",
+      "status": "pass",
+      "error": "RuntimeError: CREATE is not permitted on the read path; only SELECT queries are",
+      "duration_ms": 2.171
+    },
+    {
+      "mode": "query_sql",
+      "status": "fail",
+      "error": "RuntimeError: Query execution failed: COMMAND is not permitted on the read path; only SELECT queries are",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": [
+          "CREATE is not permitted on the read path"
+        ]
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 43, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 652, in query_sql\n    raise RuntimeError(f\"Query execution failed: {message}\")\nRuntimeError: Query execution failed: COMMAND is not permitted on the read path; only SELECT queries are\n",
+      "duration_ms": 4.439
+    }
+  ],
+  "dataset": "../dataset.json",
+  "fixture_manifest": "../fixture_manifest.json",
+  "evidence_run": "runs/02_supertable-sql-controls-reviewed"
+}

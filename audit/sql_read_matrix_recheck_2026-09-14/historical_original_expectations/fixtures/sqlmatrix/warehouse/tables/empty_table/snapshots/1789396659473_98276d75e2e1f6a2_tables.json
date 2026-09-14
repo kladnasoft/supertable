@@ -1,0 +1,27 @@
+{
+  "simple_name": "empty_table",
+  "location": "sqlmatrix/warehouse/tables/empty_table",
+  "snapshot_version": 1,
+  "last_updated_ms": 1789396659472,
+  "previous_snapshot": "sqlmatrix/warehouse/tables/empty_table/snapshots/1789396659459_9c5cab7684d16377_tables.json",
+  "schema": {
+    "eid": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "resources": [],
+  "tombstone": null,
+  "tombstone_rows": 0,
+  "stats_file": null,
+  "stats_rows": 0,
+  "rowid_high_watermark": 0,
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"eid\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 0,
+    "incoming_columns": 1,
+    "write_id": "c637cdc7-38c9-4e74-ad70-cd8ee17192d4"
+  }
+}

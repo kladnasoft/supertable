@@ -1,0 +1,13 @@
+{
+  "simple_name": "nulls",
+  "location": "sqlmatrix/warehouse/tables/nulls",
+  "snapshot_version": 0,
+  "last_updated_ms": 1789396659137,
+  "previous_snapshot": null,
+  "schema": [],
+  "resources": [],
+  "tombstone": null,
+  "tombstone_rows": 0,
+  "stats_file": null,
+  "stats_rows": 0
+}

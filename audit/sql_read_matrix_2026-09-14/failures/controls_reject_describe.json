@@ -1,0 +1,63 @@
+{
+  "case": {
+    "case_id": "controls_reject_describe",
+    "category": "sql_admission",
+    "sql": "DESCRIBE orders",
+    "columns": [],
+    "expected": [],
+    "ordered": false,
+    "role": "superadmin",
+    "error_contains": [
+      "DESCRIBE is not permitted on the read path"
+    ],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": ""
+  },
+  "reference": {
+    "status": "not_applicable",
+    "reason": "expected native admission/authorization rejection"
+  },
+  "runs": [
+    {
+      "mode": "pruned",
+      "status": "pass",
+      "error": "RuntimeError: DESCRIBE is not permitted on the read path; only SELECT queries are",
+      "duration_ms": 1.577
+    },
+    {
+      "mode": "fullscan",
+      "status": "pass",
+      "error": "RuntimeError: DESCRIBE is not permitted on the read path; only SELECT queries are",
+      "duration_ms": 1.23
+    },
+    {
+      "mode": "stream",
+      "status": "pass",
+      "error": "RuntimeError: stream failed: DESCRIBE is not permitted on the read path; only SELECT queries are",
+      "duration_ms": 1.307
+    },
+    {
+      "mode": "auto",
+      "status": "pass",
+      "error": "RuntimeError: DESCRIBE is not permitted on the read path; only SELECT queries are",
+      "duration_ms": 1.416
+    },
+    {
+      "mode": "query_sql",
+      "status": "fail",
+      "error": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 5.\n  DESCRIBE orders\n\u001b[4mLIMIT\u001b[0m 100000",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": [
+          "DESCRIBE is not permitted on the read path"
+        ]
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 43, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 652, in query_sql\n    raise RuntimeError(f\"Query execution failed: {message}\")\nRuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 5.\n  DESCRIBE orders\n\u001b[4mLIMIT\u001b[0m 100000\n",
+      "duration_ms": 3.627
+    }
+  ],
+  "dataset": "../dataset.json",
+  "fixture_manifest": "../fixture_manifest.json",
+  "evidence_run": "runs/02_supertable-sql-controls-reviewed"
+}

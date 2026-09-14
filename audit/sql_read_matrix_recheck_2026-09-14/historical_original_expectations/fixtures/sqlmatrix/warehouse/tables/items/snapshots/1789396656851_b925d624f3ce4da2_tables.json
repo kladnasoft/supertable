@@ -1,0 +1,13 @@
+{
+  "simple_name": "items",
+  "location": "sqlmatrix/warehouse/tables/items",
+  "snapshot_version": 0,
+  "last_updated_ms": 1789396656851,
+  "previous_snapshot": null,
+  "schema": [],
+  "resources": [],
+  "tombstone": null,
+  "tombstone_rows": 0,
+  "stats_file": null,
+  "stats_rows": 0
+}

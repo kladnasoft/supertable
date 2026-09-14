@@ -1,0 +1,64 @@
+{
+  "rowid_high_watermark": 29,
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"lid\":\"Int64\",\"value\":\"Int64\",\"revision\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+  "stats_file": "sqlmatrix/warehouse/tables/ledger/stats/year=2026/month=09/day=14/hour=14/1789396658840_e05b5945b1dbb6fc_stats.parquet",
+  "resources": [
+    {
+      "columns": 5,
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658356_9706d78d5d4a42df_data.parquet",
+      "file_size": 2045,
+      "rows": 8
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658442_3c771b7666c23e20_data.parquet",
+      "rows": 8,
+      "file_size": 2045,
+      "columns": 5
+    },
+    {
+      "file_size": 2045,
+      "rows": 8,
+      "columns": 5,
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658497_efff42e575e83850_data.parquet"
+    },
+    {
+      "rows": 3,
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658630_768ef3f3a41c67fc_data.parquet",
+      "columns": 5,
+      "file_size": 2012
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658822_6357217963466e9e_data.parquet",
+      "file_size": 1997,
+      "rows": 2,
+      "columns": 5
+    }
+  ],
+  "last_updated_ms": 1789396658851,
+  "stats_rows": 15,
+  "tombstone": [
+    "sqlmatrix/warehouse/tables/ledger/tombstone/year=2026/month=09/day=14/hour=14/1789396658642_16e9b764c1261dae_deleted.parquet",
+    "sqlmatrix/warehouse/tables/ledger/tombstone/year=2026/month=09/day=14/hour=14/1789396658758_1d7909988c4c98ee_deleted.parquet"
+  ],
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 2,
+    "incoming_columns": 3,
+    "write_id": "3c39c160-44dd-4235-ab44-b729bc95082d"
+  },
+  "tombstone_rows": 5,
+  "previous_snapshot": "sqlmatrix/warehouse/tables/ledger/snapshots/1789396658770_ea298e064971cab4_tables.json",
+  "location": "sqlmatrix/warehouse/tables/ledger",
+  "simple_name": "ledger",
+  "schema": {
+    "lid": "Int64",
+    "value": "Int64",
+    "revision": "Int64",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "snapshot_version": 6
+}

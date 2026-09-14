@@ -1,0 +1,85 @@
+{
+  "case": {
+    "case_id": "syntax_literal_select_semicolon",
+    "category": "sql_literal_source",
+    "sql": "SELECT 6 * 7 AS answer;",
+    "columns": [
+      "answer"
+    ],
+    "expected": [
+      [
+        42
+      ]
+    ],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": ""
+  },
+  "reference": {
+    "status": "pass",
+    "row_count": 1
+  },
+  "runs": [
+    {
+      "mode": "pruned",
+      "status": "fail",
+      "error": "ValueError: No tables found in SQL query.",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 47, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 257, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 250, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 353, in _extract_tables\n    raise ValueError(\"No tables found in SQL query.\")\nValueError: No tables found in SQL query.\n",
+      "duration_ms": 1.557
+    },
+    {
+      "mode": "fullscan",
+      "status": "fail",
+      "error": "ValueError: No tables found in SQL query.",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 47, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 257, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 250, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 353, in _extract_tables\n    raise ValueError(\"No tables found in SQL query.\")\nValueError: No tables found in SQL query.\n",
+      "duration_ms": 1.079
+    },
+    {
+      "mode": "stream",
+      "status": "fail",
+      "error": "ValueError: No tables found in SQL query.",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 29, in execute_case\n    handle = reader.stream(case.role, engine=engine.DUCKDB, batch_rows=17)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 557, in stream\n    _, status, message = self.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 257, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 250, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 353, in _extract_tables\n    raise ValueError(\"No tables found in SQL query.\")\nValueError: No tables found in SQL query.\n",
+      "duration_ms": 1.25
+    },
+    {
+      "mode": "auto",
+      "status": "fail",
+      "error": "ValueError: No tables found in SQL query.",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 47, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 257, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 250, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 353, in _extract_tables\n    raise ValueError(\"No tables found in SQL query.\")\nValueError: No tables found in SQL query.\n",
+      "duration_ms": 1.879
+    },
+    {
+      "mode": "query_sql",
+      "status": "fail",
+      "error": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  SELECT 6 * 7 AS answer;\nLIMIT \u001b[4m100000\u001b[0m",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 43, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 652, in query_sql\n    raise RuntimeError(f\"Query execution failed: {message}\")\nRuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  SELECT 6 * 7 AS answer;\nLIMIT \u001b[4m100000\u001b[0m\n",
+      "duration_ms": 2.265
+    }
+  ],
+  "dataset": "../dataset.json",
+  "fixture_manifest": "../fixture_manifest.json",
+  "evidence_run": "runs/03_supertable-sql-syntax-followup"
+}

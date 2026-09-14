@@ -1,0 +1,248 @@
+{
+  "sessions_scope": "All query groups classified by session timezone; UTC includes baseline and general date/alias cases.",
+  "sessions": {
+    "America/New_York": {
+      "query_cases": 52,
+      "executions": 260,
+      "passed": 260,
+      "failed": 0,
+      "cases_with_files_pruned": 20,
+      "max_files_pruned": 101
+    },
+    "Asia/Kathmandu": {
+      "query_cases": 47,
+      "executions": 235,
+      "passed": 235,
+      "failed": 0,
+      "cases_with_files_pruned": 20,
+      "max_files_pruned": 101
+    },
+    "Australia/Lord_Howe": {
+      "query_cases": 52,
+      "executions": 260,
+      "passed": 260,
+      "failed": 0,
+      "cases_with_files_pruned": 20,
+      "max_files_pruned": 100
+    },
+    "Europe/Budapest": {
+      "query_cases": 52,
+      "executions": 260,
+      "passed": 260,
+      "failed": 0,
+      "cases_with_files_pruned": 20,
+      "max_files_pruned": 102
+    },
+    "Pacific/Apia": {
+      "query_cases": 48,
+      "executions": 240,
+      "passed": 240,
+      "failed": 0,
+      "cases_with_files_pruned": 20,
+      "max_files_pruned": 100
+    },
+    "Pacific/Kiritimati": {
+      "query_cases": 47,
+      "executions": 235,
+      "passed": 235,
+      "failed": 0,
+      "cases_with_files_pruned": 20,
+      "max_files_pruned": 99
+    },
+    "UTC": {
+      "query_cases": 1317,
+      "executions": 6619,
+      "passed": 6584,
+      "failed": 35,
+      "cases_with_files_pruned": 413,
+      "max_files_pruned": 102
+    }
+  },
+  "timezone_and_coercion_cases": {
+    "America/New_York": {
+      "query_cases": 52,
+      "executions": 260,
+      "passed": 260,
+      "failed": 0
+    },
+    "Asia/Kathmandu": {
+      "query_cases": 47,
+      "executions": 235,
+      "passed": 235,
+      "failed": 0
+    },
+    "Australia/Lord_Howe": {
+      "query_cases": 52,
+      "executions": 260,
+      "passed": 260,
+      "failed": 0
+    },
+    "Europe/Budapest": {
+      "query_cases": 52,
+      "executions": 260,
+      "passed": 260,
+      "failed": 0
+    },
+    "Pacific/Apia": {
+      "query_cases": 48,
+      "executions": 240,
+      "passed": 240,
+      "failed": 0
+    },
+    "Pacific/Kiritimati": {
+      "query_cases": 47,
+      "executions": 235,
+      "passed": 235,
+      "failed": 0
+    },
+    "UTC": {
+      "query_cases": 132,
+      "executions": 660,
+      "passed": 660,
+      "failed": 0
+    }
+  },
+  "worker_session_observations": [
+    {
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "requested": "UTC",
+      "observed": null,
+      "note": "Base/cursor timezone was not recorded."
+    },
+    {
+      "evidence_run": "runs/02_supertable-timezones-newyork-recheck",
+      "requested": "America/New_York",
+      "observed": {
+        "base": "America/New_York",
+        "cursor": "America/New_York"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/03_Asia_Kathmandu",
+      "requested": "Asia/Kathmandu",
+      "observed": {
+        "base": "Asia/Kathmandu",
+        "cursor": "Asia/Kathmandu"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/04_Australia_Lord_Howe",
+      "requested": "Australia/Lord_Howe",
+      "observed": {
+        "base": "Australia/Lord_Howe",
+        "cursor": "Australia/Lord_Howe"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/05_Europe_Budapest",
+      "requested": "Europe/Budapest",
+      "observed": {
+        "base": "Europe/Budapest",
+        "cursor": "Europe/Budapest"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/06_Pacific_Apia",
+      "requested": "Pacific/Apia",
+      "observed": {
+        "base": "Pacific/Apia",
+        "cursor": "Pacific/Apia"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/07_Pacific_Kiritimati",
+      "requested": "Pacific/Kiritimati",
+      "observed": {
+        "base": "Pacific/Kiritimati",
+        "cursor": "Pacific/Kiritimati"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/08_UTC",
+      "requested": "UTC",
+      "observed": {
+        "base": "UTC",
+        "cursor": "UTC"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/09_America_New_York",
+      "requested": "America/New_York",
+      "observed": {
+        "base": "America/New_York",
+        "cursor": "America/New_York"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/10_Asia_Kathmandu",
+      "requested": "Asia/Kathmandu",
+      "observed": {
+        "base": "Asia/Kathmandu",
+        "cursor": "Asia/Kathmandu"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/11_Australia_Lord_Howe",
+      "requested": "Australia/Lord_Howe",
+      "observed": {
+        "base": "Australia/Lord_Howe",
+        "cursor": "Australia/Lord_Howe"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/12_Europe_Budapest",
+      "requested": "Europe/Budapest",
+      "observed": {
+        "base": "Europe/Budapest",
+        "cursor": "Europe/Budapest"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/13_Pacific_Apia",
+      "requested": "Pacific/Apia",
+      "observed": {
+        "base": "Pacific/Apia",
+        "cursor": "Pacific/Apia"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/14_Pacific_Kiritimati",
+      "requested": "Pacific/Kiritimati",
+      "observed": {
+        "base": "Pacific/Kiritimati",
+        "cursor": "Pacific/Kiritimati"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/15_UTC",
+      "requested": "UTC",
+      "observed": {
+        "base": "UTC",
+        "cursor": "UTC"
+      },
+      "note": ""
+    },
+    {
+      "evidence_run": "runs/16_supertable-group-alias-followup-recheck",
+      "requested": "UTC",
+      "observed": {
+        "base": "UTC",
+        "cursor": "UTC"
+      },
+      "note": ""
+    }
+  ]
+}

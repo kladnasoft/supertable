@@ -1,0 +1,13 @@
+{
+  "simple_name": "ledger",
+  "location": "sqlmatrix/warehouse/tables/ledger",
+  "snapshot_version": 0,
+  "last_updated_ms": 1789396658342,
+  "previous_snapshot": null,
+  "schema": [],
+  "resources": [],
+  "tombstone": null,
+  "tombstone_rows": 0,
+  "stats_file": null,
+  "stats_rows": 0
+}

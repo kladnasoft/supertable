@@ -1,0 +1,83 @@
+{
+  "case": {
+    "case_id": "controls_empty_physical_projection",
+    "category": "empty_results",
+    "sql": "SELECT eid FROM empty_table",
+    "columns": [
+      "eid"
+    ],
+    "expected": [],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {
+      "eid": "Int64"
+    },
+    "min_pruned_files": 0,
+    "note": "An existing table with no physical rows still has a queryable declared schema."
+  },
+  "reference": {
+    "status": "pass",
+    "row_count": 0
+  },
+  "runs": [
+    {
+      "mode": "pruned",
+      "status": "fail",
+      "error": "RuntimeError: No parquet files found for one or more selected tables.",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 49, in execute_case\n    raise RuntimeError(message)\nRuntimeError: No parquet files found for one or more selected tables.\n",
+      "duration_ms": 23.541
+    },
+    {
+      "mode": "fullscan",
+      "status": "fail",
+      "error": "RuntimeError: No parquet files found for one or more selected tables.",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 49, in execute_case\n    raise RuntimeError(message)\nRuntimeError: No parquet files found for one or more selected tables.\n",
+      "duration_ms": 29.092
+    },
+    {
+      "mode": "stream",
+      "status": "fail",
+      "error": "RuntimeError: stream failed: No parquet files found for one or more selected tables.",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 29, in execute_case\n    handle = reader.stream(case.role, engine=engine.DUCKDB, batch_rows=17)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 564, in stream\n    raise RuntimeError(f\"stream failed: {message}\")\nRuntimeError: stream failed: No parquet files found for one or more selected tables.\n",
+      "duration_ms": 25.612
+    },
+    {
+      "mode": "auto",
+      "status": "fail",
+      "error": "RuntimeError: No parquet files found for one or more selected tables.",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 49, in execute_case\n    raise RuntimeError(message)\nRuntimeError: No parquet files found for one or more selected tables.\n",
+      "duration_ms": 23.019
+    },
+    {
+      "mode": "query_sql",
+      "status": "fail",
+      "error": "RuntimeError: Query execution failed: No parquet files found for one or more selected tables.",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 43, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 652, in query_sql\n    raise RuntimeError(f\"Query execution failed: {message}\")\nRuntimeError: Query execution failed: No parquet files found for one or more selected tables.\n",
+      "duration_ms": 26.32
+    }
+  ],
+  "dataset": "../dataset.json",
+  "fixture_manifest": "../fixture_manifest.json",
+  "evidence_run": "runs/02_supertable-sql-controls-reviewed"
+}

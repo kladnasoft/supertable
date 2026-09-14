@@ -1,0 +1,39 @@
+{
+  "simple_name": "items",
+  "location": "sqlmatrix/warehouse/tables/items",
+  "snapshot_version": 1,
+  "last_updated_ms": 1789396656889,
+  "previous_snapshot": "sqlmatrix/warehouse/tables/items/snapshots/1789396656851_b925d624f3ce4da2_tables.json",
+  "schema": {
+    "iid": "Int64",
+    "oid": "Int64",
+    "sku": "String",
+    "units": "Int64",
+    "price": "Int64",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "resources": [
+    {
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396656863_7bf2d28ae70467be_data.parquet",
+      "file_size": 3093,
+      "rows": 60,
+      "columns": 7
+    }
+  ],
+  "tombstone": null,
+  "tombstone_rows": 0,
+  "stats_file": "sqlmatrix/warehouse/tables/items/stats/year=2026/month=09/day=14/hour=14/1789396656880_e6b988bbcc20f007_stats.parquet",
+  "stats_rows": 5,
+  "rowid_high_watermark": 60,
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"iid\":\"Int64\",\"oid\":\"Int64\",\"sku\":\"String\",\"units\":\"Int64\",\"price\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 60,
+    "incoming_columns": 5,
+    "write_id": "af061c32-6fc2-4872-9b9f-3e04250641ab"
+  }
+}

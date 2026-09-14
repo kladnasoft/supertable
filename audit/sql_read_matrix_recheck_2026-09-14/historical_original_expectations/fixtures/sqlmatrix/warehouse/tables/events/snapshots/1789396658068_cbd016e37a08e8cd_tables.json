@@ -1,0 +1,13 @@
+{
+  "simple_name": "events",
+  "location": "sqlmatrix/warehouse/tables/events",
+  "snapshot_version": 0,
+  "last_updated_ms": 1789396658068,
+  "previous_snapshot": null,
+  "schema": [],
+  "resources": [],
+  "tombstone": null,
+  "tombstone_rows": 0,
+  "stats_file": null,
+  "stats_rows": 0
+}

@@ -1,0 +1,70 @@
+{
+  "rowid_high_watermark": 150,
+  "snapshot_version": 5,
+  "schema": {
+    "oid": "Int64",
+    "cid": "Int64",
+    "region": "String",
+    "status": "String",
+    "amount": "Int64",
+    "qty": "Int64",
+    "score": "Float64",
+    "active": "Boolean",
+    "created": "Date",
+    "happened": "Datetime(time_unit='us', time_zone=None)",
+    "note": "String",
+    "code": "String",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "simple_name": "orders",
+  "last_updated_ms": 1789396656170,
+  "stats_rows": 60,
+  "tombstone": null,
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 30,
+    "incoming_columns": 12,
+    "write_id": "871a39e7-c2e8-48f6-b95e-0b5bd24203b5"
+  },
+  "location": "sqlmatrix/warehouse/tables/orders",
+  "previous_snapshot": "sqlmatrix/warehouse/tables/orders/snapshots/1789396656074_ffa449a20ec732b7_tables.json",
+  "tombstone_rows": 0,
+  "resources": [
+    {
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396655768_1d3bb72755eac092_data.parquet",
+      "rows": 30,
+      "file_size": 5648,
+      "columns": 14
+    },
+    {
+      "file_size": 5683,
+      "rows": 30,
+      "columns": 14,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396655875_d427b75c4cf44fae_data.parquet"
+    },
+    {
+      "rows": 30,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396655950_cc2c60356866cef1_data.parquet",
+      "columns": 14,
+      "file_size": 5685
+    },
+    {
+      "columns": 14,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396656044_4e3ccd65c36bd1f0_data.parquet",
+      "file_size": 5705,
+      "rows": 30
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396656138_4f329917a8bb71f9_data.parquet",
+      "file_size": 5707,
+      "rows": 30,
+      "columns": 14
+    }
+  ],
+  "stats_file": "sqlmatrix/warehouse/tables/orders/stats/year=2026/month=09/day=14/hour=14/1789396656164_633e2e65d4fe442e_stats.parquet",
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"oid\":\"Int64\",\"cid\":\"Int64\",\"region\":\"String\",\"status\":\"String\",\"amount\":\"Int64\",\"qty\":\"Int64\",\"score\":\"Float64\",\"active\":\"Boolean\",\"created\":\"Date\",\"happened\":\"Datetime(time_unit='us', time_zone=None)\",\"note\":\"String\",\"code\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+}

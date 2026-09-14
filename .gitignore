@@ -61,3 +61,18 @@ supertable/infrastructure/minio/scripts
 # Characterization performance benchmarks — timing-dependent, never sealed.
 # (The golden corpus under tests/golden IS committed; perf results are not.)
 tests/perf_results/
+
+# SQL read-matrix harness output. Every run regenerates it, and the raw
+# payloads are ~159 MB across ~11k files — too much to carry in history for a
+# public repo. What the issue write-ups actually cite is kept: the reports, the
+# per-case failure records, and the dataset/fixture manifests needed to read
+# them. Regenerate the rest with `python -m scripts.sql_read_matrix`.
+#
+# Deliberately NOT a blanket `audit/` ignore: audit/AUDIT_*.md and
+# audit/detail/*.md are hand-written and tracked, and a blanket rule would also
+# swallow future ones.
+audit/sql_read_matrix*/runs/
+audit/sql_read_matrix*/results.json
+audit/sql_read_matrix*/expectations.json
+audit/sql_read_matrix*/original_expectations.json
+audit/sql_read_matrix*/case_results.csv

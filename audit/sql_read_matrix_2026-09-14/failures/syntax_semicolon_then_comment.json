@@ -1,0 +1,115 @@
+{
+  "case": {
+    "case_id": "syntax_semicolon_then_comment",
+    "category": "sql_surface_syntax",
+    "sql": "SELECT oid, qty FROM orders WHERE oid <= 8 ORDER BY oid; -- terminated named-table query\n",
+    "columns": [
+      "oid",
+      "qty"
+    ],
+    "expected": [
+      [
+        1,
+        2
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        3,
+        4
+      ],
+      [
+        4,
+        5
+      ],
+      [
+        5,
+        1
+      ],
+      [
+        6,
+        2
+      ],
+      [
+        7,
+        3
+      ],
+      [
+        8,
+        4
+      ]
+    ],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": ""
+  },
+  "reference": {
+    "status": "pass",
+    "row_count": 8
+  },
+  "runs": [
+    {
+      "mode": "pruned",
+      "status": "fail",
+      "error": "RuntimeError: only a single statement may be submitted; found 2",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 49, in execute_case\n    raise RuntimeError(message)\nRuntimeError: only a single statement may be submitted; found 2\n",
+      "duration_ms": 2.779
+    },
+    {
+      "mode": "fullscan",
+      "status": "fail",
+      "error": "RuntimeError: only a single statement may be submitted; found 2",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 49, in execute_case\n    raise RuntimeError(message)\nRuntimeError: only a single statement may be submitted; found 2\n",
+      "duration_ms": 2.696
+    },
+    {
+      "mode": "stream",
+      "status": "fail",
+      "error": "RuntimeError: stream failed: only a single statement may be submitted; found 2",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 29, in execute_case\n    handle = reader.stream(case.role, engine=engine.DUCKDB, batch_rows=17)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 564, in stream\n    raise RuntimeError(f\"stream failed: {message}\")\nRuntimeError: stream failed: only a single statement may be submitted; found 2\n",
+      "duration_ms": 2.497
+    },
+    {
+      "mode": "auto",
+      "status": "fail",
+      "error": "RuntimeError: only a single statement may be submitted; found 2",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 49, in execute_case\n    raise RuntimeError(message)\nRuntimeError: only a single statement may be submitted; found 2\n",
+      "duration_ms": 1.767
+    },
+    {
+      "mode": "query_sql",
+      "status": "fail",
+      "error": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 3, Col: 12.\n  SELECT oid, qty FROM orders WHERE oid <= 8 ORDER BY oid; -- terminated named-table query\n\nLIMIT \u001b[4m100000\u001b[0m",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 43, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 652, in query_sql\n    raise RuntimeError(f\"Query execution failed: {message}\")\nRuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 3, Col: 12.\n  SELECT oid, qty FROM orders WHERE oid <= 8 ORDER BY oid; -- terminated named-table query\n\nLIMIT \u001b[4m100000\u001b[0m\n",
+      "duration_ms": 3.864
+    }
+  ],
+  "dataset": "../dataset.json",
+  "fixture_manifest": "../fixture_manifest.json",
+  "evidence_run": "runs/03_supertable-sql-syntax-followup"
+}

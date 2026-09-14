@@ -1,0 +1,46 @@
+{
+  "simple_name": "orders",
+  "location": "sqlmatrix/warehouse/tables/orders",
+  "snapshot_version": 1,
+  "last_updated_ms": 1789396655800,
+  "previous_snapshot": "sqlmatrix/warehouse/tables/orders/snapshots/1789396655746_2ac4eb6238ecd750_tables.json",
+  "schema": {
+    "oid": "Int64",
+    "cid": "Int64",
+    "region": "String",
+    "status": "String",
+    "amount": "Int64",
+    "qty": "Int64",
+    "score": "Float64",
+    "active": "Boolean",
+    "created": "Date",
+    "happened": "Datetime(time_unit='us', time_zone=None)",
+    "note": "String",
+    "code": "String",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "resources": [
+    {
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396655768_1d3bb72755eac092_data.parquet",
+      "file_size": 5648,
+      "rows": 30,
+      "columns": 14
+    }
+  ],
+  "tombstone": null,
+  "tombstone_rows": 0,
+  "stats_file": "sqlmatrix/warehouse/tables/orders/stats/year=2026/month=09/day=14/hour=14/1789396655790_f2475062ae1f59d2_stats.parquet",
+  "stats_rows": 12,
+  "rowid_high_watermark": 30,
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"oid\":\"Int64\",\"cid\":\"Int64\",\"region\":\"String\",\"status\":\"String\",\"amount\":\"Int64\",\"qty\":\"Int64\",\"score\":\"Float64\",\"active\":\"Boolean\",\"created\":\"Date\",\"happened\":\"Datetime(time_unit='us', time_zone=None)\",\"note\":\"String\",\"code\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 30,
+    "incoming_columns": 12,
+    "write_id": "bb7bcdb7-d90a-47e6-a4e2-a56368de771f"
+  }
+}

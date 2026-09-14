@@ -1,0 +1,12 @@
+{
+  "focused_regressions": {
+    "command": "python -m pytest supertable/tests/test_read_path_sql_compat.py supertable/tests/test_path_only_snapshot_resolution.py supertable/tests/test_empty_table_reads.py supertable/tests/test_decimal_footer_stats.py supertable/tests/test_prune_timezone_soundness.py -q --tb=short",
+    "passed": 209,
+    "failed": 0
+  },
+  "harness": {
+    "command": "python -m pytest scripts/sql_read_matrix/test_harness.py scripts/sql_read_matrix/test_temporal_harness.py -q",
+    "passed": 70,
+    "failed": 0
+  }
+}

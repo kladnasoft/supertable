@@ -1,0 +1,57 @@
+{
+  "rowid_high_watermark": 240,
+  "stats_rows": 20,
+  "stats_file": "sqlmatrix/warehouse/tables/items/stats/year=2026/month=09/day=14/hour=14/1789396657134_292649f9869703a1_stats.parquet",
+  "resources": [
+    {
+      "file_size": 3093,
+      "rows": 60,
+      "columns": 7,
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396656863_7bf2d28ae70467be_data.parquet"
+    },
+    {
+      "rows": 60,
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396656935_de80313d0b58ccde_data.parquet",
+      "columns": 7,
+      "file_size": 3123
+    },
+    {
+      "columns": 7,
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396657010_3086c39afe4b47c9_data.parquet",
+      "file_size": 3133,
+      "rows": 60
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396657111_80f8122a54816044_data.parquet",
+      "file_size": 3141,
+      "rows": 60,
+      "columns": 7
+    }
+  ],
+  "last_updated_ms": 1789396657148,
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"iid\":\"Int64\",\"oid\":\"Int64\",\"sku\":\"String\",\"units\":\"Int64\",\"price\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+  "tombstone": null,
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 60,
+    "incoming_columns": 5,
+    "write_id": "a8a02eb2-bd88-45c4-9138-5c2ff0b97570"
+  },
+  "tombstone_rows": 0,
+  "previous_snapshot": "sqlmatrix/warehouse/tables/items/snapshots/1789396657040_72f8a5923f4c9995_tables.json",
+  "location": "sqlmatrix/warehouse/tables/items",
+  "simple_name": "items",
+  "schema": {
+    "iid": "Int64",
+    "oid": "Int64",
+    "sku": "String",
+    "units": "Int64",
+    "price": "Int64",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "snapshot_version": 4
+}

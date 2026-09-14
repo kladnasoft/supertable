@@ -1,0 +1,60 @@
+{
+  "rowid_high_watermark": 27,
+  "snapshot_version": 5,
+  "schema": {
+    "revision": "Int64",
+    "__rowid__": "Int64",
+    "value": "Int64",
+    "lid": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "simple_name": "ledger",
+  "last_updated_ms": 1789396658770,
+  "stats_rows": 12,
+  "tombstone": [
+    "sqlmatrix/warehouse/tables/ledger/tombstone/year=2026/month=09/day=14/hour=14/1789396658642_16e9b764c1261dae_deleted.parquet",
+    "sqlmatrix/warehouse/tables/ledger/tombstone/year=2026/month=09/day=14/hour=14/1789396658758_1d7909988c4c98ee_deleted.parquet"
+  ],
+  "lineage": {
+    "source_type": "delete",
+    "role_name": "superadmin",
+    "overwrite_columns": [
+      "lid"
+    ],
+    "delete_only": true,
+    "incoming_rows": 2,
+    "incoming_columns": 1,
+    "write_id": "ed587cdb-c517-46dc-8d83-7671155a601f"
+  },
+  "location": "sqlmatrix/warehouse/tables/ledger",
+  "previous_snapshot": "sqlmatrix/warehouse/tables/ledger/snapshots/1789396658668_e870cb752fa65486_tables.json",
+  "tombstone_rows": 5,
+  "resources": [
+    {
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658356_9706d78d5d4a42df_data.parquet",
+      "rows": 8,
+      "file_size": 2045,
+      "columns": 5
+    },
+    {
+      "file_size": 2045,
+      "rows": 8,
+      "columns": 5,
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658442_3c771b7666c23e20_data.parquet"
+    },
+    {
+      "rows": 8,
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658497_efff42e575e83850_data.parquet",
+      "columns": 5,
+      "file_size": 2045
+    },
+    {
+      "columns": 5,
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658630_768ef3f3a41c67fc_data.parquet",
+      "file_size": 2012,
+      "rows": 3
+    }
+  ],
+  "stats_file": "sqlmatrix/warehouse/tables/ledger/stats/year=2026/month=09/day=14/hour=14/1789396658662_fa7cadd129e6fb73_stats.parquet",
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"lid\":\"Int64\",\"value\":\"Int64\",\"revision\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+}

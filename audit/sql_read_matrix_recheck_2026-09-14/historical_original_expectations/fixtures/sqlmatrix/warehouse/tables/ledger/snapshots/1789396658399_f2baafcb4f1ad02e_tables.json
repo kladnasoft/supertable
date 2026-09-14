@@ -1,0 +1,37 @@
+{
+  "simple_name": "ledger",
+  "location": "sqlmatrix/warehouse/tables/ledger",
+  "snapshot_version": 1,
+  "last_updated_ms": 1789396658399,
+  "previous_snapshot": "sqlmatrix/warehouse/tables/ledger/snapshots/1789396658342_2115acd17cd1f1ff_tables.json",
+  "schema": {
+    "lid": "Int64",
+    "value": "Int64",
+    "revision": "Int64",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "resources": [
+    {
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658356_9706d78d5d4a42df_data.parquet",
+      "file_size": 2045,
+      "rows": 8,
+      "columns": 5
+    }
+  ],
+  "tombstone": null,
+  "tombstone_rows": 0,
+  "stats_file": "sqlmatrix/warehouse/tables/ledger/stats/year=2026/month=09/day=14/hour=14/1789396658388_fe9bd5dd21bd2880_stats.parquet",
+  "stats_rows": 3,
+  "rowid_high_watermark": 8,
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"lid\":\"Int64\",\"value\":\"Int64\",\"revision\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 8,
+    "incoming_columns": 3,
+    "write_id": "79672d93-35d5-4904-adb7-2d8182feb79a"
+  }
+}

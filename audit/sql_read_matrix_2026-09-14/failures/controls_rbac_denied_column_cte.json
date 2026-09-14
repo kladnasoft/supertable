@@ -1,0 +1,91 @@
+{
+  "case": {
+    "case_id": "controls_rbac_denied_column_cte",
+    "category": "rbac_columns",
+    "sql": "WITH hidden AS (SELECT oid, note FROM orders) SELECT note FROM hidden",
+    "columns": [],
+    "expected": [],
+    "ordered": false,
+    "role": "eu_reader",
+    "error_contains": [
+      "You don't have permission to columns:"
+    ],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": ""
+  },
+  "reference": {
+    "status": "not_applicable",
+    "reason": "expected native admission/authorization rejection"
+  },
+  "runs": [
+    {
+      "mode": "pruned",
+      "status": "fail",
+      "error": "RuntimeError: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_8ba5742a_8ba5742a...\n                                    ^",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": [
+          "You don't have permission to columns:"
+        ]
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 49, in execute_case\n    raise RuntimeError(message)\nRuntimeError: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_8ba5742a_8ba5742a...\n                                    ^\n",
+      "duration_ms": 85.33
+    },
+    {
+      "mode": "fullscan",
+      "status": "fail",
+      "error": "RuntimeError: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_b00c54cd_b00c54cd...\n                                    ^",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": [
+          "You don't have permission to columns:"
+        ]
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 49, in execute_case\n    raise RuntimeError(message)\nRuntimeError: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_b00c54cd_b00c54cd...\n                                    ^\n",
+      "duration_ms": 68.038
+    },
+    {
+      "mode": "stream",
+      "status": "fail",
+      "error": "RuntimeError: stream failed: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_ddd735da_ddd735da...\n                                    ^",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": [
+          "You don't have permission to columns:"
+        ]
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 29, in execute_case\n    handle = reader.stream(case.role, engine=engine.DUCKDB, batch_rows=17)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 564, in stream\n    raise RuntimeError(f\"stream failed: {message}\")\nRuntimeError: stream failed: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_ddd735da_ddd735da...\n                                    ^\n",
+      "duration_ms": 66.519
+    },
+    {
+      "mode": "auto",
+      "status": "fail",
+      "error": "RuntimeError: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_989527ef_989527ef...\n                                    ^",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": [
+          "You don't have permission to columns:"
+        ]
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 49, in execute_case\n    raise RuntimeError(message)\nRuntimeError: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_989527ef_989527ef...\n                                    ^\n",
+      "duration_ms": 74.713
+    },
+    {
+      "mode": "query_sql",
+      "status": "fail",
+      "error": "RuntimeError: Query execution failed: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_c1543bb8_c1543bb8...\n                                    ^",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": [
+          "You don't have permission to columns:"
+        ]
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 43, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 652, in query_sql\n    raise RuntimeError(f\"Query execution failed: {message}\")\nRuntimeError: Query execution failed: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_c1543bb8_c1543bb8...\n                                    ^\n",
+      "duration_ms": 90.825
+    }
+  ],
+  "dataset": "../dataset.json",
+  "fixture_manifest": "../fixture_manifest.json",
+  "evidence_run": "runs/02_supertable-sql-controls-reviewed"
+}

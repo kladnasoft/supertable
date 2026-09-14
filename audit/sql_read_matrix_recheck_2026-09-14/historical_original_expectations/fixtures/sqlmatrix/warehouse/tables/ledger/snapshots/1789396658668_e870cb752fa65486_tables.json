@@ -1,0 +1,59 @@
+{
+  "rowid_high_watermark": 27,
+  "stats_rows": 12,
+  "stats_file": "sqlmatrix/warehouse/tables/ledger/stats/year=2026/month=09/day=14/hour=14/1789396658662_fa7cadd129e6fb73_stats.parquet",
+  "resources": [
+    {
+      "file_size": 2045,
+      "rows": 8,
+      "columns": 5,
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658356_9706d78d5d4a42df_data.parquet"
+    },
+    {
+      "rows": 8,
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658442_3c771b7666c23e20_data.parquet",
+      "columns": 5,
+      "file_size": 2045
+    },
+    {
+      "columns": 5,
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658497_efff42e575e83850_data.parquet",
+      "file_size": 2045,
+      "rows": 8
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/ledger/data/year=2026/month=09/day=14/1789396658630_768ef3f3a41c67fc_data.parquet",
+      "file_size": 2012,
+      "rows": 3,
+      "columns": 5
+    }
+  ],
+  "last_updated_ms": 1789396658668,
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"lid\":\"Int64\",\"value\":\"Int64\",\"revision\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+  "tombstone": [
+    "sqlmatrix/warehouse/tables/ledger/tombstone/year=2026/month=09/day=14/hour=14/1789396658642_16e9b764c1261dae_deleted.parquet"
+  ],
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [
+      "lid"
+    ],
+    "delete_only": false,
+    "incoming_rows": 3,
+    "incoming_columns": 3,
+    "write_id": "fa8b6de2-2f96-4fb6-a252-ffba99f38133"
+  },
+  "tombstone_rows": 3,
+  "previous_snapshot": "sqlmatrix/warehouse/tables/ledger/snapshots/1789396658520_e35b00a662d19495_tables.json",
+  "location": "sqlmatrix/warehouse/tables/ledger",
+  "simple_name": "ledger",
+  "schema": {
+    "lid": "Int64",
+    "value": "Int64",
+    "revision": "Int64",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "snapshot_version": 4
+}

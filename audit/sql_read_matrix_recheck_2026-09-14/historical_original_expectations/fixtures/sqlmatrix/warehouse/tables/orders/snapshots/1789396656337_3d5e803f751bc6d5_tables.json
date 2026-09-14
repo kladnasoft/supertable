@@ -1,0 +1,82 @@
+{
+  "rowid_high_watermark": 210,
+  "snapshot_version": 7,
+  "schema": {
+    "oid": "Int64",
+    "cid": "Int64",
+    "region": "String",
+    "status": "String",
+    "amount": "Int64",
+    "qty": "Int64",
+    "score": "Float64",
+    "active": "Boolean",
+    "created": "Date",
+    "happened": "Datetime(time_unit='us', time_zone=None)",
+    "note": "String",
+    "code": "String",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "simple_name": "orders",
+  "last_updated_ms": 1789396656336,
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"oid\":\"Int64\",\"cid\":\"Int64\",\"region\":\"String\",\"status\":\"String\",\"amount\":\"Int64\",\"qty\":\"Int64\",\"score\":\"Float64\",\"active\":\"Boolean\",\"created\":\"Date\",\"happened\":\"Datetime(time_unit='us', time_zone=None)\",\"note\":\"String\",\"code\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+  "tombstone": null,
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 30,
+    "incoming_columns": 12,
+    "write_id": "c288425d-ecd5-4ba5-a387-f770493911fb"
+  },
+  "location": "sqlmatrix/warehouse/tables/orders",
+  "previous_snapshot": "sqlmatrix/warehouse/tables/orders/snapshots/1789396656253_c81fd1486d80fbf0_tables.json",
+  "tombstone_rows": 0,
+  "resources": [
+    {
+      "rows": 30,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396655768_1d3bb72755eac092_data.parquet",
+      "columns": 14,
+      "file_size": 5648
+    },
+    {
+      "columns": 14,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396655875_d427b75c4cf44fae_data.parquet",
+      "file_size": 5683,
+      "rows": 30
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396655950_cc2c60356866cef1_data.parquet",
+      "rows": 30,
+      "file_size": 5685,
+      "columns": 14
+    },
+    {
+      "file_size": 5705,
+      "rows": 30,
+      "columns": 14,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396656044_4e3ccd65c36bd1f0_data.parquet"
+    },
+    {
+      "rows": 30,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396656138_4f329917a8bb71f9_data.parquet",
+      "columns": 14,
+      "file_size": 5707
+    },
+    {
+      "columns": 14,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396656225_d481d9695ee00d16_data.parquet",
+      "file_size": 5695,
+      "rows": 30
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396656300_9b2843f9699a4c36_data.parquet",
+      "file_size": 5689,
+      "rows": 30,
+      "columns": 14
+    }
+  ],
+  "stats_file": "sqlmatrix/warehouse/tables/orders/stats/year=2026/month=09/day=14/hour=14/1789396656325_197eb17ca042b096_stats.parquet",
+  "stats_rows": 84
+}

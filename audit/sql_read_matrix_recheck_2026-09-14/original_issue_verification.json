@@ -1,0 +1,4283 @@
+{
+  "historical_audit": "/home/kladnasoft/dev/dataisland/supertable/audit/sql_read_matrix_2026-09-14",
+  "original_query_failures": 102,
+  "original_additional_failures": 5,
+  "query_outcomes": {
+    "pass": 72,
+    "unsupported_original_expectation": 30
+  },
+  "additional_outcomes": {
+    "pass": 5
+  },
+  "frozen_review_summary": {
+    "query_cases": 6,
+    "distinct_sql": 6,
+    "expected_success_cases": 6,
+    "expected_rejection_cases": 0,
+    "executions": 30,
+    "passed": 0,
+    "failed": 30,
+    "failing_query_cases": 6,
+    "independent_oracle_disagreements": 0,
+    "additional_checks": 16,
+    "additional_check_passes": 16,
+    "additional_check_failures": 0,
+    "categories": 1,
+    "modes": {
+      "pruned": 6,
+      "fullscan": 6,
+      "stream": 6,
+      "auto": 6,
+      "query_sql": 6
+    },
+    "categories_with_failures": {
+      "sql_literal_source": 6
+    },
+    "positive_query_failures": 6,
+    "rejection_message_mismatches": 0,
+    "unexpected_rejection_case_successes": 0
+  },
+  "issues": [
+    {
+      "id": "STREAD-001",
+      "title": "Snapshot fallback exposes deleted rows and ignores share filters",
+      "status": "verified_fixed",
+      "original_failure_count": 4,
+      "outcomes": {
+        "pass": 4
+      }
+    },
+    {
+      "id": "STREAD-002",
+      "title": "query_sql silently overwrites valid row limits",
+      "status": "verified_fixed",
+      "original_failure_count": 5,
+      "outcomes": {
+        "pass": 5
+      }
+    },
+    {
+      "id": "STREAD-003",
+      "title": "query_sql appends LIMIT after a statement terminator",
+      "status": "partially_verified_remaining_case_blocked",
+      "original_failure_count": 5,
+      "outcomes": {
+        "pass": 4,
+        "unsupported_original_expectation": 1
+      }
+    },
+    {
+      "id": "STREAD-004",
+      "title": "SQL rewriting corrupts DuckDB DATE_DIFF arguments",
+      "status": "verified_fixed",
+      "original_failure_count": 5,
+      "outcomes": {
+        "pass": 5
+      }
+    },
+    {
+      "id": "STREAD-005",
+      "title": "GROUPING SETS, ROLLUP, and CUBE with LIMIT are rejected",
+      "status": "verified_fixed",
+      "original_failure_count": 21,
+      "outcomes": {
+        "pass": 21
+      }
+    },
+    {
+      "id": "STREAD-006",
+      "title": "Boolean IS UNKNOWN is rejected during SQL admission",
+      "status": "verified_fixed",
+      "original_failure_count": 5,
+      "outcomes": {
+        "pass": 5
+      }
+    },
+    {
+      "id": "STREAD-007",
+      "title": "LIMIT ALL is treated as a required table column",
+      "status": "verified_fixed",
+      "original_failure_count": 4,
+      "outcomes": {
+        "pass": 4
+      }
+    },
+    {
+      "id": "STREAD-008",
+      "title": "A trailing comment is counted as a second SQL statement",
+      "status": "verified_fixed",
+      "original_failure_count": 4,
+      "outcomes": {
+        "pass": 4
+      }
+    },
+    {
+      "id": "STREAD-009",
+      "title": "Table-free SELECTs and literal CTEs cannot execute",
+      "status": "unsupported_original_expectations",
+      "original_failure_count": 29,
+      "outcomes": {
+        "unsupported_original_expectation": 29
+      }
+    },
+    {
+      "id": "STREAD-010",
+      "title": "Existing empty tables fail projections and aggregates",
+      "status": "verified_fixed",
+      "original_failure_count": 15,
+      "outcomes": {
+        "pass": 15
+      }
+    },
+    {
+      "id": "STREAD-011",
+      "title": "Decimal ingestion fails while extracting Parquet statistics",
+      "status": "verified_fixed",
+      "original_failure_count": 1,
+      "outcomes": {
+        "pass": 1
+      }
+    },
+    {
+      "id": "STREAD-012",
+      "title": "query_sql changes forbidden-statement rejection diagnostics",
+      "status": "verified_fixed",
+      "original_failure_count": 4,
+      "outcomes": {
+        "pass": 4
+      }
+    },
+    {
+      "id": "STREAD-013",
+      "title": "Denied columns inside a CTE produce binder errors",
+      "status": "verified_fixed",
+      "original_failure_count": 5,
+      "outcomes": {
+        "pass": 5
+      }
+    }
+  ],
+  "failures": [
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "advanced_grouping_sets",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_grouping_sets.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 5, Col: 12.\n         FROM warehouse.orders GROUP BY GROUPING SETS ((region, status), (region), ())\n        \nLIMIT \u001b[4m100000\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 19,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n",
+          "total_amount"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64",
+          "total_amount": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 182.736
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 19
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "advanced_grouping_rollup",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_grouping_rollup.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 5, Col: 12.\n  ) AS total_amount\n            FROM warehouse.orders GROUP BY ROLLUP (region, status)\n        \nLIMIT \u001b[4m100000\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 19,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n",
+          "total_amount"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64",
+          "total_amount": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 171.082
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 19
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "advanced_grouping_cube",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_grouping_cube.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 5, Col: 12.\n  nt) AS total_amount\n            FROM warehouse.orders GROUP BY CUBE (region, status)\n        \nLIMIT \u001b[4m100000\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 24,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n",
+          "total_amount"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64",
+          "total_amount": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 174.653
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 24
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "advanced_null_aggregate_empty_table",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_null_aggregate_empty_table.json",
+      "historical_observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "pruned",
+        "status": "pass",
+        "row_count": 1,
+        "columns": [
+          "all_n",
+          "nonnull_n",
+          "total",
+          "mean",
+          "low",
+          "high",
+          "total_default"
+        ],
+        "types": {
+          "all_n": "Int64",
+          "nonnull_n": "Int64",
+          "total": "Int64",
+          "mean": "Float64",
+          "low": "Int64",
+          "high": "Int64",
+          "total_default": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 0,
+          "REFLECTION_SIZE": 0,
+          "REFLECTION_SIZE_RAW": 0,
+          "FILES_BEFORE_PRUNE": 0,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 0,
+          "PRUNE_DURATION_MS": 0.007,
+          "PRUNE_COUNTS": {
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 84.894
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "advanced_null_aggregate_empty_table",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_null_aggregate_empty_table.json",
+      "historical_observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "fullscan",
+        "status": "pass",
+        "row_count": 1,
+        "columns": [
+          "all_n",
+          "nonnull_n",
+          "total",
+          "mean",
+          "low",
+          "high",
+          "total_default"
+        ],
+        "types": {
+          "all_n": "Int64",
+          "nonnull_n": "Int64",
+          "total": "Int64",
+          "mean": "Float64",
+          "low": "Int64",
+          "high": "Int64",
+          "total_default": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 0,
+          "REFLECTION_SIZE": 0,
+          "REFLECTION_SIZE_RAW": 0,
+          "FILES_BEFORE_PRUNE": 0,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 0,
+          "PRUNE_DURATION_MS": 0.011,
+          "PRUNE_COUNTS": {
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 97.603
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "advanced_null_aggregate_empty_table",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_null_aggregate_empty_table.json",
+      "historical_observed": "RuntimeError: stream failed: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "stream",
+        "status": "pass",
+        "batches": 1,
+        "row_count": 1,
+        "columns": [
+          "all_n",
+          "nonnull_n",
+          "total",
+          "mean",
+          "low",
+          "high",
+          "total_default"
+        ],
+        "types": {
+          "all_n": "Int64",
+          "nonnull_n": "Int64",
+          "total": "Decimal(precision=38, scale=0)",
+          "mean": "Float64",
+          "low": "Int64",
+          "high": "Int64",
+          "total_default": "Decimal(precision=38, scale=0)"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 0,
+          "REFLECTION_SIZE": 0,
+          "REFLECTION_SIZE_RAW": 0,
+          "FILES_BEFORE_PRUNE": 0,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 0,
+          "PRUNE_DURATION_MS": 0.01,
+          "PRUNE_COUNTS": {
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 86.956
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "advanced_null_aggregate_empty_table",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_null_aggregate_empty_table.json",
+      "historical_observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "auto",
+        "status": "pass",
+        "row_count": 1,
+        "columns": [
+          "all_n",
+          "nonnull_n",
+          "total",
+          "mean",
+          "low",
+          "high",
+          "total_default"
+        ],
+        "types": {
+          "all_n": "Int64",
+          "nonnull_n": "Int64",
+          "total": "Int64",
+          "mean": "Float64",
+          "low": "Int64",
+          "high": "Int64",
+          "total_default": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 0,
+          "REFLECTION_SIZE": 0,
+          "REFLECTION_SIZE_RAW": 0,
+          "FILES_BEFORE_PRUNE": 0,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 0,
+          "PRUNE_DURATION_MS": 0.008,
+          "PRUNE_COUNTS": {
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 85.954
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "advanced_null_aggregate_empty_table",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_null_aggregate_empty_table.json",
+      "historical_observed": "RuntimeError: Query execution failed: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 1,
+        "columns": [
+          "all_n",
+          "nonnull_n",
+          "total",
+          "mean",
+          "low",
+          "high",
+          "total_default"
+        ],
+        "types": {
+          "all_n": "Int64",
+          "nonnull_n": "Int64",
+          "total": "Int64",
+          "mean": "Float64",
+          "low": "Int64",
+          "high": "Int64",
+          "total_default": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 128.794
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-004",
+      "kind": "query",
+      "case_id": "advanced_date_date_diff",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_date_date_diff.json",
+      "historical_observed": "RuntimeError: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "pruned",
+        "status": "pass",
+        "row_count": 24,
+        "columns": [
+          "eid",
+          "result"
+        ],
+        "types": {
+          "eid": "Int64",
+          "result": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 3,
+          "REFLECTION_SIZE": 660,
+          "REFLECTION_SIZE_RAW": 9195,
+          "FILES_BEFORE_PRUNE": 3,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 3,
+          "PRUNE_DURATION_MS": 0.021,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 70.881
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 24
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-004",
+      "kind": "query",
+      "case_id": "advanced_date_date_diff",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_date_date_diff.json",
+      "historical_observed": "RuntimeError: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "fullscan",
+        "status": "pass",
+        "row_count": 24,
+        "columns": [
+          "eid",
+          "result"
+        ],
+        "types": {
+          "eid": "Int64",
+          "result": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 3,
+          "REFLECTION_SIZE": 660,
+          "REFLECTION_SIZE_RAW": 9195,
+          "FILES_BEFORE_PRUNE": 3,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 3,
+          "PRUNE_DURATION_MS": 0.017,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 79.001
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 24
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-004",
+      "kind": "query",
+      "case_id": "advanced_date_date_diff",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_date_date_diff.json",
+      "historical_observed": "RuntimeError: stream failed: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "stream",
+        "status": "pass",
+        "batches": 2,
+        "row_count": 24,
+        "columns": [
+          "eid",
+          "result"
+        ],
+        "types": {
+          "eid": "Int64",
+          "result": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 3,
+          "REFLECTION_SIZE": 660,
+          "REFLECTION_SIZE_RAW": 9195,
+          "FILES_BEFORE_PRUNE": 3,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 3,
+          "PRUNE_DURATION_MS": 0.015,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 81.048
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 24
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-004",
+      "kind": "query",
+      "case_id": "advanced_date_date_diff",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_date_date_diff.json",
+      "historical_observed": "RuntimeError: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "auto",
+        "status": "pass",
+        "row_count": 24,
+        "columns": [
+          "eid",
+          "result"
+        ],
+        "types": {
+          "eid": "Int64",
+          "result": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 3,
+          "REFLECTION_SIZE": 660,
+          "REFLECTION_SIZE_RAW": 9195,
+          "FILES_BEFORE_PRUNE": 3,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 3,
+          "PRUNE_DURATION_MS": 0.021,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 91.653
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 24
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-004",
+      "kind": "query",
+      "case_id": "advanced_date_date_diff",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_date_date_diff.json",
+      "historical_observed": "RuntimeError: Query execution failed: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 24,
+        "columns": [
+          "eid",
+          "result"
+        ],
+        "types": {
+          "eid": "Int64",
+          "result": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 114.945
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 24
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-006",
+      "kind": "query",
+      "case_id": "advanced_boolean_is_unknown",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_boolean_is_unknown.json",
+      "historical_observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 27.\n  SELECT eid, flag IS \u001b[4mUNKNOWN\u001b[0m AS result FROM warehouse.events ORDER BY eid",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "pruned",
+        "status": "pass",
+        "row_count": 24,
+        "columns": [
+          "eid",
+          "result"
+        ],
+        "types": {
+          "eid": "Int64",
+          "result": "Boolean"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 3,
+          "REFLECTION_SIZE": 468,
+          "REFLECTION_SIZE_RAW": 9195,
+          "FILES_BEFORE_PRUNE": 3,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 3,
+          "PRUNE_DURATION_MS": 0.016,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 77.931
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 24
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-006",
+      "kind": "query",
+      "case_id": "advanced_boolean_is_unknown",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_boolean_is_unknown.json",
+      "historical_observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 27.\n  SELECT eid, flag IS \u001b[4mUNKNOWN\u001b[0m AS result FROM warehouse.events ORDER BY eid",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "fullscan",
+        "status": "pass",
+        "row_count": 24,
+        "columns": [
+          "eid",
+          "result"
+        ],
+        "types": {
+          "eid": "Int64",
+          "result": "Boolean"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 3,
+          "REFLECTION_SIZE": 468,
+          "REFLECTION_SIZE_RAW": 9195,
+          "FILES_BEFORE_PRUNE": 3,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 3,
+          "PRUNE_DURATION_MS": 0.018,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 92.542
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 24
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-006",
+      "kind": "query",
+      "case_id": "advanced_boolean_is_unknown",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_boolean_is_unknown.json",
+      "historical_observed": "RuntimeError: stream failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 27.\n  SELECT eid, flag IS \u001b[4mUNKNOWN\u001b[0m AS result FROM warehouse.events ORDER BY eid",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "stream",
+        "status": "pass",
+        "batches": 2,
+        "row_count": 24,
+        "columns": [
+          "eid",
+          "result"
+        ],
+        "types": {
+          "eid": "Int64",
+          "result": "Boolean"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 3,
+          "REFLECTION_SIZE": 468,
+          "REFLECTION_SIZE_RAW": 9195,
+          "FILES_BEFORE_PRUNE": 3,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 3,
+          "PRUNE_DURATION_MS": 0.038,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 79.081
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 24
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-006",
+      "kind": "query",
+      "case_id": "advanced_boolean_is_unknown",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_boolean_is_unknown.json",
+      "historical_observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 27.\n  SELECT eid, flag IS \u001b[4mUNKNOWN\u001b[0m AS result FROM warehouse.events ORDER BY eid",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "auto",
+        "status": "pass",
+        "row_count": 24,
+        "columns": [
+          "eid",
+          "result"
+        ],
+        "types": {
+          "eid": "Int64",
+          "result": "Boolean"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 3,
+          "REFLECTION_SIZE": 468,
+          "REFLECTION_SIZE_RAW": 9195,
+          "FILES_BEFORE_PRUNE": 3,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 3,
+          "PRUNE_DURATION_MS": 0.022,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 74.781
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 24
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-006",
+      "kind": "query",
+      "case_id": "advanced_boolean_is_unknown",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_boolean_is_unknown.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 27.\n  SELECT eid, flag IS \u001b[4mUNKNOWN\u001b[0m AS result FROM warehouse.events ORDER BY eid\nLIMIT 100000",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 24,
+        "columns": [
+          "eid",
+          "result"
+        ],
+        "types": {
+          "eid": "Int64",
+          "result": "Boolean"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 93.039
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 24
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_projection",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_projection.json",
+      "historical_observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "pruned",
+        "status": "pass",
+        "row_count": 0,
+        "columns": [
+          "eid"
+        ],
+        "types": {
+          "eid": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 0,
+          "REFLECTION_SIZE": 0,
+          "REFLECTION_SIZE_RAW": 0,
+          "FILES_BEFORE_PRUNE": 0,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 0,
+          "PRUNE_DURATION_MS": 0.006,
+          "PRUNE_COUNTS": {
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 50.307
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 0
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_projection",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_projection.json",
+      "historical_observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "fullscan",
+        "status": "pass",
+        "row_count": 0,
+        "columns": [
+          "eid"
+        ],
+        "types": {
+          "eid": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 0,
+          "REFLECTION_SIZE": 0,
+          "REFLECTION_SIZE_RAW": 0,
+          "FILES_BEFORE_PRUNE": 0,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 0,
+          "PRUNE_DURATION_MS": 0.014,
+          "PRUNE_COUNTS": {
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 49.293
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 0
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_projection",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_projection.json",
+      "historical_observed": "RuntimeError: stream failed: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "stream",
+        "status": "pass",
+        "batches": 0,
+        "row_count": 0,
+        "columns": [
+          "eid"
+        ],
+        "types": {
+          "eid": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 0,
+          "REFLECTION_SIZE": 0,
+          "REFLECTION_SIZE_RAW": 0,
+          "FILES_BEFORE_PRUNE": 0,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 0,
+          "PRUNE_DURATION_MS": 0.007,
+          "PRUNE_COUNTS": {
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 50.991
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 0
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_projection",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_projection.json",
+      "historical_observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "auto",
+        "status": "pass",
+        "row_count": 0,
+        "columns": [
+          "eid"
+        ],
+        "types": {
+          "eid": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 0,
+          "REFLECTION_SIZE": 0,
+          "REFLECTION_SIZE_RAW": 0,
+          "FILES_BEFORE_PRUNE": 0,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 0,
+          "PRUNE_DURATION_MS": 0.007,
+          "PRUNE_COUNTS": {
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 55.469
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 0
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_projection",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_projection.json",
+      "historical_observed": "RuntimeError: Query execution failed: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 0,
+        "columns": [
+          "eid"
+        ],
+        "types": {
+          "eid": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 58.938
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 0
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_count",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_count.json",
+      "historical_observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "pruned",
+        "status": "pass",
+        "row_count": 1,
+        "columns": [
+          "n"
+        ],
+        "types": {
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 0,
+          "REFLECTION_SIZE": 0,
+          "REFLECTION_SIZE_RAW": 0,
+          "FILES_BEFORE_PRUNE": 0,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 0,
+          "PRUNE_DURATION_MS": 0.008,
+          "PRUNE_COUNTS": {
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 70.873
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_count",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_count.json",
+      "historical_observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "fullscan",
+        "status": "pass",
+        "row_count": 1,
+        "columns": [
+          "n"
+        ],
+        "types": {
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 0,
+          "REFLECTION_SIZE": 0,
+          "REFLECTION_SIZE_RAW": 0,
+          "FILES_BEFORE_PRUNE": 0,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 0,
+          "PRUNE_DURATION_MS": 0.019,
+          "PRUNE_COUNTS": {
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 106.057
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_count",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_count.json",
+      "historical_observed": "RuntimeError: stream failed: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "stream",
+        "status": "pass",
+        "batches": 1,
+        "row_count": 1,
+        "columns": [
+          "n"
+        ],
+        "types": {
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 0,
+          "REFLECTION_SIZE": 0,
+          "REFLECTION_SIZE_RAW": 0,
+          "FILES_BEFORE_PRUNE": 0,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 0,
+          "PRUNE_DURATION_MS": 0.007,
+          "PRUNE_COUNTS": {
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 93.245
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_count",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_count.json",
+      "historical_observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "auto",
+        "status": "pass",
+        "row_count": 1,
+        "columns": [
+          "n"
+        ],
+        "types": {
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 0,
+          "REFLECTION_SIZE": 0,
+          "REFLECTION_SIZE_RAW": 0,
+          "FILES_BEFORE_PRUNE": 0,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 0,
+          "PRUNE_DURATION_MS": 0.008,
+          "PRUNE_COUNTS": {
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 63.969
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_count",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_count.json",
+      "historical_observed": "RuntimeError: Query execution failed: No parquet files found for one or more selected tables.",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 1,
+        "columns": [
+          "n"
+        ],
+        "types": {
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 67.455
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-012",
+      "kind": "query",
+      "case_id": "controls_reject_insert",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_reject_insert.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 5.\n  INSERT INTO orders (oid) VALUES (999)\n\u001b[4mLIMIT\u001b[0m 100000",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "error": "RuntimeError: Query execution failed: INSERT is not permitted on the read path; only SELECT queries are",
+        "duration_ms": 6.922
+      },
+      "reference": {
+        "status": "not_applicable",
+        "reason": "expected native admission/authorization rejection"
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-012",
+      "kind": "query",
+      "case_id": "controls_reject_create",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_reject_create.json",
+      "historical_observed": "RuntimeError: Query execution failed: COMMAND is not permitted on the read path; only SELECT queries are",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "error": "RuntimeError: Query execution failed: CREATE is not permitted on the read path; only SELECT queries are",
+        "duration_ms": 5.566
+      },
+      "reference": {
+        "status": "not_applicable",
+        "reason": "expected native admission/authorization rejection"
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-012",
+      "kind": "query",
+      "case_id": "controls_reject_drop",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_reject_drop.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 5.\n  DROP TABLE matrix_admission_probe\n\u001b[4mLIMIT\u001b[0m 100000",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "error": "RuntimeError: Query execution failed: DROP is not permitted on the read path; only SELECT queries are",
+        "duration_ms": 2.644
+      },
+      "reference": {
+        "status": "not_applicable",
+        "reason": "expected native admission/authorization rejection"
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-012",
+      "kind": "query",
+      "case_id": "controls_reject_describe",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_reject_describe.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 5.\n  DESCRIBE orders\n\u001b[4mLIMIT\u001b[0m 100000",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "error": "RuntimeError: Query execution failed: DESCRIBE is not permitted on the read path; only SELECT queries are",
+        "duration_ms": 2.813
+      },
+      "reference": {
+        "status": "not_applicable",
+        "reason": "expected native admission/authorization rejection"
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-013",
+      "kind": "query",
+      "case_id": "controls_rbac_denied_column_cte",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_rbac_denied_column_cte.json",
+      "historical_observed": "RuntimeError: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_8ba5742a_8ba5742a...\n                                    ^",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "pruned",
+        "status": "pass",
+        "error": "PermissionError: You don't have permission to columns: {'note'} in table 'orders'.",
+        "duration_ms": 16.088
+      },
+      "reference": {
+        "status": "not_applicable",
+        "reason": "expected native admission/authorization rejection"
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-013",
+      "kind": "query",
+      "case_id": "controls_rbac_denied_column_cte",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_rbac_denied_column_cte.json",
+      "historical_observed": "RuntimeError: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_b00c54cd_b00c54cd...\n                                    ^",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "fullscan",
+        "status": "pass",
+        "error": "PermissionError: You don't have permission to columns: {'note'} in table 'orders'.",
+        "duration_ms": 15.703
+      },
+      "reference": {
+        "status": "not_applicable",
+        "reason": "expected native admission/authorization rejection"
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-013",
+      "kind": "query",
+      "case_id": "controls_rbac_denied_column_cte",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_rbac_denied_column_cte.json",
+      "historical_observed": "RuntimeError: stream failed: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_ddd735da_ddd735da...\n                                    ^",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "stream",
+        "status": "pass",
+        "error": "PermissionError: You don't have permission to columns: {'note'} in table 'orders'.",
+        "duration_ms": 14.15
+      },
+      "reference": {
+        "status": "not_applicable",
+        "reason": "expected native admission/authorization rejection"
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-013",
+      "kind": "query",
+      "case_id": "controls_rbac_denied_column_cte",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_rbac_denied_column_cte.json",
+      "historical_observed": "RuntimeError: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_989527ef_989527ef...\n                                    ^",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "auto",
+        "status": "pass",
+        "error": "PermissionError: You don't have permission to columns: {'note'} in table 'orders'.",
+        "duration_ms": 14.771
+      },
+      "reference": {
+        "status": "not_applicable",
+        "reason": "expected native admission/authorization rejection"
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-013",
+      "kind": "query",
+      "case_id": "controls_rbac_denied_column_cte",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_rbac_denied_column_cte.json",
+      "historical_observed": "RuntimeError: Query execution failed: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_c1543bb8_c1543bb8...\n                                    ^",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "error": "PermissionError: You don't have permission to columns: {'note'} in table 'orders'.",
+        "duration_ms": 29.678
+      },
+      "reference": {
+        "status": "not_applicable",
+        "reason": "expected native admission/authorization rejection"
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-003",
+      "kind": "query",
+      "case_id": "syntax_terminal_semicolon",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_terminal_semicolon.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  SELECT oid, qty FROM orders WHERE oid <= 8 ORDER BY oid;\nLIMIT \u001b[4m100000\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 8,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 85.186
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 8
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-003",
+      "kind": "query",
+      "case_id": "syntax_semicolon_trailing_whitespace",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_semicolon_trailing_whitespace.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 3, Col: 12.\n  SELECT oid, qty FROM orders WHERE oid <= 8 ORDER BY oid;  \n\t\nLIMIT \u001b[4m100000\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 8,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 86.242
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 8
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-008",
+      "kind": "query",
+      "case_id": "syntax_semicolon_then_comment",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_semicolon_then_comment.json",
+      "historical_observed": "RuntimeError: only a single statement may be submitted; found 2",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "pruned",
+        "status": "pass",
+        "row_count": 8,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 261,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 6.049,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 85.231
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 8
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-008",
+      "kind": "query",
+      "case_id": "syntax_semicolon_then_comment",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_semicolon_then_comment.json",
+      "historical_observed": "RuntimeError: only a single statement may be submitted; found 2",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "fullscan",
+        "status": "pass",
+        "row_count": 8,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 8,
+          "REFLECTION_SIZE": 2175,
+          "REFLECTION_SIZE_RAW": 45542,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 8,
+          "PRUNE_DURATION_MS": 0.032,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 74.852
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 8
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-008",
+      "kind": "query",
+      "case_id": "syntax_semicolon_then_comment",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_semicolon_then_comment.json",
+      "historical_observed": "RuntimeError: stream failed: only a single statement may be submitted; found 2",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "stream",
+        "status": "pass",
+        "batches": 1,
+        "row_count": 8,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 261,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 2.433,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 77.542
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 8
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-008",
+      "kind": "query",
+      "case_id": "syntax_semicolon_then_comment",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_semicolon_then_comment.json",
+      "historical_observed": "RuntimeError: only a single statement may be submitted; found 2",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "auto",
+        "status": "pass",
+        "row_count": 8,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 261,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 3.674,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 80.631
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 8
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-003",
+      "kind": "query",
+      "case_id": "syntax_semicolon_then_comment",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_semicolon_then_comment.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 3, Col: 12.\n  SELECT oid, qty FROM orders WHERE oid <= 8 ORDER BY oid; -- terminated named-table query\n\nLIMIT \u001b[4m100000\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 8,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 90.781
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 8
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-003",
+      "kind": "query",
+      "case_id": "syntax_empty_statement_after_semicolon",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_empty_statement_after_semicolon.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  SELECT oid, qty FROM orders WHERE oid <= 8 ORDER BY oid;;\nLIMIT \u001b[4m100000\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 8,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 79.515
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 8
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "pruned",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 18.57
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "fullscan",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 6.29
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "stream",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 32, in execute_case\n    handle = reader.stream(case.role, engine=engine.DUCKDB, batch_rows=17)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 611, in stream\n    _, status, message = self.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 5.43
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "auto",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 5.398
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "query_sql",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 46, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 768, in query_sql\n    result_df, status, message = reader.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 21.393
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select_semicolon.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "pruned",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 4.208
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select_semicolon.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "fullscan",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 2.755
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select_semicolon.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "stream",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 32, in execute_case\n    handle = reader.stream(case.role, engine=engine.DUCKDB, batch_rows=17)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 611, in stream\n    _, status, message = self.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 3.699
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select_semicolon.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "auto",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 3.876
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-003",
+      "kind": "query",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select_semicolon.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  SELECT 6 * 7 AS answer;\nLIMIT \u001b[4m100000\u001b[0m",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "query_sql",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 46, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 768, in query_sql\n    result_df, status, message = reader.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 12.064
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation",
+      "blocked_by": "STREAD-009",
+      "note": "The semicolon query now reaches the table-free-query rejection; its original positive expectation remains unmet."
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte.json",
+      "historical_observed": "RuntimeError: No snapshots selected.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "pruned",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 309, in __init__\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 6.849
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte.json",
+      "historical_observed": "RuntimeError: No snapshots selected.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "fullscan",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 309, in __init__\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 8.781
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte.json",
+      "historical_observed": "RuntimeError: stream failed: No snapshots selected.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "stream",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 32, in execute_case\n    handle = reader.stream(case.role, engine=engine.DUCKDB, batch_rows=17)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 611, in stream\n    _, status, message = self.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 309, in __init__\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 6.474
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte.json",
+      "historical_observed": "RuntimeError: No snapshots selected.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "auto",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 309, in __init__\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 7.349
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte.json",
+      "historical_observed": "RuntimeError: Query execution failed: No snapshots selected.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "query_sql",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 46, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 768, in query_sql\n    result_df, status, message = reader.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 309, in __init__\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 24.613
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_union",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_union.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "pruned",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 5.797
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 3
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_union",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_union.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "fullscan",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 4.804
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 3
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_union",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_union.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "stream",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 32, in execute_case\n    handle = reader.stream(case.role, engine=engine.DUCKDB, batch_rows=17)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 611, in stream\n    _, status, message = self.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 6.39
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 3
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_union",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_union.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "auto",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 5.553
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 3
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_union",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_union.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "query_sql",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 46, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 768, in query_sql\n    result_df, status, message = reader.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 21.594
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 3
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_scalar_subquery.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "pruned",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 3.646
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_scalar_subquery.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "fullscan",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 3.488
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_scalar_subquery.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "stream",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 32, in execute_case\n    handle = reader.stream(case.role, engine=engine.DUCKDB, batch_rows=17)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 611, in stream\n    _, status, message = self.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 3.337
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_scalar_subquery.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "auto",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 3.346
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_scalar_subquery.json",
+      "historical_observed": "ValueError: No tables found in SQL query.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "query_sql",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 46, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 768, in query_sql\n    result_df, status, message = reader.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 12.354
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte_declared_columns.json",
+      "historical_observed": "RuntimeError: No snapshots selected.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "pruned",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 309, in __init__\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 6.736
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte_declared_columns.json",
+      "historical_observed": "RuntimeError: No snapshots selected.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "fullscan",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 309, in __init__\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 6.47
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte_declared_columns.json",
+      "historical_observed": "RuntimeError: stream failed: No snapshots selected.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "stream",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 32, in execute_case\n    handle = reader.stream(case.role, engine=engine.DUCKDB, batch_rows=17)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 611, in stream\n    _, status, message = self.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 309, in __init__\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 6.631
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte_declared_columns.json",
+      "historical_observed": "RuntimeError: No snapshots selected.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "auto",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 309, in __init__\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 7.958
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte_declared_columns.json",
+      "historical_observed": "RuntimeError: Query execution failed: No snapshots selected.",
+      "current_expectation_changed_fields": [
+        "error_contains"
+      ],
+      "evidence_run": "historical_original_expectations",
+      "observation": {
+        "mode": "query_sql",
+        "status": "fail",
+        "session_timezone": "UTC",
+        "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+        "mismatch": {
+          "kind": "unexpected_error",
+          "expected_error_contains": []
+        },
+        "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 46, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 768, in query_sql\n    result_df, status, message = reader.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 309, in __init__\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+        "duration_ms": 31.782
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 1
+      },
+      "status": "unsupported_original_expectation"
+    },
+    {
+      "issue": "STREAD-002",
+      "kind": "query",
+      "case_id": "syntax_offset_fetch_next",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_offset_fetch_next.json",
+      "historical_observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 6
+      },
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 3,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 84.269
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 3
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-002",
+      "kind": "query",
+      "case_id": "syntax_fetch_first",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_fetch_first.json",
+      "historical_observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 8
+      },
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 3,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 88.906
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 3
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-002",
+      "kind": "query",
+      "case_id": "syntax_limit_parenthesized",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_limit_parenthesized.json",
+      "historical_observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 8
+      },
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 3,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 96.168
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 3
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-002",
+      "kind": "query",
+      "case_id": "syntax_offset_parenthesized",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_offset_parenthesized.json",
+      "historical_observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 6
+      },
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 3,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 102.884
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 3
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-007",
+      "kind": "query",
+      "case_id": "syntax_limit_all",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_limit_all.json",
+      "historical_observed": "RuntimeError: Missing required column(s): warehouse.orders: ALL",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "pruned",
+        "status": "pass",
+        "row_count": 8,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 261,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 6.408,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 75.661
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 8
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-007",
+      "kind": "query",
+      "case_id": "syntax_limit_all",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_limit_all.json",
+      "historical_observed": "RuntimeError: Missing required column(s): warehouse.orders: ALL",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "fullscan",
+        "status": "pass",
+        "row_count": 8,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 8,
+          "REFLECTION_SIZE": 2175,
+          "REFLECTION_SIZE_RAW": 45542,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 8,
+          "PRUNE_DURATION_MS": 0.012,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 81.711
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 8
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-007",
+      "kind": "query",
+      "case_id": "syntax_limit_all",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_limit_all.json",
+      "historical_observed": "RuntimeError: stream failed: Missing required column(s): warehouse.orders: ALL",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "stream",
+        "status": "pass",
+        "batches": 1,
+        "row_count": 8,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 261,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 5.741,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 86.965
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 8
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-007",
+      "kind": "query",
+      "case_id": "syntax_limit_all",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_limit_all.json",
+      "historical_observed": "RuntimeError: Missing required column(s): warehouse.orders: ALL",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "auto",
+        "status": "pass",
+        "row_count": 8,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 261,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 3.405,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 77.688
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 8
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_sets_no_limit",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_sets_no_limit.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  FROM warehouse.orders WHERE oid <= 24 GROUP BY GROUPING SETS ((region, status), (region), ())\nLIMIT \u001b[4m100000\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 7,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 162.151
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 7
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_sets_explicit_limit",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_sets_explicit_limit.json",
+      "historical_observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 208.\n  FROM warehouse.orders WHERE oid <= 24 GROUP BY GROUPING SETS ((region, status), (region), ()) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "pruned",
+        "status": "pass",
+        "row_count": 7,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 5648,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 4.056,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 125.965
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 7
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_sets_explicit_limit",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_sets_explicit_limit.json",
+      "historical_observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 208.\n  FROM warehouse.orders WHERE oid <= 24 GROUP BY GROUPING SETS ((region, status), (region), ()) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "fullscan",
+        "status": "pass",
+        "row_count": 7,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 8,
+          "REFLECTION_SIZE": 45542,
+          "REFLECTION_SIZE_RAW": 45542,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 8,
+          "PRUNE_DURATION_MS": 0.014,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 105.51
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 7
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_sets_explicit_limit",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_sets_explicit_limit.json",
+      "historical_observed": "RuntimeError: stream failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 208.\n  FROM warehouse.orders WHERE oid <= 24 GROUP BY GROUPING SETS ((region, status), (region), ()) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "stream",
+        "status": "pass",
+        "batches": 1,
+        "row_count": 7,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 5648,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 3.585,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 97.926
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 7
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_sets_explicit_limit",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_sets_explicit_limit.json",
+      "historical_observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 208.\n  FROM warehouse.orders WHERE oid <= 24 GROUP BY GROUPING SETS ((region, status), (region), ()) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "auto",
+        "status": "pass",
+        "row_count": 7,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 5648,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 3.777,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 115.646
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 7
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_sets_explicit_limit",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_sets_explicit_limit.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 208.\n  FROM warehouse.orders WHERE oid <= 24 GROUP BY GROUPING SETS ((region, status), (region), ()) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 7,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 153.776
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 7
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_rollup_no_limit",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_rollup_no_limit.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  s_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY ROLLUP (region, status)\nLIMIT \u001b[4m100000\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 7,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 131.364
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 7
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_rollup_explicit_limit",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_rollup_explicit_limit.json",
+      "historical_observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 185.\n  s_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY ROLLUP (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "pruned",
+        "status": "pass",
+        "row_count": 7,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 5648,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 4.553,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 94.101
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 7
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_rollup_explicit_limit",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_rollup_explicit_limit.json",
+      "historical_observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 185.\n  s_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY ROLLUP (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "fullscan",
+        "status": "pass",
+        "row_count": 7,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 8,
+          "REFLECTION_SIZE": 45542,
+          "REFLECTION_SIZE_RAW": 45542,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 8,
+          "PRUNE_DURATION_MS": 0.048,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 114.968
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 7
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_rollup_explicit_limit",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_rollup_explicit_limit.json",
+      "historical_observed": "RuntimeError: stream failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 185.\n  s_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY ROLLUP (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "stream",
+        "status": "pass",
+        "batches": 1,
+        "row_count": 7,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 5648,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 2.883,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 112.868
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 7
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_rollup_explicit_limit",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_rollup_explicit_limit.json",
+      "historical_observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 185.\n  s_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY ROLLUP (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "auto",
+        "status": "pass",
+        "row_count": 7,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 5648,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 3.772,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 114.185
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 7
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_rollup_explicit_limit",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_rollup_explicit_limit.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 185.\n  s_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY ROLLUP (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 7,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 152.373
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 7
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_cube_no_limit",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_cube_no_limit.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  tus_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY CUBE (region, status)\nLIMIT \u001b[4m100000\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 12,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 145.026
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 12
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_cube_explicit_limit",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_cube_explicit_limit.json",
+      "historical_observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 183.\n  tus_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY CUBE (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "pruned",
+        "status": "pass",
+        "row_count": 12,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 5648,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 1.858,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 136.306
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 12
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_cube_explicit_limit",
+      "mode": "fullscan",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_cube_explicit_limit.json",
+      "historical_observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 183.\n  tus_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY CUBE (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "fullscan",
+        "status": "pass",
+        "row_count": 12,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 8,
+          "REFLECTION_SIZE": 45542,
+          "REFLECTION_SIZE_RAW": 45542,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 0,
+          "FILES_KEPT": 8,
+          "PRUNE_DURATION_MS": 0.013,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 227.966
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 12
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_cube_explicit_limit",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_cube_explicit_limit.json",
+      "historical_observed": "RuntimeError: stream failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 183.\n  tus_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY CUBE (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "stream",
+        "status": "pass",
+        "batches": 1,
+        "row_count": 12,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 5648,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 2.477,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 134.571
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 12
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_cube_explicit_limit",
+      "mode": "auto",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_cube_explicit_limit.json",
+      "historical_observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 183.\n  tus_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY CUBE (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "auto",
+        "status": "pass",
+        "row_count": 12,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {
+          "REFLECTIONS": 1,
+          "REFLECTION_SIZE": 5648,
+          "REFLECTION_SIZE_RAW": 5648,
+          "FILES_BEFORE_PRUNE": 8,
+          "FILES_PRUNED": 7,
+          "FILES_KEPT": 1,
+          "PRUNE_DURATION_MS": 3.896,
+          "PRUNE_COUNTS": {
+            "stats_cache_hit": 1,
+            "read_pruned_files": 7,
+            "read.prune.n": 1
+          },
+          "ENGINE": "duckdb"
+        },
+        "duration_ms": 127.602
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 12
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_cube_explicit_limit",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_cube_explicit_limit.json",
+      "historical_observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 183.\n  tus_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY CUBE (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 12,
+        "columns": [
+          "region",
+          "status",
+          "region_total",
+          "status_total",
+          "n"
+        ],
+        "types": {
+          "region": "String",
+          "status": "String",
+          "region_total": "Int64",
+          "status_total": "Int64",
+          "n": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 149.042
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 12
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-002",
+      "kind": "query",
+      "case_id": "syntax_limit_comment_between_keyword_and_count",
+      "mode": "query_sql",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_limit_comment_between_keyword_and_count.json",
+      "historical_observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 8
+      },
+      "current_expectation_changed_fields": [],
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "observation": {
+        "mode": "query_sql",
+        "status": "pass",
+        "row_count": 3,
+        "columns": [
+          "oid",
+          "qty"
+        ],
+        "types": {
+          "oid": "Int64",
+          "qty": "Int64"
+        },
+        "mismatch": null,
+        "plan_stats": {},
+        "duration_ms": 86.204
+      },
+      "reference": {
+        "status": "pass",
+        "row_count": 3
+      },
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-011",
+      "kind": "additional",
+      "case_id": "ingest_events",
+      "mode": "setup",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/runs/04_supertable-sql-numeric-review/results.json",
+      "historical_observed": "ArrowNotImplementedError: Cannot extract statistics for type ",
+      "observation": {
+        "case_id": "16_supertable-group-alias-followup-recheck__ingest_events",
+        "status": "pass",
+        "method": "DataWriter",
+        "original_case_id": "ingest_events",
+        "evidence_run": "runs/16_supertable-group-alias-followup-recheck"
+      },
+      "evidence_run": "runs/16_supertable-group-alias-followup-recheck",
+      "current_expectation_changed_fields": [],
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-001",
+      "kind": "additional",
+      "case_id": "lifecycle_path_only_leaf_pruned",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/runs/02_supertable-sql-controls-reviewed/results.json",
+      "historical_observed": {
+        "kind": "row_count",
+        "expected_count": 9,
+        "actual_count": 12
+      },
+      "observation": {
+        "case_id": "01_supertable-sql-fixed-baseline-20260914__lifecycle_path_only_leaf_pruned",
+        "sql": "SELECT kid, value, revision FROM cachecheck ORDER BY kid",
+        "columns": [
+          "kid",
+          "value",
+          "revision"
+        ],
+        "expected_rows": [
+          [
+            1,
+            10,
+            1
+          ],
+          [
+            2,
+            220,
+            2
+          ],
+          [
+            4,
+            40,
+            1
+          ],
+          [
+            5,
+            50,
+            1
+          ],
+          [
+            6,
+            660,
+            2
+          ],
+          [
+            7,
+            70,
+            1
+          ],
+          [
+            8,
+            80,
+            1
+          ],
+          [
+            9,
+            90,
+            1
+          ],
+          [
+            10,
+            100,
+            1
+          ]
+        ],
+        "expected_error_contains": [],
+        "note": "",
+        "status": "pass",
+        "run": {
+          "mode": "pruned",
+          "status": "pass",
+          "row_count": 9,
+          "columns": [
+            "kid",
+            "value",
+            "revision"
+          ],
+          "types": {
+            "kid": "Int64",
+            "value": "Int64",
+            "revision": "Int64"
+          },
+          "mismatch": null,
+          "plan_stats": {
+            "REFLECTIONS": 4,
+            "REFLECTION_SIZE": 1152,
+            "REFLECTION_SIZE_RAW": 8024,
+            "FILES_BEFORE_PRUNE": 4,
+            "FILES_PRUNED": 0,
+            "FILES_KEPT": 4,
+            "PRUNE_DURATION_MS": 0.013,
+            "PRUNE_COUNTS": {
+              "stats_cache_hit": 1,
+              "read.prune.n": 1
+            },
+            "ENGINE": "duckdb"
+          },
+          "duration_ms": 66.022
+        },
+        "mismatch": null,
+        "original_case_id": "lifecycle_path_only_leaf_pruned",
+        "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914"
+      },
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "current_expectation_changed_fields": [],
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-001",
+      "kind": "additional",
+      "case_id": "lifecycle_path_only_leaf_stream",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/runs/02_supertable-sql-controls-reviewed/results.json",
+      "historical_observed": {
+        "kind": "row_count",
+        "expected_count": 9,
+        "actual_count": 12
+      },
+      "observation": {
+        "case_id": "01_supertable-sql-fixed-baseline-20260914__lifecycle_path_only_leaf_stream",
+        "sql": "SELECT kid, value, revision FROM cachecheck ORDER BY kid",
+        "columns": [
+          "kid",
+          "value",
+          "revision"
+        ],
+        "expected_rows": [
+          [
+            1,
+            10,
+            1
+          ],
+          [
+            2,
+            220,
+            2
+          ],
+          [
+            4,
+            40,
+            1
+          ],
+          [
+            5,
+            50,
+            1
+          ],
+          [
+            6,
+            660,
+            2
+          ],
+          [
+            7,
+            70,
+            1
+          ],
+          [
+            8,
+            80,
+            1
+          ],
+          [
+            9,
+            90,
+            1
+          ],
+          [
+            10,
+            100,
+            1
+          ]
+        ],
+        "expected_error_contains": [],
+        "note": "",
+        "status": "pass",
+        "run": {
+          "mode": "stream",
+          "status": "pass",
+          "batches": 1,
+          "row_count": 9,
+          "columns": [
+            "kid",
+            "value",
+            "revision"
+          ],
+          "types": {
+            "kid": "Int64",
+            "value": "Int64",
+            "revision": "Int64"
+          },
+          "mismatch": null,
+          "plan_stats": {
+            "REFLECTIONS": 4,
+            "REFLECTION_SIZE": 1152,
+            "REFLECTION_SIZE_RAW": 8024,
+            "FILES_BEFORE_PRUNE": 4,
+            "FILES_PRUNED": 0,
+            "FILES_KEPT": 4,
+            "PRUNE_DURATION_MS": 0.018,
+            "PRUNE_COUNTS": {
+              "stats_cache_hit": 1,
+              "read.prune.n": 1
+            },
+            "ENGINE": "duckdb"
+          },
+          "duration_ms": 75.392
+        },
+        "mismatch": null,
+        "original_case_id": "lifecycle_path_only_leaf_stream",
+        "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914"
+      },
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "current_expectation_changed_fields": [],
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-001",
+      "kind": "additional",
+      "case_id": "lifecycle_path_only_share_filter_pruned",
+      "mode": "pruned",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/runs/02_supertable-sql-controls-reviewed/results.json",
+      "historical_observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 12
+      },
+      "observation": {
+        "case_id": "01_supertable-sql-fixed-baseline-20260914__lifecycle_path_only_share_filter_pruned",
+        "sql": "SELECT kid, value, revision FROM cachecheck ORDER BY kid",
+        "columns": [
+          "kid",
+          "value",
+          "revision"
+        ],
+        "expected_rows": [
+          [
+            2,
+            220,
+            2
+          ],
+          [
+            6,
+            660,
+            2
+          ],
+          [
+            10,
+            100,
+            1
+          ]
+        ],
+        "expected_error_contains": [],
+        "note": "Path-only snapshot loading must retain the share row filter and deletion vector.",
+        "status": "pass",
+        "run": {
+          "mode": "pruned",
+          "status": "pass",
+          "row_count": 3,
+          "columns": [
+            "kid",
+            "value",
+            "revision"
+          ],
+          "types": {
+            "kid": "Int64",
+            "value": "Int64",
+            "revision": "Int64"
+          },
+          "mismatch": null,
+          "plan_stats": {
+            "REFLECTIONS": 4,
+            "REFLECTION_SIZE": 1152,
+            "REFLECTION_SIZE_RAW": 8024,
+            "FILES_BEFORE_PRUNE": 4,
+            "FILES_PRUNED": 0,
+            "FILES_KEPT": 4,
+            "PRUNE_DURATION_MS": 0.015,
+            "PRUNE_COUNTS": {
+              "stats_cache_hit": 1,
+              "read.prune.n": 1
+            },
+            "ENGINE": "duckdb"
+          },
+          "duration_ms": 69.58
+        },
+        "mismatch": null,
+        "original_case_id": "lifecycle_path_only_share_filter_pruned",
+        "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914"
+      },
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "current_expectation_changed_fields": [],
+      "status": "pass"
+    },
+    {
+      "issue": "STREAD-001",
+      "kind": "additional",
+      "case_id": "lifecycle_path_only_share_filter_stream",
+      "mode": "stream",
+      "historical_evidence": "../audit/sql_read_matrix_2026-09-14/runs/02_supertable-sql-controls-reviewed/results.json",
+      "historical_observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 12
+      },
+      "observation": {
+        "case_id": "01_supertable-sql-fixed-baseline-20260914__lifecycle_path_only_share_filter_stream",
+        "sql": "SELECT kid, value, revision FROM cachecheck ORDER BY kid",
+        "columns": [
+          "kid",
+          "value",
+          "revision"
+        ],
+        "expected_rows": [
+          [
+            2,
+            220,
+            2
+          ],
+          [
+            6,
+            660,
+            2
+          ],
+          [
+            10,
+            100,
+            1
+          ]
+        ],
+        "expected_error_contains": [],
+        "note": "",
+        "status": "pass",
+        "run": {
+          "mode": "stream",
+          "status": "pass",
+          "batches": 1,
+          "row_count": 3,
+          "columns": [
+            "kid",
+            "value",
+            "revision"
+          ],
+          "types": {
+            "kid": "Int64",
+            "value": "Int64",
+            "revision": "Int64"
+          },
+          "mismatch": null,
+          "plan_stats": {
+            "REFLECTIONS": 4,
+            "REFLECTION_SIZE": 1152,
+            "REFLECTION_SIZE_RAW": 8024,
+            "FILES_BEFORE_PRUNE": 4,
+            "FILES_PRUNED": 0,
+            "FILES_KEPT": 4,
+            "PRUNE_DURATION_MS": 0.015,
+            "PRUNE_COUNTS": {
+              "stats_cache_hit": 1,
+              "read.prune.n": 1
+            },
+            "ENGINE": "duckdb"
+          },
+          "duration_ms": 62.09
+        },
+        "mismatch": null,
+        "original_case_id": "lifecycle_path_only_share_filter_stream",
+        "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914"
+      },
+      "evidence_run": "runs/01_supertable-sql-fixed-baseline-20260914",
+      "current_expectation_changed_fields": [],
+      "status": "pass"
+    }
+  ]
+}

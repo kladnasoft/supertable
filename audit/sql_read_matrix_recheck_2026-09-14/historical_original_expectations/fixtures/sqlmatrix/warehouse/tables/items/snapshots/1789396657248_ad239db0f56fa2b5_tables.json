@@ -1,0 +1,63 @@
+{
+  "rowid_high_watermark": 300,
+  "snapshot_version": 5,
+  "schema": {
+    "iid": "Int64",
+    "oid": "Int64",
+    "sku": "String",
+    "units": "Int64",
+    "price": "Int64",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "simple_name": "items",
+  "last_updated_ms": 1789396657248,
+  "stats_rows": 25,
+  "tombstone": null,
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 60,
+    "incoming_columns": 5,
+    "write_id": "3327cafd-6067-4b5a-ae71-3eeeed39db86"
+  },
+  "location": "sqlmatrix/warehouse/tables/items",
+  "previous_snapshot": "sqlmatrix/warehouse/tables/items/snapshots/1789396657148_6ba9b07c6973b5a2_tables.json",
+  "tombstone_rows": 0,
+  "resources": [
+    {
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396656863_7bf2d28ae70467be_data.parquet",
+      "rows": 60,
+      "file_size": 3093,
+      "columns": 7
+    },
+    {
+      "file_size": 3123,
+      "rows": 60,
+      "columns": 7,
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396656935_de80313d0b58ccde_data.parquet"
+    },
+    {
+      "rows": 60,
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396657010_3086c39afe4b47c9_data.parquet",
+      "columns": 7,
+      "file_size": 3133
+    },
+    {
+      "columns": 7,
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396657111_80f8122a54816044_data.parquet",
+      "file_size": 3141,
+      "rows": 60
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396657212_845ee5121e2f0d1b_data.parquet",
+      "file_size": 3257,
+      "rows": 60,
+      "columns": 7
+    }
+  ],
+  "stats_file": "sqlmatrix/warehouse/tables/items/stats/year=2026/month=09/day=14/hour=14/1789396657238_7cf32a123eef529d_stats.parquet",
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"iid\":\"Int64\",\"oid\":\"Int64\",\"sku\":\"String\",\"units\":\"Int64\",\"price\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}"
+}

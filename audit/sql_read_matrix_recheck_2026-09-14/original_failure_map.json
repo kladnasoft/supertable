@@ -1,0 +1,1103 @@
+{
+  "audit_date": "2026-09-14",
+  "revision": "2417237a8b7e2e91900fbc7503c35059dba0e030",
+  "package_version": "3.4.1",
+  "source_results": "../audit/sql_read_matrix_2026-09-14/results.json",
+  "query_failure_count": 102,
+  "additional_failure_count": 5,
+  "issue_count": 13,
+  "issues": [
+    {
+      "id": "STREAD-001",
+      "title": "Snapshot fallback exposes deleted rows and ignores share filters",
+      "file": "001-snapshot-fallback-loses-deletions-and-share-filters.md",
+      "status": "open",
+      "priority": "P1"
+    },
+    {
+      "id": "STREAD-002",
+      "title": "query_sql silently overwrites valid row limits",
+      "file": "002-query-helper-overwrites-row-limits.md",
+      "status": "open",
+      "priority": "P1"
+    },
+    {
+      "id": "STREAD-003",
+      "title": "query_sql appends LIMIT after a statement terminator",
+      "file": "003-query-helper-appends-limit-after-semicolon.md",
+      "status": "open",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-004",
+      "title": "SQL rewriting corrupts DuckDB DATE_DIFF arguments",
+      "file": "004-date-diff-rewrite-corrupts-arguments.md",
+      "status": "open",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-005",
+      "title": "GROUPING SETS, ROLLUP, and CUBE with LIMIT are rejected",
+      "file": "005-grouping-extensions-with-limit-rejected.md",
+      "status": "open",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-006",
+      "title": "Boolean IS UNKNOWN is rejected during SQL admission",
+      "file": "006-is-unknown-rejected.md",
+      "status": "open",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-007",
+      "title": "LIMIT ALL is treated as a required table column",
+      "file": "007-limit-all-treated-as-column.md",
+      "status": "open",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-008",
+      "title": "A trailing comment is counted as a second SQL statement",
+      "file": "008-trailing-comment-counted-as-statement.md",
+      "status": "open",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-009",
+      "title": "Table-free SELECTs and literal CTEs cannot execute",
+      "file": "009-table-free-selects-unsupported.md",
+      "status": "open",
+      "priority": "P3"
+    },
+    {
+      "id": "STREAD-010",
+      "title": "Existing empty tables fail projections and aggregates",
+      "file": "010-empty-tables-cannot-be-read.md",
+      "status": "open",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-011",
+      "title": "Decimal ingestion fails while extracting Parquet statistics",
+      "file": "011-decimal-ingestion-statistics-failure.md",
+      "status": "open",
+      "priority": "P2"
+    },
+    {
+      "id": "STREAD-012",
+      "title": "query_sql changes forbidden-statement rejection diagnostics",
+      "file": "012-query-helper-changes-rejection-diagnostics.md",
+      "status": "open",
+      "priority": "P3"
+    },
+    {
+      "id": "STREAD-013",
+      "title": "Denied columns inside a CTE produce binder errors",
+      "file": "013-denied-cte-column-produces-binder-error.md",
+      "status": "open",
+      "priority": "P3"
+    }
+  ],
+  "failures": [
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "advanced_grouping_sets",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_grouping_sets.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 5, Col: 12.\n         FROM warehouse.orders GROUP BY GROUPING SETS ((region, status), (region), ())\n        \nLIMIT \u001b[4m100000\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "advanced_grouping_rollup",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_grouping_rollup.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 5, Col: 12.\n  ) AS total_amount\n            FROM warehouse.orders GROUP BY ROLLUP (region, status)\n        \nLIMIT \u001b[4m100000\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "advanced_grouping_cube",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_grouping_cube.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 5, Col: 12.\n  nt) AS total_amount\n            FROM warehouse.orders GROUP BY CUBE (region, status)\n        \nLIMIT \u001b[4m100000\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "advanced_null_aggregate_empty_table",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_null_aggregate_empty_table.json",
+      "observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "advanced_null_aggregate_empty_table",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_null_aggregate_empty_table.json",
+      "observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "advanced_null_aggregate_empty_table",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_null_aggregate_empty_table.json",
+      "observed": "RuntimeError: stream failed: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "advanced_null_aggregate_empty_table",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_null_aggregate_empty_table.json",
+      "observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "advanced_null_aggregate_empty_table",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_null_aggregate_empty_table.json",
+      "observed": "RuntimeError: Query execution failed: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-004",
+      "kind": "query",
+      "case_id": "advanced_date_date_diff",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_date_date_diff.json",
+      "observed": "RuntimeError: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "issue_file": "004-date-diff-rewrite-corrupts-arguments.md"
+    },
+    {
+      "issue": "STREAD-004",
+      "kind": "query",
+      "case_id": "advanced_date_date_diff",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_date_date_diff.json",
+      "observed": "RuntimeError: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "issue_file": "004-date-diff-rewrite-corrupts-arguments.md"
+    },
+    {
+      "issue": "STREAD-004",
+      "kind": "query",
+      "case_id": "advanced_date_date_diff",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_date_date_diff.json",
+      "observed": "RuntimeError: stream failed: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "issue_file": "004-date-diff-rewrite-corrupts-arguments.md"
+    },
+    {
+      "issue": "STREAD-004",
+      "kind": "query",
+      "case_id": "advanced_date_date_diff",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_date_date_diff.json",
+      "observed": "RuntimeError: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "issue_file": "004-date-diff-rewrite-corrupts-arguments.md"
+    },
+    {
+      "issue": "STREAD-004",
+      "kind": "query",
+      "case_id": "advanced_date_date_diff",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_date_date_diff.json",
+      "observed": "RuntimeError: Query execution failed: Conversion Error: invalid date field format: \"day\", expected format is (YYYY-MM-DD)\n\nLINE 1: SELECT eid, DATE_DIFF('2024-03-15', event_date, CAST('day' AS DATE)) AS result FROM tomb_st_ccb353026ace2db...\n                                                        ^",
+      "issue_file": "004-date-diff-rewrite-corrupts-arguments.md"
+    },
+    {
+      "issue": "STREAD-006",
+      "kind": "query",
+      "case_id": "advanced_boolean_is_unknown",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_boolean_is_unknown.json",
+      "observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 27.\n  SELECT eid, flag IS \u001b[4mUNKNOWN\u001b[0m AS result FROM warehouse.events ORDER BY eid",
+      "issue_file": "006-is-unknown-rejected.md"
+    },
+    {
+      "issue": "STREAD-006",
+      "kind": "query",
+      "case_id": "advanced_boolean_is_unknown",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_boolean_is_unknown.json",
+      "observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 27.\n  SELECT eid, flag IS \u001b[4mUNKNOWN\u001b[0m AS result FROM warehouse.events ORDER BY eid",
+      "issue_file": "006-is-unknown-rejected.md"
+    },
+    {
+      "issue": "STREAD-006",
+      "kind": "query",
+      "case_id": "advanced_boolean_is_unknown",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_boolean_is_unknown.json",
+      "observed": "RuntimeError: stream failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 27.\n  SELECT eid, flag IS \u001b[4mUNKNOWN\u001b[0m AS result FROM warehouse.events ORDER BY eid",
+      "issue_file": "006-is-unknown-rejected.md"
+    },
+    {
+      "issue": "STREAD-006",
+      "kind": "query",
+      "case_id": "advanced_boolean_is_unknown",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_boolean_is_unknown.json",
+      "observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 27.\n  SELECT eid, flag IS \u001b[4mUNKNOWN\u001b[0m AS result FROM warehouse.events ORDER BY eid",
+      "issue_file": "006-is-unknown-rejected.md"
+    },
+    {
+      "issue": "STREAD-006",
+      "kind": "query",
+      "case_id": "advanced_boolean_is_unknown",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/advanced_boolean_is_unknown.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 27.\n  SELECT eid, flag IS \u001b[4mUNKNOWN\u001b[0m AS result FROM warehouse.events ORDER BY eid\nLIMIT 100000",
+      "issue_file": "006-is-unknown-rejected.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_projection",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_projection.json",
+      "observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_projection",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_projection.json",
+      "observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_projection",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_projection.json",
+      "observed": "RuntimeError: stream failed: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_projection",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_projection.json",
+      "observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_projection",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_projection.json",
+      "observed": "RuntimeError: Query execution failed: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_count",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_count.json",
+      "observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_count",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_count.json",
+      "observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_count",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_count.json",
+      "observed": "RuntimeError: stream failed: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_count",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_count.json",
+      "observed": "RuntimeError: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-010",
+      "kind": "query",
+      "case_id": "controls_empty_physical_count",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_empty_physical_count.json",
+      "observed": "RuntimeError: Query execution failed: No parquet files found for one or more selected tables.",
+      "issue_file": "010-empty-tables-cannot-be-read.md"
+    },
+    {
+      "issue": "STREAD-012",
+      "kind": "query",
+      "case_id": "controls_reject_insert",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_reject_insert.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 5.\n  INSERT INTO orders (oid) VALUES (999)\n\u001b[4mLIMIT\u001b[0m 100000",
+      "issue_file": "012-query-helper-changes-rejection-diagnostics.md"
+    },
+    {
+      "issue": "STREAD-012",
+      "kind": "query",
+      "case_id": "controls_reject_create",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_reject_create.json",
+      "observed": "RuntimeError: Query execution failed: COMMAND is not permitted on the read path; only SELECT queries are",
+      "issue_file": "012-query-helper-changes-rejection-diagnostics.md"
+    },
+    {
+      "issue": "STREAD-012",
+      "kind": "query",
+      "case_id": "controls_reject_drop",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_reject_drop.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 5.\n  DROP TABLE matrix_admission_probe\n\u001b[4mLIMIT\u001b[0m 100000",
+      "issue_file": "012-query-helper-changes-rejection-diagnostics.md"
+    },
+    {
+      "issue": "STREAD-012",
+      "kind": "query",
+      "case_id": "controls_reject_describe",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_reject_describe.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 5.\n  DESCRIBE orders\n\u001b[4mLIMIT\u001b[0m 100000",
+      "issue_file": "012-query-helper-changes-rejection-diagnostics.md"
+    },
+    {
+      "issue": "STREAD-013",
+      "kind": "query",
+      "case_id": "controls_rbac_denied_column_cte",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_rbac_denied_column_cte.json",
+      "observed": "RuntimeError: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_8ba5742a_8ba5742a...\n                                    ^",
+      "issue_file": "013-denied-cte-column-produces-binder-error.md"
+    },
+    {
+      "issue": "STREAD-013",
+      "kind": "query",
+      "case_id": "controls_rbac_denied_column_cte",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_rbac_denied_column_cte.json",
+      "observed": "RuntimeError: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_b00c54cd_b00c54cd...\n                                    ^",
+      "issue_file": "013-denied-cte-column-produces-binder-error.md"
+    },
+    {
+      "issue": "STREAD-013",
+      "kind": "query",
+      "case_id": "controls_rbac_denied_column_cte",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_rbac_denied_column_cte.json",
+      "observed": "RuntimeError: stream failed: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_ddd735da_ddd735da...\n                                    ^",
+      "issue_file": "013-denied-cte-column-produces-binder-error.md"
+    },
+    {
+      "issue": "STREAD-013",
+      "kind": "query",
+      "case_id": "controls_rbac_denied_column_cte",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_rbac_denied_column_cte.json",
+      "observed": "RuntimeError: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_989527ef_989527ef...\n                                    ^",
+      "issue_file": "013-denied-cte-column-produces-binder-error.md"
+    },
+    {
+      "issue": "STREAD-013",
+      "kind": "query",
+      "case_id": "controls_rbac_denied_column_cte",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/controls_rbac_denied_column_cte.json",
+      "observed": "RuntimeError: Query execution failed: Binder Error: Referenced column \"note\" not found in FROM clause!\nCandidate bindings: \"oid\", \"qty\"\n\nLINE 1: WITH hidden AS (SELECT oid, note FROM rbac_tomb_st_58ff5232248279c2_c1543bb8_c1543bb8...\n                                    ^",
+      "issue_file": "013-denied-cte-column-produces-binder-error.md"
+    },
+    {
+      "issue": "STREAD-003",
+      "kind": "query",
+      "case_id": "syntax_terminal_semicolon",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_terminal_semicolon.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  SELECT oid, qty FROM orders WHERE oid <= 8 ORDER BY oid;\nLIMIT \u001b[4m100000\u001b[0m",
+      "issue_file": "003-query-helper-appends-limit-after-semicolon.md"
+    },
+    {
+      "issue": "STREAD-003",
+      "kind": "query",
+      "case_id": "syntax_semicolon_trailing_whitespace",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_semicolon_trailing_whitespace.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 3, Col: 12.\n  SELECT oid, qty FROM orders WHERE oid <= 8 ORDER BY oid;  \n\t\nLIMIT \u001b[4m100000\u001b[0m",
+      "issue_file": "003-query-helper-appends-limit-after-semicolon.md"
+    },
+    {
+      "issue": "STREAD-008",
+      "kind": "query",
+      "case_id": "syntax_semicolon_then_comment",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_semicolon_then_comment.json",
+      "observed": "RuntimeError: only a single statement may be submitted; found 2",
+      "issue_file": "008-trailing-comment-counted-as-statement.md"
+    },
+    {
+      "issue": "STREAD-008",
+      "kind": "query",
+      "case_id": "syntax_semicolon_then_comment",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_semicolon_then_comment.json",
+      "observed": "RuntimeError: only a single statement may be submitted; found 2",
+      "issue_file": "008-trailing-comment-counted-as-statement.md"
+    },
+    {
+      "issue": "STREAD-008",
+      "kind": "query",
+      "case_id": "syntax_semicolon_then_comment",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_semicolon_then_comment.json",
+      "observed": "RuntimeError: stream failed: only a single statement may be submitted; found 2",
+      "issue_file": "008-trailing-comment-counted-as-statement.md"
+    },
+    {
+      "issue": "STREAD-008",
+      "kind": "query",
+      "case_id": "syntax_semicolon_then_comment",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_semicolon_then_comment.json",
+      "observed": "RuntimeError: only a single statement may be submitted; found 2",
+      "issue_file": "008-trailing-comment-counted-as-statement.md"
+    },
+    {
+      "issue": "STREAD-003",
+      "kind": "query",
+      "case_id": "syntax_semicolon_then_comment",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_semicolon_then_comment.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 3, Col: 12.\n  SELECT oid, qty FROM orders WHERE oid <= 8 ORDER BY oid; -- terminated named-table query\n\nLIMIT \u001b[4m100000\u001b[0m",
+      "issue_file": "003-query-helper-appends-limit-after-semicolon.md"
+    },
+    {
+      "issue": "STREAD-003",
+      "kind": "query",
+      "case_id": "syntax_empty_statement_after_semicolon",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_empty_statement_after_semicolon.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  SELECT oid, qty FROM orders WHERE oid <= 8 ORDER BY oid;;\nLIMIT \u001b[4m100000\u001b[0m",
+      "issue_file": "003-query-helper-appends-limit-after-semicolon.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select_semicolon.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select_semicolon.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select_semicolon.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select_semicolon.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-003",
+      "kind": "query",
+      "case_id": "syntax_literal_select_semicolon",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_select_semicolon.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  SELECT 6 * 7 AS answer;\nLIMIT \u001b[4m100000\u001b[0m",
+      "issue_file": "003-query-helper-appends-limit-after-semicolon.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte.json",
+      "observed": "RuntimeError: No snapshots selected.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte.json",
+      "observed": "RuntimeError: No snapshots selected.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte.json",
+      "observed": "RuntimeError: stream failed: No snapshots selected.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte.json",
+      "observed": "RuntimeError: No snapshots selected.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte.json",
+      "observed": "RuntimeError: Query execution failed: No snapshots selected.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_union",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_union.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_union",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_union.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_union",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_union.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_union",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_union.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_union",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_union.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_scalar_subquery.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_scalar_subquery.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_scalar_subquery.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_scalar_subquery.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_scalar_subquery",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_scalar_subquery.json",
+      "observed": "ValueError: No tables found in SQL query.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte_declared_columns.json",
+      "observed": "RuntimeError: No snapshots selected.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte_declared_columns.json",
+      "observed": "RuntimeError: No snapshots selected.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte_declared_columns.json",
+      "observed": "RuntimeError: stream failed: No snapshots selected.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte_declared_columns.json",
+      "observed": "RuntimeError: No snapshots selected.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-009",
+      "kind": "query",
+      "case_id": "syntax_literal_cte_declared_columns",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_literal_cte_declared_columns.json",
+      "observed": "RuntimeError: Query execution failed: No snapshots selected.",
+      "issue_file": "009-table-free-selects-unsupported.md"
+    },
+    {
+      "issue": "STREAD-002",
+      "kind": "query",
+      "case_id": "syntax_offset_fetch_next",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_offset_fetch_next.json",
+      "observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 6
+      },
+      "issue_file": "002-query-helper-overwrites-row-limits.md"
+    },
+    {
+      "issue": "STREAD-002",
+      "kind": "query",
+      "case_id": "syntax_fetch_first",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_fetch_first.json",
+      "observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 8
+      },
+      "issue_file": "002-query-helper-overwrites-row-limits.md"
+    },
+    {
+      "issue": "STREAD-002",
+      "kind": "query",
+      "case_id": "syntax_limit_parenthesized",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_limit_parenthesized.json",
+      "observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 8
+      },
+      "issue_file": "002-query-helper-overwrites-row-limits.md"
+    },
+    {
+      "issue": "STREAD-002",
+      "kind": "query",
+      "case_id": "syntax_offset_parenthesized",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_offset_parenthesized.json",
+      "observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 6
+      },
+      "issue_file": "002-query-helper-overwrites-row-limits.md"
+    },
+    {
+      "issue": "STREAD-007",
+      "kind": "query",
+      "case_id": "syntax_limit_all",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_limit_all.json",
+      "observed": "RuntimeError: Missing required column(s): warehouse.orders: ALL",
+      "issue_file": "007-limit-all-treated-as-column.md"
+    },
+    {
+      "issue": "STREAD-007",
+      "kind": "query",
+      "case_id": "syntax_limit_all",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_limit_all.json",
+      "observed": "RuntimeError: Missing required column(s): warehouse.orders: ALL",
+      "issue_file": "007-limit-all-treated-as-column.md"
+    },
+    {
+      "issue": "STREAD-007",
+      "kind": "query",
+      "case_id": "syntax_limit_all",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_limit_all.json",
+      "observed": "RuntimeError: stream failed: Missing required column(s): warehouse.orders: ALL",
+      "issue_file": "007-limit-all-treated-as-column.md"
+    },
+    {
+      "issue": "STREAD-007",
+      "kind": "query",
+      "case_id": "syntax_limit_all",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_limit_all.json",
+      "observed": "RuntimeError: Missing required column(s): warehouse.orders: ALL",
+      "issue_file": "007-limit-all-treated-as-column.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_sets_no_limit",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_sets_no_limit.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  FROM warehouse.orders WHERE oid <= 24 GROUP BY GROUPING SETS ((region, status), (region), ())\nLIMIT \u001b[4m100000\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_sets_explicit_limit",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_sets_explicit_limit.json",
+      "observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 208.\n  FROM warehouse.orders WHERE oid <= 24 GROUP BY GROUPING SETS ((region, status), (region), ()) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_sets_explicit_limit",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_sets_explicit_limit.json",
+      "observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 208.\n  FROM warehouse.orders WHERE oid <= 24 GROUP BY GROUPING SETS ((region, status), (region), ()) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_sets_explicit_limit",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_sets_explicit_limit.json",
+      "observed": "RuntimeError: stream failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 208.\n  FROM warehouse.orders WHERE oid <= 24 GROUP BY GROUPING SETS ((region, status), (region), ()) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_sets_explicit_limit",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_sets_explicit_limit.json",
+      "observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 208.\n  FROM warehouse.orders WHERE oid <= 24 GROUP BY GROUPING SETS ((region, status), (region), ()) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_sets_explicit_limit",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_sets_explicit_limit.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 208.\n  FROM warehouse.orders WHERE oid <= 24 GROUP BY GROUPING SETS ((region, status), (region), ()) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_rollup_no_limit",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_rollup_no_limit.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  s_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY ROLLUP (region, status)\nLIMIT \u001b[4m100000\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_rollup_explicit_limit",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_rollup_explicit_limit.json",
+      "observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 185.\n  s_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY ROLLUP (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_rollup_explicit_limit",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_rollup_explicit_limit.json",
+      "observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 185.\n  s_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY ROLLUP (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_rollup_explicit_limit",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_rollup_explicit_limit.json",
+      "observed": "RuntimeError: stream failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 185.\n  s_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY ROLLUP (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_rollup_explicit_limit",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_rollup_explicit_limit.json",
+      "observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 185.\n  s_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY ROLLUP (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_rollup_explicit_limit",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_rollup_explicit_limit.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 185.\n  s_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY ROLLUP (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_cube_no_limit",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_cube_no_limit.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 2, Col: 12.\n  tus_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY CUBE (region, status)\nLIMIT \u001b[4m100000\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_cube_explicit_limit",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_cube_explicit_limit.json",
+      "observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 183.\n  tus_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY CUBE (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_cube_explicit_limit",
+      "mode": "fullscan",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_cube_explicit_limit.json",
+      "observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 183.\n  tus_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY CUBE (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_cube_explicit_limit",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_cube_explicit_limit.json",
+      "observed": "RuntimeError: stream failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 183.\n  tus_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY CUBE (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_cube_explicit_limit",
+      "mode": "auto",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_cube_explicit_limit.json",
+      "observed": "RuntimeError: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 183.\n  tus_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY CUBE (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-005",
+      "kind": "query",
+      "case_id": "syntax_grouping_cube_explicit_limit",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_grouping_cube_explicit_limit.json",
+      "observed": "RuntimeError: Query execution failed: could not parse query: Invalid expression / Unexpected token. Line 1, Col: 183.\n  tus_total, COUNT(*) AS n FROM warehouse.orders WHERE oid <= 24 GROUP BY CUBE (region, status) LIMIT \u001b[4m100\u001b[0m",
+      "issue_file": "005-grouping-extensions-with-limit-rejected.md"
+    },
+    {
+      "issue": "STREAD-002",
+      "kind": "query",
+      "case_id": "syntax_limit_comment_between_keyword_and_count",
+      "mode": "query_sql",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/failures/syntax_limit_comment_between_keyword_and_count.json",
+      "observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 8
+      },
+      "issue_file": "002-query-helper-overwrites-row-limits.md"
+    },
+    {
+      "issue": "STREAD-011",
+      "kind": "additional",
+      "case_id": "ingest_events",
+      "mode": "setup",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/runs/04_supertable-sql-numeric-review/results.json",
+      "observed": "ArrowNotImplementedError: Cannot extract statistics for type ",
+      "issue_file": "011-decimal-ingestion-statistics-failure.md"
+    },
+    {
+      "issue": "STREAD-001",
+      "kind": "additional",
+      "case_id": "lifecycle_path_only_leaf_pruned",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/runs/02_supertable-sql-controls-reviewed/results.json",
+      "observed": {
+        "kind": "row_count",
+        "expected_count": 9,
+        "actual_count": 12
+      },
+      "issue_file": "001-snapshot-fallback-loses-deletions-and-share-filters.md"
+    },
+    {
+      "issue": "STREAD-001",
+      "kind": "additional",
+      "case_id": "lifecycle_path_only_leaf_stream",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/runs/02_supertable-sql-controls-reviewed/results.json",
+      "observed": {
+        "kind": "row_count",
+        "expected_count": 9,
+        "actual_count": 12
+      },
+      "issue_file": "001-snapshot-fallback-loses-deletions-and-share-filters.md"
+    },
+    {
+      "issue": "STREAD-001",
+      "kind": "additional",
+      "case_id": "lifecycle_path_only_share_filter_pruned",
+      "mode": "pruned",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/runs/02_supertable-sql-controls-reviewed/results.json",
+      "observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 12
+      },
+      "issue_file": "001-snapshot-fallback-loses-deletions-and-share-filters.md"
+    },
+    {
+      "issue": "STREAD-001",
+      "kind": "additional",
+      "case_id": "lifecycle_path_only_share_filter_stream",
+      "mode": "stream",
+      "evidence": "../audit/sql_read_matrix_2026-09-14/runs/02_supertable-sql-controls-reviewed/results.json",
+      "observed": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 12
+      },
+      "issue_file": "001-snapshot-fallback-loses-deletions-and-share-filters.md"
+    }
+  ]
+}

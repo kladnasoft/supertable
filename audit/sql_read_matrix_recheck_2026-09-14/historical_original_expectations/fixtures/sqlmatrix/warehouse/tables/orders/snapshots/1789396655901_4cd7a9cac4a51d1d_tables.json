@@ -1,0 +1,52 @@
+{
+  "rowid_high_watermark": 60,
+  "tombstone_rows": 0,
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"oid\":\"Int64\",\"cid\":\"Int64\",\"region\":\"String\",\"status\":\"String\",\"amount\":\"Int64\",\"qty\":\"Int64\",\"score\":\"Float64\",\"active\":\"Boolean\",\"created\":\"Date\",\"happened\":\"Datetime(time_unit='us', time_zone=None)\",\"note\":\"String\",\"code\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+  "stats_file": "sqlmatrix/warehouse/tables/orders/stats/year=2026/month=09/day=14/hour=14/1789396655893_e1bb45f3dd535eef_stats.parquet",
+  "last_updated_ms": 1789396655901,
+  "stats_rows": 24,
+  "tombstone": null,
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 30,
+    "incoming_columns": 12,
+    "write_id": "621f3816-2249-4666-a4c0-3dab0c959142"
+  },
+  "previous_snapshot": "sqlmatrix/warehouse/tables/orders/snapshots/1789396655801_be21bcb0641a8a13_tables.json",
+  "resources": [
+    {
+      "columns": 14,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396655768_1d3bb72755eac092_data.parquet",
+      "file_size": 5648,
+      "rows": 30
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396655875_d427b75c4cf44fae_data.parquet",
+      "file_size": 5683,
+      "rows": 30,
+      "columns": 14
+    }
+  ],
+  "location": "sqlmatrix/warehouse/tables/orders",
+  "simple_name": "orders",
+  "schema": {
+    "oid": "Int64",
+    "cid": "Int64",
+    "region": "String",
+    "status": "String",
+    "amount": "Int64",
+    "qty": "Int64",
+    "score": "Float64",
+    "active": "Boolean",
+    "created": "Date",
+    "happened": "Datetime(time_unit='us', time_zone=None)",
+    "note": "String",
+    "code": "String",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "snapshot_version": 2
+}

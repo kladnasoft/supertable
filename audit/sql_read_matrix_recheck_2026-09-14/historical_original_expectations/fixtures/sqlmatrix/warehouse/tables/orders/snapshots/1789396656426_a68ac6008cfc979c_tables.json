@@ -1,0 +1,88 @@
+{
+  "rowid_high_watermark": 240,
+  "stats_rows": 96,
+  "stats_file": "sqlmatrix/warehouse/tables/orders/stats/year=2026/month=09/day=14/hour=14/1789396656418_339b461ba30611d4_stats.parquet",
+  "resources": [
+    {
+      "file_size": 5648,
+      "rows": 30,
+      "columns": 14,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396655768_1d3bb72755eac092_data.parquet"
+    },
+    {
+      "rows": 30,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396655875_d427b75c4cf44fae_data.parquet",
+      "columns": 14,
+      "file_size": 5683
+    },
+    {
+      "columns": 14,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396655950_cc2c60356866cef1_data.parquet",
+      "file_size": 5685,
+      "rows": 30
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396656044_4e3ccd65c36bd1f0_data.parquet",
+      "rows": 30,
+      "file_size": 5705,
+      "columns": 14
+    },
+    {
+      "file_size": 5707,
+      "rows": 30,
+      "columns": 14,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396656138_4f329917a8bb71f9_data.parquet"
+    },
+    {
+      "rows": 30,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396656225_d481d9695ee00d16_data.parquet",
+      "columns": 14,
+      "file_size": 5695
+    },
+    {
+      "columns": 14,
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396656300_9b2843f9699a4c36_data.parquet",
+      "file_size": 5689,
+      "rows": 30
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/orders/data/year=2026/month=09/day=14/1789396656382_9eae7621226338e4_data.parquet",
+      "file_size": 5730,
+      "rows": 30,
+      "columns": 14
+    }
+  ],
+  "last_updated_ms": 1789396656426,
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"oid\":\"Int64\",\"cid\":\"Int64\",\"region\":\"String\",\"status\":\"String\",\"amount\":\"Int64\",\"qty\":\"Int64\",\"score\":\"Float64\",\"active\":\"Boolean\",\"created\":\"Date\",\"happened\":\"Datetime(time_unit='us', time_zone=None)\",\"note\":\"String\",\"code\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+  "tombstone": null,
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 30,
+    "incoming_columns": 12,
+    "write_id": "b3670ca7-c65c-4a53-a4c0-bb9dc7165d0d"
+  },
+  "tombstone_rows": 0,
+  "previous_snapshot": "sqlmatrix/warehouse/tables/orders/snapshots/1789396656337_3d5e803f751bc6d5_tables.json",
+  "location": "sqlmatrix/warehouse/tables/orders",
+  "simple_name": "orders",
+  "schema": {
+    "oid": "Int64",
+    "cid": "Int64",
+    "region": "String",
+    "status": "String",
+    "amount": "Int64",
+    "qty": "Int64",
+    "score": "Float64",
+    "active": "Boolean",
+    "created": "Date",
+    "happened": "Datetime(time_unit='us', time_zone=None)",
+    "note": "String",
+    "code": "String",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "snapshot_version": 8
+}

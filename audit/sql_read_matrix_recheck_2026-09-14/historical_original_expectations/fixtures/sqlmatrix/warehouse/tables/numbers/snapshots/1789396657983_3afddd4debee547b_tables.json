@@ -1,0 +1,57 @@
+{
+  "rowid_high_watermark": 31,
+  "stats_rows": 20,
+  "stats_file": "sqlmatrix/warehouse/tables/numbers/stats/year=2026/month=09/day=14/hour=14/1789396657971_90f375347b3a17ba_stats.parquet",
+  "resources": [
+    {
+      "file_size": 2772,
+      "rows": 10,
+      "columns": 7,
+      "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789396657601_23ec0a4d6f264e3b_data.parquet"
+    },
+    {
+      "rows": 10,
+      "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789396657709_15cc0040ee380840_data.parquet",
+      "columns": 7,
+      "file_size": 2771
+    },
+    {
+      "columns": 7,
+      "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789396657813_96b116ec3521f899_data.parquet",
+      "file_size": 2772,
+      "rows": 10
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/numbers/data/year=2026/month=09/day=14/1789396657953_7e13f6dc68f14380_data.parquet",
+      "file_size": 2502,
+      "rows": 1,
+      "columns": 7
+    }
+  ],
+  "last_updated_ms": 1789396657982,
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"rid\":\"Int64\",\"n\":\"Int64\",\"grp\":\"Int64\",\"nullable_n\":\"Int64\",\"label\":\"String\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+  "tombstone": null,
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 1,
+    "incoming_columns": 5,
+    "write_id": "f62fc7f8-ca25-4c1e-bdc6-90ee7f0d2f15"
+  },
+  "tombstone_rows": 0,
+  "previous_snapshot": "sqlmatrix/warehouse/tables/numbers/snapshots/1789396657856_1183973d90dba2ab_tables.json",
+  "location": "sqlmatrix/warehouse/tables/numbers",
+  "simple_name": "numbers",
+  "schema": {
+    "rid": "Int64",
+    "n": "Int64",
+    "grp": "Int64",
+    "nullable_n": "Int64",
+    "label": "String",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "snapshot_version": 4
+}

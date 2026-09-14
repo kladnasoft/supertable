@@ -1,0 +1,214 @@
+{
+  "case": {
+    "case_id": "syntax_limit_parenthesized",
+    "category": "sql_limit_syntax",
+    "sql": "SELECT oid, qty FROM orders WHERE oid <= 8 ORDER BY oid LIMIT (3)",
+    "columns": [
+      "oid",
+      "qty"
+    ],
+    "expected": [
+      [
+        1,
+        2
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        3,
+        4
+      ]
+    ],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": ""
+  },
+  "reference": {
+    "status": "pass",
+    "row_count": 3
+  },
+  "runs": [
+    {
+      "mode": "pruned",
+      "status": "pass",
+      "row_count": 3,
+      "columns": [
+        "oid",
+        "qty"
+      ],
+      "types": {
+        "oid": "Int64",
+        "qty": "Int64"
+      },
+      "mismatch": null,
+      "plan_stats": {
+        "REFLECTIONS": 1,
+        "REFLECTION_SIZE": 261,
+        "REFLECTION_SIZE_RAW": 5648,
+        "FILES_BEFORE_PRUNE": 8,
+        "FILES_PRUNED": 7,
+        "FILES_KEPT": 1,
+        "PRUNE_DURATION_MS": 2.079,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read_pruned_files": 7,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb"
+      },
+      "duration_ms": 78.237
+    },
+    {
+      "mode": "fullscan",
+      "status": "pass",
+      "row_count": 3,
+      "columns": [
+        "oid",
+        "qty"
+      ],
+      "types": {
+        "oid": "Int64",
+        "qty": "Int64"
+      },
+      "mismatch": null,
+      "plan_stats": {
+        "REFLECTIONS": 8,
+        "REFLECTION_SIZE": 2175,
+        "REFLECTION_SIZE_RAW": 45542,
+        "FILES_BEFORE_PRUNE": 8,
+        "FILES_PRUNED": 0,
+        "FILES_KEPT": 8,
+        "PRUNE_DURATION_MS": 0.013,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb"
+      },
+      "duration_ms": 73.365
+    },
+    {
+      "mode": "stream",
+      "status": "pass",
+      "batches": 1,
+      "row_count": 3,
+      "columns": [
+        "oid",
+        "qty"
+      ],
+      "types": {
+        "oid": "Int64",
+        "qty": "Int64"
+      },
+      "mismatch": null,
+      "plan_stats": {
+        "REFLECTIONS": 1,
+        "REFLECTION_SIZE": 261,
+        "REFLECTION_SIZE_RAW": 5648,
+        "FILES_BEFORE_PRUNE": 8,
+        "FILES_PRUNED": 7,
+        "FILES_KEPT": 1,
+        "PRUNE_DURATION_MS": 5.11,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read_pruned_files": 7,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb"
+      },
+      "duration_ms": 74.796
+    },
+    {
+      "mode": "auto",
+      "status": "pass",
+      "row_count": 3,
+      "columns": [
+        "oid",
+        "qty"
+      ],
+      "types": {
+        "oid": "Int64",
+        "qty": "Int64"
+      },
+      "mismatch": null,
+      "plan_stats": {
+        "REFLECTIONS": 1,
+        "REFLECTION_SIZE": 261,
+        "REFLECTION_SIZE_RAW": 5648,
+        "FILES_BEFORE_PRUNE": 8,
+        "FILES_PRUNED": 7,
+        "FILES_KEPT": 1,
+        "PRUNE_DURATION_MS": 4.276,
+        "PRUNE_COUNTS": {
+          "stats_cache_hit": 1,
+          "read_pruned_files": 7,
+          "read.prune.n": 1
+        },
+        "ENGINE": "duckdb"
+      },
+      "duration_ms": 90.737
+    },
+    {
+      "mode": "query_sql",
+      "status": "fail",
+      "row_count": 8,
+      "columns": [
+        "oid",
+        "qty"
+      ],
+      "types": {
+        "oid": "Int64",
+        "qty": "Int64"
+      },
+      "mismatch": {
+        "kind": "row_count",
+        "expected_count": 3,
+        "actual_count": 8
+      },
+      "plan_stats": {},
+      "actual_rows": [
+        [
+          1,
+          2
+        ],
+        [
+          2,
+          3
+        ],
+        [
+          3,
+          4
+        ],
+        [
+          4,
+          5
+        ],
+        [
+          5,
+          1
+        ],
+        [
+          6,
+          2
+        ],
+        [
+          7,
+          3
+        ],
+        [
+          8,
+          4
+        ]
+      ],
+      "duration_ms": 81.052
+    }
+  ],
+  "dataset": "../dataset.json",
+  "fixture_manifest": "../fixture_manifest.json",
+  "evidence_run": "runs/03_supertable-sql-syntax-followup"
+}

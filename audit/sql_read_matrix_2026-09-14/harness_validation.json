@@ -1,0 +1,6 @@
+{
+  "command": "python -m pytest scripts/sql_read_matrix/test_harness.py -q --tb=short",
+  "passed": 39,
+  "failed": 0,
+  "duration_seconds": 9.0
+}

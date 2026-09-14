@@ -1,0 +1,120 @@
+{
+  "case": {
+    "case_id": "syntax_limit_all",
+    "category": "sql_limit_syntax",
+    "sql": "SELECT oid, qty FROM orders WHERE oid <= 8 ORDER BY oid LIMIT ALL",
+    "columns": [
+      "oid",
+      "qty"
+    ],
+    "expected": [
+      [
+        1,
+        2
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        3,
+        4
+      ],
+      [
+        4,
+        5
+      ],
+      [
+        5,
+        1
+      ],
+      [
+        6,
+        2
+      ],
+      [
+        7,
+        3
+      ],
+      [
+        8,
+        4
+      ]
+    ],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": ""
+  },
+  "reference": {
+    "status": "pass",
+    "row_count": 8
+  },
+  "runs": [
+    {
+      "mode": "pruned",
+      "status": "fail",
+      "error": "RuntimeError: Missing required column(s): warehouse.orders: ALL",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 49, in execute_case\n    raise RuntimeError(message)\nRuntimeError: Missing required column(s): warehouse.orders: ALL\n",
+      "duration_ms": 50.044
+    },
+    {
+      "mode": "fullscan",
+      "status": "fail",
+      "error": "RuntimeError: Missing required column(s): warehouse.orders: ALL",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 49, in execute_case\n    raise RuntimeError(message)\nRuntimeError: Missing required column(s): warehouse.orders: ALL\n",
+      "duration_ms": 41.894
+    },
+    {
+      "mode": "stream",
+      "status": "fail",
+      "error": "RuntimeError: stream failed: Missing required column(s): warehouse.orders: ALL",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 29, in execute_case\n    handle = reader.stream(case.role, engine=engine.DUCKDB, batch_rows=17)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 564, in stream\n    raise RuntimeError(f\"stream failed: {message}\")\nRuntimeError: stream failed: Missing required column(s): warehouse.orders: ALL\n",
+      "duration_ms": 48.913
+    },
+    {
+      "mode": "auto",
+      "status": "fail",
+      "error": "RuntimeError: Missing required column(s): warehouse.orders: ALL",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 49, in execute_case\n    raise RuntimeError(message)\nRuntimeError: Missing required column(s): warehouse.orders: ALL\n",
+      "duration_ms": 51.064
+    },
+    {
+      "mode": "query_sql",
+      "status": "pass",
+      "row_count": 8,
+      "columns": [
+        "oid",
+        "qty"
+      ],
+      "types": {
+        "oid": "Int64",
+        "qty": "Int64"
+      },
+      "mismatch": null,
+      "plan_stats": {},
+      "duration_ms": 80.457
+    }
+  ],
+  "dataset": "../dataset.json",
+  "fixture_manifest": "../fixture_manifest.json",
+  "evidence_run": "runs/03_supertable-sql-syntax-followup"
+}

@@ -1,0 +1,496 @@
+[
+  {
+    "probe_id": "polars_native_decimal",
+    "description": "Polars native Parquet writer, statistics enabled",
+    "path": "/tmp/supertable-sql-numeric-review/ingest_probes/polars_native_decimal.parquet",
+    "versions": {
+      "polars": "1.42.1",
+      "pyarrow": "18.1.0"
+    },
+    "rows": 8,
+    "source_money_type": "decimal128(12, 3)",
+    "status": "fail",
+    "all_values_roundtrip": true,
+    "money_type": "decimal128(12, 3)",
+    "money_type_unchanged": true,
+    "fields": [
+      {
+        "field": "eid",
+        "physical_type": "INT64",
+        "logical_type": "None",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 0,
+        "min": "1",
+        "max": "8",
+        "min_raw": "1",
+        "max_raw": "8"
+      },
+      {
+        "field": "event_date",
+        "physical_type": "INT32",
+        "logical_type": "Date",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 0,
+        "min": "2024-02-28",
+        "max": "2024-03-06",
+        "min_raw": "19781",
+        "max_raw": "19788"
+      },
+      {
+        "field": "event_time",
+        "physical_type": "INT64",
+        "logical_type": "Timestamp(isAdjustedToUTC=false, timeUnit=microseconds, is_from_converted_type=false, force_set_converted_type=false)",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 0,
+        "min": "2024-02-28 12:30:00",
+        "max": "2024-03-03 07:30:00",
+        "min_raw": "1709123400000000",
+        "max_raw": "1709451000000000"
+      },
+      {
+        "field": "money",
+        "physical_type": "INT64",
+        "logical_type": "Decimal(precision=12, scale=3)",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 1,
+        "min_error": {
+          "field": "money",
+          "attribute": "min",
+          "error_type": "ArrowNotImplementedError",
+          "message": "Cannot extract statistics for type "
+        },
+        "max_error": {
+          "field": "money",
+          "attribute": "max",
+          "error_type": "ArrowNotImplementedError",
+          "message": "Cannot extract statistics for type "
+        },
+        "min_raw": "-1125",
+        "max_raw": "-250"
+      },
+      {
+        "field": "flag",
+        "physical_type": "BOOLEAN",
+        "logical_type": "None",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 1,
+        "min": "False",
+        "max": "True",
+        "min_raw": "False",
+        "max_raw": "True"
+      },
+      {
+        "field": "label",
+        "physical_type": "BYTE_ARRAY",
+        "logical_type": "String",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 1,
+        "min": "",
+        "max": "東京",
+        "min_raw": {
+          "hex": ""
+        },
+        "max_raw": {
+          "hex": "e69db1e4baac"
+        }
+      }
+    ],
+    "statistics_failures": [
+      {
+        "field": "money",
+        "attribute": "min",
+        "error_type": "ArrowNotImplementedError",
+        "message": "Cannot extract statistics for type "
+      },
+      {
+        "field": "money",
+        "attribute": "max",
+        "error_type": "ArrowNotImplementedError",
+        "message": "Cannot extract statistics for type "
+      }
+    ],
+    "statistics_accessible": false,
+    "money_physical_type": "INT64"
+  },
+  {
+    "probe_id": "polars_pyarrow_decimal",
+    "description": "Polars Parquet writer with use_pyarrow=True",
+    "path": "/tmp/supertable-sql-numeric-review/ingest_probes/polars_pyarrow_decimal.parquet",
+    "versions": {
+      "polars": "1.42.1",
+      "pyarrow": "18.1.0"
+    },
+    "rows": 8,
+    "source_money_type": "decimal128(12, 3)",
+    "status": "pass",
+    "all_values_roundtrip": true,
+    "money_type": "decimal128(12, 3)",
+    "money_type_unchanged": true,
+    "fields": [
+      {
+        "field": "eid",
+        "physical_type": "INT64",
+        "logical_type": "None",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 0,
+        "min": "1",
+        "max": "8",
+        "min_raw": "1",
+        "max_raw": "8"
+      },
+      {
+        "field": "event_date",
+        "physical_type": "INT32",
+        "logical_type": "Date",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 0,
+        "min": "2024-02-28",
+        "max": "2024-03-06",
+        "min_raw": "19781",
+        "max_raw": "19788"
+      },
+      {
+        "field": "event_time",
+        "physical_type": "INT64",
+        "logical_type": "Timestamp(isAdjustedToUTC=false, timeUnit=microseconds, is_from_converted_type=false, force_set_converted_type=false)",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 0,
+        "min": "2024-02-28 12:30:00",
+        "max": "2024-03-03 07:30:00",
+        "min_raw": "1709123400000000",
+        "max_raw": "1709451000000000"
+      },
+      {
+        "field": "money",
+        "physical_type": "FIXED_LEN_BYTE_ARRAY",
+        "logical_type": "Decimal(precision=12, scale=3)",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 1,
+        "min": "-1.125",
+        "max": "-0.250",
+        "min_raw": {
+          "hex": "fffffffffb9b"
+        },
+        "max_raw": {
+          "hex": "ffffffffff06"
+        }
+      },
+      {
+        "field": "flag",
+        "physical_type": "BOOLEAN",
+        "logical_type": "None",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 1,
+        "min": "False",
+        "max": "True",
+        "min_raw": "False",
+        "max_raw": "True"
+      },
+      {
+        "field": "label",
+        "physical_type": "BYTE_ARRAY",
+        "logical_type": "String",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 1,
+        "min": "",
+        "max": "東京",
+        "min_raw": {
+          "hex": ""
+        },
+        "max_raw": {
+          "hex": "e69db1e4baac"
+        }
+      }
+    ],
+    "statistics_failures": [],
+    "statistics_accessible": true,
+    "money_physical_type": "FIXED_LEN_BYTE_ARRAY"
+  },
+  {
+    "probe_id": "pyarrow_default_decimal",
+    "description": "PyArrow default decimal physical encoding",
+    "path": "/tmp/supertable-sql-numeric-review/ingest_probes/pyarrow_default_decimal.parquet",
+    "versions": {
+      "polars": "1.42.1",
+      "pyarrow": "18.1.0"
+    },
+    "rows": 8,
+    "source_money_type": "decimal128(12, 3)",
+    "status": "pass",
+    "all_values_roundtrip": true,
+    "money_type": "decimal128(12, 3)",
+    "money_type_unchanged": true,
+    "fields": [
+      {
+        "field": "eid",
+        "physical_type": "INT64",
+        "logical_type": "None",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 0,
+        "min": "1",
+        "max": "8",
+        "min_raw": "1",
+        "max_raw": "8"
+      },
+      {
+        "field": "event_date",
+        "physical_type": "INT32",
+        "logical_type": "Date",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 0,
+        "min": "2024-02-28",
+        "max": "2024-03-06",
+        "min_raw": "19781",
+        "max_raw": "19788"
+      },
+      {
+        "field": "event_time",
+        "physical_type": "INT64",
+        "logical_type": "Timestamp(isAdjustedToUTC=false, timeUnit=microseconds, is_from_converted_type=false, force_set_converted_type=false)",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 0,
+        "min": "2024-02-28 12:30:00",
+        "max": "2024-03-03 07:30:00",
+        "min_raw": "1709123400000000",
+        "max_raw": "1709451000000000"
+      },
+      {
+        "field": "money",
+        "physical_type": "FIXED_LEN_BYTE_ARRAY",
+        "logical_type": "Decimal(precision=12, scale=3)",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 1,
+        "min": "-1.125",
+        "max": "-0.250",
+        "min_raw": {
+          "hex": "fffffffffb9b"
+        },
+        "max_raw": {
+          "hex": "ffffffffff06"
+        }
+      },
+      {
+        "field": "flag",
+        "physical_type": "BOOLEAN",
+        "logical_type": "None",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 1,
+        "min": "False",
+        "max": "True",
+        "min_raw": "False",
+        "max_raw": "True"
+      },
+      {
+        "field": "label",
+        "physical_type": "BYTE_ARRAY",
+        "logical_type": "String",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 1,
+        "min": "",
+        "max": "東京",
+        "min_raw": {
+          "hex": ""
+        },
+        "max_raw": {
+          "hex": "e69db1e4baac"
+        }
+      }
+    ],
+    "statistics_failures": [],
+    "statistics_accessible": true,
+    "money_physical_type": "FIXED_LEN_BYTE_ARRAY"
+  },
+  {
+    "probe_id": "pyarrow_integer_decimal",
+    "description": "PyArrow store_decimal_as_integer=True",
+    "path": "/tmp/supertable-sql-numeric-review/ingest_probes/pyarrow_integer_decimal.parquet",
+    "versions": {
+      "polars": "1.42.1",
+      "pyarrow": "18.1.0"
+    },
+    "rows": 8,
+    "source_money_type": "decimal128(12, 3)",
+    "status": "fail",
+    "all_values_roundtrip": true,
+    "money_type": "decimal128(12, 3)",
+    "money_type_unchanged": true,
+    "fields": [
+      {
+        "field": "eid",
+        "physical_type": "INT64",
+        "logical_type": "None",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 0,
+        "min": "1",
+        "max": "8",
+        "min_raw": "1",
+        "max_raw": "8"
+      },
+      {
+        "field": "event_date",
+        "physical_type": "INT32",
+        "logical_type": "Date",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 0,
+        "min": "2024-02-28",
+        "max": "2024-03-06",
+        "min_raw": "19781",
+        "max_raw": "19788"
+      },
+      {
+        "field": "event_time",
+        "physical_type": "INT64",
+        "logical_type": "Timestamp(isAdjustedToUTC=false, timeUnit=microseconds, is_from_converted_type=false, force_set_converted_type=false)",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 0,
+        "min": "2024-02-28 12:30:00",
+        "max": "2024-03-03 07:30:00",
+        "min_raw": "1709123400000000",
+        "max_raw": "1709451000000000"
+      },
+      {
+        "field": "money",
+        "physical_type": "INT64",
+        "logical_type": "Decimal(precision=12, scale=3)",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 1,
+        "min_error": {
+          "field": "money",
+          "attribute": "min",
+          "error_type": "ArrowNotImplementedError",
+          "message": "Cannot extract statistics for type "
+        },
+        "max_error": {
+          "field": "money",
+          "attribute": "max",
+          "error_type": "ArrowNotImplementedError",
+          "message": "Cannot extract statistics for type "
+        },
+        "min_raw": "-1125",
+        "max_raw": "-250"
+      },
+      {
+        "field": "flag",
+        "physical_type": "BOOLEAN",
+        "logical_type": "None",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 1,
+        "min": "False",
+        "max": "True",
+        "min_raw": "False",
+        "max_raw": "True"
+      },
+      {
+        "field": "label",
+        "physical_type": "BYTE_ARRAY",
+        "logical_type": "String",
+        "has_statistics": true,
+        "has_min_max": true,
+        "null_count": 1,
+        "min": "",
+        "max": "東京",
+        "min_raw": {
+          "hex": ""
+        },
+        "max_raw": {
+          "hex": "e69db1e4baac"
+        }
+      }
+    ],
+    "statistics_failures": [
+      {
+        "field": "money",
+        "attribute": "min",
+        "error_type": "ArrowNotImplementedError",
+        "message": "Cannot extract statistics for type "
+      },
+      {
+        "field": "money",
+        "attribute": "max",
+        "error_type": "ArrowNotImplementedError",
+        "message": "Cannot extract statistics for type "
+      }
+    ],
+    "statistics_accessible": false,
+    "money_physical_type": "INT64"
+  },
+  {
+    "probe_id": "polars_decimal_without_statistics",
+    "description": "Polars native Parquet writer, statistics disabled",
+    "path": "/tmp/supertable-sql-numeric-review/ingest_probes/polars_decimal_without_statistics.parquet",
+    "versions": {
+      "polars": "1.42.1",
+      "pyarrow": "18.1.0"
+    },
+    "rows": 8,
+    "source_money_type": "decimal128(12, 3)",
+    "status": "pass",
+    "all_values_roundtrip": true,
+    "money_type": "decimal128(12, 3)",
+    "money_type_unchanged": true,
+    "fields": [
+      {
+        "field": "eid",
+        "physical_type": "INT64",
+        "logical_type": "None",
+        "has_statistics": false
+      },
+      {
+        "field": "event_date",
+        "physical_type": "INT32",
+        "logical_type": "Date",
+        "has_statistics": false
+      },
+      {
+        "field": "event_time",
+        "physical_type": "INT64",
+        "logical_type": "Timestamp(isAdjustedToUTC=false, timeUnit=microseconds, is_from_converted_type=false, force_set_converted_type=false)",
+        "has_statistics": false
+      },
+      {
+        "field": "money",
+        "physical_type": "INT64",
+        "logical_type": "Decimal(precision=12, scale=3)",
+        "has_statistics": false
+      },
+      {
+        "field": "flag",
+        "physical_type": "BOOLEAN",
+        "logical_type": "None",
+        "has_statistics": false
+      },
+      {
+        "field": "label",
+        "physical_type": "BYTE_ARRAY",
+        "logical_type": "String",
+        "has_statistics": false
+      }
+    ],
+    "statistics_failures": [],
+    "statistics_accessible": true,
+    "money_physical_type": "INT64"
+  }
+]

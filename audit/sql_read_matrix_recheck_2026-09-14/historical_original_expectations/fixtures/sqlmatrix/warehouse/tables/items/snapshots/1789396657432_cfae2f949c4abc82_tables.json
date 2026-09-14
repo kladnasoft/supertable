@@ -1,0 +1,75 @@
+{
+  "rowid_high_watermark": 420,
+  "snapshot_version": 7,
+  "schema": {
+    "iid": "Int64",
+    "oid": "Int64",
+    "sku": "String",
+    "units": "Int64",
+    "price": "Int64",
+    "__rowid__": "Int64",
+    "__timestamp__": "Datetime(time_unit='us', time_zone='UTC')"
+  },
+  "simple_name": "items",
+  "last_updated_ms": 1789396657431,
+  "schemaString": "{\"type\":\"struct\",\"fields\":{\"iid\":\"Int64\",\"oid\":\"Int64\",\"sku\":\"String\",\"units\":\"Int64\",\"price\":\"Int64\",\"__rowid__\":\"Int64\",\"__timestamp__\":\"Datetime(time_unit='us', time_zone='UTC')\"}}",
+  "tombstone": null,
+  "lineage": {
+    "source_type": "write",
+    "role_name": "superadmin",
+    "overwrite_columns": [],
+    "delete_only": false,
+    "incoming_rows": 60,
+    "incoming_columns": 5,
+    "write_id": "acb5d11a-cbb4-4969-a7b5-46ac44e50f0d"
+  },
+  "location": "sqlmatrix/warehouse/tables/items",
+  "previous_snapshot": "sqlmatrix/warehouse/tables/items/snapshots/1789396657338_df6b1151a59a4ab4_tables.json",
+  "tombstone_rows": 0,
+  "resources": [
+    {
+      "rows": 60,
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396656863_7bf2d28ae70467be_data.parquet",
+      "columns": 7,
+      "file_size": 3093
+    },
+    {
+      "columns": 7,
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396656935_de80313d0b58ccde_data.parquet",
+      "file_size": 3123,
+      "rows": 60
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396657010_3086c39afe4b47c9_data.parquet",
+      "rows": 60,
+      "file_size": 3133,
+      "columns": 7
+    },
+    {
+      "file_size": 3141,
+      "rows": 60,
+      "columns": 7,
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396657111_80f8122a54816044_data.parquet"
+    },
+    {
+      "rows": 60,
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396657212_845ee5121e2f0d1b_data.parquet",
+      "columns": 7,
+      "file_size": 3257
+    },
+    {
+      "columns": 7,
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396657318_2a963f4fec18e4ed_data.parquet",
+      "file_size": 3227,
+      "rows": 60
+    },
+    {
+      "file": "sqlmatrix/warehouse/tables/items/data/year=2026/month=09/day=14/1789396657400_ae1d9c01ec3cfb3e_data.parquet",
+      "file_size": 3227,
+      "rows": 60,
+      "columns": 7
+    }
+  ],
+  "stats_file": "sqlmatrix/warehouse/tables/items/stats/year=2026/month=09/day=14/hour=14/1789396657422_631da595a4092a8f_stats.parquet",
+  "stats_rows": 35
+}

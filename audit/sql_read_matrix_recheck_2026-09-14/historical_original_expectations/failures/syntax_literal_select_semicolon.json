@@ -1,0 +1,91 @@
+{
+  "case": {
+    "case_id": "syntax_literal_select_semicolon",
+    "category": "sql_literal_source",
+    "sql": "SELECT 6 * 7 AS answer;",
+    "columns": [
+      "answer"
+    ],
+    "expected": [
+      [
+        42
+      ]
+    ],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": "",
+    "session_timezone": "UTC"
+  },
+  "reference": {
+    "status": "pass",
+    "row_count": 1
+  },
+  "runs": [
+    {
+      "mode": "pruned",
+      "status": "fail",
+      "session_timezone": "UTC",
+      "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+      "duration_ms": 4.208
+    },
+    {
+      "mode": "fullscan",
+      "status": "fail",
+      "session_timezone": "UTC",
+      "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+      "duration_ms": 2.755
+    },
+    {
+      "mode": "stream",
+      "status": "fail",
+      "session_timezone": "UTC",
+      "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 32, in execute_case\n    handle = reader.stream(case.role, engine=engine.DUCKDB, batch_rows=17)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 611, in stream\n    _, status, message = self.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+      "duration_ms": 3.699
+    },
+    {
+      "mode": "auto",
+      "status": "fail",
+      "session_timezone": "UTC",
+      "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 50, in execute_case\n    frame, status, message = reader.execute(case.role, engine=chosen, fullscan=mode == \"fullscan\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+      "duration_ms": 3.876
+    },
+    {
+      "mode": "query_sql",
+      "status": "fail",
+      "session_timezone": "UTC",
+      "error": "ValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 46, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 768, in query_sql\n    result_df, status, message = reader.execute(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 308, in execute\n    parser = SQLParser(\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 299, in __init__\n    self._extract_tables()\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/utils/sql_parser.py\", line 412, in _extract_tables\n    raise ValueError(TABLE_FREE_QUERY_ERROR)\nValueError: this query reads no table; SuperTable executes reads against its own tables only, so table-free SELECTs (literal projections, literal UNIONs, and CTEs built only from literals) are not supported\n",
+      "duration_ms": 12.064
+    }
+  ],
+  "dataset": "../dataset.json",
+  "fixture_manifest": "../fixture_manifest.json",
+  "evidence_run": null
+}

@@ -1,0 +1,153 @@
+[
+  {
+    "case_id": "session_timezone_pruned",
+    "mode": "pruned",
+    "status": "pass",
+    "session_timezone": "UTC",
+    "row_count": 1,
+    "columns": [
+      "zone",
+      "local_day"
+    ],
+    "types": {
+      "zone": "String",
+      "local_day": "Date"
+    },
+    "mismatch": null,
+    "plan_stats": {
+      "REFLECTIONS": 8,
+      "REFLECTION_SIZE": 45542,
+      "REFLECTION_SIZE_RAW": 45542,
+      "FILES_BEFORE_PRUNE": 8,
+      "FILES_PRUNED": 0,
+      "FILES_KEPT": 8,
+      "PRUNE_DURATION_MS": 0.022,
+      "PRUNE_COUNTS": {
+        "stats_cache_hit": 1,
+        "read.prune.n": 1
+      },
+      "ENGINE": "duckdb"
+    },
+    "duration_ms": 210.232
+  },
+  {
+    "case_id": "session_timezone_fullscan",
+    "mode": "fullscan",
+    "status": "pass",
+    "session_timezone": "UTC",
+    "row_count": 1,
+    "columns": [
+      "zone",
+      "local_day"
+    ],
+    "types": {
+      "zone": "String",
+      "local_day": "Date"
+    },
+    "mismatch": null,
+    "plan_stats": {
+      "REFLECTIONS": 8,
+      "REFLECTION_SIZE": 45542,
+      "REFLECTION_SIZE_RAW": 45542,
+      "FILES_BEFORE_PRUNE": 8,
+      "FILES_PRUNED": 0,
+      "FILES_KEPT": 8,
+      "PRUNE_DURATION_MS": 0.022,
+      "PRUNE_COUNTS": {
+        "stats_cache_hit": 1,
+        "read.prune.n": 1
+      },
+      "ENGINE": "duckdb"
+    },
+    "duration_ms": 90.181
+  },
+  {
+    "case_id": "session_timezone_stream",
+    "mode": "stream",
+    "status": "pass",
+    "session_timezone": "UTC",
+    "batches": 1,
+    "row_count": 1,
+    "columns": [
+      "zone",
+      "local_day"
+    ],
+    "types": {
+      "zone": "String",
+      "local_day": "Date"
+    },
+    "mismatch": null,
+    "plan_stats": {
+      "REFLECTIONS": 8,
+      "REFLECTION_SIZE": 45542,
+      "REFLECTION_SIZE_RAW": 45542,
+      "FILES_BEFORE_PRUNE": 8,
+      "FILES_PRUNED": 0,
+      "FILES_KEPT": 8,
+      "PRUNE_DURATION_MS": 0.024,
+      "PRUNE_COUNTS": {
+        "stats_cache_hit": 1,
+        "read.prune.n": 1
+      },
+      "ENGINE": "duckdb"
+    },
+    "duration_ms": 88.43
+  },
+  {
+    "case_id": "session_timezone_auto",
+    "mode": "auto",
+    "status": "pass",
+    "session_timezone": "UTC",
+    "row_count": 1,
+    "columns": [
+      "zone",
+      "local_day"
+    ],
+    "types": {
+      "zone": "String",
+      "local_day": "Date"
+    },
+    "mismatch": null,
+    "plan_stats": {
+      "REFLECTIONS": 8,
+      "REFLECTION_SIZE": 45542,
+      "REFLECTION_SIZE_RAW": 45542,
+      "FILES_BEFORE_PRUNE": 8,
+      "FILES_PRUNED": 0,
+      "FILES_KEPT": 8,
+      "PRUNE_DURATION_MS": 0.017,
+      "PRUNE_COUNTS": {
+        "stats_cache_hit": 1,
+        "read.prune.n": 1
+      },
+      "ENGINE": "duckdb"
+    },
+    "duration_ms": 72.457
+  },
+  {
+    "case_id": "session_timezone_query_sql",
+    "mode": "query_sql",
+    "status": "pass",
+    "session_timezone": "UTC",
+    "row_count": 1,
+    "columns": [
+      "zone",
+      "local_day"
+    ],
+    "types": {
+      "zone": "String",
+      "local_day": "Date"
+    },
+    "mismatch": null,
+    "plan_stats": {},
+    "duration_ms": 78.396
+  },
+  {
+    "case_id": "session_base_and_cursor",
+    "observed": {
+      "base": "UTC",
+      "cursor": "UTC"
+    },
+    "status": "pass"
+  }
+]

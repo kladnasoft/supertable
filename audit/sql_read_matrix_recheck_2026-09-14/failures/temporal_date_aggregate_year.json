@@ -1,0 +1,223 @@
+{
+  "case": {
+    "case_id": "temporal_date_aggregate_year",
+    "category": "temporal_aggregates",
+    "sql": "SELECT EXTRACT(year FROM event_date) AS yr, COUNT(*) AS n, MIN(event_date) AS first_value, MAX(event_date) AS last_value FROM temporal_dates WHERE event_date IS NOT NULL GROUP BY yr ORDER BY yr",
+    "columns": [
+      "yr",
+      "n",
+      "first_value",
+      "last_value"
+    ],
+    "expected": [
+      [
+        1900,
+        7,
+        {
+          "type": "date",
+          "value": "1900-02-26"
+        },
+        {
+          "type": "date",
+          "value": "1900-03-04"
+        }
+      ],
+      [
+        1969,
+        4,
+        {
+          "type": "date",
+          "value": "1969-12-28"
+        },
+        {
+          "type": "date",
+          "value": "1969-12-31"
+        }
+      ],
+      [
+        1970,
+        4,
+        {
+          "type": "date",
+          "value": "1970-01-01"
+        },
+        {
+          "type": "date",
+          "value": "1970-01-04"
+        }
+      ],
+      [
+        1999,
+        4,
+        {
+          "type": "date",
+          "value": "1999-12-28"
+        },
+        {
+          "type": "date",
+          "value": "1999-12-31"
+        }
+      ],
+      [
+        2000,
+        11,
+        {
+          "type": "date",
+          "value": "2000-01-01"
+        },
+        {
+          "type": "date",
+          "value": "2000-03-03"
+        }
+      ],
+      [
+        2023,
+        11,
+        {
+          "type": "date",
+          "value": "2023-02-25"
+        },
+        {
+          "type": "date",
+          "value": "2023-12-31"
+        }
+      ],
+      [
+        2024,
+        30,
+        {
+          "type": "date",
+          "value": "2024-01-01"
+        },
+        {
+          "type": "date",
+          "value": "2024-12-31"
+        }
+      ],
+      [
+        2025,
+        3,
+        {
+          "type": "date",
+          "value": "2025-01-01"
+        },
+        {
+          "type": "date",
+          "value": "2025-01-03"
+        }
+      ],
+      [
+        2038,
+        7,
+        {
+          "type": "date",
+          "value": "2038-01-16"
+        },
+        {
+          "type": "date",
+          "value": "2038-01-22"
+        }
+      ],
+      [
+        2050,
+        7,
+        {
+          "type": "date",
+          "value": "2050-06-27"
+        },
+        {
+          "type": "date",
+          "value": "2050-07-03"
+        }
+      ],
+      [
+        2100,
+        7,
+        {
+          "type": "date",
+          "value": "2100-02-26"
+        },
+        {
+          "type": "date",
+          "value": "2100-03-04"
+        }
+      ]
+    ],
+    "ordered": true,
+    "role": "superadmin",
+    "error_contains": [],
+    "expected_types": {},
+    "min_pruned_files": 0,
+    "note": "",
+    "session_timezone": "UTC"
+  },
+  "reference": {
+    "status": "pass",
+    "row_count": 11
+  },
+  "runs": [
+    {
+      "mode": "pruned",
+      "status": "fail",
+      "session_timezone": "UTC",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_dates: yr",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 52, in execute_case\n    raise RuntimeError(message)\nRuntimeError: Missing required column(s): warehouse.temporal_dates: yr\n",
+      "duration_ms": 43.676
+    },
+    {
+      "mode": "fullscan",
+      "status": "fail",
+      "session_timezone": "UTC",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_dates: yr",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 52, in execute_case\n    raise RuntimeError(message)\nRuntimeError: Missing required column(s): warehouse.temporal_dates: yr\n",
+      "duration_ms": 48.549
+    },
+    {
+      "mode": "stream",
+      "status": "fail",
+      "session_timezone": "UTC",
+      "error": "RuntimeError: stream failed: Missing required column(s): warehouse.temporal_dates: yr",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 32, in execute_case\n    handle = reader.stream(case.role, engine=engine.DUCKDB, batch_rows=17)\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 618, in stream\n    raise RuntimeError(f\"stream failed: {message}\")\nRuntimeError: stream failed: Missing required column(s): warehouse.temporal_dates: yr\n",
+      "duration_ms": 46.358
+    },
+    {
+      "mode": "auto",
+      "status": "fail",
+      "session_timezone": "UTC",
+      "error": "RuntimeError: Missing required column(s): warehouse.temporal_dates: yr",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 52, in execute_case\n    raise RuntimeError(message)\nRuntimeError: Missing required column(s): warehouse.temporal_dates: yr\n",
+      "duration_ms": 48.551
+    },
+    {
+      "mode": "query_sql",
+      "status": "fail",
+      "session_timezone": "UTC",
+      "error": "RuntimeError: Query execution failed: Missing required column(s): warehouse.temporal_dates: yr",
+      "mismatch": {
+        "kind": "unexpected_error",
+        "expected_error_contains": []
+      },
+      "traceback": "Traceback (most recent call last):\n  File \"/home/kladnasoft/dev/dataisland/supertable/scripts/sql_read_matrix/__main__.py\", line 46, in execute_case\n    columns, rows, column_meta = query_sql(ORG, SUPER, case.sql, 100000, engine.DUCKDB, case.role, source=\"sql_matrix\")\n  File \"/home/kladnasoft/dev/dataisland/supertable/supertable/data_reader.py\", line 793, in query_sql\n    raise RuntimeError(f\"Query execution failed: {message}\")\nRuntimeError: Query execution failed: Missing required column(s): warehouse.temporal_dates: yr\n",
+      "duration_ms": 77.782
+    }
+  ],
+  "dataset": "../dataset.json",
+  "fixture_manifest": "../fixture_manifest.json",
+  "evidence_run": "runs/08_UTC"
+}
