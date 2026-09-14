@@ -1,5 +1,0 @@
-{
-  "category": "RuntimeError",
-  "message_substring": "No parquet files found",
-  "phase": "execution"
-}

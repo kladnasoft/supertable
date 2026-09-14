@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Optional, Tuple, Any, List, Dict
 
 import polars as pl
+from sqlglot import exp
 
 from supertable.config.defaults import logger
 from supertable.errors import SuperTableNotFoundError, TableNotFoundError
@@ -16,6 +17,7 @@ from supertable.storage.storage_interface import StorageInterface
 from supertable.utils.timer import Timer
 from supertable.query_plan_manager import QueryPlanManager
 from supertable.utils.sql_parser import SQLParser
+from supertable.utils.sql_compat import normalize_read_sql, parse_read_one
 from supertable.plan_extender import extend_execution_plan
 from supertable.engine.plan_stats import PlanStats
 from supertable.rbac.access_control import restrict_read_access  # noqa: F401
@@ -160,6 +162,55 @@ class DataReader:
             super_name, self.organization, create_if_missing=False,
         ).read_simple_table_snapshot(path)
         return snapshot.get("stats_file") if isinstance(snapshot, dict) else None
+
+    def _resolve_snapshot(
+        self, catalog: RedisCatalog, super_name: str, simple_name: str,
+    ) -> Dict[str, Any]:
+        """Return the table's authoritative snapshot metadata.
+
+        A Redis leaf holds a snapshot *path* and, as an optimisation, an inline
+        copy of the snapshot under ``payload`` so readers can skip a storage
+        read. The inline copy is best-effort: both ``DataWriter`` publish sites
+        and ``SimpleTable.update`` fall back to ``set_leaf_path_cas`` — path
+        only, no payload — when the payload CAS raises, so a leaf without a
+        payload is a state the writer is built to produce.
+
+        Reading access-control metadata out of ``payload`` alone was therefore
+        unsound. On a path-only leaf ``payload`` is absent, the ``isinstance``
+        test simply failed, and the read continued **with no deletion vector and
+        no share filter**: deleted and superseded rows came back, and a linked
+        share returned rows outside its filter. It was silent — no exception to
+        catch, because nothing raised.
+
+        The estimator already resolved resources either way, so the two halves
+        of the read disagreed about which snapshot they were looking at. This
+        uses the estimator's own predicate for "is the inline payload usable"
+        (``resources`` present and a list, data_estimator.py) so both see one
+        snapshot.
+
+        Raises if the snapshot cannot be read. That is deliberate and the
+        caller depends on it: the alternative to *knowing* the deletion vector
+        is refusing the read, not serving the table without one.
+        """
+        leaf = catalog.get_leaf(self.organization, super_name, simple_name)
+        if not isinstance(leaf, dict):
+            return {}
+
+        payload = leaf.get("payload")
+        if isinstance(payload, dict) and isinstance(payload.get("resources"), list):
+            return payload
+
+        path = leaf.get("path")
+        if not path:
+            # No payload and no path: there is no snapshot to consult. A table
+            # that has never been written has no deletions to miss.
+            return payload if isinstance(payload, dict) else {}
+
+        from supertable.super_table import SuperTable
+        snapshot = SuperTable(
+            super_name, self.organization, create_if_missing=False,
+        ).read_simple_table_snapshot(path)
+        return snapshot if isinstance(snapshot, dict) else {}
 
     def _execute_show_stats(
         self, command, role_name: str,
@@ -341,18 +392,21 @@ class DataReader:
             reflection.rbac_views = rbac_views
 
             # --- Tombstone (deletion-vector): look up snapshot metadata ------
+            #
+            # _resolve_snapshot, not leaf["payload"]: a leaf may legitimately
+            # carry only a path, and reading the deletion vector out of the
+            # inline payload alone silently skipped it. See the method.
             try:
                 catalog = RedisCatalog()
                 for td in tables:
                     # Tombstone filtering: read the deletion-vector pointer from
-                    # the snapshot payload in the Redis leaf.  When present, the
-                    # executor anti-joins the data on __rowid__ against it.
+                    # the table's resolved snapshot.  When present, the executor
+                    # anti-joins the data on __rowid__ against it.
                     payload = None
                     try:
-                        leaf = catalog.get_leaf(
-                            self.organization, td.super_name, td.simple_name,
+                        payload = self._resolve_snapshot(
+                            catalog, td.super_name, td.simple_name,
                         )
-                        payload = (leaf or {}).get("payload") if isinstance(leaf, dict) else None
                         if isinstance(payload, dict):
                             tomb_path = payload.get("tombstone")
                             if tomb_path:
@@ -571,23 +625,97 @@ class DataReader:
 
 
 def _ensure_sql_limit(sql: str, default_limit: int) -> str:
-    """
-    If the outermost query has no LIMIT clause, append one.
+    """Cap the outermost row bound of *sql* at *default_limit*.
 
-    Only appends when the SQL does not already end with a LIMIT (ignoring
-    trailing whitespace/semicolons).  This avoids breaking queries that
-    already specify their own LIMIT, subqueries that contain LIMIT internally,
-    or CTEs.
-    """
-    # Strip trailing whitespace and optional semicolons for inspection
-    stripped = sql.rstrip().rstrip(";").rstrip()
+    ``default_limit`` is a **ceiling**, not a default to impose:
 
-    # Check if the query already ends with LIMIT <number> (possibly with OFFSET)
-    # Pattern: LIMIT <digits> [OFFSET <digits>] at the very end
-    if re.search(r'\bLIMIT\s+\d+\s*(?:OFFSET\s+\d+\s*)?$', stripped, re.IGNORECASE):
+      * no top-level limit          -> set it to the cap
+      * top-level limit > cap       -> clamp it down to the cap
+      * top-level limit <= cap      -> return *sql* untouched
+
+    so ``LIMIT 0`` and any other deliberate bound the caller asked for survive,
+    and only an unbounded (or over-large) query is constrained.
+
+    WHY THIS IS AST WORK AND NOT A REGEX
+
+    This used to test the text against ``\\bLIMIT\\s+\\d+...$`` and, on no
+    match, append ``\\nLIMIT <cap>``. Both halves were wrong:
+
+      * The pattern only recognised a bare numeric LIMIT, so every other way of
+        writing the same bound — ``FETCH FIRST 3 ROWS ONLY``, ``LIMIT (3)``,
+        ``OFFSET 2 ROWS FETCH NEXT 3 ROWS ONLY``, ``LIMIT /* n */ 3`` — looked
+        limitless. The appended ``LIMIT 100000`` was then parsed as a *second*
+        limit and replaced the caller's, so a query that asked for three rows
+        returned every matching row. Silently expanding a result is worse than
+        failing: nothing in the response says the bound was dropped.
+
+      * Appending to the raw text ignored where the statement ended. A valid
+        ``SELECT ...;`` became ``SELECT ...;\\nLIMIT 100000`` — a limit clause
+        after the terminator — and failed to parse. The terminal semicolon is
+        not a malformed query; it is how most clients send SQL.
+
+    Operating on the AST removes the whole class: there is exactly one
+    top-level row bound, it is found the same way regardless of spelling, and
+    setting it cannot land outside the statement. Subquery and CTE limits are
+    untouched because they are not the root's ``limit`` argument.
+
+    A query that will not parse is returned unchanged, so admission control
+    stays the single place that decides whether a query is admissible and
+    reports why.
+    """
+    cap = int(default_limit)
+    parsed = parse_read_one(sql)
+    if parsed is None:
         return sql
 
-    return f"{sql}\nLIMIT {int(default_limit)}"
+    existing = _top_level_row_bound(parsed)
+    if existing is not None and existing <= cap:
+        return sql
+
+    # Replacing the whole ``limit`` argument also discards a FETCH node, so the
+    # result carries exactly one row bound however the original was spelled.
+    # ``offset`` lives in its own argument and is deliberately left alone.
+    capped = parsed.copy()
+    capped.set("limit", exp.Limit(expression=exp.Literal.number(cap)))
+
+    # Re-normalize what we just rewrote. Attaching a row bound can itself
+    # produce a shape the installed SQLGlot cannot re-parse — LIMIT directly
+    # after a grouping extension is exactly that — and this function should not
+    # emit text it could not read back. Queries returned untouched above are
+    # not normalized here: admission does that, and reformatting a query whose
+    # bound we did not change would be gratuitous.
+    return normalize_read_sql(capped.sql(dialect="duckdb"))
+
+
+def _top_level_row_bound(parsed: exp.Expression) -> Optional[int]:
+    """Integer row bound of *parsed*'s outermost query, or ``None`` if unbounded.
+
+    ``None`` covers three cases that all mean "apply the cap": no row bound at
+    all, ``LIMIT ALL`` (which is how DuckDB spells *unbounded*), and a bound
+    that is not a plain integer literal.
+
+    The spelling varies more than it looks. SQLGlot files both ``LIMIT n`` and
+    ``FETCH FIRST n ROWS ONLY`` under the same ``limit`` argument but as
+    different node types — ``Limit`` keeps the value in ``expression``,
+    ``Fetch`` in ``count`` — and ``LIMIT (n)`` wraps it in a ``Paren``.
+    Recognising only one of those shapes is what let the others through as
+    "no limit".
+    """
+    node = parsed.args.get("limit")
+    if node is None:
+        return None
+
+    value = node.args.get("count") if isinstance(node, exp.Fetch) \
+        else node.args.get("expression")
+    while isinstance(value, exp.Paren):
+        value = value.this
+
+    if isinstance(value, exp.Literal) and not value.args.get("is_string"):
+        try:
+            return int(value.name)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def query_sql(
@@ -615,7 +743,20 @@ def query_sql(
     try:
         is_select = classify_query(sql, super_name).kind is CommandKind.SELECT
     except ValueError:
-        is_select = True
+        # Admission has already refused this query, so there is no result to
+        # bound and nothing to gain by rewriting it.
+        #
+        # This used to assume SELECT and add a limit anyway, which mangled the
+        # diagnostics of statements that were about to be rejected: INSERT,
+        # DROP and DESCRIBE came back as a parse error about the injected
+        # LIMIT, and CREATE degraded to "COMMAND is not permitted" because
+        # `CREATE TABLE t (a INT)\nLIMIT 100000` no longer parses as a CREATE.
+        # The operations stayed rejected — this was never a write or an
+        # authorization bypass — but the caller was told the wrong reason.
+        #
+        # Leaving the text alone lets the reader classify it and report the
+        # specific refusal, which query_sql surfaces as the RuntimeError below.
+        is_select = False
     if is_select:
         sql = _ensure_sql_limit(sql, default_limit=limit)
 

@@ -163,6 +163,7 @@ class DuckDBEngine:
             alias_to_table_name: dict,
             alias_to_files: dict,
             alias_to_columns: dict,
+            alias_to_column_types: dict,
             created_views: List[str],
             acquired_dv_keys: List[str],
             timer_capture,
@@ -198,6 +199,7 @@ class DuckDBEngine:
             # Use VIEW (lazy, default). Set SUPERTABLE_DUCKDB_MATERIALIZE=table to revert.
             used_presign = create_reflection_view_with_presign_retry(
                 con, self.storage, table_name, files, cols, log_prefix,
+                column_types=alias_to_column_types.get(alias),
             )
             created_views.append(table_name)
             if used_presign:
@@ -332,6 +334,7 @@ class DuckDBEngine:
         }
         rbac_views = getattr(reflection, "rbac_views", None) or {}
         alias_to_table_name, alias_to_files, alias_to_columns = {}, {}, {}
+        alias_to_column_types: dict = {}
         alias_to_filter_only: dict = {}
         for td in parser.get_table_tuples():
             sup = snapshots_by_key.get((td.super_name, td.simple_name))
@@ -339,6 +342,35 @@ class DuckDBEngine:
                 continue
             cols = list(td.columns or [])
             if cols:
+                # Conditional references — a GROUP BY identifier shadowed by a
+                # projected alias — are columns only if this table declares
+                # one. DuckDB binds the real column over the alias
+                # (`SELECT a AS b ... GROUP BY b` groups by the physical b), so
+                # a name that does exist must be read or the bind fails; a name
+                # that does not is the alias and must not be demanded. The
+                # snapshot schema is the first place that can tell them apart,
+                # which is why the parser deferred the decision to here.
+                known = {str(c).lower() for c in (sup.columns or [])}
+                have = {x.lower() for x in cols}
+                _rbac = rbac_views.get(td.alias)
+                _allowed = [str(c) for c in (getattr(_rbac, "allowed_columns", None) or ["*"])]
+                _allowed_lower = None if "*" in _allowed else {c.lower() for c in _allowed}
+                for candidate in (td.optional_columns or []):
+                    low = candidate.lower()
+                    if low not in have and low in known:
+                        # The name IS a column of this table, so DuckDB would
+                        # group by it. If the role may not read it, that is a
+                        # permission failure and has to say so — dropping it
+                        # instead would surface as a confusing binder error,
+                        # which is precisely the STREAD-013 defect.
+                        if _allowed_lower is not None and low not in _allowed_lower:
+                            raise PermissionError(
+                                f"You don't have permission to columns: "
+                                f"{{'{candidate}'}} in table '{td.simple_name}'"
+                            )
+                        cols.append(candidate)
+                        have.add(low)
+
                 lower = {x.lower() for x in cols}
                 for c in (ROWID_SYSTEM_COL, TIMESTAMP_SYSTEM_COL):
                     if c not in lower:
@@ -362,6 +394,9 @@ class DuckDBEngine:
             )
             alias_to_files[td.alias] = list(sup.files)
             alias_to_columns[td.alias] = cols
+            # Only consulted when the file list is empty: an existing
+            # table with no resources has no footer to take a schema from.
+            alias_to_column_types[td.alias] = dict(sup.column_types or {})
 
         self._ensure_httpfs(
             con, [f for files in alias_to_files.values() for f in files],
@@ -373,7 +408,7 @@ class DuckDBEngine:
         try:
             executing_query, _ = self._build_view_chain(
                 con, reflection, parser, alias_to_table_name, alias_to_files,
-                alias_to_columns, created_views, acquired_dv_keys,
+                alias_to_columns, alias_to_column_types, created_views, acquired_dv_keys,
                 timer_capture, log_prefix, explain, explain_options,
                 expose_rowid, alias_to_filter_only,
             )

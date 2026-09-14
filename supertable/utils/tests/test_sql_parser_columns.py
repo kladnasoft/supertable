@@ -817,12 +817,15 @@ CASES.append({
         )
         SELECT a, total FROM summary ORDER BY total DESC
     """,
-    # The outer query references 'summary' which is a CTE.
-    # The inner query references 't' with columns a, b.
-    # NOTE: The parser treats CTE names as tables. With multiple tables
-    # (t + summary), unqualified columns become ambiguous.
-    # The outer SELECT * on 'summary' yields star semantics.
-    "expect": {"summary": [], "t": []},
+    # A CTE name parses as a Table but is not one. Counting it made every
+    # unqualified column in the query ambiguous — two "tables", so no single
+    # owner — and dropped them all, leaving the empty list that means *all
+    # columns*. That is accidentally safe for I/O but it is why RBAC could not
+    # refuse a denied column referenced only inside a CTE: it never saw one.
+    # Only physical aliases are counted now, so the body's columns resolve —
+    # which is what get_physical_tables() already documented.
+    # 'total' is the CTE's own output, not a column of t, so it is excluded.
+    "expect": {"summary": [], "t": ["a", "b"]},
 })
 
 CASES.append({
@@ -836,9 +839,14 @@ CASES.append({
         SELECT category, SUM(amount) AS cat_total
         FROM base GROUP BY category ORDER BY cat_total DESC
     """,
-    # NOTE: Parser treats CTE name 'base' as a table. With multiple tables
-    # (orders + base), unqualified columns are ambiguous -> star semantics.
-    "expect": {"orders": [], "base": []},
+    # A CTE name parses as a Table but is not one. Counting it made every
+    # unqualified column in the query ambiguous — two "tables", so no single
+    # owner — and dropped them all, leaving the empty list that means *all
+    # columns*. That is accidentally safe for I/O but it is why RBAC could not
+    # refuse a denied column referenced only inside a CTE: it never saw one.
+    # Only physical aliases are counted now, so the body's columns resolve —
+    # which is what get_physical_tables() already documented.
+    "expect": {"orders": ["amount", "category", "id"], "base": []},
 })
 
 
@@ -1142,11 +1150,14 @@ CASES.append({
         SELECT EXTRACT(YEAR FROM created_at) AS yr, COUNT(*) AS cnt
         FROM t GROUP BY yr ORDER BY cnt DESC
     """,
-    # NOTE: 'yr' in GROUP BY is an alias reference, but the parser's alias-skip
-    # only covers ORDER BY/HAVING/QUALIFY. GROUP BY alias refs (a MySQL/DuckDB
-    # extension) are not filtered — 'yr' is collected as a physical column.
-    # This is a known limitation, not a regression from the fix.
-    "expect": {"t": sorted(["created_at", "yr"])},
+    # GROUP BY alias references are now resolved (STREAD-014). The alias is no
+    # longer demanded as a physical column — which was not a cosmetic quirk:
+    # the estimator rejected the query outright with "Missing required
+    # column(s)", so this shape could not run at all. It is recorded as a
+    # conditional name instead (TableDefinition.optional_columns) and added to
+    # the projection only if the table really declares it, because DuckDB binds
+    # a real column of that name over the alias.
+    "expect": {"t": ["created_at"]},
 })
 
 CASES.append({
@@ -1218,11 +1229,15 @@ CASES.append({
     # cohort_week and active_week are aliases from expressions -> skip in ORDER BY
     # active_users is alias from COUNT -> skip in ORDER BY
     # Physical columns: first_seen (inside DATE_TRUNC), activity_date, user_id
-    # NOTE: GROUP BY cohort_week, active_week are alias references that the
-    # parser doesn't yet filter (GROUP BY alias-skip not implemented).
+    # GROUP BY alias references are now resolved (STREAD-014). The alias is no
+    # longer demanded as a physical column — which was not a cosmetic quirk:
+    # the estimator rejected the query outright with "Missing required
+    # column(s)", so this shape could not run at all. It is recorded as a
+    # conditional name instead (TableDefinition.optional_columns) and added to
+    # the projection only if the table really declares it, because DuckDB binds
+    # a real column of that name over the alias.
     "expect": {
-        "user_activity": sorted(["active_week", "activity_date", "cohort_week",
-                                  "first_seen", "user_id"]),
+        "user_activity": sorted(["activity_date", "first_seen", "user_id"]),
     },
 })
 
@@ -1268,9 +1283,16 @@ CASES.append({
         FROM weekly
         ORDER BY weekly_sales DESC
     """,
-    # NOTE: Parser treats CTE names (daily, weekly) as tables. With three
-    # tables, all unqualified columns become ambiguous -> star semantics.
-    "expect": {"transactions": [], "daily": [], "weekly": []},
+    # A CTE name parses as a Table but is not one. Counting it made every
+    # unqualified column in the query ambiguous — two "tables", so no single
+    # owner — and dropped them all, leaving the empty list that means *all
+    # columns*. That is accidentally safe for I/O but it is why RBAC could not
+    # refuse a denied column referenced only inside a CTE: it never saw one.
+    # Only physical aliases are counted now, so the body's columns resolve —
+    # which is what get_physical_tables() already documented.
+    # Chained CTEs: daily_sales and weekly_sales are computed outputs of the
+    # CTEs above them, so neither is attributed to transactions.
+    "expect": {"transactions": ["date", "region", "sales"], "daily": [], "weekly": []},
 })
 
 CASES.append({
@@ -1842,11 +1864,19 @@ CASES.append({
     # longer handed to 't'. Nothing is then attributed to 't', and it falls back
     # to [] — all columns.
     #
-    # [] is correct but not the tightest answer; 'a' and 'b' are all this query
-    # really needs. Tightening it means resolving names down through each
-    # derived level, a larger change than the bug required. Reading every column
-    # is sound; asking for columns that do not exist was not.
-    "expect": {"t": []},
+    # It is now the tightest answer: {'t': ['a', 'b']}, which is what this
+    # comment previously named as the goal and deferred. The columns arrived as
+    # a side effect of a different fix — 'a' and 'b' are the direct values of
+    # the innermost aliases ('a AS x'), and the sweep used to skip such columns
+    # as "already counted from the SELECT list" when only the OUTERMOST
+    # select's projections had actually been counted. That skip now verifies
+    # which select counted them.
+    #
+    # Not cosmetic: the same gap made a restricted role unable to run
+    # `WITH allowed AS (SELECT oid, amount AS gross FROM orders) ...` at all,
+    # because 'amount' was dropped from the column set and the RBAC view was
+    # built without it. Reading every column was sound but hid that.
+    "expect": {"t": ["a", "b"]},
 })
 
 CASES.append({
@@ -2955,9 +2985,15 @@ CASES.append({
         SELECT DATE_PART('hour', ts) AS hour_of_day, COUNT(*) AS cnt
         FROM events GROUP BY hour_of_day ORDER BY cnt DESC
     """,
-    # NOTE: hour_of_day in GROUP BY is alias ref → parser collects as physical
-    # (GROUP BY alias-skip not implemented). cnt in ORDER BY → alias → skipped.
-    "expect": {"events": sorted(["hour_of_day", "ts"])},
+    # GROUP BY alias references are now resolved (STREAD-014). The alias is no
+    # longer demanded as a physical column — which was not a cosmetic quirk:
+    # the estimator rejected the query outright with "Missing required
+    # column(s)", so this shape could not run at all. It is recorded as a
+    # conditional name instead (TableDefinition.optional_columns) and added to
+    # the projection only if the table really declares it, because DuckDB binds
+    # a real column of that name over the alias.
+    # cnt in ORDER BY → alias → skipped (unchanged).
+    "expect": {"events": ["ts"]},
 })
 
 CASES.append({
@@ -2968,7 +3004,14 @@ CASES.append({
         SELECT STRFTIME(ts, '%Y-%m') AS month_str, SUM(val) AS total
         FROM t GROUP BY month_str ORDER BY total DESC
     """,
-    "expect": {"t": sorted(["month_str", "ts", "val"])},
+    # GROUP BY alias references are now resolved (STREAD-014). The alias is no
+    # longer demanded as a physical column — which was not a cosmetic quirk:
+    # the estimator rejected the query outright with "Missing required
+    # column(s)", so this shape could not run at all. It is recorded as a
+    # conditional name instead (TableDefinition.optional_columns) and added to
+    # the projection only if the table really declares it, because DuckDB binds
+    # a real column of that name over the alias.
+    "expect": {"t": sorted(["ts", "val"])},
 })
 
 CASES.append({
@@ -2981,9 +3024,15 @@ CASES.append({
         GROUP BY day
         ORDER BY daily_count DESC
     """,
-    # 'day' in GROUP BY → collected as physical (GROUP BY alias-skip not impl.)
-    # 'daily_count' in ORDER BY → alias → skipped
-    "expect": {"events": sorted(["created_at", "day"])},
+    # GROUP BY alias references are now resolved (STREAD-014). The alias is no
+    # longer demanded as a physical column — which was not a cosmetic quirk:
+    # the estimator rejected the query outright with "Missing required
+    # column(s)", so this shape could not run at all. It is recorded as a
+    # conditional name instead (TableDefinition.optional_columns) and added to
+    # the projection only if the table really declares it, because DuckDB binds
+    # a real column of that name over the alias.
+    # 'daily_count' in ORDER BY → alias → skipped (unchanged).
+    "expect": {"events": ["created_at"]},
 })
 
 
@@ -3004,7 +3053,7 @@ CASES.append({
     "desc": "Missing FROM clause — sqlglot may still parse it",
     "super": "s",
     "sql": "SELECT 1 + 1",
-    "expect_error": ValueError,  # No tables found
+    "expect_error": ValueError,  # table-free query: unsupported capability
 })
 
 CASES.append({
@@ -3939,11 +3988,11 @@ CASES.append({
         )
         SELECT a, total FROM summary ORDER BY total DESC
     """,
-    # CTE 'summary' is filtered out. Only 't' remains.
-    # Columns from inside the CTE body are collected for 't'.
-    # However, with two "tables" (t + summary) in the parser's view,
-    # unqualified columns become ambiguous -> star semantics -> [].
-    "expect_physical": {"t": []},
+    # CTE 'summary' is filtered out. Only 't' remains, and the columns from
+    # inside the CTE body are now actually collected for it — which is what
+    # this case always described. The previous [] was multi-table ambiguity
+    # swallowing them; see cte_001.
+    "expect_physical": {"t": ["a", "b"]},
 })
 
 CASES.append({
@@ -3988,9 +4037,9 @@ CASES.append({
         FROM weekly
         ORDER BY weekly_sales DESC
     """,
-    # CTEs 'daily' and 'weekly' excluded. Only 'transactions' remains.
-    # Multi-table ambiguity causes star semantics.
-    "expect_physical": {"transactions": []},
+    # CTEs 'daily' and 'weekly' excluded. Only 'transactions' remains, with the
+    # three columns the pipeline actually reads from it.
+    "expect_physical": {"transactions": ["date", "region", "sales"]},
 })
 
 CASES.append({

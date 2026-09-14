@@ -5,7 +5,7 @@ The read path is intentionally restricted: ``DataReader`` only resolves and runs
 queries that read existing data.  Historically this was enforced implicitly —
 anything that wasn't a ``SELECT`` failed somewhere downstream (``EXPLAIN`` /
 ``SHOW`` parse to a sqlglot ``Command`` with no tables, so ``SQLParser`` raised
-"No tables found").
+its table-free-query error).
 
 This module makes the *allowed* set explicit and adds two diagnostic commands on
 top of plain ``SELECT``:
@@ -30,7 +30,9 @@ from sqlglot.errors import ParseError
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
+
+from supertable.utils.sql_compat import normalize_read_sql, parse_read_statements
 
 
 class CommandKind(Enum):
@@ -141,19 +143,48 @@ def assert_read_only(sql: str):
     Returns the parsed statement so the caller can reuse it rather than parse
     the same text again.
     """
-    text = (sql or "").strip()
+    return _admit_read_sql(sql)[0]
+
+
+def _admit_read_sql(sql: str) -> Tuple[Any, str]:
+    """Admission-check *sql* and return ``(root_ast, admitted_sql)``.
+
+    ``admitted_sql`` is the text the AST was parsed from, which is *not*
+    necessarily the input: :func:`normalize_read_sql` first rewrites constructs
+    the installed SQLGlot cannot parse but the engine accepts (see
+    ``supertable.utils.sql_compat``). The caller must pass that text downstream,
+    not the original, so the AST and the executed SQL stay the same query.
+
+    The whole contract of :func:`assert_read_only` applies here — this exists
+    only so ``classify_query`` can get the normalized text without normalizing
+    and parsing a second time.
+    """
+    raw = sql or ""
+    text = raw.strip()
     if not text:
-        return None                 # empty defers to SQLParser's own error
+        return None, sql            # empty defers to SQLParser's own error
+
+    normalized = normalize_read_sql(text)
+    # Hand back the caller's own text byte-for-byte unless a shim actually
+    # fired. Normalization is a last resort for SQL that would otherwise be
+    # refused; it must not quietly reformat every query that passes through.
+    admitted = raw if normalized == text else normalized
+    text = normalized
 
     try:
-        statements = [st for st in sqlglot.parse(text, read="duckdb") if st]
+        # parse_read_statements drops statement nodes that carry no executable
+        # work. A terminal semicolon with a trailing comment parses as its own
+        # exp.Semicolon node, and counting that made "SELECT ...; -- note" look
+        # like a two-statement chain and refused it. A comment is not a
+        # statement; a real second statement still parses as one.
+        statements = parse_read_statements(text)
     except ParseError as e:
         # Unparseable SQL is refused here rather than handed to the engine:
         # "the parser could not read it" must not mean "let DuckDB try".
         raise ValueError(f"could not parse query: {e}") from e
 
     if not statements:
-        return None
+        return None, admitted
     if len(statements) > 1:
         # One request is one statement. Anything else is a chain, and a chain is
         # how an injected payload arrives.
@@ -180,7 +211,7 @@ def assert_read_only(sql: str):
                 f"{name.lower()}() are not permitted on the read path"
             )
 
-    return root
+    return root, admitted
 
 
 def classify_query(query: str, default_super: str) -> SystemCommand:
@@ -227,11 +258,11 @@ def classify_query(query: str, default_super: str) -> SystemCommand:
             raise ValueError("EXPLAIN is only supported for SELECT statements.")
         # EXPLAIN reaches the same engine with the same text, so it is admitted
         # on the same terms — otherwise it is a hole the shape of the guard.
-        inner_ast = assert_read_only(inner)
+        inner_ast, inner_sql = _admit_read_sql(inner)
         options = "ANALYZE" if m.group("opts") else ""
         return SystemCommand(
             kind=CommandKind.EXPLAIN,
-            sql=inner,
+            sql=inner_sql,
             parsed=inner_ast,
             explain=True,
             explain_options=options,
@@ -240,5 +271,9 @@ def classify_query(query: str, default_super: str) -> SystemCommand:
     # Ordinary query. Admission-checked first: until this guard existed, any
     # text that named one real table ran verbatim, which put DuckDB's file
     # functions inside the read path and outside every access control.
-    return SystemCommand(kind=CommandKind.SELECT, sql=raw,
-                         parsed=assert_read_only(raw))
+    #
+    # ``sql`` is the *admitted* text, not ``raw``: admission may have rewritten
+    # a construct SQLGlot cannot parse into an equivalent it can, and the
+    # executor has to run the query the AST actually describes.
+    root, admitted_sql = _admit_read_sql(raw)
+    return SystemCommand(kind=CommandKind.SELECT, sql=admitted_sql, parsed=root)

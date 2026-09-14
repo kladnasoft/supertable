@@ -1346,7 +1346,18 @@ class TestDataEstimator:
         assert reflection.total_reflections == 1
         assert len(reflection.supers) == 1
 
-    def test_estimate_no_files_raises(self):
+    def test_estimate_no_files_but_declared_schema_is_readable(self):
+        """An existing table with no resources is empty, not broken.
+
+        DataWriter accepts an empty input and publishes a snapshot carrying a
+        schema and no resources, so this state is one the writer produces. It
+        used to raise RuntimeError("No parquet files found"), which made such a
+        table unreadable in every mode — not even SELECT COUNT(*) worked.
+
+        The declared schema comes back as ``column_types`` so the executor can
+        build a typed zero-row relation; there is no parquet footer to take the
+        types from.
+        """
         est = _make_estimator([TableDefinition("s", "t", "a", columns=["col_a"])])
         est.catalog.scan_leaf_items.return_value = [
             {"simple": "t", "path": "/snap.json", "version": 1, "ts": 0,
@@ -1356,7 +1367,29 @@ class TestDataEstimator:
                  "resources": [],
              }},
         ]
-        with pytest.raises(RuntimeError, match="No parquet files"):
+        reflection = est.estimate()
+        assert reflection.total_reflections == 0
+        assert len(reflection.supers) == 1
+        assert reflection.supers[0].files == []
+        assert reflection.supers[0].column_types == {"col_a": "string"}
+
+    def test_estimate_no_files_and_no_schema_still_raises(self):
+        """The case the check actually exists for.
+
+        No resources AND no declared schema says nothing about the table's
+        shape, so it must stay an error — otherwise a genuinely broken snapshot
+        would silently read as an empty table.
+        """
+        est = _make_estimator([TableDefinition("s", "t", "a", columns=[])])
+        est.catalog.scan_leaf_items.return_value = [
+            {"simple": "t", "path": "/snap.json", "version": 1, "ts": 0,
+             "payload": {
+                 "snapshot_version": 1,
+                 "schema": {},
+                 "resources": [],
+             }},
+        ]
+        with pytest.raises(RuntimeError, match="no declared schema"):
             est.estimate()
 
     def test_to_duckdb_path_empty(self):

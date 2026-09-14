@@ -13,6 +13,30 @@ from supertable.data_classes import PredInterval, TableDefinition
 # Predicate → interval extraction helpers (read-path file pruning)
 # ---------------------------------------------------------------------------
 
+#: Raised when a query reads no stored table — a literal ``SELECT 42``, a
+#: literal UNION, or a CTE built only from literals.
+#:
+#: This is a deliberate capability boundary, not a missing feature. The read
+#: path exists to read *this library's* tables: every protection a row or
+#: column has lives in a view the reader builds over a snapshot, so a query
+#: with no snapshot is outside all of it. Admission control
+#: (``system_query.assert_read_only``) enforces that positively by requiring
+#: every FROM/JOIN source to be a named table — but a table-free SELECT has no
+#: FROM at all, so that rule passes vacuously, and DuckDB's *scalar* file
+#: readers (``read_text``, ``read_blob``, …) are reachable from a bare
+#: projection. This error is what currently stops them.
+#:
+#: So supporting table-free SELECTs is not a matter of deleting this check: it
+#: needs a positive guard over projection functions first. Until then the
+#: capability is refused explicitly, with a message that says so rather than
+#: sounding like the query was malformed.
+TABLE_FREE_QUERY_ERROR = (
+    "this query reads no table; SuperTable executes reads against its own "
+    "tables only, so table-free SELECTs (literal projections, literal UNIONs, "
+    "and CTEs built only from literals) are not supported"
+)
+
+
 _COMPARISON_OPS: Dict[type, str] = {
     exp.EQ: "eq",
     exp.GT: "gt",
@@ -31,6 +55,31 @@ def _unwrap_paren(node: exp.Expression) -> exp.Expression:
     while isinstance(node, exp.Paren):
         node = node.this
     return node
+
+
+def _is_row_bound_syntax(node: exp.Expression) -> bool:
+    """True when *node* sits inside a LIMIT/OFFSET clause rather than the query body.
+
+    ``LIMIT ALL`` is DuckDB/Postgres for "no limit", but SQLGlot has no node for
+    it and parses the bare word as ``Limit(expression=Column(ALL))``. The
+    unrestricted ``find_all(exp.Column)`` sweep below then collected ``ALL`` as a
+    required data column and the estimator refused the query with
+    ``Missing required column(s): warehouse.orders: ALL``.
+
+    Anything under a row bound is control syntax — a count, an offset, or this
+    keyword — never a reference to stored data, so none of it belongs in the
+    column set. Note ``GROUP BY ALL`` / ``ORDER BY ALL`` are unaffected: SQLGlot
+    models those properly and never emits a Column for them.
+    """
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, (exp.Limit, exp.Offset)):
+            return True
+        if isinstance(parent, exp.Select):
+            # Reached the enclosing SELECT without crossing a row bound.
+            return False
+        parent = parent.parent
+    return False
 
 
 def _split_and(node: exp.Expression) -> List[exp.Expression]:
@@ -247,8 +296,22 @@ class SQLParser:
         # (or [] if meaning "all columns" due to * or t.*)
         self._alias_to_columns: Dict[str, List[str]] = {}
 
+        # alias -> names that are only columns IF the schema has them
+        # (GROUP BY identifiers shadowed by a projected alias)
+        self._alias_to_optional_columns: Dict[str, List[str]] = {}
+
         self._extract_tables()
         self._cte_names: Set[str] = self._collect_cte_names()
+
+        # A CTE name parses as a Table, so a query whose only "tables" are
+        # literal CTEs gets past _extract_tables and used to fail much later in
+        # the estimator with "No snapshots selected." — a message about
+        # internal state, for the same unsupported capability that a literal
+        # SELECT reports directly. Both shapes are the same refusal and now say
+        # the same thing, at the same point, before any snapshot resolution.
+        if all(tbl[1] in self._cte_names for tbl in self._alias_to_table.values()):
+            raise ValueError(TABLE_FREE_QUERY_ERROR)
+
         self._extract_columns()
 
     # ---------------- Parsing helpers ----------------
@@ -350,7 +413,7 @@ class SQLParser:
             alias_to_table[alias] = (db_name, table_name)
 
         if not alias_to_table:
-            raise ValueError("No tables found in SQL query.")
+            raise ValueError(TABLE_FREE_QUERY_ERROR)
 
         self._alias_to_table = alias_to_table
 
@@ -376,13 +439,40 @@ class SQLParser:
     # ---------------- Column extraction helpers ----------------
 
     @staticmethod
-    def _is_direct_alias_projection_column(col: exp.Column) -> bool:
+    def _is_direct_alias_projection_column(
+        col: exp.Column, counted_select: Optional[exp.Select] = None,
+    ) -> bool:
         """
         True if this Column is the direct value of an Alias in SELECT
         (e.g. "o.id AS order_id"), so we don't double-count it.
+
+        *counted_select* is the SELECT whose projection list was actually
+        scanned. It matters because this predicate means "already counted", and
+        only that one SELECT's projections were:
+
+            WITH allowed AS (SELECT oid, amount AS gross FROM orders)
+            SELECT oid, gross FROM allowed
+
+        ``amount`` is the direct value of an Alias — but of the *CTE's* SELECT,
+        and the projection loop scans the outer one (``oid, gross``). Skipping
+        it as "already counted" dropped it from the column set entirely, the
+        RBAC view was built without it, and DuckDB failed with
+        ``Referenced column "amount" not found in FROM clause``. Passing the
+        scanned SELECT makes the claim checkable instead of assumed.
         """
         parent = col.parent
-        return isinstance(parent, exp.Alias) and parent.this is col
+        if not (isinstance(parent, exp.Alias) and parent.this is col):
+            return False
+        if counted_select is None:
+            return True
+        # Walk to the SELECT this projection belongs to; only that one's
+        # expressions were counted.
+        node = parent.parent
+        while node is not None:
+            if isinstance(node, exp.Select):
+                return node is counted_select
+            node = node.parent
+        return False
 
     @staticmethod
     def _is_inside_alias_scope(col: exp.Column) -> bool:
@@ -394,6 +484,12 @@ class SQLParser:
         clause types before reaching the Select node, the column is in
         alias scope and may be a reference to a computed SELECT alias
         rather than a physical table column.
+
+        GROUP BY is deliberately NOT here — see
+        :meth:`_is_inside_group_by_scope`. An alias is legal there too, but
+        unlike these three clauses a GROUP BY identifier that also names a real
+        column resolves to the *column*, so the two cases cannot share one
+        answer.
         """
         node = col.parent
         while node is not None:
@@ -401,6 +497,40 @@ class SQLParser:
                 return True
             if isinstance(node, exp.Select):
                 # Reached the SELECT without passing through ORDER/HAVING/QUALIFY
+                return False
+            node = node.parent
+        return False
+
+    @staticmethod
+    def _is_inside_group_by_scope(col: exp.Column) -> bool:
+        """
+        True if this Column sits in a GROUP BY clause, including inside a
+        grouping extension such as ``GROUP BY ROLLUP (category)``.
+
+        GROUP BY accepts a SELECT alias — ``SELECT EXTRACT(year FROM d) AS yr
+        ... GROUP BY yr`` is valid and DuckDB runs it — so treating every such
+        identifier as a physical column rejected the query up front with
+        ``Missing required column(s): warehouse.temporal_dates: yr``.
+
+        But it cannot simply be skipped like an ORDER BY alias, because the
+        resolution rules differ. Where the name also exists as a real input
+        column, DuckDB binds the **column**, not the alias:
+
+            SELECT a AS b, COUNT(*) FROM t GROUP BY b
+
+        groups by the physical ``b`` and then fails with "column a must appear
+        in the GROUP BY clause" — proof that the alias lost. Dropping ``b`` from
+        the projection would leave it out of the reflection and break the bind.
+
+        So these names are neither required nor ignorable: they go to
+        ``TableDefinition.optional_columns``, and whoever holds the schema
+        decides. See :class:`supertable.data_classes.TableDefinition`.
+        """
+        node = col.parent
+        while node is not None:
+            if isinstance(node, exp.Group):
+                return True
+            if isinstance(node, exp.Select):
                 return False
             node = node.parent
         return False
@@ -427,13 +557,35 @@ class SQLParser:
         seen_per_alias: Dict[str, Set[str]] = {
             alias: set() for alias in self._alias_to_table
         }
+        # Names legal as a GROUP BY alias that may equally be real columns.
+        alias_to_optional: Dict[str, List[str]] = {
+            alias: [] for alias in self._alias_to_table
+        }
 
-        # Determine if we can safely assign unqualified columns
-        unique_tables = set(self._alias_to_table.values())
+        # Determine if we can safely assign unqualified columns.
+        #
+        # Count PHYSICAL aliases only. A CTE name is carried in _alias_to_table
+        # (it parses as a Table) but is not a real table, and counting it made
+        # every unqualified column in a CTE query ambiguous — two "tables", so
+        # no single owner — and therefore silently dropped:
+        #
+        #   WITH hidden AS (SELECT oid, note FROM orders) SELECT note FROM hidden
+        #
+        # collected nothing for orders. An empty column list means "all
+        # columns" downstream, so RBAC had no specific column to refuse and a
+        # denied column produced a DuckDB binder error from the restricted view
+        # instead of the column-permission error every other shape returns.
+        # get_physical_tables() already documents the intent: columns for a CTE
+        # query are "collected from inside the CTE body".
+        physical_aliases = {
+            alias: tbl for alias, tbl in self._alias_to_table.items()
+            if tbl[1] not in self._cte_names
+        }
+        unique_tables = set(physical_aliases.values())
         single_alias_for_unqualified: Optional[str] = None
         if len(unique_tables) == 1:
             # All aliases refer to the same physical table -> unqualified columns OK.
-            single_alias_for_unqualified = next(iter(self._alias_to_table.keys()))
+            single_alias_for_unqualified = next(iter(physical_aliases.keys()))
 
         select_expr = self._parsed.find(exp.Select)
 
@@ -449,8 +601,33 @@ class SQLParser:
         #
         # `rn` was unqualified and facts was the only table, so it was handed to
         # facts, which has no such column.
-        derived_outputs: List[Tuple[exp.Subquery, Set[str]]] = []
+        derived_outputs: List[Tuple[exp.Expression, Set[str]]] = []
         derived_star_tables: Set[str] = set()
+
+        # A CTE is the same situation as a derived table: names it *computes*
+        # belong to its output, not to any physical table underneath it. Now
+        # that unqualified columns resolve through a CTE (see
+        # single_alias_for_unqualified below), the guard has to cover CTEs too,
+        # or `WITH h AS (SELECT oid AS x FROM orders) SELECT x FROM h` would
+        # hand `x` to orders and report it missing. Two things name an output:
+        # an aliased projection, and a declared column list — WITH h(a, b).
+        for cte in self._parsed.find_all(exp.CTE):
+            cte_names: Set[str] = set()
+            cte_alias = cte.args.get("alias")
+            if cte_alias is not None:
+                for declared in cte_alias.columns:
+                    if declared.name:
+                        cte_names.add(declared.name.lower())
+            cte_inner = cte.this if isinstance(cte.this, exp.Select) else None
+            if cte_inner is not None:
+                for proj in cte_inner.expressions:
+                    if isinstance(proj, exp.Alias):
+                        ident = proj.args.get("alias")
+                        if isinstance(ident, exp.Identifier) and ident.name:
+                            cte_names.add(ident.name.lower())
+            if cte_names:
+                derived_outputs.append((cte, cte_names))
+
         for sub in self._parsed.find_all(exp.Subquery):
             if not sub.alias:
                 continue                      # not a derived table in FROM/JOIN
@@ -528,6 +705,8 @@ class SQLParser:
         # Global * overrides everything: all tables => all columns ([])
         if global_star:
             self._alias_to_columns = {alias: [] for alias in self._alias_to_table}
+            # [] already means "all columns", so nothing is optional.
+            self._alias_to_optional_columns = {alias: [] for alias in self._alias_to_table}
             return
 
         # ---------------- Normal column extraction (no global *) ----------------
@@ -616,7 +795,11 @@ class SQLParser:
                 # Skip stars; they are handled via star logic.
                 continue
 
-            if self._is_direct_alias_projection_column(col):
+            if _is_row_bound_syntax(col):
+                # Control syntax, not a data reference. See the helper.
+                continue
+
+            if self._is_direct_alias_projection_column(col, select_expr):
                 # Already counted from SELECT list.
                 continue
 
@@ -642,6 +825,20 @@ class SQLParser:
                 resolved_alias = single_alias_for_unqualified
             else:
                 # Ambiguous unqualified column with multiple tables -> ignore.
+                continue
+
+            # A GROUP BY identifier that matches a projected alias is
+            # unresolvable here: DuckDB would bind a real column of this name
+            # over the alias, and only the schema says whether one exists.
+            # Record it as optional and let the holder of the schema decide,
+            # rather than guessing in either direction.
+            if (
+                col_name.lower() in select_alias_names
+                and not col.table
+                and self._is_inside_group_by_scope(col)
+            ):
+                if col_name not in alias_to_optional[resolved_alias]:
+                    alias_to_optional[resolved_alias].append(col_name)
                 continue
 
             if (
@@ -677,6 +874,11 @@ class SQLParser:
                 alias_to_columns[alias] = sorted(cols)
 
         self._alias_to_columns = alias_to_columns
+        # An alias requesting all columns ([]) already covers anything optional.
+        self._alias_to_optional_columns = {
+            alias: ([] if not alias_to_columns.get(alias) else sorted(set(names)))
+            for alias, names in alias_to_optional.items()
+        }
 
     # ---------------- Public API ----------------
 
@@ -700,6 +902,7 @@ class SQLParser:
                 simple_name=table_name,
                 alias=alias,
                 columns=columns,
+                optional_columns=self._alias_to_optional_columns.get(alias, []),
             )
             result.append(definition)
 
@@ -741,6 +944,7 @@ class SQLParser:
         """
         # Group by (super_name, simple_name), merge columns across aliases.
         merged: Dict[Tuple[str, str], List[str]] = {}
+        merged_optional: Dict[Tuple[str, str], Set[str]] = {}
 
         for alias, (super_name, table_name) in self._alias_to_table.items():
             # Skip CTE aliases — they are not physical tables.
@@ -761,13 +965,21 @@ class SQLParser:
                     combined = set(existing) | set(cols)
                     merged[key] = sorted(combined)
 
+            merged_optional.setdefault(key, set()).update(
+                self._alias_to_optional_columns.get(alias, [])
+            )
+
         result: List[TableDefinition] = []
         for (super_name, table_name), columns in merged.items():
+            # A star request ([]) already covers every column, so nothing is
+            # left conditional for this table.
+            optional = [] if not columns else sorted(merged_optional.get((super_name, table_name), set()))
             result.append(TableDefinition(
                 super_name=super_name,
                 simple_name=table_name,
                 alias=table_name,
                 columns=columns,
+                optional_columns=optional,
             ))
 
         return result

@@ -809,7 +809,10 @@ class DataEstimator:
                 # confusing the executor's snapshots_by_key lookup.
                 if snapshots:
                     super_snapshot = SuperSnapshot(super_name=super_name, simple_name=simple_name,
-                                                   simple_version=current_version, files=parquet_files, columns=schema)
+                                                   simple_version=current_version, files=parquet_files, columns=schema,
+                                                   # Carried only so a resource-free table can still be
+                                                   # given a typed empty relation; see all_have_files below.
+                                                   column_types=dict(schema_types))
                     supers.append(super_snapshot)
 
         # Validate requested columns
@@ -818,10 +821,24 @@ class DataEstimator:
         # Total parquet files across all selected snapshots
         total_reflections = sum(len(s.files) for s in supers)
 
-        # Ensure every selected snapshot has at least one file
-        all_have_files = all(bool(s.files) for s in supers)
+        # Ensure every selected snapshot is readable: it either has files to
+        # scan, or it declares a schema from which a typed empty relation can be
+        # built.
+        #
+        # A table with no files is not an error by itself. DataWriter accepts an
+        # empty input and publishes a snapshot carrying a schema and
+        # ``resources: {}``, so an existing table can legitimately have nothing
+        # to scan — and refusing it meant an existing empty table could not be
+        # read at all, not even ``SELECT COUNT(*)``, which should return 0.
+        #
+        # This does not weaken the check into "always pass". A snapshot with
+        # neither files nor a declared schema still fails, and an empty file
+        # list cannot arise any other way: the read-path pruner deliberately
+        # never prunes to zero (prune_files_by_predicates, processing.py) so
+        # that "no files" means "no resources" and not "everything was pruned".
+        all_readable = all(bool(s.files) or bool(s.column_types) for s in supers)
 
-        if not supers or missing_info or not all_have_files:
+        if not supers or missing_info or not all_readable:
             if not supers:
                 msg = "No snapshots selected."
             elif missing_info:
@@ -831,8 +848,11 @@ class DataEstimator:
                     cols_str = ", ".join(sorted(cols))
                     details.append(f"{super_name}.{table_name}: {cols_str}")
                 msg = "Missing required column(s): " + " | ".join(details)
-            else:  # not all_have_files
-                msg = "No parquet files found for one or more selected tables."
+            else:  # not all_readable
+                msg = (
+                    "No parquet files and no declared schema for one or more "
+                    "selected tables."
+                )
 
             logger.warning(msg)
             raise RuntimeError(msg)

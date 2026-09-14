@@ -1949,11 +1949,24 @@ def _route_stats(stat) -> Tuple[Optional[str], object, object]:
     unsupported type yields no usable range, so the column is never used to
     exclude a file.
     """
-    mn, mx = stat.min, stat.max
     # Decimal is intentionally unsupported: routing through double is lossy and
-    # could cause false negatives. Detected via logical type or decoded value.
+    # could cause false negatives.
+    #
+    # The logical-type test runs BEFORE the bounds are read, and the order is
+    # load-bearing. Polars writes a Decimal column as INT64 carrying a DECIMAL
+    # logical type, and the footer advertises ``has_min_max = True`` — but
+    # PyArrow cannot decode bounds in that encoding, so touching ``stat.min``
+    # raises ``ArrowNotImplementedError: Cannot extract statistics for type``.
+    # Reading the values only to discover we had no use for them aborted the
+    # entire write: a table with one Decimal column could not be ingested at
+    # all, even though the decimal data itself round-trips intact.
     if _logical_type_name(stat).upper() == "DECIMAL":
         return None, None, None
+
+    mn, mx = stat.min, stat.max
+    # Second, value-based check: an encoding may decode to Decimal without
+    # declaring a DECIMAL logical type (PyArrow's FIXED_LEN_BYTE_ARRAY form
+    # decodes fine, so this branch is reachable and is not dead).
     if isinstance(mn, decimal.Decimal) or isinstance(mx, decimal.Decimal):
         return None, None, None
     # date / timestamp → micros (datetime is a date subclass; both routed here)

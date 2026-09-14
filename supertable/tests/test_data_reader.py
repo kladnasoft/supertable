@@ -1145,9 +1145,15 @@ class TestExecuteWithScan:
 class TestEnsureSqlLimit:
 
     def test_no_limit_appends_default(self):
-        from supertable.data_reader import _ensure_sql_limit
+        from supertable.data_reader import _ensure_sql_limit, _top_level_row_bound
+        from supertable.utils.sql_compat import parse_read_one
         result = _ensure_sql_limit("SELECT * FROM tbl", 100)
-        assert result == "SELECT * FROM tbl\nLIMIT 100"
+        # Asserts the contract (a top-level bound of 100 is applied), not the
+        # rendering. The helper builds the clause on the AST now, so the exact
+        # whitespace is sqlglot's to choose; pinning "\nLIMIT 100" pinned the
+        # string-append mechanism that appended the clause after a terminal
+        # semicolon and silently replaced a caller's FETCH/parenthesized bound.
+        assert _top_level_row_bound(parse_read_one(result)) == 100
 
     def test_existing_limit_is_preserved(self):
         from supertable.data_reader import _ensure_sql_limit
@@ -1209,16 +1215,20 @@ class TestEnsureSqlLimit:
         assert "LIMIT 0" in result
 
     def test_where_clause_no_limit(self):
-        from supertable.data_reader import _ensure_sql_limit
+        from supertable.data_reader import _ensure_sql_limit, _top_level_row_bound
+        from supertable.utils.sql_compat import parse_read_one
         sql = "SELECT * FROM tbl WHERE id > 5"
         result = _ensure_sql_limit(sql, 200)
-        assert result == "SELECT * FROM tbl WHERE id > 5\nLIMIT 200"
+        assert _top_level_row_bound(parse_read_one(result)) == 200
+        assert "WHERE" in result.upper()
 
     def test_order_by_no_limit(self):
-        from supertable.data_reader import _ensure_sql_limit
+        from supertable.data_reader import _ensure_sql_limit, _top_level_row_bound
+        from supertable.utils.sql_compat import parse_read_one
         sql = "SELECT * FROM tbl ORDER BY id"
         result = _ensure_sql_limit(sql, 100)
-        assert result == "SELECT * FROM tbl ORDER BY id\nLIMIT 100"
+        assert _top_level_row_bound(parse_read_one(result)) == 100
+        assert "ORDER BY" in result.upper()
 
     def test_limit_word_in_column_name_does_not_match(self):
         from supertable.data_reader import _ensure_sql_limit

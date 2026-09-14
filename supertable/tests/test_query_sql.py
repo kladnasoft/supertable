@@ -17,7 +17,17 @@ import polars as pl
 import numpy as np
 import pytest
 
-from supertable.data_reader import _ensure_sql_limit
+from supertable.data_reader import _ensure_sql_limit, _top_level_row_bound
+from supertable.utils.sql_compat import parse_read_one
+
+
+def _bound(sql):
+    """Top-level row bound of *sql*, read back through the parser.
+
+    The limit is applied to the AST, so these tests assert the bound the
+    query actually carries rather than a particular rendering of it.
+    """
+    return _top_level_row_bound(parse_read_one(sql))
 
 
 # ---------------------------------------------------------------------------
@@ -29,22 +39,22 @@ class TestEnsureSqlLimitAppends:
 
     def test_simple_select(self):
         result = _ensure_sql_limit("SELECT * FROM t", 1000)
-        assert result == "SELECT * FROM t\nLIMIT 1000"
+        assert _bound(result) == 1000
 
     def test_select_with_where(self):
         sql = "SELECT * FROM t WHERE x = 1"
         result = _ensure_sql_limit(sql, 500)
-        assert result == f"{sql}\nLIMIT 500"
+        assert _bound(result) == 500 and "WHERE" in result.upper()
 
     def test_select_with_order_by(self):
         sql = "SELECT * FROM t ORDER BY x DESC"
         result = _ensure_sql_limit(sql, 100)
-        assert result == f"{sql}\nLIMIT 100"
+        assert _bound(result) == 100 and "ORDER BY" in result.upper()
 
     def test_select_with_group_by(self):
         sql = "SELECT region, COUNT(*) FROM t GROUP BY region"
         result = _ensure_sql_limit(sql, 200)
-        assert result == f"{sql}\nLIMIT 200"
+        assert _bound(result) == 200 and "GROUP BY" in result.upper()
 
     def test_trailing_semicolon(self):
         """Semicolons should not fool the detection — LIMIT should be appended."""
@@ -131,9 +141,14 @@ class TestEnsureSqlLimitEdgeCases:
     """Edge cases and boundary conditions."""
 
     def test_empty_sql(self):
-        """Empty SQL — still appends LIMIT (engine will raise on execution)."""
-        result = _ensure_sql_limit("", 100)
-        assert "LIMIT 100" in result
+        """Empty SQL is returned as-is.
+
+        It used to come back as a bare "\nLIMIT 100", which is not a query and
+        only ever produced a parser error further downstream. Returning the
+        input unchanged lets SQLParser raise its canonical "non-empty SQL
+        string" error instead.
+        """
+        assert _ensure_sql_limit("", 100) == ""
 
     def test_multiline_sql_no_limit(self):
         sql = "SELECT *\nFROM t\nWHERE x = 1\nORDER BY y"

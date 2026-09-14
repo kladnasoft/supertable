@@ -176,15 +176,26 @@ def _basic() -> List[Scenario]:
     ))
 
     # Zero-file catalog: a table whose snapshot lists NO resources.
+    #
+    # This used to be sealed as RuntimeError("No parquet files found"). It is a
+    # read of zero rows now (STREAD-010): DataWriter accepts an empty input and
+    # publishes a snapshot with a schema and no resources, so such a table
+    # legitimately exists and refusing it made it unreadable — not even
+    # SELECT COUNT(*) worked. It is the same empty table as
+    # basic_empty_table above, which reaches zero rows via a zero-row parquet
+    # instead of via no parquet, and the two now agree.
+    #
+    # The error path is still reachable and still sealed elsewhere: a snapshot
+    # with no resources AND no declared schema is refused, since that says
+    # nothing about the table's shape.
     out.append(Scenario(
         scenario_id="basic_zero_file_catalog", category="basic",
-        description="A table whose snapshot lists no parquet resources at all.",
+        description="A table whose snapshot lists no parquet resources reads as zero rows.",
         tables=[TableSpec(
             simple_name="t", primary_keys=["id"], files=[],
             schema={"id": "Int64", "val": "String"},
         )],
         sql="SELECT id, val FROM t ORDER BY id", ordered=True,
-        expect_error=ErrorExpectation("RuntimeError", "No parquet files found", "execution"),
     ))
 
     return out

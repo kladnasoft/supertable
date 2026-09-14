@@ -26,6 +26,19 @@ class TableDefinition:
     simple_name: str
     alias: str
     columns: List[str] = field(default_factory=list)
+    #: Names referenced where a SELECT alias is legal but which may equally be
+    #: a real column — a GROUP BY identifier, for instance. They cannot be
+    #: classified without the table's schema, so they are carried separately
+    #: from ``columns``:
+    #:
+    #:   * the missing-column check ignores them (an alias is not a column, and
+    #:     demanding one rejected valid queries), and
+    #:   * the executor adds them to the projection only if the snapshot
+    #:     actually declares them, which is what keeps DuckDB's physical-column
+    #:     precedence intact.
+    #:
+    #: Empty for every query that does not group by a projected alias.
+    optional_columns: List[str] = field(default_factory=list)
 
 @dataclass
 class SuperSnapshot:
@@ -34,6 +47,12 @@ class SuperSnapshot:
     simple_version: int
     files: List[str] = field(default_factory=list)
     columns: Set[str] = field(default_factory=set)
+    #: Declared column name -> polars type name, from the snapshot schema.
+    #: Needed only when ``files`` is empty: an existing table with no resources
+    #: has no parquet footer to read a schema from, so this is the sole source
+    #: of types for building a typed zero-row relation. Empty otherwise, since
+    #: a real scan gets its types from the files.
+    column_types: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import threading
 import time
 import weakref
@@ -520,10 +521,20 @@ def create_reflection_table(
         table_name: str,
         files: List[str],
         columns: Optional[List[str]] = None,
+        column_types: Optional[Dict[str, str]] = None,
 ) -> None:
-    """CREATE TABLE ... AS SELECT ... FROM parquet_scan(...)."""
+    """CREATE TABLE ... AS SELECT ... FROM parquet_scan(...).
+
+    With no *files* but a declared *column_types*, materialises a typed empty
+    table — the eager counterpart of create_reflection_view's empty relation, so
+    SUPERTABLE_DUCKDB_MATERIALIZE=table reads an empty table the same way.
+    """
     if not files:
-        raise ValueError(f"No files provided for reflection table '{table_name}'")
+        empty_select = _empty_relation_select(columns, column_types)
+        if empty_select is None:
+            raise ValueError(f"No files provided for reflection table '{table_name}'")
+        con.execute(f"CREATE TABLE {table_name} AS SELECT {empty_select} WHERE 1=0;")
+        return
 
     parquet_files_str = ", ".join(f"'{escape_parquet_path(f)}'" for f in files)
     select_cols = _reflection_select_cols(columns)
@@ -544,6 +555,7 @@ def create_reflection_table_with_presign_retry(
         files: List[str],
         columns: Optional[List[str]] = None,
         log_prefix: str = "",
+        column_types: Optional[Dict[str, str]] = None,
 ) -> bool:
     """
     Create a reflection table with automatic presign fallback on HTTP errors.
@@ -553,7 +565,7 @@ def create_reflection_table_with_presign_retry(
     tried_presign = False
 
     try:
-        create_reflection_table(con, table_name, files, columns)
+        create_reflection_table(con, table_name, files, columns, column_types)
     except Exception as e:
         msg = str(e)
         if any(tok in msg for tok in (
@@ -564,7 +576,7 @@ def create_reflection_table_with_presign_retry(
             tried_presign = True
             presigned_files = make_presigned_list(storage, files)
             configure_httpfs_and_s3(con, presigned_files)
-            create_reflection_table(con, table_name, presigned_files, columns)
+            create_reflection_table(con, table_name, presigned_files, columns, column_types)
         else:
             raise
 
@@ -575,11 +587,90 @@ def create_reflection_table_with_presign_retry(
 # Reflection VIEW creation (lazy — no upfront data read)
 # =========================================================
 
+#: Polars type name -> DuckDB type, matched on the base name with any
+#: parameters stripped. Used only to type an EMPTY relation, where there is no
+#: parquet footer to read the schema from.
+#:
+#: Written out rather than handed to DuckDB's own type parser, which accepts
+#: some of these names and gets one of them wrong: ``CAST(NULL AS Int8)``
+#: resolves to BIGINT, while ``Float64``, ``Utf8`` and ``Datetime(...)`` are
+#: rejected outright. A table of exact base names also avoids the substring
+#: traps a looser match would hit — "uint8" contains "int8", and "datetime"
+#: contains both "date" and "time".
+_DUCKDB_TYPE_BY_POLARS_BASE: Dict[str, str] = {
+    "int8": "TINYINT", "int16": "SMALLINT", "int32": "INTEGER", "int64": "BIGINT",
+    "uint8": "UTINYINT", "uint16": "USMALLINT", "uint32": "UINTEGER", "uint64": "UBIGINT",
+    "float32": "FLOAT", "float64": "DOUBLE",
+    "boolean": "BOOLEAN", "bool": "BOOLEAN",
+    "date": "DATE", "time": "TIME", "duration": "INTERVAL",
+    "utf8": "VARCHAR", "string": "VARCHAR", "categorical": "VARCHAR", "enum": "VARCHAR",
+    "binary": "BLOB",
+}
+
+#: Fallback for a type this mapping does not know. VARCHAR is the conservative
+#: choice: the relation is empty either way, and a wrong *numeric* type would
+#: bind silently where a wrong string type fails loudly.
+_DUCKDB_TYPE_FALLBACK = "VARCHAR"
+
+
+def duckdb_type_for_polars(polars_type: Optional[str]) -> str:
+    """Translate a declared polars type name into a DuckDB type.
+
+    Only the type *class* has to survive: this types a zero-row relation, so no
+    value is ever stored or read back. What matters is that aggregates and
+    comparisons bind the way they would over the real table.
+    """
+    text = (polars_type or "").strip()
+    if not text:
+        return _DUCKDB_TYPE_FALLBACK
+
+    base = text.split("(", 1)[0].strip().lower()
+
+    if base == "decimal":
+        match = re.search(r"\(\s*(\d+)\s*,\s*(\d+)\s*\)", text)
+        return f"DECIMAL({match.group(1)},{match.group(2)})" if match else "DECIMAL(38,9)"
+
+    if base == "datetime":
+        # Datetime(time_unit='us', time_zone='UTC') is tz-aware;
+        # Datetime(time_unit='us', time_zone=None) is not.
+        tail = text.split("time_zone", 1)[1] if "time_zone" in text else ""
+        aware = bool(tail) and "None" not in tail[:16]
+        return "TIMESTAMPTZ" if aware else "TIMESTAMP"
+
+    return _DUCKDB_TYPE_BY_POLARS_BASE.get(base, _DUCKDB_TYPE_FALLBACK)
+
+
+def _empty_relation_select(
+        columns: Optional[List[str]],
+        column_types: Optional[Dict[str, str]],
+) -> Optional[str]:
+    """Build the SELECT list for a typed zero-row relation, or ``None``.
+
+    ``None`` means there is no declared schema to build one from, which is a
+    genuine failure — an empty *file list* with an empty *schema* says nothing
+    about what the table looks like.
+    """
+    declared = {str(k): v for k, v in (column_types or {}).items() if k}
+    if not declared:
+        return None
+
+    wanted = [c for c in (columns or []) if c and str(c).strip()] or list(declared)
+    # Keep only columns the snapshot actually declares: a projection may name a
+    # system column (__rowid__) that an empty table never wrote, and inventing
+    # one here would put a column in the relation that the real table lacks.
+    parts = [
+        f"CAST(NULL AS {duckdb_type_for_polars(declared[c])}) AS {quote_if_needed(c)}"
+        for c in wanted if c in declared
+    ]
+    return ", ".join(parts) if parts else None
+
+
 def create_reflection_view(
         con: duckdb.DuckDBPyConnection,
         view_name: str,
         files: List[str],
         columns: Optional[List[str]] = None,
+        column_types: Optional[Dict[str, str]] = None,
 ) -> None:
     """CREATE OR REPLACE VIEW ... AS SELECT ... FROM parquet_scan(...).
 
@@ -590,9 +681,26 @@ def create_reflection_view(
 
     Use this in the transient executor to prevent OOM on large datasets.
     The pinned executor continues to use TABLEs for its cross-query cache.
+
+    With no *files* but a declared *column_types*, this builds a typed zero-row
+    relation instead of failing. ``DataWriter`` accepts an empty input and
+    publishes a snapshot with a schema and ``resources: {}``, so a table can
+    legitimately exist with nothing to scan; refusing it made an existing empty
+    table unreadable — ``SELECT COUNT(*)`` could not return 0. Note this is the
+    only way a file list is empty here: the read-path pruner deliberately never
+    prunes to zero (see ``prune_files_by_predicates``), precisely so that an
+    empty list means "no resources" and nothing else.
     """
     if not files:
-        raise ValueError(f"No files provided for reflection view '{view_name}'")
+        empty_select = _empty_relation_select(columns, column_types)
+        if empty_select is None:
+            raise ValueError(f"No files provided for reflection view '{view_name}'")
+        # WHERE 1=0 keeps the declared column types while guaranteeing no row.
+        con.execute(
+            f"CREATE OR REPLACE VIEW {view_name} AS "
+            f"SELECT {empty_select} WHERE 1=0;"
+        )
+        return
 
     parquet_files_str = ", ".join(f"'{escape_parquet_path(f)}'" for f in files)
     select_cols = _reflection_select_cols(columns)
@@ -613,6 +721,7 @@ def create_reflection_view_with_presign_retry(
         files: List[str],
         columns: Optional[List[str]] = None,
         log_prefix: str = "",
+        column_types: Optional[Dict[str, str]] = None,
 ) -> bool:
     """
     Create a lazy reflection VIEW with automatic presign fallback on HTTP errors.
@@ -627,14 +736,15 @@ def create_reflection_view_with_presign_retry(
     materialize = settings.SUPERTABLE_DUCKDB_MATERIALIZE
     if materialize == "table":
         return create_reflection_table_with_presign_retry(
-            con, storage, view_name, files, columns, log_prefix
+            con, storage, view_name, files, columns, log_prefix,
+            column_types=column_types,
         )
 
     configure_httpfs_and_s3(con, files)
     tried_presign = False
 
     try:
-        create_reflection_view(con, view_name, files, columns)
+        create_reflection_view(con, view_name, files, columns, column_types)
     except Exception as e:
         msg = str(e)
         if any(tok in msg for tok in (
@@ -645,7 +755,7 @@ def create_reflection_view_with_presign_retry(
             tried_presign = True
             presigned_files = make_presigned_list(storage, files)
             configure_httpfs_and_s3(con, presigned_files)
-            create_reflection_view(con, view_name, presigned_files, columns)
+            create_reflection_view(con, view_name, presigned_files, columns, column_types)
         else:
             raise
 
@@ -665,7 +775,15 @@ def rewrite_query_with_hashed_tables(
         return original_sql
 
     try:
-        parsed = sqlglot.parse_one(original_sql)
+        # read="duckdb" is not optional. Without it sqlglot parses with its
+        # neutral dialect and then *renders* as duckdb, which silently changes
+        # what the query means: DATE_DIFF('day', d, DATE '2024-03-15') came back
+        # out as DATE_DIFF('2024-03-15', d, CAST('day' AS DATE)) — argument order
+        # and types both wrong — and DuckDB then failed on an invalid date
+        # conversion. A reparse must name the dialect the text was written in.
+        # Both call sites feed duckdb-dialect SQL: the spark path rewrites first
+        # and only then transpiles duckdb -> spark (see _spark_rewrite_query).
+        parsed = sqlglot.parse_one(original_sql, read="duckdb")
     except Exception as e:
         logger.warning(f"[duckdb] Failed to parse SQL for rewrite; using original. Error: {e}")
         return original_sql
