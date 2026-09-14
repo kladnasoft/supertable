@@ -215,12 +215,27 @@ class DataReader:
     def _execute_show_stats(
         self, command, role_name: str,
     ) -> Tuple[pl.DataFrame, Status, Optional[str]]:
-        """Return the raw contents of a table's latest statistics parquet.
+        """Return a table's latest statistics parquet, masked to the role.
 
-        Reads-never-create and table-level RBAC are enforced (the same gates a
-        SELECT hits); the statistics rows/columns themselves are returned
-        unfiltered. When the table exists but has no stats artifact yet, an empty
-        frame with the stats schema columns is returned (success, not error).
+        Reads-never-create and RBAC are enforced — the same gates a SELECT hits,
+        now including the **column** mask. When the table exists but has no
+        stats artifact yet, an empty frame with the stats schema columns is
+        returned (success, not error).
+
+        WHY THE COLUMN MASK MATTERS HERE
+
+        A statistics row carries a column's min, max and null count. Returning
+        every row to a role that may not read every column disclosed the
+        contents of masked columns by another route: a role denied
+        ``SELECT salary`` still learned ``min=50000, max=250000`` from
+        ``SHOW STATS`` — which on a two-row table is the salaries themselves,
+        and on any table is the range and the null count (AUDIT_BUGS M9).
+
+        Only the table gate used to run here, because ``columns=[]`` means "all
+        columns" and that deliberately skips column-level validation. That is
+        right for *admission* — SHOW STATS names no columns, so there is nothing
+        to refuse up front — but it left the output unfiltered. The role's
+        allowed set is applied to the rows instead.
         """
         from supertable.data_classes import TableDefinition
         from supertable.processing import load_stats, STATS_SCHEMA
@@ -241,10 +256,10 @@ class DataReader:
             logger.warning(self._lp(f"[show-stats] target missing: {e}"))
             return pl.DataFrame(), Status.ERROR, str(e)
 
-        # Table-level RBAC: raises PermissionError if the role cannot read the
-        # table at all. columns=[] means "all columns", which skips column-level
-        # denial — we don't filter the stats output, only gate table access.
-        restrict_read_access(
+        # RBAC. Raises PermissionError if the role cannot read the table at all;
+        # the returned views carry the role's allowed columns, which is what
+        # masks the rows below. An empty dict means unrestricted.
+        rbac_views = restrict_read_access(
             super_name=super_name,
             organization=self.organization,
             role_name=role_name,
@@ -261,7 +276,78 @@ class DataReader:
 
         if stats_df is None:
             return pl.DataFrame(schema={k: pl.Utf8 for k in STATS_SCHEMA}), Status.OK, None
+
+        view = rbac_views.get(td.alias)
+        stats_df = self._mask_stats_columns(stats_df, view)
+        stats_df = self._mask_stats_bounds(stats_df, view)
         return stats_df, Status.OK, None
+
+    #: The statistics columns that carry literal values out of the data. A
+    #: min/max is a value copied from some row, so these are the ones a row
+    #: filter has to reach; the rest describe shape (types, counts, sizes).
+    _STATS_VALUE_COLUMNS = (
+        "min_bigint", "max_bigint", "min_double", "max_double",
+        "min_timestamp", "max_timestamp", "min_string", "max_string",
+    )
+
+    @classmethod
+    def _mask_stats_bounds(cls, stats_df: pl.DataFrame, rbac_view) -> pl.DataFrame:
+        """Null the min/max values when the role has a row filter.
+
+        A column mask is not enough on its own. Statistics describe every row in
+        the file, so a role restricted to ``region = 'eu'`` read ``max=900000``
+        for a salary belonging to a ``us`` row it cannot select — the value of a
+        row outside its filter, reached through a column it *is* allowed.
+
+        Row filtering cannot be applied to a statistics row the way it is to a
+        data row: a min/max is an aggregate over rows the role may not see, and
+        there is no subset of it that corresponds to the rows it may. So the
+        bounds are withheld rather than recomputed. Everything that describes
+        shape rather than content — file, row group, column, type, counts,
+        sizes — is kept, which is what makes the command still useful for
+        diagnosing layout and pruning.
+
+        ``stats_available`` is deliberately left alone: it says whether the
+        footer HAS usable statistics, which is a property of the file and the
+        answer to a different question than "what are they".
+        """
+        where_clause = (getattr(rbac_view, "where_clause", "") or "").strip()
+        if not where_clause:
+            return stats_df
+        present = [c for c in cls._STATS_VALUE_COLUMNS if c in stats_df.columns]
+        if not present:
+            return stats_df
+        return stats_df.with_columns([
+            pl.lit(None).cast(stats_df.schema[c]).alias(c) for c in present
+        ])
+
+    @staticmethod
+    def _mask_stats_columns(stats_df: pl.DataFrame, rbac_view) -> pl.DataFrame:
+        """Drop statistics rows for columns the role may not read.
+
+        Returns *stats_df* unchanged for an unrestricted role (no view, or a
+        ``["*"]`` grant), so the common case costs nothing.
+
+        Matched case-insensitively, the way ``_requested_columns_denied`` does:
+        a grant written ``Salary`` must mask a parquet column named ``salary``,
+        or the mask is defeated by spelling.
+
+        System columns (``__rowid__``, ``__timestamp__``) fall out of a
+        restricted role's result for free — they are never in a role's grant —
+        which matches the read path, where they are stripped from every query.
+        """
+        allowed = getattr(rbac_view, "allowed_columns", None)
+        if not allowed or "*" in allowed:
+            return stats_df
+        if "column_name" not in stats_df.columns:
+            # No column to mask on. Refuse rather than return rows whose
+            # per-column identity cannot be established.
+            return stats_df.clear()
+
+        permitted = {str(c).casefold() for c in allowed}
+        return stats_df.filter(
+            pl.col("column_name").cast(pl.Utf8).str.to_lowercase().is_in(list(permitted))
+        )
 
     def execute(
         self,

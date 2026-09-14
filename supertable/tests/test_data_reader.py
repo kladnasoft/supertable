@@ -1962,6 +1962,12 @@ class TestExecuteShowStats:
         stats_df = pl.DataFrame(rows, schema=STATS_SCHEMA)
 
         mock_get_storage.return_value = MagicMock()
+        # The real restrict_read_access returns {} for an unrestricted role,
+        # and SHOW STATS now READS that return value to mask the statistics of
+        # columns the role may not see (AUDIT_BUGS M9). A bare MagicMock would
+        # be a truthy stand-in for "restricted to <mock>" and mask everything,
+        # so the stub has to answer the way the function does.
+        mock_restrict.return_value = {}
         from supertable.data_reader import DataReader, Status
 
         with patch.object(
