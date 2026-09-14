@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional, Tuple
 
-from supertable.utils.sql_compat import normalize_read_sql, parse_read_statements
+from supertable.utils.sql_compat import normalize_and_parse
 
 
 class CommandKind(Enum):
@@ -164,24 +164,26 @@ def _admit_read_sql(sql: str) -> Tuple[Any, str]:
     if not text:
         return None, sql            # empty defers to SQLParser's own error
 
-    normalized = normalize_read_sql(text)
-    # Hand back the caller's own text byte-for-byte unless a shim actually
-    # fired. Normalization is a last resort for SQL that would otherwise be
-    # refused; it must not quietly reformat every query that passes through.
-    admitted = raw if normalized == text else normalized
-    text = normalized
-
     try:
-        # parse_read_statements drops statement nodes that carry no executable
-        # work. A terminal semicolon with a trailing comment parses as its own
-        # exp.Semicolon node, and counting that made "SELECT ...; -- note" look
-        # like a two-statement chain and refused it. A comment is not a
-        # statement; a real second statement still parses as one.
-        statements = parse_read_statements(text)
+        # ONE parse for both halves. Normalizing needs a parse to decide whether
+        # a rewrite is required, so asking for the text and then parsing it
+        # again paid for the same work twice — ~190ms on a 1,000-value IN list.
+        #
+        # The statements exclude nodes carrying no executable work: a terminal
+        # semicolon with a trailing comment parses as its own exp.Semicolon
+        # node, and counting that made "SELECT ...; -- note" look like a
+        # two-statement chain and refused it. A comment is not a statement; a
+        # real second statement still parses as one.
+        normalized, statements = normalize_and_parse(text)
     except ParseError as e:
         # Unparseable SQL is refused here rather than handed to the engine:
         # "the parser could not read it" must not mean "let DuckDB try".
         raise ValueError(f"could not parse query: {e}") from e
+
+    # Hand back the caller's own text byte-for-byte unless a shim actually
+    # fired. Normalization is a last resort for SQL that would otherwise be
+    # refused; it must not quietly reformat every query that passes through.
+    admitted = raw if normalized == text else normalized
 
     if not statements:
         return None, admitted

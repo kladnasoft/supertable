@@ -38,7 +38,7 @@ the tokenizer's own character offsets. Nothing is matched against raw text.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import sqlglot
 from sqlglot import exp
@@ -231,34 +231,86 @@ def _wrap_row_bound(sql: str, dialect: str = "duckdb") -> Optional[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def normalize_read_sql(sql: str, dialect: str = "duckdb") -> str:
-    """Return *sql* rewritten into a form the installed SQLGlot can parse.
+def _normalize_text(sql: str, dialect: str) -> str:
+    """Apply the token-level rewrites, tokenizing only when one could apply.
 
-    Unconditional rewrites (``IS UNKNOWN``) are applied first because they are
-    pure translations. The grouping-extension wrap is applied **only** after a
-    real parse failure, so a query that already parses is returned byte-for-byte
-    unchanged and cannot be perturbed by this shim.
+    Both rewrites need the tokenizer to be *correct* — that is what keeps them
+    off string literals and comments. But neither can apply unless the keyword
+    is present in the text at all, and a case-insensitive substring test is
+    essentially free where tokenizing is not: on a query carrying a 1,000-value
+    IN list, each tokenization costs ~25ms, and admission runs on every read.
+
+    The gate is a necessary condition, never a sufficient one. A query
+    containing the word in a literal still gets tokenized and still comes back
+    unchanged — the cost of a false positive is a wasted tokenization, not a
+    wrong rewrite. The tokenizer remains the only thing that decides.
+    """
+    upper = sql.upper()
+    if "UNKNOWN" in upper:
+        sql = _rewrite_is_unknown(sql, dialect)
+        upper = sql.upper()
+    # ``LIMIT ALL`` needs both words; requiring LIMIT alone would tokenize
+    # every bounded query for nothing.
+    if "ALL" in upper and "LIMIT" in upper:
+        sql = _strip_limit_all(sql, dialect)
+    return sql
+
+def normalize_and_parse(
+    sql: str, dialect: str = "duckdb",
+) -> Tuple[str, List[exp.Expression]]:
+    """Normalize *sql* and parse it, in ONE parse. ``(text, statements)``.
+
+    Normalizing requires a parse — that is how "does this need the
+    grouping-extension wrap?" is answered — so handing the caller only the text
+    and letting it parse again pays for the same work twice. On a query with a
+    1,000-value IN list that second parse cost ~190ms, and the read benchmark's
+    ``random_1000_by_key`` scenario regressed ~200ms because of it. The same
+    double parse had been removed from this path once before, deliberately;
+    this returns both halves so it cannot come back.
+
+    Unconditional rewrites (``IS UNKNOWN``, ``LIMIT ALL``) are applied first
+    because they are pure translations. The grouping-extension wrap is applied
+    **only** after a real parse failure, so a query that already parses is
+    returned byte-for-byte unchanged and cannot be perturbed by this shim.
+
+    Raises :class:`sqlglot.errors.ParseError` when the text does not parse even
+    after normalization, so the caller decides how that is reported.
     """
     if not sql or not sql.strip():
+        return sql, []
+
+    normalized = _normalize_text(sql, dialect)
+
+    try:
+        return normalized, _executable(sqlglot.parse(normalized, read=dialect))
+    except ParseError:
+        wrapped = _wrap_row_bound(normalized, dialect)
+        if wrapped is None:
+            raise
+        try:
+            return wrapped, _executable(sqlglot.parse(wrapped, read=dialect))
+        except ParseError:
+            # Report the failure of the text the caller actually gave us, not
+            # of a rewrite it never asked for.
+            raise
+
+
+def _executable(statements: List[Optional[exp.Expression]]) -> List[exp.Expression]:
+    return [st for st in statements if not is_noop_statement(st)]
+
+
+def normalize_read_sql(sql: str, dialect: str = "duckdb") -> str:
+    """The text half of :func:`normalize_and_parse`, for callers with no use
+    for the AST.
+
+    Unparseable input comes back unchanged rather than raising: these callers
+    are not the ones that decide admissibility, and admission will report the
+    error properly.
+    """
+    try:
+        return normalize_and_parse(sql, dialect)[0]
+    except ParseError:
         return sql
-
-    normalized = _rewrite_is_unknown(sql, dialect)
-    normalized = _strip_limit_all(normalized, dialect)
-
-    try:
-        sqlglot.parse(normalized, read=dialect)
-        return normalized
-    except ParseError:
-        pass
-
-    wrapped = _wrap_row_bound(normalized, dialect)
-    if wrapped is None:
-        return normalized
-    try:
-        sqlglot.parse(wrapped, read=dialect)
-    except ParseError:
-        return normalized
-    return wrapped
 
 
 def is_noop_statement(statement: Optional[exp.Expression]) -> bool:
@@ -303,7 +355,7 @@ def parse_read_one(sql: str, dialect: str = "duckdb") -> Optional[exp.Expression
     if not sql or not sql.strip():
         return None
     try:
-        statements = parse_read_statements(normalize_read_sql(sql, dialect), dialect)
+        _text, statements = normalize_and_parse(sql, dialect)
     except Exception:
         return None
     if len(statements) != 1:
