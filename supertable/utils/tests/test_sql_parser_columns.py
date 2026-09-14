@@ -603,10 +603,15 @@ CASES.append({
         FROM employees a
         JOIN employees b ON a.manager_id = b.id
     """,
-    # Both aliases 'a' and 'b' refer to 'employees'
+    # Aliases of the SAME physical table now share that table's union of
+    # named columns. The executor builds one reflection view per alias, and
+    # an unqualified column cannot be attributed to one of several aliases
+    # over one table — so splitting them left an alias's view missing a
+    # column the query reads through it. See get_table_tuples().
+    # Both aliases 'a' and 'b' refer to 'employees', so both carry its union.
     "expect": {
         "a": sorted(["id", "name", "manager_id"]),
-        "b": sorted(["name", "id"]),
+        "b": sorted(["id", "name", "manager_id"]),
     },
 })
 
@@ -875,10 +880,17 @@ CASES.append({
         SELECT a, b FROM t
         WHERE b > (SELECT AVG(b) FROM t AS t2 WHERE t2.a = t.a)
     """,
-    # Two aliases for table 't': 't' and 't2'
-    # Inside the subquery AVG(b) is unqualified with two tables -> ambiguous.
-    # Only t2.a and t.a are qualified.
-    "expect": {"t": sorted(["a", "b"]), "t2": ["a"]},
+    # Aliases of the SAME physical table now share that table's union of
+    # named columns. The executor builds one reflection view per alias, and
+    # an unqualified column cannot be attributed to one of several aliases
+    # over one table — so splitting them left an alias's view missing a
+    # column the query reads through it. See get_table_tuples().
+    # This expectation used to read {"t2": ["a"]}, which was the defect rather
+    # than a limitation: the subquery is SELECT AVG(b) FROM t AS t2, so t2's view
+    # needs 'b'. Built without it, AVG(b) resolved against the OUTER query and
+    # DuckDB refused the whole read with "WHERE clause cannot contain
+    # aggregates" — an ordinary correlated self-reference returned nothing.
+    "expect": {"t": sorted(["a", "b"]), "t2": sorted(["a", "b"])},
 })
 
 CASES.append({
@@ -3852,9 +3864,16 @@ CASES.append({
         HAVING total_pay > 10000
         ORDER BY total_pay DESC
     """,
+    # Aliases of the SAME physical table now share that table's union of
+    # named columns. The executor builds one reflection view per alias, and
+    # an unqualified column cannot be attributed to one of several aliases
+    # over one table — so splitting them left an alias's view missing a
+    # column the query reads through it. See get_table_tuples().
+    # 'e' and 'm' are both hr.employees, so both carry its union; 'd' and 'p'
+    # are different tables and are untouched.
     "expect": {
         "e": sorted(["dept_id", "id", "manager_id", "name"]),
-        "m": sorted(["id", "name"]),
+        "m": sorted(["dept_id", "id", "manager_id", "name"]),
         "d": sorted(["dept_name", "id"]),
         "p": sorted(["amount", "employee_id", "pay_period"]),
     },

@@ -892,17 +892,62 @@ class SQLParser:
                 alias: str,
                 columns: List[str]   # [] means "all columns" when derived from * / t.*
             )
-        """
-        result: List[TableDefinition] = []
 
+        Aliases of the SAME physical table all receive that table's UNION of
+        columns, not their own share of them. Splitting them is unsound:
+
+            SELECT fid, qty FROM facts f
+             WHERE qty = (SELECT MAX(qty) FROM facts x WHERE x.grp = f.grp)
+
+        Both aliases read one table, so an unqualified column cannot be
+        attributed to one of them — ``qty`` went to ``f`` and ``x`` was left
+        with only ``grp``. The executor builds one reflection view per alias, so
+        ``x``'s view had no ``qty`` column at all; ``MAX(qty)`` then resolved
+        against the OUTER query instead and DuckDB refused the whole read with
+        "WHERE clause cannot contain aggregates". A correlated self-reference is
+        ordinary SQL and returned no rows.
+
+        The union is the only safe projection here, and it costs nothing
+        structural: the per-table column set is a subset of what
+        ``get_physical_tables()`` already reports, and what RBAC already
+        validates.
+
+        Only NAMED columns are unioned. An alias that asked for everything
+        (``[]``, from ``SELECT *``) keeps that for itself and does not impose it
+        on its siblings, because "this alias needs every column" says nothing
+        about the others — and widening a sibling to ``[]`` would both read
+        columns the query never mentions and stop RBAC from enumerating (and so
+        validating) that alias's columns at all.
+        """
+        # Union of the named columns per physical table. An alias whose own list
+        # is empty means "all columns" and is preserved as such below.
+        union: Dict[Tuple[str, str], Set[str]] = {}
         for alias, (supertable, table_name) in self._alias_to_table.items():
-            columns = self._alias_to_columns.get(alias, [])
+            key = (supertable, table_name)
+            union.setdefault(key, set()).update(
+                self._alias_to_columns.get(alias, []) or []
+            )
+
+        optional_union: Dict[Tuple[str, str], Set[str]] = {}
+        for alias, (supertable, table_name) in self._alias_to_table.items():
+            optional_union.setdefault((supertable, table_name), set()).update(
+                self._alias_to_optional_columns.get(alias, [])
+            )
+
+        result: List[TableDefinition] = []
+        for alias, (supertable, table_name) in self._alias_to_table.items():
+            key = (supertable, table_name)
+            own = self._alias_to_columns.get(alias, [])
+            # An alias that requested everything keeps [] — see the docstring.
+            columns = [] if not own else sorted(union[key])
             definition = TableDefinition(
                 super_name=supertable,
                 simple_name=table_name,
                 alias=alias,
                 columns=columns,
-                optional_columns=self._alias_to_optional_columns.get(alias, []),
+                # A star request already covers everything conditional.
+                optional_columns=([] if not columns
+                                  else sorted(optional_union.get(key, set()))),
             )
             result.append(definition)
 
