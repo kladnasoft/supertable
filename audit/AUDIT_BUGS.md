@@ -230,7 +230,7 @@ object stores.
 
 | # | finding | where | status |
 |---|---|---|---|
-| M1 | `newer_than`'s stale filter ignores the deletion vector, so deleted rows veto re-inserts; the same op sequence gives different data depending on whether compaction ran | processing | PROVEN |
+| M1 | `newer_than`'s stale filter ignored the deletion vector, so a deleted row's watermark vetoed its own re-insert, and the same op sequence gave different data depending on whether compaction had run. Dead rows are now excluded before the watermark is taken, on both the polars and DuckDB-probe lanes. No extra I/O: `__rowid__` was already read and the vector was already loaded later in the same write (hoisted, cache-first), gated on `overwrite_columns and newer_than`. | processing | **FIXED** — `processing._drop_tombstoned`; sealed by the `newer_than_after_delete` benchmark scenario, which fails on the unfixed tree |
 | M2 | `bump_root` runs unguarded *after* the leaf commit and re-raises — `write()` throws on a write that already landed, and the caller's retry double-applies it | write path | PROVEN |
 | M3 | Lua round-trip rewrites the root doc: empty lists become `{}`, ints >2^53 become floats | `redis_catalog.py:155` | PROVEN |
 | M4 | `list_files()` returns prefix-**inclusive** paths while every other method re-applies the prefix; chained into itself it returns empty, fed to `read_bytes` every read fails and is swallowed. `base_prefix` has **zero** test coverage | storage | PROVEN |
