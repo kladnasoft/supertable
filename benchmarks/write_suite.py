@@ -607,6 +607,83 @@ def large_batch_write(rows: int, log=print) -> Dict[str, Any]:
     }
 
 
+def newer_than_after_delete(rows: int, log=print) -> Dict[str, Any]:
+    """The stale-write guard, over a table that has deletes in it.
+
+    ``newer_than`` applies a row only when its watermark strictly exceeds the
+    stored one. Computing that watermark means reading the existing rows, and a
+    deleted row is still physically in its file until compaction rewrites it —
+    so the guard has to know which rows the deletion vector has removed.
+
+    THE CORRECTNESS CHECKS ARE THE POINT, NOT THE TIMING
+
+    Until AUDIT_BUGS M1 was fixed, a deleted row's watermark vetoed its own
+    replacement: re-inserting a deleted key at a lower revision was silently
+    dropped, and because compaction physically removes the dead row, the same
+    operation sequence produced different data depending on whether compaction
+    had run. Three properties are asserted here:
+
+      * a genuinely stale rewrite of a LIVE row is still rejected — the guard
+        must not have been traded away for the fix;
+      * a re-insert of a DELETED key lands, whatever its revision; and
+      * a fresh rewrite of a live row still applies.
+
+    It also puts a timing number on the path, which nothing else in this suite
+    did: every other scenario leaves ``newer_than`` unset and returns from the
+    filter immediately, so a regression here was previously unmeasurable.
+    """
+    table = "perf_write_newer_than"
+    drop_table(table)
+    writer = _writer()
+
+    # Load at revision 5, then delete the first fifth of the keys. The deleted
+    # rows share files with survivors, so the files stay live and their dead
+    # rows remain physically present — which is the state the guard must handle.
+    writer.write(role_name=BENCH_ROLE, simple_name=table,
+                 data=make_batch(0, rows, seed=23, revision=5),
+                 overwrite_columns=[KEY])
+    deleted = max(1, rows // 5)
+    writer.write(role_name=BENCH_ROLE, simple_name=table,
+                 data=pa.table({KEY: pa.array(list(range(deleted)), type=pa.int64())}),
+                 overwrite_columns=[KEY], delete_only=True)
+    after_delete = count_rows(table)
+
+    # The measured write: one batch covering both the deleted keys (re-insert at
+    # a LOWER revision, must land) and the surviving ones (revision 5 again,
+    # must be rejected as stale).
+    t0 = time.perf_counter()
+    writer.write(role_name=BENCH_ROLE, simple_name=table,
+                 data=make_batch(0, rows, seed=23, revision=3),
+                 overwrite_columns=[KEY], newer_than="revision")
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+    total = count_rows(table)
+    reinserted = _count_revision(table, 3)
+    survivors_untouched = _count_revision(table, 5)
+
+    checks = {}
+    checks.update(expect("deleted_rows_gone", after_delete == rows - deleted,
+                         after_delete, rows - deleted))
+    # Every deleted key comes back; nothing else does.
+    checks.update(expect("deleted_keys_reinserted", reinserted == deleted,
+                         reinserted, deleted))
+    # The surviving keys were rewritten at an equal revision: strictly-greater
+    # means equal is stale, so they must be untouched.
+    checks.update(expect("stale_rewrite_rejected", survivors_untouched == rows - deleted,
+                         survivors_untouched, rows - deleted))
+    checks.update(expect("row_count_stable", total == rows, total, rows))
+
+    drop_table(table)
+    return {
+        "metrics": {"rows": rows, "deleted": deleted,
+                    "rows_after_delete": after_delete,
+                    "reinserted": reinserted,
+                    "newer_than_ms": round(elapsed_ms, 3)},
+        "rows": total,
+        "expectations": checks,
+    }
+
+
 def upsert_existing_keys(rows: int, log=print) -> Dict[str, Any]:
     """Rewrite every key that already exists — the merge-on-read path.
 
@@ -696,6 +773,17 @@ def scenarios(duration_s: float, scale_name: str) -> List[Dict[str, Any]]:
             "description": "one large append — per-row cost with fixed cost "
                            "amortised away",
             "body": lambda: large_batch_write(50_000 if small else 500_000),
+        },
+        {
+            "id": "newer_than_after_delete",
+            # Latency scenario: one measured write, so the same iteration/warmup
+            # treatment the other single-write scenarios get.
+            "iterations": 5,
+            "warmup": 1,
+            "description": "stale-write guard over a table containing deletes; "
+                           "a deleted key must be re-insertable and a live "
+                           "row's stale rewrite must still be refused",
+            "body": lambda: newer_than_after_delete(20_000 if small else 100_000),
         },
         {
             "id": "upsert_existing_keys",

@@ -580,6 +580,21 @@ class DataWriter:
             # oracle on any probe/derive failure.  delete_only (no
             # overwrite_columns) is handled separately in the deletion block.
             resolved_delete_pairs = empty_delete_pairs()
+            # The deletion vector is needed BEFORE stale filtering, not only for
+            # the re-tombstone check further down: a deleted row is still in its
+            # file, so its watermark would veto its own replacement
+            # (AUDIT_BUGS M1).  Loaded here and reused there -- the same
+            # cache-first load hoisted, not a second one -- and only when there
+            # is a watermark to compute, so append/upsert/delete writes are
+            # untouched.
+            stale_dv_df = None
+            if overwrite_columns and newer_than:
+                _stale_dv_path = last_simple_table.get("tombstone")
+                if _stale_dv_path:
+                    stale_dv_df = load_tombstone(
+                        _stale_dv_path, allow_cache=True, required=True,
+                        profiler=profiler,
+                    )
             if overwrite_columns:
                 pre_filter_count = dataframe.height
                 dataframe, resolved_delete_pairs = resolve_overwrite_writes(
@@ -588,6 +603,7 @@ class DataWriter:
                     overwrite_columns=overwrite_columns,
                     newer_than_col=newer_than,
                     profiler=profiler,
+                    dead_rowids=stale_dv_df,
                 )
                 # Normalise at the boundary so everything downstream is a frame,
                 # whatever shape the resolver handed back (it returns a frame;
@@ -668,8 +684,10 @@ class DataWriter:
                 # with no storage round-trip.  required=True preserves the
                 # carry-forward safety on a genuine miss (abort, never truncate).
                 prev_dv_df = (
-                    load_tombstone(prev_tombstone_path, allow_cache=True, required=True, profiler=profiler)
-                    if prev_tombstone_path else None
+                    stale_dv_df if stale_dv_df is not None
+                    else (load_tombstone(prev_tombstone_path, allow_cache=True,
+                                         required=True, profiler=profiler)
+                          if prev_tombstone_path else None)
                 )
                 # 1. Identify which existing rows this write deletes/replaces.
                 #    overwrite_columns drives the anti-join key (delete + upsert);

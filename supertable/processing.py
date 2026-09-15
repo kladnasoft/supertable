@@ -928,6 +928,44 @@ def _write_single_parquet_file(
 # Newer-than filtering (idempotency / conflict resolution)
 # =========================
 
+def _drop_tombstoned(frame: polars.DataFrame, dead_rowids) -> polars.DataFrame:
+    """Remove rows whose ``__rowid__`` is in the deletion vector.
+
+    A deleted row stays physically in its file until compaction rewrites it, so
+    a watermark computed over raw file contents sees values belonging to rows
+    that no longer exist. That let a deleted row veto its own replacement:
+
+        write  id=1 rev=5      -> row exists
+        delete id=1            -> row gone, still in the file, now in the DV
+        write  id=1 rev=3 newer_than='rev'
+               -> max(rev) for id=1 read as 5 from the dead row, 3 <= 5,
+                  incoming row dropped and the re-insert silently lost
+
+    And because compaction physically removes the dead row, the same operation
+    sequence produced different data depending on whether compaction happened
+    to have run (AUDIT_BUGS M1) -- non-determinism driven by background
+    maintenance, which is worse than a wrong answer because a replay of the
+    same ingest can yield two different tables.
+
+    A polars anti-join, matching the one the write path already uses to avoid
+    re-tombstoning: building a Python set of the vector measured 846ms against
+    48ms for the join on a 1M/100k case.
+    """
+    if dead_rowids is None or ROWID_COL not in frame.columns:
+        return frame
+    if isinstance(dead_rowids, polars.DataFrame):
+        if dead_rowids.height == 0 or ROWID_COL not in dead_rowids.columns:
+            return frame
+        dead = dead_rowids.select(ROWID_COL).unique()
+    else:
+        if not dead_rowids:
+            return frame
+        dead = polars.DataFrame({ROWID_COL: list(dead_rowids)})
+    if dead.schema[ROWID_COL] != frame.schema[ROWID_COL]:
+        dead = dead.with_columns(polars.col(ROWID_COL).cast(frame.schema[ROWID_COL]))
+    return frame.join(dead, on=ROWID_COL, how="anti")
+
+
 def filter_stale_incoming_rows(
         incoming_df: polars.DataFrame,
         overlapping_files: Set[Tuple[str, bool, int]],
@@ -936,6 +974,7 @@ def filter_stale_incoming_rows(
         file_cache: Optional[Dict[str, polars.DataFrame]] = None,
         profiler: Optional[Profiler] = None,
         read_columns: Optional[List[str]] = None,
+        dead_rowids=None,
 ) -> polars.DataFrame:
     """
     Remove rows from *incoming_df* that are stale or already present in existing data.
@@ -948,6 +987,10 @@ def filter_stale_incoming_rows(
       - Key not found in existing data            → keep incoming row (new key).
       - Existing file lacks the newer_than column → keep incoming row (legacy data).
       - incoming newer_than > existing max        → keep incoming row (genuine update).
+      - Row is in the deletion vector             → ignored entirely: a deleted
+        row has no watermark to beat, so it cannot veto a re-insert.  Requires
+        *dead_rowids*; omitting it keeps the old, unsound behaviour and exists
+        only for callers with no vector to hand.
 
     If file_cache dict is provided, read DataFrames are stored in it keyed by file path
     so downstream processing can reuse them without re-reading from storage.
@@ -979,6 +1022,17 @@ def filter_stale_incoming_rows(
         # If the file doesn't have the newer_than column, skip it (legacy data → allow overwrite)
         if newer_than_col not in part.columns:
             continue
+        # Drop rows the deletion vector has removed BEFORE their watermark is
+        # taken, or a deleted row blocks its own replacement (AUDIT_BUGS M1).
+        # Done here, per file, rather than after the concat: __rowid__ is
+        # already in *part* (read_columns includes it) but the projection below
+        # drops it, and a legacy file without one is simply left unfiltered
+        # instead of forcing a schema union across parts.
+        with p.span("newer_than.drop_tombstoned"):
+            part = _drop_tombstoned(part, dead_rowids)
+        if part.height == 0:
+            continue
+
         # Select only the columns we need, filtering to matching keys
         available_cols = [c for c in needed_cols if c in part.columns]
         if not all(c in available_cols for c in overwrite_columns):
@@ -1547,6 +1601,7 @@ def _derive_stale_and_deletes(
         overwrite_columns: List[str],
         newer_than_col: Optional[str],
         profiler: Optional[Profiler] = None,
+        dead_rowids=None,
 ) -> Tuple[polars.DataFrame, List[Tuple[str, int]]]:
     """Derive (filtered incoming df, delete pairs) from the probe's matched rows.
 
@@ -1562,8 +1617,14 @@ def _derive_stale_and_deletes(
     matched = _align_keys_to_incoming(matched, incoming_df, overwrite_columns, newer_than_col)
 
     if newer_than_col and newer_than_col in matched.columns:
+        # Dead rows carry no watermark (AUDIT_BUGS M1).  Applied to the
+        # aggregation only: the delete pairs below are derived from the
+        # unfiltered set, where an already-tombstoned rowid is harmless and is
+        # de-duplicated by the writer anyway.
+        with p.span("newer_than.drop_tombstoned"):
+            live = _drop_tombstoned(matched, dead_rowids)
         with p.span("newer_than.group_agg"):
-            existing_max = matched.group_by(overwrite_columns).agg(
+            existing_max = live.group_by(overwrite_columns).agg(
                 polars.col(newer_than_col).max().alias("__existing_max__")
             )
         with p.span("newer_than.join_filter"):
@@ -1599,6 +1660,7 @@ def resolve_overwrite_writes(
         overwrite_columns: List[str],
         newer_than_col: Optional[str] = None,
         profiler: Optional[Profiler] = None,
+        dead_rowids=None,
 ) -> Tuple[polars.DataFrame, List[Tuple[str, int]]]:
     """Single-pass overwrite resolution: stale filtering + delete-vector pairs.
 
@@ -1644,6 +1706,7 @@ def resolve_overwrite_writes(
         try:
             return _derive_stale_and_deletes(
                 incoming_df, matched, overwrite_columns, newer_than_col, profiler=p,
+                dead_rowids=dead_rowids,
             )
         except Exception as e:
             logging.warning(f"[write-probe] derive failed, using polars path: {e}")
@@ -1673,6 +1736,7 @@ def resolve_overwrite_writes(
             file_cache=file_cache,
             profiler=p,
             read_columns=read_columns,
+            dead_rowids=dead_rowids,
         )
     else:
         filtered = incoming_df
