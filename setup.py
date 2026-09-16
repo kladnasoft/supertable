@@ -27,7 +27,13 @@ setup(
     author_email="lkupas@kladnasoft.com",
     license="Super Table Public Use License (STPUL) v1.0",
     python_requires=">=3.10",
-    packages=find_packages(include=["supertable", "supertable.*"]),
+    # Kept in step with [tool.setuptools.packages.find] in pyproject.toml, which
+    # is the config the PEP 517 build actually applies; see the note there on why
+    # the test and benchmark suites are excluded and `supertable/audit/` is not.
+    packages=find_packages(
+        include=["supertable", "supertable.*"],
+        exclude=["*.tests", "*.tests.*", "*.benchmarks", "*.benchmarks.*"],
+    ),
     include_package_data=True,
     install_requires=read_requirements(),
     classifiers=[

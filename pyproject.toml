@@ -57,6 +57,16 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["supertable", "supertable.*"]
+# Test and benchmark suites are development material: ~110 modules, 1.7MB of a
+# 7.3MB wheel, of no use to an installed copy. Discovery here is namespace-aware,
+# so these directories shipped whether or not they carried an __init__.py. The
+# patterns match the dotted package name, so leaving them unanchored catches
+# every depth: supertable.tests, supertable.audit.tests, and
+# supertable.engine.benchmarks.tests alike.
+#
+# This is deliberately "*.tests" and not "supertable.audit" — `supertable/audit/`
+# is runtime code (the audit log's writers, crypto and retention) and must ship.
+exclude = ["*.tests", "*.tests.*", "*.benchmarks", "*.benchmarks.*"]
 
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"

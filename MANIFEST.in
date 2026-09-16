@@ -1,0 +1,26 @@
+# What ships in an sdist.
+#
+# The package excludes its test and benchmark suites (see the note on
+# [tool.setuptools.packages.find] in pyproject.toml), but that setting governs
+# *packages* only. An sdist is assembled from a separate file list that reaches
+# outside the package tree, which is how `tests/test_benchmark_harness.py` — a
+# repo-root file, in no package at all — ended up in the 3.4.3 tarball. These
+# prunes name the development directories explicitly so that adding a file to
+# one of them can never put it in a release.
+prune tests
+prune test_suite
+prune benchmarks
+prune audit
+prune issues
+prune scripts
+prune docs
+
+# Belt and braces. `.env` is tracked in this repository and .gitignore's entry
+# for it is `.env/` — a directory pattern, which does not match the file. It has
+# never been picked up by the sdist, but "has never been" is not a guarantee,
+# and the cost of stating it is one line.
+exclude .env
+exclude TOKEN
+
+global-exclude *.py[cod]
+global-exclude __pycache__/*
