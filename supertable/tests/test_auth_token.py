@@ -20,7 +20,7 @@ import pytest
 os.environ.setdefault("SUPERTABLE_ORGANIZATION", "test_org")
 os.environ.setdefault("SUPERTABLE_SUPERUSER_TOKEN", "test_token")
 
-from supertable.redis_catalog import LOGIN_TOKEN_PREFIX  # noqa: E402
+from supertable.redis_catalog import AUTH_TOKEN_PREFIX, LOGIN_TOKEN_PREFIX  # noqa: E402
 from supertable import redis_keys as RK  # noqa: E402
 
 
@@ -59,18 +59,20 @@ ORG = "acme"
 
 def test_minted_token_carries_the_login_prefix(catalog):
     out = catalog.create_auth_token(ORG, created_by="admin")
-    assert out["token"].startswith(LOGIN_TOKEN_PREFIX)
+    assert out["token"].startswith(AUTH_TOKEN_PREFIX)
 
 
 def test_prefix_is_the_documented_literal():
     """Pinned: a scanner rule and the host both key off this exact string."""
-    assert LOGIN_TOKEN_PREFIX == "st_login_"
+    assert AUTH_TOKEN_PREFIX == "st_auth_"
+    # The 3.4.2 name still resolves so an external importer does not break.
+    assert LOGIN_TOKEN_PREFIX == AUTH_TOKEN_PREFIX
 
 
 def test_prefix_adds_no_entropy_but_costs_none_either(catalog):
     """The secret is the 24 random bytes after the marker, not the marker."""
     out = catalog.create_auth_token(ORG, created_by="admin")
-    body = out["token"][len(LOGIN_TOKEN_PREFIX):]
+    body = out["token"][len(AUTH_TOKEN_PREFIX):]
     assert len(body) >= 32, f"token body unexpectedly short: {body!r}"
 
 
@@ -103,7 +105,7 @@ def test_a_legacy_unprefixed_token_still_validates(catalog):
     and that failure is the signal that the change logs out every existing
     session.
     """
-    legacy = "8Wd3nQhTqZ1rLpXv0KcYbA2f"          # no st_login_ marker
+    legacy = "8Wd3nQhTqZ1rLpXv0KcYbA2f"          # no st_auth_ marker
     digest = hashlib.sha256(legacy.encode("utf-8")).hexdigest()
     catalog.r.hset(RK.auth_tokens(ORG), digest, json.dumps({
         "token_id": digest, "enabled": True, "username": "bob",
@@ -118,12 +120,14 @@ def test_a_legacy_unprefixed_token_still_validates(catalog):
 def test_the_prefix_alone_is_not_a_valid_token(catalog):
     """Guard against a prefix check ever standing in for verification."""
     catalog.create_auth_token(ORG, created_by="admin")
-    assert catalog.validate_auth_token(ORG, LOGIN_TOKEN_PREFIX) is False
-    assert catalog.validate_auth_token(ORG, LOGIN_TOKEN_PREFIX + "x") is False
+    assert catalog.validate_auth_token(ORG, AUTH_TOKEN_PREFIX) is False
+    assert catalog.validate_auth_token(ORG, AUTH_TOKEN_PREFIX + "x") is False
 
 
 def test_unknown_and_empty_tokens_are_refused(catalog):
     assert catalog.validate_auth_token(ORG, "") is False
+    assert catalog.validate_auth_token(ORG, "st_auth_totally_made_up") is False
+    # A token minted under the retired 3.4.2 marker is not magically valid.
     assert catalog.validate_auth_token(ORG, "st_login_totally_made_up") is False
     assert catalog.validate_auth_token_full(ORG, "") is None
 

@@ -43,7 +43,17 @@ def _now_ms() -> int:
 # issued before this marker existed keep working untouched — the alternative
 # would be a flag day that logs out every existing session to gain nothing.
 # The prefix is a property of NEW tokens, not a format rule for old ones.
-LOGIN_TOKEN_PREFIX = "st_login_"
+#
+# Renamed from ``st_login_`` in 3.4.3. The platform's WebUI mints the same
+# credential into the same hash and had drifted to its own ``sup_login_``
+# marker; one credential type carrying two markers means a secret-scanner rule
+# written for one silently misses the other. Both now emit ``st_auth_``.
+# Tokens issued under either old marker keep working, per the note above.
+AUTH_TOKEN_PREFIX = "st_auth_"
+
+#: Deprecated alias. ``AUTH_TOKEN_PREFIX`` is the name to use; this stays so an
+#: external importer of the 3.4.2 name does not break on upgrade.
+LOGIN_TOKEN_PREFIX = AUTH_TOKEN_PREFIX
 
 
 # ---------------------------------------------------------------------------
@@ -1273,12 +1283,12 @@ return 1
         means the token never expires by time alone — it can still be
         disabled via ``enabled=False``.
 
-        The plaintext carries the :data:`LOGIN_TOKEN_PREFIX` marker so that a
+        The plaintext carries the :data:`AUTH_TOKEN_PREFIX` marker so that a
         leaked token is recognisable as a SuperTable credential on sight and by
         secret scanners.  The prefix is not a secret and adds no entropy; the
         192 bits after it are the whole of the strength.
         """
-        token = LOGIN_TOKEN_PREFIX + secrets.token_urlsafe(24)
+        token = AUTH_TOKEN_PREFIX + secrets.token_urlsafe(24)
         token_id = hashlib.sha256(token.encode("utf-8")).hexdigest()
         meta = {
             "token_id": token_id,
