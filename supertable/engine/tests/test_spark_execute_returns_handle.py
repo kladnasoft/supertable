@@ -153,3 +153,35 @@ def test_executor_materializes_spark_rows(monkeypatch):
 
     assert used == "spark_sql"
     assert df.height == len(ROWS), f"Spark read came back with {df.height} rows"
+
+
+def test_variable_substitution_is_off_before_any_user_sql(monkeypatch):
+    """${spark.hadoop.fs.s3a.secret.key} must not expand inside user SQL."""
+    ex, conn = _spark_executor(monkeypatch)
+    reflection, parser = _query()
+
+    ex.execute(reflection=reflection, parser=parser, query_manager=None,
+               timer_capture=lambda _evt: None)
+
+    executed = conn.cur.executed
+    off = executed.index("SET spark.sql.variable.substitute=false")
+    assert off < executed.index("SELECT id, name FROM t")
+
+
+def test_no_query_runs_when_substitution_cannot_be_turned_off(monkeypatch):
+    ex, conn = _spark_executor(monkeypatch)
+    reflection, parser = _query()
+    plain = conn.cur.execute
+
+    def refuse(sql):
+        if sql.startswith("SET spark.sql.variable.substitute"):
+            raise RuntimeError("conf is not modifiable")
+        plain(sql)
+
+    conn.cur.execute = refuse
+    import pytest
+
+    with pytest.raises(RuntimeError, match="not modifiable"):
+        ex.execute(reflection=reflection, parser=parser, query_manager=None,
+                   timer_capture=lambda _evt: None)
+    assert not any(sql.startswith("SELECT") for sql in conn.cur.executed)

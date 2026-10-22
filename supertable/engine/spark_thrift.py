@@ -861,6 +861,13 @@ class SparkThriftExecutor:
             # 3. Configure S3
             _configure_spark_s3(cursor, cluster)
 
+            # 3b. Spark expands ${...} in SQL text from the session conf before
+            #     parsing, and step 3 just put the object-store secret there:
+            #     "SELECT '${spark.hadoop.fs.s3a.secret.key}' FROM t" returned
+            #     it. Nothing this executor runs needs substitution. Not
+            #     guarded: if the SET fails, the query must not run.
+            cursor.execute("SET spark.sql.variable.substitute=false")
+
             # 3a. Work around Spark's inability to read TIMESTAMP(NANOS, false)
             #     parquet columns written by DuckDB.  DuckDB writes
             #     __timestamp__ and other timestamp columns as INT64
