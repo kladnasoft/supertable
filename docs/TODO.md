@@ -4,7 +4,6 @@ This page records follow-up work supported by executable code in the reviewed tr
 
 ## Query result delivery
 
-- [ ] Correct Spark stream handoff. `SparkThriftExecutor.execute` sets `handed_to_stream=True` and returns a handle, but a bare `return` in `finally` overrides it with `None`. The shared materializer returns an empty Polars DataFrame for `None`; the reader stream API raises because it received no handle. Verify materialized and streamed results after changing the handoff. Sources: [Spark adapter](../supertable/engine/spark_thrift.py), [executor](../supertable/engine/executor.py), [materializer](../supertable/engine/arrow_result.py).
 - [ ] Align OData engine selection and diagnostics with execution. `query_odata_sql_stream` accepts an engine argument but does not pass it to `DataReader.stream`; its selected-engine diagnostic can fall back to `duckdb` without actual engine telemetry. Source: [OData stream helper](../supertable/odata/stream.py).
 - [ ] Make the default-limit helper compose with SQL terminators. `_ensure_sql_limit` strips a semicolon for its check but appends the new limit to the original SQL; SQL ending in `;` can become an invalid second statement. Source: [reader helper](../supertable/data_reader.py).
 - [ ] Define restricted-role access to `SHOW STATS`. The command checks READ authority but returns the raw statistics artifact without applying row/column views, potentially revealing statistics outside the role's normal query scope. Source: [statistics command](../supertable/data_reader.py).

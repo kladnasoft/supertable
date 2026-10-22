@@ -1153,29 +1153,31 @@ class SparkThriftExecutor:
 
             # 8. Cleanup: drop RBAC views and temp tables.
             # Skipped when a stream handle owns them — it tears down on close.
-            if handed_to_stream:
-                return
-            if cursor:
-                for view in created_views:
+            # Never ``return`` from here: a return in ``finally`` replaces the
+            # value the ``try`` is returning, and the reader got ``None``
+            # instead of its stream handle.
+            if not handed_to_stream:
+                if cursor:
+                    for view in created_views:
+                        try:
+                            cursor.execute(f"DROP VIEW IF EXISTS {view}")
+                        except Exception:
+                            pass
+                    for table in created_tables:
+                        try:
+                            cursor.execute(f"DROP VIEW IF EXISTS {table}")
+                        except Exception:
+                            pass
                     try:
-                        cursor.execute(f"DROP VIEW IF EXISTS {view}")
+                        cursor.close()
                     except Exception:
                         pass
-                for table in created_tables:
-                    try:
-                        cursor.execute(f"DROP VIEW IF EXISTS {table}")
-                    except Exception:
-                        pass
-                try:
-                    cursor.close()
-                except Exception:
-                    pass
 
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
 
 # ---------------------------------------------------------------------------

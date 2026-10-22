@@ -60,7 +60,7 @@ Authorization and parser construction occur before that broad execution handler.
 
 `execute()` does not add a row limit. Materialization consumes the complete result into memory. Choose SQL `LIMIT` or `stream()` when the expected result is large.
 
-The current Spark executor has a return-value defect that discards its stream handle, described in [Query engine](09_query_engine.md#5-spark-execution-and-current-limitation). Explicit DuckDB avoids that path; AUTO can select Spark when a registered cluster meets the estimated size threshold.
+AUTO can select Spark when a registered cluster meets the estimated size threshold. A Spark result is materialized the same way, from the stream handle described in [Query engine](09_query_engine.md#5-spark-execution).
 
 ## 2. Accepted SQL and table preflight
 

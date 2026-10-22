@@ -87,7 +87,7 @@ finally:
 
 Close a handle even if iteration ends early. The handle releases its query resources and triggers its completion callback on close. Normal reads hide `__rowid__` and `__timestamp__`; DuckDB streaming with `expose_rowid=True` can expose the row ID, subject to the role's allowed-column view.
 
-Use `engine.DUCKDB` for these examples. `engine.AUTO` can select a registered Spark cluster for sufficiently large estimates, and the current Spark streaming return path has a defect described in [query engines](09_query_engine.md). `DataReader` instances hold mutable execution/stream state; create a separate reader for independent queries.
+Use `engine.DUCKDB` for these examples. `engine.AUTO` can select a registered Spark cluster for sufficiently large estimates; see [query engines](09_query_engine.md). `DataReader` instances hold mutable execution/stream state; create a separate reader for independent queries.
 
 ## Return JSON-friendly rows
 

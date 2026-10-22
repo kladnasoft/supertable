@@ -113,13 +113,13 @@ Initialization sets the default collation to `nocase`, disables insertion-order 
 
 Remote S3 and HTTP reads require DuckDB's `httpfs` extension. Missing local extensions cause a clear runtime error unless online installation is enabled. Storage paths resolve through storage URL helpers where available. Certain HTTP/authentication failures during reflection creation trigger one retry using presigned paths. Optional DuckDB settings are applied only where supported, so a dedicated external-cache cap depends on the installed DuckDB build.
 
-## 5. Spark execution and current limitation
+## 5. Spark execution
 
 The Spark implementation uses PyHive to connect to a registered Thrift endpoint. Cluster configuration supplies `thrift_host`, `thrift_port` (default `10000`), `auth` (default `NONE`), and optional credentials. Missing PyHive or an eligible active cluster raises an error.
 
 The executor builds temporary Parquet views, combines multiple files with `UNION ALL`, applies deletion and RBAC views, rewrites SQL to Spark syntax, and attempts to capture `EXPLAIN EXTENDED`. S3 paths are converted to `s3a://`; optional presigning is controlled by `SUPERTABLE_SPARK_PRESIGNED`. Defaults are 300 seconds for query execution, 120 seconds per statement, and 30 seconds for the connection setting.
 
-**Current return-value defect:** `SparkThriftExecutor.execute()` returns a stream handle inside its `try`, but a bare `return` in its streaming `finally` branch overrides that handle with `None`. The materialized executor currently converts this into an empty DataFrame, while `DataReader.stream()` reports that no reader was produced. Use `Engine.DUCKDB` when a working result is required until that implementation is corrected. Setting AUTO does not avoid this defect when AUTO selects Spark.
+Both the materialized and the streaming executor ask Spark for a stream. `SparkThriftExecutor.execute()` then returns a `SparkStreamHandle`, which pulls rows with `fetchmany`, in batches of `SUPERTABLE_STREAM_BATCH_ROWS` or the `batch_rows` a stream asks for, and converts each batch to Arrow. The handle owns the query's cursor, Thrift session and temporary views, and drops and closes them once it is drained or closed. Called directly without a batch size, `execute()` fetches every row into a Polars DataFrame and tears down before it returns.
 
 ## 6. Results and monitoring
 
