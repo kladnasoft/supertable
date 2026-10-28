@@ -19,13 +19,13 @@ long_description = readme.read_text(encoding="utf-8") if readme.exists() else ""
 
 setup(
     name="supertable",
-    version="3.4.2",
+    version="3.4.3",
     description="SuperTable — versioned data lake library for SQL analytics on Parquet + Redis.",
     long_description=long_description,
     long_description_content_type="text/markdown",
     author="Levente Kupas",
     author_email="lkupas@kladnasoft.com",
-    license="Super Table Public Use License (STPUL) v1.0",
+    license="KSPUL-1.2 (Kladna Soft Public Use License v1.2)",
     python_requires=">=3.10",
     # Kept in step with [tool.setuptools.packages.find] in pyproject.toml, which
     # is the config the PEP 517 build actually applies; see the note there on why

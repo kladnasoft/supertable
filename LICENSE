@@ -1,103 +1,752 @@
-# Functional Source License, Version 1.1, ALv2 Future License
+DRAFT — to be reviewed by legal counsel before release.
 
-## Abbreviation
+# KLADNA SOFT PUBLIC USE LICENSE (KSPUL) v1.2
 
-FSL-1.1-ALv2
+Product: SuperTable (a Free Product, Section 2.1)
+Licensor: Kladna Soft Kft., Budapest, Hungary
+Copyright (c) 2024-2026 Kladna Soft Kft.
 
-## Notice
+This is one license for every Product listed in Section 2. The Product
+line above names the Product that this copy accompanies.
 
-Copyright 2024-2026 Kladna Soft Kft.
+1. Definitions
+   1.1. "Software" means each Product in the form in which the Licensor
+   makes it available, including its source code, object code,
+   packages, container images, documentation, and related materials,
+   and the updates, patches, and new versions that the Licensor
+   provides under this License.
+   1.2. "Product" means each software product listed in Section 2, and
+   any other software product that the Licensor designates as licensed
+   under this License through a LICENSE file, repository notice,
+   package notice, website notice, or other accompanying notice.
+   1.3. "Free Products" and "Licensed Products" mean the Products
+   listed as such in Section 2.
+   1.4. "Licensor" means Kladna Soft Kft., a company registered in
+   Hungary with its registered office at Nagy Lajos Király útja
+   206-208., Budapest, Hungary.
+   1.5. "Licensee" means the individual or Legal Entity that accepts
+   this License by downloading, installing, or using the Software.
+   "You" and "Your" refer to the Licensee. If You accept this License
+   on behalf of a Legal Entity, You confirm that You are authorized to
+   do so, and the Licensee is that Legal Entity. Use of the Software by
+   or on behalf of a Legal Entity is use by that Legal Entity.
+   1.6. "Legal Entity" means any company, partnership, association,
+   foundation, cooperative, public body, or other organization, and any
+   individual acting in the course of a trade, business, or profession.
+   1.7. "Organization" means the Licensee together with every Legal
+   Entity that directly or indirectly controls the Licensee, is
+   controlled by the Licensee, or is under common control with the
+   Licensee, that is, the whole group: parent companies, subsidiaries,
+   and companies under common control (each such Legal Entity other
+   than the Licensee an "Affiliate"). "Control" means owning more than
+   fifty percent (50%) of the voting rights or capital of a Legal
+   Entity, or having the power to direct its management and policies,
+   whether through ownership, contract, or otherwise. Where the
+   Licensee is an individual using the Software for Non-Commercial Use,
+   the Organization is that individual.
+   1.8. "Long-Term Contractor" means an individual who is not an
+   employee but works for a member of the Organization on a full-time
+   or substantially full-time basis (on average thirty (30) hours a
+   week or more), whether engaged directly or through an agency, a
+   personal company, or another intermediary, for a continuous period
+   that has lasted, or is expected to last, six (6) months or more.
+   1.9. "Employees" means the employees of every member of the
+   Organization together with its Long-Term Contractors. The number of
+   Employees is the number of employees stated in the most recent
+   annual report or approved annual financial statements of the
+   Organization (the consolidated figure where one is published,
+   otherwise the sum of the figures for each member), plus the current
+   number of Long-Term Contractors. For a member that has not yet
+   published such a figure, a good-faith estimate of its current number
+   of employees is used. The number of users, the volume of data, the
+   number of Instances or Environments, and computing resources are not
+   part of the number of Employees.
+   1.10. "Micro-Company" means an Organization that meets both of the
+   following conditions, which follow the definition of a
+   microenterprise in Article 2(3) of the Annex to Commission
+   Recommendation 2003/361/EC of 6 May 2003 concerning the definition
+   of micro, small and medium-sized enterprises (OJ L 124, 20.5.2003,
+   p. 36):
+   (a) it has fewer than ten (10) Employees; and
+   (b) its annual turnover or its annual balance sheet total does not
+   exceed two million euros (EUR 2,000,000); it is enough that one of
+   the two does not exceed that amount.
+   The financial figures are those of the most recent approved
+   accounting period of the whole Organization (consolidated where
+   consolidated accounts are published, otherwise added up for each
+   member), converted to euros where needed at the exchange rate of the
+   last day of that period. For this License, the number of Employees
+   under Section 1.9 is used as the staff headcount, so Long-Term
+   Contractors count, and the Organization under Section 1.7 is used as
+   the enterprise together with its linked enterprises. A public
+   authority, a body governed by public law, and an Organization of
+   which twenty-five percent (25%) or more of the capital or voting
+   rights is controlled, directly or indirectly, jointly or
+   individually, by one or more public bodies, are not Micro-Companies.
+   An Organization with fewer than ten (10) Employees whose annual
+   turnover and annual balance sheet total both exceed EUR 2,000,000 is
+   not a Micro-Company (Section 4.4).
+   1.11. "Educational Institution" means a school, college, or
+   university that is accredited or officially recognized by the
+   competent authority of its country to provide education or to award
+   qualifications.
+   1.12. "Non-Profit Organization" means a Legal Entity that is
+   registered as a non-profit, charitable, or public-benefit
+   organization under the law of the country where it is registered,
+   and that does not distribute profits to its members, owners, or
+   officers. It does not include public authorities or bodies governed
+   by public law, other than Educational Institutions.
+   1.13. "Non-Commercial Use" means use by an individual that is not
+   intended for or directed toward commercial advantage or monetary
+   compensation, and that is not made in the course of any trade,
+   business, or profession, such as personal learning, hobby projects,
+   and non-commercial open-source or community projects. Use by or on
+   behalf of a Legal Entity for its own operations is not
+   Non-Commercial Use; Section 4.2 covers such use where it applies.
+   1.14. "Production Use" means use of the Software in support of
+   actual business or organizational operations, including processing
+   data to produce reports, datasets, models, or decisions that are
+   relied on outside an Evaluation, or giving people access to the
+   Software for their regular work.
+   1.15. "Evaluation" means use of a Licensed Product, without
+   Production Use, solely to assess whether it suits the needs of the
+   Organization, within the period set out in Section 4.2(b).
+   1.16. "Subscription" means a paid, time-limited license to one or
+   more Licensed Products that the Licensor grants under an Order.
+   1.17. "Order" means the online purchase, order form, accepted quote,
+   or other written agreement under which an Organization obtains a
+   Subscription from the Licensor, or from a reseller authorized by the
+   Licensor, and which states at least the Band, the term, the fee, and
+   the Licensed Products covered.
+   1.18. "Band" means a range of the number of Employees, as set out in
+   the Licensor's price list in effect at the time of purchase or
+   renewal.
+   1.19. "Authorized User" means any individual, including an employee,
+   Long-Term Contractor, consultant, or agent, who uses the Software on
+   behalf of and for the purposes of the Organization.
+   1.20. "Third Party" means any individual or Legal Entity outside the
+   Organization. Authorized Users, and Service Providers acting under
+   Section 5.5, are not Third Parties while they act for the
+   Organization within this License.
+   1.21. "Instance" means any installation, deployment, or running copy
+   of the Software, on any infrastructure. "Environment" means any
+   environment configured in or served by the Software, such as DEV,
+   TEST, and PROD.
+   1.22. "Modification" means any change to the Software, including to
+   its source code, object code, or other files, whether by editing,
+   patching, translating, or adapting it, or by replacing or altering
+   its code while it runs (for example, by monkey-patching). Configuring
+   and using the Software through the means that Section 7.1 describes
+   is not a Modification.
+   1.23. "Derivative Work" means any work that is based on or derived
+   from the Software or any part of it, within the meaning of
+   applicable copyright law, including a modified version, a fork, a
+   translation, and any work that copies or adapts any part of the
+   source code of the Software. Your Content is not a Derivative Work
+   (Section 7.2).
+   1.24. "Your Content" means Your data, the configuration of Your
+   Instances, and the notebooks, SQL, queries, transforms, checks,
+   pipelines, dashboards, reports, prompts, scripts, programs, and other
+   content that You or Your Authorized Users create with the Software,
+   or that use the Software only through its documented interfaces,
+   excluding any part of the Software itself.
+   1.25. "Hosted Service" means making a Product, or its functionality,
+   available to Third Parties over a network as a hosted, managed,
+   software-as-a-service, platform-as-a-service, or similar offering,
+   whether or not for a fee.
+   1.26. "Competing Product" means a product or service provided to
+   Third Parties, whether or not for a fee, that substitutes for a
+   Product; that substitutes for another product or service that the
+   Licensor offers using a Product, such as hosting or managed operation
+   of a Product; or that offers the same or substantially similar
+   functionality as a Product.
+   1.27. "Service Provider" means an individual or Legal Entity outside
+   the Organization, such as a consultancy, systems integrator,
+   managed-service provider, or IT service provider, that installs,
+   configures, operates, or supports the Software for a client.
+   1.28. "Partner Agreement" means a written agreement signed by the
+   Licensor that authorizes a party to do something that this License
+   does not allow, such as reselling or distributing the Software,
+   offering it as a Hosted Service, embedding it in a product for Third
+   Parties, or operating it for clients on that party's own
+   infrastructure.
+   1.29. "License Key" means any key, token, certificate, file, or other
+   mechanism that the Licensor provides, or that the Software uses, to
+   identify, enable, limit, or verify a license.
+   1.30. "Contribution" means any bug report, feature request,
+   suggestion, proposed code change, documentation, or other material
+   that You submit to the Licensor for possible inclusion in the
+   Software.
 
-## Terms and Conditions
+2. Products
 
-### Licensor ("We")
+   2.1. Free Products
+   The Free Products are:
+   (a) SuperTable, the Python library published as the "supertable"
+   package;
+   (b) Data Island Core; and
+   (c) Gatekeeper, the Data Island identity service.
+   Free Products are free of charge for everyone (Section 4.1).
 
-The party offering the Software under these Terms and Conditions.
+   2.2. Licensed Products
+   The Licensed Products are:
+   (a) Data Island Studio; and
+   (b) Data Island Lighthouse.
+   Licensed Products are free of charge in the cases set out in Section
+   4.2 and require a Subscription otherwise (Section 4.3).
 
-### The Software
+   2.3. Products Delivered Together
+   A Free Product that is included in or delivered with a Licensed
+   Product, such as the Data Island Core runtime inside Data Island
+   Studio, remains a Free Product. Functionality of a Free Product that
+   exists only to serve a Licensed Product, such as the Lighthouse tools
+   that Data Island Core serves, may be used only by an Organization
+   that is entitled to use that Licensed Product.
 
-The "Software" is each version of the software that we make available under
-these Terms and Conditions, as indicated by our inclusion of these Terms and
-Conditions with the Software.
+   2.4. Releases
+   The list of Products in the version of this License that accompanies
+   a release of a Product applies to that release (Section 10).
 
-### License Grant
+3. License Grant (Use Only)
 
-Subject to your compliance with this License Grant and the Patents,
-Redistribution and Trademark clauses below, we hereby grant you the right to
-use, copy, modify, create derivative works, publicly perform, publicly display
-and redistribute the Software for any Permitted Purpose identified below.
+   3.1. Grant
+   Subject to Your compliance with this License, the Licensor grants
+   You a worldwide, non-exclusive, non-transferable, non-sublicensable
+   license, for the duration set out in Section 3.5, to:
+   (a) obtain the Software from the Licensor or from its official
+   distribution channels;
+   (b) install, deploy, and run unmodified copies of the Software
+   inside Your Organization, and make the copies needed to do so,
+   including backup and disaster-recovery copies;
+   (c) build the Software from the unmodified source code that the
+   Licensor provides (Section 6.2), and package unmodified Software
+   together with other software, for example in a container image, for
+   deployment inside Your Organization;
+   (d) within the purpose and conditions of the grant in Section 4 that
+   applies to You, use the Software for the internal purposes of Your
+   Organization, including Production Use where Section 4 allows it,
+   and to deliver Your own products and services, provided that they
+   are not a Hosted Service or a Competing Product and that no Third
+   Party receives a copy of the Software; and
+   (e) copy the documentation, and adapt it for internal use, such as
+   in runbooks and training materials for Your Authorized Users.
 
-### Permitted Purpose
+   3.2. Unlimited Scope
+   Within the purpose and conditions of the grant in Section 4 that
+   applies to You, You may run the Software on any number of Instances
+   and Environments, for any number of Authorized Users, and with any
+   volume of data, on infrastructure that Your Organization controls,
+   or that is operated for it by the Licensor, by a partner under a
+   Partner Agreement, or by a Service Provider under Section 5.5. No
+   grant under this License is limited or priced by the number of
+   users, the volume of data, the number of Instances or Environments,
+   or the processors, memory, or other computing resources on which the
+   Software runs.
 
-A Permitted Purpose is any purpose other than a Competing Use. A Competing Use
-means making the Software available to others in a commercial product or
-service that:
+   3.3. Your Own Programs
+   You may write programs, scripts, notebooks, and queries that use the
+   Software through its documented interfaces (such as its Python API,
+   SQL, REST, OData, MCP, and command-line interfaces), declare the
+   Software as a dependency of them, and copy the code examples in the
+   documentation into them. Such programs are Your Content, provided
+   that they do not contain a Modification of the Software.
 
-1. substitutes for the Software;
-2. substitutes for any other product or service we offer using the Software
-   that exists as of the date we make the Software available; or
-3. offers the same or substantially similar functionality as the Software.
+   3.4. Use Only
+   This License grants rights to use the Software as described in this
+   Section 3. It does not grant any right to modify the Software, to
+   create Derivative Works, or to distribute, sell, sublicense, or host
+   the Software for Third Parties, except as this License or a Partner
+   Agreement expressly allows.
 
-Permitted Purposes specifically include using the Software:
+   3.5. Duration
+   The grant for the Free Products, and the grants of Section 4.2 for
+   as long as their conditions are met, are perpetual unless terminated
+   under Section 14. The grant under a Subscription lasts for the term
+   of that Subscription.
 
-1. for your internal use and access;
-2. for non-commercial education;
-3. for non-commercial research; and
-4. in connection with professional services that you provide to a licensee
-   using the Software in accordance with these Terms and Conditions.
+4. Free and Paid Use
 
-### Patents
+   4.1. Free Products (FREE FOR EVERYONE)
+   Every individual and Legal Entity, of any size, may use the Free
+   Products under Section 3 at no cost, for any purpose that Section 3
+   allows, including Production Use.
 
-To the extent your use for a Permitted Purpose would necessarily infringe our
-patents, the license grant above includes a license under our patents. If you
-make a claim against any party that the Software infringes or contributes to
-the infringement of any patent, then your patent license to the Software ends
-immediately.
+   4.2. Licensed Products: Free Use (FREE)
+   The following may use the Licensed Products under Section 3 at no
+   cost:
+   (a) Micro-Companies. A Micro-Company may use the Licensed Products
+   for any business purpose that Section 3 allows, including Production
+   Use, for as long as it remains a Micro-Company. If the Organization
+   ceases to be a Micro-Company, it must, within thirty (30) days,
+   obtain a Subscription, qualify under another grant in this Section
+   4.2, or stop using the Licensed Products.
+   (b) Evaluation. Any Organization, of any size, may use the Licensed
+   Products for Evaluation for up to ninety (90) days from the earlier
+   of the first installation of a Licensed Product by the Organization
+   and the date on which the Licensor issues it an evaluation License
+   Key. An Evaluation may use sample data, synthetic data, or copies of
+   real data in non-production Environments. Each Organization has one
+   Evaluation period, which covers the Licensed Products together.
+   Extended or additional Evaluation periods require written
+   authorization from the Licensor. When the Evaluation period ends,
+   the Organization must obtain a Subscription, qualify under another
+   grant in this Section 4.2, or stop using the Licensed Products.
+   (c) Education. Educational Institutions, their enrolled students, and
+   their educators may use the Licensed Products for:
+       (i) classroom instruction and coursework;
+       (ii) academic research and publications;
+       (iii) student projects and thesis work;
+       (iv) educational workshops and training; and
+       (v) the Educational Institution's own internal administration.
+   This grant does not cover commercial training programs offered for
+   profit, or consulting, analytics, or IT services provided to Third
+   Parties for a fee.
+   (d) Non-Profit Organizations. A Non-Profit Organization may use the
+   Licensed Products for its non-profit purposes and internal
+   operations, including Production Use. This grant does not extend to
+   its for-profit Affiliates, or to consulting, analytics, or IT
+   services provided to Third Parties for a fee.
+   (e) Personal Use. An individual may use the Licensed Products for
+   Non-Commercial Use.
 
-### Redistribution
+   4.3. Licensed Products: Paid Use (SUBSCRIPTION REQUIRED)
+   Any other use of a Licensed Product requires a Subscription. This
+   includes, in particular, use by or on behalf of any Legal Entity that
+   is not a Micro-Company, an Educational Institution, or a Non-Profit
+   Organization, other than Evaluation. The fee for a Subscription is
+   set by the Band that contains the number of Employees of the
+   Organization, according to the Licensor's price list in effect at
+   the time of purchase or renewal (published at
+   https://dataisland.ai/pricing), or as stated in the Order.
 
-The Terms and Conditions apply to all copies, modifications and derivatives of
-the Software.
+   4.4. Companies Under Ten Employees That Are Not Micro-Companies
+   An Organization with fewer than ten (10) Employees that is not a
+   Micro-Company (for example, because its annual turnover and its
+   annual balance sheet total both exceed EUR 2,000,000) needs a
+   Subscription, and its Band is the lowest Band of the price list
+   (currently named "Small").
 
-If you redistribute any copies, modifications or derivatives of the Software,
-you must include a copy of or a link to these Terms and Conditions and not
-remove any copyright notices provided in or with the Software.
+   4.5. Scope of a Subscription
+   A Subscription covers the whole Organization, including every
+   Affiliate, with unlimited Authorized Users, data, Instances, and
+   Environments, as described in Section 3.2. One Order may cover both
+   Licensed Products.
 
-### Disclaimer
+   4.6. Declaration and Confirmation
+   The Organization declares its number of Employees when it purchases
+   a Subscription, and confirms it at each renewal, in good faith and
+   based on its most recent annual report and its current number of
+   Long-Term Contractors.
 
-THE SOFTWARE IS PROVIDED "AS IS" AND WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING WITHOUT LIMITATION WARRANTIES OF FITNESS FOR A PARTICULAR
-PURPOSE, MERCHANTABILITY, TITLE OR NON-INFRINGEMENT.
+   4.7. Growth
+   If the number of Employees grows beyond the Band during a term, the
+   Band and the fee do not change for the rest of that term. At
+   renewal, the Band that contains the confirmed number of Employees
+   applies, whether it is higher or lower, so an Organization that has
+   grown moves up to the next Band at renewal. Legal Entities that the
+   Organization acquires or establishes during a term are covered for
+   the rest of that term. If the Licensee itself becomes an Affiliate of
+   a larger group, the Subscription continues to cover only the
+   Organization as it was before that change, until renewal.
 
-IN NO EVENT WILL WE HAVE ANY LIABILITY TO YOU ARISING OUT OF OR RELATED TO THE
-SOFTWARE, INCLUDING INDIRECT, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES,
-EVEN IF WE HAVE BEEN INFORMED OF THEIR POSSIBILITY IN ADVANCE.
+   4.8. Term and Renewal
+   A Subscription runs for the term stated in the Order (normally
+   twelve (12) months) and renews as the Order provides. If it expires
+   or is not renewed, the right to use the Licensed Products under it
+   ends, unless the Organization qualifies under Section 4.2. Expiry
+   does not affect Your Content or Your use of the Free Products.
 
-### Trademarks
+   4.9. Order Terms
+   Support, the Enterprise add-on, hosting, services, discounts,
+   payment, and data-processing terms are set by the Order and by the
+   Licensor's terms referred to in it. If an Order conflicts with this
+   License, the Order prevails for that Subscription.
 
-Except for displaying the License Details and identifying us as the origin of
-the Software, you have no right under these Terms and Conditions to use our
-trademarks, trade names, service marks or product names.
+5. Restrictions
 
-## Grant of Future License
+   5.1. What You May Not Do
+   Except as this License expressly allows, or as a Partner Agreement
+   expressly authorizes, You may not, and may not allow or help anyone
+   else to:
+   (a) modify the Software, or create, use, or distribute a
+   Modification or a Derivative Work, except as Sections 3.1(e), 6.4,
+   and 15.1 allow;
+   (b) reverse engineer, decompile, or disassemble any part of the
+   Software, except to the extent that applicable law expressly permits
+   it despite this restriction (Section 15.1);
+   (c) remove, alter, or obscure this License or any license,
+   copyright, trademark, or other notice in or with the Software; every
+   copy that You make must include this License;
+   (d) circumvent, disable, remove, or tamper with any License Key or
+   license-verification mechanism, or create, share, or use any License
+   Key other than one that the Licensor issued for Your Organization;
+   (e) distribute, publish, or otherwise make copies of the Software
+   available to anyone outside Your Organization (Section 5.2 sets out
+   what is not distribution);
+   (f) sell, resell, sublicense, rent, lease, lend, or otherwise
+   transfer the Software or any right under this License, or charge a
+   Third Party a fee for the Software itself;
+   (g) offer the Software, or its functionality, to Third Parties as a
+   Hosted Service (Section 5.3 sets out what is not a Hosted Service);
+   (h) include, embed, or bundle the Software, or any part of it, in a
+   product that is distributed, sold, licensed, or otherwise provided to
+   Third Parties, such as software or an appliance that they install;
+   (i) offer, sell, or provide a Competing Product that includes, runs,
+   or is based on the Software or any part of it, or develop a Competing
+   Product by copying, translating, or adapting any part of the source
+   code or documentation of the Software; or
+   (j) use a Licensed Product beyond the grant that applies to You, such
+   as Production Use during an Evaluation.
 
-We hereby irrevocably grant you an additional license to use the Software under
-the Apache License, Version 2.0 that is effective on the second anniversary of
-the date we make the Software available.
+   5.2. What Is Not Distribution
+   The following are not distribution under Section 5.1(e):
+   (a) making the Software available to Your Authorized Users, and to
+   Service Providers acting under Section 5.5, within the grant that
+   applies to Your Organization;
+   (b) referring others to the Licensor's official distribution
+   channels (such as its package and image registries and
+   https://dataisland.ai), or declaring the Software as a dependency of
+   Your own programs without including a copy of it; each recipient
+   then obtains the Software from the Licensor under this License; and
+   (c) giving a Third Party Your Content, as long as it contains no part
+   of the Software other than code examples copied from the
+   documentation under Section 3.3.
 
-On or after that date, you may use the Software under the Apache License,
-Version 2.0, in which case the following will apply:
+   5.3. What Is Not a Hosted Service
+   Making the outputs of Your own use of the Software available to
+   Third Parties is not a Hosted Service: for example, reports,
+   dashboards, datasets, files, and query results built on Your data,
+   including when Third Parties read data that You choose to share with
+   them through the Software's data interfaces (such as REST, OData, or
+   SQL endpoints). Using the Software inside Your own product or service
+   whose functionality is different from that of the Software, so that
+   Third Parties use Your product or service rather than the Software,
+   is not a Hosted Service either, provided that it is not a Competing
+   Product. Giving Third Parties access to the Software itself, its user
+   interfaces, or its functionality so that they can process their own
+   data, build their own content, or run their own workloads is a Hosted
+   Service.
 
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use
-this file except in compliance with the License.
+   5.4. Partner Agreements
+   Reselling, distributing, offering a Hosted Service, managed operation
+   on the provider's own infrastructure, embedding, OEM use, and any
+   Modification beyond what this License allows are available only
+   under a Partner Agreement. Contact the Licensor (Section 17).
 
-You may obtain a copy of the License at:
+   5.5. Consultancies and Service Providers
+   A Service Provider may install, configure, operate, and support the
+   Software for a client only under the client's own license under this
+   License (a grant for which the client qualifies, or the client's
+   Subscription), or under a Partner Agreement. Without a Partner
+   Agreement:
+   (a) the Software must run on infrastructure that the client
+   controls, such as the client's own servers or cloud accounts;
+   (b) the Service Provider may not use one client's license for
+   another client or for its own purposes; and
+   (c) the Service Provider's own internal use, demonstrations, and
+   training need a grant of its own.
+   Services that a Service Provider performs for a client under this
+   Section 5.5 are not a Competing Product. The client remains
+   responsible for its Service Providers' compliance with this License.
 
-    http://www.apache.org/licenses/LICENSE-2.0
+6. Source Code
 
-Unless required by applicable law or agreed to in writing, software distributed
-under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-CONDITIONS OF ANY KIND, either express or implied.
+   6.1. Reading the Source Code
+   Where the Licensor makes the source code of the Software available,
+   for example in a public repository or on request, You may read and
+   study it, for example to understand, evaluate, troubleshoot, or
+   review the security of the Software, and to write Your Content.
+   Reading the source code does not give You any right to modify it, to
+   create Derivative Works, to copy any part of it into another work,
+   or to distribute it.
 
-See the License for the specific language governing permissions and limitations
-under the License.
+   6.2. Building from Source
+   You may build the Software from the unmodified source code that the
+   Licensor provides, for use under Section 3. The result is subject to
+   this License like any other copy of the Software.
+
+   6.3. Errors and Fixes
+   If You find an error in the Software, You may report it to the
+   Licensor. The Licensor decides whether and how to correct it,
+   normally through an update. Installing the updates, patches, and new
+   versions that the Licensor provides is not a Modification.
+
+   6.4. Proposed Changes
+   You may change a copy of the source code solely to prepare and test
+   a Contribution, in a non-production Environment, and submit it to the
+   Licensor through the channel that the Licensor designates (such as a
+   pull request to its repository). You may not use or distribute the
+   changed copy for any other purpose. Submitting a Contribution gives
+   You no right to use the change until the Licensor releases it as part
+   of the Software.
+
+   6.5. Source-Available, Not Open Source
+   The Software is source-available, not open source. Access to its
+   source code is provided for transparency, evaluation, security
+   review, and Contributions, and does not grant any rights beyond those
+   that this License expressly states.
+
+7. Configuration and Your Content
+
+   7.1. Configuration
+   Configuring the Software through the settings, configuration files,
+   environment variables, interfaces, and extension points that its
+   documentation describes (such as connectors, plugins, or
+   user-defined functions where the Software supports them) is not a
+   Modification.
+
+   7.2. Your Content Is Yours
+   Your Content, including Your data, notebooks, SQL, queries,
+   transforms, checks, pipelines, dashboards, and configuration, belongs
+   to You (or to whoever owns it), is not a Derivative Work of the
+   Software, and is not subject to this License. The Licensor claims no
+   rights in Your Content or in the data that You process with the
+   Software. You may use, change, share, and license Your Content as
+   You choose, provided that it contains no part of the Software other
+   than code examples copied from the documentation under Section 3.3.
+
+8. Contributions
+   8.1. You may submit Contributions to the Licensor. By submitting a
+   Contribution, You grant the Licensor a perpetual, irrevocable,
+   worldwide, royalty-free, non-exclusive license to use, copy, modify,
+   distribute, sublicense, and incorporate Your Contribution into the
+   Software or any other product, under any license terms. You confirm
+   that You have the right to grant this license. The Licensor is not
+   obliged to use any Contribution, and You provide Contributions "as
+   is".
+   8.2. The Licensor may ask You to sign a contributor agreement before
+   it accepts a code Contribution.
+
+9. Ownership, Trademarks, Patents, and Other Components
+   9.1. All rights, title, and interest in the Software remain with the
+   Licensor. This License does not transfer any ownership rights.
+   9.2. The Licensor reserves all rights not expressly granted to You
+   under this License.
+   9.3. This License grants no right to use the Licensor's names,
+   trademarks, or logos, including "Kladna Soft", "Data Island", and
+   "SuperTable", except to identify the Software and its origin
+   truthfully.
+   9.4. The Licensor grants You a worldwide, non-exclusive license, at
+   no additional charge, under the patents that the Licensor owns or
+   controls and that the unmodified Software necessarily infringes, to
+   use the Software as this License permits. If You, or anyone acting
+   for You, bring a claim alleging that the Software infringes a patent,
+   every license granted to You under this License ends on the date on
+   which that claim is filed.
+   9.5. Open-source and other third-party components that are included
+   with the Software and identified as licensed under other terms, for
+   example in accompanying notices, are governed by those terms. This
+   License does not limit the rights that those terms give You for those
+   components. Third-party services that You connect to the Software,
+   such as cloud providers or AI model providers, are governed by Your
+   own agreements with them.
+
+10. License Versions and Transition
+    10.1. The Licensor may publish new versions of this License. Each
+    release of a Product is licensed under the version of this License
+    that accompanies that release. A later version does not change the
+    license of an earlier release.
+    10.2. This version of this License replaces, for the releases that
+    are made with it, the Functional Source License, Version 1.1, ALv2
+    Future License (FSL-1.1-ALv2) for SuperTable and Data Island Core,
+    the Apache License, Version 2.0 (Apache-2.0) for Gatekeeper, and
+    version 1.1 of this License for Data Island Lighthouse.
+    10.3. Each version of a Product that the Licensor released before
+    under another license remains under the license it was released
+    with. In particular, versions of SuperTable and Data Island Core
+    released under FSL-1.1-ALv2 remain under FSL-1.1-ALv2, including its
+    grant of the Apache License, Version 2.0 for each of those versions
+    on the second anniversary of the date it was made available;
+    versions of Gatekeeper released under Apache-2.0 remain under
+    Apache-2.0; and versions released under version 1.1 of this License
+    remain under version 1.1. This License does not take away any right
+    that You received under those licenses for those versions.
+
+11. Compliance and Verification
+    11.1. You agree to keep records reasonably needed to show that You
+    are eligible for the grant that You rely on, such as the number of
+    Employees, the figures that make Your Organization a Micro-Company,
+    Your status as an Educational Institution or a Non-Profit
+    Organization, or the start date of Your Evaluation.
+    11.2. The Licensor may, upon reasonable notice and no more than once
+    in any twelve (12) month period (unless the previous verification
+    found non-compliance), request verification of Your compliance with
+    this License, such as an annual report or a statement signed by an
+    authorized officer. You agree to provide such verification within
+    thirty (30) days of the request.
+    11.3. If verification shows that the Organization needed a
+    Subscription, or a higher Band than the one it holds, the
+    Organization will obtain the correct Subscription and pay the
+    applicable fees from the date on which it was first needed. Growth
+    during a term under Section 4.7 is not a shortfall.
+    11.4. This License does not require the Software to send usage data
+    to the Licensor. Compliance rests on Your declaration and on
+    verification under this Section 11.
+
+12. Disclaimer of Warranties
+    12.1. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE
+    SOFTWARE IS PROVIDED "AS IS," WITHOUT WARRANTY OF ANY KIND, EXPRESS
+    OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+    NON-INFRINGEMENT. THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE
+    OF THE SOFTWARE IS WITH YOU.
+    12.2. Any warranty, support, or service commitment for a
+    Subscription is set out only in the Order.
+
+13. Limitation of Liability
+    13.1. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT
+    SHALL THE LICENSOR BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL,
+    EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+    PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+    PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+    OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+    OF THE SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+    13.2. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT
+    SHALL THE LICENSOR'S TOTAL LIABILITY EXCEED THE AMOUNT PAID BY YOU
+    FOR THE SOFTWARE IN THE TWELVE (12) MONTHS PRECEDING THE CLAIM.
+    13.3. NOTHING IN THIS LICENSE EXCLUDES OR LIMITS LIABILITY FOR DAMAGE
+    CAUSED INTENTIONALLY, BY GROSS NEGLIGENCE, OR BY A CRIMINAL ACT, FOR
+    DAMAGE TO HUMAN LIFE, PHYSICAL INTEGRITY, OR HEALTH, OR ANY OTHER
+    LIABILITY THAT CANNOT BE EXCLUDED OR LIMITED UNDER APPLICABLE LAW.
+
+14. Termination
+    14.1. If You breach this License, the Licensor may notify You of the
+    breach in writing (email is sufficient). If You do not cure the
+    breach within thirty (30) days after that notice, this License and
+    the rights granted under it terminate.
+    14.2. Where the breach is that the Organization needed a
+    Subscription, or a higher Band, it cures the breach by obtaining that
+    Subscription and paying the fees under Section 11.3.
+    14.3. The cure period does not apply to a breach of Section 5.1(d),
+    to a deliberate breach of Section 5.1(g) or 5.1(i), or to the
+    repetition of a breach of which You were previously notified. For
+    such a breach, the Licensor may terminate this License by written
+    notice with immediate effect.
+    14.4. Upon termination, You must stop all use of the Software and
+    destroy all copies of the Software in Your possession or control,
+    except that You may use the Software for up to thirty (30) days
+    after termination solely to export Your Content.
+    14.5. Sections 7, 8, 9.1 to 9.3, 9.5, 10, 11, 12, 13, 14, 15, and
+    16 survive termination of this License.
+
+15. Rights Under Applicable Law and General Terms
+    15.1. Nothing in this License limits any right that applicable law
+    gives a lawful user of the Software and that cannot be excluded or
+    limited by contract, such as the rights under Directive 2009/24/EC
+    on the legal protection of computer programs and the laws that
+    implement it (in Hungary, Act LXXVI of 1999 on Copyright) to
+    observe, study, or test the functioning of the Software and to
+    decompile it to the extent needed for interoperability. Where
+    applicable law allows You to correct an error in the Software
+    despite Section 5.1(a), You will first report the error to the
+    Licensor and give it a reasonable opportunity to correct it, and You
+    may use the correction only inside Your Organization.
+    15.2. You may not assign or transfer this License or a Subscription,
+    except to a successor to all or substantially all of the business of
+    the Organization that agrees to this License, with written notice to
+    the Licensor. The Licensor may assign this License to a successor to
+    its business.
+    15.3. If any provision of this License is held invalid or
+    unenforceable, it is limited to the minimum extent necessary, and
+    the rest of this License remains in effect.
+    15.4. A failure or delay by the Licensor in enforcing any provision
+    of this License is not a waiver of that provision.
+    15.5. This License, together with any Order or Partner Agreement
+    that applies to You, is the entire agreement between You and the
+    Licensor about the Software.
+
+16. Governing Law and Dispute Resolution
+    16.1. This License shall be governed by and construed in accordance
+    with the laws of Hungary, without regard to its conflict of law
+    principles. The United Nations Convention on Contracts for the
+    International Sale of Goods does not apply.
+    16.2. Any disputes arising from this License shall first be subject
+    to good-faith negotiation. If unresolved within thirty (30) days,
+    disputes shall be submitted exclusively to the competent courts of
+    Budapest, Hungary.
+    16.3. If You are a consumer, Sections 16.1 and 16.2 do not deprive
+    You of the protection of the mandatory laws, or of the courts, of
+    the country where You live.
+    16.4. This License is written in English. Any translation is
+    provided for convenience only, and the English text prevails.
+
+17. Contact Information
+    17.1. For inquiries about Subscriptions, Partner Agreements,
+    compliance questions, or any other matters regarding this License,
+    please contact:
+
+      Kladna Soft Kft.
+      Nagy Lajos Király útja 206-208., Budapest, Hungary
+      Email: info@kladnasoft.com
+      Website: https://dataisland.ai
+      Pricing: https://dataisland.ai/pricing
+
+18. License Summary (Non-Binding)
+
+    Who pays
+
+    +-------------------------------------+---------------+---------------+
+    | Use case                            | Free Products | Licensed      |
+    |                                     | (SuperTable,  | Products      |
+    |                                     | Core,         | (Studio,      |
+    |                                     | Gatekeeper)   | Lighthouse)   |
+    +-------------------------------------+---------------+---------------+
+    | Any organization, any size,         | FREE          | Yearly        |
+    |   including production              |               | Subscription  |
+    |                                     |               | by company    |
+    |                                     |               | size          |
+    | Micro-company (fewer than 10        | FREE          | FREE          |
+    |   employees, and turnover or        |               |               |
+    |   balance sheet total up to         |               |               |
+    |   EUR 2M, whole group)              |               |               |
+    | Fewer than 10 employees, but not a  | FREE          | Subscription, |
+    |   micro-company                     |               | Small band    |
+    | Evaluation (90 days, once per       | FREE          | FREE          |
+    |   organization, not in production)  |               |               |
+    | Accredited education                | FREE          | FREE          |
+    | Registered non-profit               | FREE          | FREE          |
+    | Personal / non-commercial           | FREE          | FREE          |
+    +-------------------------------------+---------------+---------------+
+
+    What you may do (all Products)
+
+    +-------------------------------------+-------------------------------+
+    | Action                              | Allowed?                      |
+    +-------------------------------------+-------------------------------+
+    | Install and run unmodified copies   | Yes                           |
+    |   inside your organization (the     |                               |
+    |   whole group): any number of       |                               |
+    |   instances, users, data and        |                               |
+    |   environments                      |                               |
+    | Read the source code                | Yes                           |
+    | Configure it; write your own        | Yes, and they are yours       |
+    |   notebooks, SQL, pipelines and     |                               |
+    |   programs                          |                               |
+    | Change the source code, or make     | No                            |
+    |   derivative works                  |                               |
+    | Give copies to anyone outside your  | No                            |
+    |   organization                      |                               |
+    | Sell, resell, sublicense or rent it | Only with a Partner Agreement |
+    | Host it or run it as a managed      | Only with a Partner Agreement |
+    |   service for others, or embed it   |                               |
+    |   in a product for others           |                               |
+    | Build or offer a competing product  | No                            |
+    |   or service with it                |                               |
+    | Consultancy operating it for a      | Under the client's own        |
+    |   client                            | license                       |
+    +-------------------------------------+-------------------------------+
+
+    Company size is the number of employees of the whole group, as in
+    the last annual report, plus long-term full-time contractors. It is
+    declared at purchase and confirmed at renewal; a company that grows
+    moves to the next band at renewal. Versions released before under
+    FSL-1.1-ALv2, Apache-2.0, or KSPUL v1.1 keep those licenses.
+
+    This summary is for convenience only. The full license terms above
+    are legally binding.
+
+BY USING THE SOFTWARE, YOU ACKNOWLEDGE THAT YOU HAVE READ THIS LICENSE,
+UNDERSTAND IT, AND AGREE TO BE BOUND BY ITS TERMS AND CONDITIONS.
+
+Copyright (c) 2024-2026 Kladna Soft Kft. All rights reserved.
