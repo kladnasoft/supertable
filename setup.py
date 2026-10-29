@@ -45,18 +45,20 @@ setup(
     extras_require={
         "s3": ["boto3>=1.34,<2.0"],
         "minio": ["minio>=7.2,<8.0"],
-        "azure": ["azure-storage-blob>=12.26.0"],
+        "azure": ["azure-storage-blob>=12.26.0", "azure-identity>=1.17"],
         "gcp": ["google-cloud-storage>=3.1.0"],
         "all-cloud": [
             "boto3>=1.34,<2.0",
             "minio>=7.2,<8.0",
             "azure-storage-blob>=12.26.0",
+            "azure-identity>=1.17",
             "google-cloud-storage>=3.1.0",
         ],
         "all": [
             "boto3>=1.34,<2.0",
             "minio>=7.2,<8.0",
             "azure-storage-blob>=12.26.0",
+            "azure-identity>=1.17",
             "google-cloud-storage>=3.1.0",
         ],
     },
