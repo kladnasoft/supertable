@@ -2543,3 +2543,193 @@ class TestRetryDoesNotTruncateTheBody(unittest.TestCase):
         with self.assertRaises(ClientError):
             st._call("put_object", Bucket="b", Key="k", Body=NoSeek())
         self.assertEqual(len(sent), 1, "it must not retry an unrewindable body")
+
+
+# ---------------------------------------------------------------------------
+# AzureBlobStorage.presign: SAS URLs, signed locally with the account key, or
+# under managed identity / Entra ID with one cached user delegation key.
+# ---------------------------------------------------------------------------
+import importlib.util  # noqa: E402
+from datetime import datetime, timedelta  # noqa: E402
+
+
+@unittest.skipUnless(importlib.util.find_spec("azure.storage.blob"), "azure-storage-blob not installed")
+class TestAzurePresign(unittest.TestCase):
+    URL = "https://acct.blob.core.windows.net/lake/k.parquet"
+
+    def _storage(self, credential):
+        from supertable.storage.azure_storage import AzureBlobStorage
+
+        svc = MagicMock()
+        svc.credential = credential
+        svc.account_name = "acct"
+        # Each key names its own expiry, so a test can check which one signed.
+        svc.get_user_delegation_key.side_effect = lambda start, expiry: f"udk:{expiry.isoformat()}"
+        svc.get_container_client.return_value.get_blob_client.return_value.url = self.URL
+        return AzureBlobStorage("lake", svc), svc
+
+    def test_account_key_signs_locally(self):
+        st, svc = self._storage(types.SimpleNamespace(account_key="a2V5"))
+        with patch("azure.storage.blob.generate_blob_sas", return_value="sig") as gen:
+            self.assertEqual(st.presign("k.parquet"), f"{self.URL}?sig")
+        svc.get_user_delegation_key.assert_not_called()
+        self.assertEqual(gen.call_args.kwargs["account_key"], "a2V5")
+
+    def test_managed_identity_fetches_one_delegation_key_for_many_files(self):
+        st, svc = self._storage(object())  # an Entra ID credential: no account key
+        with patch("azure.storage.blob.generate_blob_sas", return_value="sig") as gen:
+            for _ in range(50):
+                st.presign("k.parquet")
+        self.assertEqual(svc.get_user_delegation_key.call_count, 1)
+        self.assertEqual(len({c.kwargs["user_delegation_key"] for c in gen.call_args_list}), 1)
+
+    def test_delegation_key_renewed_when_a_sas_would_outlive_it(self):
+        st, svc = self._storage(object())
+        with patch("azure.storage.blob.generate_blob_sas", return_value="sig") as gen:
+            st.presign("k.parquet", expiry_seconds=3600)
+            st.presign("k.parquet", expiry_seconds=12 * 3600)  # beyond the cached key
+            st.presign("k.parquet", expiry_seconds=3600)       # the renewed key covers it
+        self.assertEqual(svc.get_user_delegation_key.call_count, 2)
+        # No SAS may outlive the key that signed it.
+        for c in gen.call_args_list:
+            key_expiry = datetime.fromisoformat(c.kwargs["user_delegation_key"].split(":", 1)[1])
+            self.assertGreaterEqual(key_expiry, c.kwargs["expiry"])
+        start, expiry = svc.get_user_delegation_key.call_args.args
+        self.assertGreaterEqual(expiry - start, timedelta(hours=12))
+
+
+class _FakeHnsContainer:
+    """A container of a Data Lake Gen2 (hierarchical namespace) account as the
+    Blob API shows it: every directory is an empty blob marked hdi_isfolder,
+    reported only when metadata is asked for, kept after its files go, and
+    refused deletion while it holds anything. With hns=False: a flat account."""
+
+    def __init__(self, files, hns=True):
+        self.files = set(files)
+        self.folders = {
+            "/".join(f.split("/")[:i]) for f in files for i in range(1, f.count("/") + 1)
+        } if hns else set()
+
+    def _item(self, name, with_metadata=True):
+        meta = {"hdi_isfolder": "true"} if name in self.folders else {}
+        return types.SimpleNamespace(name=name, metadata=meta if with_metadata else None)
+
+    def list_blobs(self, name_starts_with="", include=None):
+        names = sorted(n for n in self.files | self.folders if n.startswith(name_starts_with))
+        return [self._item(n, "metadata" in (include or [])) for n in names]
+
+    def get_blob_client(self, name):
+        from azure.core.exceptions import ResourceNotFoundError
+
+        def props():
+            if name not in self.files | self.folders:
+                raise ResourceNotFoundError("not found")
+            return self._item(name)
+        return types.SimpleNamespace(get_blob_properties=props)
+
+    def delete_blob(self, name):
+        from azure.core.exceptions import ResourceNotFoundError
+
+        if name in self.folders:
+            if any(n.startswith(name + "/") for n in self.files | self.folders):
+                raise AssertionError(f"DirectoryIsNotEmpty: {name}")
+            self.folders.discard(name)
+        elif name in self.files:
+            self.files.discard(name)
+        else:
+            raise ResourceNotFoundError("not found")
+
+
+@unittest.skipUnless(importlib.util.find_spec("azure.storage.blob"), "azure-storage-blob not installed")
+class TestAzureHierarchicalNamespace(unittest.TestCase):
+    FILES = ("org/t/data/p0.parquet", "org/t/data/p1.parquet", "org/t/meta.json")
+
+    def _storage(self, hns=True):
+        from supertable.storage.azure_storage import AzureBlobStorage
+
+        fake = _FakeHnsContainer(self.FILES, hns=hns)
+        svc = MagicMock()
+        svc.get_container_client.return_value = fake
+        return AzureBlobStorage("lake", svc), fake
+
+    def test_directory_structure_skips_folders(self):
+        st, _ = self._storage()
+        self.assertEqual(
+            st.get_directory_structure("org"),
+            {"t": {"data": {"p0.parquet": None, "p1.parquet": None}, "meta.json": None}},
+        )
+
+    def test_a_folder_is_not_a_file(self):
+        st, _ = self._storage()
+        self.assertFalse(st.exists("org/t"))
+        self.assertTrue(st.exists("org/t/meta.json"))
+
+    def test_delete_folder_removes_its_files_then_its_folders(self):
+        st, fake = self._storage()
+        st.delete("org/t")
+        self.assertEqual(fake.files, set())
+        self.assertEqual(fake.folders, {"org"})  # the parent stays, as it would on disk
+
+    def test_delete_tree_leaves_no_folders(self):
+        st, fake = self._storage()
+        self.assertEqual(st.delete_tree("org"), 3)
+        self.assertEqual((fake.files, fake.folders), (set(), set()))
+
+    def test_delete_of_an_emptied_folder_succeeds(self):
+        st, fake = self._storage()
+        for f in self.FILES:
+            st.delete(f)
+        self.assertIn("org/t/data", fake.folders)  # Data Lake Gen2 keeps it
+        st.delete("org/t/data")
+        self.assertNotIn("org/t/data", fake.folders)
+
+    def test_delete_of_nothing_still_raises(self):
+        st, _ = self._storage()
+        with self.assertRaises(FileNotFoundError):
+            st.delete("org/missing")
+
+    def test_flat_account_is_unchanged(self):
+        st, fake = self._storage(hns=False)
+        self.assertEqual(st.get_directory_structure("org")["t"]["meta.json"], None)
+        self.assertFalse(st.exists("org/t"))
+        self.assertEqual(st.delete_tree("org"), 3)
+        self.assertEqual(fake.files, set())
+
+
+@unittest.skipUnless(importlib.util.find_spec("azure.storage.blob"), "azure-storage-blob not installed")
+class TestAzureFromEnv(unittest.TestCase):
+    def _settings(self, **over):
+        base = dict(
+            SUPERTABLE_HOME="", AZURE_STORAGE_ACCOUNT="", effective_storage_bucket="lake",
+            effective_storage_endpoint="", SUPERTABLE_PREFIX="", AZURE_STORAGE_CONNECTION_STRING="",
+            effective_storage_access_key="", AZURE_SAS_TOKEN="",
+        )
+        base.update(over)
+        return types.SimpleNamespace(**base)
+
+    def test_connection_string_alone_is_enough(self):
+        # What the portal's Access keys page gives: no separate account or endpoint.
+        from supertable.storage import azure_storage
+
+        conn = "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=a2V5;EndpointSuffix=core.windows.net"
+        with patch.object(azure_storage, "settings", self._settings(AZURE_STORAGE_CONNECTION_STRING=conn)), \
+                patch.object(azure_storage, "BlobServiceClient") as bsc:
+            st = azure_storage.AzureBlobStorage.from_env()
+        bsc.from_connection_string.assert_called_once_with(conn)
+        self.assertEqual(st.container_name, "lake")
+
+    def test_account_and_key(self):
+        from supertable.storage import azure_storage
+
+        with patch.object(azure_storage, "settings", self._settings(
+                AZURE_STORAGE_ACCOUNT="acct", effective_storage_access_key="a2V5")), \
+                patch.object(azure_storage, "BlobServiceClient") as bsc:
+            azure_storage.AzureBlobStorage.from_env()
+        bsc.assert_called_once_with(account_url="https://acct.blob.core.windows.net", credential="a2V5")
+
+    def test_nothing_to_connect_with_raises(self):
+        from supertable.storage import azure_storage
+
+        with patch.object(azure_storage, "settings", self._settings()):
+            with self.assertRaises(RuntimeError):
+                azure_storage.AzureBlobStorage.from_env()

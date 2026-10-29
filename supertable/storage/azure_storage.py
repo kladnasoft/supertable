@@ -3,6 +3,8 @@ import io
 import json
 import fnmatch
 import os
+import threading
+from datetime import datetime, timedelta, timezone
 
 from supertable.config.settings import settings
 from typing import Any, Dict, List, Optional, Tuple
@@ -96,10 +98,10 @@ class AzureBlobStorage(StorageInterface):
         key = settings.effective_storage_access_key
         sas = settings.AZURE_SAS_TOKEN
 
-        if not endpoint:
-            if not account:
-                raise RuntimeError("Azure configuration requires AZURE_STORAGE_ACCOUNT, STORAGE_ENDPOINT_URL, or ABFSS SUPERTABLE_HOME")
+        if not endpoint and account:
             endpoint = f"https://{account}.blob.core.windows.net"
+        if not (endpoint or conn_str):
+            raise RuntimeError("Azure configuration requires AZURE_STORAGE_ACCOUNT, STORAGE_ENDPOINT_URL, AZURE_STORAGE_CONNECTION_STRING, or ABFSS SUPERTABLE_HOME")
 
         # Build BlobServiceClient with the best available credential
         if conn_str:
@@ -139,7 +141,6 @@ class AzureBlobStorage(StorageInterface):
 
     def presign(self, key: str, expiry_seconds: int = 3600) -> str:
         """Return a presigned (SAS) GET URL for the blob."""
-        from datetime import datetime, timedelta, timezone
         from azure.storage.blob import generate_blob_sas, BlobSasPermissions
 
         full_key = self._with_base(key)
@@ -156,17 +157,14 @@ class AzureBlobStorage(StorageInterface):
             account_key = credential
         else:
             # AAD / managed identity: use user delegation key
-            start_time = datetime.now(timezone.utc)
-            expiry_time = start_time + timedelta(seconds=expiry_seconds)
-            delegation_key = self.svc.get_user_delegation_key(start_time, expiry_time)
+            expiry_time = datetime.now(timezone.utc) + timedelta(seconds=expiry_seconds)
             sas_token = generate_blob_sas(
                 account_name=account_name,
                 container_name=self.container_name,
                 blob_name=full_key,
-                user_delegation_key=delegation_key,
+                user_delegation_key=self._user_delegation_key(expiry_time),
                 permission=BlobSasPermissions(read=True),
                 expiry=expiry_time,
-                start=start_time,
             )
             return f"{blob_client.url}?{sas_token}"
 
@@ -190,10 +188,59 @@ class AzureBlobStorage(StorageInterface):
             return f"{self.base_prefix}/{path}" if path else self.base_prefix
         return path
 
+    # A user delegation key costs a round trip to Azure and signs any number
+    # of SAS URLs until it expires, so one is fetched and reused rather than
+    # one per presigned file (a query presigns every file it reads).
+    _DELEGATION_KEY_LIFETIME = timedelta(hours=6)
+    _delegation_lock = threading.Lock()
+
+    def _user_delegation_key(self, valid_until: datetime):
+        """A user delegation key that is still valid at *valid_until*."""
+        with self._delegation_lock:
+            cached = getattr(self, "_delegation_key", None)
+            if cached is not None and cached[1] >= valid_until:
+                return cached[0]
+            now = datetime.now(timezone.utc)
+            expiry = max(now + self._DELEGATION_KEY_LIFETIME, valid_until)
+            # Started a little in the past: tolerates clock skew with Azure.
+            key = self.svc.get_user_delegation_key(now - timedelta(minutes=5), expiry)
+            self._delegation_key = (key, expiry)
+            return key
+
+    # An account with a hierarchical namespace (Data Lake Gen2) has real
+    # directories, and the Blob API shows each as an empty blob marked
+    # hdi_isfolder: in flat listings, before its contents. It keeps one after
+    # its files are deleted and refuses to delete one that is not empty. A
+    # flat account has none, so the handling below changes nothing there.
+    @staticmethod
+    def _is_folder(item: Any) -> bool:
+        return (getattr(item, "metadata", None) or {}).get("hdi_isfolder") == "true"
+
+    def _delete_folders(self, path: str) -> int:
+        """Delete the directories under *path* (a full key) and *path* itself, deepest first."""
+        path = path.rstrip("/")
+        folders = [
+            b.name
+            for b in self.container.list_blobs(name_starts_with=f"{path}/" if path else "", include=["metadata"])
+            if self._is_folder(b)
+        ]
+        if path:
+            try:
+                if self._is_folder(self.container.get_blob_client(path).get_blob_properties()):
+                    folders.append(path)
+            except ResourceNotFoundError:
+                pass
+        for name in sorted(folders, key=lambda n: n.count("/"), reverse=True):
+            try:
+                self.container.delete_blob(name)
+            except ResourceNotFoundError:
+                pass
+        return len(folders)
+
     def _blob_exists(self, name: str) -> bool:
+        """A file at *name*; a directory is not one, as on a flat account."""
         try:
-            self.container.get_blob_client(name).get_blob_properties()
-            return True
+            return not self._is_folder(self.container.get_blob_client(name).get_blob_properties())
         except ResourceNotFoundError:
             return False
 
@@ -302,13 +349,23 @@ class AzureBlobStorage(StorageInterface):
 
         # prefix recursive
         prefix = path if path.endswith("/") else f"{path}/"
-        to_delete = [b.name for b in self.container.list_blobs(name_starts_with=prefix)]
-
-        if not to_delete:
-            raise FileNotFoundError(f"File or folder not found: {path}")
+        to_delete = [
+            b.name for b in self.container.list_blobs(name_starts_with=prefix, include=["metadata"])
+            if not self._is_folder(b)
+        ]
 
         for name in to_delete:
             self.container.delete_blob(name)
+
+        # The emptied directories go too (Data Lake Gen2).
+        if self._delete_folders(path) == 0 and not to_delete:
+            raise FileNotFoundError(f"File or folder not found: {path}")
+
+    def delete_tree(self, path: str) -> int:
+        removed = super().delete_tree(path)
+        # The files are gone; on Data Lake Gen2 their directories are not.
+        self._delete_folders(self._with_base(path))
+        return removed
 
     # -------------------------
     # Directory structure
@@ -319,9 +376,9 @@ class AzureBlobStorage(StorageInterface):
         if path and not path.endswith("/"):
             path = path + "/"
 
-        for blob in self.container.list_blobs(name_starts_with=path):
+        for blob in self.container.list_blobs(name_starts_with=path, include=["metadata"]):
             key = blob.name
-            if key.endswith("/"):
+            if key.endswith("/") or self._is_folder(blob):
                 continue
             suffix = key[len(path):] if path else key
             parts = [p for p in suffix.split("/") if p]

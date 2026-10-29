@@ -524,7 +524,10 @@ def _build_settings() -> Settings:
         SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE=_env_str("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_SIZE", "5GB"),
         SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR=_env_str("SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR"),
         SUPERTABLE_DUCKDB_MATERIALIZE=_env_str("SUPERTABLE_DUCKDB_MATERIALIZE", "view"),
-        SUPERTABLE_DUCKDB_PRESIGNED=_env_bool("SUPERTABLE_DUCKDB_PRESIGNED", False),
+        # On by default for Azure: DuckDB is given no credentials for a private
+        # container, so it can read a blob only through a SAS URL.
+        SUPERTABLE_DUCKDB_PRESIGNED=_env_bool(
+            "SUPERTABLE_DUCKDB_PRESIGNED", _env_str("STORAGE_TYPE", "LOCAL").upper() == "AZURE"),
         SUPERTABLE_DUCKDB_USE_HTTPFS=_env_bool("SUPERTABLE_DUCKDB_USE_HTTPFS", False),
         SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=_env_bool("SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD", False),
         SUPERTABLE_DUCKDB_WRITE_PROBE=_env_bool("SUPERTABLE_DUCKDB_WRITE_PROBE", False),

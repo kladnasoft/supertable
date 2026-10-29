@@ -306,6 +306,25 @@ class TestBuildSettings:
         s = _build_settings()
         assert s.STORAGE_TYPE == "MINIO"
 
+    def test_duckdb_presigned_defaults_on_for_azure_only(
+        self, fresh_env: pytest.MonkeyPatch
+    ) -> None:
+        # DuckDB has no credentials for a private Azure container: it reads
+        # blobs through SAS URLs, so signing is on unless set explicitly.
+        fresh_env.delenv("SUPERTABLE_DUCKDB_PRESIGNED", raising=False)
+        for storage_type, expected in (
+            ("azure", True), ("LOCAL", False), ("MINIO", False), ("S3", False),
+        ):
+            fresh_env.setenv("STORAGE_TYPE", storage_type)
+            assert _build_settings().SUPERTABLE_DUCKDB_PRESIGNED is expected, storage_type
+
+        fresh_env.setenv("STORAGE_TYPE", "AZURE")
+        fresh_env.setenv("SUPERTABLE_DUCKDB_PRESIGNED", "0")
+        assert _build_settings().SUPERTABLE_DUCKDB_PRESIGNED is False
+        fresh_env.setenv("STORAGE_TYPE", "MINIO")
+        fresh_env.setenv("SUPERTABLE_DUCKDB_PRESIGNED", "1")
+        assert _build_settings().SUPERTABLE_DUCKDB_PRESIGNED is True
+
     def test_int_and_bool_parsing(self, fresh_env: pytest.MonkeyPatch) -> None:
         fresh_env.setenv("MAX_OVERLAPPING_FILES", "37")
         fresh_env.setenv("IS_SHOW_TIMING", "no")
