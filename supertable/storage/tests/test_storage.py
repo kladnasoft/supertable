@@ -2733,3 +2733,43 @@ class TestAzureFromEnv(unittest.TestCase):
         with patch.object(azure_storage, "settings", self._settings()):
             with self.assertRaises(RuntimeError):
                 azure_storage.AzureBlobStorage.from_env()
+
+    def _from_env_with_container(self, exists=None, create=None):
+        from supertable.storage import azure_storage
+
+        conn = "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=a2V5;EndpointSuffix=core.windows.net"
+        with patch.object(azure_storage, "settings", self._settings(AZURE_STORAGE_CONNECTION_STRING=conn)), \
+                patch.object(azure_storage, "BlobServiceClient") as bsc:
+            container = bsc.from_connection_string.return_value.get_container_client.return_value
+            container.exists.return_value = False
+            if exists is not None:
+                container.exists.side_effect = exists
+            if create is not None:
+                container.create_container.side_effect = create
+            st = azure_storage.AzureBlobStorage.from_env()
+        return st, container
+
+    def test_a_new_account_gets_its_container(self):
+        # A fresh storage account has no containers: every write would fail.
+        st, container = self._from_env_with_container()
+        container.create_container.assert_called_once_with()
+        self.assertEqual(st.container_name, "lake")
+
+    def test_an_existing_container_is_left_alone(self):
+        _, container = self._from_env_with_container(exists=lambda: True)
+        container.create_container.assert_not_called()
+
+    def test_container_created_concurrently_is_fine(self):
+        from azure.core.exceptions import ResourceExistsError
+
+        _, container = self._from_env_with_container(create=ResourceExistsError("ContainerAlreadyExists"))
+        container.create_container.assert_called_once_with()
+
+    def test_refused_or_unreachable_check_does_not_fail_construction(self):
+        # A container-scoped SAS may not see the container; the network may be down.
+        from azure.core.exceptions import ClientAuthenticationError, ServiceRequestError
+
+        for err in (ClientAuthenticationError("AuthorizationFailure"), ServiceRequestError("no route")):
+            st, container = self._from_env_with_container(exists=err)
+            self.assertEqual(st.container_name, "lake")
+            container.create_container.assert_not_called()

@@ -4,7 +4,7 @@ import logging
 import json
 from typing import Dict, Iterator, List, Optional, Tuple
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 import time
 
 
@@ -38,6 +38,7 @@ class Settings:
         self.SUPERTABLE_REDIS_DB: int = _cfg.SUPERTABLE_REDIS_DB
         self.SUPERTABLE_REDIS_PASSWORD: Optional[str] = _cfg.SUPERTABLE_REDIS_PASSWORD or None
         self.SUPERTABLE_REDIS_USERNAME: Optional[str] = _cfg.SUPERTABLE_REDIS_USERNAME or None
+        self.SUPERTABLE_REDIS_SSL: bool = _cfg.SUPERTABLE_REDIS_SSL
 
         self.SUPERTABLE_REDIS_SENTINEL: Optional[str] = str(_cfg.SUPERTABLE_REDIS_SENTINEL) if _cfg.SUPERTABLE_REDIS_SENTINEL else None
         self.SUPERTABLE_REDIS_SENTINELS: Optional[str] = _cfg.SUPERTABLE_REDIS_SENTINELS or None
@@ -341,10 +342,11 @@ def _build_redis_client() -> redis.Redis:
                 db = db_from_url
             except Exception:
                 pass
+        # Percent-encoded: an access key may hold '/', which a URL cannot.
         if u.username:
-            username = u.username
+            username = unquote(u.username)
         if u.password:
-            password = _coerce_password(u.password)
+            password = _coerce_password(unquote(u.password))
 
     # Sentinel detection + options
     sentinel_enabled = (settings.SUPERTABLE_REDIS_SENTINEL or "").strip().lower() in (
@@ -446,7 +448,9 @@ def _build_redis_client() -> redis.Redis:
             ssl=use_ssl,
         )
 
-    # Standard Redis mode
+    # Standard Redis mode. Without a URL, SUPERTABLE_REDIS_SSL decides TLS, as
+    # it does for the catalog's client in redis_connector (Azure Managed Redis
+    # accepts only TLS).
     return redis.Redis(
         host=host,
         port=port,
@@ -454,7 +458,7 @@ def _build_redis_client() -> redis.Redis:
         password=password,
         username=username,
         decode_responses=True,
-        ssl=use_ssl,
+        ssl=use_ssl or (not url and bool(settings.SUPERTABLE_REDIS_SSL)),
     )
 
 

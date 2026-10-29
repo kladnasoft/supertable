@@ -19,8 +19,10 @@ logger = logging.getLogger(__name__)
 
 # Quiet noisy third-party HTTP client loggers.  At DEBUG these emit one line
 # per request (connection setup + every HEAD/GET/PUT), which drowns out
-# SuperTable's own logs.  WARNING keeps genuine connection problems visible.
-for _noisy_logger in ("urllib3", "botocore", "boto3", "s3transfer", "boto"):
+# SuperTable's own logs; the Azure SDK logs every request and response, with
+# all their headers, already at INFO.  WARNING keeps genuine connection
+# problems visible.
+for _noisy_logger in ("urllib3", "botocore", "boto3", "s3transfer", "boto", "azure"):
     logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})

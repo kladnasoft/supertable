@@ -49,6 +49,21 @@ STORAGE_USE_SSL=true
 SUPERTABLE_PREFIX=warehouse
 ```
 
+For Azure Storage with Azure Managed Redis:
+
+```dotenv
+STORAGE_TYPE=AZURE
+AZURE_STORAGE_CONNECTION_STRING="DefaultEndpointsProtocol=https;AccountName=acmedata;AccountKey=<key>;EndpointSuffix=core.windows.net"
+STORAGE_BUCKET=supertable
+SUPERTABLE_REDIS_HOST=acme-redis.westeurope.redis.azure.net
+SUPERTABLE_REDIS_PORT=10000
+SUPERTABLE_REDIS_SSL=true
+SUPERTABLE_REDIS_PASSWORD=<access key>
+SUPERTABLE_REDIS_DB=0
+```
+
+The container is created on first use if it does not exist. Accounts with a hierarchical namespace (Data Lake Gen2) work as well as flat ones. Azure Managed Redis accepts only TLS, on port 10000, and has only database 0. Its database must use the `NoCluster` clustering policy, which can be chosen only when the database is created; see the Redis section below.
+
 Supply storage credentials through the backend's supported environment settings or provider credential mechanism. These examples select data access; they do not create application users or start servers. Backend-specific construction and credential precedence are in [storage](04_storage.md).
 
 ## Application home
@@ -61,9 +76,11 @@ The resolved path is cached. Importing that module changes the process working d
 
 ## Redis settings that the main catalog consumes
 
-[RedisConnector](../supertable/redis_connector.py) uses `SUPERTABLE_REDIS_HOST`, `PORT`, `DB`, `PASSWORD`, `SSL`, and the Sentinel enablement/hosts/master/password settings. Its `RedisOptions` forces decoded responses and strict Sentinel discovery.
+[RedisConnector](../supertable/redis_connector.py) uses `SUPERTABLE_REDIS_HOST`, `PORT`, `DB`, `USERNAME`, `PASSWORD`, `SSL`, `URL`, and the Sentinel enablement/hosts/master/password settings. Its `RedisOptions` forces decoded responses and strict Sentinel discovery.
 
-The main connector does not consume `SUPERTABLE_REDIS_URL`, `SUPERTABLE_REFLECTION_REDIS_URL`, or `SUPERTABLE_REDIS_USERNAME`. Although `SUPERTABLE_REDIS_SENTINEL_STRICT` is declared, the main options builder sets strict mode to true unconditionally. Set host/port/database/password explicitly for the catalog. The settings object's `effective_redis_url` property prefers the reflection URL and then the Redis URL, but that property is not used by this connector.
+`SUPERTABLE_REDIS_URL` (`redis://` or `rediss://`) overrides the host, port, database, username, and password it contains, and its scheme decides TLS. Percent-encode characters such as `/` in a password, as an Azure access key may contain. A username without a password is dropped. The platform client in [redis_infra](../supertable/redis_infra.py) reads these settings the same way. The main connector does not consume `SUPERTABLE_REFLECTION_REDIS_URL`. Although `SUPERTABLE_REDIS_SENTINEL_STRICT` is declared, the main options builder sets strict mode to true unconditionally. The settings object's `effective_redis_url` property prefers the reflection URL and then the Redis URL, but that property is not used by this connector.
+
+The direct client refuses a server in cluster mode with `RedisClusterModeError` when it is built. The catalog updates several keys of a supertable atomically, and a cluster refuses that when the keys hash to different slots. Azure Managed Redis creates databases with the OSS clustering policy unless told otherwise; create the database with `--clustering-policy NoCluster` instead.
 
 Sentinel hosts are comma-separated `host:port` entries; malformed entries are skipped. Sentinel password falls back to the Redis password. If Sentinel is enabled and only a Sentinel password is supplied, it is also used for the Redis master password. With hosts present, failed discovery raises after roughly three seconds; with no hosts, the connector falls back to direct Redis. SSL is passed on the direct branch, but not on its Sentinel branch.
 

@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlparse
 
 
 import redis
@@ -24,8 +25,11 @@ class RedisOptions:
       - SUPERTABLE_REDIS_HOST (default: localhost)
       - SUPERTABLE_REDIS_PORT (default: 6379)
       - SUPERTABLE_REDIS_DB (default: 0)
+      - SUPERTABLE_REDIS_USERNAME (ACL user; ignored without a password)
       - SUPERTABLE_REDIS_PASSWORD
       - SUPERTABLE_REDIS_SSL (default: false)
+      - SUPERTABLE_REDIS_URL (optional, redis:// or rediss:// for TLS; the
+        parts it gives override the settings above, the scheme decides TLS)
 
     Hardcoded (not configurable):
       - decode_responses is always True (all Redis data is JSON text)
@@ -40,6 +44,7 @@ class RedisOptions:
     host: str = field(init=False)
     port: int = field(init=False)
     db: int = field(init=False)
+    username: Optional[str] = field(init=False)
     password: Optional[str] = field(init=False)
     use_ssl: bool = field(init=False)
     decode_responses: bool = field(default=False)
@@ -55,8 +60,30 @@ class RedisOptions:
         host = settings.SUPERTABLE_REDIS_HOST
         port = settings.SUPERTABLE_REDIS_PORT
         db = settings.SUPERTABLE_REDIS_DB
+        username = settings.SUPERTABLE_REDIS_USERNAME or None
         password = settings.SUPERTABLE_REDIS_PASSWORD or None
         use_ssl = settings.SUPERTABLE_REDIS_SSL
+
+        # Same reading of the URL as redis_infra, so the catalog and the
+        # platform clients reach the same server.
+        url = (settings.SUPERTABLE_REDIS_URL or "").strip()
+        if url:
+            u = urlparse(url)
+            if u.scheme not in ("redis", "rediss"):
+                raise ValueError(f"Unsupported Redis URL scheme: {u.scheme}")
+            host = u.hostname or host
+            port = u.port or port
+            if u.path.strip("/"):
+                try:
+                    db = int(u.path.strip("/"))
+                except ValueError:
+                    pass
+            # Percent-encoded: an access key may hold '/', which a URL cannot.
+            if u.username:
+                username = unquote(u.username)
+            if u.password:
+                password = unquote(u.password)
+            use_ssl = u.scheme == "rediss"
 
         # All Redis data is JSON text — always decode responses to str.
         decode = True
@@ -86,12 +113,17 @@ class RedisOptions:
         if is_sentinel and password is None and sentinel_password:
             password = sentinel_password
 
+        # An ACL login needs both; a username alone would fail AUTH.
+        if username and not password:
+            username = None
+
         # Never silently fall back to standalone Redis — fail loud in production.
         sentinel_strict = True
 
         object.__setattr__(self, "host", host)
         object.__setattr__(self, "port", port)
         object.__setattr__(self, "db", db)
+        object.__setattr__(self, "username", username)
         object.__setattr__(self, "password", password)
         object.__setattr__(self, "use_ssl", use_ssl)
         object.__setattr__(self, "decode_responses", decode)
@@ -115,6 +147,7 @@ def _options_cache_key(opts: RedisOptions) -> Tuple[Any, ...]:
         opts.host,
         opts.port,
         opts.db,
+        opts.username,
         opts.password,
         opts.use_ssl,
         opts.is_sentinel,
@@ -165,6 +198,7 @@ def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Red
         sentinel_client = sentinel.master_for(
             opts.sentinel_master,
             db=opts.db,
+            username=opts.username,
             password=opts.password,
             decode_responses=decode_responses,
         )
@@ -199,6 +233,7 @@ def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Red
             host=opts.host,
             port=opts.port,
             db=opts.db,
+            username=opts.username,
             password=opts.password,
             decode_responses=decode_responses,
             ssl=opts.use_ssl,
@@ -230,14 +265,49 @@ def _build_redis_client(opts: RedisOptions, decode_responses: bool) -> redis.Red
     logger.info(
         f"[redis-catalog] Using standard Redis mode. host={opts.host}, port={opts.port}, db={opts.db}"
     )
-    return redis.Redis(
+    client = redis.Redis(
         host=opts.host,
         port=opts.port,
         db=opts.db,
+        username=opts.username,
         password=opts.password,
         decode_responses=decode_responses,
         ssl=opts.use_ssl,
     )
+    _reject_cluster_mode(client, opts)
+    return client
+
+
+class RedisClusterModeError(RuntimeError):
+    """The Redis server runs in cluster mode, which SuperTable cannot use."""
+
+
+def _reject_cluster_mode(client: redis.Redis, opts: RedisOptions) -> None:
+    """Refuse a Redis that has cluster mode on, before anything is written.
+
+    A cluster spreads keys over shards by hash slot. A plain client gets MOVED
+    for every key on another shard, and the catalog's atomic updates (Lua
+    scripts and MULTI/EXEC over several keys of one supertable) fail with
+    CROSSSLOT, so roughly half of all operations would fail at random. Azure
+    Managed Redis creates a database with the OSS clustering policy unless
+    told otherwise.
+
+    The probe runs on the client's own pool, so its connection is the one the
+    first command reuses. If it fails for any other reason, that first
+    command reports the problem, as it did before.
+    """
+    try:
+        enabled = client.info("cluster").get("cluster_enabled")
+    except Exception:
+        return
+    if str(enabled) == "1":
+        raise RedisClusterModeError(
+            f"Redis at {opts.host}:{opts.port} runs in cluster mode. SuperTable needs a "
+            "non-clustered Redis: its catalog updates several keys atomically, which a "
+            "cluster refuses when they hash to different slots. On Azure Managed Redis, "
+            "create the database with --clustering-policy NoCluster (the clustering "
+            "policy cannot be changed on an existing database)."
+        )
 
 
 def close_all_redis_clients() -> None:

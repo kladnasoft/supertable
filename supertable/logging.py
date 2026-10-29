@@ -327,7 +327,7 @@ def configure_logging(
         root.addHandler(h)
 
     # Quiet noisy libraries
-    for noisy in ("httpx", "httpcore", "uvicorn.access", "hpack", "urllib3"):
+    for noisy in ("httpx", "httpcore", "uvicorn.access", "hpack", "urllib3", "azure"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     # Let uvicorn.error through (startup/shutdown messages)

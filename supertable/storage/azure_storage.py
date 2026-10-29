@@ -6,12 +6,13 @@ import os
 import threading
 from datetime import datetime, timedelta, timezone
 
+from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from typing import Any, Dict, List, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import AzureError, ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
 from supertable.storage.storage_interface import StorageInterface
@@ -121,7 +122,27 @@ class AzureBlobStorage(StorageInterface):
         if not container:
             raise RuntimeError("Azure configuration requires STORAGE_BUCKET / AZURE_CONTAINER (or abfss container in SUPERTABLE_HOME)")
 
-        return cls(container_name=container, blob_service_client=svc, base_prefix=base_prefix)
+        storage = cls(container_name=container, blob_service_client=svc, base_prefix=base_prefix)
+        storage._ensure_container_exists()
+        return storage
+
+    def _ensure_container_exists(self) -> None:
+        """Create the container if it is missing, as MinioStorage does its bucket.
+
+        A new storage account has no containers, and without one every write
+        fails with ContainerNotFound. A credential limited to one container
+        (a container SAS, a role scoped to it) may be refused the check or the
+        create, and the account may be unreachable just now; none of that is
+        raised here, so construction behaves as before and the first real
+        operation reports the problem.
+        """
+        try:
+            if not self.container.exists():
+                self.container.create_container()
+        except ResourceExistsError:
+            pass  # another process created it in between
+        except AzureError as e:
+            logger.debug(f"[azure-storage] could not check or create container '{self.container_name}': {e}")
 
     # -------------------------
     # Optional: DuckDB path / presign
