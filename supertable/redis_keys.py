@@ -1055,8 +1055,11 @@ def parse_monitor_partition_key(key: str) -> Optional[Tuple[str, str, str]]:
 # Platform (dataisland:) — service registry + app bootstrap
 # =========================================================================== #
 
+# Core's own services, SDK clients, Lighthouse, and Studio with the executors
+# it registers on their behalf.
 _VALID_SERVICE_TYPES: FrozenSet[str] = frozenset(
-    {"api", "webui", "odata", "mcp", "sdk", "lighthouse"}
+    {"api", "webui", "odata", "mcp", "sdk", "lighthouse",
+     "studio", "python-worker", "spark-worker", "egress-gateway"}
 )
 
 
@@ -1065,8 +1068,9 @@ def registry(
 ) -> str:
     """One service-instance heartbeat key (STRING, TTL 30s).
 
-    ``service_type`` comes from a closed set
-    (``api | webui | odata | mcp | sdk | lighthouse``).
+    ``service_type`` comes from a closed set (``api | webui | odata | mcp |
+    sdk | lighthouse | studio | python-worker | spark-worker |
+    egress-gateway``).
     ``host`` is the OS hostname; ``pid`` is the process id.
     """
     if service_type not in _VALID_SERVICE_TYPES:
