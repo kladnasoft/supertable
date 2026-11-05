@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import socket
 import threading
 import uuid
 from typing import Dict, List, Optional
@@ -41,7 +42,14 @@ for _lib in ("pyhive", "pyhive.hive", "TCLIService", "thrift", "thrift_sasl"):
 # =========================================================
 
 def _spark_timeout_seconds() -> int:
-    """Overall timeout for a Spark Thrift query (connect + setup + execute + fetch).
+    """Overall timeout for a Spark Thrift query once its session is open:
+    setup, views, EXPLAIN and the statement itself, until the statement has
+    run and its result's metadata has been read.
+
+    A result returned as a SparkStreamHandle is fetched outside it, at the
+    consumer's pace, and each batch the handle fetches is bounded by the
+    statement timeout instead. ``execute()`` called without a batch size
+    fetches inside it.
 
     Default: 300 s (5 min).  Override with SUPERTABLE_SPARK_QUERY_TIMEOUT.
     """
@@ -52,10 +60,12 @@ def _spark_timeout_seconds() -> int:
 
 
 def _spark_statement_timeout_seconds() -> int:
-    """Per-statement timeout for individual Thrift cursor.execute() calls.
+    """Per-call timeout for the heavyweight Thrift calls.
 
     Default: 120 s (2 min).  Override with SUPERTABLE_SPARK_STATEMENT_TIMEOUT.
-    Applies to each CREATE VIEW / SET / user-query individually.
+    Applies to the EXPLAIN and the user statement, each on its own, and to
+    each batch a SparkStreamHandle fetches. Views and SETs rely on the overall
+    query timeout.
     """
     try:
         return settings.SUPERTABLE_SPARK_STATEMENT_TIMEOUT
@@ -669,6 +679,53 @@ def _configure_spark_s3(cursor, cluster: Optional[Dict] = None) -> None:
             logger.debug(f"[spark.thrift] SET {key} failed: {e}")
 
 
+def _thrift_socket(conn):
+    """The thrift ``TSocket`` a PyHive connection talks through, or None.
+
+    PyHive wraps it in thrift_sasl's TSaslClientTransport (auth NONE, LDAP,
+    CUSTOM; attribute ``_trans``) or in thrift's TBufferedTransport (NOSASL;
+    the name-mangled ``__trans``), and exposes neither.
+    """
+    transport = getattr(conn, "_transport", None)
+    for attr in ("_trans", "_TBufferedTransport__trans"):
+        inner = getattr(transport, attr, None)
+        if inner is not None:
+            return inner
+    return None
+
+
+def _shutdown_socket(tsocket) -> None:
+    """Fail the Thrift call in flight on *tsocket*, and every later one, at once.
+
+    This is how a call is stopped from another thread. PyHive's client has no
+    lock and HiveServer2 answers one connection's requests in order, so an RPC
+    sent from a second thread — a CancelOperation, or the CloseSession inside
+    ``Connection.close()`` — waits behind the call in flight while both threads
+    read the one socket: they hang, or each takes the other's reply. Closing
+    the descriptor does not wake a blocked ``recv``; ``shutdown`` does. The
+    server closes the session, with its operation and temp views, when it sees
+    the connection go.
+    """
+    sock = getattr(tsocket, "handle", None)
+    if sock is None:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def _close_socket(tsocket) -> None:
+    """Close *tsocket*. PyHive's ``close()`` skips it when its CloseSession
+    fails, as it does on a socket that was shut down."""
+    if tsocket is None:
+        return
+    try:
+        tsocket.close()
+    except Exception:
+        pass
+
+
 def _execute_with_stmt_timeout(
         cursor,
         sql: str,
@@ -680,9 +737,9 @@ def _execute_with_stmt_timeout(
     """Execute a single SQL statement with per-statement timeout enforcement.
 
     If the statement does not complete within *stmt_timeout_s* seconds the
-    connection is forcibly closed (which unblocks any pending Thrift RPC)
-    and the overall *timed_out_event* is set so upstream code can detect
-    the timeout.
+    connection's socket is shut down, which fails the pending Thrift RPC at
+    once (see ``_shutdown_socket``), and the overall *timed_out_event* is set
+    so upstream code can detect the timeout.
 
     Use this for heavyweight operations (user query, EXPLAIN) that may
     hang.  Lightweight DDL (CREATE VIEW, SET) can rely on the overall
@@ -697,10 +754,7 @@ def _execute_with_stmt_timeout(
             f"closing connection: {sql[:120]}"
         )
         timed_out_event.set()
-        try:
-            conn.close()
-        except Exception:
-            pass
+        _shutdown_socket(_thrift_socket(conn))
 
     timer = threading.Timer(stmt_timeout_s, _on_timeout)
     timer.daemon = True
@@ -809,12 +863,15 @@ class SparkThriftExecutor:
         4. Register parquet files as temp views
         5. Create RBAC-filtered views if needed
         6. Rewrite and execute the user query
-        7. Fetch results as pandas DataFrame
+        7. Return a stream handle, or fetch results as a polars DataFrame
         8. Clean up temp views
 
-        The entire flow is guarded by SUPERTABLE_SPARK_QUERY_TIMEOUT (default 300 s).
-        If the timeout fires the connection is forcibly closed, which unblocks any
-        pending Thrift RPC and raises a RuntimeError to the caller.
+        Once the session is open, everything up to the statement's completion
+        is guarded by SUPERTABLE_SPARK_QUERY_TIMEOUT (default 300 s). If the
+        timeout fires the connection's socket is shut down, which fails any
+        pending Thrift RPC at once and raises a RuntimeError to the caller. A
+        returned stream handle bounds each batch it fetches with
+        SUPERTABLE_SPARK_STATEMENT_TIMEOUT.
         """
         query_timeout = _spark_timeout_seconds()
         stmt_timeout = _spark_statement_timeout_seconds()
@@ -829,8 +886,8 @@ class SparkThriftExecutor:
         created_views: List[str] = []
         created_tables: List[str] = []
 
-        # Watchdog: if the overall timeout fires we forcibly close the
-        # connection from a background thread. This causes any blocked
+        # Watchdog: if the overall timeout fires we shut the connection's
+        # socket down from a background thread. This causes any blocked
         # cursor.execute / fetchall to raise an exception immediately.
         _timed_out = threading.Event()
         _conn_ref: List = []  # mutable container so watchdog can see conn
@@ -844,10 +901,7 @@ class SparkThriftExecutor:
                     f"forcibly closing connection"
                 )
                 for c in _conn_ref:
-                    try:
-                        c.close()
-                    except Exception:
-                        pass
+                    _shutdown_socket(_thrift_socket(c))
 
         watchdog = threading.Thread(target=_watchdog, daemon=True, name="spark-timeout")
         watchdog.start()
@@ -1121,7 +1175,7 @@ class SparkThriftExecutor:
                 handle = SparkStreamHandle(
                     cursor=cursor, connection=conn, views=created_views,
                     tables=created_tables, batch_rows=stream_batch_rows,
-                    log_prefix=log_prefix,
+                    log_prefix=log_prefix, fetch_timeout=stmt_timeout,
                 )
                 # Ownership of the cursor, connection and temp views passes to
                 # the handle; the finally block below must not tear down what
@@ -1188,6 +1242,7 @@ class SparkThriftExecutor:
                         conn.close()
                     except Exception:
                         pass
+                    _close_socket(_thrift_socket(conn))
 
 
 # ---------------------------------------------------------------------------
@@ -1312,18 +1367,29 @@ class SparkStreamHandle:
     Teardown is deferred here rather than in ``execute``'s ``finally``: the
     temp views and the connection are what the reader is reading through, so
     dropping them on return would kill the stream.
+
+    Each fetch is bounded by *fetch_timeout* (the statement timeout when not
+    given), because the query's own timeouts end when ``execute`` returns and
+    PyHive's socket has none. A fetch that overruns it, like ``cancel()``,
+    shuts the connection's socket down.
     """
 
     def __init__(self, cursor, connection, views, tables, batch_rows,
-                 log_prefix="", schema=None):
+                 log_prefix="", schema=None, fetch_timeout=None):
         self._cursor = cursor
         self._con = connection
+        self._socket = _thrift_socket(connection)
         self._views = list(views or [])
         self._tables = list(tables or [])
         self._batch_rows = max(1, int(batch_rows))
+        self._fetch_timeout = (_spark_statement_timeout_seconds()
+                               if fetch_timeout is None else fetch_timeout)
         self._log_prefix = log_prefix
         self._closed = False
-        # Same race as the DuckDB handle: cancel must not reach a cursor that
+        #: Why the stream was stopped (cancelled, or a fetch timed out), once
+        #: it has been. The socket is shut down from then on.
+        self._stopped = None
+        # Same race as the DuckDB handle: a stop must not reach a socket that
         # close() is tearing down.
         self._teardown_lock = threading.Lock()
         self.rows_streamed = 0
@@ -1340,7 +1406,7 @@ class SparkStreamHandle:
     def batches(self):
         try:
             while True:
-                rows = self._cursor.fetchmany(self._batch_rows)
+                rows = self._fetchmany()
                 if not rows:
                     break
                 self.rows_streamed += len(rows)
@@ -1348,38 +1414,68 @@ class SparkStreamHandle:
         finally:
             self.close()
 
-    def cancel(self) -> None:
-        """Ask the Thrift server to abandon the operation.
+    def _fetchmany(self):
+        if self._stopped:
+            raise RuntimeError(self._stopped)
+        timer = threading.Timer(self._fetch_timeout, self._stop, args=(
+            f"Spark fetch timed out after {self._fetch_timeout}s",))
+        timer.daemon = True
+        timer.start()
+        try:
+            return self._cursor.fetchmany(self._batch_rows)
+        except Exception as e:
+            if self._stopped:
+                raise RuntimeError(self._stopped) from e
+            raise
+        finally:
+            timer.cancel()
 
-        Safe from another thread; that is the point. PyHive exposes cancel on
-        the cursor, which sends TCancelOperation rather than waiting for the
-        query to finish.
-        """
+    def _stop(self, reason: str) -> None:
+        """Fail the fetch in flight, and every later one; from any thread."""
         with self._teardown_lock:
-            if self._closed:
+            if self._closed or self._stopped:
                 return
-            try:
-                self._cursor.cancel()
-            except Exception as e:
-                logger.debug(
-                    f"{self._log_prefix}[spark.stream] cancel failed: {e}")
+            self._stopped = reason
+            _shutdown_socket(self._socket)
+        logger.debug(f"{self._log_prefix}[spark.stream] {reason}")
+
+    def cancel(self) -> None:
+        """Stop the stream. Safe from another thread; that is the point.
+
+        Nothing is sent to the server: a CancelOperation from a second thread
+        would wait behind the FetchResults ``batches()`` is blocked in, with
+        both threads reading one socket (see ``_shutdown_socket``). The socket
+        is shut down instead, so the fetch in flight raises at once and
+        ``batches()`` closes the handle, and the server drops the session with
+        its operation and temp views. A no-op once closed.
+
+        The fetch raises a RuntimeError that says it was interrupted, which is
+        how the stream-job runner tells a cancelled or expired job from a
+        failed one, as it does with DuckDB's interrupt.
+        """
+        self._stop("Spark stream was interrupted by cancel()")
 
     def close(self) -> None:
         with self._teardown_lock:
             if self._closed:
                 return
             self._closed = True
-        for name in list(self._views) + list(self._tables):
-            try:
-                self._cursor.execute(f"DROP VIEW IF EXISTS {name}")
-            except Exception:
-                pass
-        for obj in (self._cursor, self._con):
-            try:
-                if obj is not None:
-                    obj.close()
-            except Exception:
-                pass
+        # After a stop the socket is shut down and no call would arrive, so
+        # none is made: the server drops the views with the session when it
+        # sees the connection go.
+        if not self._stopped:
+            for name in list(self._views) + list(self._tables):
+                try:
+                    self._cursor.execute(f"DROP VIEW IF EXISTS {name}")
+                except Exception:
+                    pass
+            for obj in (self._cursor, self._con):
+                try:
+                    if obj is not None:
+                        obj.close()
+                except Exception:
+                    pass
+        _close_socket(self._socket)
         if self.on_close is not None:
             try:
                 ncols = len(self.schema) if self.schema is not None else 0

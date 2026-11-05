@@ -139,7 +139,7 @@ reader.stream(
 
 `engine=None` resolves to AUTO. `batch_rows=0` uses `SUPERTABLE_STREAM_BATCH_ROWS`, default `65536`. The handle provides `schema`, `batches()`, `cancel()`, `close()`, and context-manager cleanup. `batches()` closes resources in its `finally` block; explicit context management also cleans up when a consumer stops early.
 
-`cancel()` interrupts the active cursor; `close()` releases resources. These are separate operations. A failed stream preparation raises `RuntimeError` rather than returning a status tuple. Exceptions may also arise while batches are consumed.
+`cancel()` stops the read in flight and is safe to call from another thread. DuckDB interrupts its cursor. Spark shuts its Thrift socket down, and the fetch in flight, or the next one, raises a `RuntimeError` saying the stream was interrupted (see [Query engine](09_query_engine.md#5-spark-execution)). `close()` releases resources. These are separate operations. A failed stream preparation raises `RuntimeError` rather than returning a status tuple. Exceptions may also arise while batches are consumed.
 
 Streaming uses the same table, role, share-filter, and deletion-vector preparation as materialized execution. The ordinary public view hides `__rowid__` and `__timestamp__`. `expose_rowid=True` requests visibility of `__rowid__` in DuckDB's deletion-filtered view for service-level paging; RBAC's allowed-column view can still restrict it.
 

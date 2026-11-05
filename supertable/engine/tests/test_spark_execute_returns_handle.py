@@ -16,6 +16,9 @@ connection standing in for PyHive.
 
 from __future__ import annotations
 
+import socket
+import threading
+import time
 from importlib import import_module
 from types import SimpleNamespace
 
@@ -61,20 +64,37 @@ class _Cursor:
         self.closed = True
 
 
+class _TSocket:
+    """The part of thrift's TSocket the executor touches: ``handle``, ``close``."""
+
+    def __init__(self, sock):
+        self.handle = sock
+
+    def close(self):
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
 class _Conn:
-    def __init__(self):
+    def __init__(self, tsocket=None):
         self.cur = _Cursor()
         self.closed = False
+        self.closed_by = None
+        # PyHive's auth NONE wraps the TSocket in a TSaslClientTransport,
+        # which keeps it as ``_trans``.
+        self._transport = SimpleNamespace(_trans=tsocket)
 
     def cursor(self):
         return self.cur
 
     def close(self):
         self.closed = True
+        self.closed_by = threading.current_thread()
 
 
-def _spark_executor(monkeypatch):
-    conn = _Conn()
+def _spark_executor(monkeypatch, tsocket=None):
+    conn = _Conn(tsocket)
     ex = spark.SparkThriftExecutor.__new__(spark.SparkThriftExecutor)
     ex.storage = None
     ex.organization = "org"
@@ -214,3 +234,57 @@ def test_session_is_torn_down_when_the_handle_cannot_be_built(monkeypatch):
         ex.execute(reflection=reflection, parser=parser, query_manager=None,
                    timer_capture=lambda _evt: None, stream_batch_rows=2)
     assert conn.cur.closed and conn.closed
+
+
+class _BlockingCursor(_Cursor):
+    """The user's SELECT waits on the socket, as PyHive's ExecuteStatement
+    does for its reply, and fails the way PyHive does once it is shut down."""
+
+    def __init__(self, sock):
+        super().__init__()
+        self._sock = sock
+
+    def execute(self, sql):
+        super().execute(sql)
+        if sql == USER_SQL and self._sock.recv(1) == b"":
+            raise EOFError("TSocket read 0 bytes")
+
+
+@pytest.mark.parametrize("which", ["statement", "query"])
+def test_a_timeout_interrupts_the_running_statement(monkeypatch, which):
+    """Both timers closed the connection, and PyHive's close() sends
+    CloseSession over the client the statement is blocked in. The server
+    answers that only after the statement, so the timeout fired when the
+    statement had finished anyway. Both shut the socket down now."""
+    ours, theirs = socket.socketpair()
+    tsocket = _TSocket(ours)
+    ex, conn = _spark_executor(monkeypatch, tsocket)
+    conn.cur = _BlockingCursor(ours)
+    short, long_ = (lambda: 0.3), (lambda: 30)
+    monkeypatch.setattr(spark, "_spark_statement_timeout_seconds",
+                        short if which == "statement" else long_)
+    monkeypatch.setattr(spark, "_spark_timeout_seconds",
+                        short if which == "query" else long_)
+    reflection, parser = _query()
+    outcome = {}
+
+    def run():
+        try:
+            ex.execute(reflection=reflection, parser=parser, query_manager=None,
+                       timer_capture=lambda _evt: None)
+        except Exception as e:
+            outcome["error"] = e
+
+    caller = threading.Thread(target=run, daemon=True)
+    started = time.monotonic()
+    caller.start()
+    caller.join(3)
+    try:
+        assert not caller.is_alive(), "the timeout did not interrupt the statement"
+        assert time.monotonic() - started < 3
+        assert "timed out" in str(outcome.get("error")), outcome
+        # Only the teardown closes the connection, on the caller's thread.
+        assert conn.closed_by is caller
+        assert tsocket.handle is None
+    finally:
+        theirs.close()

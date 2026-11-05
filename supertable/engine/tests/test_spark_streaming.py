@@ -3,18 +3,23 @@
 
 PyHive is not a dependency of the SDK, so these drive ``SparkStreamHandle``
 with a stub cursor that implements the DB-API surface it actually uses —
-``description``, ``fetchmany``, ``cancel``, ``execute``, ``close`` — and hands
-back the values PyHive does: ``str`` for a DATE, ``Decimal`` for a DECIMAL,
+``description``, ``fetchmany``, ``execute``, ``close`` — and hands back the
+values PyHive does: ``str`` for a DATE, ``Decimal`` for a DECIMAL,
 ``datetime`` for a TIMESTAMP, ``str`` for ARRAY, MAP, STRUCT and intervals.
+Cancellation and the fetch timeout are driven through a real socket pair
+standing in for the Thrift socket.
 
-The conversion, batching, schema stability, cancellation and teardown logic
-are covered here; the Thrift round trip itself is not.
+The Thrift round trip itself, with PyHive's client against a server, is in
+``test_spark_thrift_wire.py``, which runs where PyHive is installed.
 """
 
 from __future__ import annotations
 
 import datetime
+import socket
 import sys
+import threading
+import time
 from decimal import Decimal
 from importlib import import_module
 from types import ModuleType, SimpleNamespace
@@ -29,13 +34,12 @@ SparkStreamHandle = spark.SparkStreamHandle
 class _StubCursor:
     """Just enough of a PyHive cursor."""
 
-    def __init__(self, rows, description, fail_cancel=False):
+    def __init__(self, rows, description):
         self._rows = list(rows)
         self.description = description
         self.executed = []
         self.closed = False
         self.cancelled = False
-        self._fail_cancel = fail_cancel
 
     def fetchmany(self, size):
         out, self._rows = self._rows[:size], self._rows[size:]
@@ -45,17 +49,30 @@ class _StubCursor:
         self.executed.append(sql)
 
     def cancel(self):
-        if self._fail_cancel:
-            raise RuntimeError("thrift down")
         self.cancelled = True
 
     def close(self):
         self.closed = True
 
 
+class _StubTSocket:
+    """The part of thrift's TSocket the handle touches: ``handle``, ``close``."""
+
+    def __init__(self, sock):
+        self.handle = sock
+
+    def close(self):
+        if self.handle is not None:
+            self.handle.close()
+            self.handle = None
+
+
 class _StubConn:
-    def __init__(self):
+    def __init__(self, tsocket=None):
         self.closed = False
+        # PyHive's auth NONE wraps the TSocket in a TSaslClientTransport,
+        # which keeps it as ``_trans``.
+        self._transport = SimpleNamespace(_trans=tsocket)
 
     def close(self):
         self.closed = True
@@ -65,8 +82,8 @@ DESC = [("t.a", "BIGINT_TYPE"), ("b", "STRING_TYPE"), ("c", "DOUBLE_TYPE")]
 ROWS = [(i, f"s{i}", i * 1.5) for i in range(250)]
 
 
-def _handle(rows=ROWS, desc=DESC, batch_rows=100, **kw):
-    cur = _StubCursor(rows, desc, **kw)
+def _handle(rows=ROWS, desc=DESC, batch_rows=100):
+    cur = _StubCursor(rows, desc)
     con = _StubConn()
     return SparkStreamHandle(cursor=cur, connection=con,
                              views=["v1"], tables=["t1"],
@@ -195,16 +212,152 @@ def test_close_is_idempotent():
     assert len(cur.executed) == n
 
 
-def test_cancel_reaches_the_server():
-    handle, cur, _ = _handle()
+class _BlockingCursor(_StubCursor):
+    """``fetchmany`` waits on the socket, as PyHive's does for a FetchResults
+    reply, and fails the way PyHive does once the socket is shut down."""
+
+    def __init__(self, sock, description):
+        super().__init__([], description)
+        self._sock = sock
+        self.waiting = threading.Event()
+
+    def fetchmany(self, size):
+        self.waiting.set()
+        if self._sock.recv(1) == b"":
+            raise EOFError("TSocket read 0 bytes")
+        return [(1, "x", 1.0)]
+
+
+@pytest.fixture()
+def blocked_handle():
+    ours, server = socket.socketpair()
+    tsocket = _StubTSocket(ours)
+    cur, con = _BlockingCursor(ours, DESC), _StubConn(tsocket)
+    handle = SparkStreamHandle(cursor=cur, connection=con, views=["v1"],
+                               tables=["t1"], batch_rows=100, fetch_timeout=30)
+    yield handle, cur, con, tsocket
+    handle.close()
+    server.close()
+
+
+def _drain_in_thread(handle):
+    outcome = {}
+
+    def run():
+        try:
+            outcome["rows"] = sum(b.num_rows for b in handle.batches())
+        except Exception as e:
+            outcome["error"] = e
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread, outcome
+
+
+def test_cancel_from_another_thread_ends_the_fetch_in_flight(blocked_handle):
+    """cancel() used to send CancelOperation on the Thrift client the reader
+    was blocked in: both threads then read one socket and hung, holding the
+    teardown lock. It sends nothing now; it shuts the socket down."""
+    handle, cur, con, tsocket = blocked_handle
+    reader, outcome = _drain_in_thread(handle)
+    assert cur.waiting.wait(2)
+
+    canceller = threading.Thread(target=handle.cancel, daemon=True)
+    canceller.start()
+    canceller.join(0.5)
+    assert not canceller.is_alive(), "cancel() blocked"
+    reader.join(2)
+
+    assert not reader.is_alive(), "the blocked fetch was not interrupted"
+    assert isinstance(outcome.get("error"), RuntimeError), outcome
+    assert "interrupted by cancel()" in str(outcome["error"])
+    assert not cur.cancelled, "cancel() must not make a Thrift call"
+    # The server drops the session and its temp views with the connection;
+    # a DROP VIEW or CloseSession could not reach it any more.
+    assert cur.executed == [] and not cur.closed and not con.closed
+    assert tsocket.handle is None, "the socket must still be closed"
+
+
+def test_a_fetch_that_overruns_the_fetch_timeout_is_stopped(blocked_handle):
+    """execute()'s timeouts end when it returns the handle, and PyHive's
+    socket has none, so a stalled fetch held the reader for good."""
+    handle, _cur, _con, tsocket = blocked_handle
+    handle._fetch_timeout = 0.2
+    reader, outcome = _drain_in_thread(handle)
+    reader.join(2)
+    assert not reader.is_alive(), "the stalled fetch was not stopped"
+    assert "Spark fetch timed out after 0.2s" in str(outcome.get("error")), outcome
+    assert tsocket.handle is None
+
+
+class _JobStore:
+    """What ``run_job`` asks of its JobStore, kept in memory."""
+
+    def __init__(self, cancelled):
+        self._cancelled = cancelled
+
+    def update(self, rec, **fields):
+        for name, value in fields.items():
+            setattr(rec, name, value)
+
+    def set_state(self, rec, state, error=""):
+        rec.state, rec.error = state, error
+
+    def is_cancelled(self, organization, job_id):
+        return self._cancelled
+
+
+@pytest.mark.parametrize("cancelled, deadline_in, ends", [
+    (True, 0.0, ("cancelled", "cancelled by request")),
+    (False, 0.2, ("expired", "deadline exceeded")),
+])
+def test_a_stream_job_its_watcher_stops_is_cancelled_or_expired(
+        blocked_handle, monkeypatch, cancelled, deadline_in, ends):
+    """The job runner's watcher cancels the handle of a job that is cancelled
+    or past its deadline. The runner records that as cancelled or expired
+    only when the read's error says it was interrupted, as DuckDB's does;
+    any other error marks the job failed."""
+    from supertable.streaming import runner
+    from supertable.streaming.jobs import JobRecord
+
+    handle, _cur, _con, _tsocket = blocked_handle
+    monkeypatch.setattr(import_module("supertable.data_reader"), "DataReader",
+                        lambda **_kw: SimpleNamespace(stream=lambda **_kw: handle))
+    rec = JobRecord(job_id="job-1", organization="org", super_name="s",
+                    sql="SELECT 1", role_name="r",
+                    deadline_ts=time.time() + deadline_in if deadline_in else 0.0)
+
+    job = threading.Thread(target=runner.run_job, args=(rec, _JobStore(cancelled)),
+                           kwargs={"storage": object()}, daemon=True)
+    job.start()
+    job.join(5)
+    assert not job.is_alive(), "the job never stopped"
+    assert (rec.state, rec.error) == ends
+
+
+def test_cancel_before_reading_fetches_nothing():
+    handle, cur, con = _handle()
     handle.cancel()
-    assert cur.cancelled
+    with pytest.raises(RuntimeError, match=r"interrupted by cancel\(\)"):
+        list(handle.batches())
+    assert cur._rows == ROWS, "nothing may be fetched after a cancel"
+    assert not cur.cancelled
 
 
-def test_cancel_failure_is_not_fatal():
-    """Cancelling a query that already finished must not raise at the caller."""
-    handle, _, _ = _handle(fail_cancel=True)
-    handle.cancel()          # must not raise
+def test_cancel_after_close_is_a_no_op():
+    handle, cur, con = _handle()
+    list(handle.batches())
+    handle.cancel()
+    assert handle._stopped is None and not cur.cancelled
+    assert cur.closed and con.closed
+
+
+def test_fetches_within_the_timeout_are_not_stopped():
+    handle, cur, _ = _handle(batch_rows=100)
+    handle._fetch_timeout = 5
+    assert sum(b.num_rows for b in handle.batches()) == len(ROWS)
+    assert handle._stopped is None
+    assert [s for s in cur.executed if "DROP VIEW" in s], cur.executed
 
 
 def test_rows_streamed_and_on_close_feed_monitoring():
