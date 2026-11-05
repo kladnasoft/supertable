@@ -34,7 +34,6 @@ See [mirroring](13_mirroring.md) and [audit](12_audit.md).
 - [ ] Reconcile snapshot schema representations. The normal schema collector returns a dictionary, but `schemaString` serializes that value as `fields` in a struct; ordinary writes also record the incoming frame rather than a union over every retained resource. Sources: [schema collector](../supertable/utils/helper.py), [snapshot update](../supertable/simple_table.py).
 - [ ] Align declared Redis settings with connector behavior. The main connector does not consume the URL/username settings, forces decoded responses and strict Sentinel selection, and does not pass the direct-client SSL option to its Sentinel branch. Sources: [settings](../supertable/config/settings.py), [connector](../supertable/redis_connector.py).
 - [ ] Align engine configuration with routing. AUTO uses active clusters and their byte thresholds; declared lite byte/freshness controls do not participate in that decision. The executor supplies the `lite` configuration for DuckDB execution. Sources: [runtime configuration](../supertable/engine/engine_config.py), [executor](../supertable/engine/executor.py).
-- [ ] Reconcile version literals. `pyproject.toml` and `supertable.__version__` say `3.3.0`; `setup.py` declares `3.0.7`. Sources: [project metadata](../pyproject.toml), [package version](../supertable/__init__.py), [setup invocation](../setup.py).
 
 See [configuration](02_configuration.md) and [Python SDK](15_python_sdk.md).
 
