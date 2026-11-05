@@ -110,6 +110,32 @@ def _leaf_to_snapshot_like(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _cols_count(snapshot: Any) -> int:
+    """A table's column count, from its snapshot's resources.
+
+    The distinct column names across the resources whose ``columns`` is a list
+    (of names, or of ``{"name": ...}`` items). Without a single name, the
+    largest integer ``columns`` a resource records, which is what the writer
+    stores. 0 for a table without resources. ``get_super_meta`` reports this
+    per table and ``get_table_stats`` per item, so the two cannot disagree.
+    """
+    resources = snapshot.get("resources", []) if isinstance(snapshot, dict) else []
+    names = set()
+    widest = 0
+    for res in resources if isinstance(resources, list) else []:
+        if isinstance(res, dict):
+            cols = res.get("columns")
+            if isinstance(cols, list):
+                for cn in cols:
+                    if isinstance(cn, str):
+                        names.add(cn)
+                    elif isinstance(cn, dict) and cn.get("name"):
+                        names.add(cn["name"])
+            elif isinstance(cols, (int, float)) and int(cols) > widest:
+                widest = int(cols)
+    return len(names) if names else widest
+
+
 def _schema_to_dict(schema_obj: Any) -> Dict[str, Any]:
     """Normalize schema representations into a {name: type} dict."""
     if isinstance(schema_obj, dict):
@@ -315,6 +341,10 @@ class MetaReader:
     def get_table_stats(self, table_name: str, role_name: str) -> List[Dict[str, Any]]:
         """Snapshot statistics for one named table.
 
+        An item is the table's snapshot without ``previous_snapshot``,
+        ``schema`` and ``location``, plus its ``cols_count``: the column count
+        ``get_super_meta`` reports for the same table.
+
         Raises ``PermissionError`` when the role lacks META on it. Returning
         ``[]`` made a denial look identical to an empty table, which for a
         stats endpoint is the difference between "you may not ask" and "the
@@ -339,7 +369,8 @@ class MetaReader:
                         self.super_table, table, create_if_missing=False,
                     )
                     st_data, _ = st.get_simple_table_snapshot()
-                    stats.append(_prune_dict(st_data, keys_to_remove))
+                    stats.append({**_prune_dict(st_data, keys_to_remove),
+                                  "cols_count": _cols_count(st_data)})
                 except (FileNotFoundError, KeyError, TableNotFoundError):
                     logger.debug("Simple table snapshot missing for %s", table)
                     continue
@@ -350,7 +381,8 @@ class MetaReader:
                     self.super_table, table_name, create_if_missing=False,
                 )
                 st_data, _ = st.get_simple_table_snapshot()
-                stats.append(_prune_dict(st_data, keys_to_remove))
+                stats.append({**_prune_dict(st_data, keys_to_remove),
+                              "cols_count": _cols_count(st_data)})
             except (FileNotFoundError, KeyError, TableNotFoundError):
                 logger.debug("Simple table snapshot missing for %s", table_name)
                 return []
@@ -473,22 +505,7 @@ class MetaReader:
                 tombstone_rows = st_data.get("tombstone_rows", 0) if isinstance(st_data, dict) else 0
                 table_rows = max(0, table_rows - int(tombstone_rows or 0))
                 table_size = sum(res.get("file_size", 0) for res in resources if isinstance(res, dict))
-
-                # Column count: count distinct column names across all resources
-                _col_names = set()
-                _col_int_max = 0
-                for res in resources:
-                    if isinstance(res, dict):
-                        _cols = res.get("columns")
-                        if isinstance(_cols, list):
-                            for cn in _cols:
-                                if isinstance(cn, str):
-                                    _col_names.add(cn)
-                                elif isinstance(cn, dict) and cn.get("name"):
-                                    _col_names.add(cn["name"])
-                        elif isinstance(_cols, (int, float)) and int(_cols) > _col_int_max:
-                            _col_int_max = int(_cols)
-                table_cols = len(_col_names) if _col_names else _col_int_max
+                table_cols = _cols_count(st_data)
 
                 simple_table_info.append({
                     "name": table,

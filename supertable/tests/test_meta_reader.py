@@ -1335,3 +1335,99 @@ class TestMetaScope:
 
         with pytest.raises(PermissionError, match="no wildcard grant"):
             reader.get_table_schema("sales", "coincidence")
+
+
+# ===========================================================================
+# cols_count — one column count for the stats and the meta
+# ===========================================================================
+
+#: A table's resources in each form the count reads, and the count it owes.
+_COLUMN_SNAPSHOTS = {
+    "names": ({"resources": [
+        {"file": "f1", "rows": 1, "file_size": 10, "columns": ["id", "amount"]},
+        {"file": "f2", "rows": 1, "file_size": 10, "columns": ["id", "region"]},
+    ]}, 3),
+    "name items": ({"resources": [
+        {"file": "f1", "rows": 1, "file_size": 10,
+         "columns": [{"name": "id", "type": "Int64"}, {"name": "amount"}]},
+        {"file": "f2", "rows": 1, "file_size": 10, "columns": [{"name": "id"}]},
+    ]}, 2),
+    "integer counts": ({"resources": [
+        {"file": "f1", "rows": 1, "file_size": 10, "columns": 4},
+        {"file": "f2", "rows": 1, "file_size": 10, "columns": 6},
+    ]}, 6),
+    "names over counts": ({"resources": [
+        {"file": "f1", "rows": 1, "file_size": 10, "columns": ["id"]},
+        {"file": "f2", "rows": 1, "file_size": 10, "columns": 9},
+    ]}, 1),
+    "no resources": ({"schema": [{"name": "id", "type": "Int64"}]}, 0),
+    "empty resources": ({"resources": [], "schema": [{"name": "id"}]}, 0),
+}
+
+
+class TestColsCount:
+    """``get_table_stats`` and ``get_super_meta`` report one column count.
+
+    Stats items carried no ``cols_count`` while the meta computed one inline,
+    so a client reading stats could only show the count as unknown. Both now
+    take it from ``_cols_count``, so they cannot disagree about a table.
+    """
+
+    def setup_method(self):
+        import supertable.meta_reader as mod
+        with mod._SUPER_META_CACHE_LOCK:
+            mod._SUPER_META_CACHE.clear()
+
+    @pytest.mark.parametrize(
+        "snapshot, expected", list(_COLUMN_SNAPSHOTS.values()),
+        ids=list(_COLUMN_SNAPSHOTS),
+    )
+    @patch(f"{_MOD}._super_meta_cache_ttl_s", return_value=0.0)
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_META)
+    def test_stats_report_the_count_the_meta_reports(
+        self, mock_check, MockST, mock_ttl, snapshot, expected,
+    ):
+        reader = _make_reader("sup", "org")
+        reader.catalog.get_root.return_value = {"version": 1, "ts": 0}
+        _wire_catalog_scan(
+            reader.catalog, "supertable:org:lakes:sup:meta:leaf:doc:events",
+        )
+        # The meta takes a leaf that holds a resource list and otherwise
+        # reads storage, which is where the stats always read.
+        reader.catalog.r.mget.return_value = [json.dumps(snapshot).encode()]
+        MockST.return_value.get_simple_table_snapshot.return_value = (
+            json.loads(json.dumps(snapshot)), "/path",
+        )
+
+        stats = reader.get_table_stats("events", "admin")
+        meta = reader.get_super_meta("admin")
+
+        assert [item["cols_count"] for item in stats] == [expected]
+        assert [t["cols_count"] for t in meta["super"]["tables"]] == [expected]
+
+    @patch(_P_SIMPLE_TABLE)
+    @patch(_P_CHECK_META)
+    def test_aggregate_stats_count_each_table(self, mock_check, MockST):
+        reader = _make_reader("sup", "org")
+        _wire_catalog_scan(
+            reader.catalog,
+            "supertable:org:lakes:sup:meta:leaf:doc:t1",
+            "supertable:org:lakes:sup:meta:leaf:doc:t2",
+        )
+        snapshots = iter([_COLUMN_SNAPSHOTS["names"][0],
+                          _COLUMN_SNAPSHOTS["integer counts"][0]])
+        MockST.return_value.get_simple_table_snapshot.side_effect = (
+            lambda: (dict(next(snapshots)), "/p")
+        )
+
+        stats = reader.get_table_stats("sup", "admin")
+        assert [item["cols_count"] for item in stats] == [3, 6]
+
+    def test_resources_that_are_not_a_list_count_nothing(self):
+        from supertable.meta_reader import _cols_count
+
+        assert _cols_count(None) == 0
+        assert _cols_count({"resources": None}) == 0
+        assert _cols_count({"resources": {"f1": {"columns": 3}}}) == 0
+        assert _cols_count({"resources": ["f1", {"columns": 2}]}) == 2
