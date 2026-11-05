@@ -314,7 +314,9 @@ class DuckDBEngine:
         once on the shared connection and read from the cursor; meanwhile the
         shared connection stays free for other queries, and ``interrupt()`` on
         the cursor cancels THIS stream without touching anything else. Both are
-        verified in test_streaming_engine.
+        verified in test_streaming_engine. A cursor does not inherit its
+        parent's session settings, so it gets the connection's object-storage
+        configuration and runtime pragmas of its own before the query runs.
 
         The caller must close the returned handle. Views and deletion-vector
         references stay alive until it does — they are what the reader is
@@ -398,9 +400,8 @@ class DuckDBEngine:
             # table with no resources has no footer to take a schema from.
             alias_to_column_types[td.alias] = dict(sup.column_types or {})
 
-        self._ensure_httpfs(
-            con, [f for files in alias_to_files.values() for f in files],
-        )
+        paths = [f for files in alias_to_files.values() for f in files]
+        self._ensure_httpfs(con, paths)
 
         created_views: List[str] = []
         acquired_dv_keys: List[str] = []
@@ -414,7 +415,16 @@ class DuckDBEngine:
             )
             apply_runtime_pragmas(con, engine_config)
 
+            # The cursor shares the connection's views and global settings
+            # (memory_limit, threads), but its session settings start at
+            # DuckDB's defaults: no S3 endpoint, region or credentials, vhost
+            # URLs, TLS on, a 30 s HTTP timeout. A scan run on it would go to
+            # AWS without credentials rather than to the store the views were
+            # bound against, so configure it as the connection was, in the
+            # same order.
             cursor = con.cursor()
+            configure_httpfs_and_s3(cursor, paths)
+            apply_runtime_pragmas(cursor, engine_config)
             rows = int(batch_rows or settings.SUPERTABLE_STREAM_BATCH_ROWS)
             logger.debug(f"{log_prefix}[duckdb.stream] {executing_query}")
             result = cursor.execute(executing_query)

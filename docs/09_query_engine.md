@@ -70,7 +70,7 @@ Explicit `Engine.DUCKDB` bypasses routing. Explicit `Engine.SPARK_SQL` requests 
 
 ## 4. DuckDB execution
 
-DuckDB keeps a connection in thread-local state. Each query creates views over its selected Parquet files with `union_by_name=TRUE` and `HIVE_PARTITIONING=FALSE`.
+DuckDB keeps a connection in thread-local state. Each query creates views over its selected Parquet files with `union_by_name=TRUE` and `HIVE_PARTITIONING=FALSE`, then runs on a cursor of that connection. A cursor sees the connection's views and its global settings, such as the memory limit and thread count, but starts its own session settings at DuckDB's defaults: no S3 endpoint, region or credentials, `vhost` URLs, TLS on, and a 30-second HTTP timeout. The engine therefore applies the object-storage configuration and the runtime settings to the cursor as it did to the connection, in the same order, before the query runs on it.
 
 The view chain is:
 
