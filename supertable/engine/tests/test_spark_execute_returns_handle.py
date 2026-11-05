@@ -186,7 +186,9 @@ def test_executor_materializes_spark_rows(monkeypatch):
 
 
 def test_variable_substitution_is_off_before_any_user_sql(monkeypatch):
-    """${spark.hadoop.fs.s3a.secret.key} must not expand inside user SQL."""
+    """${spark.hadoop.fs.s3a.secret.key} must not expand inside user SQL:
+    not in the SELECT, and not in the EXPLAIN EXTENDED run ahead of it, whose
+    plan text is kept in the query profile and the monitoring row."""
     ex, conn = _spark_executor(monkeypatch)
     reflection, parser = _query()
 
@@ -195,10 +197,12 @@ def test_variable_substitution_is_off_before_any_user_sql(monkeypatch):
 
     executed = conn.cur.executed
     off = executed.index("SET spark.sql.variable.substitute=false")
-    assert off < executed.index("SELECT id, name FROM t")
+    carrying = [i for i, sql in enumerate(executed) if USER_SQL in sql]
+    assert [executed[i] for i in carrying] == [f"EXPLAIN EXTENDED {USER_SQL}", USER_SQL]
+    assert off < carrying[0]
 
 
-def test_no_query_runs_when_substitution_cannot_be_turned_off(monkeypatch):
+def test_no_user_sql_runs_when_substitution_cannot_be_turned_off(monkeypatch):
     ex, conn = _spark_executor(monkeypatch)
     reflection, parser = _query()
     plain = conn.cur.execute
@@ -213,7 +217,9 @@ def test_no_query_runs_when_substitution_cannot_be_turned_off(monkeypatch):
     with pytest.raises(RuntimeError, match="not modifiable"):
         ex.execute(reflection=reflection, parser=parser, query_manager=None,
                    timer_capture=lambda _evt: None)
-    assert not any(sql.startswith("SELECT") for sql in conn.cur.executed)
+    assert not any(USER_SQL in sql for sql in conn.cur.executed), conn.cur.executed
+    # The session is torn down, not left open with the refusal.
+    assert conn.cur.closed and conn.closed
 
 
 class _MetadataFailsCursor(_Cursor):
