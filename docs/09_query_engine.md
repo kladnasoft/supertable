@@ -64,7 +64,7 @@ AUTO examines active Spark cluster registrations for the organization:
 
 Spark's subsequent cluster selection also enforces each cluster's `max_bytes` when positive and selects randomly among eligible active clusters. AUTO's first decision does not check the maximum ranges, so it can select Spark and then fail because no cluster accepts that job size. It does not automatically retry the query on DuckDB.
 
-Explicit `Engine.DUCKDB` bypasses routing. Explicit `Engine.SPARK_SQL` in the materialized executor requests a cluster with `force=True`, bypassing cluster byte ranges while still requiring an active cluster. The streaming executor does not pass that force flag.
+Explicit `Engine.DUCKDB` bypasses routing. Explicit `Engine.SPARK_SQL` requests a cluster with `force=True` in both the materialized and the streaming executor, bypassing cluster byte ranges while still requiring an active cluster.
 
 `engine_lite_max_bytes` and `engine_freshness_sec` are present in configuration but do not participate in `Executor._auto_pick()`. The current executor always uses the `lite` DuckDB configuration; it does not select a separate `pro` execution implementation.
 

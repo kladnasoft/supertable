@@ -25,6 +25,8 @@ from types import SimpleNamespace
 import pyarrow as pa
 import pytest
 
+from supertable.redis_catalog import RedisCatalog
+
 spark = import_module("supertable.engine.spark_thrift")
 executor_mod = import_module("supertable.engine.executor")
 
@@ -108,15 +110,26 @@ def _spark_executor(monkeypatch, tsocket=None):
     return ex, conn
 
 
-def _query():
+def _query(reflection_bytes=0):
     reflection = SimpleNamespace(
-        reflection_bytes=0, supers=[], rbac_views={}, tombstone_views={},
+        reflection_bytes=reflection_bytes, supers=[], rbac_views={},
+        tombstone_views={},
     )
     parser = SimpleNamespace(
         get_table_tuples=lambda: [], original_query=USER_SQL,
         executing_query=None,
     )
     return reflection, parser
+
+
+def _executor(ex, monkeypatch):
+    executor = executor_mod.Executor.__new__(executor_mod.Executor)
+    executor.organization = "org"
+    executor.spark_exec = ex
+    monkeypatch.setattr(executor_mod, "resolve_engine_configs",
+                        lambda *_a, **_k: {"lite": None, "pro": None})
+    monkeypatch.setattr(executor, "_get_catalog", lambda: None, raising=False)
+    return executor
 
 
 def test_streamed_execute_returns_the_handle(monkeypatch):
@@ -158,12 +171,7 @@ def test_executor_materializes_spark_rows(monkeypatch):
     ex, _conn = _spark_executor(monkeypatch)
     reflection, parser = _query()
 
-    executor = executor_mod.Executor.__new__(executor_mod.Executor)
-    executor.organization = "org"
-    executor.spark_exec = ex
-    monkeypatch.setattr(executor_mod, "resolve_engine_configs",
-                        lambda *_a, **_k: {"lite": None, "pro": None})
-    monkeypatch.setattr(executor, "_get_catalog", lambda: None, raising=False)
+    executor = _executor(ex, monkeypatch)
     plan_stats = SimpleNamespace(add_stat=lambda _s: None)
     timer = SimpleNamespace(capture_and_reset_timing=lambda _e: None)
 
@@ -234,6 +242,37 @@ def test_session_is_torn_down_when_the_handle_cannot_be_built(monkeypatch):
         ex.execute(reflection=reflection, parser=parser, query_manager=None,
                    timer_capture=lambda _evt: None, stream_batch_rows=2)
     assert conn.cur.closed and conn.closed
+
+
+class _SelCatalog(RedisCatalog):
+    """RedisCatalog with a canned cluster list (no Redis connection)."""
+
+    def __init__(self, clusters):
+        self._clusters = clusters
+
+    def list_spark_clusters(self, org):
+        return self._clusters
+
+
+def test_forced_stream_ignores_the_cluster_size_window(monkeypatch):
+    """Executor.execute asks for Spark with force=True; Executor.stream did
+    not, so the same forced query failed cluster selection when streamed."""
+    ex, _conn = _spark_executor(monkeypatch)
+    ex.catalog = _SelCatalog([{
+        "status": "active", "cluster_id": "big", "name": "big",
+        "thrift_host": "spark.invalid", "thrift_port": 10000,
+        "min_bytes": 10 * 1024 ** 3, "max_bytes": 0,
+    }])
+    reflection, parser = _query(reflection_bytes=4096)
+    executor = _executor(ex, monkeypatch)
+    timer = SimpleNamespace(capture_and_reset_timing=lambda _e: None)
+
+    handle = executor.stream(
+        reflection=reflection, parser=parser, query_manager=None, timer=timer,
+        log_prefix="", engine=executor_mod.Engine.SPARK_SQL, batch_rows=2,
+    )
+    assert isinstance(handle, spark.SparkStreamHandle)
+    assert sum(b.num_rows for b in handle.batches()) == len(ROWS)
 
 
 class _BlockingCursor(_Cursor):

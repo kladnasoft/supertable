@@ -203,6 +203,7 @@ class Executor:
                 query_manager=query_manager,
                 timer_capture=timer_capture,
                 log_prefix=log_prefix,
+                force=(engine == Engine.SPARK_SQL),
                 stream_batch_rows=rows,
             )
 
