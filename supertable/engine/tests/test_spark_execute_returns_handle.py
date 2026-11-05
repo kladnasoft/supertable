@@ -20,12 +20,14 @@ from importlib import import_module
 from types import SimpleNamespace
 
 import pyarrow as pa
+import pytest
 
 spark = import_module("supertable.engine.spark_thrift")
 executor_mod = import_module("supertable.engine.executor")
 
 DESC = [("id", "BIGINT_TYPE"), ("name", "STRING_TYPE")]
 ROWS = [(1, "a"), (2, "b"), (3, "c")]
+USER_SQL = "SELECT id, name FROM t"
 
 
 class _Cursor:
@@ -91,7 +93,7 @@ def _query():
         reflection_bytes=0, supers=[], rbac_views={}, tombstone_views={},
     )
     parser = SimpleNamespace(
-        get_table_tuples=lambda: [], original_query="SELECT id, name FROM t",
+        get_table_tuples=lambda: [], original_query=USER_SQL,
         executing_query=None,
     )
     return reflection, parser
@@ -179,9 +181,36 @@ def test_no_query_runs_when_substitution_cannot_be_turned_off(monkeypatch):
         plain(sql)
 
     conn.cur.execute = refuse
-    import pytest
 
     with pytest.raises(RuntimeError, match="not modifiable"):
         ex.execute(reflection=reflection, parser=parser, query_manager=None,
                    timer_capture=lambda _evt: None)
     assert not any(sql.startswith("SELECT") for sql in conn.cur.executed)
+
+
+class _MetadataFailsCursor(_Cursor):
+    """GetResultSetMetadata fails once the user's SELECT has run."""
+
+    @property
+    def description(self):
+        if self.executed and self.executed[-1] == USER_SQL:
+            raise RuntimeError("GetResultSetMetadata: TTransportException")
+        return self._description
+
+    @description.setter
+    def description(self, value):
+        self._description = value
+
+
+def test_session_is_torn_down_when_the_handle_cannot_be_built(monkeypatch):
+    """Building the handle reads the result's metadata over Thrift. The
+    executor marked the session as the handle's before that, so a failure
+    there left the session, its cursor and its views open with no owner."""
+    ex, conn = _spark_executor(monkeypatch)
+    conn.cur = _MetadataFailsCursor()
+    reflection, parser = _query()
+
+    with pytest.raises(RuntimeError, match="GetResultSetMetadata"):
+        ex.execute(reflection=reflection, parser=parser, query_manager=None,
+                   timer_capture=lambda _evt: None, stream_batch_rows=2)
+    assert conn.cur.closed and conn.closed

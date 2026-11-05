@@ -1118,19 +1118,22 @@ class SparkThriftExecutor:
 
             # 7. Return the rows — streamed, or collected.
             if stream_batch_rows:
+                handle = SparkStreamHandle(
+                    cursor=cursor, connection=conn, views=created_views,
+                    tables=created_tables, batch_rows=stream_batch_rows,
+                    log_prefix=log_prefix,
+                )
                 # Ownership of the cursor, connection and temp views passes to
                 # the handle; the finally block below must not tear down what
-                # the reader is still reading through.
+                # the reader is still reading through. Only once the handle
+                # exists: building it reads the result's metadata over Thrift,
+                # and if that fails nothing else would close the session.
                 handed_to_stream = True
                 logger.info(
                     f"{log_prefix}[spark.thrift] streaming result in batches "
                     f"of {stream_batch_rows}"
                 )
-                return SparkStreamHandle(
-                    cursor=cursor, connection=conn, views=created_views,
-                    tables=created_tables, batch_rows=stream_batch_rows,
-                    log_prefix=log_prefix,
-                )
+                return handle
 
             # Buffered fallback. Executor always streams, but execute() is
             # called directly too, so this stays — returning polars rather than
