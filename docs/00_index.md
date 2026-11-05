@@ -40,4 +40,4 @@ The SDK walkthrough uses `acme` as the organization, `warehouse` as the SuperTab
 
 Defaults describe declarations and their actual consumers. A declared option does not necessarily affect every path, and the chapters call out unused or overridden settings. Method names are not treated as guarantees: for example, catalog methods named `*_cas` do not accept an expected version.
 
-Source links point to implementation files so behavior can be checked when code changes. SDK examples explicitly select DuckDB because of the currently documented Spark result-delivery limitation. External services are prerequisites where stated; listing an integration or helper does not imply that this library starts an HTTP server or a worker for it.
+Source links point to implementation files so behavior can be checked when code changes. SDK examples explicitly select DuckDB, which runs in the Python process and needs no Spark cluster. External services are prerequisites where stated; listing an integration or helper does not imply that this library starts an HTTP server or a worker for it.

@@ -211,7 +211,7 @@ finished = store.get("example_org", job.job_id)
 print(finished.state if finished else "expired metadata")
 ```
 
-`submit_and_run(..., background=True, deadline_sec=None, batch_rows=0, fullscan=False, store=None)` starts a daemon thread by default. `background=False` runs in the caller. The job runner invokes `DataReader.stream()` with AUTO; this helper currently has no engine argument, so the Spark limitation also applies when AUTO selects Spark.
+`submit_and_run(..., background=True, deadline_sec=None, batch_rows=0, fullscan=False, store=None)` starts a daemon thread by default. `background=False` runs in the caller. The job runner invokes `DataReader.stream()` with AUTO; this helper has no engine argument.
 
 Job states are `pending`, `running`, `done`, `failed`, `cancelled`, and `expired`. Chunk paths are `<organization>/_query_jobs/<job_id>/chunk-000000.arrow`, with zero-based chunk indices. The record tracks rows, serialized bytes, chunk count, acknowledgement position, owner, deadline, error, and serialized Arrow schema.
 

@@ -161,7 +161,7 @@ Accepted types are `plans`, `writes`, `mcp`, `odata`, `errors`, `locks`, and `co
 | `registry` | `dataisland:<org>:registry:<service_type>:<host>:<pid>` |
 | `app_master_mcp` | `dataisland:_apps_:doc:<app_name>:master_mcp` |
 
-Registry service types are `api`, `webui`, `odata`, `mcp`, `sdk`, and `lighthouse`. Host must be a nonempty string without a colon; it is not validated using the ordinary segment regex. PID must convert to a positive integer. `parse_registry_key()` extracts `(org, service_type, host, pid)` as strings from a matching prefix.
+Registry service types are `api`, `webui`, `odata`, `mcp`, `sdk`, `lighthouse`, `studio`, `python-worker`, `spark-worker`, and `egress-gateway`. Host must be a nonempty string without a colon; it is not validated using the ordinary segment regex. PID must convert to a positive integer. `parse_registry_key()` extracts `(org, service_type, host, pid)` as strings from a matching prefix.
 
 These builders do not choose a Redis type, expiry, heartbeat interval, or payload. A service using them must supply those behaviors.
 
