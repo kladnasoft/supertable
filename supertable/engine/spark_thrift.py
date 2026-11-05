@@ -1191,10 +1191,16 @@ class SparkThriftExecutor:
 # Streaming
 # ---------------------------------------------------------------------------
 
-#: HiveServer2 type names -> Arrow. The schema is fixed once from the cursor
-#: description so every batch shares it; inferring per batch would let an
-#: all-NULL column in one batch disagree with a typed column in the next, and
-#: pyarrow would then refuse to build the table.
+#: HiveServer2 type names -> Arrow, for the columns that arrive as their own
+#: Python type: Spark sends these in a typed Thrift column, or PyHive converts
+#: them (TIMESTAMP to datetime). DATE comes as its text, '2024-01-01', and is
+#: parsed (see _arrow_array). DECIMAL takes its precision and scale from the
+#: server (see _spark_description). Spark sends every other type as text —
+#: ARRAY, MAP and STRUCT as JSON, intervals as '1 00:00:00.000000000' — so any
+#: name not here is a string column. The schema is therefore fixed from the
+#: description before the first batch, and every batch shares it; inferring
+#: per batch would let an all-NULL column in one batch disagree with a typed
+#: column in the next, and pyarrow would then refuse to build the table.
 _HIVE_TO_ARROW = {
     "BOOLEAN_TYPE": pa.bool_(),
     "TINYINT_TYPE": pa.int8(),
@@ -1209,32 +1215,87 @@ _HIVE_TO_ARROW = {
     "DATE_TYPE": pa.date32(),
     "TIMESTAMP_TYPE": pa.timestamp("us"),
     "BINARY_TYPE": pa.binary(),
+    "NULL_TYPE": pa.null(),
 }
 
 
-def _spark_arrow_schema(description) -> Optional[pa.Schema]:
-    """Arrow schema from a PyHive cursor description, or None if unmappable.
+def _hive_type_name(col) -> str:
+    return str(col[1]).upper() if len(col) > 1 and col[1] else ""
 
-    Returning None is deliberate: an unknown Hive type is better handled by
-    letting pyarrow infer from the values than by guessing wrong and failing
-    every batch.
+
+def _spark_description(cursor, connection):
+    """The cursor's description, with each DECIMAL's precision and scale.
+
+    PEP 249 puts a column's precision and scale in slots 4 and 5 of its
+    description. PyHive leaves them None: of the GetResultSetMetadata reply it
+    keeps only each column's type name, and drops the qualifiers Spark sends
+    with a DECIMAL (``{'precision': 10, 'scale': 2}`` for DECIMAL(10,2)). So
+    when the result has a DECIMAL column the reply is asked for again here,
+    through PyHive's client and operation handle. A cursor without those is
+    returned as it is.
+    """
+    description = getattr(cursor, "description", None)
+    if not description or not any(
+            _hive_type_name(col) == "DECIMAL_TYPE" for col in description):
+        return description
+    try:
+        from TCLIService import ttypes
+        request = ttypes.TGetResultSetMetadataReq(cursor._operationHandle)
+        client = connection.client
+    except (ImportError, AttributeError):
+        return description
+    reply = client.GetResultSetMetadata(request)
+    if reply.status.statusCode != ttypes.TStatusCode.SUCCESS_STATUS:
+        raise RuntimeError(
+            f"cannot read the result's column types: {reply.status.errorMessage}")
+    filled = []
+    for col, meta in zip(description, reply.schema.columns):
+        entry = meta.typeDesc.types[0].primitiveEntry
+        qualifiers = (entry.typeQualifiers.qualifiers or {}
+                      if entry is not None and entry.typeQualifiers else {})
+        precision, scale = qualifiers.get("precision"), qualifiers.get("scale")
+        if precision is not None and scale is not None:
+            col = (*col[:4], precision.i32Value, scale.i32Value, *col[6:])
+        filled.append(col)
+    return filled
+
+
+def _spark_arrow_schema(description) -> Optional[pa.Schema]:
+    """Arrow schema from a cursor description, or None without a result set.
+
+    Every column gets a type (see ``_HIVE_TO_ARROW``). A DECIMAL is
+    ``decimal128`` of its own precision and scale, read from slots 4 and 5 as
+    ``_spark_description`` fills them; without them it raises, because no one
+    decimal type holds every value: DECIMAL(38,0) needs 38 integer digits and
+    DECIMAL(38,20) 20 fraction digits.
     """
     if not description:
         return None
     fields = []
     for col in description:
-        name = col[0]
-        type_name = str(col[1]).upper() if len(col) > 1 and col[1] else ""
-        # DECIMAL carries precision/scale in the name; the exact form varies by
-        # server, so fall back to string rather than truncating a number.
-        arrow_type = _HIVE_TO_ARROW.get(type_name)
-        if arrow_type is None:
-            if type_name.startswith("DECIMAL"):
-                arrow_type = pa.decimal128(38, 18)
-            else:
-                return None
+        name, type_name = col[0], _hive_type_name(col)
+        if type_name == "DECIMAL_TYPE":
+            precision, scale = (col[4], col[5]) if len(col) > 5 else (None, None)
+            if precision is None or scale is None:
+                raise RuntimeError(
+                    f"Spark sent no precision and scale for DECIMAL column {name!r}")
+            arrow_type = pa.decimal128(precision, scale)
+        else:
+            arrow_type = _HIVE_TO_ARROW.get(type_name, pa.string())
         fields.append(pa.field(name.split(".")[-1], arrow_type))
     return pa.schema(fields)
+
+
+def _arrow_array(values, arrow_type) -> pa.Array:
+    """One column of PyHive values as *arrow_type*.
+
+    A DATE arrives as its text, which pyarrow turns into a date only by
+    casting from string; every other value already has the Python type its
+    Arrow type is built from.
+    """
+    if pa.types.is_date32(arrow_type):
+        return pa.array(values, type=pa.string()).cast(arrow_type)
+    return pa.array(values, type=arrow_type)
 
 
 class SparkStreamHandle:
@@ -1265,22 +1326,13 @@ class SparkStreamHandle:
         self.rows_streamed = 0
         self.on_close = None
         self.schema = schema or _spark_arrow_schema(
-            getattr(cursor, "description", None))
+            _spark_description(cursor, connection))
 
     def _to_batch(self, rows) -> pa.RecordBatch:
-        # Rows arrive as tuples; Arrow wants columns.
-        columns = list(zip(*rows)) if rows else []
-        if self.schema is not None:
-            arrays = [pa.array(list(col), type=self.schema.field(i).type)
-                      for i, col in enumerate(columns)]
-            return pa.RecordBatch.from_arrays(arrays, schema=self.schema)
-        names = [d[0].split(".")[-1]
-                 for d in (self._cursor.description or [])]
-        arrays = [pa.array(list(col)) for col in columns]
-        batch = pa.RecordBatch.from_arrays(arrays, names=names)
-        # Freeze the inferred schema so later batches match this one.
-        self.schema = batch.schema
-        return batch
+        # Rows arrive as tuples; Arrow wants columns, built as the schema says.
+        arrays = [_arrow_array(list(col), field.type)
+                  for col, field in zip(zip(*rows), self.schema)]
+        return pa.RecordBatch.from_arrays(arrays, schema=self.schema)
 
     def batches(self):
         try:

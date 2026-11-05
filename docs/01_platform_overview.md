@@ -55,7 +55,7 @@ This is a sequence of storage and catalog operations, not a transaction spanning
 
 The DuckDB path constructs views over the selected Parquet files, applies deletion vectors and row/column restrictions, and executes the rewritten SQL. Results are available as a Polars DataFrame or an Arrow batch stream. `fullscan=True` bypasses estimator predicate pruning; it does not disable authorization or deletions.
 
-AUTO routing can choose a registered active Spark cluster using estimated bytes and cluster thresholds. Spark results reach the caller through the same executor and materializer as DuckDB results. Explicit DuckDB selection is used throughout the SDK examples. See [query engine](09_query_engine.md) for the exact selection.
+AUTO routing can choose a registered active Spark cluster using estimated bytes and cluster thresholds. Spark results reach the caller through the same executor and materializer as DuckDB results, with Spark's ARRAY, MAP, STRUCT and interval columns as text. Explicit DuckDB selection is used throughout the SDK examples. See [query engine](09_query_engine.md) for the exact selection.
 
 Reads resolve current leaf metadata. There is no high-level `as_of` query parameter or atomic organization-wide snapshot. Table snapshot history is exposed through predecessor paths and catalog helpers.
 
