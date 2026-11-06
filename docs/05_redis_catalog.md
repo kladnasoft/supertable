@@ -150,6 +150,8 @@ Staging and pipe upserts store JSON documents and add names to set indexes in a 
 
 Share and linked-share creation similarly write JSON plus index membership through pipelines. These records store supplied metadata; storage exports and refresh behavior are responsibilities of their callers.
 
+Two Lua scripts back a provider's revocation and manifests. `delete_share_if_unchanged(org, share_id, expected_document)` removes a share's document and index entry together, and only while the stored bytes equal `expected_document` encoded the way `create_share` writes it, so a share replaced after the caller read it survives; pass the dictionary `get_share` returned. It returns false for an absent share and raises `RuntimeError` when the document changed or the document and index disagree. `allocate_share_manifest_generation(org, share_id, incarnation)` returns the next manifest generation for one share token, whose 64-hex hash is `incarnation`: Redis `TIME` in milliseconds, or one past the previous value when that is not below it, so generations strictly increase across processes and within a millisecond. The last value stays in its own key without a TTL; neither the share index nor either delete touches it.
+
 ## Deletion scope
 
 `delete_leaf()` removes only the leaf key. `delete_simple_table()` removes the leaf and its lock; it does not remove the row-ID sequence, schema key, table-name set membership, table settings, or quality records. It returns true if its Redis delete command executes, even when no keys existed.

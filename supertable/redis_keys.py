@@ -34,6 +34,7 @@ Hierarchy (v2)
             config                                   HASH    runtime audit toggle
           shares:
             doc:{share_id}                           STRING  share definition
+              :manifest_generation:{token_hash}      STRING  last manifest generation
             index                                    SET     share IDs
           engine:
             thrifts                                  HASH    Spark Thrift clusters
@@ -400,6 +401,19 @@ def share_doc(org: str, share_id: str) -> str:
 def share_index(org: str) -> str:
     """Index of all share IDs in this org (SET)."""
     return f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}:shares:index"
+
+
+def share_manifest_generation(org: str, share_id: str, incarnation: str) -> str:
+    """Last manifest generation issued under one share token (STRING).
+
+    *incarnation* is the token's hash, so a share created again under the
+    same id counts afresh. The index lists share IDs, never this key.
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{SYSTEM_SCOPE}"
+        f":shares:doc:{_safe('share_id', share_id)}"
+        f":manifest_generation:{_safe('incarnation', incarnation)}"
+    )
 
 
 # --- Org-level Engine ------------------------------------------------------ #

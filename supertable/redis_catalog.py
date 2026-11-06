@@ -26,6 +26,20 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+#: The largest integer a Lua number (a double) holds exactly, so the largest
+#: value a catalog script may count to.
+_LUA_MAX_SAFE_INTEGER = (1 << 53) - 1
+
+
+def _share_json(share_doc: Dict[str, Any]) -> str:
+    """The bytes a share document is stored as.
+
+    ``create_share`` writes them and ``delete_share_if_unchanged`` compares
+    against them, so the two cannot drift apart.
+    """
+    return json.dumps(share_doc)
+
+
 # ---------------------------------------------------------------------------
 # Login-token marker
 # ---------------------------------------------------------------------------
@@ -427,6 +441,56 @@ redis.call('HSET', KEYS[2], 'last_updated_ms', now_ms)
 return 1
 """
 
+    # ------------- Provider-share Lua scripts ------------- #
+
+    # Delete one indexed share only while its stored bytes equal ARGV[1].
+    # KEYS[1] share doc, KEYS[2] share index; ARGV[1] expected document JSON,
+    # ARGV[2] share_id.
+    # Returns 1 deleted, 0 absent, -2 doc and index disagree (or wrong type),
+    # -4 the document changed.
+    _LUA_SHARE_DELETE_IF_UNCHANGED = """
+local document_type = redis.call('TYPE', KEYS[1])
+if type(document_type) == 'table' then document_type = document_type['ok'] end
+local index_type = redis.call('TYPE', KEYS[2])
+if type(index_type) == 'table' then index_type = index_type['ok'] end
+if document_type ~= 'none' and document_type ~= 'string' then return -2 end
+if index_type ~= 'none' and index_type ~= 'set' then return -2 end
+local indexed = redis.call('SISMEMBER', KEYS[2], ARGV[2])
+if document_type == 'none' then
+  if indexed == 1 then return -2 end
+  return 0
+end
+if indexed ~= 1 then return -2 end
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return -4 end
+redis.call('DEL', KEYS[1])
+redis.call('SREM', KEYS[2], ARGV[2])
+return 1
+"""
+
+    # The next manifest generation for one share token: Redis TIME in ms, or
+    # one past the last generation when that is not below it, so values
+    # strictly increase even within a millisecond or if the clock steps back.
+    # KEYS[1] generation key.
+    # Returns the generation, -1 overflow, -2 the stored value is not one.
+    _LUA_SHARE_MANIFEST_GENERATION = """
+local server_time = redis.call('TIME')
+local server_ms = tonumber(server_time[1]) * 1000
+    + math.floor(tonumber(server_time[2]) / 1000)
+if not server_ms or server_ms <= 0 or server_ms > 9007199254740991 then
+  return -1
+end
+local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+if not current or current < 0 or current > 9007199254740991
+    or current ~= math.floor(current) then
+  return -2
+end
+local generation = server_ms
+if generation <= current then generation = current + 1 end
+if generation > 9007199254740991 then return -1 end
+redis.call('SET', KEYS[1], string.format('%d', generation))
+return generation
+"""
+
     def __init__(self, options: Optional[RedisOptions] = None):
         self.r = RedisConnector(options).r
 
@@ -444,6 +508,10 @@ return 1
         self._rbac_delete_role = self.r.register_script(self._LUA_RBAC_DELETE_ROLE)
         self._rbac_remove_role_from_user = self.r.register_script(self._LUA_RBAC_REMOVE_ROLE_FROM_USER)
         self._rbac_add_role_to_user = self.r.register_script(self._LUA_RBAC_ADD_ROLE_TO_USER)
+
+        # Provider-share Lua scripts
+        self._share_delete_if_unchanged = self.r.register_script(self._LUA_SHARE_DELETE_IF_UNCHANGED)
+        self._share_manifest_generation = self.r.register_script(self._LUA_SHARE_MANIFEST_GENERATION)
 
     # ------------- Health check -------------
 
@@ -1491,7 +1559,7 @@ return 1
         """Store a share definition and add to the org-level index."""
         try:
             with self.r.pipeline() as p:
-                p.set(RK.share_doc(org, share_id), json.dumps(share_doc))
+                p.set(RK.share_doc(org, share_id), _share_json(share_doc))
                 p.sadd(RK.share_index(org), share_id)
                 p.execute()
         except redis.RedisError as e:
@@ -1516,6 +1584,78 @@ return 1
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] delete_share error: {e}")
             return False
+
+    def delete_share_if_unchanged(
+            self, org: str, share_id: str, expected_document: Dict[str, Any],
+    ) -> bool:
+        """Delete one indexed share, only if it still is *expected_document*.
+
+        A revocation decides on the document it read; deleting whatever is
+        stored by the time it acts would remove a share replaced in between
+        under that stale decision. So the stored bytes are compared with
+        *expected_document* encoded the way ``create_share`` writes it, and the
+        document and its index entry go in one script. Pass the dict
+        ``get_share`` returned: decoding keeps its key order, so it encodes
+        back to the stored bytes.
+
+        Returns ``True`` when deleted, ``False`` when the share is absent.
+        Raises ``RuntimeError`` when the document changed, or when it and the
+        index disagree; Redis errors propagate.
+        """
+        if not isinstance(expected_document, dict):
+            raise TypeError("Expected share document must be a JSON object")
+        try:
+            result = int(self._share_delete_if_unchanged(
+                keys=[RK.share_doc(org, share_id), RK.share_index(org)],
+                args=[_share_json(expected_document), share_id],
+            ) or 0)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] delete_share_if_unchanged error: {e}")
+            raise
+        if result == -2:
+            raise RuntimeError(f"Corrupt share metadata/index for {org}")
+        if result == -4:
+            raise RuntimeError("Share changed during deletion")
+        if result not in (0, 1):
+            raise RuntimeError(f"Invalid conditional share deletion result: {result}")
+        return result == 1
+
+    def allocate_share_manifest_generation(
+            self, org: str, share_id: str, incarnation: str,
+    ) -> int:
+        """The next manifest generation for one share token, in Redis ms.
+
+        Every call returns a larger value than the last for the same
+        *incarnation*, the share token's 64-hex hash: Redis ``TIME`` in
+        milliseconds, or one past the previous value when that is not below
+        it. So two manifests issued in one millisecond, from any number of
+        processes, still have distinct, ordered generations, and a share
+        revoked and created again under the same id starts its own sequence.
+        The value is kept at ``RK.share_manifest_generation`` without a TTL.
+
+        Raises ``ValueError`` for a malformed *incarnation*, ``OverflowError``
+        past 2**53 - 1, and ``RuntimeError`` when the stored value is not a
+        generation; Redis errors propagate.
+        """
+        if not isinstance(incarnation, str) or re.fullmatch(
+            r"[0-9a-f]{64}", incarnation,
+        ) is None:
+            raise ValueError("share incarnation must be 64 lowercase hex digits")
+        try:
+            result = int(self._share_manifest_generation(
+                keys=[RK.share_manifest_generation(org, share_id, incarnation)],
+                args=[],
+            ) or 0)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] allocate_share_manifest_generation error: {e}")
+            raise
+        if result == -1:
+            raise OverflowError("share manifest generation overflow")
+        if result == -2:
+            raise RuntimeError("Corrupt share manifest generation state")
+        if result <= 0 or result > _LUA_MAX_SAFE_INTEGER:
+            raise RuntimeError(f"Invalid share manifest generation: {result}")
+        return result
 
     def list_shares(self, org: str) -> List[Dict[str, Any]]:
         shares: List[Dict[str, Any]] = []

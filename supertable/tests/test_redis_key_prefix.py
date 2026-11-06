@@ -73,6 +73,8 @@ def _all_helpers() -> list[tuple[str, str, str]]:
         ("audit_legal_hold",             RK.audit_legal_hold(ORG),             f"{sys_pre}:audit:legal_hold"),
         ("share_doc",                    RK.share_doc(ORG, SHARE),             f"{sys_pre}:shares:doc:{SHARE}"),
         ("share_index",                  RK.share_index(ORG),                  f"{sys_pre}:shares:index"),
+        ("share_manifest_generation",    RK.share_manifest_generation(ORG, SHARE, "ab" * 32),
+                                                                               f"{sys_pre}:shares:doc:{SHARE}:manifest_generation:{'ab' * 32}"),
         ("engine_thrifts",               RK.engine_thrifts(ORG),               f"{sys_pre}:engine:thrifts"),
         ("engine_plugs",                 RK.engine_plugs(ORG),                 f"{sys_pre}:engine:plugs"),
         ("engine_duckdb",                RK.engine_duckdb(ORG),                f"{sys_pre}:engine:duckdb"),
@@ -614,6 +616,7 @@ _ARG_BY_NAME = {
     "monitor_type": "plans", "date": "2026-06-09",
     "link_id": LINK, "role_type": "admin",
     "service_type": "api", "host": "host1", "pid": 1234,
+    "incarnation": "ab" * 32,
 }
 
 

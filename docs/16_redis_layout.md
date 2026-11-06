@@ -93,6 +93,7 @@ The stage's data-file index is a storage JSON file, `<org>/<sup>/staging/<stage>
 | `audit_legal_hold` | `S:audit:legal_hold` | String `1` or `0` |
 | `share_doc` | `S:shares:doc:<share_id>` | JSON string: supplied share metadata |
 | `share_index` | `S:shares:index` | Set of share IDs |
+| `share_manifest_generation` | `S:shares:doc:<share_id>:manifest_generation:<incarnation>` | Integer string: last manifest generation issued under one share token, without TTL |
 | `engine_thrifts` | `S:engine:thrifts` | Hash: Spark cluster ID → JSON configuration |
 | `engine_plugs` | `S:engine:plugs` | Hash: Spark plug ID → JSON configuration |
 | `engine_duckdb` | `S:engine:duckdb` | JSON string: engine configuration sections and modification time |
