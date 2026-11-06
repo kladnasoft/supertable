@@ -19,11 +19,12 @@ import polars as pl
 import pytest
 
 from supertable import meta_reader as meta_reader_module
+from supertable.data_reader import DataReader, Status
 from supertable.data_writer import DataWriter
 from supertable.meta_reader import MetaReader
 from supertable.rbac.role_manager import RoleManager
 from supertable.redis_catalog import RedisCatalog
-from supertable.redis_keys import meta_leaf
+from supertable.redis_keys import meta_leaf, rbac_role_doc
 from supertable.super_table import SuperTable
 
 ORG = "kladna-soft"
@@ -36,6 +37,10 @@ ROLES = {
     "no_rowid": {"orders": {"columns": ["id", "name"]}},
     "rowid_excluded": {"orders": {"columns": ["*"], "exclude_columns": ["__rowid__"]}},
     "denied": {"*": {"columns": ["*"]}, "orders": {"access": "deny"}},
+    # RoleManager stores these as given.
+    "null_columns": {"orders": {"columns": None}},
+    "null_exclusions": {"orders": {"columns": ["*"], "exclude_columns": None}},
+    "string_exclusion": {"orders": {"columns": ["*"], "exclude_columns": "secret"}},
 }
 
 
@@ -99,6 +104,37 @@ def test_a_column_scoped_role_sees_only_its_columns(reader):
     expected = [{"id": "Int64", "name": "String"}]
     assert reader.get_odata_table_schema("orders", "narrow") == expected
     assert reader.get_odata_table_schema("orders", "masked") == expected
+
+
+def test_a_null_column_list_is_read_as_the_read_path_reads_it(reader):
+    """columns None is every column, as the SQL read path takes it, and
+    exclude_columns None excludes none. Both were iterated as stored, and the
+    TypeError failed the role's whole $metadata in Core's OData service."""
+    every_column = [{"id": "Int64", "name": "String", "secret": "Int64"}]
+    assert reader.get_odata_table_schema("orders", "null_columns") == every_column
+    assert reader.get_odata_table_schema("orders", "null_exclusions") == every_column
+    _, status, _ = DataReader(
+        super_name=SUPER, organization=ORG, query="SELECT secret FROM orders",
+    ).execute(role_name="null_columns")
+    assert status == Status.OK
+
+
+def test_an_exclusion_that_is_not_a_list_leaves_the_table_out(reader):
+    """A string was read letter by letter: "secret" excluded s, e, c, r and t,
+    and the column it named was listed."""
+    assert "orders" in reader.get_tables("string_exclusion")
+    assert reader.get_odata_table_schema("orders", "string_exclusion") is None
+
+
+def test_a_column_list_the_read_path_refuses_leaves_the_table_out(
+        reader, hermetic_fakeredis):
+    """RoleManager cannot store ``columns: 5``, but a role document can hold
+    it; normalize_allowed_columns refuses it, and iterating it raised."""
+    role_id = RoleManager(super_name=SUPER, organization=ORG).get_role_by_name(
+        "narrow")["role_id"]
+    hermetic_fakeredis.hset(rbac_role_doc(ORG, SUPER, role_id), "tables",
+                            json.dumps({"orders": {"columns": 5}}))
+    assert reader.get_odata_table_schema("orders", "narrow") is None
 
 
 def test_a_role_that_cannot_read_rowid_gets_no_keyed_schema(reader):

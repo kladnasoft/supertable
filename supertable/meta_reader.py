@@ -21,6 +21,7 @@ from supertable.rbac.access_control import (
     visible_columns_for_policy,
 )
 from supertable.rbac.permissions import Permission
+from supertable.rbac.row_column_security import normalize_allowed_columns
 from supertable.redis_catalog import RedisCatalog
 from supertable import redis_keys as RK
 
@@ -391,12 +392,14 @@ class MetaReader:
 
         Returns ``[{column: type}]`` like :meth:`get_table_schema`, sorted,
         with the columns the role's policy lets it read (include minus
-        exclude) and no ``__*__`` system column. A table that fails a
-        condition, or whose schema has columns differing only in case, is
-        ``None`` rather than a ``PermissionError``, so one table cannot fail a
-        feed of many. A role that may not read metadata at all (unknown,
-        disabled, no META) raises ``PermissionError``, as
-        :meth:`get_super_meta` does.
+        exclude) and no ``__*__`` system column. The policy is read as the
+        SQL read path reads it, ``columns`` None being every column and
+        ``exclude_columns`` None excluding none. A table that fails a
+        condition, whose policy holds a column list of another shape, or
+        whose schema has columns differing only in case, is ``None`` rather
+        than an error, so one table cannot fail a feed of many. A role that
+        may not read metadata at all (unknown, disabled, no META) raises
+        ``PermissionError``, as :meth:`get_super_meta` does.
 
         The leaf is read once, so the proof and the schema come from one
         snapshot. The role is resolved once per ``MetaReader``: the service
@@ -437,13 +440,28 @@ class MetaReader:
         schema = _schema_to_dict(snapshot.get("schema", {}))
         if not verify_stable_identity(snapshot) or not identity_column_present(schema):
             return None
+        # Read the policy as the SQL read path does: normalize_allowed_columns
+        # takes ``columns`` None or absent as every column. ``exclude_columns``
+        # None excludes none, as in check_read_access. visible_columns_for_policy
+        # iterates both as stored, so a role holding None raised TypeError and
+        # failed its whole feed. A ``columns`` the normalizer refuses
+        # (ValueError), or an ``exclude_columns`` that is not a list, such as a
+        # string visible_columns_for_policy would read letter by letter, leaves
+        # the table out.
+        exclude_columns = entry.get("exclude_columns") or []
+        if not isinstance(exclude_columns, (list, tuple, set)):
+            return None
         try:
-            if not visible_columns_for_policy(entry, [ROWID_COLUMN]):
+            policy = {
+                "columns": normalize_allowed_columns(entry.get("columns")),
+                "exclude_columns": exclude_columns,
+            }
+            if not visible_columns_for_policy(policy, [ROWID_COLUMN]):
                 return None
             visible = visible_columns_for_policy(
-                entry, [name for name in schema if not _is_system_column(str(name))],
+                policy, [name for name in schema if not _is_system_column(str(name))],
             )
-        except PermissionError:
+        except (PermissionError, ValueError):
             return None
         if not visible:
             return None
