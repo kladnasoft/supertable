@@ -37,7 +37,7 @@ The sentinel pattern `^_[a-z0-9][a-z0-9_-]*_$` is reserved. `is_reserved_org_nam
 | --- | --- | --- |
 | `meta_root` | `L:meta:root` | JSON string: version, timestamp, optional root flags |
 | `meta_mirrors` | `L:meta:mirrors` | JSON string: `formats`, `ts` |
-| `meta_namespace_deletion_intent` | `L:meta:deletion-intent` | Builder-defined namespace marker; core table deletion does not currently set it |
+| `meta_namespace_deletion_intent` | `L:meta:deletion-intent` | JSON string: `intent_id`, `started_at_ms`; set by `SuperTable.delete()` before storage is removed, deleted with the root as its last step, no TTL |
 | `meta_table_names` | `L:meta:table_names` | Set of simple-table names, populated by writer acceleration updates |
 | `meta_leaf` | `L:meta:leaf:doc:<simple>` | JSON string: version, timestamp, snapshot path, optional inline payload |
 | `meta_rowid_seq` | `L:meta:rowid_seq:doc:<simple>` | Integer string incremented with `INCRBY` |

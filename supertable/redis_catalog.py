@@ -1537,16 +1537,60 @@ return generation
             logger.error(f"[redis-catalog] delete_simple_table error: {e}")
             return False
 
+    def set_namespace_deletion_intent(self, org: str, sup: str) -> str:
+        """Mark *sup* as being deleted, and return the mark's id.
+
+        Writes ``RK.meta_namespace_deletion_intent``: a JSON string
+        ``{"intent_id": ..., "started_at_ms": ...}`` without a TTL, which
+        dataisland-core reads to refuse a lake mid-teardown; the SDK's own
+        readers and writers do not read it. :meth:`delete_super_table`
+        removes it, with the root, as its last step. Redis errors propagate.
+        """
+        intent_id = secrets.token_hex(16)
+        intent = {"intent_id": intent_id, "started_at_ms": _now_ms()}
+        try:
+            self.r.set(RK.meta_namespace_deletion_intent(org, sup), json.dumps(intent))
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] set_namespace_deletion_intent error: {e}")
+            raise
+        return intent_id
+
     def delete_super_table(self, org: str, sup: str, count: int = 1000) -> int:
         """Delete **all** Redis keys for a given supertable (meta + locks + RBAC, etc).
 
-        This is implemented via SCAN to avoid blocking Redis.
-        Returns the number of keys deleted (best-effort).
+        Every key but ``meta:root`` and the deletion intent goes first, via
+        SCAN to avoid blocking Redis; then those two go together, in one
+        ``DEL``. So a lake whose deletion stopped part way keeps both: it still
+        opens (``SuperTable`` finds its root) and is still refused (its intent
+        is set), and running the delete again finishes it. There is no
+        namespace lock: two deletes of one lake both run to the end, and the
+        first to finish removes the intent the other may still rely on.
+
+        Returns the number of keys deleted. Redis errors propagate.
         """
         if not (org and sup):
             return 0
-        pattern = RK.super_table_pattern(org, sup)
-        return self._delete_by_scan(pattern=pattern, count=count)
+        root = RK.meta_root(org, sup)
+        intent = RK.meta_namespace_deletion_intent(org, sup)
+        deleted = 0
+        cursor = 0
+        try:
+            while True:
+                cursor, keys = self.r.scan(
+                    cursor=cursor, match=RK.super_table_pattern(org, sup), count=max(1, int(count)),
+                )
+                # redis-py may return list[str] or list[bytes]
+                batch = [k if isinstance(k, str) else k.decode("utf-8") for k in (keys or [])]
+                batch = [k for k in batch if k not in (root, intent)]
+                if batch:
+                    deleted += int(self.r.delete(*batch) or 0)
+                if int(cursor) == 0:
+                    break
+            deleted += int(self.r.delete(root, intent) or 0)
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] delete_super_table error: {e}")
+            raise
+        return deleted
 
     def _delete_by_scan(self, pattern: str, count: int = 1000) -> int:
         deleted = 0

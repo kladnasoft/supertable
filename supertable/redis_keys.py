@@ -492,9 +492,12 @@ def meta_mirrors(org: str, sup: str) -> str:
 def meta_namespace_deletion_intent(org: str, sup: str) -> str:
     """Tombstone marking a supertable as being deleted (STRING).
 
-    Set before a namespace teardown begins and checked by readers, so a request
-    that arrives mid-deletion is refused rather than served from a half-removed
-    catalog. Lake-scoped beside ``meta:root``, which is what it guards.
+    ``SuperTable.delete`` sets it, as JSON ``{intent_id, started_at_ms}``,
+    before a namespace teardown begins, and deletes it with ``meta:root`` as
+    the teardown's last step. Readers check it (dataisland-core's do; the
+    SDK's own do not), so a request that arrives mid-deletion is refused
+    rather than served from a half-removed catalog. Lake-scoped beside
+    ``meta:root``, which is what it guards.
     """
     return (
         f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"

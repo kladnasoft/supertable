@@ -135,12 +135,25 @@ class SuperTable:
         SuperTable — which cannot be gated, since the role that would
         authorise it is bootstrapped by that very call — deletion happens when
         the roles already exist, so there is no chicken-and-egg here.
+
+        Before anything is removed, the lake's namespace deletion intent is
+        set (``RedisCatalog.set_namespace_deletion_intent``), and it goes only
+        with the root, as the last step. In between, readers of the intent,
+        such as dataisland-core, refuse the lake. A delete that fails part way
+        leaves both, with whatever else it had not yet removed, and running it
+        again finishes the job: the root keeps the lake openable, and
+        ``RoleManager`` re-creates the ``superadmin`` role if the removed keys
+        took it. Redis errors propagate.
         """
         check_control_access(
             super_name=self.super_name,
             organization=self.organization,
             role_name=role_name,
             table_name="*",
+        )
+
+        intent_id = self.catalog.set_namespace_deletion_intent(
+            self.organization, self.super_name,
         )
 
         base_dir = os.path.join(self.organization, self.super_name)
@@ -157,9 +170,11 @@ class SuperTable:
         # gone and the pointer to it may safely go too.
         removed = self.storage.delete_tree(base_dir)
 
-        # Best-effort delete all Redis keys under this supertable prefix
+        # Every Redis key under this supertable prefix, the root and the
+        # deletion intent last.
         self.catalog.delete_super_table(self.organization, self.super_name)
 
         logger.info(
-            f"Deleted SuperTable (storage): {base_dir} ({removed} object(s) removed)"
+            f"Deleted SuperTable (storage): {base_dir} ({removed} object(s) removed, "
+            f"deletion intent {intent_id})"
         )
