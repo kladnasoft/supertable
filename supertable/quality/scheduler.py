@@ -15,7 +15,8 @@ Post-ingest trigger uses a three-layer protection:
   2. LOCK — only one check can run per table at a time.
      If a check is already running, the pending flag stays for the next tick.
 
-  3. COOLDOWN — after a check completes, a cooldown key is set (default 5 min).
+  3. COOLDOWN — after a check completes, a cooldown key is set (default 5 min;
+     a run asked for with cooldown 0 sets none).
      No new check can start for that table until cooldown expires.
      This prevents rapid re-triggering even if ingests keep coming.
 
@@ -34,6 +35,7 @@ import threading
 import time
 import traceback
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -259,7 +261,7 @@ def _scheduler_tick(
             last_q = last_quick_run.get(tkey, 0)
 
             if now - last_q >= quick_interval:
-                if _try_run_check(r, org, sup, table_name, "quick", dqc, cooldown_sec):
+                if run_check(r, org, sup, table_name, "quick", dqc, cooldown_sec):
                     last_quick_run[tkey] = now
 
             # ── CRON-BASED DEEP CHECK ─────────────────────────────
@@ -273,7 +275,7 @@ def _scheduler_tick(
                 has_deep = any(v.get("enabled") for k, v in (eff_config.get("checks") or {}).items()
                                if k.startswith("D"))
                 if has_deep:
-                    if _try_run_check(r, org, sup, table_name, "deep", dqc, cooldown_sec):
+                    if run_check(r, org, sup, table_name, "deep", dqc, cooldown_sec):
                         last_deep_run[tkey] = now
 
             # ── CRON-BASED CUSTOM RULES CHECK ─────────────────────
@@ -285,7 +287,7 @@ def _scheduler_tick(
             if custom_enabled and now - last_c >= custom_interval:
                 has_rules = bool(dqc.list_rules_for_table(table_name))
                 if has_rules:
-                    if _try_run_check(r, org, sup, table_name, "custom", dqc, cooldown_sec):
+                    if run_check(r, org, sup, table_name, "custom", dqc, cooldown_sec):
                         last_custom_run[tkey] = now
 
             # ── POST-INGEST PENDING CHECK ─────────────────────────
@@ -298,13 +300,13 @@ def _scheduler_tick(
 
                 ran_any = False
                 if pi_quick:
-                    if _try_run_check(r, org, sup, table_name, "quick", dqc, cooldown_sec):
+                    if run_check(r, org, sup, table_name, "quick", dqc, cooldown_sec):
                         ran_any = True
                 if pi_custom and dqc.list_rules_for_table(table_name):
-                    if _try_run_check(r, org, sup, table_name, "custom", dqc, cooldown_sec):
+                    if run_check(r, org, sup, table_name, "custom", dqc, cooldown_sec):
                         ran_any = True
                 if pi_deep:
-                    if _try_run_check(r, org, sup, table_name, "deep", dqc, cooldown_sec):
+                    if run_check(r, org, sup, table_name, "deep", dqc, cooldown_sec):
                         ran_any = True
 
                 if ran_any:
@@ -336,7 +338,32 @@ def _release_running_lock(r, running_key: str, token: str) -> None:
         )
 
 
-def _try_run_check(
+@dataclass(frozen=True)
+class CheckRunOutcome:
+    """What one :func:`run_check` call did.
+
+    ``state`` is ``"success"`` when the check ran to its end, ``"failed"``
+    when it raised or the call was invalid, and ``"skipped"`` when a cooldown
+    was active or another check held the table's running lock. ``message`` is
+    a fixed description of the state, never an error's text.
+
+    Truthy only for success, so ``if run_check(...)`` counts what it always
+    counted: a bool used to say False both for a skip and for a failure.
+    """
+
+    mode: str
+    state: str
+    message: str = ""
+
+    @property
+    def successful(self) -> bool:
+        return self.state == "success"
+
+    def __bool__(self) -> bool:
+        return self.successful
+
+
+def run_check(
     r,
     org: str,
     sup: str,
@@ -344,12 +371,27 @@ def _try_run_check(
     mode: str,
     dqc,
     cooldown_sec: int,
-) -> bool:
+) -> CheckRunOutcome:
     """
-    Attempt to run a quality check with lock + cooldown protection.
+    Run one quality check with lock + cooldown protection.
 
-    Returns True if the check was executed, False if skipped.
+    *mode* is ``"quick"``, ``"deep"`` or ``"custom"``. A success keeps the
+    table's next check away for *cooldown_sec* seconds; 0 leaves no cooldown
+    behind, for a run an operator asks for. Any cooldown already set still
+    skips the run, whichever mode set it.
+
+    Returns a :class:`CheckRunOutcome`: skipped while a cooldown is active or
+    another check holds the table's running lock; failed when the check
+    raises, and, before anything runs, when *cooldown_sec* is not a
+    non-negative integer; success otherwise.
     """
+    if type(cooldown_sec) is not int or cooldown_sec < 0:
+        logger.error(
+            f"[dq-scheduler] Not running {mode} check for {table_name}: "
+            f"cooldown_sec must be a non-negative integer, got {cooldown_sec!r}"
+        )
+        return CheckRunOutcome(mode, "failed", "invalid cooldown")
+
     running_key = _running_key(org, sup, table_name)
     cooldown_key = _cooldown_key(org, sup, table_name)
 
@@ -360,7 +402,7 @@ def _try_run_check(
             f"[dq-scheduler] Skipping {table_name} ({mode}): "
             f"cooldown active, {ttl}s remaining"
         )
-        return False
+        return CheckRunOutcome(mode, "skipped", "cooldown active")
 
     # ── Acquire lock (SET NX = only if not exists) ────────────
     # The value is a per-attempt token, not a timestamp, so the release below
@@ -379,7 +421,7 @@ def _try_run_check(
             f"[dq-scheduler] Skipping {table_name} ({mode}): "
             f"another check is already running"
         )
-        return False
+        return CheckRunOutcome(mode, "skipped", "another check is running")
 
     # ── Execute the check ─────────────────────────────────────
     try:
@@ -393,15 +435,18 @@ def _try_run_check(
             _run_quick_check(r, org, sup, table_name, dqc)
 
         # ── Set cooldown ──────────────────────────────────────
-        r.set(cooldown_key, _now_iso(), ex=cooldown_sec)
-        return True
+        # Only for a positive one: Redis refuses EX 0, and the error used to
+        # turn a check that had run into a failure.
+        if cooldown_sec > 0:
+            r.set(cooldown_key, _now_iso(), ex=cooldown_sec)
+        return CheckRunOutcome(mode, "success")
 
     except Exception:
         logger.error(
             f"[dq-scheduler] {mode} check failed for {table_name}:\n"
             f"{traceback.format_exc()}"
         )
-        return False
+        return CheckRunOutcome(mode, "failed", "check failed")
 
     finally:
         # ── Release lock (only if we still own it) ────────────

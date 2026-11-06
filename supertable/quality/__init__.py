@@ -15,9 +15,17 @@ Operational entry points:
     sets a debounced Redis "pending" flag (never blocks or fails the write).
   - ``start_scheduler`` — consumer: starts the background daemon thread that
     drains pending flags and runs checks.  Call once at host startup.
+  - ``run_check`` — runs one check now, under the same lock and cooldown as
+    the scheduler, and returns a ``CheckRunOutcome``: success, failed or
+    skipped.
 """
 from __future__ import annotations
 
-from supertable.quality.scheduler import notify_ingest, start_scheduler
+from supertable.quality.scheduler import (
+    CheckRunOutcome,
+    notify_ingest,
+    run_check,
+    start_scheduler,
+)
 
-__all__ = ["notify_ingest", "start_scheduler"]
+__all__ = ["CheckRunOutcome", "notify_ingest", "run_check", "start_scheduler"]
