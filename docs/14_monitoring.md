@@ -121,7 +121,9 @@ quality.set_schedule(schedule)
 start_scheduler()
 ```
 
-`start_scheduler()` starts one daemon thread per process, returning `True` when started and `False` when already running. It waits ten seconds, then scans on a 60-second tick. It is exported by `supertable.quality` but is not automatically started by table writes or module import. The thread has no public stop method.
+`start_scheduler()` starts one daemon thread per process, returning `True` when started and `False` when already running. It waits ten seconds, then scans on a 60-second tick. It is exported by `supertable.quality` but is not automatically started by table writes or module import.
+
+`stop_scheduler(timeout_s=10.0)`, also exported by `supertable.quality`, asks the thread to exit and waits up to `timeout_s` seconds. The thread exits at once while it waits, and otherwise between lakes or tables: a check already running is not interrupted. The call returns `True` when no scheduler thread is left running, including when none was started, and `False` when a check was still running at the deadline; the thread then exits when that check ends, and `start_scheduler()` returns `False` until it has. A timeout that is not a non-negative, finite number raises `ValueError`. After a stop, `start_scheduler()` starts a new thread.
 
 Default lake schedule:
 

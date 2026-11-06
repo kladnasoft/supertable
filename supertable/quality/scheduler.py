@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -61,10 +62,14 @@ DEFAULT_COOLDOWN_SECONDS = 300       # 5 minutes between checks on same table
 DEFAULT_PENDING_TTL_SECONDS = 600    # pending flag expires after 10 min
 DEFAULT_RUNNING_TTL_SECONDS = 300    # safety: running lock expires after 5 min
 TICK_INTERVAL_SECONDS = 60           # scheduler wakes up every 60s
+STARTUP_DELAY_SECONDS = 10           # first tick waits for the host to start
 
 # Singleton state
 _scheduler_thread: Optional[threading.Thread] = None
 _scheduler_lock = threading.Lock()
+# Set by stop_scheduler until the thread is gone. The loop waits on it
+# instead of sleeping, and a tick checks it between lakes and tables.
+_scheduler_stop = threading.Event()
 
 # Reading the schedule costs one Redis round trip, and the write path calls
 # ``notify_ingest`` after every table write.  With automatic checks off — the
@@ -159,20 +164,26 @@ def notify_ingest(r, org: str, sup: str, table_name: str) -> None:
 
 
 def _scheduler_loop() -> None:
-    """Main loop — checks every 60s if any cron expression is due."""
+    """Main loop — checks every 60s if any cron expression is due.
+
+    Every wait is on ``_scheduler_stop``, so :func:`stop_scheduler` ends the
+    loop at once while it waits, and otherwise when the tick returns.
+    """
     # Wait for the app to fully initialize
-    time.sleep(10)
+    if _scheduler_stop.wait(STARTUP_DELAY_SECONDS):
+        return
 
     last_quick_run: Dict[str, float] = {}  # "org:sup:table" -> epoch
     last_deep_run: Dict[str, float] = {}
     last_custom_run: Dict[str, float] = {}
 
-    while True:
+    while not _scheduler_stop.is_set():
         try:
             _scheduler_tick(last_quick_run, last_deep_run, last_custom_run)
         except Exception:
             logger.error(f"[dq-scheduler] Error in tick:\n{traceback.format_exc()}")
-        time.sleep(TICK_INTERVAL_SECONDS)
+        if _scheduler_stop.wait(TICK_INTERVAL_SECONDS):
+            break
 
 
 def start_scheduler() -> bool:
@@ -183,7 +194,9 @@ def start_scheduler() -> bool:
     the debounce / lock / cooldown rules documented at the top of this module.
 
     Call this once during host-application startup (e.g. a FastAPI lifespan
-    hook).  Calling it again is a safe no-op while a thread is already alive.
+    hook), and :func:`stop_scheduler` at shutdown.  Calling it again is a
+    safe no-op while a thread is already alive; once that thread has
+    stopped, it starts a new one.
 
     Returns:
         ``True`` if this call started the thread, ``False`` if one was already
@@ -194,6 +207,7 @@ def start_scheduler() -> bool:
         if _scheduler_thread is not None and _scheduler_thread.is_alive():
             logger.debug("[dq-scheduler] Already running; start_scheduler() is a no-op")
             return False
+        _scheduler_stop.clear()
         t = threading.Thread(
             target=_scheduler_loop,
             name="supertable-dq-scheduler",
@@ -203,6 +217,49 @@ def start_scheduler() -> bool:
         t.start()
         logger.info("[dq-scheduler] Background scheduler started")
         return True
+
+
+def stop_scheduler(timeout_s: float = 10.0) -> bool:
+    """Stop the background scheduler, waiting up to *timeout_s* seconds.
+
+    The thread exits at its next stop check: at once while it waits between
+    ticks, otherwise once the table it is checking is done. A check already
+    running is not interrupted, so a long one can outlast the deadline; the
+    thread then exits when it finishes, and ``start_scheduler`` returns
+    ``False`` until it has.
+
+    Returns ``True`` when no scheduler thread is left running (also when none
+    was started), ``False`` when it was still finishing a check at the
+    deadline. Raises ``ValueError`` unless *timeout_s* is a non-negative,
+    finite number.
+    """
+    global _scheduler_thread
+    if (
+        isinstance(timeout_s, bool)
+        or not isinstance(timeout_s, (int, float))
+        or not math.isfinite(timeout_s)
+        or timeout_s < 0
+    ):
+        raise ValueError("timeout_s must be a non-negative, finite number of seconds")
+    with _scheduler_lock:
+        _scheduler_stop.set()
+        thread = _scheduler_thread
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=timeout_s)
+    if thread is not None and thread.is_alive():
+        # The signal stays set, so the thread exits when its check ends.
+        logger.warning(
+            f"[dq-scheduler] Scheduler still finishing a check after {timeout_s}s"
+        )
+        return False
+    with _scheduler_lock:
+        if _scheduler_thread is thread:
+            # Gone, or never started: nothing is left for the signal to stop.
+            _scheduler_thread = None
+            _scheduler_stop.clear()
+    if thread is not None:
+        logger.info("[dq-scheduler] Background scheduler stopped")
+    return True
 
 
 def _scheduler_tick(
@@ -230,7 +287,11 @@ def _scheduler_tick(
 
     now = time.time()
 
+    # stop_scheduler is honoured between lakes and between tables, never
+    # inside a check: a check cut short would still be given its cooldown.
     for org, sup in pairs:
+        if _scheduler_stop.is_set():
+            return
         dqc = DQConfig(r, org, sup)
         schedule = dqc.get_schedule()
 
@@ -247,6 +308,8 @@ def _scheduler_tick(
         tables = _list_tables(r, org, sup)
 
         for table_name in tables:
+            if _scheduler_stop.is_set():
+                return
             tkey = f"{org}:{sup}:{table_name}"
 
             # Table-specific schedule override
