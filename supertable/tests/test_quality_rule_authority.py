@@ -178,6 +178,8 @@ def test_editing_a_rule_restamps_it_to_the_editor(r, allow_write):
 
 def test_the_scheduler_runs_a_rule_as_its_registering_role(r, allow_write):
     """The core assertion: not superadmin, the rule's own role."""
+    import polars as pl
+    from supertable.data_reader import Status
     from supertable.quality import scheduler as sched
 
     dqc = DQConfig(r, ORG, SUP, actor_role_name="etl")
@@ -190,7 +192,9 @@ def test_the_scheduler_runs_a_rule_as_its_registering_role(r, allow_write):
             self.query_plan_manager = None
         def execute(self, role_name=None, **kw):
             seen["role"] = role_name
-            return (None, "OK", "")
+            # The reader's own answer: a polars frame and a Status. A rule
+            # whose read does not end in Status.OK fails the check.
+            return (pl.DataFrame({"violations": [0]}), Status.OK, None)
 
     with patch("supertable.data_reader.DataReader", _Reader):
         sched._run_custom_check(r, ORG, SUP, "orders", dqc)

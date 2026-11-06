@@ -267,7 +267,14 @@ def _scheduler_tick(
     last_deep_run: Dict[str, float],
     last_custom_run: Dict[str, float],
 ) -> None:
-    """Single scheduler tick — process cron-based and pending (post-ingest) checks."""
+    """Single scheduler tick — process cron-based and pending (post-ingest) checks.
+
+    A cron check that ran is recorded whether it succeeded or failed, so it
+    waits for its next interval either way; only a skipped one (cooldown, or
+    another check's lock) is tried again on the next tick. A check that fails
+    every time, a broken custom rule say, would otherwise run on every tick.
+    A pending flag is cleared only by a success.
+    """
     try:
         from supertable.quality.config import DQConfig
         from supertable.redis_connector import create_redis_client
@@ -324,7 +331,8 @@ def _scheduler_tick(
             last_q = last_quick_run.get(tkey, 0)
 
             if now - last_q >= quick_interval:
-                if run_check(r, org, sup, table_name, "quick", dqc, cooldown_sec):
+                outcome = run_check(r, org, sup, table_name, "quick", dqc, cooldown_sec)
+                if outcome.state != "skipped":
                     last_quick_run[tkey] = now
 
             # ── CRON-BASED DEEP CHECK ─────────────────────────────
@@ -338,7 +346,8 @@ def _scheduler_tick(
                 has_deep = any(v.get("enabled") for k, v in (eff_config.get("checks") or {}).items()
                                if k.startswith("D"))
                 if has_deep:
-                    if run_check(r, org, sup, table_name, "deep", dqc, cooldown_sec):
+                    outcome = run_check(r, org, sup, table_name, "deep", dqc, cooldown_sec)
+                    if outcome.state != "skipped":
                         last_deep_run[tkey] = now
 
             # ── CRON-BASED CUSTOM RULES CHECK ─────────────────────
@@ -350,7 +359,8 @@ def _scheduler_tick(
             if custom_enabled and now - last_c >= custom_interval:
                 has_rules = bool(dqc.list_rules_for_table(table_name))
                 if has_rules:
-                    if run_check(r, org, sup, table_name, "custom", dqc, cooldown_sec):
+                    outcome = run_check(r, org, sup, table_name, "custom", dqc, cooldown_sec)
+                    if outcome.state != "skipped":
                         last_custom_run[tkey] = now
 
             # ── POST-INGEST PENDING CHECK ─────────────────────────
@@ -374,7 +384,7 @@ def _scheduler_tick(
 
                 if ran_any:
                     r.delete(pending_key)
-                # If nothing ran (locked or cooling down),
+                # If nothing succeeded (locked, cooling down or failed),
                 # the pending key stays — we'll retry on the next tick.
 
 
@@ -405,10 +415,11 @@ def _release_running_lock(r, running_key: str, token: str) -> None:
 class CheckRunOutcome:
     """What one :func:`run_check` call did.
 
-    ``state`` is ``"success"`` when the check ran to its end, ``"failed"``
-    when it raised or the call was invalid, and ``"skipped"`` when a cooldown
-    was active or another check held the table's running lock. ``message`` is
-    a fixed description of the state, never an error's text.
+    ``state`` is ``"success"`` when the check ran to its end and recorded its
+    result, ``"failed"`` when it raised (its schema read, a statement or a
+    result write failed) or the call was invalid, and ``"skipped"`` when a
+    cooldown was active or another check held the table's running lock.
+    ``message`` is a fixed description of the state, never an error's text.
 
     Truthy only for success, so ``if run_check(...)`` counts what it always
     counted: a bool used to say False both for a skip and for a failure.
@@ -446,7 +457,9 @@ def run_check(
     Returns a :class:`CheckRunOutcome`: skipped while a cooldown is active or
     another check holds the table's running lock; failed when the check
     raises, and, before anything runs, when *cooldown_sec* is not a
-    non-negative integer; success otherwise.
+    non-negative integer; success otherwise. A check raises when its schema
+    read, one of its statements or the write of its result fails, so a
+    success has recorded its result.
     """
     if type(cooldown_sec) is not int or cooldown_sec < 0:
         logger.error(
@@ -521,7 +534,13 @@ def run_check(
 # ──────────────────────────────────────────────────────────────────────
 
 def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
-    """Execute a quick profile check for one table."""
+    """Execute a quick profile check for one table.
+
+    Raises when the schema read, the profile statement or the write of the
+    result fails, so :func:`run_check` reports the run failed. These used to
+    be logged and returned from, and the run counted as a success that had
+    recorded nothing.
+    """
     _check_start_ms = int(time.time() * 1000)
 
     from supertable.quality.checker import (
@@ -529,32 +548,23 @@ def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
         evaluate_custom_rule, compute_quality_score, is_profilable_column,
     )
     from supertable.quality.anomaly import detect_anomalies, detect_schema_drift
-
-    try:
-        from supertable.meta_reader import MetaReader
-    except ImportError:
-        logger.error("[dq-scheduler] MetaReader not available")
-        return
+    from supertable.meta_reader import MetaReader
+    from supertable.data_reader import DataReader, Status
 
     eff = dqc.get_effective_config(table_name)
     checks = eff.get("checks", {})
 
     # Get schema
-    try:
-        mr = MetaReader(super_name=sup, organization=org)
-        schema_raw = mr.get_table_schema(table_name, PROFILER_ROLE)
-        if not schema_raw or not schema_raw[0]:
-            logger.warning(f"[dq-scheduler] No schema for {table_name}")
-            return
-        schema_dict = schema_raw[0]
-        # Exclude system columns the read view hides (__rowid__/__timestamp__)
-        # plus _sys_ internals: profiling them builds SQL that cannot bind
-        # against the read path and fails the whole quick check.
-        columns = [(name, ctype) for name, ctype in schema_dict.items()
-                    if is_profilable_column(name)]
-    except Exception as e:
-        logger.error(f"[dq-scheduler] Schema read failed for {table_name}: {e}")
-        return
+    mr = MetaReader(super_name=sup, organization=org)
+    schema_raw = mr.get_table_schema(table_name, PROFILER_ROLE)
+    if not schema_raw or not schema_raw[0]:
+        raise RuntimeError(f"No schema for {table_name}")
+    schema_dict = schema_raw[0]
+    # Exclude system columns the read view hides (__rowid__/__timestamp__)
+    # plus _sys_ internals: profiling them builds SQL that cannot bind
+    # against the read path and fails the whole quick check.
+    columns = [(name, ctype) for name, ctype in schema_dict.items()
+                if is_profilable_column(name)]
 
     # Build and execute quick SQL
     table_fqn = f"{sup}.{table_name}"
@@ -567,29 +577,29 @@ def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
 
     sql = build_quick_sql(table_fqn, columns, inc_col, last_ts)
 
-    try:
-        from supertable.data_reader import DataReader
-        dr = DataReader(super_name=sup, organization=org, query=sql)
-        if dr.query_plan_manager:
-            dr.query_plan_manager.source_type = "system"
-        # Elevated on purpose, and unlike a rule this is safe to be.
-        #
-        # ``build_quick_sql`` is library-generated: the table is the one being
-        # profiled, the columns come from that table's own schema, and no part
-        # of it is caller-supplied SQL. Profiling *is* a whole-table
-        # measurement — a null rate computed through one role's row filters
-        # would be a wrong answer, not a safer one — so it reads unfiltered.
-        #
-        # The rule path below is the opposite case and runs as the role that
-        # registered the rule. See _run_custom_rules.
-        result_df, status, message = dr.execute(role_name=PROFILER_ROLE)
-        if result_df is None or result_df.empty:
-            logger.warning(f"[dq-scheduler] Quick SQL returned empty for {table_name}")
-            return
-        row = result_df.to_dict(orient="records")[0]
-    except Exception as e:
-        logger.error(f"[dq-scheduler] Quick SQL execution failed for {table_name}: {e}")
-        return
+    dr = DataReader(super_name=sup, organization=org, query=sql)
+    if dr.query_plan_manager:
+        dr.query_plan_manager.source_type = "system"
+    # Elevated on purpose, and unlike a rule this is safe to be.
+    #
+    # ``build_quick_sql`` is library-generated: the table is the one being
+    # profiled, the columns come from that table's own schema, and no part
+    # of it is caller-supplied SQL. Profiling *is* a whole-table
+    # measurement — a null rate computed through one role's row filters
+    # would be a wrong answer, not a safer one — so it reads unfiltered.
+    #
+    # The rule path below is the opposite case and runs as the role that
+    # registered the rule. See _run_custom_rules.
+    result_df, status, message = dr.execute(role_name=PROFILER_ROLE)
+    # The reader answers a statement that fails with an empty frame and an
+    # error status rather than raising. Its frames are polars, which has
+    # neither ``.empty`` nor ``to_dict(orient=...)``: the pandas calls this
+    # made raised on every run, and the run was logged and counted a success.
+    if status != Status.OK:
+        raise RuntimeError(f"Quick SQL failed for {table_name}: {message}")
+    if result_df.is_empty():
+        raise RuntimeError(f"Quick SQL returned no row for {table_name}")
+    row = result_df.row(0, named=True)
 
     parsed = parse_quick_result(row, columns)
 
@@ -631,8 +641,10 @@ def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
         "schema": [list(c) for c in columns],
     }
 
-    dqc.set_latest(table_name, latest)
-    dqc.set_anomalies(table_name, anomalies)
+    # DQConfig's setters log a Redis error and return False.
+    if not (dqc.set_latest(table_name, latest)
+            and dqc.set_anomalies(table_name, anomalies)):
+        raise RuntimeError(f"Could not record the quick check of {table_name}")
 
     for col_name, col_data in parsed.get("columns", {}).items():
         col_data["checked_at"] = latest["checked_at"]
@@ -640,7 +652,10 @@ def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
         col_data["status"] = "critical" if any(a["severity"] == "critical" for a in col_issues) \
             else ("warning" if col_issues else "ok")
         col_data["issues"] = [a.get("message", "") for a in col_issues]
-        dqc.set_latest_column(table_name, col_name, col_data)
+        if not dqc.set_latest_column(table_name, col_name, col_data):
+            raise RuntimeError(
+                f"Could not record the quick check of {table_name}.{col_name}"
+            )
 
     logger.info(
         f"[dq-scheduler] Quick check done: {table_name} — "
@@ -658,20 +673,21 @@ def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
 
 
 def _run_deep_check(r, org: str, sup: str, table_name: str, dqc) -> None:
-    """Execute deep profile checks for enabled columns."""
+    """Execute deep profile checks for enabled columns.
+
+    Raises when the schema read fails, and, once every other column has been
+    profiled and recorded, when a column's statement or the write of its
+    result failed; the history row is written only for a run with no failed
+    column.
+    """
     _deep_start_ms = int(time.time() * 1000)
 
     from supertable.quality.checker import (
         build_deep_string_sql, build_deep_numeric_sql, _col_category,
         is_profilable_column,
     )
-
-    try:
-        from supertable.meta_reader import MetaReader
-        from supertable.data_reader import DataReader
-    except ImportError:
-        logger.error("[dq-scheduler] MetaReader/DataReader not available")
-        return
+    from supertable.meta_reader import MetaReader
+    from supertable.data_reader import DataReader, Status
 
     eff = dqc.get_effective_config(table_name)
     checks = eff.get("checks", {})
@@ -679,17 +695,14 @@ def _run_deep_check(r, org: str, sup: str, table_name: str, dqc) -> None:
     if not deep_enabled:
         return
 
-    try:
-        mr = MetaReader(super_name=sup, organization=org)
-        schema_raw = mr.get_table_schema(table_name, PROFILER_ROLE)
-        if not schema_raw or not schema_raw[0]:
-            return
-        schema_dict = schema_raw[0]
-    except Exception as e:
-        logger.error(f"[dq-scheduler] Deep schema read failed for {table_name}: {e}")
-        return
+    mr = MetaReader(super_name=sup, organization=org)
+    schema_raw = mr.get_table_schema(table_name, PROFILER_ROLE)
+    if not schema_raw or not schema_raw[0]:
+        raise RuntimeError(f"No schema for {table_name}")
+    schema_dict = schema_raw[0]
 
     table_fqn = f"{sup}.{table_name}"
+    failed_columns = []
 
     for col_name, col_type in schema_dict.items():
         if not is_profilable_column(col_name):
@@ -708,9 +721,11 @@ def _run_deep_check(r, org: str, sup: str, table_name: str, dqc) -> None:
             if dr.query_plan_manager:
                 dr.query_plan_manager.source_type = "system"
             result_df, status, message = dr.execute(role_name=PROFILER_ROLE)
-            if result_df is None or result_df.empty:
-                continue
-            deep_result = result_df.to_dict(orient="records")[0]
+            if status != Status.OK:
+                raise RuntimeError(f"Deep SQL failed: {message}")
+            if result_df.is_empty():
+                raise RuntimeError("Deep SQL returned no row")
+            deep_result = result_df.row(0, named=True)
             deep_result["check_type"] = "deep"
             deep_result["checked_at"] = _now_iso()
             deep_result["column_name"] = col_name
@@ -720,10 +735,18 @@ def _run_deep_check(r, org: str, sup: str, table_name: str, dqc) -> None:
             existing = dqc.get_latest_column(table_name, col_name) or {}
             existing["deep"] = deep_result
             existing["deep_checked_at"] = deep_result["checked_at"]
-            dqc.set_latest_column(table_name, col_name, existing)
+            if not dqc.set_latest_column(table_name, col_name, existing):
+                raise RuntimeError("Could not record the deep result")
 
         except Exception as e:
             logger.warning(f"[dq-scheduler] Deep check failed for {table_name}.{col_name}: {e}")
+            failed_columns.append(col_name)
+
+    if failed_columns:
+        raise RuntimeError(
+            f"Deep check failed for {len(failed_columns)} column(s) of "
+            f"{table_name}: {', '.join(failed_columns)}"
+        )
 
     logger.info(f"[dq-scheduler] Deep check done: {table_name}")
 
@@ -763,18 +786,18 @@ def _run_custom_check(r, org: str, sup: str, table_name: str, dqc) -> None:
 
     Runs all enabled custom rules, evaluates results, merges into the
     existing latest (from Redis), recomputes score, and stores back.
+
+    Raises, before anything is recorded, at the first rule that cannot run or
+    whose result cannot be evaluated, and when the write of the result fails.
+    The counts cover the rules that ran: one skipped for having no recorded
+    role, or for building no SQL, is not counted as passed.
     """
     _custom_start_ms = int(time.time() * 1000)
 
     from supertable.quality.checker import (
         build_custom_rule_sql, evaluate_custom_rule, compute_quality_score,
     )
-
-    try:
-        from supertable.data_reader import DataReader
-    except ImportError:
-        logger.error("[dq-scheduler] DataReader not available")
-        return
+    from supertable.data_reader import DataReader, Status
 
     custom_rules = dqc.list_rules_for_table(table_name)
     if not custom_rules:
@@ -817,8 +840,10 @@ def _run_custom_check(r, org: str, sup: str, table_name: str, dqc) -> None:
             dr = DataReader(super_name=sup, organization=org, query=rule_sql)
             if dr.query_plan_manager:
                 dr.query_plan_manager.source_type = "system"
-            r_df, _, _ = dr.execute(role_name=rule_role)
-            r_result = r_df.to_dict(orient="records") if r_df is not None and not r_df.empty else []
+            r_df, status, message = dr.execute(role_name=rule_role)
+            if status != Status.OK:
+                raise RuntimeError(message)
+            r_result = r_df.to_dicts()
             eval_result = evaluate_custom_rule(rule, r_result)
             rule_results.append({
                 "rule_id": rule["rule_id"],
@@ -837,7 +862,11 @@ def _run_custom_check(r, org: str, sup: str, table_name: str, dqc) -> None:
                     "detected_at": _now_iso(),
                 })
         except Exception as e:
-            logger.warning(f"[dq-scheduler] Custom rule {rule['rule_id']} failed: {e}")
+            # A rule that could not run used to be logged and skipped, and
+            # still counted as passed. A failed statement comes back as an
+            # empty frame with an error status, so a rule on a missing column,
+            # read as no rows, passed as well.
+            raise RuntimeError(f"Custom rule {rule['rule_id']} could not run") from e
 
     # ── Merge into existing latest ────────────────────────────
     existing = dqc.get_latest(table_name) or {}
@@ -854,7 +883,7 @@ def _run_custom_check(r, org: str, sup: str, table_name: str, dqc) -> None:
     n_warnings = sum(1 for a in all_anomalies if a.get("severity") == "warning")
     n_critical = sum(1 for a in all_anomalies if a.get("severity") == "critical")
     builtin_count = existing.get("total_checks", 0) - len(existing.get("rule_results", []))
-    total_checks = max(0, builtin_count) + len(custom_rules)
+    total_checks = max(0, builtin_count) + len(rule_results)
     passed = total_checks - n_warnings - n_critical
 
     # Update the latest record in place
@@ -870,8 +899,9 @@ def _run_custom_check(r, org: str, sup: str, table_name: str, dqc) -> None:
         "custom_checked_at": _now_iso(),
     })
 
-    dqc.set_latest(table_name, existing)
-    dqc.set_anomalies(table_name, all_anomalies)
+    if not (dqc.set_latest(table_name, existing)
+            and dqc.set_anomalies(table_name, all_anomalies)):
+        raise RuntimeError(f"Could not record the custom rules of {table_name}")
 
     logger.info(
         f"[dq-scheduler] Custom rules check done: {table_name} — "

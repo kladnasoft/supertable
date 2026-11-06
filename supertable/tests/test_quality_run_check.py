@@ -7,7 +7,8 @@ manual "Run checks now" does, could not have one: the check ran, then
 ``SET ... EX 0`` raised "invalid expire time", and the run was reported failed.
 
 The checks themselves are stubbed; the lock, the cooldown and the outcome are
-the real ones, on fakeredis.
+the real ones, on fakeredis. tests/characterization/test_quality_run_check_real.py
+runs the real checks.
 """
 from __future__ import annotations
 
@@ -136,7 +137,8 @@ def test_the_package_exports_the_entry_point():
 
 
 # --------------------------------------------------------------------------
-# The scheduler's own tick counts runs through the outcome's truth value
+# The scheduler's own tick: a cron run that ran is recorded, success or
+# failure, and only a success clears a pending flag
 # --------------------------------------------------------------------------
 
 @pytest.fixture()
@@ -188,3 +190,39 @@ def test_a_tick_with_a_zero_cooldown_records_its_runs(r, runs, lake):
     assert f"{ORG}:{SUP}:{TABLE}" in state[0]
     assert not r.exists(sched._pending_key(ORG, SUP, TABLE))
     assert not r.exists(_cooldown(r))
+
+
+@pytest.fixture()
+def failing_quick(runs, monkeypatch):
+    """A quick check that fails every time, as a broken table's does."""
+    def broken(*args):
+        runs.append("quick")
+        raise RuntimeError("statement failed")
+
+    monkeypatch.setattr(sched, "_run_quick_check", broken)
+    return runs
+
+
+def test_a_failed_cron_run_waits_for_its_next_interval(r, failing_quick, lake):
+    """Unrecorded, a check that fails every time ran on every tick."""
+    lake(300)
+    state = ({}, {}, {})
+
+    for _ in range(3):
+        _tick(state)
+
+    assert failing_quick == ["quick"]
+    assert f"{ORG}:{SUP}:{TABLE}" in state[0]
+    assert not r.exists(_cooldown(r)), "a failure sets no cooldown"
+
+
+def test_a_failed_pending_run_keeps_its_flag_for_the_next_tick(r, failing_quick, lake):
+    lake(300)
+    r.set(sched._pending_key(ORG, SUP, TABLE), "now")
+    state = ({}, {}, {})
+
+    _tick(state)
+    assert failing_quick == ["quick", "quick"], "the cron run, then the pending one"
+    _tick(state)
+    assert failing_quick == ["quick", "quick", "quick"], "the pending one again, alone"
+    assert r.exists(sched._pending_key(ORG, SUP, TABLE))
