@@ -2,7 +2,7 @@
 
 These pages describe the active Python source tree at revision `5fe87d0`, reviewed on 2026-09-13. The content was rebuilt from executable code and configuration declarations, using the existing documentation filenames as the chapter structure. Existing documentation prose, code comments, and docstrings were excluded from the reconstruction.
 
-`pyproject.toml`, `setup.py` and the package version identify this tree as `3.5.1`.
+`pyproject.toml`, `setup.py` and the package version identify this tree as `3.5.2`.
 
 ## Start here
 
