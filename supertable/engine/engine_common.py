@@ -209,6 +209,10 @@ _SUPPORTED_SETTINGS: Dict[str, frozenset] = {}
 _HTTPFS_APPLIED_LOCK = threading.Lock()
 _HTTPFS_APPLIED: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
+# The DuckDB secret ``configure_httpfs_and_s3`` keeps the object store's
+# endpoint, region, URL style, TLS and credentials in.
+_S3_SECRET_NAME = "supertable_s3"
+
 
 def _httpfs_fingerprint() -> tuple:
     """The exact values ``configure_httpfs_and_s3`` would apply, as a key.
@@ -248,7 +252,14 @@ def reset_httpfs_configuration() -> None:
 def configure_httpfs_and_s3(
         con: duckdb.DuckDBPyConnection, for_paths: List[str]
 ) -> None:
-    """Load httpfs and configure S3 credentials + caches on the given connection.
+    """Load httpfs and configure S3 credentials + caches for the connection's database.
+
+    Everything is configured database-wide, so every cursor of the connection
+    reads with it: ``DuckDBEngine.stream`` runs each query on a cursor, which
+    sees the database's secrets and global settings but none of the
+    connection's session settings.  The store's endpoint, region, URL style,
+    TLS and credentials are one TEMPORARY secret, and ``http_timeout`` is SET
+    GLOBAL.
 
     Both cache settings (HTTP metadata cache and external file cache) are
     registered by the httpfs extension, not DuckDB core.  They must be SET
@@ -351,9 +362,6 @@ def configure_httpfs_and_s3(
                     _SUPPORTED_SETTINGS[build_key] = supported
         except Exception:
             supported = frozenset({
-                "s3_endpoint", "s3_region", "s3_access_key_id",
-                "s3_secret_access_key", "s3_session_token",
-                "s3_url_style", "s3_use_ssl",
                 "http_timeout", "enable_http_metadata_cache",
                 "enable_external_file_cache", "external_file_cache_max_size",
                 "external_file_cache_directory",
@@ -369,18 +377,37 @@ def configure_httpfs_and_s3(
     url_style = detect_url_style()
     use_ssl = detect_ssl()
 
+    # The store goes into a TEMPORARY secret, not into s3_* settings.  A
+    # setting is readable by any SQL run where it holds: current_setting() is
+    # a scalar call, which the read gate's named-table rule admits.  And a
+    # plain SET of an s3_* setting holds for this connection's session only,
+    # so the cursor a stream runs its query on would read on DuckDB's
+    # defaults: AWS, no credentials, vhost URLs, TLS.  A secret belongs to the
+    # database, so every cursor signs its reads with it, and the only SQL that
+    # shows what it holds is duckdb_secrets(), a table function the read gate
+    # refuses, which redacts the secret and the session token besides.
+    # TEMPORARY keeps it in memory, never on disk under the home directory;
+    # OR REPLACE lets a changed configuration replace it.
+    def literal(value: str) -> str:
+        return sanitize_sql_string(f"'{value}'")
+
+    params = ["TYPE s3"]
     if endpoint:
-        set_if_supported("s3_endpoint", f"'{endpoint}'")
+        params.append(f"ENDPOINT {literal(endpoint)}")
     if access_key:
-        set_if_supported("s3_access_key_id", f"'{access_key}'")
+        params.append(f"KEY_ID {literal(access_key)}")
     if secret_key:
-        set_if_supported("s3_secret_access_key", f"'{secret_key}'")
+        params.append(f"SECRET {literal(secret_key)}")
     if session_token:
-        set_if_supported("s3_session_token", f"'{session_token}'")
+        params.append(f"SESSION_TOKEN {literal(session_token)}")
     if region:
-        set_if_supported("s3_region", f"'{region}'")
-    set_if_supported("s3_url_style", f"'{url_style}'")
-    set_if_supported("s3_use_ssl", "TRUE" if use_ssl else "FALSE")
+        params.append(f"REGION {literal(region)}")
+    params.append(f"URL_STYLE {literal(url_style)}")
+    params.append(f"USE_SSL {'TRUE' if use_ssl else 'FALSE'}")
+    con.execute(
+        f"CREATE OR REPLACE TEMPORARY SECRET {_S3_SECRET_NAME} "
+        f"({', '.join(params)});"
+    )
 
     http_timeout_env = settings.SUPERTABLE_DUCKDB_HTTP_TIMEOUT
     if http_timeout_env:
@@ -388,7 +415,9 @@ def configure_httpfs_and_s3(
             # DuckDB's http_timeout is in SECONDS (UBIGINT, default 30).
             # SUPERTABLE_DUCKDB_HTTP_TIMEOUT=60 → SET http_timeout=60 → 60 s. No conversion needed.
             # Ref: duckdb_settings() description: "HTTP timeout read/write/connection/retry (in seconds)"
-            con.execute(f"SET http_timeout={int(http_timeout_env)};")
+            # GLOBAL, because a plain SET of it holds for this connection's
+            # session only, and a stream's cursor would read at 30 s.
+            con.execute(f"SET GLOBAL http_timeout={int(http_timeout_env)};")
         except Exception:
             pass
 
@@ -1107,6 +1136,10 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
     whatever ``init_connection`` applied (settings-based), so callers without a
     resolved config are unaffected.  Every pragma is best-effort: httpfs-only
     settings silently no-op on connections that have not loaded httpfs.
+
+    Each one is database-wide, so the cursor ``DuckDBEngine.stream`` runs the
+    query on has it too: memory_limit, threads and the external file cache
+    are global settings, and http_timeout is SET GLOBAL.
     """
     if cfg is None:
         return
@@ -1132,9 +1165,11 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
         pass
 
     # httpfs settings — only effective once httpfs is loaded (remote reads).
+    # GLOBAL, because a plain SET of http_timeout holds for this connection's
+    # session only, and a stream's cursor would read at DuckDB's 30 s.
     if cfg.duckdb_http_timeout is not None:
         try:
-            con.execute(f"SET http_timeout={int(cfg.duckdb_http_timeout)};")
+            con.execute(f"SET GLOBAL http_timeout={int(cfg.duckdb_http_timeout)};")
         except Exception:
             pass
 

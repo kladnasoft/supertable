@@ -85,11 +85,12 @@ def test_settings_change_is_applied_on_the_next_call(duckdb_con):
     finally:
         ec.settings = original
 
-    assert any("s3_region='ap-south-7'" in s for s in con.sql)
-    region = duckdb_con.execute(
-        "SELECT value FROM duckdb_settings() WHERE name='s3_region'"
-    ).fetchone()[0]
-    assert region == "ap-south-7"
+    assert any("REGION 'ap-south-7'" in s for s in con.sql)
+    (secret,) = duckdb_con.execute(
+        "SELECT secret_string FROM duckdb_secrets() WHERE name = ?",
+        [ec._S3_SECRET_NAME],
+    ).fetchone()
+    assert "region=ap-south-7" in secret.split(";")
 
 
 def test_cache_is_per_connection(duckdb_con):
@@ -117,9 +118,10 @@ def test_local_paths_never_configure(duckdb_con):
 def test_failed_configuration_is_not_remembered(duckdb_con, monkeypatch):
     """A connection that failed PART WAY THROUGH must be retried, not skipped.
 
-    The failure is injected inside ``set_if_supported`` so httpfs is already
-    loaded and the capability scan has already run — i.e. the connection is
-    genuinely half-configured, which is the state a cache must not record.
+    The failure is injected while the store's secret is built, so httpfs is
+    already loaded and the capability scan has already run — i.e. the
+    connection is genuinely half-configured, which is the state a cache must
+    not record.
     """
     con = _spy(duckdb_con)
 
@@ -133,7 +135,7 @@ def test_failed_configuration_is_not_remembered(duckdb_con, monkeypatch):
 
     con.sql.clear()
     ec.configure_httpfs_and_s3(con, S3_FILES)
-    assert any("SET s3_" in s for s in con.sql), \
+    assert any("CREATE OR REPLACE TEMPORARY SECRET" in s for s in con.sql), \
         "the retry must configure, not return from the cache"
 
 
