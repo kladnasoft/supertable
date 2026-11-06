@@ -616,18 +616,26 @@ return generation
             raise
 
     def get_root(self, org: str, sup: str) -> Optional[Dict]:
+        """The ``meta:root`` document, or ``None`` when there is none.
+
+        Raises when Redis cannot answer, as :meth:`root_exists` does: ``None``
+        for an error read as "no root", so a replica resolved to its own
+        empty leaves and a caller checking the root's flags saw none.
+        """
         try:
             raw = self.r.get(RK.meta_root(org, sup))
             return json.loads(raw) if raw else None
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_root error: {e}")
-            return None
+            raise
 
     def update_root_flags(self, org: str, sup: str, flags: Dict[str, Any]) -> bool:
         """Merge *flags* into the existing meta:root JSON document.
 
         Used to set read_only, cloned_from, clone_type, clone_ts without
         disturbing version/ts.  Creates the root if it does not exist.
+        Returns ``True``; a Redis error raises rather than returning
+        ``False``, which a caller ignoring the result took for success.
         """
         key = RK.meta_root(org, sup)
         try:
@@ -638,7 +646,7 @@ return generation
             return True
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] update_root_flags error: {e}")
-            return False
+            raise
 
     def find_readonly_clones(self, org: str, source_sup: str) -> List[str]:
         """Return names of supertables that are read-only clones of *source_sup*."""
@@ -686,6 +694,10 @@ return generation
         Returns None for non-replicas.  Never follows chains (if source
         is itself a replica, we stop — one level only).
         Single get_root() call — avoids redundant Redis reads.
+
+        A Redis error propagates: read as "not a replica", it sent every leaf
+        read, existence check and scan to the replica's own, empty namespace.
+        An unreadable root document still reads as a non-replica.
         """
         try:
             root = self.get_root(org, sup)
@@ -695,6 +707,8 @@ return generation
                     tables = root.get("replica_tables")
                     allowed = tables if isinstance(tables, list) and tables else None
                     return (source, allowed)
+        except redis.RedisError:
+            raise
         except Exception:
             pass
         return None
@@ -716,12 +730,19 @@ return generation
         return self._get_leaf_raw(org, sup, simple)
 
     def _get_leaf_raw(self, org: str, sup: str, simple: str) -> Optional[Dict]:
+        """The ``meta:leaf`` document, or ``None`` when there is none.
+
+        Raises when Redis cannot answer. ``None`` for an error read as a
+        table without a snapshot: ``DataReader`` then read the table without
+        its deletion vector and share filter, and a garbage collector
+        protecting the files snapshots reference left this table's exposed.
+        """
         try:
             raw = self.r.get(RK.meta_leaf(org, sup, simple))
             return json.loads(raw) if raw else None
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_leaf error: {e}")
-            return None
+            raise
 
     def reserve_rowids(self, org: str, sup: str, simple: str, count: int) -> int:
         """Atomically reserve ``count`` contiguous ``__rowid__`` values.
@@ -1567,12 +1588,16 @@ return generation
             raise
 
     def get_share(self, org: str, share_id: str) -> Optional[Dict[str, Any]]:
+        """The share document, or ``None`` when there is none.
+
+        Raises when Redis cannot answer, so an error is not a missing share.
+        """
         try:
             raw = self.r.get(RK.share_doc(org, share_id))
             return json.loads(raw) if raw else None
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_share error: {e}")
-            return None
+            raise
 
     def delete_share(self, org: str, share_id: str) -> bool:
         try:
@@ -1658,6 +1683,12 @@ return generation
         return result
 
     def list_shares(self, org: str) -> List[Dict[str, Any]]:
+        """The documents of every indexed share.
+
+        Raises when Redis cannot answer, for the index or for any one
+        document, rather than returning the shares read so far. An indexed
+        share whose document is missing or not JSON is left out.
+        """
         shares: List[Dict[str, Any]] = []
         try:
             members = self.r.smembers(RK.share_index(org))
@@ -1671,6 +1702,7 @@ return generation
                         continue
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] list_shares error: {e}")
+            raise
         return shares
 
     # --------------------------------------------------------------------------- #
@@ -1688,12 +1720,16 @@ return generation
             raise
 
     def get_linked_share(self, org: str, sup: str, link_id: str) -> Optional[Dict[str, Any]]:
+        """The linked-share document, or ``None`` when there is none.
+
+        Raises when Redis cannot answer, so an error is not a missing link.
+        """
         try:
             raw = self.r.get(RK.linked_share_doc(org, sup, link_id))
             return json.loads(raw) if raw else None
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_linked_share error: {e}")
-            return None
+            raise
 
     def update_linked_share(self, org: str, sup: str, link_id: str, doc: Dict[str, Any]) -> bool:
         try:
@@ -1715,6 +1751,11 @@ return generation
             return False
 
     def list_linked_shares(self, org: str, sup: str) -> List[Dict[str, Any]]:
+        """The documents of every indexed linked share in the lake.
+
+        Raises when Redis cannot answer, as :meth:`list_shares` does. An
+        indexed link whose document is missing or not JSON is left out.
+        """
         links: List[Dict[str, Any]] = []
         try:
             members = self.r.smembers(RK.linked_share_index(org, sup))
@@ -1728,6 +1769,7 @@ return generation
                         continue
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] list_linked_shares error: {e}")
+            raise
         return links
 
     # --------------------------------------------------------------------------- #

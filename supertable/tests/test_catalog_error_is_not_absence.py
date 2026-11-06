@@ -9,15 +9,23 @@ Sentinel's 0.5 s socket timeout puts this within reach of ordinary load.
 
 Both halves of the fix are covered here: the catalog must propagate the error,
 and the write path must not treat "no leaf" as an invitation to invent a table.
+
+The catalog's reads follow the same rule: ``get_root``, the leaf read, replica
+resolution, the share and linked-share reads and ``update_root_flags`` answered
+a Redis error with ``None``, ``[]`` or ``False``, so a replica read its own
+empty namespace and a reader served a table without its deletion vector.
 """
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
 import redis
 
+from supertable import redis_keys as RK
+from supertable.data_classes import TableDefinition
 from supertable.errors import TableNotFoundError
 from supertable.storage.tests.fake_object_store import FakeObjectStore
 
@@ -44,6 +52,27 @@ def _flaky_redis(error=None):
     # get_root() -> replica resolution; unrelated, and must not mask the error.
     client.get.return_value = None
     return client
+
+
+def _timing_out(*args, **kwargs):
+    raise redis.exceptions.TimeoutError("Timeout reading from socket")
+
+
+def _unreachable_redis():
+    """A Redis client every command of which times out."""
+    client = MagicMock(name="redis")
+    for command in ("get", "set", "smembers", "exists", "scan"):
+        getattr(client, command).side_effect = _timing_out
+    return client
+
+
+def _answering(values):
+    """A ``get`` that answers from *values* and times out for any other key."""
+    def get(key):
+        if key in values:
+            return values[key]
+        return _timing_out()
+    return get
 
 
 # ===========================================================================
@@ -80,6 +109,104 @@ class TestCatalogPropagatesRedisErrors:
         assert _catalog(client).leaf_exists("org", "sup", "events") is True
         client.exists.return_value = 0
         assert _catalog(client).leaf_exists("org", "sup", "events") is False
+
+
+# ===========================================================================
+# Half 1, the reads: a value the catalog could not read is not an absent one
+# ===========================================================================
+
+class TestCatalogReadsPropagateRedisErrors:
+
+    @pytest.mark.parametrize("method,args", [
+        ("get_root", ("org", "sup")),
+        ("_get_leaf_raw", ("org", "sup", "events")),
+        ("get_leaf", ("org", "sup", "events")),
+        ("_resolve_replica_info", ("org", "sup")),
+        ("update_root_flags", ("org", "sup", {"read_only": True})),
+        ("get_share", ("org", "share-1")),
+        ("list_shares", ("org",)),
+        ("get_linked_share", ("org", "sup", "link-1")),
+        ("list_linked_shares", ("org", "sup")),
+    ])
+    def test_a_read_redis_could_not_answer_raises(self, method, args):
+        cat = _catalog(_unreachable_redis())
+        with pytest.raises(redis.exceptions.TimeoutError):
+            getattr(cat, method)(*args)
+
+    def test_a_replica_whose_root_cannot_be_read_does_not_read_its_own_leaves(self):
+        """A replica's tables live in its source's namespace, not its own.
+
+        Read as "no root", the timeout made the replica a plain lake, and its
+        leaf reads, existence checks and scans all went to its own keys.
+        """
+        own_leaf = json.dumps({"version": 0, "ts": 0, "path": "org/replica/v0.json"})
+        client = MagicMock(name="redis")
+        client.get.side_effect = _answering(
+            {RK.meta_leaf("org", "replica", "events"): own_leaf})
+        client.exists.return_value = 1
+        client.scan.return_value = (0, [RK.meta_leaf("org", "replica", "events")])
+        cat = _catalog(client)
+
+        with pytest.raises(redis.exceptions.TimeoutError):
+            cat.get_leaf("org", "replica", "events")
+        with pytest.raises(redis.exceptions.TimeoutError):
+            cat.leaf_exists("org", "replica", "events")
+        with pytest.raises(redis.exceptions.TimeoutError):
+            list(cat.scan_leaf_keys("org", "replica"))
+
+    @pytest.mark.parametrize("method,args,first_doc", [
+        ("list_shares", ("org",), RK.share_doc("org", "a")),
+        ("list_linked_shares", ("org", "sup"), RK.linked_share_doc("org", "sup", "a")),
+    ], ids=["shares", "linked_shares"])
+    def test_a_listing_with_one_unreadable_member_raises(self, method, args, first_doc):
+        """Not the members read before the error, as if that were all."""
+        client = MagicMock(name="redis")
+        client.smembers.return_value = ["a", "b"]
+        client.get.side_effect = _answering({first_doc: json.dumps({"id": "a"})})
+        with pytest.raises(redis.exceptions.TimeoutError):
+            getattr(_catalog(client), method)(*args)
+
+    def test_a_healthy_redis_still_reports_absence(self):
+        client = MagicMock(name="redis")
+        client.get.return_value = None
+        client.smembers.return_value = set()
+        cat = _catalog(client)
+        assert cat.get_root("org", "sup") is None
+        assert cat.get_leaf("org", "sup", "events") is None
+        assert cat._resolve_replica_info("org", "sup") is None
+        assert cat.get_share("org", "share-1") is None
+        assert cat.list_shares("org") == []
+        assert cat.get_linked_share("org", "sup", "link-1") is None
+        assert cat.list_linked_shares("org", "sup") == []
+
+    def test_an_unreadable_root_document_still_reads_as_no_replica(self):
+        """Only a Redis error propagates out of replica resolution."""
+        client = MagicMock(name="redis")
+        client.get.side_effect = lambda key: (
+            "{not json" if key == RK.meta_root("org", "sup") else None)
+        assert _catalog(client)._resolve_replica_info("org", "sup") is None
+
+
+class TestReadControlsSeeTheError:
+    """What the swallowed error cost the read path: its controls."""
+
+    def test_the_reader_does_not_resolve_a_snapshot_it_could_not_read(self):
+        """``{}`` here is a table with no deletion vector and no share filter."""
+        from supertable.data_reader import DataReader
+
+        reader = DataReader.__new__(DataReader)
+        reader.organization = "org"
+        with pytest.raises(redis.exceptions.TimeoutError):
+            reader._resolve_snapshot(_catalog(_unreachable_redis()), "sup", "events")
+
+    def test_the_share_filter_fingerprint_does_not_skip_an_unreadable_leaf(self):
+        from supertable.odata.policy import _share_row_filters
+
+        with patch("supertable.redis_catalog.RedisCatalog",
+                   return_value=_catalog(_unreachable_redis())):
+            with pytest.raises(redis.exceptions.TimeoutError):
+                _share_row_filters("org", "sup", "reader",
+                                   [TableDefinition("sup", "events", "e")])
 
 
 # ===========================================================================

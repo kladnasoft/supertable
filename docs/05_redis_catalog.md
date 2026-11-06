@@ -50,7 +50,7 @@ A leaf at `meta:leaf:doc:<simple>` identifies the current simple-table snapshot:
 
 The example is a reduced record. The payload produced by the table writer also includes schema, tombstone and statistics references, timestamps, location, and optional lineage. `version` is the Redis leaf update counter; `snapshot_version` is maintained in the JSON snapshot. They are separate fields, not one shared counter.
 
-`get_leaf()` returns the decoded record or `None`. `SimpleTable.get_simple_table_snapshot()` first uses an inline payload with a list-valued `resources` field, including an accepted nested `payload.snapshot` shape. Otherwise it reads `path` from storage. The pointer must still contain a path even when the payload is inline.
+`get_leaf()` returns the decoded record, or `None` when there is no leaf; a Redis error raises. `SimpleTable.get_simple_table_snapshot()` first uses an inline payload with a list-valued `resources` field, including an accepted nested `payload.snapshot` shape. Otherwise it reads `path` from storage. The pointer must still contain a path even when the payload is inline.
 
 ## Publication and atomic operations
 
@@ -105,7 +105,7 @@ The snapshot chain is metadata history. Following it can raise if a previous JSO
 
 ## Replica reads
 
-When a root has `clone_type="replica"` and a different nonempty `cloned_from`, `get_leaf()`, `leaf_exists()`, and leaf scanning read the source super-table's leaves. A nonempty list in `replica_tables` filters permitted simple names; a missing or empty list means no table-name restriction here.
+When a root has `clone_type="replica"` and a different nonempty `cloned_from`, `get_leaf()`, `leaf_exists()`, and leaf scanning read the source super-table's leaves. A nonempty list in `replica_tables` filters permitted simple names; a missing or empty list means no table-name restriction here. A Redis error reading the root raises from these calls rather than sending them to the replica's own, empty namespace.
 
 Root retrieval remains at the requested namespace. Replica lookup is a single source redirection, not recursive source resolution. `find_readonly_clones()` scans roots in one organization and returns those whose `read_only` flag is truthy and whose `cloned_from` matches the source. These catalog primitives read and write metadata; they do not perform storage copying themselves.
 
@@ -117,9 +117,11 @@ Failure handling varies by method:
 
 | Methods | Redis failure behavior |
 | --- | --- |
-| `root_exists()`, raw leaf existence, `ensure_root()`, leaf publication, `bump_root()` | Log and raise |
+| `root_exists()`, raw leaf existence, `ensure_root()`, leaf publication, `bump_root()`, `update_root_flags()` | Log and raise |
+| `get_root()`, `get_leaf()` and raw leaf retrieval, `get_share()`, `get_linked_share()` | Log and raise; `None` means the key is absent. Malformed JSON raises the decoder's error |
+| Replica resolution in `get_leaf()`, `leaf_exists()`, and leaf scans | Raise; a malformed root reads as no replica |
+| `list_shares()`, `list_linked_shares()` | Log and raise, for the index or any one document; an indexed document that is missing or malformed is skipped |
 | `ping()` | Return false |
-| `get_root()`, raw leaf retrieval | Return `None` on Redis errors; malformed JSON is not covered by that Redis-only catch |
 | Leaf scans and batches | Log and stop/skip the failed operation, potentially yielding partial results |
 | Many metadata getters | Return `None`, an empty list, or defaults |
 | Several metadata mutation helpers | Return false or a partial deletion count |

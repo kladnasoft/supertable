@@ -145,7 +145,7 @@ Streaming uses the same table, role, share-filter, and deletion-vector preparati
 
 If an exception escapes the leaf getter during per-table deletion-vector lookup, the reader wraps it in `DeletionVectorUnavailable` and fails the read. An exception while establishing a share predicate uses `ShareFilterUnavailable`; both derive from `ReadAccessUnavailable`. A share predicate is combined with an existing role predicate using `AND`.
 
-`RedisCatalog` converts Redis-specific errors in its leaf/root getters to `None`, so those failures do not necessarily reach the exception handling above. A failed control lookup after successful planning can therefore look like an absent payload and skip controls.
+`RedisCatalog`'s leaf and root getters raise a Redis error rather than returning `None`, so a lookup that fails after successful planning reaches that handling and fails the read instead of looking like an absent payload.
 
 A path-only leaf is a related limitation: the estimator can recover resources from its snapshot file, but the control lookup reads tombstones and share predicates only from the embedded leaf payload. When that payload is absent, neither executor reloads the missing controls from the snapshot. The writer can publish a path-only leaf after a payload-publication failure, so that fallback can omit deletion/share filtering on a later read. See [implementation gaps](TODO.md).
 
