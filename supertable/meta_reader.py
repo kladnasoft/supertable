@@ -9,7 +9,18 @@ from datetime import datetime
 from typing import List, Optional, Dict, Any, Set, Tuple
 
 from supertable.errors import SuperTableNotFoundError, TableNotFoundError
-from supertable.rbac.access_control import check_meta_access
+from supertable.odata.row_identity import (
+    ROWID_COLUMN,
+    identity_column_present,
+    verify_stable_identity,
+)
+from supertable.rbac.access_control import (
+    check_meta_access,
+    resolve_role_access_context,
+    resolve_table_policy,
+    visible_columns_for_policy,
+)
+from supertable.rbac.permissions import Permission
 from supertable.redis_catalog import RedisCatalog
 from supertable import redis_keys as RK
 
@@ -158,6 +169,26 @@ def _cols_count(snapshot: Any) -> int:
     return len(names) if names else widest
 
 
+#: Keys a linked share's leaf or snapshot carries. Its rows, and their rowids,
+#: are the provider lake's, served under the provider's filter and mask.
+_LINKED_SHARE_MARKERS = frozenset({
+    "_linked_share", "_provider_org", "_row_filter", "_allowed_columns",
+})
+
+
+def _carries_linked_share(*documents: Any) -> bool:
+    """Whether any of *documents* carries a linked-share marker."""
+    return any(
+        isinstance(doc, dict) and not _LINKED_SHARE_MARKERS.isdisjoint(doc)
+        for doc in documents
+    )
+
+
+def _is_system_column(name: str) -> bool:
+    """``__rowid__``, ``__timestamp__`` and any other ``__*__`` column."""
+    return len(name) > 4 and name.startswith("__") and name.endswith("__")
+
+
 def _schema_to_dict(schema_obj: Any) -> Dict[str, Any]:
     """Normalize schema representations into a {name: type} dict."""
     if isinstance(schema_obj, dict):
@@ -197,6 +228,8 @@ class MetaReader:
             create_if_missing=False,
         )
         self.catalog = RedisCatalog()
+        # role_name -> RoleAccessContext, for get_odata_table_schema.
+        self._odata_role_contexts: Dict[str, Any] = {}
 
 
     def _get_all_tables(self) -> List[str]:
@@ -332,6 +365,89 @@ class MetaReader:
 
             distinct_schema = dict(sorted(schema_items))
             return [distinct_schema]
+
+    def get_odata_table_schema(
+            self, table_name: str, role_name: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Schema of one table that can back keyed OData, or ``None``.
+
+        dataisland-core's OData service calls this for every entity set it
+        lists in ``$metadata`` and for every page it serves, and keys each
+        entity on the row's ``__rowid__``. So a table qualifies only when its
+        rowids can be trusted as keys and the role can read them:
+
+        * it is one table, not the lake's aggregate (``table_name`` equal to
+          the SuperTable's name), whose tables each count their own rowids;
+        * the role's policy covers it: no entry, or ``access: deny``, leaves
+          it out, though :meth:`get_tables` lists a denied table;
+        * it exists and is not a linked share, whose rows and rowids are the
+          provider lake's;
+        * its snapshot proves the rowid contract (``verify_stable_identity``:
+          a watermark, and no more live rows than ids reserved) and its schema
+          carries ``__rowid__``;
+        * the role's column policy grants ``__rowid__``, which the service
+          selects with every page;
+        * the role sees at least one other column.
+
+        Returns ``[{column: type}]`` like :meth:`get_table_schema`, sorted,
+        with the columns the role's policy lets it read (include minus
+        exclude) and no ``__*__`` system column. A table that fails a
+        condition, or whose schema has columns differing only in case, is
+        ``None`` rather than a ``PermissionError``, so one table cannot fail a
+        feed of many. A role that may not read metadata at all (unknown,
+        disabled, no META) raises ``PermissionError``, as
+        :meth:`get_super_meta` does.
+
+        The leaf is read once, so the proof and the schema come from one
+        snapshot. The role is resolved once per ``MetaReader``: the service
+        asks about every table of a lake within one request, and a new
+        ``MetaReader`` sees a changed role.
+        """
+        org = self.super_table.organization
+        sup = self.super_table.super_name
+        if table_name == sup:
+            return None
+        context = self._odata_role_contexts.get(role_name)
+        if context is None:
+            context = resolve_role_access_context(
+                sup, org, role_name, Permission.META, "META data",
+            )
+            self._odata_role_contexts[role_name] = context
+        try:
+            entry = resolve_table_policy(context, table_name, "META data")
+        except PermissionError:
+            return None
+
+        leaf = self.catalog.get_leaf(org, sup, table_name)
+        if not isinstance(leaf, dict):
+            return None
+        snapshot = _leaf_to_snapshot_like(leaf)
+        if snapshot is None:
+            if not leaf.get("path"):
+                return None
+            try:
+                snapshot = self.super_table.storage.read_json(leaf["path"])
+            except FileNotFoundError:
+                return None
+        if (
+            not isinstance(snapshot, dict)
+            or _carries_linked_share(leaf, leaf.get("payload"), snapshot)
+        ):
+            return None
+        schema = _schema_to_dict(snapshot.get("schema", {}))
+        if not verify_stable_identity(snapshot) or not identity_column_present(schema):
+            return None
+        try:
+            if not visible_columns_for_policy(entry, [ROWID_COLUMN]):
+                return None
+            visible = visible_columns_for_policy(
+                entry, [name for name in schema if not _is_system_column(str(name))],
+            )
+        except PermissionError:
+            return None
+        if not visible:
+            return None
+        return [dict(sorted((name, schema[name]) for name in visible))]
 
     def collect_simple_table_schema(self, schemas: set, table_name: str, role_name: str) -> None:
         """Add one table's schema tuple to *schemas*.

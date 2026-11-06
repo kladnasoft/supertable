@@ -54,6 +54,13 @@ def test_stream_accepts_every_keyword_the_service_passes():
         assert name in params, f"service passes {name!r}, signature lacks it"
 
 
+def test_keyed_schema_reader_takes_what_the_service_passes():
+    """odata_handler.py calls ``reader.get_odata_table_schema(table,
+    role_name=role_name)`` for $metadata and for every entity-set page."""
+    params = inspect.signature(supertable.MetaReader.get_odata_table_schema).parameters
+    assert list(params) == ["self", "table_name", "role_name"]
+
+
 def test_policy_change_raises_permission_error():
     """The service catches PermissionError to turn this into a continuation
     conflict rather than a 500 — so the subclass must remain one."""
