@@ -1341,8 +1341,9 @@ class TestMetaScope:
 # cols_count — one column count for the stats and the meta
 # ===========================================================================
 
-#: A table's resources in each form the count reads, and the count it owes.
+#: A table's snapshot in each form the count reads, and the count it owes.
 _COLUMN_SNAPSHOTS = {
+    # A table with files: its resources decide.
     "names": ({"resources": [
         {"file": "f1", "rows": 1, "file_size": 10, "columns": ["id", "amount"]},
         {"file": "f2", "rows": 1, "file_size": 10, "columns": ["id", "region"]},
@@ -1360,8 +1361,33 @@ _COLUMN_SNAPSHOTS = {
         {"file": "f1", "rows": 1, "file_size": 10, "columns": ["id"]},
         {"file": "f2", "rows": 1, "file_size": 10, "columns": 9},
     ]}, 1),
-    "no resources": ({"schema": [{"name": "id", "type": "Int64"}]}, 0),
-    "empty resources": ({"resources": [], "schema": [{"name": "id"}]}, 0),
+    "files over schema": ({"resources": [
+        {"file": "f1", "rows": 1, "file_size": 10, "columns": 4},
+    ], "schema": {"id": "Int64", "amount": "Float64"}}, 4),
+    # Even when they record no column: the schema speaks only for a table
+    # without files.
+    "files without columns": ({"resources": [
+        {"file": "f1", "rows": 1, "file_size": 10},
+    ], "schema": {"id": "Int64", "amount": "Float64"}}, 0),
+    # A table without files: the columns its schema declares, in the shapes
+    # the reader takes (DataEstimator._schema_to_dict).
+    "no files, schema object": ({"resources": [], "schema": {
+        "id": "Int64", "amount": "Float64", "region": "String",
+    }}, 3),
+    "no files, schema items": ({"resources": [], "schema": [
+        {"name": "id", "type": "long", "nullable": True, "metadata": {}},
+        {"name": "amount", "type": "double", "nullable": True, "metadata": {}},
+        {"name": "id", "type": "long", "nullable": True, "metadata": {}},
+    ]}, 2),
+    "no resources, schema items": (
+        {"schema": [{"name": "id", "type": "Int64"}]}, 1),
+    # Neither files nor a declared column.
+    "no files, no schema": ({"resources": [], "schema": []}, 0),
+    "no files, empty schema object": ({"resources": [], "schema": {}}, 0),
+    "no files, schema the reader does not take": ({"resources": [], "schema": [
+        {"id": "Int64"}, {"name": None, "type": "Int64"}, "amount",
+    ]}, 0),
+    "no resources, no schema": ({}, 0),
 }
 
 
@@ -1371,6 +1397,11 @@ class TestColsCount:
     Stats items carried no ``cols_count`` while the meta computed one inline,
     so a client reading stats could only show the count as unknown. Both now
     take it from ``_cols_count``, so they cannot disagree about a table.
+
+    The count read only resources, so a table without files counted 0 even
+    when its schema declares columns, which the reader serves. An empty write
+    to such a table publishes that version, and so does a rollback to version
+    0. Such a table now counts its schema's columns.
     """
 
     def setup_method(self):
@@ -1405,6 +1436,8 @@ class TestColsCount:
 
         assert [item["cols_count"] for item in stats] == [expected]
         assert [t["cols_count"] for t in meta["super"]["tables"]] == [expected]
+        # Counted before the item drops the schema it may be counted from.
+        assert ["schema" in item for item in stats] == [False]
 
     @patch(_P_SIMPLE_TABLE)
     @patch(_P_CHECK_META)
@@ -1414,15 +1447,17 @@ class TestColsCount:
             reader.catalog,
             "supertable:org:lakes:sup:meta:leaf:doc:t1",
             "supertable:org:lakes:sup:meta:leaf:doc:t2",
+            "supertable:org:lakes:sup:meta:leaf:doc:t3",
         )
         snapshots = iter([_COLUMN_SNAPSHOTS["names"][0],
-                          _COLUMN_SNAPSHOTS["integer counts"][0]])
+                          _COLUMN_SNAPSHOTS["integer counts"][0],
+                          _COLUMN_SNAPSHOTS["no files, schema object"][0]])
         MockST.return_value.get_simple_table_snapshot.side_effect = (
             lambda: (dict(next(snapshots)), "/p")
         )
 
         stats = reader.get_table_stats("sup", "admin")
-        assert [item["cols_count"] for item in stats] == [3, 6]
+        assert [item["cols_count"] for item in stats] == [3, 6, 3]
 
     def test_resources_that_are_not_a_list_count_nothing(self):
         from supertable.meta_reader import _cols_count
@@ -1431,3 +1466,11 @@ class TestColsCount:
         assert _cols_count({"resources": None}) == 0
         assert _cols_count({"resources": {"f1": {"columns": 3}}}) == 0
         assert _cols_count({"resources": ["f1", {"columns": 2}]}) == 2
+
+    def test_resources_that_are_not_a_list_are_no_files(self):
+        """``get_super_meta`` counts such a table's files as 0, so its schema
+        speaks for it, as it does for an empty resource list."""
+        from supertable.meta_reader import _cols_count
+
+        assert _cols_count({"resources": {}, "schema": {"id": "Int64"}}) == 1
+        assert _cols_count({"resources": None, "schema": [{"name": "id"}]}) == 1

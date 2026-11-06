@@ -111,18 +111,40 @@ def _leaf_to_snapshot_like(meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _cols_count(snapshot: Any) -> int:
-    """A table's column count, from its snapshot's resources.
+    """A table's column count, from its snapshot.
 
-    The distinct column names across the resources whose ``columns`` is a list
-    (of names, or of ``{"name": ...}`` items). Without a single name, the
-    largest integer ``columns`` a resource records, which is what the writer
-    stores. 0 for a table without resources. ``get_super_meta`` reports this
-    per table and ``get_table_stats`` per item, so the two cannot disagree.
+    For a table with files, the distinct column names across the resources
+    whose ``columns`` is a list (of names, or of ``{"name": ...}`` items).
+    Without a single name, the largest integer ``columns`` a resource records,
+    which is what the writer stores.
+
+    A table without files (``resources`` empty, or not a list, which
+    ``get_super_meta`` counts as no files) counts the columns its ``schema``
+    declares, in the shapes the reader takes (``DataEstimator._schema_to_dict``):
+    a ``{name: type}`` object, or a list of ``{"name": ...}`` items. Such a
+    version declares its table's columns there: an empty write to a table
+    without files publishes one, and so does dataisland-core's rollback to
+    version 0, which keeps the columns of the version it replaces. The reader
+    serves them as a typed empty relation, so counting only resources reported
+    those tables as having no columns. 0 for a table with neither.
+
+    ``get_super_meta`` reports this per table and ``get_table_stats`` per item,
+    so the two cannot disagree.
     """
-    resources = snapshot.get("resources", []) if isinstance(snapshot, dict) else []
+    if not isinstance(snapshot, dict):
+        return 0
+    resources = snapshot.get("resources")
+    if not isinstance(resources, list) or not resources:
+        schema = snapshot.get("schema")
+        if isinstance(schema, dict):
+            return len(schema)
+        if isinstance(schema, list):
+            return len({str(item["name"]) for item in schema
+                        if isinstance(item, dict) and item.get("name") is not None})
+        return 0
     names = set()
     widest = 0
-    for res in resources if isinstance(resources, list) else []:
+    for res in resources:
         if isinstance(res, dict):
             cols = res.get("columns")
             if isinstance(cols, list):
@@ -343,7 +365,9 @@ class MetaReader:
 
         An item is the table's snapshot without ``previous_snapshot``,
         ``schema`` and ``location``, plus its ``cols_count``: the column count
-        ``get_super_meta`` reports for the same table.
+        ``get_super_meta`` reports for the same table. It is counted from the
+        whole snapshot, so a table without files counts the columns its
+        ``schema`` declares though the item leaves the schema out.
 
         Raises ``PermissionError`` when the role lacks META on it. Returning
         ``[]`` made a denial look identical to an empty table, which for a
