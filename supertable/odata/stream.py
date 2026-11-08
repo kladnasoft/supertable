@@ -227,6 +227,12 @@ def query_odata_sql_stream(
     ``effective_policy_fingerprint`` and ``selected_engine`` so the server can
     re-verify policy after the rows have been consumed.
 
+    ``engine`` is the engine the policy is resolved for and the read runs on;
+    None leaves the read to AUTO. A service that keys its entities on
+    ``__rowid__`` names ``Engine.DUCKDB``: AUTO hands the read to an active
+    Spark cluster whose size threshold admits it, and Spark's read does not
+    carry the column.
+
     Raises :class:`ODataPolicyChanged` (a PermissionError) when
     ``expected_effective_policy_fingerprint`` no longer matches — checked
     BEFORE reading, so a revoked grant cannot leak a single row.
@@ -250,7 +256,8 @@ def query_odata_sql_stream(
     paged_sql = _bounded_sql(sql, continuation_boundary, max_total_rows)
     reader = DataReader(super_name=super_name, organization=organization,
                         query=paged_sql, source=source)
-    handle = reader.stream(role_name=role_name, expose_rowid=True)
+    handle = reader.stream(role_name=role_name, engine=engine,
+                           expose_rowid=True)
 
     if out is not None:
         # Recorded after the read is planned, so it names the engine that will

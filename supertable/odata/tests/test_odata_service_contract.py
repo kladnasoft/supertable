@@ -18,6 +18,7 @@ import polars as pl
 import pytest
 
 import supertable
+from supertable.engine.engine_enum import Engine
 from supertable.odata import stream as S
 from supertable.odata.row_identity import ROWID_COLUMN
 
@@ -50,7 +51,7 @@ def test_stream_accepts_every_keyword_the_service_passes():
     for name in ("organization", "super_name", "sql", "role_name",
                  "max_total_rows", "timeout_sec", "source", "out",
                  "cancel_event", "expected_effective_policy_fingerprint",
-                 "continuation_boundary"):
+                 "continuation_boundary", "engine"):
         assert name in params, f"service passes {name!r}, signature lacks it"
 
 
@@ -65,6 +66,64 @@ def test_policy_change_raises_permission_error():
     """The service catches PermissionError to turn this into a continuation
     conflict rather than a 500 — so the subclass must remain one."""
     assert issubclass(S.ODataPolicyChanged, PermissionError)
+
+
+# --------------------------------------------------------------------------
+# The engine — the one the service names is the one the read runs on
+# --------------------------------------------------------------------------
+
+class _Handle:
+    """The stream handle ODataStream iterates and closes, holding no rows."""
+
+    schema = None
+
+    def batches(self):
+        return iter(())
+
+    def cancel(self):
+        pass
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize("named, read_on", [
+    ({"engine": Engine.DUCKDB}, Engine.DUCKDB),
+    ({}, Engine.AUTO),
+])
+def test_the_read_runs_on_the_engine_the_service_names(monkeypatch, named,
+                                                      read_on):
+    """odata_server.py names ``Engine.DUCKDB`` for every page: only DuckDB's
+    read carries ``__rowid__``, and under AUTO an active Spark cluster takes
+    the read. So the engine must reach the read, not only the policy
+    fingerprint. Without one the read is AUTO, as ``DataReader.stream``'s is.
+
+    The reader is real down to ``execute``, which records the engine it was
+    asked for and hands back an empty handle.
+    """
+    from supertable.data_reader import DataReader, Status
+    from supertable.odata import policy
+
+    seen = {}
+
+    def _fingerprint(organization, super_name, sql, role_name, *, engine=None):
+        seen["policy"] = engine
+        return {"role_policy_fingerprint": "role",
+                "effective_policy_fingerprint": "effective"}
+
+    def _execute(self, role_name, with_scan=False, engine=Engine.AUTO,
+                 fullscan=False):
+        seen["read"] = engine
+        self._stream_out["handle"] = _Handle()
+        return None, Status.OK, None
+
+    monkeypatch.setattr(policy, "query_sql_policy_fingerprint", _fingerprint)
+    monkeypatch.setattr(DataReader, "execute", _execute)
+    supertable.query_odata_sql_stream(
+        organization="org", super_name="sup", sql="SELECT 1", role_name=ROLE,
+        **named,
+    ).close()
+    assert seen == {"policy": named.get("engine"), "read": read_on}
 
 
 # --------------------------------------------------------------------------
