@@ -533,6 +533,16 @@ def run_check(
 # Check execution
 # ──────────────────────────────────────────────────────────────────────
 
+def _table_fqn(sup: str, table_name: str) -> str:
+    """The table as the checks' statements name it, both parts quoted.
+
+    Unquoted, a SuperTable named with a hyphen -- ``medicare-example_dev_bronze``
+    -- parsed as a subtraction, and every check on it failed.
+    """
+    from supertable.quality.checker import _quote
+    return f"{_quote(sup)}.{_quote(table_name)}"
+
+
 def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
     """Execute a quick profile check for one table.
 
@@ -567,7 +577,7 @@ def _run_quick_check(r, org: str, sup: str, table_name: str, dqc) -> None:
                 if is_profilable_column(name)]
 
     # Build and execute quick SQL
-    table_fqn = f"{sup}.{table_name}"
+    table_fqn = _table_fqn(sup, table_name)
     inc_col = eff.get("incremental_column")
     last_ts = None
     if inc_col and eff.get("scope") == "incremental":
@@ -701,7 +711,7 @@ def _run_deep_check(r, org: str, sup: str, table_name: str, dqc) -> None:
         raise RuntimeError(f"No schema for {table_name}")
     schema_dict = schema_raw[0]
 
-    table_fqn = f"{sup}.{table_name}"
+    table_fqn = _table_fqn(sup, table_name)
     failed_columns = []
 
     for col_name, col_type in schema_dict.items():
@@ -803,7 +813,7 @@ def _run_custom_check(r, org: str, sup: str, table_name: str, dqc) -> None:
     if not custom_rules:
         return
 
-    table_fqn = f"{sup}.{table_name}"
+    table_fqn = _table_fqn(sup, table_name)
     rule_results = []
     rule_anomalies = []
 

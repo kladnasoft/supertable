@@ -76,6 +76,34 @@ def test_a_deep_check_records_every_column(dqc):
     assert dqc.get_latest_column("orders", "name")["deep"]["non_nulls"] == 2
 
 
+def test_every_check_runs_on_a_supertable_named_with_a_hyphen(hermetic_fakeredis):
+    """The checks named their table ``sup.table`` unquoted. A SuperTable may
+    be named with a hyphen -- Studio names a project's
+    ``<project>_<env>_<layer>``, so a project called ``medicare-example`` has
+    ``medicare-example_dev_bronze`` -- and the statement parsed it as a
+    subtraction, so every quick, deep and custom check on it failed."""
+    sup = "medicare-example_dev_bronze"
+    SuperTable(sup, ORG)
+    DataWriter(super_name=sup, organization=ORG).write(
+        role_name=ROLE, simple_name="orders", overwrite_columns=[],
+        data=pl.DataFrame({"id": [1, 2, 3], "name": ["a", None, "c"]}))
+    dqc = DQConfig(hermetic_fakeredis, ORG, sup)
+    _enable_deep(dqc)
+    DQConfig(hermetic_fakeredis, ORG, sup, actor_role_name=ROLE).create_rule(
+        {"table_name": "orders", "rule_type": "row_count_min", "threshold": 1})
+
+    def run(mode):
+        return run_check(hermetic_fakeredis, ORG, sup, "orders", mode, dqc, 0).state
+
+    assert run("quick") == "success"
+    assert dqc.get_latest("orders")["row_count"] == 3
+    assert run("deep") == "success"
+    assert dqc.get_latest_column("orders", "name")["deep"]["non_nulls"] == 2
+    assert run("custom") == "success"
+    assert [(rule["rule_type"], rule["status"])
+            for rule in dqc.get_latest("orders")["rule_results"]] == [
+        ("row_count_min", "ok")]
+
 def test_a_violated_rule_is_an_anomaly_and_a_kept_one_passes(dqc):
     violated = _rule(dqc, rule_type="null_rate_max", column_name="name",
                      threshold=0, severity="critical")
