@@ -26,7 +26,7 @@ export SUPERTABLE_REDIS_DB=0
 
 Settings are loaded into a process-wide object. Importing the home-directory module, including through normal package imports, creates/resolves the application home and changes the process working directory to it. Use absolute paths when your application must retain a reference to its original directory. Local storage still requires Redis for metadata and locks.
 
-`pyproject.toml`, `setup.py` and `supertable.__version__` identify this source as `3.5.2`. Use the checked-out APIs as the reference for this guide.
+`pyproject.toml`, `setup.py` and `supertable.__version__` identify this source as `3.5.3`. Use the checked-out APIs as the reference for this guide.
 
 ## Create and write a table
 
