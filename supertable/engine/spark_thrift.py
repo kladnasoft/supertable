@@ -186,7 +186,8 @@ def _to_spark_predicate(clause: str) -> str:
     if not text:
         return ""
     try:
-        return sqlglot.parse_one(text, read="duckdb").sql(dialect="spark")
+        return sqlglot.parse_one(text, read="duckdb").sql(
+            dialect="spark", comments=False)
     except sqlglot.errors.ParseError as e:
         # Narrow on purpose: a NameError or a typo here would otherwise be
         # reported as "bad filter", which sends the reader hunting the wrong
@@ -526,23 +527,29 @@ def _spark_rewrite_query(
         original_sql: str,
         alias_to_table: Dict[str, str],
 ) -> str:
-    """Rewrite table references and transpile SQL to Spark dialect.
+    """Rewrite table references and write the query out in Spark's dialect.
 
     Two-step process:
     1. Delegate to ``rewrite_query_with_hashed_tables`` to replace table
        references with physical hashed names (shared with DuckDB path).
-    2. Transpile the resulting SQL from DuckDB dialect to Spark dialect
-       via sqlglot.  This converts identifier quoting from double-quotes
-       (``"col"``) to backticks (`` `col` ``), and adapts other syntax
-       differences (e.g. INTERVAL literals, type names).
+    2. Write the result — DuckDB-dialect SQL — out as Spark SQL via sqlglot.
+       This converts identifier quoting from double-quotes (``"col"``) to
+       backticks (`` `col` ``), escapes a backslash in a string the way Spark
+       reads one, and adapts other syntax differences (e.g. INTERVAL
+       literals, type names).
 
-    Falls back to a simple double-quote → backtick replacement if sqlglot
-    transpilation fails for any reason.
+    Spark only ever receives what step 2 writes. There used to be a fallback
+    for when it failed: swap the quote characters in the text and send that.
+    DuckDB-dialect text is not Spark text — Spark reads ``\\'`` as a quote
+    inside a string where DuckDB reads the string's end — so the fallback
+    handed Spark a query that neither grammar's reading of it had judged. A
+    query that cannot be written for Spark now RAISES.
+
+    No comments are written: see ``rewrite_query_with_hashed_tables``.
     """
     rewritten = rewrite_query_with_hashed_tables(original_sql, alias_to_table)
 
     try:
-        import sqlglot
         # Parse as DuckDB (which uses double-quote identifiers),
         # generate as Spark (which uses backtick identifiers).
         transpiled = sqlglot.transpile(
@@ -550,66 +557,17 @@ def _spark_rewrite_query(
             read="duckdb",
             write="spark",
             pretty=False,
+            comments=False,
         )
-        if transpiled and transpiled[0]:
-            return transpiled[0]
     except Exception as e:
-        logger.debug(f"[spark.thrift] sqlglot transpile failed, using quote fallback: {e}")
+        raise ValueError(f"could not write the query for Spark: {e}") from e
 
-    # Fallback: replace double-quoted identifiers with backtick-quoted ones.
-    # This handles the common case where sqlglot can't parse the rewritten SQL
-    # but the only issue is identifier quoting style.
-    return _double_quotes_to_backticks(rewritten)
-
-
-def _double_quotes_to_backticks(sql: str) -> str:
-    """Replace double-quoted identifiers with backtick-quoted identifiers.
-
-    Walks the SQL character-by-character, respecting single-quoted string
-    literals (which must not be modified).  Only double-quoted sequences
-    are converted.
-
-    Example:
-        ``SELECT "product_id", SUM("revenue") AS "total"``
-        → ``SELECT `product_id`, SUM(`revenue`) AS `total```
-    """
-    result = []
-    i = 0
-    in_single = False
-    while i < len(sql):
-        ch = sql[i]
-        if ch == "'" and not in_single:
-            # Enter single-quoted string — copy verbatim until closing '
-            in_single = True
-            result.append(ch)
-            i += 1
-            while i < len(sql):
-                c2 = sql[i]
-                result.append(c2)
-                if c2 == "'" and (i + 1 >= len(sql) or sql[i + 1] != "'"):
-                    in_single = False
-                    i += 1
-                    break
-                if c2 == "'" and i + 1 < len(sql) and sql[i + 1] == "'":
-                    # Escaped single quote — copy both
-                    result.append(sql[i + 1])
-                    i += 2
-                else:
-                    i += 1
-        elif ch == '"':
-            # Double-quoted identifier — convert to backtick
-            result.append('`')
-            i += 1
-            while i < len(sql) and sql[i] != '"':
-                result.append(sql[i])
-                i += 1
-            result.append('`')
-            if i < len(sql):
-                i += 1  # skip closing "
-        else:
-            result.append(ch)
-            i += 1
-    return ''.join(result)
+    if len(transpiled) != 1 or not transpiled[0]:
+        raise ValueError(
+            "could not write the query for Spark: expected one statement, "
+            f"got {len(transpiled)}"
+        )
+    return transpiled[0]
 
 
 # =========================================================

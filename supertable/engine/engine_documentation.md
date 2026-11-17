@@ -141,7 +141,7 @@ Each view name includes a per-query UUID suffix to prevent collisions under conc
 ```
 supertable/engine/
 ├── __init__.py              Package exports (Engine, Executor, PlanStats, DataEstimator)
-├── engine_enum.py           Engine enum (AUTO, DUCKDB_LITE, DUCKDB_PRO, SPARK_SQL) + dialect
+├── engine_enum.py           Engine enum (AUTO, DUCKDB, SPARK_SQL)
 ├── engine_common.py         Shared: S3 config, httpfs, view creation (reflection/RBAC/dedup/tombstone), query rewriting, connection init, augment_rbac_columns
 ├── executor.py              Engine router + auto-pick logic
 ├── duckdb_lite.py           Ephemeral DuckDB executor (fire-and-forget)

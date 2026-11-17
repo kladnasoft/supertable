@@ -50,7 +50,7 @@ reader.execute(
 | Argument | Behavior |
 | --- | --- |
 | `role_name` | Name of the role to resolve in this organization and SuperTable |
-| `engine` | An `Engine` enum member; the method reads its `dialect` property |
+| `engine` | An `Engine` enum member. It chooses where the query runs; the query is read as DuckDB SQL whichever is chosen |
 | `fullscan` | Bypasses SuperTable's statistics-based file pruning |
 | `with_scan` | Accepted by the current signature but not used in the execution body |
 
@@ -70,7 +70,7 @@ An unqualified name such as `orders` uses the constructor's `super_name`. A qual
 - Missing leaf: `TableNotFoundError`, returned as `Status.ERROR` with its message.
 - Missing source columns or absent Parquet resources: execution error during estimation.
 
-The read gate permits one read statement and rejects writes, multiple statements, and table functions. SELECT queries may contain CTEs, joins, subqueries, and set operations subject to the parser and selected engine. A query with no named source table fails parser validation.
+The read gate permits one read statement and rejects writes, multiple statements, table functions in FROM or after `LATERAL`, and functions that read the engine's state, files or URLs or call Java; see [Query engine](09_query_engine.md), section 1. A comment in the query is not sent to the engine. SELECT queries may contain CTEs, joins, subqueries, and set operations subject to the parser and selected engine. A query with no named source table fails parser validation.
 
 The SQL role is supplied directly by the caller. `DataReader` does not authenticate a username, select a user's role, or verify a bearer token. An application exposing it must resolve the caller's permitted role before invoking this API.
 

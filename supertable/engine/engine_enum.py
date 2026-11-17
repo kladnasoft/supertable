@@ -15,15 +15,8 @@ class Engine(Enum):
     DUCKDB = "duckdb"
     SPARK_SQL = "spark_sql"
 
-    @property
-    def dialect(self) -> str:
-        """Return the sqlglot dialect string for this engine.
-
-        Used by SQLParser to select the correct grammar.  AUTO defaults
-        to ``"duckdb"`` because that is the most common resolution path
-        and DuckDB's grammar is a superset of what Spark SQL accepts
-        for the standard SELECT/JOIN/GROUP BY patterns used in queries.
-        """
-        if self == Engine.SPARK_SQL:
-            return "spark"
-        return "duckdb"
+    # There is no ``dialect`` here any more. A query has one reading — DuckDB's,
+    # the one admission judges — whatever engine runs it; the Spark executor
+    # writes that reading out as Spark SQL. A per-engine parser dialect is how
+    # the tables a query was authorized for came apart from the tables it ran
+    # over (see DataReader.execute).

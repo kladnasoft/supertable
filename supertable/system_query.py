@@ -102,6 +102,71 @@ def _unquote(ident: str) -> str:
 #: PRAGMA, CALL, EXPORT, DDL, DML — is not a read and is refused outright.
 _READ_ROOTS = (exp.Select, exp.Union, exp.Intersect, exp.Except, exp.Subquery)
 
+#: Nodes that are not a read wherever they stand, not only at the root. A read
+#: root can carry one: ``SELECT * INTO x FROM t`` is a Select whose ``into``
+#: SQLGlot writes back out as ``CREATE TABLE x AS SELECT ...``, and a CTE body
+#: parses as any statement at all (``WITH w AS (DELETE FROM t RETURNING *)``).
+#: Built by name so a class the pinned SQLGlot lacks is skipped, not an
+#: import error.
+_NOT_A_READ = tuple(
+    cls for cls in (
+        getattr(exp, name, None) for name in (
+            "DML", "DDL", "Into", "Lock", "Command", "Transaction", "Pragma",
+            "Set", "Attach", "Detach", "Copy", "Use", "Describe",
+        )
+    ) if cls is not None
+)
+
+#: What may stand after LATERAL besides a subquery, VALUES or UNNEST: functions
+#: that make rows out of the values they are handed and open nothing. DuckDB's
+#: ``range`` / ``generate_series`` and its JSON walkers, and the generators of
+#: Spark's ``LATERAL VIEW``. This is the allow-list; every other function there
+#: is refused, known or not.
+_LATERAL_ROW_GENERATORS = frozenset({
+    "unnest", "range", "generate_series",
+    "explode", "explode_outer", "posexplode", "posexplode_outer",
+    "inline", "inline_outer", "stack", "json_tuple",
+    "json_each", "json_tree",
+})
+
+#: Scalar functions that read the engine's own state instead of table data:
+#: settings (where an object store's keys can sit), variables, secrets, the
+#: catalog of views the reader built — a view's SQL names the files under it —
+#: the engine's log, or the path of the file a row came from.
+_ENGINE_STATE_FUNCTIONS = frozenset({
+    "current_setting", "getenv", "getvariable", "which_secret",
+    "pg_get_viewdef", "pg_get_constraintdef", "get_block_size", "write_log",
+    "input_file_name", "input_file_block_start", "input_file_block_length",
+})
+
+#: Spark's (and Hive's) ways to call into the JVM from SQL.
+_JAVA_CALL_FUNCTIONS = frozenset({
+    "reflect", "reflect2", "java_method", "try_reflect",
+})
+
+#: Functions that open a file or a URL, or run SQL of their own. Most are
+#: table functions, which the FROM and LATERAL rules already refuse by shape;
+#: they are named here as well so that one is refused wherever a grammar lets
+#: it stand — a projection, an argument, behind a schema qualifier.
+_FILE_READING_FUNCTIONS = frozenset({
+    "glob", "query", "query_table", "sniff_csv", "in_file",
+    "parquet_scan", "csv_scan", "json_scan", "ndjson_scan", "arrow_scan",
+    "sqlite_scan", "sqlite_attach", "postgres_scan", "postgres_attach",
+    "mysql_scan", "iceberg_scan", "iceberg_metadata", "iceberg_snapshots",
+    "delta_scan", "load_extension", "load_aws_credentials",
+    "json_execute_serialized_sql", "shapefile_meta",
+})
+
+#: ...and every function whose name starts with one of these: ``read_text``,
+#: ``read_parquet``, ``parquet_metadata``, ``duckdb_secrets``,
+#: ``pragma_database_size``, ``http_get``. An engine or an extension adds
+#: readers faster than a list of names is kept; these families are the ones
+#: that have never held anything a read of table data needs.
+_FILE_READING_PREFIXES = (
+    "read_", "parquet_", "duckdb_", "pragma_", "sqlite_", "postgres_",
+    "mysql_", "iceberg_", "delta_", "http", "s3_", "azure_", "gcs_", "st_read",
+)
+
 
 def assert_read_only(sql: str):
     """Refuse anything that is not a plain read of real tables.
@@ -131,12 +196,49 @@ def assert_read_only(sql: str):
 
     Naming the dangerous functions would be a losing game — DuckDB adds more,
     and an extension adds its own. The rule is instead positive and small: the
-    statement must be a read, and every FROM/JOIN source must be a named table.
+    statement must be a read all the way down, every FROM/JOIN source must be a
+    named table, and a LATERAL may read only a subquery, VALUES, UNNEST or a
+    function that makes rows of the values it is given.
 
     The AST makes that distinction cleanly. A real table parses as
     ``Table(this=Identifier)``; every table function parses as ``Table`` whose
     ``this`` is a function node instead. So "is this an identifier" is the whole
     test, and it holds for forms nobody has thought of yet.
+
+    A function after LATERAL is not a ``Table`` at all — it parses as
+    ``Lateral(this=<function>)`` — so until 3.5.4 that test never saw it, and
+    ``FROM t, LATERAL read_text('/etc/hostname')`` ran for any role that could
+    read ``t``. LATERAL is judged on its own now, against
+    :data:`_LATERAL_ROW_GENERATORS`: a list of what is allowed, so a table
+    function nobody has heard of is refused with the rest. A name behind a
+    schema qualifier (``main.range(3)``) or in quotes is refused there too;
+    neither is how anyone writes a row generator.
+
+    THE ONE BLOCK-LIST, AND WHY IT IS THERE
+
+    Scalar functions cannot be allow-listed: there are hundreds and a read
+    legitimately uses any of them. The few that read something other than the
+    values they are handed are refused by name wherever they stand
+    (:data:`_ENGINE_STATE_FUNCTIONS`, :data:`_JAVA_CALL_FUNCTIONS`,
+    :data:`_FILE_READING_FUNCTIONS`, :data:`_FILE_READING_PREFIXES`), and so is
+    Spark's ``TRANSFORM ... USING``, which runs a program.
+
+    WHAT IS JUDGED IS WHAT RUNS
+
+    The engine never receives the caller's text. It receives what SQLGlot
+    writes back out from this parse, with table names replaced. Two things
+    follow, and both were holes:
+
+      * A comment is not in the parse, so it is not judged — and SQLGlot wrote
+        a line comment back out as ``/* text */`` without escaping a ``*/``
+        inside the text. ``SELECT a -- */ , (SELECT content FROM
+        read_text('/x')) /*`` was one column and a comment here, and two
+        columns at the engine. Comments are cleared from the statement this
+        returns, and every writer downstream writes none.
+      * There is one reading. Spark's grammar ends a string elsewhere than
+        DuckDB's (``\\'``), so a second parse of the same text for the Spark
+        engine could name different tables than the statement Spark was then
+        sent. Nothing parses the caller's text as Spark any more.
 
     Raises ValueError, which the reader already turns into Status.ERROR.
 
@@ -202,18 +304,111 @@ def _admit_read_sql(sql: str) -> Tuple[Any, str]:
             f"only SELECT queries are"
         )
 
-    for table in root.find_all(exp.Table):
-        inner = table.this
-        if not isinstance(inner, exp.Identifier):
-            # A table function: read_parquet, read_csv, glob, an extension's
-            # own, or one that does not exist yet.
-            name = type(inner).__name__ if inner is not None else "?"
-            raise ValueError(
-                "only named tables may be queried; table functions such as "
-                f"{name.lower()}() are not permitted on the read path"
-            )
-
+    _judge(root)
     return root, admitted
+
+
+def _function_name(node: exp.Expression) -> str:
+    """A call's name, casefolded, however it is spelt.
+
+    A function SQLGlot has no class for is an ``Anonymous`` whose ``this`` is
+    the name as written — a plain string, or an ``Identifier`` when it was
+    quoted (``"current_setting"('threads')``). The engine resolves both to the
+    same function, so both read as the same name here.
+    """
+    if isinstance(node, exp.Anonymous):
+        target = node.this
+        if isinstance(target, exp.Identifier):
+            target = target.this
+        return str(target or "").strip().casefold()
+    try:
+        return str(node.sql_name() or "").casefold()
+    except Exception:  # a node with no SQL name of its own
+        return type(node).__name__.casefold()
+
+
+def _refuse_function(name: str) -> None:
+    """Refuse the function *name* when it reads anything but the values it is
+    handed. See the lists for what each family is."""
+    if name in _ENGINE_STATE_FUNCTIONS:
+        raise ValueError(
+            f"{name}() reads the engine's own state and is not permitted on "
+            f"the read path"
+        )
+    if name in _JAVA_CALL_FUNCTIONS:
+        raise ValueError(
+            f"{name}() calls Java and is not permitted on the read path"
+        )
+    if name in _FILE_READING_FUNCTIONS or name.startswith(_FILE_READING_PREFIXES):
+        raise ValueError(
+            f"{name}() reads files, URLs or the engine's catalog and is not "
+            f"permitted on the read path; only named tables may be queried"
+        )
+
+
+def _judge_lateral(node: exp.Lateral) -> None:
+    """Refuse a LATERAL whose source is not on the allow-list.
+
+    A subquery (or VALUES) is admitted here because its own tables and
+    functions are walked like any other's. A function is admitted only when it
+    is a row generator written plainly: not behind a qualifier — ``Dot`` is
+    how ``main.read_text(...)`` parses — and not a quoted name. Anything else
+    in this position (a bare name, a literal) reads something this module
+    cannot name, so it is refused as well.
+    """
+    source = node.this
+    if isinstance(source, (exp.Subquery, exp.Query, exp.Values, exp.Unnest)):
+        return
+    if isinstance(source, exp.Func):
+        quoted = isinstance(source, exp.Anonymous) and isinstance(source.this, exp.Identifier)
+        name = _function_name(source)
+        if not quoted and name in _LATERAL_ROW_GENERATORS:
+            return
+        raise ValueError(
+            "LATERAL may read a subquery, VALUES, UNNEST or a row generator "
+            f"such as range(); {name or '?'}() is not permitted on the read path"
+        )
+    raise ValueError(
+        "LATERAL may read a subquery, VALUES, UNNEST or a row generator such "
+        "as range(); anything else is not permitted on the read path"
+    )
+
+
+def _judge(root: exp.Expression) -> None:
+    """Hold every node of an admitted statement to the read path's rules.
+
+    One walk, because admission runs on every read and a query with a
+    1,000-value IN list has a thousand nodes to visit. Comments are cleared on
+    the way: see "WHAT IS JUDGED IS WHAT RUNS" on :func:`assert_read_only`.
+    """
+    for node in root.walk():
+        if node.comments:
+            node.comments = None
+
+        if isinstance(node, exp.Table):
+            inner = node.this
+            if not isinstance(inner, exp.Identifier):
+                # A table function: read_parquet, read_csv, glob, an
+                # extension's own, or one that does not exist yet.
+                name = type(inner).__name__ if inner is not None else "?"
+                raise ValueError(
+                    "only named tables may be queried; table functions such as "
+                    f"{name.lower()}() are not permitted on the read path"
+                )
+        elif isinstance(node, exp.Lateral):
+            _judge_lateral(node)
+        elif isinstance(node, exp.Func):
+            _refuse_function(_function_name(node))
+        elif isinstance(node, exp.QueryTransform):
+            raise ValueError(
+                "TRANSFORM ... USING runs a program on the engine's machine "
+                "and is not permitted on the read path"
+            )
+        elif isinstance(node, _NOT_A_READ):
+            raise ValueError(
+                f"{type(node).__name__.upper()} is not permitted on the read "
+                f"path; only SELECT queries are"
+            )
 
 
 def classify_query(query: str, default_super: str) -> SystemCommand:

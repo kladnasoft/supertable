@@ -8,13 +8,25 @@ Implementation: [executor](../supertable/engine/executor.py), [estimator](../sup
 
 `Engine` in `supertable.engine.engine_enum` has three values:
 
-| Member | Value | Parser dialect |
-| --- | --- | --- |
-| `Engine.AUTO` | `auto` | DuckDB |
-| `Engine.DUCKDB` | `duckdb` | DuckDB |
-| `Engine.SPARK_SQL` | `spark_sql` | Spark |
+| Member | Value |
+| --- | --- |
+| `Engine.AUTO` | `auto` |
+| `Engine.DUCKDB` | `duckdb` |
+| `Engine.SPARK_SQL` | `spark_sql` |
 
-The read gate first validates ordinary queries using the DuckDB SQL parser. It accepts one read statement, including SELECT queries with CTEs and set operations, and rejects writes and table functions such as direct `read_parquet(...)` calls. SQL must ultimately reference a named table: a table-free `SELECT 1` does not pass `SQLParser`.
+The engine chooses where a query runs, not how it is read. Every query is parsed once, as DuckDB SQL, by the read gate (`supertable.system_query`), and that one parse is what is authorized, estimated and executed on either engine: `DataReader` hands it to `SQLParser`, and the Spark executor is sent SQLGlot's writing of it in Spark's dialect. Nothing parses the caller's text with Spark's grammar. The two grammars end a string in different places (Spark reads `\'` as a quote inside it), so a second parse could name other tables than the statement that was then run.
+
+The read gate accepts one read statement, including SELECT queries with CTEs and set operations, and refuses:
+
+- anything that is not a read, at the root or inside it: writes, DDL, `COPY`, `ATTACH`, `SET`, `PRAGMA`, `SELECT ... INTO`, a CTE whose body is `INSERT`/`UPDATE`/`DELETE`, and more than one statement;
+- a FROM or JOIN source that is not a named table, which is every table function, such as a direct `read_parquet(...)` call;
+- a `LATERAL` source other than a subquery, `VALUES`, `UNNEST` or a row generator written plainly: `range`, `generate_series`, `json_each`, `json_tree`, and Spark's `explode`, `posexplode`, `inline`, `stack`, `json_tuple` and their `_outer` forms. This is an allow-list: any other function there is refused, as is one behind a schema qualifier (`main.range(3)`) or with a quoted name;
+- a scalar function that reads the engine's own state (`current_setting`, `getenv`, `getvariable`, `pg_get_viewdef`, `input_file_name`), that reads files or URLs (every name starting with `read_`, `parquet_`, `duckdb_`, `pragma_`, `http` and the other prefixes in `_FILE_READING_PREFIXES`, and the names in `_FILE_READING_FUNCTIONS`), or that calls Java (`reflect`, `java_method`, `try_reflect`), wherever it stands and however it is spelt;
+- Spark's `TRANSFORM ... USING`.
+
+Comments do not reach an engine. A comment is not part of the parse, so nothing judges its text; the gate clears comments from the statement it hands on, and `rewrite_query_with_hashed_tables`, the Spark writer and `_ensure_sql_limit` write none. A query the rewrite cannot parse, or that cannot be written for Spark, fails; it is never sent as the caller wrote it.
+
+SQL must ultimately reference a named table: a table-free `SELECT 1` does not pass `SQLParser`.
 
 An unqualified table name resolves inside the reader's `super_name`. `other_super.orders` resolves `orders` in `other_super`, using the same organization. CTE names are excluded from the physical table list. Repeated physical table references are merged for schema validation and resource estimation. Distinct aliases identify query views, so use explicit, distinct aliases for joins and nested references.
 
@@ -70,7 +82,7 @@ Explicit `Engine.DUCKDB` bypasses routing. Explicit `Engine.SPARK_SQL` requests 
 
 ## 4. DuckDB execution
 
-DuckDB keeps a connection in thread-local state. Each query creates views over its selected Parquet files with `union_by_name=TRUE` and `HIVE_PARTITIONING=FALSE`, then runs on a cursor of that connection. A cursor sees the connection's views and what the connection's database holds, but none of the connection's session settings. The engine therefore configures object storage for the whole database when a query reads remote paths. The store's endpoint, region, URL style, TLS and credentials go into one temporary DuckDB secret, kept in memory, which every S3 read on any cursor signs with. The HTTP timeout is set globally, as the memory limit, thread count and caches already are. No setting holds a credential, so a query cannot read one with `current_setting()`. `duckdb_secrets()` is the only SQL that shows a secret, and it redacts the secret and session token; it is a table function, which the read gate refuses.
+DuckDB keeps a connection in thread-local state. Each query creates views over its selected Parquet files with `union_by_name=TRUE` and `HIVE_PARTITIONING=FALSE`, then runs on a cursor of that connection. A cursor sees the connection's views and what the connection's database holds, but none of the connection's session settings. The engine therefore configures object storage for the whole database when a query reads remote paths. The store's endpoint, region, URL style, TLS and credentials go into one temporary DuckDB secret, kept in memory, which every S3 read on any cursor signs with. The HTTP timeout is set globally, as the memory limit, thread count and caches already are. No setting holds a credential, so a query could not read one with `current_setting()` even where the read gate admitted that call, which it no longer does. `duckdb_secrets()` is the only SQL that shows a secret, and it redacts the secret and session token; it is a table function, which the read gate refuses in FROM, after `LATERAL` and by name.
 
 The view chain is:
 

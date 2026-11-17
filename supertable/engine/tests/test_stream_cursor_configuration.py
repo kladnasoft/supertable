@@ -12,7 +12,7 @@ cursor ran went to AWS, without credentials, over TLS and with vhost URLs.
 3.5.2's first build SET them on the cursor as well, which put the store's key
 and secret in the session that runs the caller's query, where
 ``current_setting('s3_secret_access_key')``, a scalar call the read gate
-admits, returned them.
+admitted until 3.5.4, returned them.
 
 ``configure_httpfs_and_s3`` keeps the store in a temporary secret and SETs
 ``http_timeout`` GLOBAL, as ``apply_runtime_pragmas`` does, so the cursor reads
@@ -234,16 +234,20 @@ def test_runtime_pragmas_reach_the_cursor(engine, tmp_path):
      "FROM invoices WHERE 1 = 0",
      [{"s": None, "n": 0}]),
 ])
-def test_an_admitted_query_cannot_read_the_stores_credentials(
+def test_a_query_cannot_read_the_stores_credentials(
         engine, tmp_path, query, expected):
     """No setting holds a credential, on the cursor or on its connection.
 
-    The read gate admits these queries: their one source is a named table.
-    On 3.5.2's first build the cursor returned the store's key, secret and
-    token, which for a deployment that hands its object store's root
-    credentials to the engine is write and delete on the whole store.
+    Two things keep these queries from a credential, and each is checked
+    alone. The read gate refuses ``current_setting`` (since 3.5.4; until then
+    it admitted these, their one source being a named table). And the engine,
+    run here without the gate, has nothing to return: on 3.5.2's first build
+    the cursor returned the store's key, secret and token, which for a
+    deployment that hands its object store's root credentials to the engine
+    is write and delete on the whole store.
     """
-    assert_read_only(query)
+    with pytest.raises(ValueError, match="engine's own state"):
+        assert_read_only(query)
     assert _rows(_stream(engine, tmp_path, query, RUNTIME)) == expected
 
     con = engine_duckdb._shared_state()["con"]

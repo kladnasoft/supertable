@@ -799,10 +799,25 @@ def rewrite_query_with_hashed_tables(
         original_sql: str,
         alias_to_table: Dict[str, str],
 ) -> str:
-    """Replace table references in SQL with hashed physical table names."""
-    if not alias_to_table:
-        return original_sql
+    """Write *original_sql* out for the engine, its tables replaced with their
+    hashed physical names.
 
+    What this returns is the only form of a query an engine receives, so it is
+    always SQLGlot's writing of the DuckDB reading — the reading admission
+    judged (``system_query.assert_read_only``) — and never the caller's text:
+
+      * A query that cannot be parsed here RAISES. It used to be handed to the
+        engine as written, on the theory that the engine would report the
+        problem; that made "the rewrite could not read it" mean "nothing
+        between the caller and the engine has read it".
+      * It is written without comments. A comment is not part of the parse, so
+        nothing judges its text, and SQLGlot writes a line comment back out as
+        ``/* text */`` without escaping a ``*/`` inside it:
+        ``SELECT a -- */ , (SELECT content FROM read_text('/x')) /*`` was one
+        column to admission and two at the engine.
+      * With no tables to map it is still written out again, for the same
+        reason.
+    """
     try:
         # read="duckdb" is not optional. Without it sqlglot parses with its
         # neutral dialect and then *renders* as duckdb, which silently changes
@@ -814,10 +829,11 @@ def rewrite_query_with_hashed_tables(
         # and only then transpiles duckdb -> spark (see _spark_rewrite_query).
         parsed = sqlglot.parse_one(original_sql, read="duckdb")
     except Exception as e:
-        logger.warning(f"[duckdb] Failed to parse SQL for rewrite; using original. Error: {e}")
-        return original_sql
+        raise ValueError(
+            f"could not parse the query to rewrite it for execution: {e}"
+        ) from e
 
-    for table in parsed.find_all(exp.Table):
+    for table in parsed.find_all(exp.Table) if alias_to_table else ():
         alias_expr = table.args.get("alias")
         alias_name = None
 
@@ -844,7 +860,7 @@ def rewrite_query_with_hashed_tables(
                     exp.TableAlias(this=exp.to_identifier(alias_name)),
                 )
 
-    return parsed.sql(dialect="duckdb")
+    return parsed.sql(dialect="duckdb", comments=False)
 
 
 # =========================================================

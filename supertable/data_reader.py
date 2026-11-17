@@ -385,18 +385,28 @@ class DataReader:
         if command.kind is CommandKind.SHOW_STATS:
             return self._execute_show_stats(command, role_name)
 
-        # Build parser with the correct dialect for the chosen engine. For
-        # EXPLAIN, parse only the inner SELECT so estimation/RBAC/reflection
-        # behave exactly as for the equivalent plain SELECT.
-        # Reuse the AST admission already built, but ONLY for the dialect it
-        # was parsed with. Admission always parses as duckdb; handing that to a
-        # spark-dialect parser would silently reinterpret the query.
+        # Build the parser from the statement admission judged — the same one
+        # for every engine. For EXPLAIN that is the inner SELECT, so
+        # estimation/RBAC/reflection behave exactly as for the equivalent plain
+        # SELECT.
+        #
+        # There is ONE reading of a query, DuckDB's. Until 3.5.4 a query pinned
+        # to Spark was parsed here a second time, with Spark's grammar, and the
+        # tables to authorize came from that parse — while the Spark executor
+        # was sent the DuckDB reading written out for Spark. The two grammars
+        # end a string in different places (Spark reads \' as a quote inside
+        # it), so text could name one table to this parser and another to the
+        # engine:
+        #
+        #   SELECT 'a\' AS x FROM text."/etc/passwd" WHERE value <> ' FROM t --'
+        #
+        # read as "table t" here and as Spark's file datasource there. What is
+        # authorized has to be what runs, so both now come from one tree.
         parser = SQLParser(
             super_name=self.super_name,
             query=command.sql,
-            dialect=engine.dialect,
-            parsed=(command.parsed
-                    if getattr(engine, "dialect", None) == "duckdb" else None),
+            dialect="duckdb",
+            parsed=command.parsed,
         )
         tables = parser.get_table_tuples()
         physical_tables = parser.get_physical_tables()
@@ -770,7 +780,11 @@ def _ensure_sql_limit(sql: str, default_limit: int) -> str:
     # emit text it could not read back. Queries returned untouched above are
     # not normalized here: admission does that, and reformatting a query whose
     # bound we did not change would be gratuitous.
-    return normalize_read_sql(capped.sql(dialect="duckdb"))
+    #
+    # No comments: SQLGlot writes a line comment back out as ``/* text */``
+    # without escaping a ``*/`` inside the text, so a comment written out
+    # again can end early and leave the rest of itself standing as SQL.
+    return normalize_read_sql(capped.sql(dialect="duckdb", comments=False))
 
 
 def _top_level_row_bound(parsed: exp.Expression) -> Optional[int]:

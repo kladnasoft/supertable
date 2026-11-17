@@ -517,11 +517,16 @@ class TestRewritePreservesMeaning:
         # Differences on both sides of the comparison date, per the audit.
         assert [r[1] for r in con.execute(rewritten).fetchall()] == [5, -5, 0]
 
-    def test_a_rewrite_with_no_tables_to_map_is_a_noop(self):
+    def test_a_rewrite_with_no_tables_to_map_keeps_the_query(self):
+        """It is written out again all the same — an engine never receives the
+        caller's own text (see ``rewrite_query_with_hashed_tables``) — and what
+        is written is the same query: the arguments where they were."""
         from supertable.engine.engine_common import rewrite_query_with_hashed_tables
 
         sql = "SELECT eid, DATE_DIFF('day', a, b) FROM events"
-        assert rewrite_query_with_hashed_tables(sql, {}) == sql
+        rewritten = rewrite_query_with_hashed_tables(sql, {})
+        assert sqlglot.parse_one(rewritten, read="duckdb") == sqlglot.parse_one(sql, read="duckdb")
+        assert rewritten == "SELECT eid, DATE_DIFF('DAY', a, b) FROM events"
 
 
 # ---------------------------------------------------------------------------
