@@ -21,6 +21,7 @@ from supertable.config.defaults import logger
 from supertable.config.settings import settings
 from supertable.config.homedir import get_app_home
 from supertable.engine.engine_config import normalize_memory_size
+from supertable.utils.sql_compat import is_cte_reference
 
 
 # =========================================================
@@ -817,6 +818,12 @@ def rewrite_query_with_hashed_tables(
         column to admission and two at the engine.
       * With no tables to map it is still written out again, for the same
         reason.
+      * Every table in it is one of the views the executor built — a name in
+        *alias_to_table* — or a CTE of the query (``is_cte_reference``).
+        Anything else RAISES. A table left as it was written is resolved by
+        the engine in its own catalog, where the views of every query on the
+        connection live, the unfiltered ones under each role's view included,
+        beside ``information_schema`` and ``duckdb_views``.
     """
     try:
         # read="duckdb" is not optional. Without it sqlglot parses with its
@@ -833,7 +840,7 @@ def rewrite_query_with_hashed_tables(
             f"could not parse the query to rewrite it for execution: {e}"
         ) from e
 
-    for table in parsed.find_all(exp.Table) if alias_to_table else ():
+    for table in parsed.find_all(exp.Table):
         alias_expr = table.args.get("alias")
         alias_name = None
 
@@ -859,6 +866,11 @@ def rewrite_query_with_hashed_tables(
                     "alias",
                     exp.TableAlias(this=exp.to_identifier(alias_name)),
                 )
+        elif not is_cte_reference(table):
+            raise ValueError(
+                f"table '{table.name or alias_name}' is not one this query "
+                f"was authorized to read"
+            )
 
     return parsed.sql(dialect="duckdb", comments=False)
 

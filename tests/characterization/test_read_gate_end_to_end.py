@@ -306,3 +306,79 @@ def test_a_custom_sql_rule_reads_no_file_and_no_engine_state(lake, secret, sql):
     else:
         assert outcome.state == "failed"
         assert dqc.get_latest("emp") is None
+
+
+# --------------------------------------------------------------------------
+# A CTE is a CTE only where the engine reads it as one
+# --------------------------------------------------------------------------
+
+def _reflection_view(lake, monkeypatch) -> str:
+    """The name of the view the reader builds over ``emp``'s files — every
+    column and every row of them, under the views that apply the deletion
+    vector and the role's policy. Read off what the engine is sent."""
+    import re
+
+    sent = []
+    rewrite = engine_duckdb.rewrite_query_with_hashed_tables
+    monkeypatch.setattr(engine_duckdb, "rewrite_query_with_hashed_tables",
+                        lambda *a, **k: sent.append(rewrite(*a, **k)) or sent[-1])
+    _, status, message = lake.read("SELECT id FROM emp")
+    monkeypatch.undo()
+    assert status is Status.OK, message
+    return re.search(r"st_[0-9a-f]{16}", sent[0]).group(0)
+
+
+@pytest.mark.parametrize("sql", [
+    # The engine's own catalog, behind a CTE of the same name.
+    "WITH tables AS (SELECT 1 AS x FROM emp) "
+    "SELECT t.table_name FROM information_schema.tables t",
+    "WITH duckdb_views AS (SELECT 1 AS x FROM emp) "
+    "SELECT v.view_name, v.sql FROM main.duckdb_views v",
+    "SELECT v.sql FROM (WITH duckdb_views AS (SELECT 1 AS x FROM emp) "
+    "SELECT x FROM duckdb_views) a, duckdb_views v",
+    "WITH a AS (SELECT view_name, sql FROM duckdb_views), "
+    "duckdb_views AS (SELECT 1 AS x FROM emp) SELECT * FROM a",
+])
+def test_a_cte_name_does_not_hide_the_engines_catalog(lake, sql):
+    """On 3.5.3 each of these listed the views on the engine's connection —
+    with ``sql``, the files under them — because a CTE of that name anywhere
+    in the query made the reference a CTE to the parser, and the executor left
+    what it had no view for as it was written."""
+    lake.refused(sql, "not found")
+
+
+@pytest.mark.parametrize("shape", [
+    "WITH {view} AS (SELECT 1 AS x FROM emp) SELECT s.* FROM main.{view} s",
+    "SELECT s.* FROM (WITH {view} AS (SELECT 1 AS x FROM emp) SELECT x FROM {view}) a, {view} s",
+    "WITH a AS (SELECT * FROM {view}), {view} AS (SELECT 1 AS x FROM emp) SELECT * FROM a",
+])
+def test_a_cte_name_does_not_reach_a_tables_unfiltered_view(lake, monkeypatch, shape):
+    """The same, aimed at the reader's own view of ``emp``. On 3.5.3 the first
+    shape returned ``salary``, ``__rowid__`` and ``__timestamp__`` to a role
+    that may read ``id`` and ``region``: the rows as they are in the files,
+    under every view that would have masked, filtered or removed them."""
+    view = _reflection_view(lake, monkeypatch)
+    frame, status, message = lake.read(shape.format(view=view))
+    assert status is Status.ERROR, frame.to_dicts()
+    assert "not found" in message and frame.is_empty()
+
+
+@pytest.mark.parametrize("sql, expected", [
+    ("WITH w AS (SELECT id, region FROM emp) SELECT * FROM w ORDER BY id",
+     [{"id": 1, "region": "eu"}, {"id": 2, "region": "us"}]),
+    ("WITH a AS (SELECT id FROM emp), b AS (SELECT id * 10 AS ten FROM a) "
+     "SELECT a.id, b.ten FROM a JOIN b ON b.ten = a.id * 10 ORDER BY a.id",
+     [{"id": 1, "ten": 10}, {"id": 2, "ten": 20}]),
+    ("SELECT x.id FROM (WITH w AS (SELECT id FROM emp WHERE region = 'us') SELECT * FROM w) x",
+     [{"id": 2}]),
+    ("WITH w AS (SELECT id FROM emp WHERE region = 'eu') "
+     "SELECT e.id FROM emp e WHERE e.id IN (SELECT id FROM w)",
+     [{"id": 1}]),
+    ("WITH RECURSIVE r AS (SELECT id FROM emp WHERE id = 1 UNION ALL "
+     "SELECT id + 1 FROM r WHERE id < 3) SELECT id FROM r ORDER BY id",
+     [{"id": 1}, {"id": 2}, {"id": 3}]),
+])
+def test_a_cte_where_the_engine_reads_one_still_runs(lake, sql, expected):
+    frame, status, message = lake.read(sql)
+    assert status is Status.OK, message
+    assert frame.to_dicts() == expected

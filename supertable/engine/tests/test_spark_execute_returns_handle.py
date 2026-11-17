@@ -32,7 +32,9 @@ executor_mod = import_module("supertable.engine.executor")
 
 DESC = [("id", "BIGINT_TYPE"), ("name", "STRING_TYPE")]
 ROWS = [(1, "a"), (2, "b"), (3, "c")]
-USER_SQL = "SELECT id, name FROM t"
+# No table of the catalog: ``_query`` below maps none, and the executor sends on
+# no table it did not map (``rewrite_query_with_hashed_tables``).
+USER_SQL = "SELECT id, name FROM (SELECT 1 AS id, 'a' AS name) AS t"
 
 
 class _Cursor:

@@ -409,9 +409,8 @@ class TestMakePresignedList:
 
 class TestRewriteQuery:
 
-    def test_empty_alias_map_returns_original(self):
-        sql = "SELECT * FROM t"
-        assert rewrite_query_with_hashed_tables(sql, {}) == sql
+    def test_a_query_without_tables_is_written_out_again(self):
+        assert rewrite_query_with_hashed_tables("SELECT 1", {}) == "SELECT 1"
 
     def test_with_aliases_rewrites(self):
         result = rewrite_query_with_hashed_tables(
@@ -425,11 +424,19 @@ class TestRewriteQuery:
         )
         assert "st_xyz" in result
 
-    def test_unknown_alias_untouched(self):
+    def test_a_table_that_was_not_mapped_is_refused(self):
+        """It was left as written, for the engine to resolve in its own
+        catalog — where every query's views are."""
+        with pytest.raises(ValueError, match="not one this query was authorized"):
+            rewrite_query_with_hashed_tables(
+                "SELECT * FROM keep_me", {"other": "st_abc"}
+            )
+
+    def test_a_cte_of_the_query_is_left_to_the_engine(self):
         result = rewrite_query_with_hashed_tables(
-            "SELECT * FROM keep_me", {"other": "st_abc"}
+            "WITH w AS (SELECT * FROM orders) SELECT * FROM w", {"orders": "st_xyz"}
         )
-        assert "keep_me" in result
+        assert result == "WITH w AS (SELECT * FROM st_xyz AS orders) SELECT * FROM w"
 
 
 # ═══════════════════════════════════════════════════════════

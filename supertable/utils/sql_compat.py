@@ -379,6 +379,65 @@ def is_noop_statement(statement: Optional[exp.Expression]) -> bool:
     return False
 
 
+def is_cte_reference(table: exp.Table) -> bool:
+    """True when *table* names a CTE that is visible where the name stands.
+
+    A CTE name parses as a ``Table``, and the read path treats one differently
+    from every other table: it is not looked up in the catalog, not authorized,
+    and not replaced with a view the reader built — the engine resolves it. So
+    "is this a CTE" has to be answered the way the engine answers it, or a
+    name the engine resolves in its own catalog goes through unchecked. It
+    used to be answered by name alone, anywhere in the query:
+
+        WITH tables AS (SELECT 1 FROM t)
+        SELECT table_name FROM information_schema.tables
+
+        SELECT v.sql FROM (WITH duckdb_views AS (SELECT 1 FROM t)
+                           SELECT * FROM duckdb_views) x, duckdb_views v
+
+    Both read the engine's catalog, and with the name of a reader's own
+    reflection view in place of ``tables`` the first read a table's raw rows:
+    every column, the deletion vector's rows included, whatever the role.
+
+    The engine's rule, which is this one:
+
+      * A qualified name is never a CTE.
+      * A CTE is visible in the query its WITH is attached to, and in what
+        that query holds.
+      * Inside the definitions of that same WITH, only the CTEs defined
+        *before* the one the name stands in are visible — and that one itself
+        and the later ones only when the WITH is RECURSIVE.
+
+    Names match exactly. The engine folds case, so a reference spelt in
+    another case is a CTE to the engine and a table to this function: it is
+    then looked up, not found, and refused, which is the safe way to differ.
+    """
+    name = table.name
+    if not name or not isinstance(table.this, exp.Identifier):
+        return False
+    if table.args.get("db") is not None or table.args.get("catalog") is not None:
+        return False
+
+    inside_cte: Optional[exp.Expression] = None   # the CTE definition last walked out of
+    child: exp.Expression = table
+    node = table.parent
+    while node is not None:
+        if isinstance(node, exp.CTE):
+            inside_cte = node
+        with_ = node.args.get("with")
+        if isinstance(with_, exp.With):
+            ctes = [c for c in with_.expressions if isinstance(c, exp.CTE)]
+            if child is with_ and inside_cte is not None and not with_.args.get("recursive"):
+                # The name stands in one of this WITH's own definitions.
+                position = next(
+                    (i for i, c in enumerate(ctes) if c is inside_cte), 0)
+                ctes = ctes[:position]
+            if any(c.alias == name for c in ctes):
+                return True
+        child, node = node, node.parent
+    return False
+
+
 def parse_read_statements(sql: str, dialect: str = "duckdb") -> List[exp.Expression]:
     """Parse *sql* into its executable statements, dropping no-op nodes.
 

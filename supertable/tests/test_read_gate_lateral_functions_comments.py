@@ -349,7 +349,6 @@ def test_no_writer_writes_a_comment_back_out(sql):
     """Each place the read path turns a parse back into text."""
     for written in (
         rewrite_query_with_hashed_tables(sql, {"orders": "st_abc", "o": "st_abc"}),
-        rewrite_query_with_hashed_tables(sql, {}),
         _spark_rewrite_query(sql, {"orders": "st_abc", "o": "st_abc"}),
         _ensure_sql_limit(sql, default_limit=5),
     ):
@@ -385,7 +384,16 @@ def test_the_two_grammars_read_different_tables_in_the_same_text():
     assert [(t.db, t.name) for t in as_spark.find_all(exp.Table)] == [
         ("", "orders")]
     # And DuckDB's reading is the one written out for Spark.
-    assert "text.`/etc/passwd`" in _spark_rewrite_query(TWO_READINGS, {"orders": "st_abc"})
+    assert "text.`/etc/passwd`" in sqlglot.transpile(
+        TWO_READINGS, read="duckdb", write="spark")[0]
+
+
+def test_the_spark_writer_sends_on_no_table_it_did_not_map():
+    """The last step holds on its own: with the tables of Spark's reading
+    mapped, as 3.5.3's reader mapped them, the file datasource of DuckDB's
+    reading is not one of them, and nothing is written for Spark."""
+    with pytest.raises(ValueError, match="not one this query was authorized to read"):
+        _spark_rewrite_query(TWO_READINGS, {"orders": "st_abc"})
 
 
 def test_the_engine_enum_names_no_parser_dialect():
@@ -468,3 +476,102 @@ def test_a_query_the_rewrite_cannot_read_is_not_sent_as_written(sql):
         rewrite_query_with_hashed_tables(sql, {"t": "st_abc"})
     with pytest.raises(ValueError, match="could not parse the query"):
         _spark_rewrite_query(sql, {"t": "st_abc"})
+
+
+# --------------------------------------------------------------------------
+# A CTE is a CTE only where the engine reads it as one
+# --------------------------------------------------------------------------
+
+def _tables(sql: str):
+    command = classify_query(sql, SUPER)
+    parser = SQLParser(SUPER, command.sql, "duckdb", parsed=command.parsed)
+    return sorted((t.super_name, t.simple_name) for t in parser.get_physical_tables())
+
+
+@pytest.mark.parametrize("sql, read", [
+    # A qualified name is never a CTE. The engine reads its own catalog here.
+    ("WITH tables AS (SELECT 1 AS x FROM orders) "
+     "SELECT t.table_name FROM information_schema.tables t",
+     ("information_schema", "tables")),
+    ("WITH duckdb_views AS (SELECT 1 AS x FROM orders) "
+     "SELECT v.sql FROM main.duckdb_views v", ("main", "duckdb_views")),
+    # ...and with the name of a reflection view, a table's unfiltered rows.
+    ("WITH st_05b8117a705e9b13 AS (SELECT 1 AS x FROM orders) "
+     "SELECT s.* FROM main.st_05b8117a705e9b13 s", ("main", "st_05b8117a705e9b13")),
+    # Outside the query its WITH belongs to.
+    ("SELECT v.sql FROM (WITH duckdb_views AS (SELECT 1 AS x FROM orders) "
+     "SELECT x FROM duckdb_views) a, duckdb_views v", (SUPER, "duckdb_views")),
+    ("SELECT * FROM orders WHERE id IN (WITH st_abc AS (SELECT 1 AS id) SELECT id FROM st_abc) "
+     "UNION ALL SELECT s.* FROM st_abc s", (SUPER, "st_abc")),
+    # Before its own definition, in an earlier one of the same WITH.
+    ("WITH a AS (SELECT sql FROM duckdb_views), "
+     "duckdb_views AS (SELECT 1 AS x FROM orders) SELECT * FROM a",
+     (SUPER, "duckdb_views")),
+])
+def test_a_name_the_engine_reads_from_its_catalog_is_a_table_to_the_parser(sql, read):
+    """So it is looked up, is not there, and the query is refused. Until 3.5.4
+    a CTE of that name anywhere in the query made every such reference a CTE:
+    not looked up, not authorized, not replaced — the engine's to resolve."""
+    assert read in _tables(sql)
+    with pytest.raises(ValueError, match="not one this query was authorized to read"):
+        rewrite_query_with_hashed_tables(sql, {"orders": "st_orders"})
+
+
+def test_a_cte_inside_its_own_definition_is_the_table_unless_recursive():
+    """``WITH w AS (SELECT ... FROM w)``: the inner ``w`` is the catalog's."""
+    from supertable.utils.sql_compat import is_cte_reference
+
+    def references(sql):
+        tree = sqlglot.parse_one(sql, read="duckdb")
+        return [(t.name, is_cte_reference(t)) for t in tree.find_all(exp.Table)]
+
+    assert sorted(references(
+        "WITH w AS (SELECT id FROM w) SELECT * FROM w x JOIN orders USING (id)")) == [
+        ("orders", False), ("w", False), ("w", True)]
+    assert sorted(references(
+        "WITH RECURSIVE r AS (SELECT id FROM orders UNION ALL SELECT id + 1 FROM r) "
+        "SELECT * FROM r")) == [("orders", False), ("r", True), ("r", True)]
+
+
+@pytest.mark.parametrize("sql", [
+    "WITH w AS (SELECT * FROM orders) SELECT * FROM w",
+    "WITH a AS (SELECT * FROM orders), b AS (SELECT * FROM a) SELECT * FROM b JOIN a USING (id)",
+    "WITH w AS (SELECT id FROM orders) SELECT * FROM orders o WHERE o.id IN (SELECT id FROM w)",
+    "SELECT * FROM (WITH w AS (SELECT * FROM orders) SELECT * FROM w) x",
+    "WITH w AS (SELECT * FROM orders) SELECT * FROM w UNION ALL SELECT * FROM w",
+    "WITH w AS (SELECT * FROM orders) SELECT * FROM orders o, LATERAL (SELECT * FROM w WHERE w.id = o.id) l",
+    "WITH w AS (WITH v AS (SELECT * FROM orders) SELECT * FROM v) SELECT * FROM w",
+    "WITH RECURSIVE r AS (SELECT id FROM orders UNION ALL SELECT id + 1 FROM r WHERE id < 3) "
+    "SELECT * FROM r",
+    'WITH "Weird Name" AS (SELECT * FROM orders) SELECT * FROM "Weird Name"',
+])
+def test_a_cte_where_the_engine_reads_one_is_still_a_cte(sql):
+    assert _tables(sql) == [(SUPER, "orders")]
+    written = rewrite_query_with_hashed_tables(sql, {"orders": "st_orders", "o": "st_orders"})
+    assert "st_orders" in written and " orders" not in written.replace("AS orders", "")
+
+
+def test_one_alias_cannot_be_a_cte_here_and_a_table_there():
+    """Everything downstream is keyed by alias. The inner ``orders`` is the
+    table (a CTE is not visible in its own definition) and the outer one the
+    CTE, under one name: the table's view would be written over both."""
+    with pytest.raises(ValueError, match="names both a CTE and a table"):
+        _tables("WITH orders AS (SELECT * FROM orders WHERE a > 1) SELECT * FROM orders")
+    # The same when the name outside its WITH is the engine's to resolve.
+    with pytest.raises(ValueError, match="names both a CTE and a table"):
+        _tables("SELECT * FROM orders WHERE id IN "
+                "(WITH st_abc AS (SELECT 1 AS id) SELECT id FROM st_abc) "
+                "UNION ALL SELECT * FROM st_abc")
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT * FROM keep_me",
+    "SELECT * FROM orders JOIN other_table USING (id)",
+    "SELECT * FROM orders WHERE id IN (SELECT id FROM information_schema.tables)",
+])
+def test_the_rewrite_sends_on_no_table_it_did_not_map(sql):
+    """It used to leave such a name as written, for the engine to resolve."""
+    with pytest.raises(ValueError, match="not one this query was authorized to read"):
+        rewrite_query_with_hashed_tables(sql, {"orders": "st_orders"})
+    with pytest.raises(ValueError, match="not one this query was authorized to read"):
+        rewrite_query_with_hashed_tables(sql, {})

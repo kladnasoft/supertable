@@ -517,16 +517,21 @@ class TestRewritePreservesMeaning:
         # Differences on both sides of the comparison date, per the audit.
         assert [r[1] for r in con.execute(rewritten).fetchall()] == [5, -5, 0]
 
-    def test_a_rewrite_with_no_tables_to_map_keeps_the_query(self):
-        """It is written out again all the same — an engine never receives the
-        caller's own text (see ``rewrite_query_with_hashed_tables``) — and what
-        is written is the same query: the arguments where they were."""
+    def test_a_rewrite_changes_only_the_table(self):
+        """What is written out is the same query: the arguments where they
+        were, and the table's view under the table's name."""
         from supertable.engine.engine_common import rewrite_query_with_hashed_tables
 
         sql = "SELECT eid, DATE_DIFF('day', a, b) FROM events"
-        rewritten = rewrite_query_with_hashed_tables(sql, {})
-        assert sqlglot.parse_one(rewritten, read="duckdb") == sqlglot.parse_one(sql, read="duckdb")
-        assert rewritten == "SELECT eid, DATE_DIFF('DAY', a, b) FROM events"
+        rewritten = rewrite_query_with_hashed_tables(sql, {"events": "st_abc"})
+        assert rewritten == "SELECT eid, DATE_DIFF('DAY', a, b) FROM st_abc AS events"
+
+    def test_a_rewrite_with_no_tables_at_all_is_written_out_again(self):
+        """An engine never receives the caller's own text (see
+        ``rewrite_query_with_hashed_tables``), tables or not."""
+        from supertable.engine.engine_common import rewrite_query_with_hashed_tables
+
+        assert rewrite_query_with_hashed_tables("SELECT 1 -- note", {}) == "SELECT 1"
 
 
 # ---------------------------------------------------------------------------

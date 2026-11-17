@@ -7,6 +7,7 @@ from sqlglot import exp
 from sqlglot.errors import ParseError
 from sqlglot.optimizer.scope import traverse_scope
 from supertable.data_classes import PredInterval, TableDefinition
+from supertable.utils.sql_compat import is_cte_reference
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +302,6 @@ class SQLParser:
         self._alias_to_optional_columns: Dict[str, List[str]] = {}
 
         self._extract_tables()
-        self._cte_names: Set[str] = self._collect_cte_names()
 
         # A CTE name parses as a Table, so a query whose only "tables" are
         # literal CTEs gets past _extract_tables and used to fail much later in
@@ -309,7 +309,7 @@ class SQLParser:
         # internal state, for the same unsupported capability that a literal
         # SELECT reports directly. Both shapes are the same refusal and now say
         # the same thing, at the same point, before any snapshot resolution.
-        if all(tbl[1] in self._cte_names for tbl in self._alias_to_table.values()):
+        if all(alias in self._cte_aliases for alias in self._alias_to_table):
             raise ValueError(TABLE_FREE_QUERY_ERROR)
 
         self._extract_columns()
@@ -401,6 +401,12 @@ class SQLParser:
             - If no alias is present, alias = table name.
         """
         alias_to_table: Dict[str, Tuple[str, str]] = {}
+        # Whether a name is a CTE is decided per reference, where it stands
+        # (see is_cte_reference) — not by whether a CTE of that name exists
+        # somewhere in the query. A reference that is not one is a table of
+        # the catalog: looked up, authorized, and replaced with a view.
+        cte_aliases: Set[str] = set()
+        table_aliases: Set[str] = set()
 
         for table in self._parsed.find_all(exp.Table):
             table_name = table.name
@@ -411,30 +417,26 @@ class SQLParser:
             alias = self._get_alias(table) or table_name
 
             alias_to_table[alias] = (db_name, table_name)
+            (cte_aliases if is_cte_reference(table) else table_aliases).add(alias)
 
         if not alias_to_table:
             raise ValueError(TABLE_FREE_QUERY_ERROR)
 
+        # Everything downstream is keyed by alias — the columns a query needs,
+        # the role's view, the name the executor rewrites — so one alias cannot
+        # stand for a CTE in one place and a table in another: the table's
+        # view would be written over the CTE's name as well.
+        both = sorted(cte_aliases & table_aliases)
+        if both:
+            raise ValueError(
+                f"'{both[0]}' names both a CTE and a table in this query; "
+                f"give the table an alias of its own"
+            )
+
         self._alias_to_table = alias_to_table
+        self._cte_aliases: Set[str] = cte_aliases
 
     # ---------------- CTE detection ────────────────────────────────── #
-
-    def _collect_cte_names(self) -> Set[str]:
-        """
-        Return the set of CTE names defined in WITH clauses.
-
-        These names are *not* physical tables — they are query-scoped
-        aliases for subqueries.  ``get_physical_tables()`` uses this set
-        to exclude CTE references from the physical table list.
-        """
-        names: Set[str] = set()
-        for cte in self._parsed.find_all(exp.CTE):
-            alias_expr = cte.args.get("alias")
-            if isinstance(alias_expr, exp.TableAlias):
-                ident = alias_expr.this
-                if isinstance(ident, exp.Identifier) and ident.name:
-                    names.add(ident.name)
-        return names
 
     # ---------------- Column extraction helpers ----------------
 
@@ -579,7 +581,7 @@ class SQLParser:
         # query are "collected from inside the CTE body".
         physical_aliases = {
             alias: tbl for alias, tbl in self._alias_to_table.items()
-            if tbl[1] not in self._cte_names
+            if alias not in self._cte_aliases
         }
         unique_tables = set(physical_aliases.values())
         single_alias_for_unqualified: Optional[str] = None
@@ -993,7 +995,7 @@ class SQLParser:
 
         for alias, (super_name, table_name) in self._alias_to_table.items():
             # Skip CTE aliases — they are not physical tables.
-            if table_name in self._cte_names:
+            if alias in self._cte_aliases:
                 continue
 
             key = (super_name, table_name)
