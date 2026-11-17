@@ -154,6 +154,8 @@ These are declarations, not a guarantee that every field is consumed by every se
 | `SUPERTABLE_DUCKDB_PRESIGNED` | `bool` | `false` |
 | `SUPERTABLE_DUCKDB_USE_HTTPFS` | `bool` | `false` |
 | `SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD` | `bool` | `false` |
+| `SUPERTABLE_DUCKDB_FILE_ACCESS_LOCK` | `bool` | `true` |
+| `SUPERTABLE_DUCKDB_FILE_ACCESS_DIRECTORIES` | `str` | `empty` |
 | `SUPERTABLE_DUCKDB_WRITE_PROBE` | `bool` | `false` |
 | `SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE` | `int` | `8` |
 | `SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC` | `int` | `300` |
@@ -300,6 +302,8 @@ These are declarations, not a guarantee that every field is consumed by every se
 - `STORAGE_USE_SSL` is read by query-engine credential configuration; S3 and MinIO adapter construction derive their transport from the endpoint rather than passing this field as a universal TLS switch. Keep endpoint scheme and engine settings consistent.
 - Azure's effective container selects `STORAGE_BUCKET` before `AZURE_CONTAINER`. The ordinary loader gives `STORAGE_BUCKET` a nonempty `supertable` default. GCS's effective bucket selects `GCS_BUCKET` first.
 - `SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=false` prevents the configured HTTPFS loader from installing an extension when loading it fails; it can still load an already installed extension.
+- `SUPERTABLE_DUCKDB_FILE_ACCESS_LOCK=true` confines the DuckDB read connection to the application home, its spill directory and the URL schemes storage keys resolve to; [Query engine](09_query_engine.md) lists them. It needs DuckDB 1.2 or later, and a read fails rather than run unlocked when the lock cannot be set. With the lock on, `httpfs` is loaded on a connection's first query when the storage is an object store, because no extension can be loaded afterwards.
+- `SUPERTABLE_DUCKDB_FILE_ACCESS_DIRECTORIES` names further directories for the locked connection, separated by `:`. It is for a LOCAL lake that is not under `SUPERTABLE_HOME`: a process that changed its working directory after importing the package, since LOCAL keys are relative to it, or snapshots that name files by absolute path. A directory named here can be written as well as read by a query that got past the read gate.
 - `SUPERTABLE_DUCKDB_WRITE_PROBE` gates an additional capability probe in the write path. Its default is false.
 - `SUPERTABLE_SUPER_META_CACHE_TTL_S=None` resolves to a one-second metadata cache TTL in `MetaReader`. A cached result is reused only while both its root version matches and its expiry has not passed. The ordinary environment loader maps zero and negative values back to `None`, so those values also select the one-second fallback.
 - `SUPERTABLE_STREAM_MAX_AHEAD_CHUNKS=0` and `SUPERTABLE_STREAM_MAX_SPILL_BYTES=0` disable their respective producer limits in the streaming runner.

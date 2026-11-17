@@ -119,8 +119,8 @@ def install() -> None:
         _wrap(cls, "execute", f"engine[{tag}]", on_return=mark)
         if hasattr(cls, "_get_connection"):
             _wrap(cls, "_get_connection", f"conn[{tag}]")
-        if hasattr(cls, "_ensure_httpfs"):
-            _wrap(cls, "_ensure_httpfs", f"httpfs[{tag}]")
+        if hasattr(cls, "_ready_connection"):
+            _wrap(cls, "_ready_connection", f"httpfs[{tag}]")
         for fn in ("create_reflection_view_with_presign_retry",
                    "create_reflection_table_with_presign_retry"):
             if hasattr(mod, fn):

@@ -1581,7 +1581,9 @@ class TestDuckDBEngine:
     @patch("supertable.engine.duckdb.hashed_table_name", return_value="st_abc")
     @patch("supertable.engine.duckdb.create_reflection_view_with_presign_retry", return_value=False)
     @patch("supertable.engine.duckdb.rewrite_query_with_hashed_tables", return_value="SELECT 1")
-    def test_execute_flow(self, mock_rewrite, mock_create, mock_hash, mock_init, mock_duckdb):
+    # The connection is a mock: there is no DuckDB behind it to lock.
+    @patch("supertable.engine.duckdb.lock_file_access", return_value="open")
+    def test_execute_flow(self, mock_lock, mock_rewrite, mock_create, mock_hash, mock_init, mock_duckdb):
         fake_con = MagicMock()
         fake_con.execute.return_value.fetchdf.return_value = pd.DataFrame({"x": [1]})
         mock_duckdb.connect.return_value = fake_con
@@ -1609,6 +1611,7 @@ class TestDuckDBEngine:
         assert "CREATING_REFLECTION" in captures
         mock_init.assert_called_once()
         mock_create.assert_called_once()
+        mock_lock.assert_called_once_with(fake_con, ["f.parquet"])
         # The lite executor reuses a persistent connection; it is NOT closed per query.
 
     @patch("supertable.engine.duckdb.duckdb")

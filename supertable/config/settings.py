@@ -165,6 +165,22 @@ class Settings:
     # an actionable message; set ON only on a networked box that must
     # self-install.
     SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD: bool = False  # SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD
+    # Lock the read connection's file access after it has loaded what it needs:
+    # DuckDB then opens files only under the application home and the
+    # connection's spill directory, and URLs only of the schemes the read path
+    # resolves storage keys to (see engine_common.lock_file_access).  It stands
+    # behind the SQL read gate: a query the gate should have refused still
+    # cannot read /etc or /proc, write or attach a file outside those
+    # directories, or load an extension.  Needs DuckDB 1.2 or later; a read
+    # fails rather than run unlocked when the lock cannot be set.
+    SUPERTABLE_DUCKDB_FILE_ACCESS_LOCK: bool = True  # SUPERTABLE_DUCKDB_FILE_ACCESS_LOCK
+    # Directories the locked connection may open beside the application home,
+    # separated by os.pathsep (":").  For a LOCAL lake whose files are not
+    # under SUPERTABLE_HOME: a process that changed its working directory
+    # after importing the package, or snapshots that name files by absolute
+    # path.  Everything under a directory named here can be read AND written
+    # by a query that got past the read gate.
+    SUPERTABLE_DUCKDB_FILE_ACCESS_DIRECTORIES: str = ""  # SUPERTABLE_DUCKDB_FILE_ACCESS_DIRECTORIES
     # Write-path overwrite/delete resolution via the DuckDB pushdown probe.
     #
     # DISABLED by default, on measurement.  3.0.6 briefly enabled it on the
@@ -530,6 +546,8 @@ def _build_settings() -> Settings:
             "SUPERTABLE_DUCKDB_PRESIGNED", _env_str("STORAGE_TYPE", "LOCAL").upper() == "AZURE"),
         SUPERTABLE_DUCKDB_USE_HTTPFS=_env_bool("SUPERTABLE_DUCKDB_USE_HTTPFS", False),
         SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=_env_bool("SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD", False),
+        SUPERTABLE_DUCKDB_FILE_ACCESS_LOCK=_env_bool("SUPERTABLE_DUCKDB_FILE_ACCESS_LOCK", True),
+        SUPERTABLE_DUCKDB_FILE_ACCESS_DIRECTORIES=_env_str("SUPERTABLE_DUCKDB_FILE_ACCESS_DIRECTORIES"),
         SUPERTABLE_DUCKDB_WRITE_PROBE=_env_bool("SUPERTABLE_DUCKDB_WRITE_PROBE", False),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_MAX_PER_TABLE", 8),
         SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC=_env_int("SUPERTABLE_DUCKDB_TOMBSTONE_CACHE_TTL_SEC", 300),

@@ -101,6 +101,58 @@ View names are derived from the table, snapshot version, and projection; query-s
 
 Deletion-vector tables are cached with a configured capacity and TTL, defaulting to 8 entries and 300 seconds. Referenced cache entries are released when the stream closes.
 
+### File-access lock
+
+The read gate is what keeps a file function out of a query. Behind it, the connection a query runs on is confined by DuckDB itself. On a connection's first query, after the engine has configured object storage for that query's paths and before it builds any view, `lock_file_access` sets `allowed_directories` and then `enable_external_access=false`. DuckDB lets neither be undone or widened while the database runs, and every cursor of the connection is bound by them. A query that got past the gate would then be refused, with a permission error, on:
+
+- a local file outside the list: `/etc/hostname`, `/proc/self/environ`, a path that leaves a listed directory through `..` or through a symbolic link, a file read through a view created before the lock
+- `COPY ... TO`, `EXPORT DATABASE` and `ATTACH` outside the list
+- `LOAD` of an extension, and a change of the spill directory
+- a URL of a scheme that is not on the list
+
+The list holds local directories and URL schemes:
+
+| Entry | On the list | Why |
+| --- | --- | --- |
+| The application home (`SUPERTABLE_HOME`) | always | A LOCAL lake's keys are paths relative to it, DuckDB's pinned home with its extensions is under it, and so are the default spill and cache directories |
+| The connection's spill directory | always | DuckDB adds it itself; it is named besides for when it is not under the home |
+| `SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR` | on a DuckDB build with a cache directory | The external file cache |
+| `SUPERTABLE_DUCKDB_FILE_ACCESS_DIRECTORIES` | when set | A LOCAL lake that is not under the home |
+| `s3://`, `http://`, `https://`, `gcs://` | when `httpfs` is loaded | Every URL form a storage key is resolved to |
+
+Every form the read path hands DuckDB falls under one entry:
+
+| Storage | Form | Entry |
+| --- | --- | --- |
+| LOCAL | the key, a path relative to the working directory, which the package sets to the application home at import | application home |
+| S3, MinIO | `s3://bucket/key` | `s3://` |
+| S3, MinIO with `SUPERTABLE_DUCKDB_USE_HTTPFS` | `http(s)://host/bucket/key`, or `http(s)://bucket.host/key` in vhost style | `http://`, `https://` |
+| S3, MinIO presigned | the same URL with `X-Amz-*` parameters | `http://`, `https://` |
+| Azure | a SAS URL, `https://account.blob.core.windows.net/container/key?...`; presigning is on by default for Azure | `https://` |
+| Azure with `SUPERTABLE_DUCKDB_USE_HTTPFS` | the blob URL without a signature | `https://` |
+| GCS | `gcs://bucket/key` | `gcs://` |
+| GCS with `SUPERTABLE_DUCKDB_USE_HTTPFS`, or presigned | `https://storage.googleapis.com/bucket/key`, with `X-Goog-*` parameters when signed | `https://` |
+| any | a key that is already a URL is passed on as it is | its scheme, if listed |
+
+The presigned forms come from `SUPERTABLE_DUCKDB_PRESIGNED` or from the retry a 301 or 403 on the first read takes. The parts of a deletion vector are resolved as data files are and fall under the same entries. `azure://container/key`, which the Azure storage returns when presigning is off, is not listed: DuckDB reads it only with its `azure` extension, which the package neither loads nor gives credentials, so that form is not readable with or without the lock.
+
+URLs are allowed by scheme, not by bucket or host. DuckDB compares a URL prefix as text and does not resolve `..` in a URL, so `http://host/lake/../other/x` passes a `http://host/lake/` prefix and the server answers for `/other/`. A narrower entry would look like a boundary without being one, and a presigned URL of a form the list did not foresee would fail every read on the connection. Local paths are different: DuckDB resolves both the entries and each path it checks through `..` and symbolic links.
+
+The lock is frozen when it is set, so everything a connection will need is put in place first:
+
+- `httpfs` cannot be loaded afterwards. The engine loads it before the lock when the first query reads URLs, and also when the configured storage is an object store and the first query happens to read none. It is looked for where `LOAD` finds it, under the application home, then where DuckDB auto-loads it from, under the operating-system home, and is installed only where `SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD` permits.
+- A connection locked without `httpfs` has no URL scheme on its list: a LOCAL deployment's read connection reaches no network. If a later query does bring a URL, the engine replaces the connection with a new one. Streams still open on the old one read to their end.
+- DuckDB's secret manager is started before the lock. It starts on first use by listing `~/.duckdb/stored_secrets` under the operating-system home, which is outside the list; a first use under the lock would fail there and leave the manager unusable for the life of the process.
+- `lock_configuration` is not used. The memory limit, thread count, HTTP timeout and cache switches are set per query, and they and the store's secret can still be set on a locked connection.
+
+What the lock does not do:
+
+- It is not the read gate and it is not RBAC. On a locked connection the lake's own files can still be read as they lie, without the role's column list, row filter or deletion vector, and so can any URL of a listed scheme, an internal address included. Keeping a query from saying that remains the gate's work.
+- DuckDB's list does not tell reading from writing, and the spill directory has to be written. A file under a listed directory can be written, and `INSTALL` into the home's extension directory is not refused; `LOAD` is.
+- It confines the read connection only. The write path's probe connection and the diagnostics connections run no caller SQL and are not locked.
+
+If the lock cannot be set as designed, on a DuckDB older than 1.2 or one that does not keep the schemes as URL prefixes, the read fails with an error that names `SUPERTABLE_DUCKDB_FILE_ACCESS_LOCK`; it is not run unlocked. When DuckDB refuses a file on a locked connection, the engine logs a warning that names both settings.
+
 ### Configuration
 
 Organization engine configuration is resolved from Redis first, then environment variables, then defaults. Shared fields live at the configuration root; DuckDB fields live in the `lite` or `pro` section. `resolve_engine_config_provenance()` reports each field's source.
@@ -117,13 +169,15 @@ Organization engine configuration is resolved from Redis first, then environment
 | `SUPERTABLE_DUCKDB_PRESIGNED` | `false` | Prefer storage presigned paths during estimation |
 | `SUPERTABLE_DUCKDB_USE_HTTPFS` | `false` | Use constructed HTTP URLs instead of S3 URLs when resolving object-store keys |
 | `SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD` | `false` | Permit installing `httpfs` if it is not already available |
+| `SUPERTABLE_DUCKDB_FILE_ACCESS_LOCK` | `true` | Lock the read connection's file access after its first query has loaded what it needs |
+| `SUPERTABLE_DUCKDB_FILE_ACCESS_DIRECTORIES` | empty | Directories the locked connection may open beside the application home, separated by `:` |
 | `SUPERTABLE_STREAM_BATCH_ROWS` | `65536` | Default Arrow batch row count |
 
 Memory values accept positive numbers with units such as `MB`, `GB`, `MiB`, and `GiB`; a bare number is interpreted as GB. Invalid memory limits fall back to `1GB`. Thread derivation uses approximately one thread per 400 MB, capped by CPU count times the I/O multiplier.
 
 Initialization sets the default collation to `nocase`, disables insertion-order preservation where supported, and configures a spill directory under the application home. Add `ORDER BY` when output order matters.
 
-Remote S3 and HTTP reads require DuckDB's `httpfs` extension. Missing local extensions cause a clear runtime error unless online installation is enabled. Storage paths resolve through storage URL helpers where available. Certain HTTP/authentication failures during reflection creation trigger one retry using presigned paths. Optional DuckDB settings are applied only where supported, so a dedicated external-cache cap depends on the installed DuckDB build.
+Remote S3, GCS and HTTP reads require DuckDB's `httpfs` extension. Missing local extensions cause a clear runtime error unless online installation is enabled. Storage paths resolve through storage URL helpers where available. Certain HTTP/authentication failures during reflection creation trigger one retry using presigned paths. Optional DuckDB settings are applied only where supported, so a dedicated external-cache cap depends on the installed DuckDB build.
 
 ## 5. Spark execution
 

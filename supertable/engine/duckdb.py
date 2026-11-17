@@ -27,6 +27,10 @@ from supertable.engine.engine_common import (
     create_tombstone_view,
     widen_projection_for_row_filter,
     TombstoneCache,
+    lock_file_access,
+    has_remote_path,
+    FILE_ACCESS_LOCAL,
+    FILE_ACCESS_OPEN,
 )
 
 
@@ -52,7 +56,10 @@ def _shared_state():
     """Per-thread holder for the connection and the deletion-vector cache."""
     st = getattr(_SHARED, "state", None)
     if st is None:
-        st = {"con": None, "httpfs": False, "tombstone_cache": None}
+        # "file_access" is what lock_file_access did to "con": None until the
+        # connection's first query has locked it.
+        st = {"con": None, "httpfs": False, "file_access": None,
+              "tombstone_cache": None}
         _SHARED.state = st
     return st
 
@@ -63,6 +70,7 @@ def reset_shared_duckdb_state() -> None:
     con = st.get("con")
     st["con"] = None
     st["httpfs"] = False
+    st["file_access"] = None
     st["tombstone_cache"] = None
     if con is not None:
         try:
@@ -122,20 +130,47 @@ class DuckDBEngine:
         con = duckdb.connect()
         init_connection(con, temp_dir=temp_dir)
         # httpfs (and both cache settings) are configured lazily on the first
-        # query via _ensure_httpfs → configure_httpfs_and_s3.  They cannot be
+        # query via _ready_connection → configure_httpfs_and_s3.  They cannot be
         # applied here because the httpfs extension is not loaded yet.
         st["con"] = con
         st["httpfs"] = False
+        st["file_access"] = None
         logger.info("[duckdb] persistent connection created")
         return con
 
-    def _ensure_httpfs(self, con: duckdb.DuckDBPyConnection, paths: List[str]) -> None:
-        """Configure httpfs once per connection lifetime, under the lock."""
+    def _ready_connection(
+            self,
+            con: duckdb.DuckDBPyConnection,
+            temp_dir: str,
+            paths: List[str],
+    ) -> duckdb.DuckDBPyConnection:
+        """Configure httpfs, then lock file access: each once per connection.
+
+        Returns the connection the query is to run on, which is *con* unless
+        *con* was locked before it had httpfs and *paths* now hold a URL.  An
+        extension cannot be loaded into a locked connection, so that one is
+        replaced: streams still open on it keep the cursors they read through,
+        and its views and deletion-vector tables go when the last one closes.
+
+        The order is the lock's condition: what ``configure_httpfs_and_s3``
+        loads has to be loaded before ``lock_file_access``, and the spill
+        directory ``_get_connection`` set cannot be changed after it.
+        """
         st = _shared_state()
         with self._lock:
+            if st["file_access"] == FILE_ACCESS_LOCAL and has_remote_path(paths):
+                logger.warning(
+                    "[duckdb.lock] this connection was locked for local files "
+                    "and the query reads URLs; replacing it"
+                )
+                self._reset_connection()
+                con = self._get_connection(temp_dir=temp_dir)
             if not st["httpfs"]:
                 configure_httpfs_and_s3(con, paths)
                 st["httpfs"] = True
+            if st["file_access"] is None:
+                st["file_access"] = lock_file_access(con, paths)
+        return con
 
     def _reset_connection(self) -> None:
         """Close and discard the connection on unrecoverable error."""
@@ -147,6 +182,7 @@ class DuckDBEngine:
                 pass
             st["con"] = None
             st["httpfs"] = False
+            st["file_access"] = None
             # Tables died with the connection — just forget the registry.
             self._tombstone_cache.clear_registry()
             logger.warning("[duckdb] connection reset")
@@ -398,9 +434,15 @@ class DuckDBEngine:
             # table with no resources has no footer to take a schema from.
             alias_to_column_types[td.alias] = dict(sup.column_types or {})
 
-        self._ensure_httpfs(
-            con, [f for files in alias_to_files.values() for f in files],
-        )
+        # Every path this query hands DuckDB: the data files, and the parts of
+        # each deletion vector, which are resolved as the data files are.
+        paths = [f for files in alias_to_files.values() for f in files]
+        for tomb_def in (getattr(reflection, "tombstone_views", None) or {}).values():
+            tomb_path = getattr(tomb_def, "tombstone_path", None)
+            paths.extend([tomb_path] if isinstance(tomb_path, str)
+                         else [x for x in (tomb_path or []) if x])
+        con = self._ready_connection(con, query_manager.temp_dir, paths)
+        st_file_access = _shared_state()["file_access"]
 
         created_views: List[str] = []
         acquired_dv_keys: List[str] = []
@@ -426,7 +468,18 @@ class DuckDBEngine:
                 views=created_views, dv_keys=acquired_dv_keys,
                 cache=self._tombstone_cache,
             )
-        except Exception:
+        except Exception as e:
+            if (type(e).__name__ == "PermissionException"
+                    and st_file_access not in (None, FILE_ACCESS_OPEN)):
+                # DuckDB names the file and says "disabled by configuration";
+                # which configuration is for the operator's log.
+                logger.warning(
+                    f"{log_prefix}[duckdb.lock] DuckDB refused a file this "
+                    f"connection is locked away from "
+                    f"(SUPERTABLE_DUCKDB_FILE_ACCESS_LOCK; a LOCAL lake outside "
+                    f"SUPERTABLE_HOME is named in "
+                    f"SUPERTABLE_DUCKDB_FILE_ACCESS_DIRECTORIES): {e}"
+                )
             # Nothing will close the handle if we never return one.
             StreamHandle(
                 reader=None, cursor=cursor, connection=con,

@@ -74,6 +74,12 @@ def bootstrap_hermetic_env(home: Optional[str] = None) -> str:
         "STORAGE_ENDPOINT_URL": "",        # avoid S3 endpoint detection path
         "STORAGE_BUCKET": "supertable",
         "SUPERTABLE_DUCKDB_PRESIGNED": "0",  # LocalStorage has no presign()
+        # The sealed scenarios' snapshots name their Parquet files by absolute
+        # path under tests/golden, outside the temporary home: a LOCAL lake
+        # kept elsewhere, which the read connection's file-access lock has to
+        # be told about.  The lock itself stays on for the whole suite.
+        "SUPERTABLE_DUCKDB_FILE_ACCESS_LOCK": "true",
+        "SUPERTABLE_DUCKDB_FILE_ACCESS_DIRECTORIES": str(REPO_ROOT / "tests" / "golden"),
         "SUPERTABLE_REDIS_SENTINEL": "false",
         "SUPERTABLE_REDIS_SENTINELS": "",
         "SUPERTABLE_REDIS_HOST": "localhost",

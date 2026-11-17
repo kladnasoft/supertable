@@ -9,7 +9,7 @@ pytz>=2023.3
 tzdata>=2023.3
 
 # -------- Engine / query / utils --------
-duckdb>=1.1,<2.0
+duckdb>=1.2,<2.0
 polars>=1.6,<2.0
 sqlglot>=26,<27
 colorlog>=6.9,<7.0

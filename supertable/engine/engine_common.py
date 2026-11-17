@@ -1224,6 +1224,289 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
 
 
 # =========================================================
+# File-access lock
+# =========================================================
+
+#: Storage types whose keys the read path resolves to URLs rather than to files
+#: under the application home.
+_OBJECT_STORE_TYPES = frozenset({"S3", "MINIO", "AZURE", "GCS"})
+
+#: The URL schemes the read path hands DuckDB.  httpfs serves all four.
+#:
+#:   s3://     S3 and MinIO keys (``to_duckdb_path``), and what the estimator
+#:             builds itself from endpoint and bucket when a storage has no
+#:             helper
+#:   http://   the same keys with SUPERTABLE_DUCKDB_USE_HTTPFS, and every
+#:   https://  presigned form: S3 and MinIO presigned GETs, Azure SAS URLs and
+#:             GCS signed URLs, from SUPERTABLE_DUCKDB_PRESIGNED or from the
+#:             retry a 301/403 on the first read takes (``make_presigned_list``)
+#:   gcs://    GCS keys
+#:
+#: Allowed by scheme, not by bucket or host.  DuckDB compares a URL prefix as
+#: text and does not resolve ``..`` in a URL, so ``http://host/lake/../other/x``
+#: passes a ``http://host/lake/`` prefix and the server answers for ``/other/``:
+#: a narrower entry would look like a boundary without being one, while a
+#: presigned URL of a form the list did not foresee would fail every read.
+#:
+#: ``azure://``, which ``AzureBlobStorage.to_duckdb_path`` returns, is not
+#: here.  DuckDB reads it only with its azure extension, which nothing in this
+#: package loads or gives credentials, so an Azure lake is read through SAS
+#: URLs (SUPERTABLE_DUCKDB_PRESIGNED is on by default for it).  It could not be
+#: listed anyway: DuckDB keeps a scheme as a prefix only while an extension
+#: that serves it is loaded, and takes any other entry for a directory under
+#: the working directory.
+FILE_ACCESS_URL_SCHEMES = ("s3://", "http://", "https://", "gcs://")
+
+#: What ``lock_file_access`` did to a connection.
+FILE_ACCESS_OPEN = "open"      # SUPERTABLE_DUCKDB_FILE_ACCESS_LOCK is off
+FILE_ACCESS_LOCAL = "local"    # local directories only; httpfs is not loaded
+FILE_ACCESS_REMOTE = "remote"  # local directories and FILE_ACCESS_URL_SCHEMES
+
+_FILE_ACCESS_SETTING = "SUPERTABLE_DUCKDB_FILE_ACCESS_LOCK"
+
+
+def has_remote_path(paths: Optional[List[str]]) -> bool:
+    """True when any of *paths* is a URL rather than a file path."""
+    return any("://" in str(p) for p in (paths or ()))
+
+
+def _httpfs_loaded(con: duckdb.DuckDBPyConnection) -> bool:
+    try:
+        row = con.execute(
+            "SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'httpfs'"
+        ).fetchone()
+        return bool(row and row[0])
+    except Exception:
+        pass
+    # duckdb_extensions() lists the extension directory, which a locked
+    # connection is refused when the directory resolves to somewhere off its
+    # list.  The settings an extension registers are held in memory, and
+    # reading the list of them loads nothing.
+    try:
+        return bool(con.execute(
+            "SELECT 1 FROM duckdb_settings() WHERE name = 'enable_http_metadata_cache'"
+        ).fetchone())
+    except Exception:
+        return False
+
+
+def _load_httpfs_before_lock(con: duckdb.DuckDBPyConnection) -> None:
+    """Load httpfs while the connection may still load an extension.
+
+    Raises with the reason when it cannot.  Tried in the order a read would
+    have come by it: the pinned home's extension directory, which is where
+    ``configure_httpfs_and_s3`` loads it from; the operating-system home's,
+    which is where DuckDB itself finds it when a ``gcs://`` read auto-loads it
+    (``home_directory`` moves the first and not the second); and an install,
+    only where SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD permits one.
+    """
+    try:
+        con.execute("LOAD httpfs;")
+        return
+    except Exception as load_err:
+        failure = load_err
+
+    import glob as _glob
+
+    pattern = os.path.join(
+        os.path.expanduser("~"), ".duckdb", "extensions",
+        f"v{duckdb.__version__}", "*", "httpfs.duckdb_extension",
+    )
+    for candidate in sorted(_glob.glob(pattern)):
+        try:
+            con.execute(f"LOAD '{escape_parquet_path(candidate)}';")
+            return
+        except Exception as path_err:
+            failure = path_err
+
+    if settings.SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD:
+        con.execute("INSTALL httpfs;")
+        con.execute("LOAD httpfs;")
+        return
+    raise failure
+
+
+def _file_access_directories(con: duckdb.DuckDBPyConnection) -> List[str]:
+    """The local directories a locked connection still reads and writes.
+
+    The application home holds a LOCAL lake (its keys are relative, and the
+    package makes the home the working directory at import), DuckDB's pinned
+    home with its extensions, and the default spill and cache directories.
+    The connection's own spill directory and a configured cache directory are
+    named besides, for when they lie elsewhere, and so is whatever
+    SUPERTABLE_DUCKDB_FILE_ACCESS_DIRECTORIES names: a LOCAL lake kept
+    somewhere other than the home.  A directory inside another on the list is
+    left out.  DuckDB resolves every entry, and every local path it later
+    checks, through symbolic links and ``..``.
+
+    DuckDB's list does not tell reading from writing, and the spill directory
+    has to be written: whatever is listed here can be written too.
+    """
+    directories = [get_app_home()]
+    try:
+        spill = con.execute("SELECT current_setting('temp_directory')").fetchone()[0]
+    except Exception:
+        spill = None
+    if spill:
+        directories.append(str(spill))
+    cache_dir = settings.SUPERTABLE_DUCKDB_EXTERNAL_CACHE_DIR
+    if cache_dir and _external_file_cache_cappable(con):
+        directories.append(cache_dir)
+    directories.extend(
+        (settings.SUPERTABLE_DUCKDB_FILE_ACCESS_DIRECTORIES or "").split(os.pathsep))
+    absolute = [os.path.abspath(os.path.expanduser(d.strip()))
+                for d in directories if d and d.strip()]
+    kept: List[str] = []
+    for directory in absolute:
+        if any(_within(directory, other) for other in kept):
+            continue
+        kept = [other for other in kept if not _within(other, directory)]
+        kept.append(directory)
+    return kept
+
+
+def lock_file_access(
+        con: duckdb.DuckDBPyConnection,
+        for_paths: Optional[List[str]] = None,
+) -> str:
+    """Confine the files and URLs *con* can open, for as long as it lives.
+
+    Defence in depth behind the SQL read gate (``system_query``), which is what
+    keeps a file function out of a query.  Should a query get past the gate,
+    this is what it meets at the engine: ``read_text('/etc/hostname')``,
+    ``/proc/self/environ``, a ``COPY ... TO``, an ``ATTACH``, an ``INSTALL`` or
+    a ``LOAD`` are refused by DuckDB itself, on this connection and on every
+    cursor of it.  It does not stand in for the gate: a locked connection still
+    reads any file of the lake, unfiltered, and any URL of the listed schemes.
+
+    Sets ``allowed_directories`` and then ``enable_external_access=false``.
+    DuckDB lets neither be undone or widened on a running database, so
+    everything the connection will ever need has to be in place first:
+
+      * httpfs is loaded here if it is not yet, when *for_paths* holds a URL
+        or the configured storage is an object store.  No extension can be
+        loaded afterwards.  A connection locked without it reads local files
+        only and returns ``FILE_ACCESS_LOCAL``; ``DuckDBEngine`` replaces such
+        a connection if a later query does bring a URL.
+      * DuckDB's secret manager is started.  It starts on first use by listing
+        ``~/.duckdb/stored_secrets`` under the operating-system home, which is
+        outside the list; a first use under the lock fails there and leaves
+        the manager unusable until the process restarts.
+      * ``lock_configuration`` is not used: memory limit, threads, HTTP
+        timeout and the cache switches are set per query, and all of them, the
+        store's secret included, can still be set after this.
+
+    Call it once per connection, after ``init_connection`` (the spill
+    directory cannot be changed afterwards) and after
+    ``configure_httpfs_and_s3`` for the first query's paths.  Returns
+    ``FILE_ACCESS_OPEN`` and does nothing when the setting is off.  Raises
+    rather than leave a connection half locked or locked on a list DuckDB did
+    not take as written.
+    """
+    if not settings.SUPERTABLE_DUCKDB_FILE_ACCESS_LOCK:
+        return FILE_ACCESS_OPEN
+
+    remote = _httpfs_loaded(con)
+    try:
+        locked = con.execute(
+            "SELECT current_setting('enable_external_access')"
+        ).fetchone()[0] is False
+    except Exception:
+        locked = False
+    if locked:
+        # Already locked, and a lock cannot be set twice: say what it holds.
+        return FILE_ACCESS_REMOTE if remote else FILE_ACCESS_LOCAL
+
+    if not remote:
+        if has_remote_path(for_paths):
+            # The query in hand reads URLs: without httpfs it cannot run at
+            # all, so the reason it cannot be loaded is the query's error.
+            try:
+                _load_httpfs_before_lock(con)
+            except Exception as e:
+                raise RuntimeError(
+                    "DuckDB's 'httpfs' extension could not be loaded, so this "
+                    "query cannot read its storage. Seed it into "
+                    f"'{get_app_home()}/.duckdb/extensions/v{duckdb.__version__}/<platform>/' "
+                    "or set SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD=true. "
+                    f"Underlying DuckDB error: {e}"
+                ) from e
+            remote = True
+        elif (settings.STORAGE_TYPE or "").upper() in _OBJECT_STORE_TYPES:
+            try:
+                _load_httpfs_before_lock(con)
+                remote = True
+            except Exception as e:
+                logger.warning(
+                    "[duckdb.lock] httpfs could not be loaded before the lock; "
+                    f"this connection reads local files only: {e}"
+                )
+
+    if remote:
+        try:
+            con.execute("SELECT count(*) FROM duckdb_secrets()").fetchall()
+        except Exception as e:
+            logger.warning(f"[duckdb.lock] DuckDB's secret manager did not start: {e}")
+
+    directories = _file_access_directories(con)
+    schemes = list(FILE_ACCESS_URL_SCHEMES) if remote else []
+    entries = ", ".join(
+        f"'{escape_parquet_path(entry)}'" for entry in directories + schemes
+    )
+    try:
+        con.execute(f"SET allowed_directories=[{entries}];")
+        if schemes:
+            taken = set(con.execute(
+                "SELECT current_setting('allowed_directories')"
+            ).fetchone()[0] or [])
+            lost = [scheme for scheme in schemes if scheme not in taken]
+            if lost:
+                raise RuntimeError(
+                    f"DuckDB {duckdb.__version__} did not keep {lost} as URL "
+                    f"prefixes (it holds {sorted(taken)})"
+                )
+        con.execute("SET enable_external_access=false;")
+    except Exception as e:
+        raise RuntimeError(
+            "could not lock the DuckDB connection's file access on DuckDB "
+            f"{duckdb.__version__} (the lock needs DuckDB 1.2 or later). Set "
+            f"{_FILE_ACCESS_SETTING}=false to read without the lock. "
+            f"Underlying error: {e}"
+        ) from e
+
+    if not remote:
+        # A LOCAL lake's keys are relative paths.  The package makes the
+        # application home the working directory at import; a process that
+        # has since moved reads its lake from where it now stands, and DuckDB
+        # will refuse those files.
+        try:
+            cwd = os.getcwd()
+            outside = not any(_within(cwd, d) for d in directories)
+        except OSError:
+            outside = False     # the working directory itself is gone
+        if outside:
+            logger.warning(
+                f"[duckdb.lock] the working directory '{cwd}' is outside "
+                f"SUPERTABLE_HOME '{get_app_home()}': LOCAL storage keys "
+                f"resolve against the working directory, and DuckDB will "
+                f"refuse them unless SUPERTABLE_DUCKDB_FILE_ACCESS_DIRECTORIES "
+                f"names it."
+            )
+    logger.info(
+        f"[duckdb.lock] file access locked to {directories}"
+        + (f" and {schemes}" if schemes else " (no URLs: httpfs is not loaded)")
+    )
+    return FILE_ACCESS_REMOTE if remote else FILE_ACCESS_LOCAL
+
+
+def _within(path: str, directory: str) -> bool:
+    """True when *path* is *directory* or lies under it, links resolved."""
+    real = os.path.realpath(path)
+    root = os.path.realpath(directory)
+    return real == root or real.startswith(root.rstrip(os.sep) + os.sep)
+
+
+# =========================================================
 # Engine self-diagnostics (UI "Diagnose" button)
 # =========================================================
 
