@@ -297,10 +297,10 @@ def test_a_custom_sql_rule_reads_no_file_and_no_engine_state(lake, secret, sql):
     _rule(lake, sql.replace("{secret}", secret))
     outcome, dqc = _run_rules(lake)
 
-    published = json.dumps(dqc.get_latest("emp") or {}, default=str)
-    assert SENTINEL not in published and str(len(SENTINEL) + 1) not in published
+    assert SENTINEL not in json.dumps(dqc.get_latest("emp") or {}, default=str)
     if "-- */" in sql:
-        # The comment is only a comment: the rule is the count it started as.
+        # The comment is only a comment: the rule is the count it started as,
+        # two rows, and not that plus the length of the file.
         assert outcome.state == "success"
         assert [r["value"] for r in dqc.get_latest("emp")["rule_results"]] == [2]
     else:
