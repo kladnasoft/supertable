@@ -471,14 +471,27 @@ def configure_httpfs_and_s3(
 # Presign helpers
 # =========================================================
 
+#: Schemes written ``scheme://<bucket or container>/<key>``: the first part
+#: names the bucket, everything after it is the object's key in that bucket.
+#: ``gcs://`` and ``azure://`` are what ``GCSStorage.to_duckdb_path`` and
+#: ``AzureBlobStorage.to_duckdb_path`` return; ``gs://`` and ``az://`` are the
+#: other spellings DuckDB reads the same stores by.
+_BUCKET_SCHEMES = ("s3", "gcs", "gs", "azure", "az")
+
+#: Of those, the stores whose ``to_duckdb_path`` puts the storage's base
+#: prefix into the path and whose ``presign`` adds it again: the key handed
+#: to ``presign`` has to be the one ``to_duckdb_path`` was given.
+_BASE_PREFIXED_SCHEMES = ("gcs", "gs", "azure", "az")
+
+
 def url_to_key(url: str, bucket: Optional[str]) -> Optional[str]:
-    """Extract the object key from an S3/HTTP URL."""
+    """Extract the object key from an object-store or HTTP URL."""
     try:
         parsed = urlparse(url)
     except Exception:
         return None
 
-    if parsed.scheme == "s3":
+    if parsed.scheme in _BUCKET_SCHEMES:
         return parsed.path.lstrip("/")
 
     if parsed.scheme in ("http", "https"):
@@ -498,6 +511,27 @@ def url_to_key(url: str, bucket: Optional[str]) -> Optional[str]:
     return None
 
 
+def _key_as_storage_takes_it(storage, url: str, key: str) -> str:
+    """*key* without the storage's base prefix, for a store that adds it.
+
+    ``GCSStorage`` and ``AzureBlobStorage`` write ``<base prefix>/<key>`` into
+    the path they hand DuckDB and prepend the same prefix in ``presign``. A
+    path mapped back to a key therefore still carries the prefix, and signing
+    it as it is would sign ``<prefix>/<prefix>/<key>``, an object that does
+    not exist.
+    """
+    try:
+        scheme = urlparse(url).scheme
+    except Exception:
+        return key
+    if scheme not in _BASE_PREFIXED_SCHEMES:
+        return key
+    base = str(getattr(storage, "base_prefix", "") or "").strip("/")
+    if base and key.startswith(base + "/"):
+        return key[len(base) + 1:]
+    return key
+
+
 def make_presigned_list(storage, paths: List[str]) -> List[str]:
     """Attempt to presign each path; fall back to original on failure."""
     presign_fn = getattr(storage, "presign", None) if storage is not None else None
@@ -511,7 +545,7 @@ def make_presigned_list(storage, paths: List[str]) -> List[str]:
         key = url_to_key(p, bucket)
         if key:
             try:
-                out.append(presign_fn(key))
+                out.append(presign_fn(_key_as_storage_takes_it(storage, p, key)))
             except Exception as e:
                 out.append(p)
                 logger.warning(f"[presign] failed for '{p}': {e}")
@@ -519,6 +553,21 @@ def make_presigned_list(storage, paths: List[str]) -> List[str]:
             out.append(p)
 
     return out
+
+
+#: What an object store's refusal of an unsigned read looks like in DuckDB's
+#: error text. One list for every read that falls back to presigned URLs: the
+#: data files of a reflection and the parts of a deletion vector.
+PRESIGN_RETRY_TOKENS = (
+    "HTTP Error", "HTTP GET error", "301", "Moved Permanently",
+    "AccessDenied", "SignatureDoesNotMatch", "403", "400",
+)
+
+
+def wants_presign_retry(error: BaseException) -> bool:
+    """True when *error* is the kind a presigned URL may get past."""
+    msg = str(error)
+    return any(tok in msg for tok in PRESIGN_RETRY_TOKENS)
 
 
 # =========================================================
@@ -598,10 +647,7 @@ def create_reflection_table_with_presign_retry(
         create_reflection_table(con, table_name, files, columns, column_types)
     except Exception as e:
         msg = str(e)
-        if any(tok in msg for tok in (
-                "HTTP Error", "HTTP GET error", "301", "Moved Permanently",
-                "AccessDenied", "SignatureDoesNotMatch", "403", "400",
-        )):
+        if wants_presign_retry(e):
             logger.warning(f"{log_prefix}[duckdb.retry] presign fallback for {table_name}: {msg}")
             tried_presign = True
             presigned_files = make_presigned_list(storage, files)
@@ -744,6 +790,15 @@ def create_reflection_view(
     con.execute(sql)
 
 
+def reflections_are_materialised() -> bool:
+    """True when a reflection is a TABLE (``SUPERTABLE_DUCKDB_MATERIALIZE=table``).
+
+    Asked in one place: the engine names and drops a table differently from a
+    view, and has to agree with what was created.
+    """
+    return settings.SUPERTABLE_DUCKDB_MATERIALIZE == "table"
+
+
 def create_reflection_view_with_presign_retry(
         con: duckdb.DuckDBPyConnection,
         storage,
@@ -763,8 +818,7 @@ def create_reflection_view_with_presign_retry(
 
     Returns True if the presign fallback was used.
     """
-    materialize = settings.SUPERTABLE_DUCKDB_MATERIALIZE
-    if materialize == "table":
+    if reflections_are_materialised():
         return create_reflection_table_with_presign_retry(
             con, storage, view_name, files, columns, log_prefix,
             column_types=column_types,
@@ -777,10 +831,7 @@ def create_reflection_view_with_presign_retry(
         create_reflection_view(con, view_name, files, columns, column_types)
     except Exception as e:
         msg = str(e)
-        if any(tok in msg for tok in (
-                "HTTP Error", "HTTP GET error", "301", "Moved Permanently",
-                "AccessDenied", "SignatureDoesNotMatch", "403", "400",
-        )):
+        if wants_presign_retry(e):
             logger.warning(f"{log_prefix}[duckdb.retry] presign fallback (view) for {view_name}: {msg}")
             tried_presign = True
             presigned_files = make_presigned_list(storage, files)
@@ -1997,9 +2048,14 @@ def create_tombstone_view(
         tombstone_def,
         dv_table: Optional[str] = None,
         expose_rowid: bool = False,
-) -> None:
+        storage=None,
+        presigned: bool = False,
+        log_prefix: str = "",
+) -> bool:
     """
     Create a view that hides the system columns and drops tombstoned rows.
+
+    Returns True when the vector's parts were read through presigned URLs.
 
     ``expose_rowid`` keeps ``__rowid__`` in the projection. It exists for
     OData, which needs the row identity as an entity key and as a pagination
@@ -2043,6 +2099,14 @@ def create_tombstone_view(
         tombstone_def: TombstoneDef with ``tombstone_path`` (or None)
         dv_table: name of a pre-materialised deletion-vector table, or None
             to fall back to the inline ``read_parquet`` path
+        storage: the storage the parts live in. With it, an inline read the
+            object store refuses unsigned (301/403) is made again through
+            presigned URLs, as the data files' read is
+            (``create_reflection_view_with_presign_retry``). Without that the
+            fallback covered the data files alone, and a table with a deletion
+            vector could not be read wherever the direct read is refused.
+        presigned: the data files of this query already needed presigned
+            URLs, so the parts are signed before the first attempt.
     """
     # Tolerant, static system-column strip: ``COLUMNS(c -> ...)`` silently
     # skips a system column that is absent (pre-``__rowid__`` parquet), where
@@ -2072,12 +2136,18 @@ def create_tombstone_view(
             f"ON {source_table}.{rid} = __dv__.{rid};"
         )
     elif tomb_parts:
-        files_sql = ", ".join(f"'{escape_parquet_path(x)}'" for x in tomb_parts)
-        sql = (
-            f"CREATE OR REPLACE VIEW {view_name} AS "
-            f"SELECT {live_cols} FROM {source_table} "
-            f"ANTI JOIN (SELECT DISTINCT {rid} FROM read_parquet([{files_sql}])) AS __dv__ "
-            f"ON {source_table}.{rid} = __dv__.{rid};"
+        def _inline(parts: List[str]) -> None:
+            files_sql = ", ".join(f"'{escape_parquet_path(x)}'" for x in parts)
+            con.execute(
+                f"CREATE OR REPLACE VIEW {view_name} AS "
+                f"SELECT {live_cols} FROM {source_table} "
+                f"ANTI JOIN (SELECT DISTINCT {rid} FROM read_parquet([{files_sql}])) AS __dv__ "
+                f"ON {source_table}.{rid} = __dv__.{rid};"
+            )
+
+        return read_vector_parts_with_presign_retry(
+            con, storage, tomb_parts, _inline, presigned=presigned,
+            what=f"deletion vector of {view_name}", log_prefix=log_prefix,
         )
     else:
         sql = (
@@ -2085,6 +2155,55 @@ def create_tombstone_view(
             f"SELECT {live_cols} FROM {source_table};"
         )
     con.execute(sql)
+    return False
+
+
+def read_vector_parts_with_presign_retry(
+        con: duckdb.DuckDBPyConnection,
+        storage,
+        parts: List[str],
+        read: Callable[[List[str]], None],
+        *,
+        presigned: bool = False,
+        what: str = "deletion vector",
+        log_prefix: str = "",
+) -> bool:
+    """Run *read* over a deletion vector's *parts*, signed when they must be.
+
+    The parts are resolved as the data files are, so an object store that
+    refuses the data files unsigned refuses these too. *read* is first given
+    the parts as they are; on a refusal it is given them presigned, once.
+    With ``presigned`` the first attempt is skipped: the query's data files
+    were refused a moment ago, and the same refusal would only be repeated.
+
+    A missing part must never be passed over: a vector read without one
+    brings back exactly the rows that part deleted. So nothing here swallows
+    an error; what cannot be read raises.
+
+    Returns True when the presigned form was the one that was read.
+    """
+    if presigned and storage is not None:
+        signed = make_presigned_list(storage, parts)
+        if signed != parts:
+            configure_httpfs_and_s3(con, signed)
+            read(signed)
+            return True
+    try:
+        read(parts)
+        return False
+    except Exception as e:
+        if storage is None or not wants_presign_retry(e):
+            raise
+        signed = make_presigned_list(storage, parts)
+        if signed == parts:
+            # Nothing to sign with: the second attempt would be the first.
+            raise
+        logger.warning(
+            f"{log_prefix}[duckdb.retry] presign fallback for the {what}: {e}"
+        )
+        configure_httpfs_and_s3(con, signed)
+        read(signed)
+        return True
 
 
 # =========================================================
@@ -2186,12 +2305,20 @@ class TombstoneCache:
             con: duckdb.DuckDBPyConnection,
             cache_key: Optional[str],
             duckdb_path: Optional[str],
+            storage=None,
+            presigned: bool = False,
     ) -> Optional[str]:
         """Return the DV table name for *cache_key*, materialising it on miss,
         refreshing its idle TTL, and incrementing its ref count.  Returns
         ``None`` when caching is disabled or the inputs are incomplete — the
         caller then falls back to the inline ``read_parquet`` path, preserving
         exact legacy behaviour.
+
+        With *storage*, parts the object store refuses unsigned are read
+        through presigned URLs (``read_vector_parts_with_presign_retry``);
+        *presigned* says the query's data files already needed them.  The
+        table stays keyed by the stable path: a presigned URL changes with
+        every signature and names the same parts.
         """
         if not self.enabled or not cache_key or not duckdb_path:
             return None
@@ -2205,11 +2332,17 @@ class TombstoneCache:
                 # missing one resurrects exactly the rows it recorded.
                 _parts = ([duckdb_path] if isinstance(duckdb_path, str)
                           else [x for x in (duckdb_path or []) if x])
-                files_sql = ", ".join(
-                    f"'{escape_parquet_path(x)}'" for x in _parts)
-                con.execute(
-                    f"CREATE TABLE IF NOT EXISTS {table_name} AS "
-                    f"SELECT DISTINCT {rid} FROM read_parquet([{files_sql}]);"
+                def _materialise(parts: List[str]) -> None:
+                    files_sql = ", ".join(
+                        f"'{escape_parquet_path(x)}'" for x in parts)
+                    con.execute(
+                        f"CREATE TABLE IF NOT EXISTS {table_name} AS "
+                        f"SELECT DISTINCT {rid} FROM read_parquet([{files_sql}]);"
+                    )
+
+                read_vector_parts_with_presign_retry(
+                    con, storage, _parts, _materialise, presigned=presigned,
+                    what=f"deletion vector {table_name}",
                 )
                 entry = _DVCacheEntry(
                     table_name=table_name,

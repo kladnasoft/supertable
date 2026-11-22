@@ -20,6 +20,7 @@ from supertable.engine.engine_common import (
     configure_httpfs_and_s3,
     create_reflection_table_with_presign_retry,
     create_reflection_view_with_presign_retry,
+    reflections_are_materialised,
     rewrite_query_with_hashed_tables,
     init_connection,
     apply_runtime_pragmas,
@@ -208,6 +209,7 @@ class DuckDBEngine:
             explain_options: str = "",
             expose_rowid: bool = False,
             alias_to_filter_only: Optional[dict] = None,
+            created_tables: Optional[List[str]] = None,
     ):
         """Build reflection -> tombstone -> RBAC views and rewrite the query.
 
@@ -225,29 +227,56 @@ class DuckDBEngine:
         reflection ONLY so the RBAC/share row filter can bind. The RBAC view
         drops them again, so a widened projection never reaches the caller.
 
+        ``created_tables`` takes the reflections that were materialised as
+        TABLES (``SUPERTABLE_DUCKDB_MATERIALIZE=table``): a table is not
+        dropped by ``DROP VIEW``, so the caller's teardown has to know which
+        is which.
+
         Returns ``(executing_query, tried_presign)``.
         """
+        # Per-query suffix so concurrent requests on the same table do not
+        # collide on a shared view name (CREATE OR REPLACE would silently
+        # corrupt a sibling query's view mid-execution).
+        query_suffix = _uuid.uuid4().hex[:8]
+        query_alias_to_name = dict(alias_to_table_name)
+
+        # A materialised reflection is this query's own copy of the rows: it
+        # is named for the query and dropped with it.  Under the reflection's
+        # shared name the table outlived the query (teardown dropped views
+        # only), so the second read of a table on a connection failed with
+        # "Table ... already exists", and a table shared by name could be
+        # dropped by one query while another still read through it.
+        materialised = reflections_are_materialised()
+        materialised_names: set = set()
+
         tried_presign = False
         for alias, table_name in alias_to_table_name.items():
             files = alias_to_files[alias]
             cols = alias_to_columns[alias]
 
             # Use VIEW (lazy, default). Set SUPERTABLE_DUCKDB_MATERIALIZE=table to revert.
+            if materialised:
+                table_name = f"{table_name}_{query_suffix}"
+                query_alias_to_name[alias] = table_name
+                if table_name in materialised_names:
+                    # The same table under a second alias (a self-join) with
+                    # the same columns: one copy serves both.
+                    continue
+                materialised_names.add(table_name)
+                if created_tables is not None:
+                    # Recorded before the CREATE, so a statement that fails
+                    # half-way still has its name on the teardown list.
+                    created_tables.append(table_name)
             used_presign = create_reflection_view_with_presign_retry(
                 con, self.storage, table_name, files, cols, log_prefix,
                 column_types=alias_to_column_types.get(alias),
             )
-            created_views.append(table_name)
+            if not materialised:
+                created_views.append(table_name)
             if used_presign:
                 tried_presign = True
 
         timer_capture("CREATING_REFLECTION")
-
-        # Per-query suffix so concurrent requests on the same table do not
-        # collide on a shared view name (CREATE OR REPLACE would silently
-        # corrupt a sibling query's view mid-execution).
-        query_suffix = _uuid.uuid4().hex[:8]
-        query_alias_to_name = dict(alias_to_table_name)
 
         # Tombstone / system-column view — created for EVERY alias so the
         # system columns (__rowid__, __timestamp__) are always stripped and
@@ -263,11 +292,21 @@ class DuckDBEngine:
             # falls back to the inline read_parquet path (dv_table=None).
             cache_key = getattr(tomb_def, "cache_key", None) if tomb_def else None
             tomb_path = getattr(tomb_def, "tombstone_path", None) if tomb_def else None
-            dv_table = self._tombstone_cache.acquire(con, cache_key, tomb_path)
+            # The vector's parts are resolved as the data files are, so a
+            # store that refused the data files unsigned refuses these too:
+            # both reads of them fall back to presigned URLs, and go there
+            # at once when the data files of this query already had to.
+            dv_table = self._tombstone_cache.acquire(
+                con, cache_key, tomb_path,
+                storage=self.storage, presigned=tried_presign,
+            )
             if dv_table:
                 acquired_dv_keys.append(cache_key)
-            create_tombstone_view(con, source, view, tomb_def, dv_table=dv_table,
-                                  expose_rowid=expose_rowid)
+            if create_tombstone_view(con, source, view, tomb_def, dv_table=dv_table,
+                                     expose_rowid=expose_rowid,
+                                     storage=self.storage, presigned=tried_presign,
+                                     log_prefix=log_prefix):
+                tried_presign = True
             created_views.append(view)
             query_alias_to_name[alias] = view
 
@@ -445,6 +484,7 @@ class DuckDBEngine:
         st_file_access = _shared_state()["file_access"]
 
         created_views: List[str] = []
+        created_tables: List[str] = []
         acquired_dv_keys: List[str] = []
         cursor = None
         try:
@@ -453,6 +493,7 @@ class DuckDBEngine:
                 alias_to_columns, alias_to_column_types, created_views, acquired_dv_keys,
                 timer_capture, log_prefix, explain, explain_options,
                 expose_rowid, alias_to_filter_only,
+                created_tables=created_tables,
             )
             apply_runtime_pragmas(con, engine_config)
 
@@ -466,7 +507,7 @@ class DuckDBEngine:
             return StreamHandle(
                 reader=reader, cursor=cursor, connection=con,
                 views=created_views, dv_keys=acquired_dv_keys,
-                cache=self._tombstone_cache,
+                cache=self._tombstone_cache, tables=created_tables,
             )
         except Exception as e:
             if (type(e).__name__ == "PermissionException"
@@ -484,7 +525,7 @@ class DuckDBEngine:
             StreamHandle(
                 reader=None, cursor=cursor, connection=con,
                 views=created_views, dv_keys=acquired_dv_keys,
-                cache=self._tombstone_cache,
+                cache=self._tombstone_cache, tables=created_tables,
             ).close()
             raise
 
@@ -502,11 +543,15 @@ class StreamHandle:
     is in flight.
     """
 
-    def __init__(self, reader, cursor, connection, views, dv_keys, cache):
+    def __init__(self, reader, cursor, connection, views, dv_keys, cache,
+                 tables=None):
         self.reader = reader
         self._cursor = cursor
         self._con = connection
         self._views = views
+        #: Reflections materialised as tables for this query alone
+        #: (SUPERTABLE_DUCKDB_MATERIALIZE=table); dropped after the views.
+        self._tables = list(tables or [])
         self._dv_keys = dv_keys
         self._cache = cache
         self._closed = False
@@ -675,6 +720,14 @@ class StreamHandle:
         for view in reversed(self._views):
             try:
                 self._con.execute(f"DROP VIEW IF EXISTS {view};")
+            except Exception:
+                pass
+        # Then the tables those views stood on.  DROP VIEW does not drop a
+        # table; left behind, each one kept its rows in the connection for
+        # as long as the process ran.
+        for table in reversed(self._tables):
+            try:
+                self._con.execute(f"DROP TABLE IF EXISTS {table};")
             except Exception:
                 pass
         for key in self._dv_keys:

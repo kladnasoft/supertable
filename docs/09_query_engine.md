@@ -99,6 +99,8 @@ The reflection projection includes `__rowid__` and `__timestamp__` when needed f
 
 View names are derived from the table, snapshot version, and projection; query-specific suffixes distinguish control views. On handle closure the engine closes the Arrow reader and cursor, drops query views, and releases deletion-vector cache references. The shared connection remains available for later queries.
 
+With `SUPERTABLE_DUCKDB_MATERIALIZE=table` the reflection is a table instead of a view: the rows are read into the connection when the query starts. That table is the query's own. Its name carries the query's suffix, two aliases of one table with the same columns share it, and handle closure drops it after the views that stand on it, so repeated and concurrent reads of a table neither meet an existing table nor lose one to another query's teardown.
+
 Deletion-vector tables are cached with a configured capacity and TTL, defaulting to 8 entries and 300 seconds. Referenced cache entries are released when the stream closes.
 
 ### File-access lock
@@ -177,7 +179,7 @@ Memory values accept positive numbers with units such as `MB`, `GB`, `MiB`, and 
 
 Initialization sets the default collation to `nocase`, disables insertion-order preservation where supported, and configures a spill directory under the application home. Add `ORDER BY` when output order matters.
 
-Remote S3, GCS and HTTP reads require DuckDB's `httpfs` extension. Missing local extensions cause a clear runtime error unless online installation is enabled. Storage paths resolve through storage URL helpers where available. Certain HTTP/authentication failures during reflection creation trigger one retry using presigned paths. Optional DuckDB settings are applied only where supported, so a dedicated external-cache cap depends on the installed DuckDB build.
+Remote S3, GCS and HTTP reads require DuckDB's `httpfs` extension. Missing local extensions cause a clear runtime error unless online installation is enabled. Storage paths resolve through storage URL helpers where available. Certain HTTP/authentication failures during reflection creation trigger one retry using presigned paths. The parts of a deletion vector take the same retry, whether the vector is read into its cached table or inline, and are signed without a first attempt when the query's data files already needed it; a vector that cannot be read either way fails the query, since a table read without it would bring its deleted rows back. For the retry a path is turned back into the key the storage signs: `s3://`, `gcs://`, `gs://`, `azure://` and `az://` paths give the key after the bucket or container (for GCS and Azure without the storage's base prefix, which `presign` adds again), and `http(s)://` paths the key after the configured bucket. Optional DuckDB settings are applied only where supported, so a dedicated external-cache cap depends on the installed DuckDB build.
 
 ## 5. Spark execution
 
