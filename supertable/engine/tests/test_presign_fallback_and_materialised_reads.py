@@ -16,7 +16,12 @@
    teardown dropped views only: the next read of the same table on the
    connection failed with "Table ... already exists".
 
-The first and third run on a real DuckDB. The first also needs DuckDB's httpfs
+4. **A storage prefix behind the presign fallback.** A storage with a base
+   prefix (``SUPERTABLE_PREFIX``) writes the prefix into the path it hands
+   DuckDB and adds it again when it signs. The fallback signed the path's key
+   as it stood, ``<prefix>/<prefix>/<key>``, an object that does not exist.
+
+The first, third and fourth run on a real DuckDB. The first also needs DuckDB's httpfs
 extension and reaches a store that is a local HTTP server in this process: it
 answers 403 to a request without a signature and serves the file to one with.
 """
@@ -28,6 +33,7 @@ import functools
 import http.server
 import io
 import os
+import shutil
 import socketserver
 import threading
 from pathlib import Path
@@ -103,9 +109,11 @@ def test_what_is_no_object_store_url_gives_no_key(url):
 class _Signer:
     """A storage that signs: it records the keys it was asked for."""
 
-    def __init__(self, base_prefix=""):
+    def __init__(self, base_prefix="", **names):
         self.base_prefix = base_prefix
         self.asked = []
+        for name, value in names.items():       # bucket_name / container_name
+            setattr(self, name, value)
 
     def presign(self, key):
         self.asked.append(key)
@@ -122,15 +130,39 @@ def test_a_gcs_or_azure_path_is_signed_instead_of_repeated(scheme, monkeypatch):
     assert storage.asked == [DATA_KEY]
 
 
-@pytest.mark.parametrize("scheme", ["gcs", "azure"])
-def test_the_storages_base_prefix_is_not_signed_twice(scheme, monkeypatch):
+PREFIX = "warehouse/prod"
+
+#: Every form a storage with the bucket ``lake-bucket`` and the base prefix
+#: ``warehouse/prod`` hands DuckDB for ``DATA_KEY``.
+PREFIXED_PATHS = {
+    "s3://": f"s3://lake-bucket/{PREFIX}/{DATA_KEY}",
+    "gcs://": f"gcs://lake-bucket/{PREFIX}/{DATA_KEY}",
+    "azure://": f"azure://lake-bucket/{PREFIX}/{DATA_KEY}",
+    "http, bucket in the path": f"http://minio:9000/lake-bucket/{PREFIX}/{DATA_KEY}",
+    "https, bucket in the host": f"https://lake-bucket.s3.eu-west-1.amazonaws.com/{PREFIX}/{DATA_KEY}",
+    "https, GCS": f"https://storage.googleapis.com/lake-bucket/{PREFIX}/{DATA_KEY}",
+    "https, Azure": f"https://account.blob.core.windows.net/lake-bucket/{PREFIX}/{DATA_KEY}",
+    "already signed": f"http://minio:9000/lake-bucket/{PREFIX}/{DATA_KEY}?X-Amz-Signature=old",
+}
+
+
+@pytest.mark.parametrize("form", sorted(PREFIXED_PATHS))
+def test_the_storages_base_prefix_is_not_signed_twice(form, monkeypatch):
     """``to_duckdb_path`` writes the base prefix into the path and ``presign``
     adds it again: the key that is signed is the one the path was made from."""
     _settings(monkeypatch)
-    storage = _Signer(base_prefix="warehouse/prod")
-    path = f"{scheme}://bucket/warehouse/prod/{DATA_KEY}"
-    ec.make_presigned_list(storage, [path])
+    storage = _Signer(base_prefix=PREFIX, bucket_name="lake-bucket")
+    assert ec.make_presigned_list(storage, [PREFIXED_PATHS[form]]) == [
+        f"https://signed.example/{DATA_KEY}?sig=ok"]
     assert storage.asked == [DATA_KEY]
+
+
+@pytest.mark.parametrize("form", sorted(PREFIXED_PATHS))
+def test_a_storage_without_a_prefix_signs_the_whole_key(form, monkeypatch):
+    _settings(monkeypatch)
+    storage = _Signer(bucket_name="lake-bucket")
+    ec.make_presigned_list(storage, [PREFIXED_PATHS[form]])
+    assert storage.asked == [f"{PREFIX}/{DATA_KEY}"]
 
 
 def test_a_key_outside_the_base_prefix_is_signed_as_it_is(monkeypatch):
@@ -140,37 +172,75 @@ def test_a_key_outside_the_base_prefix_is_signed_as_it_is(monkeypatch):
     assert storage.asked == [f"elsewhere/{DATA_KEY}"]
 
 
-def test_the_real_gcs_storage_signs_the_key_its_path_was_made_from(monkeypatch):
-    """The path ``GCSStorage`` hands DuckDB, taken back to ``GCSStorage.presign``."""
-    gcp_storage = pytest.importorskip("supertable.storage.gcp_storage")
-    _settings(monkeypatch, SUPERTABLE_DUCKDB_USE_HTTPFS=False)
-    monkeypatch.setattr(gcp_storage, "settings", ec.settings)
-    for base_prefix in ("", "warehouse/prod"):
-        storage = object.__new__(gcp_storage.GCSStorage)
+def test_a_prefix_is_taken_off_whole_segments_only(monkeypatch):
+    """``warehouse`` is no prefix of ``warehouse-archive/...``."""
+    _settings(monkeypatch)
+    storage = _Signer(base_prefix="warehouse")
+    ec.make_presigned_list(storage, [f"s3://bucket/warehouse-archive/{DATA_KEY}"])
+    assert storage.asked == [f"warehouse-archive/{DATA_KEY}"]
+
+
+@pytest.mark.parametrize("names", [{"bucket_name": "lake-bucket"},
+                                   {"container_name": "lake-bucket"}])
+def test_the_bucket_taken_off_an_http_path_is_the_storages_own(names, monkeypatch):
+    """``STORAGE_BUCKET`` is one of the places a storage takes its bucket
+    from: GCS reads ``GCS_BUCKET`` first, Azure falls back to
+    ``AZURE_CONTAINER``. The path holds the name the storage wrote."""
+    _settings(monkeypatch, STORAGE_BUCKET="supertable")
+    storage = _Signer(**names)
+    ec.make_presigned_list(storage, [f"https://storage.googleapis.com/lake-bucket/{DATA_KEY}"])
+    assert storage.asked == [DATA_KEY]
+
+
+def test_a_storage_that_names_no_bucket_falls_back_to_the_setting(monkeypatch):
+    _settings(monkeypatch, STORAGE_BUCKET="lake-bucket")
+    storage = _Signer()
+    ec.make_presigned_list(storage, [f"http://minio:9000/lake-bucket/{DATA_KEY}"])
+    assert storage.asked == [DATA_KEY]
+
+
+def _real_storage(kind):
+    """A real storage class with no client behind it: the paths it writes."""
+    if kind == "minio":
+        module = pytest.importorskip("supertable.storage.minio_storage")
+        storage = object.__new__(module.MinioStorage)
+        storage.bucket_name, storage.endpoint_url, storage.secure = (
+            "lake-bucket", "http://minio:9000", False)
+    elif kind in ("s3 path style", "s3 vhost style"):
+        module = pytest.importorskip("supertable.storage.s3_storage")
+        storage = object.__new__(module.S3Storage)
+        storage.bucket_name, storage.endpoint_url, storage.secure = (
+            "lake-bucket", "https://s3.eu-west-1.amazonaws.com", True)
+        storage.url_style = "path" if kind == "s3 path style" else "vhost"
+    elif kind == "gcs":
+        module = pytest.importorskip("supertable.storage.gcp_storage")
+        storage = object.__new__(module.GCSStorage)
         storage.bucket_name = "lake-bucket"
-        storage.base_prefix = base_prefix
-        asked = []
-        storage.presign = lambda key, asked=asked: asked.append(key) or f"https://signed/{key}"
-        path = storage.to_duckdb_path(DATA_KEY)
-        assert path.startswith("gcs://lake-bucket/")
-        assert ec.make_presigned_list(storage, [path]) == [f"https://signed/{DATA_KEY}"]
-        assert asked == [DATA_KEY]
-
-
-def test_the_real_azure_storage_signs_the_key_its_path_was_made_from(monkeypatch):
-    azure_storage = pytest.importorskip("supertable.storage.azure_storage")
-    _settings(monkeypatch, SUPERTABLE_DUCKDB_USE_HTTPFS=False)
-    monkeypatch.setattr(azure_storage, "settings", ec.settings)
-    for base_prefix in ("", "warehouse/prod"):
-        storage = object.__new__(azure_storage.AzureBlobStorage)
+    else:
+        module = pytest.importorskip("supertable.storage.azure_storage")
+        storage = object.__new__(module.AzureBlobStorage)
         storage.container_name = "lake"
-        storage.base_prefix = base_prefix
-        asked = []
-        storage.presign = lambda key, asked=asked: asked.append(key) or f"https://signed/{key}"
-        path = storage.to_duckdb_path(DATA_KEY)
-        assert path.startswith("azure://lake/")
-        assert ec.make_presigned_list(storage, [path]) == [f"https://signed/{DATA_KEY}"]
-        assert asked == [DATA_KEY]
+        storage.svc = SimpleNamespace(url="https://account.blob.core.windows.net/")
+    return storage
+
+
+@pytest.mark.parametrize("kind", ["minio", "s3 path style", "s3 vhost style", "gcs", "azure"])
+@pytest.mark.parametrize("prefer_httpfs", [False, True], ids=["store scheme", "http(s)"])
+@pytest.mark.parametrize("base_prefix", ["", PREFIX], ids=["no prefix", "prefix"])
+def test_every_real_storage_signs_the_key_its_path_was_made_from(
+        kind, prefer_httpfs, base_prefix, monkeypatch):
+    """The path each storage class hands DuckDB, taken back to its own
+    ``presign``: the key it is asked to sign is the key the path came from.
+    ``STORAGE_BUCKET`` is set to something else throughout."""
+    _settings(monkeypatch, STORAGE_BUCKET="some-other-bucket")
+    storage = _real_storage(kind)
+    storage.base_prefix = base_prefix
+    asked = []
+    storage.presign = lambda key: asked.append(key) or f"https://signed/{key}"
+    path = storage.to_duckdb_path(DATA_KEY, prefer_httpfs=prefer_httpfs)
+    assert DATA_KEY in path and (not base_prefix or base_prefix in path)
+    assert ec.make_presigned_list(storage, [path]) == [f"https://signed/{DATA_KEY}"]
+    assert asked == [DATA_KEY]
 
 
 # ==========================================================================
@@ -532,6 +602,52 @@ def test_without_a_storage_to_sign_with_the_read_fails_and_brings_no_row_back(la
         _rows(_stream(engine, lake, "SELECT id FROM emp", files=[DATA_KEY],
                       vector=[store.url(key) for key in VECTOR_KEYS],
                       cache_key=VECTOR_KEYS[0]))
+
+
+# --------------------------------------------------------------------------
+# 4. a storage prefix behind the fallback, on a real DuckDB
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def prefixed(lake, store):
+    """The same table under a storage's base prefix: the store holds
+    ``<prefix>/<key>``, the storage writes the prefix into every path, and
+    adds it to whatever key it is asked to sign."""
+    shutil.copytree(lake.home / "acme", lake.home / PREFIX / "acme")
+
+    class Storage:
+        base_prefix = PREFIX
+        bucket_name = "bucket"
+
+        def __init__(self):
+            self.asked = []
+
+        def to_duckdb_path(self, key):
+            return store.url(f"{self.base_prefix}/{key}")
+
+        def presign(self, key):
+            self.asked.append(key)
+            return store.url(f"{self.base_prefix}/{key}") + "?sig=ok"
+
+    return Storage()
+
+
+@pytest.mark.parametrize("cached", [True, False], ids=["cached vector", "inline vector"])
+def test_a_table_under_a_storage_prefix_is_read_behind_the_fallback(
+        lake, store, prefixed, cached):
+    engine = engine_duckdb.DuckDBEngine(storage=prefixed)
+    handle = _stream(
+        engine, lake, "SELECT id, region FROM emp ORDER BY id",
+        files=[prefixed.to_duckdb_path(DATA_KEY)],
+        vector=[prefixed.to_duckdb_path(key) for key in VECTOR_KEYS],
+        cache_key=f"{PREFIX}/{VECTOR_KEYS[0]}" if cached else None)
+    assert _rows(handle) == [{"id": 1, "region": "eu"}]
+    # signed by the keys the paths were made from, each once
+    assert prefixed.asked == [DATA_KEY, *VECTOR_KEYS]
+    assert store.signed(f"{PREFIX}/{DATA_KEY}")
+    assert all(store.signed(f"{PREFIX}/{key}") for key in VECTOR_KEYS)
+    # and nothing was asked of the store under the prefix written twice
+    assert not [key for key, _ in store.seen if key.startswith(f"{PREFIX}/{PREFIX}/")]
 
 
 # --------------------------------------------------------------------------

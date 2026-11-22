@@ -478,11 +478,6 @@ def configure_httpfs_and_s3(
 #: other spellings DuckDB reads the same stores by.
 _BUCKET_SCHEMES = ("s3", "gcs", "gs", "azure", "az")
 
-#: Of those, the stores whose ``to_duckdb_path`` puts the storage's base
-#: prefix into the path and whose ``presign`` adds it again: the key handed
-#: to ``presign`` has to be the one ``to_duckdb_path`` was given.
-_BASE_PREFIXED_SCHEMES = ("gcs", "gs", "azure", "az")
-
 
 def url_to_key(url: str, bucket: Optional[str]) -> Optional[str]:
     """Extract the object key from an object-store or HTTP URL."""
@@ -511,41 +506,56 @@ def url_to_key(url: str, bucket: Optional[str]) -> Optional[str]:
     return None
 
 
-def _key_as_storage_takes_it(storage, url: str, key: str) -> str:
-    """*key* without the storage's base prefix, for a store that adds it.
+def _storage_bucket(storage) -> Optional[str]:
+    """The bucket or container *storage* reads, as the storage itself names it.
 
-    ``GCSStorage`` and ``AzureBlobStorage`` write ``<base prefix>/<key>`` into
-    the path they hand DuckDB and prepend the same prefix in ``presign``. A
-    path mapped back to a key therefore still carries the prefix, and signing
-    it as it is would sign ``<prefix>/<prefix>/<key>``, an object that does
-    not exist.
+    The setting ``STORAGE_BUCKET`` is only one of the places a storage takes
+    its bucket from: GCS reads ``GCS_BUCKET`` first and Azure falls back to
+    ``AZURE_CONTAINER``. An ``http(s)://`` path carries the bucket the storage
+    wrote into it, so that is the name to take off again.
     """
-    try:
-        scheme = urlparse(url).scheme
-    except Exception:
-        return key
-    if scheme not in _BASE_PREFIXED_SCHEMES:
-        return key
-    base = str(getattr(storage, "base_prefix", "") or "").strip("/")
+    for attr in ("bucket_name", "container_name"):
+        value = getattr(storage, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return detect_bucket()
+
+
+def _key_as_storage_takes_it(storage, key: str) -> str:
+    """*key* without the storage's base prefix.
+
+    Every storage with a base prefix (``SUPERTABLE_PREFIX``) writes
+    ``<prefix>/<key>`` into the path it hands DuckDB (``to_duckdb_path``) and
+    prepends the same prefix in ``presign``. A path mapped back to a key
+    therefore still carries the prefix, and signing it as it is signs
+    ``<prefix>/<prefix>/<key>``: an object that does not exist, so the read
+    the fallback was meant to save failed with the store's 404.
+    """
+    base = getattr(storage, "base_prefix", "")
+    base = base.strip("/") if isinstance(base, str) else ""
     if base and key.startswith(base + "/"):
         return key[len(base) + 1:]
     return key
 
 
 def make_presigned_list(storage, paths: List[str]) -> List[str]:
-    """Attempt to presign each path; fall back to original on failure."""
+    """Attempt to presign each path; fall back to original on failure.
+
+    A path is turned back into the key the storage was given when it made the
+    path: after the bucket, and without the storage's base prefix.
+    """
     presign_fn = getattr(storage, "presign", None) if storage is not None else None
     if not callable(presign_fn):
         return paths
 
-    bucket = detect_bucket()
+    bucket = _storage_bucket(storage)
     out: List[str] = []
 
     for p in paths:
         key = url_to_key(p, bucket)
         if key:
             try:
-                out.append(presign_fn(_key_as_storage_takes_it(storage, p, key)))
+                out.append(presign_fn(_key_as_storage_takes_it(storage, key)))
             except Exception as e:
                 out.append(p)
                 logger.warning(f"[presign] failed for '{p}': {e}")
