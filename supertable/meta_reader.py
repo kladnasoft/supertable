@@ -53,10 +53,16 @@ def _prune_dict(d: Dict[str, Any], keys_to_remove: Set[str]) -> Dict[str, Any]:
 def _get_redis_items(pattern) -> List[str]:
     """
     Get all tables for this super table by scanning Redis keys.
+
+    Each key is returned once.  SCAN may return a key a second time when the
+    keyspace is resized between two calls of one iteration, and
+    ``list_supers`` / ``list_tables`` name one lake or table per key: a
+    repeated key was a lake or a table listed twice.
     """
     catalog = RedisCatalog()
     try:
         items = []
+        seen = set()
         cursor = 0
         while True:
             cursor, keys = catalog.r.scan(cursor=cursor, match=pattern, count=1000)
@@ -67,6 +73,9 @@ def _get_redis_items(pattern) -> List[str]:
                 else:
                     key_str = str(key)
 
+                if key_str in seen:
+                    continue
+                seen.add(key_str)
                 items.append(key_str)
             if cursor == 0:
                 break

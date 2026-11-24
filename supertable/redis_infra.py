@@ -149,12 +149,19 @@ class _FallbackCatalog:
         return self.set_mirrors(org, sup, nxt)
 
     def scan_leaf_keys(self, org: str, sup: str, count: int = 1000) -> Iterator[str]:
+        # Each key once: SCAN may return a key a second time when the keyspace
+        # is resized between two calls (see RedisCatalog.scan_leaf_keys).
         pattern = RK.meta_leaf_pattern(org, sup)
         cursor = 0
+        seen = set()
         while True:
             cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=max(1, int(count)))
             for k in keys:
-                yield k if isinstance(k, str) else k.decode("utf-8")
+                ks = k if isinstance(k, str) else k.decode("utf-8")
+                if ks in seen:
+                    continue
+                seen.add(ks)
+                yield ks
             if cursor == 0:
                 break
 

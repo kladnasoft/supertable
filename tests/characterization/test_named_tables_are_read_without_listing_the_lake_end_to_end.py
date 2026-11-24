@@ -12,6 +12,11 @@ RBAC and DuckDB, twice: as the code now runs, and with the named fetch switched
 off, which is the path every read took before. The rows must be the same rows,
 through a deletion vector, a restricted role, a join, another lake and a
 replica lake; and the named reads must not have scanned for leaves at all.
+
+Listing had a fault of its own, which is shown here on the same tables: SCAN
+may return a key twice, the listing passed it on, and a read that listed its
+lake then read that table twice. The listing now names each leaf once
+(``supertable/tests/test_listings_yield_each_key_once.py``).
 """
 
 from __future__ import annotations
@@ -286,30 +291,57 @@ def test_a_read_sends_redis_fewer_commands_than_it_did(
     assert by_name == without_scans
 
 
-def test_a_listing_that_repeats_a_table_does_not_double_a_named_read(
-        lakes, list_the_lake, monkeypatch):
-    """SCAN may hand an element back more than once while the database is
-    being resized, and the listing passes that on. A read that took every
-    listed leaf for a snapshot then read the table's files twice, and said OK.
-    A table fetched by name is fetched once, whatever a listing would return.
+@pytest.fixture
+def scan_repeats(hermetic_fakeredis, monkeypatch):
+    """Have SCAN return every key twice, as Redis may while the database is
+    being resized between two calls of one iteration. Returns the patterns
+    scanned for, so a test can tell that a listing really ran."""
+    patterns = []
+    real_scan = hermetic_fakeredis.scan
+
+    def scan(*args, **kwargs):
+        cursor, keys = real_scan(*args, **kwargs)
+        patterns.append(str(kwargs.get("match")))
+        return cursor, list(keys) + list(keys)
+
+    monkeypatch.setattr(hermetic_fakeredis, "scan", scan)
+    return patterns
+
+
+def test_a_table_scan_returns_twice_is_read_once(lakes, list_the_lake, scan_repeats):
+    """A read that took every listed leaf for a snapshot read a table listed
+    twice twice: this count came back 8 and this sum doubled, with
+    ``Status.OK``. A table fetched by name is not listed at all, and the
+    listing now names each leaf once for the reads that still use it.
     """
-    real = RedisCatalog.scan_leaf_keys
-
-    def repeating(self, org, sup, count=1000):
-        for key in real(self, org, sup, count=count):
-            yield key
-            yield key
-
-    monkeypatch.setattr(RedisCatalog, "scan_leaf_keys", repeating)
     sql = "SELECT COUNT(*) AS n, SUM(salary) AS total FROM emp"
     total = 40_000 + 910_000 + 55_000 + 61_000
 
     assert _read(lakes.main, sql) == (Status.OK, None, [{"n": 4, "total": total}])
+    assert not [p for p in scan_repeats if p.endswith(LEAF_PATTERN_END)]
 
-    # What the same listing does to a read that still lists: the hazard the
-    # named fetch takes every ordinary read out of.
     list_the_lake.arm()
-    assert _read(lakes.main, sql) == (Status.OK, None, [{"n": 8, "total": 2 * total}])
+    assert _read(lakes.main, sql) == (Status.OK, None, [{"n": 4, "total": total}])
+    assert [p for p in scan_repeats if p.endswith(LEAF_PATTERN_END)], \
+        "the lake was not listed; the second read proves nothing"
+
+
+def test_a_table_scan_returns_twice_is_listed_once(lakes, scan_repeats):
+    """The same for what a caller is shown: each lake and each table once."""
+    from supertable.meta_reader import list_supers, list_tables
+
+    tables = list_tables(ORG, lakes.main, role_name=ADMIN)
+    assert sorted(set(tables)) == tables
+    assert {"emp", "dept", "filler_00", "filler_11"} <= set(tables)
+
+    lakes_listed = list_supers(ORG, role_name=ADMIN)
+    assert lakes_listed.count(lakes.main) == 1
+    assert lakes_listed.count(lakes.other) == 1
+    assert sorted(set(lakes_listed)) == lakes_listed
+
+    leaves = list(RedisCatalog().scan_leaf_items(ORG, lakes.main))
+    assert len(leaves) == len({leaf["simple"] for leaf in leaves}) == len(tables)
+    assert scan_repeats, "nothing was scanned; the test proves nothing"
 
 
 def test_a_table_written_after_a_read_is_found_by_name(lakes):

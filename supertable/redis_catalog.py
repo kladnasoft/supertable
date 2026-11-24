@@ -649,15 +649,23 @@ return generation
             raise
 
     def find_readonly_clones(self, org: str, source_sup: str) -> List[str]:
-        """Return names of supertables that are read-only clones of *source_sup*."""
+        """Return names of supertables that are read-only clones of *source_sup*.
+
+        Each clone is named once: SCAN may return a root twice (see
+        :meth:`scan_leaf_keys`), and a repeated root is skipped.
+        """
         clones: List[str] = []
         pattern = RK.meta_root_pattern_for_org(org)
         cursor = 0
+        seen: Set[str] = set()
         try:
             while True:
                 cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=500)
                 for k in keys:
                     ks = k if isinstance(k, str) else k.decode("utf-8")
+                    if ks in seen:
+                        continue
+                    seen.add(ks)
                     parsed = RK.parse_lake_key(ks)
                     if parsed is None:
                         continue
@@ -1456,18 +1464,31 @@ return generation
     # ------------- Listings via SCAN -------------
 
     def scan_leaf_keys(self, org: str, sup: str, count: int = 1000) -> Iterator[str]:
-        """Yields full Redis keys: supertable:{org}:lakes:{sup}:meta:leaf:doc:* (replica-aware)."""
+        """Yields full Redis keys: supertable:{org}:lakes:{sup}:meta:leaf:doc:* (replica-aware).
+
+        Each key is yielded once.  SCAN promises that a full iteration returns
+        every key that was there throughout, not that it returns each of them
+        once: a key can come back a second time when the keyspace is resized
+        between two calls of one iteration.  Passed on, that was a table
+        listed twice, and a reader that took every listed leaf for a snapshot
+        (``DataEstimator`` did, on every read) scanned the table's files
+        twice and returned each row doubled, with nothing to show for it.
+        """
         info = self._resolve_replica_info(org, sup)
         effective_sup = info[0] if info else sup
         allowed = info[1] if info else None
 
         pattern = RK.meta_leaf_pattern(org, effective_sup)
         cursor = 0
+        seen: Set[str] = set()
         try:
             while True:
                 cursor, keys = self.r.scan(cursor=cursor, match=pattern, count=max(1, int(count)))
                 for k in keys:
                     ks = k if isinstance(k, str) else k.decode('utf-8')
+                    if ks in seen:
+                        continue
+                    seen.add(ks)
                     if allowed:
                         simple = ks.rsplit("meta:leaf:doc:", 1)[-1]
                         if simple not in allowed:
