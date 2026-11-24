@@ -521,6 +521,7 @@ def compact_resources(
         small_only: bool = True,
         dead_rowids: Optional[Set[int]] = None,
         profiler: Optional[Profiler] = None,
+        footer_md_out: Optional[Dict] = None,
 ) -> Tuple[int, int, List[Dict], Set[str]]:
     """Compact small parquet files in a snapshot's resources list.
 
@@ -553,6 +554,12 @@ def compact_resources(
             ``files_written``/``bytes_written`` counters and ``io.*`` spans, so
             the auto-compaction I/O is attributable per write (the write path
             passes the live profiler; ``None`` -> no instrumentation).
+        footer_md_out: optional dict the footer of every file written here is
+            put into, keyed by the file's path: the parquet ``FileMetaData``
+            parsed from the very bytes that were uploaded.  The caller reads
+            statistics and schema of the new files from it and does not fetch
+            them back from storage (``extract_stats_rows``'s
+            ``footer_md_cache``).  ``None`` -> nothing is kept.
 
     Returns:
         A 4-tuple ``(considered, total_rows, new_resources, sunset_files)``:
@@ -684,6 +691,7 @@ def compact_resources(
                     new_resources=new_resources,
                     compression_level=compression_level,
                     profiler=p,
+                    footer_md_out=footer_md_out,
                 )
                 chunk_df = None
             chunk_frames = []
@@ -700,6 +708,7 @@ def compact_resources(
             new_resources=new_resources,
             compression_level=compression_level,
             profiler=p,
+            footer_md_out=footer_md_out,
         )
 
     return len(sunset_files), total_rows, new_resources, sunset_files
@@ -3415,6 +3424,7 @@ def compact_tombstones(
         compression_level: int,
         table_config: Optional[dict] = None,
         profiler: Optional[Profiler] = None,
+        footer_md_out: Optional[Dict] = None,
 ) -> Tuple[int, List[Dict], Set[str]]:
     """Physically drop tombstoned rows from the data files that hold them.
 
@@ -3426,6 +3436,10 @@ def compact_tombstones(
 
     After this call the caller clears the tombstone pointer: the dead rows no
     longer exist on disk, so the deletion-vector is fully consumed.
+
+    *footer_md_out* (optional) takes the footer of every file written here,
+    keyed by path, as ``compact_resources`` documents: the caller then needs
+    no read of a new file to know its statistics or its schema.
 
     Returns ``(removed_rows, new_resources, sunset_files)``.
     """
@@ -3509,6 +3523,7 @@ def compact_tombstones(
                     new_resources=new_resources,
                     compression_level=compression_level,
                     profiler=p,
+                    footer_md_out=footer_md_out,
                 )
 
     return removed, new_resources, sunset_files

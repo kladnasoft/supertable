@@ -155,6 +155,8 @@ The small-file cutoff is `max(1, int(max_memory_chunk_size * 0.75))`. Automatic 
 
 Compaction reads and rewrites selected live rows, preserves row IDs, unions frame schemas, and removes replaced resources from the next snapshot. Grouping uses stored file sizes, so the memory setting is not a hard limit on decoded memory consumption. Small-file reads can be skipped by the helper on missing/unreadable files; source data is not universally validated as part of compaction.
 
+Neither an explicit `compact()` nor a write that compacts on its way reads back the files it writes. The footer of each new file is parsed from the bytes as they are uploaded (`footer_md_out` on `compact_tombstones` and `compact_resources`; a write puts them beside the footer of its incoming file), and the stats artifact and the new snapshot's schema are derived from those footers. A file whose footer was not kept is read from storage for them, as before.
+
 ## Per-table settings
 
 ```python

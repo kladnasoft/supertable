@@ -153,6 +153,11 @@ class DataEstimator:
         # Lazily-built key→path resolver; see _to_duckdb_path.
         self._resolve_plan = None
         self.catalog = RedisCatalog()
+        # (super_name, simple_name) -> the snapshot ``estimate`` took that
+        # table's file list from.  The reader takes the deletion vector and the
+        # share row filter from here, so one read is one snapshot; see
+        # ``estimate`` for why a second catalog read cannot be used for them.
+        self.resolved_snapshots: Dict[Tuple[str, str], Dict] = {}
 
     def _schema_to_dict(self, schema_obj) -> Dict[str, str]:
         """Normalize schema representations into a {name: type} dict."""
@@ -681,6 +686,9 @@ class DataEstimator:
         prune_profiler = Profiler()
 
         supers: List[SuperSnapshot] = []
+        # Filled below, per table; emptied first so a second estimate() on this
+        # object cannot hand out the snapshots of the first.
+        self.resolved_snapshots = {}
         reflection_file_size = 0        # projected (selected-column) bytes — routing
         reflection_file_size_raw = 0    # whole-file bytes — physical footprint
         max_freshness_ms = 0
@@ -814,6 +822,29 @@ class DataEstimator:
                                                    # given a typed empty relation; see all_have_files below.
                                                    column_types=dict(schema_types))
                     supers.append(super_snapshot)
+
+                    # Keep the snapshot these files were listed from, for the
+                    # reader.  The deletion vector and a share row filter live
+                    # in the same snapshot as the file list and only mean
+                    # anything together with it: a compaction clears the vector
+                    # as it rewrites the files, and an upsert grows the vector
+                    # as it adds one.  The reader used to fetch the leaf a
+                    # second time for them, so a commit between the two reads
+                    # paired these files with the next snapshot's vector, and
+                    # every row deleted so far came back (or a row just
+                    # upserted went missing) for that one read.
+                    #
+                    # Only when the files came from exactly one snapshot, and
+                    # it is this table's own.  The legacy "table named like its
+                    # SuperTable" branch of ``_filter_snapshots`` lists the
+                    # files of OTHER tables under this name, one or many; no
+                    # snapshot of this table describes that, and the reader
+                    # keeps its own lookup for it.
+                    if (len(snapshots) == 1
+                            and isinstance(current_snapshot_data, dict)
+                            and str(snapshots[0].get("table_name", "")).lower()
+                            == simple_name.lower()):
+                        self.resolved_snapshots[(super_name, simple_name)] = current_snapshot_data
 
         # Validate requested columns
         missing_info = get_missing_columns(self.tables, supers)

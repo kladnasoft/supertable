@@ -11,6 +11,12 @@ Both sites used to catch Exception and log at DEBUG, so a single Redis hiccup
 served resurrected or unfiltered rows under Status.OK with no visible signal.
 ``odata/policy.py`` calls the share-filter case "the one direction this must
 never fail in" — the fingerprint obeyed that; the enforcement did not.
+
+The reader takes both controls from the snapshot the estimator listed the
+table's files from, and keeps the leaf lookup for an alias the estimator kept
+no snapshot for. The failing lookup is therefore injected on
+that remaining path (``_the_reader_has_to_ask_the_catalog``); on the ordinary
+path there is no second lookup left to fail, which has a test of its own.
 """
 
 from __future__ import annotations
@@ -60,10 +66,59 @@ def _read(sql="SELECT count(*) AS n FROM facts"):
         role_name=D.ROLE, with_scan=False, engine=engine.AUTO)
 
 
+def _the_reader_has_to_ask_the_catalog():
+    """Leave the reader nothing but its own leaf lookup to take the controls from.
+
+    The reader takes the deletion vector and the share filter from the snapshot
+    the estimator listed the table's files from, and asks the catalog only for
+    an alias the estimator kept no snapshot for. That lookup is the handler
+    under test here, so the estimator is made to keep none.
+    """
+    from supertable.engine.data_estimator import DataEstimator
+
+    real_estimate = DataEstimator.estimate
+
+    def estimate(self):
+        reflection = real_estimate(self)
+        self.resolved_snapshots = {}
+        return reflection
+
+    return patch.object(DataEstimator, "estimate", estimate)
+
+
 def test_healthy_read_still_works():
     """The control: nothing here should make an ordinary read fail."""
     _df, status, msg = _read()
     assert str(status).endswith("OK"), msg
+
+
+def test_healthy_read_still_works_when_the_reader_has_to_ask_the_catalog():
+    """The second control: the lookup the tests below break works when whole."""
+    expected, status, msg = _read()
+    assert str(status).endswith("OK"), msg
+    with _the_reader_has_to_ask_the_catalog():
+        df, status, msg = _read()
+    assert str(status).endswith("OK"), msg
+    assert df.equals(expected)
+
+
+def test_a_leaf_the_estimator_has_read_is_not_asked_for_again():
+    """One read is one snapshot. The controls come with the file list, so a
+    catalog that stops answering once the files are listed takes nothing away
+    from the read: it returns what the healthy read returns, controls applied.
+
+    This used to be the failure the tests below inject. The second lookup is
+    gone from this path because it could also SUCCEED with a newer snapshot,
+    and give this read's files the next snapshot's deletion vector.
+    """
+    expected, status, msg = _read()
+    assert str(status).endswith("OK"), msg
+
+    with patch(f"{_MOD}.RedisCatalog", return_value=_LeafFails()):
+        df, status, message = _read()
+
+    assert str(status).endswith("OK"), message
+    assert df.equals(expected)
 
 
 def test_unreadable_leaf_fails_the_read_rather_than_resurrecting_rows():
@@ -73,7 +128,8 @@ def test_unreadable_leaf_fails_the_read_rather_than_resurrecting_rows():
     # execute() reports every failure as Status.ERROR rather than raising, so
     # what matters is that NO ROWS come back and the reason is legible — not
     # which mechanism carries it.
-    with patch(f"{_MOD}.RedisCatalog", return_value=_LeafFails()):
+    with _the_reader_has_to_ask_the_catalog(), \
+            patch(f"{_MOD}.RedisCatalog", return_value=_LeafFails()):
         df, status, message = _read()
 
     assert str(status).endswith("ERROR"), "a read without its control returned OK"
@@ -87,7 +143,8 @@ def test_the_stream_path_also_refuses():
     """
     from supertable.data_reader import DataReader
 
-    with patch(f"{_MOD}.RedisCatalog", return_value=_LeafFails()):
+    with _the_reader_has_to_ask_the_catalog(), \
+            patch(f"{_MOD}.RedisCatalog", return_value=_LeafFails()):
         with pytest.raises(RuntimeError, match="deletion vector"):
             DataReader(super_name=D.SUPER, organization=D.ORG,
                        query="SELECT count(*) AS n FROM facts", source="sdk"
@@ -99,7 +156,8 @@ def test_the_error_names_the_table_it_could_not_protect():
     failed' — the answer decides whether one tenant or all of them are down."""
     from supertable.data_reader import DeletionVectorUnavailable
 
-    with patch(f"{_MOD}.RedisCatalog", return_value=_LeafFails()):
+    with _the_reader_has_to_ask_the_catalog(), \
+            patch(f"{_MOD}.RedisCatalog", return_value=_LeafFails()):
         _df, _status, message = _read()
     assert "facts" in str(message)
 

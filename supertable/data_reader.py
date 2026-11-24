@@ -27,7 +27,7 @@ from supertable.engine.executor import Executor
 from supertable.engine.engine_enum import Engine as engine
 from supertable.data_classes import TombstoneDef, RbacViewDef
 from supertable.redis_catalog import RedisCatalog
-from supertable.system_query import classify_query, CommandKind
+from supertable.system_query import classify_query, CommandKind, admit_row_predicate
 
 
 class Status(Enum):
@@ -494,15 +494,34 @@ class DataReader:
             # inline payload alone silently skipped it. See the method.
             try:
                 catalog = RedisCatalog()
+                # ONE snapshot per read.  The estimator listed each table's
+                # files from a snapshot it read above; the deletion vector and
+                # the share row filter belong to that same snapshot and are
+                # taken from it, not from the catalog as it stands by now.  A
+                # compaction that commits in between clears the vector while it
+                # rewrites the files, so the files of the older snapshot read
+                # with the newer one's (empty) vector bring back every row
+                # deleted so far; an upsert in between grows the vector and
+                # makes the rows it replaced vanish from a read that does not
+                # have the new file yet.
+                pinned = getattr(estimator, "resolved_snapshots", None)
+                if not isinstance(pinned, dict):
+                    pinned = {}
                 for td in tables:
                     # Tombstone filtering: read the deletion-vector pointer from
                     # the table's resolved snapshot.  When present, the executor
                     # anti-joins the data on __rowid__ against it.
                     payload = None
                     try:
-                        payload = self._resolve_snapshot(
-                            catalog, td.super_name, td.simple_name,
-                        )
+                        payload = pinned.get((td.super_name, td.simple_name))
+                        if not isinstance(payload, dict):
+                            # Nothing pinned: an alias the estimator resolved
+                            # no single snapshot for (a CTE name, the legacy
+                            # merged-table branch).  The catalog is asked, as
+                            # it always was.
+                            payload = self._resolve_snapshot(
+                                catalog, td.super_name, td.simple_name,
+                            )
                         if isinstance(payload, dict):
                             tomb_path = payload.get("tombstone")
                             if tomb_path:
@@ -547,7 +566,17 @@ class DataReader:
                     try:
                         if isinstance(payload, dict):
                             share_row_filter = payload.get("_row_filter")
-                            if share_row_filter and isinstance(share_row_filter, str):
+                            # ``None`` and ``""`` are how a share says it has
+                            # no filter.  Anything else IS a filter and has to
+                            # be one the reader can stand behind: a value that
+                            # is not text (a dict, a list) used to be skipped,
+                            # which served the whole table, and text went into
+                            # the view's WHERE unread, where a second statement
+                            # or a closing parenthesis did what it said.  It is
+                            # admitted first, and what cannot be admitted fails
+                            # the read through the handler below.
+                            if share_row_filter is not None and share_row_filter != "":
+                                share_row_filter = admit_row_predicate(share_row_filter)
                                 existing_rbac = reflection.rbac_views.get(td.alias)
                                 if existing_rbac:
                                     # Merge: AND the share filter with existing RBAC filter
@@ -571,6 +600,11 @@ class DataReader:
                             f"cannot establish the share row filter for "
                             f"{td.super_name}.{td.simple_name}: {rf_err}"
                         ) from rf_err
+
+                # The snapshots have given what they hold.  They are let go
+                # before the query runs rather than kept until it returns: the
+                # snapshot of a table with many files is itself large.
+                pinned.clear()
 
             except ReadAccessUnavailable:
                 # A control could not be established. The two handlers inside

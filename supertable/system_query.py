@@ -27,6 +27,8 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError
 
+import functools
+import json
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -409,6 +411,246 @@ def _judge(root: exp.Expression) -> None:
                 f"{type(node).__name__.upper()} is not permitted on the read "
                 f"path; only SELECT queries are"
             )
+
+
+# ---------------------------------------------------------------------------
+# Row predicates that are not the caller's SQL
+# ---------------------------------------------------------------------------
+
+#: Stands in for the table a row predicate is judged against, and names the
+#: call its text is handed to DuckDB's parser in.  Neither exists anywhere.
+_ROW_PREDICATE_NAME = "__st_row_predicate__"
+_ROW_PREDICATE_SELECT = f"SELECT 1 FROM {_ROW_PREDICATE_NAME} WHERE "
+
+_NOT_ONE_EXPRESSION = "the row predicate is not a single SQL expression"
+_READS_ELSEWHERE = (
+    "a row predicate may read the row it filters and nothing else; "
+    "subqueries are not permitted in one"
+)
+
+
+def admit_row_predicate(predicate: Any) -> str:
+    """Admit a row predicate that reaches a view as text, and return it.
+
+    WHY THIS EXISTS
+
+    A linked share carries a row filter (``_row_filter``) on its snapshot, and
+    the reader writes that text into the ``WHERE`` of the view every row of the
+    share is read through. It is SQL that nobody submitted to the read gate:
+    :func:`assert_read_only` judges the caller's statement, and the rewrite
+    that refuses an unknown table only ever sees the caller's statement too.
+    Written into the view as it came, the text was held to no rule at all:
+
+      * ``1=1; CREATE TABLE x AS SELECT ...`` ran its second statement on the
+        reader's connection;
+      * ``1=1) OR (1=1`` closed the parenthesis it was merged in and undid the
+        role's own row filter beside it;
+      * ``id IN (SELECT ... FROM <another view on the connection>)`` read a
+        relation no role of the caller was checked for.
+
+    WHAT IS ADMITTED
+
+    One expression over the row being filtered: columns, literals, operators
+    and scalar functions. Nothing that reads another relation, so no subquery
+    in any form, and no function the read gate refuses a caller
+    (:func:`_refuse_function`). A predicate that needs anything else was never
+    going to work: the tables it could name are not on the reader's connection.
+
+    WHAT IS JUDGED IS WHAT RUNS, FOR BOTH ENGINES
+
+    The text is returned UNCHANGED, so a predicate that is admitted means
+    exactly what it meant before this check existed. Writing SQLGlot's reading
+    back out instead would have been the obvious way to make "judged" and
+    "run" the same thing, and it is what the caller's statement gets, but it
+    changes what some predicates mean: DuckDB's ``name ~ 'x'`` matches the
+    whole string and comes back out as ``REGEXP_MATCHES``, which matches any
+    part of it. A row filter that quietly lets more rows through is the fault
+    this check is here to prevent.
+
+    So each engine's own reading is judged instead:
+
+      * DuckDB runs the text as it is, and DuckDB's parser is asked how it
+        reads it (:func:`_judge_row_predicate_as_duckdb_reads_it`).
+      * Spark runs SQLGlot's writing of it (``_to_spark_predicate``), and
+        SQLGlot's reading is judged
+        (:func:`_judge_row_predicate_as_sqlglot_reads_it`).
+
+    Both have to admit it. A predicate only one of them can read is refused;
+    which engine a read runs on is not known here.
+
+    Raises ``ValueError``. The message never quotes the predicate: it is the
+    provider's policy, and whoever is refused the read is not its author.
+    Admitted text is remembered, so a share's predicate is parsed once per
+    process and not once per read.
+    """
+    if not isinstance(predicate, str) or not predicate.strip():
+        raise ValueError("a row predicate has to be a non-empty SQL expression")
+    return _admit_row_predicate(predicate)
+
+
+@functools.lru_cache(maxsize=1024)
+def _admit_row_predicate(text: str) -> str:
+    # Only a predicate that was admitted is remembered: lru_cache keeps no
+    # entry for a call that raised, so a refused one is judged again each time.
+    _judge_row_predicate_as_sqlglot_reads_it(text)
+    _judge_row_predicate_as_duckdb_reads_it(text)
+    return text
+
+
+def _judge_row_predicate_as_sqlglot_reads_it(text: str) -> None:
+    """Hold SQLGlot's reading of *text* to the rules of a row predicate.
+
+    The text is read as the ``WHERE`` of a statement that has nothing else.
+    If what SQLGlot writes back is that statement and its condition, the text
+    was a condition and only that: a second statement, a set operation or a
+    clause after it (``GROUP BY``, ``ORDER BY``, ``LIMIT``, ``QUALIFY``) each
+    leave something more to write.
+    """
+    try:
+        _normalized, statements = normalize_and_parse(_ROW_PREDICATE_SELECT + text)
+    except Exception:
+        # Not chained: the parser's message quotes the text.
+        raise ValueError(
+            "the row predicate is not a SQL expression the read path can parse"
+        ) from None
+
+    if len(statements) != 1 or type(statements[0]) is not exp.Select:
+        raise ValueError(_NOT_ONE_EXPRESSION)
+    root = statements[0]
+
+    # The gate's own walk: table functions, LATERAL, the functions that read
+    # the engine's state, files or the JVM. It clears comments on the way.
+    _judge(root)
+
+    where = root.args.get("where")
+    condition = where.this if where is not None else None
+    if condition is None:
+        raise ValueError(_NOT_ONE_EXPRESSION)
+    written = root.sql(dialect="duckdb", comments=False)
+    if written != _ROW_PREDICATE_SELECT + condition.sql(dialect="duckdb", comments=False):
+        raise ValueError(_NOT_ONE_EXPRESSION)
+
+    for node in condition.walk():
+        if isinstance(node, (exp.Query, exp.Subquery, exp.Table, exp.Lateral)):
+            raise ValueError(_READS_ELSEWHERE)
+
+
+def _judge_row_predicate_as_duckdb_reads_it(text: str) -> None:
+    """Hold DuckDB's own reading of *text* to the rules of a row predicate.
+
+    DuckDB is the engine that runs the text as it is, so it is DuckDB's parser
+    that has to say the text is one expression. It is handed the text as the
+    single argument of a call, ``__st_row_predicate__(<text>)``, and its parse
+    tree is compared with the tree of the same call around ``TRUE``: the two
+    may differ in that one argument and nowhere else. Text that closes the
+    call, adds an argument, a clause or a statement leaves a different tree,
+    or none.
+
+    Nothing is run. ``json_serialize_sql`` parses; the statement is its
+    parameter, on a connection of its own that holds no table and no secret.
+    """
+    try:
+        import duckdb
+
+        con = duckdb.connect()
+        try:
+            try:
+                # A missing extension is an error here, never a download.
+                con.execute("SET autoinstall_known_extensions=false;")
+            except Exception:
+                pass
+            baseline = _duckdb_reading(
+                con, f"SELECT 1 WHERE {_ROW_PREDICATE_NAME}(TRUE)")
+            candidate = _duckdb_reading(
+                con, f"SELECT 1 WHERE {_ROW_PREDICATE_NAME}({text})")
+        finally:
+            con.close()
+    except ValueError:
+        raise
+    except Exception as e:
+        # Not chained, for the reason given above; the class says enough.
+        raise ValueError(
+            "DuckDB could not be asked how it reads the row predicate "
+            f"({type(e).__name__})"
+        ) from None
+
+    call = _row_predicate_call(candidate)
+    arguments = call.get("children")
+    if not isinstance(arguments, list) or len(arguments) != 1:
+        raise ValueError(_NOT_ONE_EXPRESSION)
+    argument = arguments[0]
+
+    # Everything but the argument has to be what the bare call parses to.
+    call["children"] = _row_predicate_call(baseline)["children"]
+    if candidate != baseline:
+        raise ValueError(_NOT_ONE_EXPRESSION)
+
+    pending = [argument]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            if item.get("class") == "SUBQUERY" or "subquery" in item:
+                if not _selects_from_nothing(item.get("subquery")):
+                    raise ValueError(_READS_ELSEWHERE)
+            name = item.get("function_name")
+            if isinstance(name, str) and name:
+                _refuse_function(name.casefold())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+
+
+def _selects_from_nothing(subquery: Any) -> bool:
+    """True when DuckDB's subquery node is a SELECT over no relation.
+
+    DuckDB reads ``x = ANY([1, 2])`` and ``x IN (VALUES (1), (2))`` as
+    subqueries: a SELECT with no FROM over the unnested list, and one over a
+    list of literal rows. Neither names a table, a view or a function that
+    opens one, so both stay admitted; what such a SELECT calls and holds is
+    still walked by the caller. A subquery with any other source reads a
+    relation, and so does one this does not recognise.
+    """
+    node = subquery.get("node") if isinstance(subquery, dict) else None
+    if not isinstance(node, dict) or node.get("type") != "SELECT_NODE":
+        return False
+    source = node.get("from_table")
+    if not isinstance(source, dict) or source.get("type") not in ("EMPTY", "EXPRESSION_LIST"):
+        return False
+    ctes = node.get("cte_map")
+    if ctes and not (isinstance(ctes, dict) and not ctes.get("map")):
+        return False
+    return True
+
+
+def _duckdb_reading(con: Any, sql: str) -> Any:
+    """DuckDB's parse tree of the one statement *sql* holds, without the
+    positions in the text, which differ for every predicate."""
+    row = con.execute("SELECT json_serialize_sql(?::VARCHAR)", [sql]).fetchone()
+    document = json.loads(row[0])
+    statements = document.get("statements") if isinstance(document, dict) else None
+    if (not isinstance(document, dict) or document.get("error")
+            or not isinstance(statements, list) or len(statements) != 1):
+        raise ValueError(_NOT_ONE_EXPRESSION)
+    return _without_locations(statements[0])
+
+
+def _without_locations(node: Any) -> Any:
+    if isinstance(node, dict):
+        return {key: _without_locations(value)
+                for key, value in node.items() if key != "query_location"}
+    if isinstance(node, list):
+        return [_without_locations(value) for value in node]
+    return node
+
+
+def _row_predicate_call(statement: Any) -> dict:
+    """The ``__st_row_predicate__(...)`` call that is the whole ``WHERE``."""
+    node = statement.get("node") if isinstance(statement, dict) else None
+    where = node.get("where_clause") if isinstance(node, dict) else None
+    if (not isinstance(where, dict) or where.get("class") != "FUNCTION"
+            or str(where.get("function_name") or "").casefold() != _ROW_PREDICATE_NAME):
+        raise ValueError(_NOT_ONE_EXPRESSION)
+    return where
 
 
 def classify_query(query: str, default_super: str) -> SystemCommand:

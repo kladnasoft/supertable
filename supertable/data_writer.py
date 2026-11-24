@@ -218,6 +218,7 @@ class DataWriter:
 
     def _build_compact_model_df(
         self, new_resources: list, last_snapshot: dict,
+        footer_md_cache: dict | None = None,
     ) -> "DataFrame":
         """Build a zero-row Polars DataFrame whose schema mirrors the
         post-compaction file schema.
@@ -242,6 +243,14 @@ class DataWriter:
              so the pre-compaction schema is correct for the new
              snapshot as well.
           3. Empty frame — last resort.
+
+        ``footer_md_cache`` maps a file path to the parquet ``FileMetaData``
+        parsed from the bytes the writer uploaded for it (see
+        ``compact_resources``'s ``footer_md_out``). A file found there is not
+        read back: fetching it was a download of the whole object, made a
+        second time after the one for its statistics, to parse a footer that
+        was in memory when the file was written. A file not found there is
+        read from storage as before.
         """
         # --- 1. Read the schemas of all new files and union them ------
         # ``concat_with_union`` semantics: column order is "a's columns
@@ -250,6 +259,7 @@ class DataWriter:
         if new_resources:
             union_schema: dict = {}
             success_count = 0
+            cached_footers = footer_md_cache or {}
             for r in new_resources:
                 first_path = r.get("file") if isinstance(r, dict) else None
                 if not first_path:
@@ -260,8 +270,10 @@ class DataWriter:
                     # ~260ms per compacting write (6.8% of all write time) — and
                     # then discards every row.  Only the schema is wanted, and
                     # the footer carries it.
-                    raw = self.super_table.storage.read_bytes(first_path)
-                    md = pq.read_metadata(io.BytesIO(raw))
+                    md = cached_footers.get(first_path)
+                    if md is None:
+                        raw = self.super_table.storage.read_bytes(first_path)
+                        md = pq.read_metadata(io.BytesIO(raw))
                     sample = polars.from_arrow(
                         md.schema.to_arrow_schema().empty_table()
                     )
@@ -941,6 +953,11 @@ class DataWriter:
                                 tombstone_parts(tombstone_path), profiler=profiler)
                         )
                     if dv_to_drain is not None and dv_to_drain.height > 0:
+                        # footer_md_out: the footers of the files both phases
+                        # write join the incoming file's in footer_md_cache, so
+                        # step 6 and the schema below read none of them back.
+                        # Each was fetched whole for step 6, and once more for
+                        # the schema when files were merged, under this lock.
                         removed, tomb_new, tomb_sunset = compact_tombstones(
                             snapshot=last_simple_table,
                             tombstone_df=dv_to_drain,
@@ -948,6 +965,7 @@ class DataWriter:
                             compression_level=compression_level,
                             table_config=table_config,
                             profiler=profiler,
+                            footer_md_out=footer_md_cache,
                         )
                         new_resources.extend(tomb_new)
                         sunset_files |= tomb_sunset
@@ -1004,6 +1022,7 @@ class DataWriter:
                         table_config=table_config,
                         small_only=True,
                         profiler=profiler,
+                        footer_md_out=footer_md_cache,
                     )
                     if comp_new or comp_sunset:
                         _comp_considered = considered
@@ -1127,7 +1146,8 @@ class DataWriter:
                 # the metadata even though the Parquet is wider.
                 if compaction_ran:
                     schema_model_df = self._build_compact_model_df(
-                        new_resources, last_simple_table
+                        new_resources, last_simple_table,
+                        footer_md_cache=footer_md_cache,
                     )
                 else:
                     schema_model_df = None if delete_only else dataframe
@@ -1553,6 +1573,13 @@ class DataWriter:
             tomb_sunset: set = set()
             tomb_compacted_rows = 0
 
+            # path -> the footer of each file this compaction writes, parsed
+            # from the bytes as they were uploaded.  Statistics and schema of
+            # the new files are read from it below.  They used to be read back
+            # from storage, each file fetched whole once for its statistics and
+            # once more for its schema, with the table lock held throughout.
+            footer_md_cache: dict = {}
+
             should_run_tombstones = tombstone_rows > 0
             if should_run_tombstones:
                 tomb_compacted_rows, tomb_new_resources, tomb_sunset = compact_tombstones(
@@ -1561,6 +1588,7 @@ class DataWriter:
                     data_dir=simple_table.data_dir,
                     compression_level=compression_level,
                     table_config=table_config,
+                    footer_md_out=footer_md_cache,
                 )
                 logger.info(lp(
                     f"tombstone compaction removed {tomb_compacted_rows} rows "
@@ -1589,6 +1617,7 @@ class DataWriter:
                     compression_level=compression_level,
                     table_config=table_config,
                     small_only=small_only,
+                    footer_md_out=footer_md_cache,
                 )
             )
             mark("small_file_compact")
@@ -1673,7 +1702,9 @@ class DataWriter:
                     r.get("file") for r in all_new_resources
                     if isinstance(r, dict) and r.get("file")
                 ]
-                new_stats_rows = extract_stats_rows(new_data_files)
+                new_stats_rows = extract_stats_rows(
+                    new_data_files, footer_md_cache=footer_md_cache,
+                )
                 stats_path, combined_stats_df = build_stats_file(
                     stats_dir=stats_dir,
                     prev_stats_path=last_simple_table.get("stats_file"),
@@ -1714,6 +1745,7 @@ class DataWriter:
                 #      schema that's already empty / missing.
                 model_df = self._build_compact_model_df(
                     all_new_resources, last_simple_table,
+                    footer_md_cache=footer_md_cache,
                 )
 
                 new_snapshot_dict, new_snapshot_path = simple_table.update(
