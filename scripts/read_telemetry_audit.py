@@ -84,6 +84,11 @@ def install() -> None:
 
     _wrap(est.DataEstimator, "estimate", "estimate")
     _wrap(est.DataEstimator, "_collect_snapshots_from_redis", "catalog_read")
+    # A read of named tables fetches their leaves by name and never reaches
+    # the listing above; without this its catalog time would be reported as
+    # estimate's own.
+    if hasattr(est.DataEstimator, "_named_snapshots"):
+        _wrap(est.DataEstimator, "_named_snapshots", "catalog_fetch")
     if hasattr(est, "load_stats"):
         _wrap(est, "load_stats", "stats_load")
     if hasattr(est, "prune_files_by_predicates"):

@@ -34,7 +34,7 @@ The parser collects source columns from projections and expressions, including p
 
 ## 2. Read current snapshots and estimate resources
 
-`DataEstimator(organization, storage, tables, predicate_constraints=None, plan_stats=None, fullscan=False)` scans the Redis leaf entries for each selected SuperTable. It uses a leaf's embedded snapshot payload when that payload contains a resource list; otherwise it reads the referenced snapshot file from storage. Resource entries supply Parquet paths and file sizes, and snapshot schemas supply known column names and types.
+`DataEstimator(organization, storage, tables, predicate_constraints=None, plan_stats=None, fullscan=False)` reads the Redis leaf entry of each table the query names, all the tables of one SuperTable in a single round trip (`RedisCatalog.get_leaf_items()`). It does not list the SuperTable to find them, so the cost of this step does not grow with the number of tables in the lake or of keys in the Redis database. Two cases list every leaf of the SuperTable instead (`scan_leaf_items()`): a table named like its SuperTable, the legacy way to ask for all of its tables, and a query one of whose tables has no snapshot under its name, where the listing decides what is found and how the read fails. It uses a leaf's embedded snapshot payload when that payload contains a resource list; otherwise it reads the referenced snapshot file from storage. Resource entries supply Parquet paths and file sizes, and snapshot schemas supply known column names and types.
 
 `estimate()` returns a `Reflection` containing:
 

@@ -461,8 +461,13 @@ class DataEstimator:
 
     # ----------------------- snapshot discovery & filtering -----------------------
 
-    def _collect_snapshots_from_redis(self, organization, super_name) -> List[Dict]:
-        items = list(self.catalog.scan_leaf_items(organization, super_name, count=512))
+    @staticmethod
+    def _snapshots_from_items(items: Iterable[Dict]) -> List[Dict]:
+        """Catalog leaf items as the snapshot records ``estimate`` works on.
+
+        One shape for a leaf that was listed and a leaf that was fetched by
+        name.  A leaf with no path is not a snapshot and is left out.
+        """
         snapshots = []
         for it in items:
             if not it.get("path"):
@@ -478,10 +483,81 @@ class DataEstimator:
             )
         return snapshots
 
+    def _collect_snapshots_from_redis(self, organization, super_name) -> List[Dict]:
+        items = list(self.catalog.scan_leaf_items(organization, super_name, count=512))
+        return self._snapshots_from_items(items)
+
     def _filter_snapshots(self, super_name, simple_name, snapshots: List[Dict]) -> List[Dict]:
         if super_name.lower() == simple_name.lower():
             return [s for s in snapshots if not (s["table_name"].startswith("__") and s["table_name"].endswith("__"))]
         return [s for s in snapshots if s["table_name"].lower() == simple_name.lower()]
+
+    def _named_snapshots(
+        self, organization, super_name, simple_names: List[str],
+    ) -> Optional[Dict[str, List[Dict]]]:
+        """Each table's snapshot, fetched by name; ``None`` when names cannot answer.
+
+        Listing a lake costs a SCAN of the whole Redis database and a fetch of
+        every one of its leaves, and ``_filter_snapshots`` then kept the one
+        the query named.  The leaf of a named table is a key that can be asked
+        for directly.
+
+        What is returned is what the listing would have been filtered down to,
+        so the caller cannot tell the two apart:
+
+          * ``_filter_snapshots`` compares names case-insensitively, and every
+            leaf key is built by ``redis_keys``, which admits lowercase names
+            only.  The one leaf that can match a name is therefore the one
+            named by its lowercase form, and that is the key fetched.
+          * a table named like its SuperTable is the legacy way to ask for
+            EVERY table of the lake.  Only the listing answers that, so a query
+            using it is not answered here at all.
+
+        All of a query's tables in the lake are answered, or none: ``None``
+        sends the caller to the listing, which then decides as it always did.
+        That covers a table that is not there, a leaf without a path, a
+        document that is not a leaf, and a leaf written into Redis under a
+        name ``redis_keys`` would not have built.
+
+        One state reads differently, and no writer can produce it: such a
+        hand-written leaf whose name differs only in case from a real table's.
+        The listing matched both and merged their files into one read; the
+        real table is found by name here, so the other is not looked for.
+        """
+        lowered = [name.lower() for name in simple_names]
+        if super_name.lower() in lowered:
+            return None
+        fetch = getattr(self.catalog, "get_leaf_items", None)
+        if not callable(fetch):
+            return None
+
+        by_name: Dict[str, List[Dict]] = {}
+        for snapshot in self._snapshots_from_items(list(fetch(organization, super_name, lowered))):
+            by_name.setdefault(snapshot["table_name"], []).append(snapshot)
+
+        named: Dict[str, List[Dict]] = {}
+        for name, low in zip(simple_names, lowered):
+            mine = by_name.get(low)
+            if mine is None or len(mine) != 1:
+                return None
+            named[name] = list(mine)
+        return named
+
+    def _snapshots_by_table(self, super_name: str, simple_names: List[str]) -> Dict[str, List[Dict]]:
+        """The snapshots each of a query's tables in one lake is read from.
+
+        By name when that answers every table (:meth:`_named_snapshots`); by
+        listing the lake, once for all of them, when it does not.
+        """
+        named = self._named_snapshots(self.organization, super_name, simple_names)
+        if named is not None:
+            return named
+        all_snapshots = self._collect_snapshots_from_redis(
+            organization=self.organization, super_name=super_name)
+        return {
+            name: self._filter_snapshots(super_name, name, all_snapshots)
+            for name in simple_names
+        }
 
     def _get_supertable_map(self) -> List[Tuple[str, List[str]]]:
         grouped = defaultdict(list)
@@ -700,11 +776,13 @@ class DataEstimator:
 
         # Discover snapshots
         for super_name, tables in super_map:
-            # Collect snapshots ONCE per super_name (avoid redundant SCAN per simple table)
-            all_snapshots = self._collect_snapshots_from_redis(organization=self.organization, super_name=super_name)
+            # The catalog is read ONCE per super_name, for all its tables in
+            # this query: their leaves by name, or the whole lake's listing
+            # where a name cannot answer (see _snapshots_by_table).
+            snapshots_by_table = self._snapshots_by_table(super_name, tables)
 
             for simple_name in tables:
-                snapshots = self._filter_snapshots(super_name, simple_name, all_snapshots)
+                snapshots = snapshots_by_table[simple_name]
                 # Defence in depth: the read path must never bootstrap a
                 # missing supertable. ``DataReader._assert_targets_exist``
                 # is the primary guard at the entry point; this kwarg

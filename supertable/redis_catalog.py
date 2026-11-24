@@ -7,7 +7,7 @@ import re
 import time
 import hashlib
 import secrets
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
 
 import redis
 from supertable.config.defaults import logger
@@ -1500,6 +1500,16 @@ return generation
             logger.error(f"[redis-catalog] pipeline GET error: {e}")
             return
 
+        yield from self._leaf_items(keys, vals)
+
+    @staticmethod
+    def _leaf_items(keys: List[str], vals: List[Any]) -> Iterator[Dict]:
+        """The fetched leaf documents as the items the leaf readers hand out.
+
+        One decoder for :meth:`scan_leaf_items` and :meth:`get_leaf_items`, so
+        a leaf looks the same whichever of them found it.  A key with no value
+        and a document that is not a leaf are left out.
+        """
         for k, raw in zip(keys, vals):
             if not raw:
                 continue
@@ -1515,6 +1525,74 @@ return generation
                 }
             except Exception:
                 continue
+
+    # ------------- Named leaves, without SCAN -------------
+
+    def get_leaf_items(self, org: str, sup: str, simples: Iterable[str]) -> List[Dict]:
+        """The leaves of the tables named in *simples*, as :meth:`scan_leaf_items` yields them.
+
+        For a caller that knows which tables it wants.  ``scan_leaf_items``
+        finds a lake's leaves with SCAN, and SCAN walks every key of the Redis
+        database whatever its pattern; every leaf of the lake is then fetched
+        and decoded.  A read of one table paid for all the tables of all the
+        lakes sharing the database.  This asks for the named keys and nothing
+        else: the root (replica resolution) and one round trip for the leaves.
+
+        The answer is the scan's answer for those names:
+
+          * replica-aware in the same way — a replica's leaves are its
+            source's, less the tables it was not given;
+          * one item per leaf, in the order of *simples*, decoded by the code
+            that decodes the scan's (:meth:`_leaf_items`);
+          * a name with no leaf is left out, and so is a name no leaf can have
+            (one :mod:`redis_keys` refuses as a key segment: every leaf key is
+            built there, so none exists under such a name);
+          * the names are read in one MULTI/EXEC, as a batch of the scan is,
+            so the tables of one query are seen as of one moment.
+
+        Names are matched exactly.  ``DataEstimator``, which compares the
+        scan's items to a query's names case-insensitively, lowercases the
+        name itself and goes to the scan for a name that has no leaf here.
+
+        Unlike the scan, raises when Redis cannot answer.  The scan logs the
+        error and yields what it has, which reads as "no such table"; a leaf
+        that could not be read is not an absent one (see :meth:`_get_leaf_raw`).
+        An organization or lake name no key can be built from raises
+        ``ValueError``, as it does where the scan builds its pattern.
+        """
+        info = self._resolve_replica_info(org, sup)
+        effective_sup = info[0] if info else sup
+        allowed = info[1] if info else None
+
+        # Validates org and lake exactly as the scan does, before the loop
+        # below reads a ValueError as "this table name cannot have a leaf".
+        RK.meta_leaf_pattern(org, effective_sup)
+
+        keys: List[str] = []
+        seen: Set[str] = set()
+        for simple in simples:
+            if allowed and simple not in allowed:
+                continue
+            try:
+                key = RK.meta_leaf(org, effective_sup, simple)
+            except ValueError:
+                continue
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+        if not keys:
+            return []
+
+        try:
+            with self.r.pipeline() as p:
+                for k in keys:
+                    p.get(k)
+                vals = p.execute()
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] get_leaf_items error: {e}")
+            raise
+
+        return list(self._leaf_items(keys, vals))
 
     # ------------- Deletions (dangerous) -------------
 

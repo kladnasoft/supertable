@@ -111,7 +111,9 @@ Root retrieval remains at the requested namespace. Replica lookup is a single so
 
 ## Enumeration and failure behavior
 
-`scan_leaf_keys()` uses Redis `SCAN` with the lake's leaf pattern. `scan_leaf_items()` batches `GET` calls and yields dictionaries containing `simple`, `version`, `ts`, `path`, and `payload`. Missing or malformed entries in those batches are skipped. `SCAN` is incremental and is not a consistent snapshot of a changing namespace.
+`scan_leaf_keys()` uses Redis `SCAN` with the lake's leaf pattern. `scan_leaf_items()` batches `GET` calls and yields dictionaries containing `simple`, `version`, `ts`, `path`, and `payload`. Missing or malformed entries in those batches are skipped. `SCAN` is incremental and is not a consistent snapshot of a changing namespace: Redis may return a key more than once while the database is being resized, and these two methods pass a repeated key on, so a caller that must see each table once has to deduplicate. It also walks every key of the Redis database whatever its pattern, so listing one lake costs time in proportion to everything stored beside it.
+
+`get_leaf_items(org, sup, simples)` returns the same dictionaries for the tables named in `simples`, without `SCAN`: it reads the root for replica resolution and then the named leaf keys in one `MULTI`/`EXEC`. Names are matched exactly and come back in the order given, each once. A name with no leaf is left out, and so is a name `redis_keys` does not accept as a key segment, since no leaf key is built under one. Replica lakes resolve as they do for the scan, including the `replica_tables` filter. Use it when the table names are known; `DataEstimator` does, and lists the lake only for a table named like its SuperTable or when a named table has no snapshot.
 
 Failure handling varies by method:
 
@@ -119,7 +121,8 @@ Failure handling varies by method:
 | --- | --- |
 | `root_exists()`, raw leaf existence, `ensure_root()`, leaf publication, `bump_root()`, `update_root_flags()` | Log and raise |
 | `get_root()`, `get_leaf()` and raw leaf retrieval, `get_share()`, `get_linked_share()` | Log and raise; `None` means the key is absent. Malformed JSON raises the decoder's error |
-| Replica resolution in `get_leaf()`, `leaf_exists()`, and leaf scans | Raise; a malformed root reads as no replica |
+| Replica resolution in `get_leaf()`, `leaf_exists()`, `get_leaf_items()`, and leaf scans | Raise; a malformed root reads as no replica |
+| `get_leaf_items()` | Log and raise; a named leaf that is absent or malformed is left out of the result |
 | `list_shares()`, `list_linked_shares()` | Log and raise, for the index or any one document; an indexed document that is missing or malformed is skipped |
 | `ping()` | Return false |
 | Leaf scans and batches | Log and stop/skip the failed operation, potentially yielding partial results |
