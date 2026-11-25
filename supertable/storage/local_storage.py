@@ -11,7 +11,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from supertable.config.homedir import app_home
-from supertable.storage.storage_interface import StorageInterface
+from supertable.storage.storage_interface import StorageInterface, json_text
 
 class LocalStorage(StorageInterface):
     """
@@ -82,7 +82,7 @@ class LocalStorage(StorageInterface):
         fd, tmp_path = tempfile.mkstemp(prefix=".tmp-json-", dir=directory)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as tmpf:
-                json.dump(data, tmpf, indent=2, ensure_ascii=False)
+                tmpf.write(json_text(data))
                 tmpf.flush()
                 os.fsync(tmpf.fileno())
 

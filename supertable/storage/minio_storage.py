@@ -18,7 +18,7 @@ from minio.commonconfig import CopySource
 from minio.deleteobjects import DeleteObject
 from minio.error import S3Error
 
-from supertable.storage.storage_interface import StorageInterface
+from supertable.storage.storage_interface import StorageInterface, json_text
 
 
 class MinioStorage(StorageInterface):
@@ -225,7 +225,7 @@ class MinioStorage(StorageInterface):
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
         path = self._with_base(path)
-        payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        payload = json_text(data).encode("utf-8")
         buf = io.BytesIO(payload)
         self.client.put_object(
             self.bucket_name,

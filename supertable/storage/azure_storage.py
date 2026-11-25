@@ -15,7 +15,7 @@ import pyarrow.parquet as pq
 from azure.core.exceptions import AzureError, ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
-from supertable.storage.storage_interface import StorageInterface
+from supertable.storage.storage_interface import StorageInterface, json_text
 
 
 def _parse_abfss(uri: str) -> Tuple[str, str, str, str]:
@@ -316,7 +316,7 @@ class AzureBlobStorage(StorageInterface):
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
         path = self._with_base(path)
-        payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        payload = json_text(data).encode("utf-8")
         blob = self.container.get_blob_client(path)
         blob.upload_blob(
             payload,

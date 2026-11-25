@@ -13,7 +13,7 @@ import pyarrow.parquet as pq
 from google.cloud import storage
 from google.api_core.exceptions import NotFound
 
-from supertable.storage.storage_interface import StorageInterface
+from supertable.storage.storage_interface import StorageInterface, json_text
 
 
 class GCSStorage(StorageInterface):
@@ -165,7 +165,7 @@ class GCSStorage(StorageInterface):
 
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
         path = self._with_base(path)
-        payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        payload = json_text(data).encode("utf-8")
         blob = self.bucket.blob(path)
         blob.upload_from_string(payload, content_type="application/json")
 

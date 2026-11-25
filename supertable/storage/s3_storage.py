@@ -15,7 +15,7 @@ from botocore.exceptions import ClientError
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from supertable.storage.storage_interface import StorageInterface
+from supertable.storage.storage_interface import StorageInterface, json_text
 
 
 class S3Storage(StorageInterface):
@@ -491,7 +491,7 @@ class S3Storage(StorageInterface):
     def write_json(self, path: str, data: Dict[str, Any]) -> None:
         path = self._with_base(path)
         self._ensure_bucket_region()
-        payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        payload = json_text(data).encode("utf-8")
         self._call("put_object",
                    Bucket=self.bucket_name,
                    Key=path,

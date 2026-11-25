@@ -53,7 +53,7 @@ Local storage uses the supplied path directly, so absolute paths remain absolute
 
 | Operation | Behavior |
 | --- | --- |
-| `read_json(path)`, `write_json(path, data)` | Load/store JSON; absent reads raise `FileNotFoundError`; empty or invalid JSON produces an error |
+| `read_json(path)`, `write_json(path, data)` | Load/store JSON; absent reads raise `FileNotFoundError`; empty or invalid JSON produces an error. Every backend stores the text of `storage_interface.json_text(data)`: one line, no indentation, text outside ASCII as itself. A reader parses that and an indented document written by an earlier release to the same value |
 | `read_bytes`, `write_bytes`, `read_text`, `write_text` | Read/store a complete payload; text defaults to UTF-8 |
 | `read_parquet(path, columns=None)` | Return a PyArrow table; optionally project columns |
 | `write_parquet(table, path)` | Write a PyArrow table using `pyarrow.parquet.write_table` |
