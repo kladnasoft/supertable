@@ -71,6 +71,19 @@ The last one cannot be represented by a dict, so the workload never generates
 it (see `WriteWorkload._keys_for`). That is a limit of the model, and it is
 deliberate rather than accidental.
 
+### The commit of the catalog entry
+
+`--write` also runs [`test_catalog_commit.py`](test_catalog_commit.py). A
+commit stores the table's snapshot in Redis beside its path, through a Lua
+script, and a fake Redis does not have the real `cjson`: the real one writes an
+empty list as `{}` and an integer of 15 digits or more as a rounded float. So
+this suite is the only place where the commit script can be compared with the
+one it replaced (kept in the test, word for word): on what a reader finds in
+the entry, on the version it gives whatever was in the key before, on two
+releases writing one table in turn, and on the commands a commit sends. The
+real writer then goes through every kind of write, and after each one the
+entry must hold the snapshot file's document, value for value.
+
 ## Read half
 
 ~90 cases over a deterministic 200-row fact table plus a dimension table,

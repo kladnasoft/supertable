@@ -228,30 +228,75 @@ redis.call('SET', key, new_val)
 return new_version
 """
 
+    # The leaf is put together as text around the payload it is given, and the
+    # payload is stored as it arrives.  The script used to decode the leaf that
+    # was there, decode the new payload and encode the two again, which cost
+    # in two ways.  Redis runs one command at a time, and for a table of 1,000
+    # files that was 9 ms in which no client of the database was served, on
+    # every commit.  And cjson does not give back what it was given: an empty
+    # list came out as {}, an integer of 15 digits or more as a rounded float,
+    # a float lost its digits past the fourteenth, so the payload in the leaf
+    # was not the snapshot it stood for.
+    #
+    # The version of the leaf that is there is read from its first bytes.  A
+    # leaf written here begins {"version":N, and nothing but the top-level
+    # version can stand there, so for every leaf a script wrote the match is
+    # exact when it matches.  Any other value (a leaf an older release wrote,
+    # one without a payload, one that is not JSON, one that does not end as a
+    # JSON object does) is decoded whole, by the lines that decoded every leaf
+    # before, and gives what it gave before.
+    #
+    # Not reproduced: a value written by hand that begins with its version,
+    # ends with a closing brace and is something else in between.  Its version
+    # is taken from its head.  The old script decoded all of it, so it started
+    # the versions again from 0 when the rest was not JSON or nested deeper
+    # than cjson reads, and went on from the later value when "version" stood
+    # there twice.
+    #
+    # Numbers are written as cjson wrote them (%.14g), the path by cjson.
+    #
+    # The payload text is stored unchecked: checking it would be decoding it.
+    # set_leaf_payload_cas is the script's only caller and sends what
+    # json.dumps made, with allow_nan=False, which is always JSON.  (An empty
+    # text is stored as {}, as the old script stored what it could not decode.)
     _LUA_LEAF_PAYLOAD_CAS_SET = """
 local key = KEYS[1]
 local payload_json = ARGV[1]
 local new_path = ARGV[2]
 local now_ms = tonumber(ARGV[3])
 
-local cur = redis.call('GET', key)
 local old_version = -1
-if cur then
-  local ok, obj = pcall(cjson.decode, cur)
-  if ok and obj and obj['version'] then
-    old_version = tonumber(obj['version'])
+local digits = string.match(redis.call('GETRANGE', key, 0, 39), '^{"version":(%d+)[,}]')
+if digits and redis.call('GETRANGE', key, -1, -1) == '}' then
+  old_version = tonumber(digits)
+else
+  local cur = redis.call('GET', key)
+  if cur then
+    local ok, obj = pcall(cjson.decode, cur)
+    if ok and obj and obj['version'] then
+      old_version = tonumber(obj['version'])
+    end
   end
 end
 local new_version = old_version + 1
 
-local payload = {}
-local okp, pobj = pcall(cjson.decode, payload_json)
-if okp and pobj then
-  payload = pobj
+if not payload_json or payload_json == '' then
+  payload_json = '{}'
 end
 
-local new_val = cjson.encode({version=new_version, ts=now_ms, path=new_path, payload=payload})
-redis.call('SET', key, new_val)
+local parts = {'{"version":', string.format('%.14g', new_version)}
+if now_ms then
+  parts[#parts + 1] = ',"ts":'
+  parts[#parts + 1] = string.format('%.14g', now_ms)
+end
+if new_path then
+  parts[#parts + 1] = ',"path":'
+  parts[#parts + 1] = cjson.encode(new_path)
+end
+parts[#parts + 1] = ',"payload":'
+parts[#parts + 1] = payload_json
+parts[#parts + 1] = '}'
+redis.call('SET', key, table.concat(parts))
 return new_version
 """
 
@@ -792,9 +837,36 @@ return generation
             path: str,
             now_ms: Optional[int] = None,
     ) -> int:
-        """Atomically write a leaf pointer *and* snapshot payload (so readers avoid storage reads)."""
+        """Atomically write a leaf pointer *and* snapshot payload (so readers avoid storage reads).
+
+        The payload is stored as the JSON text made here; the script puts the
+        leaf together around it and does not decode it.  So what a reader finds
+        under ``payload`` is the snapshot it was given, value for value.
+
+        A payload holding a number that is not finite (NaN, Infinity) is not
+        stored: ``redis.ResponseError`` is raised and the leaf is left as it
+        was.  The script raised the same for such a payload when it still
+        encoded it, and the writers answer by storing a leaf without payload,
+        which readers follow to the snapshot file.  It is raised here because
+        the text of such a number is not JSON, and the script would now store
+        it as it came.
+        """
         try:
-            payload_json = json.dumps(payload or {})
+            payload_json = json.dumps(payload or {}, allow_nan=False, separators=(",", ":"))
+        except ValueError:
+            # Either a number that is not finite, or something that cannot be
+            # serialised at all (a circular reference), which was stored as an
+            # empty payload and still is.
+            try:
+                json.dumps(payload or {})
+            except Exception:
+                payload_json = "{}"
+            else:
+                error = redis.ResponseError(
+                    "leaf payload holds a number that is not finite (NaN or Infinity)"
+                )
+                logger.error(f"[redis-catalog] leaf_payload_cas_set error: {error}")
+                raise error
         except Exception:
             payload_json = "{}"
 

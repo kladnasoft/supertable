@@ -50,16 +50,22 @@ A leaf at `meta:leaf:doc:<simple>` identifies the current simple-table snapshot:
 
 The example is a reduced record. The payload produced by the table writer also includes schema, tombstone and statistics references, timestamps, location, and optional lineage. `version` is the Redis leaf update counter; `snapshot_version` is maintained in the JSON snapshot. They are separate fields, not one shared counter.
 
+The record is stored on one line, in the order `version`, `ts`, `path`, `payload`; the example is laid out for reading. The payload is the snapshot document value for value: it is stored as the JSON text the writer serialised, and the script that stores it does not decode it. A leaf written by a release up to 3.5.7 went through Redis's `cjson` on the way in, which changed it: an empty list was stored as `{}`, an integer of 15 digits or more as a rounded float, a float without its digits past the fourteenth, and keys in another order. Readers parse both forms.
+
 `get_leaf()` returns the decoded record, or `None` when there is no leaf; a Redis error raises. `SimpleTable.get_simple_table_snapshot()` first uses an inline payload with a list-valued `resources` field, including an accepted nested `payload.snapshot` shape. Otherwise it reads `path` from storage. The pointer must still contain a path even when the payload is inline.
 
 ## Publication and atomic operations
 
 The methods named `set_leaf_path_cas()` and `set_leaf_payload_cas()` atomically increment and replace a leaf using Lua. They do not accept an expected version, compare against a caller's previous value, or verify a lock token. For a missing leaf, their initial result is version `0`; for an existing valid leaf, it is the old version plus one.
 
+`set_leaf_payload_cas()` reads the old version from the first bytes of the leaf it replaces when that leaf begins `{"version":N` and ends as a JSON object does, which every leaf it writes does; it then neither fetches nor decodes the old leaf. Redis is busy with a commit for about a quarter of the time it was: it takes the new snapshot's text and stores it, where it used to decode the old leaf, decode the new payload and encode both again (about 2 ms instead of 9 ms for a table of 1,000 files, measured with `SLOWLOG`). Any other value in the key (a leaf written by an earlier release or by `set_leaf_path_cas()`, one written by hand, one that is not JSON) is fetched and decoded as before, with the same result. What differs from the script it replaces is confined to values written by hand that begin with their version and end with `}`: the version is taken from the head, whatever stands between. The old script decoded the whole value, so it started again from `0` when the rest was not valid JSON or nested deeper than `cjson` reads, and went on from the later value when `version` was named twice.
+
+The script calls `GETRANGE` as well as `GET` and `SET`. A Redis user restricted to named commands needs it allowed (it belongs to the `@read` and `@string` categories); without it the script fails, and the writer falls back to a path-only leaf on every commit.
+
 | Operation | Atomic portion | Separate work |
 | --- | --- | --- |
 | `set_leaf_path_cas()` | Read version and replace `{version, ts, path}` in one Lua script | Does not retain an existing inline payload |
-| `set_leaf_payload_cas()` | Read version and replace `{version, ts, path, payload}` in one Lua script | Payload JSON is encoded before the script; serialization failure supplies `{}` |
+| `set_leaf_payload_cas()` | Read version and replace `{version, ts, path, payload}` in one Lua script | Payload JSON is encoded before the script and stored as that text; serialization failure supplies `{}`; a payload holding a number that is not finite (NaN, Infinity) raises `redis.ResponseError` and stores nothing |
 | `bump_root()` | Read, increment, preserve flags, and replace root in one Lua script | Independent of leaf publication |
 | `reserve_rowids(count)` | Redis `INCRBY` reserves a contiguous range | No rollback when subsequent file creation fails |
 | `ensure_root()` | Individual `EXISTS` and `SET` commands | The check and creation are separate operations |
