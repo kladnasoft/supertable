@@ -139,7 +139,7 @@ The lock manager renews acquired leases with a background heartbeat. The writer'
 
 ## Overwrite matching and Parquet output
 
-All existing resources begin as candidates when overwrite keys are supplied. A statistics artifact can eliminate files whose stored ranges cannot match the input. Missing or unsupported bounds retain the candidate.
+All existing resources begin as candidates when overwrite keys are supplied. A statistics artifact can eliminate files whose stored ranges cannot match the input. Missing or unsupported bounds retain the candidate. A write without overwrite keys matches no key and builds no candidate set: the step records its counters (`resources_total`, `overlap_files_false`, `overlap_files_total_bytes`) in one pass over the snapshot (`find_overlapping_files(..., want_candidates=False)`).
 
 If `SUPERTABLE_DUCKDB_WRITE_PROBE` is enabled, matching first tries a DuckDB scan projecting the keys, row ID, optional comparison column, and filename. It joins against distinct incoming keys and resolves storage paths, with a presigned-URL retry for selected failures. Unavailable or failed probing falls back to projected Polars reads.
 

@@ -384,18 +384,25 @@ def prune_not_overlapping_files_by_threshold(
     """
     max_mem, max_files = _resolve_limits(table_config)
 
-    total_size = sum(item[2] for item in overlapping_files)
-    total_false = len([item for item in overlapping_files if item[1] is False])
-
+    # One pass.  This runs on every write over every file of the table, and it
+    # used to walk the candidates four times (their sizes, the False items, the
+    # True items, the False items again).
+    total_size = 0
     # Always keep all True (overlapping) items
-    result: Set[Tuple[str, bool, int]] = set([item for item in overlapping_files if item[1] is True])
+    result: Set[Tuple[str, bool, int]] = set()
+    held_back: List[Tuple[str, bool, int]] = []
+    for item in overlapping_files:
+        total_size += item[2]
+        has_overlap = item[1]
+        if has_overlap is True:
+            result.add(item)
+        elif has_overlap is False:
+            held_back.append(item)
 
     # Gate: only pull in False items if thresholds hit
-    if total_size > max_mem or total_false >= max_files:
+    if total_size > max_mem or len(held_back) >= max_files:
         # Include ALL false items — downstream handles chunked flushing
-        for item in overlapping_files:
-            if item[1] is False:
-                result.add(item)
+        result.update(held_back)
 
     return result
 
@@ -666,6 +673,7 @@ def find_overlapping_files(  # keep name/signature for compatibility
         locking: object = None,  # deprecated: kept for signature compatibility
         table_config: Optional[dict] = None,
         profiler: Optional[Profiler] = None,
+        want_candidates: bool = True,
 ) -> Set[Tuple[str, bool, int]]:
     """
     Builds the candidate set:
@@ -676,6 +684,12 @@ def find_overlapping_files(  # keep name/signature for compatibility
 
     Limits are resolved per-table (table_config) with fallback to global default.
 
+    ``want_candidates=False`` is for a write without overwrite columns, which
+    has no use for the set: an append matches no key.  The step's counters and
+    timings are then recorded as they always were and an empty set is returned,
+    without the set being built.  With overwrite columns the argument changes
+    nothing.
+
     NOTE:
       - No per-file locking here (consistent with new locking model).
       - Return: set of tuples (file_path, has_overlap: bool, file_size)
@@ -684,6 +698,11 @@ def find_overlapping_files(  # keep name/signature for compatibility
     resources = last_simple_table.get("resources", {}) or {}
     overlapping_files: Set[Tuple[str, bool, int]] = set()
     p.add("resources_total", len(resources))
+
+    if not overwrite_columns and not want_candidates:
+        if _record_append_overlap_counters(resources, table_config, p):
+            return overlapping_files
+        # A file listed twice: counted below, the way the set counts it.
 
     if overwrite_columns:
         # Snapshots carry no per-file key statistics, so a file cannot be proven
@@ -697,11 +716,18 @@ def find_overlapping_files(  # keep name/signature for compatibility
         p.mark("overlap.scan_resources", t0)
 
     else:
-        # No overwrite columns → pure compaction path for small files
+        # No overwrite columns → pure compaction path for small files.
+        # The limit is the same for every file, so it is resolved once: it was
+        # resolved again for each of them, which was most of what this step
+        # cost a table of thousands of files.  Resolved at the first file, not
+        # before the loop, so that what a malformed resource or a malformed
+        # table configuration raises, and in which order, is as it was.
+        _max_mem = None
         for resource in resources:
             file = resource["file"]
             file_size = int(resource.get("file_size") or 0)
-            _max_mem, _ = _resolve_limits(table_config)
+            if _max_mem is None:
+                _max_mem, _ = _resolve_limits(table_config)
             if file_size < _max_mem:
                 overlapping_files.add((file, False, file_size))
 
@@ -709,12 +735,60 @@ def find_overlapping_files(  # keep name/signature for compatibility
     with p.span("overlap.prune"):
         overlapping_files = prune_not_overlapping_files_by_threshold(overlapping_files, table_config=table_config)
 
-    p.add("overlap_files_true", sum(1 for _, ov, _ in overlapping_files if ov))
-    p.add("overlap_files_false", sum(1 for _, ov, _ in overlapping_files if not ov))
-    p.add("overlap_files_total_bytes", sum(sz for _, _, sz in overlapping_files))
+    files_true = files_false = total_bytes = 0
+    for _, has_overlap, file_size in overlapping_files:
+        if has_overlap:
+            files_true += 1
+        else:
+            files_false += 1
+        total_bytes += file_size
+    p.add("overlap_files_true", files_true)
+    p.add("overlap_files_false", files_false)
+    p.add("overlap_files_total_bytes", total_bytes)
 
     # Per-file locks removed intentionally; higher-level simple/table lock handles concurrency
+    if not overwrite_columns and not want_candidates:
+        return set()
     return overlapping_files
+
+
+def _record_append_overlap_counters(resources, table_config: Optional[dict], p) -> bool:
+    """Record what ``find_overlapping_files`` records for an append, without its set.
+
+    The set of an append holds one ``(file, False, size)`` for every file
+    smaller than ``max_memory_chunk_size``, and the pruning then keeps all of
+    them or none.  So the counters are the number of such files and their
+    bytes, and one pass over the snapshot gives both: a third of the time the
+    set took for a table of 3,000 small files.
+
+    A set would count a file listed twice once.  That is not reproduced here:
+    ``False`` is returned, nothing is recorded, and the caller counts with the
+    set.  Malformed resources and a malformed configuration raise what they
+    raised, in the same order.
+    """
+    seen: Set = set()
+    small_files = 0
+    small_bytes = 0
+    _max_mem = None
+    for resource in resources:
+        file = resource["file"]
+        file_size = int(resource.get("file_size") or 0)
+        if _max_mem is None:
+            _max_mem, _ = _resolve_limits(table_config)
+        if file_size < _max_mem:
+            seen.add(file)
+            small_files += 1
+            small_bytes += file_size
+    if len(seen) != small_files:
+        return False
+
+    with p.span("overlap.prune"):
+        max_mem, max_files = _resolve_limits(table_config)
+        kept = small_bytes > max_mem or small_files >= max_files
+    if kept:
+        p.add("overlap_files_false", small_files)
+        p.add("overlap_files_total_bytes", small_bytes)
+    return True
 
 
 # =========================

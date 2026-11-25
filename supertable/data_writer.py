@@ -523,10 +523,15 @@ class DataWriter:
             mark("snapshot")
 
             # --- Detect overlaps ----------------------------------------------
+            # The candidates are used below only when there are overwrite
+            # columns to match on.  Without them the step still records its
+            # counters, and no longer builds a set of every small file of the
+            # table to throw it away.
             overlapping_files = find_overlapping_files(
                 last_simple_table, dataframe, overwrite_columns, locking=None,
                 table_config=table_config,
                 profiler=profiler,
+                want_candidates=bool(overwrite_columns),
             )
             mark("overlap")
             if overwrite_columns:
