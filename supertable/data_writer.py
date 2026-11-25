@@ -47,6 +47,8 @@ from supertable.processing import (
     compact_resources,
     compact_tombstones,
     should_compact_small_files,
+    select_small_files_to_merge,
+    count_small_files,
     _max_tombstone_rows,
     _read_parquet_safe,
 )
@@ -1007,6 +1009,7 @@ class DataWriter:
                 # Result folds into the SAME snapshot commit below (new_resources
                 # / sunset_files feed build_stats and simple_table.update).
                 compaction_ran = False
+                _comp_left = 0
                 if compaction_gate:
                     live_resources = [
                         r for r in (last_simple_table.get("resources") or [])
@@ -1015,8 +1018,19 @@ class DataWriter:
                     live_resources += [
                         r for r in new_resources if r.get("file") not in sunset_files
                     ]
+                    # Not every small file, every time.  A merge the file
+                    # count triggered writes a file that is small again, so
+                    # taking it into each later merge read and rewrote it,
+                    # bigger every time: each row rewritten five times and
+                    # merges growing to 0.9 s over 1,400 small appends.  The files
+                    # that are a large share of the merge are left for a later
+                    # write (select_small_files_to_merge).
+                    to_merge = select_small_files_to_merge(
+                        live_resources, table_config)
+                    _comp_left = max(0, count_small_files(
+                        live_resources, table_config) - len(to_merge))
                     considered, comp_rows, comp_new, comp_sunset = compact_resources(
-                        snapshot={"resources": live_resources},
+                        snapshot={"resources": to_merge},
                         data_dir=simple_table.data_dir,
                         compression_level=compression_level,
                         table_config=table_config,
@@ -1073,7 +1087,9 @@ class DataWriter:
                         f"wrote {_tomb_files_written} file(s); "
                         f"small-file phase merged {_comp_considered} small file(s) -> "
                         f"{_comp_files_written} file(s) ({_comp_rows} row(s)); "
-                        f"large files left untouched; live files {_live_before} -> {_final_live}; "
+                        + (f"{_comp_left} small file(s) left for a later merge; "
+                           if _comp_left else "")
+                        + f"large files left untouched; live files {_live_before} -> {_final_live}; "
                         f"compaction io: read {_cio_fr} file(s)/{_cio_br / 1048576:.1f} MiB, "
                         f"wrote {_cio_files} file(s)/{_cio_bw / 1048576:.1f} MiB"
                     ))
@@ -1390,9 +1406,14 @@ class DataWriter:
              ``compact()`` is explicit maintenance and always drains.
           4. Run ``compact_resources`` to merge small parquet files in
              memory-bounded chunks. When ``small_only=True`` (default),
-             only files strictly smaller than ``max_memory_chunk_size``
-             qualify — large files are left untouched. ``small_only=False``
-             rewrites every resource regardless of size.
+             only files that are still small qualify (under three
+             quarters of ``max_memory_chunk_size`` stored and under the
+             decoded-size threshold, ``processing._is_small_file``) —
+             large files are left untouched. Every small file is merged:
+             the selection a write applies when the file count opens the
+             gate (``select_small_files_to_merge``) is not used here.
+             ``small_only=False`` rewrites every resource regardless of
+             size.
           5. Commit the new snapshot via ``simple_table.update``,
              leaf-CAS, ``bump_root``, optional mirroring, and the same
              monitoring + audit pipeline as ``write``.
@@ -1415,9 +1436,10 @@ class DataWriter:
                 ``compact()`` always drains an existing deletion-vector
                 regardless of this flag (the vector must be consumed
                 before small-file compaction to stay consistent).
-            small_only: only consider files smaller than
-                ``max_memory_chunk_size`` for compaction. Set to False
-                to rewrite every file (e.g. for a full-table re-encode).
+            small_only: only consider files that are still small
+                (``processing._is_small_file``) for compaction. Set to
+                False to rewrite every file (e.g. for a full-table
+                re-encode).
             compression_level: zstd compression level for new parquets.
             lineage: optional provenance dict — same conventions as
                 ``write``. If omitted a minimal compaction lineage is

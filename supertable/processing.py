@@ -419,32 +419,240 @@ def _small_file_threshold(max_mem: int) -> int:
     return max(1, int(max_mem * _COMPACTION_TARGET_RATIO))
 
 
+# ``max_memory_chunk_size`` is counted in STORED bytes, and a merge holds its
+# chunk DECODED.  The two are far apart exactly where it hurts.  Batches of a
+# million rows by fifty columns stored in 8 MiB each were "small", so every
+# third append read three of them back: 1.2 GB of rows, 5 GB of memory and two
+# seconds, to write one file instead of three.
+#
+# So a chunk has a second bound, on an estimate of its decoded size, and a file
+# that already reaches that size is big enough whatever it weighs on disk.  The
+# estimate is rows x columns x 8 bytes: what the snapshot records for every
+# file, and the width of the numeric and timestamp values that compress this
+# way.  The bound is a multiple of ``max_memory_chunk_size``, so the per-table
+# setting scales both.
+#
+# The multiple is deliberately high.  Every file costs a reader something
+# (0.2 to 1.4 ms a file depending on the query, measured), so this bound must
+# not turn one file into several where the stored-size bound was doing its
+# job.  At 32 it only comes into play for data stored in about a quarter of a
+# byte a value or less, where a 16 MiB chunk would decode to more than half a
+# gigabyte; anything that compresses less than that reaches the stored bytes
+# first and is laid out as before.  Lowering it trades files for memory: at 8
+# a merge of well-compressed rows peaked at 0.4 GB instead of 0.6 GB and left
+# three times as many files.
+#
+# Long strings decode to more than 8 bytes a value, so this is an estimate and
+# not a hard limit.
+_DECODED_BYTES_PER_VALUE = 8
+_COMPACTION_DECODED_RATIO = 32
+
+
+def _decoded_size_cap(max_mem: int) -> int:
+    """Estimated decoded size at which a chunk being merged is closed."""
+    return max(1, int(max_mem) * _COMPACTION_DECODED_RATIO)
+
+
+def _decoded_size_threshold(max_mem: int) -> int:
+    """Estimated decoded size below which a file still counts as "small".
+
+    The same hysteresis as ``_small_file_threshold``: a chunk closed at the cap
+    yields a file above this, so it is not picked up again.
+    """
+    return max(1, int(_decoded_size_cap(max_mem) * _COMPACTION_TARGET_RATIO))
+
+
+def _as_count(value) -> int:
+    """A row or column count from a snapshot resource, 0 when it is not one.
+
+    ``columns`` is the number of columns in the files this module writes, and a
+    list of column descriptions in some hand-built snapshots.
+    """
+    if type(value) is int:
+        return value if value > 0 else 0
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (list, tuple, dict, set, frozenset)):
+        return len(value)
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _estimated_decoded_bytes(rows: int, columns: int) -> int:
+    return max(0, int(rows)) * max(0, int(columns)) * _DECODED_BYTES_PER_VALUE
+
+
+def _resource_decoded_estimate(resource: Dict) -> int:
+    """Estimated decoded size of a snapshot resource; 0 when it records no counts."""
+    return (
+        _as_count(resource.get("rows")) * _as_count(resource.get("columns"))
+        * _DECODED_BYTES_PER_VALUE
+    )
+
+
+def _small_files(resources, max_mem: int):
+    """Yield ``(resource, stored size)`` for every small file of *resources*, in order.
+
+    A file is small while it is small on disk AND small decoded: its
+    ``file_size`` is under ``_small_file_threshold`` and its estimated decoded
+    size is under ``_decoded_size_threshold``.  A resource that records no row
+    or column count is judged on its stored size alone, as every resource was
+    before.  Entries without a ``file`` are not files.
+
+    The one definition behind the gate (``should_compact_small_files``), the
+    count, the selection and the candidate set of ``compact_resources``, so
+    they can never disagree: a gate that opens on files the merge then skips
+    would re-fire on every write with nothing to do.
+
+    The gate runs this over every file of the table on every write, so it is
+    written for that: the thresholds are worked out once, a file that is large
+    on disk costs what it always did, and the counts the writer records (two
+    plain integers) are multiplied in place.
+    """
+    stored_threshold = _small_file_threshold(max_mem)
+    decoded_threshold = _decoded_size_threshold(max_mem)
+    per_value = _DECODED_BYTES_PER_VALUE
+    for resource in resources or ():
+        if not resource.get("file"):
+            continue
+        size = int(resource.get("file_size") or 0)
+        if size >= stored_threshold:
+            continue
+        rows = resource.get("rows")
+        columns = resource.get("columns")
+        if type(rows) is int and type(columns) is int:
+            if rows > 0 and columns > 0 and rows * columns * per_value >= decoded_threshold:
+                continue
+        elif rows is not None and columns is not None and (
+                _resource_decoded_estimate(resource) >= decoded_threshold):
+            continue
+        yield resource, size
+
+
+def _is_small_file(resource: Dict, max_mem: int) -> bool:
+    """True while *resource* is a candidate for small-file compaction.
+
+    One resource at a time; ``_small_files`` is the thing to loop with.
+    """
+    for _ in _small_files((resource,), max_mem):
+        return True
+    return False
+
+
 def should_compact_small_files(
         resources: List[Dict],
         table_config: Optional[dict] = None,
 ) -> bool:
     """Return True when accumulated small files trip the auto-compaction gate.
 
-    Mirrors the threshold in ``prune_not_overlapping_files_by_threshold``: a
-    file is "small" when its ``file_size`` is strictly smaller than
-    ``max_memory_chunk_size``.  The gate opens when EITHER the small-file count
-    reaches ``max_overlapping_files`` OR the combined small-file size exceeds
-    ``max_memory_chunk_size``.  Files already at/above the chunk size are big
-    enough on their own and are never counted.
+    A file is "small" by ``_is_small_file``: its ``file_size`` is under
+    ``_small_file_threshold`` and its estimated decoded size is under
+    ``_decoded_size_threshold``.  The gate opens when EITHER the small-file
+    count reaches ``max_overlapping_files`` OR the combined small-file size
+    exceeds ``max_memory_chunk_size``.  Files that are big enough on their own
+    are never counted.
 
     ``resources`` is a snapshot's resource list (dicts with ``file`` /
     ``file_size``).  Limits resolve per-table via ``_resolve_limits``.
     """
     max_mem, max_files = _resolve_limits(table_config)
-    threshold = _small_file_threshold(max_mem)
-    small_sizes = [
-        int(r.get("file_size") or 0)
-        for r in (resources or [])
-        if r.get("file") and int(r.get("file_size") or 0) < threshold
-    ]
+    small_sizes = [size for _resource, size in _small_files(resources, max_mem)]
     if not small_sizes:
         return False
     return len(small_sizes) >= max_files or sum(small_sizes) > max_mem
+
+
+def count_small_files(
+        resources: List[Dict],
+        table_config: Optional[dict] = None,
+) -> int:
+    """How many of *resources* are small files (``_is_small_file``)."""
+    max_mem, _max_files = _resolve_limits(table_config)
+    return sum(1 for _ in _small_files(resources, max_mem))
+
+
+# A merge that the file COUNT triggered used to take every small file, and what
+# it wrote was small again: a hundred appends of 5,000 well-compressed rows
+# merge into about 1 MiB.  So the next merge read that file back and rewrote
+# it, with the hundred files that had arrived since, and the one after that
+# read the result, each time a bigger file, until it passed the size threshold.
+# Measured on 1,400 such appends: every row read back and rewritten five times,
+# merges growing from 0.4 s to 0.9 s.  Smaller batches are worse in proportion; one-row
+# appends rewrite the whole table every hundred writes.
+#
+# A file is now left out of such a merge while it is a large share of it: it
+# joins once it would hold at most one row in ``_COMPACTION_TIER_FANIN`` of the
+# rows merged.  Every time a row is rewritten it therefore lands in a file at
+# least that many times bigger than the one it left, which bounds the rewrites
+# of a row by a logarithm instead of by the table's size.  Ten files of one
+# size are what it takes to merge them, so at most nine wait at each size.
+_COMPACTION_TIER_FANIN = 10
+
+
+def select_small_files_to_merge(
+        resources: List[Dict],
+        table_config: Optional[dict] = None,
+) -> List[Dict]:
+    """The small files a write merges once the auto-compaction gate is open.
+
+    Returns resource dicts from *resources*, in the order they have there (the
+    order they were written in, so their rows stay in timestamp order when the
+    merge concatenates them).
+
+    Every small file is returned, as before, when merging them all leaves
+    nothing to merge again:
+
+      - their stored bytes exceed ``max_memory_chunk_size`` (the gate's byte
+        trigger: there is a full file's worth), or
+      - their estimated decoded size reaches ``_decoded_size_threshold`` (what
+        the merge writes is big enough by that measure).
+
+    Otherwise the file count opened the gate and the result would be one more
+    small file.  The largest files are then left out, one at a time, while the
+    largest holds more than one row in ``_COMPACTION_TIER_FANIN`` of those
+    still selected (see the note above).  They stay in the snapshot untouched
+    and are merged by a later write, with files of their own size.
+
+    The selection must still do what the gate is for.  If it would leave more
+    than half of ``max_overlapping_files`` small files behind, sizes are too
+    spread out for it and every small file is merged, as before.  Leaving one
+    file out takes ten others to merge, so a table whose
+    ``max_overlapping_files`` is ten or less has every small file merged too.
+
+    Sizes are compared in rows, not bytes: the cost of a merge follows the rows
+    it decodes, and the stored size of a file of a few rows is mostly its
+    footer.  A resource that records no row count weighs nothing and is always
+    selected, which is what happened to every file before.
+
+    ``compact()`` does not use this: explicit compaction merges every small
+    file.
+    """
+    max_mem, max_files = _resolve_limits(table_config)
+    small = [resource for resource, _size in _small_files(resources, max_mem)]
+    if len(small) < 2:
+        return small
+    if sum(int(r.get("file_size") or 0) for r in small) > max_mem:
+        return small
+    if sum(_resource_decoded_estimate(r) for r in small) >= _decoded_size_threshold(max_mem):
+        return small
+
+    rows = [_as_count(r.get("rows")) for r in small]
+    # Stable: files of equal size keep their snapshot order.
+    by_size = sorted(range(len(small)), key=rows.__getitem__)
+    selected_rows = sum(rows)
+    keep = len(by_size)
+    while keep > 1 and rows[by_size[keep - 1]] * _COMPACTION_TIER_FANIN > selected_rows:
+        selected_rows -= rows[by_size[keep - 1]]
+        keep -= 1
+
+    # One merged file replaces ``keep`` files: len(small) - keep + 1 remain.
+    most_left = max(1, max_files // 2)
+    if keep < 2 or len(small) - keep + 1 > most_left:
+        return small
+    chosen = set(by_size[:keep])
+    return [r for i, r in enumerate(small) if i in chosen]
 
 
 # =========================
@@ -529,6 +737,11 @@ def compact_resources(
     needing any incoming data**. Used by ``DataWriter.compact()`` and
     ``SimpleTable.export_to()``.
 
+    A chunk is closed, and written as one file, when the stored bytes of its
+    source files reach ``max_memory_chunk_size`` or their estimated decoded
+    size reaches ``_decoded_size_cap`` (rows x columns x 8 bytes, 32 times
+    ``max_memory_chunk_size``), whichever comes first.
+
     Args:
         snapshot: the current snapshot dict (read by the caller — must
             contain a ``resources`` list of resource dicts with at least
@@ -538,8 +751,10 @@ def compact_resources(
         table_config: per-table config dict (or None for global defaults);
             used by ``_resolve_limits`` to pick up
             ``max_memory_chunk_size`` and ``max_overlapping_files``.
-        small_only: when True (default), only files **strictly smaller**
-            than ``max_memory_chunk_size`` are considered for
+        small_only: when True (default), only files that are still small
+            (``_is_small_file``: under three quarters of
+            ``max_memory_chunk_size`` on disk and under
+            ``_decoded_size_threshold`` decoded) are considered for
             compaction — large files are left untouched. When False,
             every file is rewritten regardless of size.
         dead_rowids: optional set of ``__rowid__`` values to physically
@@ -601,21 +816,22 @@ def compact_resources(
     max_mem, _max_files = _resolve_limits(table_config)
 
     # Classify candidates. Per ``small_only``, a file is a compaction
-    # candidate while it is still under ``_small_file_threshold`` — the same
-    # hysteresis band ``should_compact_small_files`` gates on, so the gate and
-    # the candidate set can never disagree (a gate that opens on files this
-    # loop then skips would spin, re-firing every write with nothing to do).
+    # candidate while ``_small_files`` yields it — the same test
+    # ``should_compact_small_files`` gates on, so the gate and the candidate
+    # set can never disagree (a gate that opens on files this loop then skips
+    # would spin, re-firing every write with nothing to do).
     # When ``small_only=False`` every file is a candidate.
-    threshold = _small_file_threshold(max_mem)
-    candidates: List[Tuple[str, int]] = []
-    for resource in resources:
-        file_path = resource.get("file")
-        if not file_path:
-            continue
-        file_size = int(resource.get("file_size") or 0)
-        if small_only and file_size >= threshold:
-            continue
-        candidates.append((file_path, file_size))
+    decoded_cap = _decoded_size_cap(max_mem)
+    candidates: List[Tuple[str, int]]
+    if small_only:
+        candidates = [
+            (resource["file"], size) for resource, size in _small_files(resources, max_mem)
+        ]
+    else:
+        candidates = [
+            (resource["file"], int(resource.get("file_size") or 0))
+            for resource in resources if resource.get("file")
+        ]
 
     if not candidates:
         return 0, 0, [], set()
@@ -624,14 +840,19 @@ def compact_resources(
     sunset_files: Set[str] = set()
     total_rows = 0
     chunk_size_bytes = 0
+    # Estimated decoded size of the frames buffered for the current chunk: the
+    # second flush bound, see ``_COMPACTION_DECODED_RATIO``.  Taken from the
+    # frames as read, after any dead rows are dropped, so it is what is
+    # resident and does not depend on what the snapshot recorded.
+    chunk_decoded_bytes = 0
     # Survivor frames for the chunk currently being buffered.  They are merged
     # ONCE, at flush, by ``concat_fold_equivalent`` — folding them pairwise
     # here re-projected and re-copied the whole accumulated buffer on every
     # file, which is O(F x rows) of pure copying (O(F^2) for similar-sized
     # files) and fires precisely when there are many small files to merge.
-    # The flush boundary is unaffected: it is driven by ``chunk_size_bytes``,
-    # accumulated from each file's on-disk size, never from the merged frame —
-    # so the same set of frames is resident either way.
+    # The flush boundary is unaffected: it is driven by ``chunk_size_bytes``
+    # and ``chunk_decoded_bytes``, accumulated per file as it is read, never
+    # from the merged frame — so the same set of frames is resident either way.
     chunk_frames: List[polars.DataFrame] = []
 
     # Normalise the deletion-vector to a one-column frame ONCE, outside the
@@ -673,12 +894,19 @@ def compact_resources(
         # empty file never contributed rows *or* columns to the merged schema.
         if existing_df.height > 0:
             chunk_frames.append(existing_df)
+            chunk_decoded_bytes += _estimated_decoded_bytes(
+                existing_df.height, existing_df.width)
 
         sunset_files.add(file_path)
         chunk_size_bytes += int(file_size or 0)
 
-        # Flush when the buffered chunk exceeds the per-table memory cap.
-        if chunk_size_bytes >= max_mem:
+        # Flush when the buffered chunk reaches the per-table cap, in stored
+        # bytes or in estimated decoded bytes, whichever comes first.  A chunk
+        # closed on the second holds at least ``decoded_cap`` of rows times
+        # columns, and the file written from it has every one of those rows and
+        # no fewer columns than any source, so ``_is_small_file`` counts it as
+        # big enough: it is not merged again.
+        if chunk_size_bytes >= max_mem or chunk_decoded_bytes >= decoded_cap:
             if chunk_frames:
                 chunk_df = concat_fold_equivalent(chunk_frames)
                 total_rows += chunk_df.shape[0]
@@ -696,6 +924,7 @@ def compact_resources(
                 chunk_df = None
             chunk_frames = []
             chunk_size_bytes = 0
+            chunk_decoded_bytes = 0
 
     # Final flush — if anything remains in the buffer, write it out.
     if chunk_frames:
@@ -711,7 +940,36 @@ def compact_resources(
             footer_md_out=footer_md_out,
         )
 
+    # The frames are done with: drop this function's own references before
+    # asking for their memory to be returned.
+    chunk_df = None
+    chunk_frames = []
+    existing_df = None
+    if sunset_files:
+        with p.span("compact.release_memory"):
+            _release_merge_memory()
+
     return len(sunset_files), total_rows, new_resources, sunset_files
+
+
+def _release_merge_memory() -> None:
+    """Return to the operating system the memory a finished merge decoded into.
+
+    The files a merge reads are decoded into Arrow's memory pool, which keeps
+    what is freed for its own reuse and returns nothing by itself.  Nothing in
+    a write allocates on that scale again until the next merge, so a writer
+    process stayed as large as its largest merge so far: 350 MB of freed
+    buffers after a merge of 2,000,000 rows, measured, all of it returned by
+    this call in 50 ms (it costs in proportion to what it returns, a few
+    milliseconds for a merge of small files).
+
+    Best effort: memory another thread still uses is not touched, a pool that
+    cannot do it does nothing, and a failure is ignored.
+    """
+    try:
+        pa.default_memory_pool().release_unused()
+    except Exception as e:
+        logging.debug(f"[compact] merge memory not returned to the system: {e}")
 
 
 # =========================
@@ -781,6 +1039,29 @@ def write_parquet_and_collect_resources(
         _write_single_parquet_file(write_df, overwrite_columns, data_dir, new_resources, compression_level, profiler=profiler, footer_md_out=footer_md_out)
 
 
+def _rows_already_in_order(write_df: polars.DataFrame, sort_cols: List[str]) -> bool:
+    """True when sorting *write_df* by *sort_cols* would leave every row in place.
+
+    Files written one after another carry ascending ``__timestamp__`` values,
+    so a merge that reads them in snapshot order concatenates rows that are in
+    order already.  Sorting them anyway moves nothing and is not free: polars
+    first makes the frame contiguous and then gathers it, two more copies of
+    the decoded rows (measured: a merge held 3.7 times its decoded input with
+    the sort and 1.7 times without) and a tenth to a quarter of the merge's
+    time.  ``is_sorted`` reads the one column and copies nothing.
+
+    Answered only for the case every writer in this module is in, a sort by
+    ``__timestamp__`` alone; any other sort is performed as before.  ``False``
+    is always safe: it means "sort".
+    """
+    if sort_cols != ["__timestamp__"]:
+        return False
+    try:
+        return bool(write_df.get_column("__timestamp__").is_sorted())
+    except Exception:
+        return False
+
+
 def _write_single_parquet_file(
         write_df, overwrite_columns, target_dir, new_resources, compression_level=10,
         profiler: Optional[Profiler] = None,
@@ -814,7 +1095,7 @@ def _write_single_parquet_file(
         (["__timestamp__"] if "__timestamp__" in write_df.columns else [])
         + [c for c in (overwrite_columns or []) if c in write_df.columns and c != "__timestamp__"]
     )
-    if sort_cols and write_df.height > 0:
+    if sort_cols and write_df.height > 0 and not _rows_already_in_order(write_df, sort_cols):
         with p.span("write.sort"):
             write_df = write_df.sort(sort_cols)
 

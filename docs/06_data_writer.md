@@ -143,7 +143,7 @@ All existing resources begin as candidates when overwrite keys are supplied. A s
 
 If `SUPERTABLE_DUCKDB_WRITE_PROBE` is enabled, matching first tries a DuckDB scan projecting the keys, row ID, optional comparison column, and filename. It joins against distinct incoming keys and resolves storage paths, with a presigned-URL retry for selected failures. Unavailable or failed probing falls back to projected Polars reads.
 
-New Parquet data uses Zstandard, the requested compression level, statistics, and row groups of 122,880 rows. Ordinary writes pass no overwrite sort columns to the file writer; sorting is by `__timestamp__` when present. A write does not split its incoming frame into bounded-memory chunks using `max_memory_chunk_size`: that setting chiefly controls compaction decisions and grouping.
+New Parquet data uses Zstandard, the requested compression level, statistics, and row groups of 122,880 rows. Ordinary writes pass no overwrite sort columns to the file writer; sorting is by `__timestamp__` when present. Rows that are already in `__timestamp__` order are encoded as they are: the rows of one write share a timestamp, and a merge of files written one after another concatenates them in order, so only a frame whose rows are out of order is sorted. A write does not split its incoming frame into bounded-memory chunks using `max_memory_chunk_size`: that setting chiefly controls compaction decisions and grouping.
 
 ## Tombstones and automatic compaction
 
@@ -151,9 +151,17 @@ Tombstones contain `(file, __rowid__)` pairs. New deletions normally add a Parqu
 
 A resource whose deleted count reaches its physical row count is removed from the next snapshot, along with unnecessary tombstone entries. This is logical reclamation: the old data object is retained.
 
-The small-file cutoff is `max(1, int(max_memory_chunk_size * 0.75))`. Automatic small-file compaction triggers when the count of files below that cutoff reaches `max_overlapping_files`, or their combined stored bytes exceed `max_memory_chunk_size`. Tombstone compaction triggers when the current combined deletion vector reaches `max_tombstone_rows`; the small-file trigger can also cause tombstones to be drained first.
+A file is small while both of these hold: its stored size is under `max(1, int(max_memory_chunk_size * 0.75))`, and its estimated decoded size, rows × columns × 8 bytes, is under three quarters of 32 times `max_memory_chunk_size` (384 MiB at the default). A resource that records no row or column count is judged on its stored size alone. Automatic small-file compaction triggers when the count of small files reaches `max_overlapping_files`, or their combined stored bytes exceed `max_memory_chunk_size`. Tombstone compaction triggers when the current combined deletion vector reaches `max_tombstone_rows`; the small-file trigger can also cause tombstones to be drained first.
 
-Compaction reads and rewrites selected live rows, preserves row IDs, unions frame schemas, and removes replaced resources from the next snapshot. Grouping uses stored file sizes, so the memory setting is not a hard limit on decoded memory consumption. Small-file reads can be skipped by the helper on missing/unreadable files; source data is not universally validated as part of compaction.
+Which small files a write then merges depends on what opened the gate:
+
+- All of them, when their stored bytes exceed `max_memory_chunk_size` or their estimated decoded size reaches the threshold above. What is written is then big enough not to be merged again.
+- Otherwise the file count opened the gate, and merging everything would write one more small file. A file is left out while it holds more than a tenth of the rows being merged, largest first. It stays in the snapshot untouched and is merged by a later write, once about ten files of its size have gathered. A file that an earlier merge wrote is therefore not read back and rewritten by every merge after it.
+- All of them again, if leaving files out would leave more than half of `max_overlapping_files` small files behind. Leaving one file out takes ten others to merge, so a table whose `max_overlapping_files` is ten or less merges all.
+
+Explicit `compact()` merges every small file.
+
+Compaction reads and rewrites selected live rows, preserves row IDs, unions frame schemas, and removes replaced resources from the next snapshot. A merged file is closed when the stored bytes of its source files reach `max_memory_chunk_size` or their estimated decoded size reaches 32 times that (512 MiB at the default), whichever comes first. The second bound only comes into play for data stored in about a quarter of a byte a value or less; anything that compresses less reaches the stored bytes first. The estimate assumes 8 bytes a value and long strings decode to more, so it is not a hard limit on decoded memory consumption. After a merge the memory its files were decoded into is returned to the operating system (`release_unused` on Arrow's default pool). Small-file reads can be skipped by the helper on missing/unreadable files; source data is not universally validated as part of compaction.
 
 Neither an explicit `compact()` nor a write that compacts on its way reads back the files it writes. The footer of each new file is parsed from the bytes as they are uploaded (`footer_md_out` on `compact_tombstones` and `compact_resources`; a write puts them beside the footer of its incoming file), and the stats artifact and the new snapshot's schema are derived from those footers. A file whose footer was not kept is read from storage for them, as before.
 
