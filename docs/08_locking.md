@@ -43,7 +43,7 @@ After the first successful acquisition, the lock manager starts a daemon heartbe
 
 When renewal returns false, the manager removes that token from its held set and records it as lost. Up to 1,024 lost `(key, token)` pairs are retained. Subsequent `is_held()` checks for those pairs immediately return false. The heartbeat does not reacquire a lost lock or interrupt application code already running.
 
-The heartbeat stops when normal releases empty the held set. An `atexit` handler attempts to release all remaining tokens. A process exit that bypasses cleanup leaves expiry as the recovery mechanism.
+The heartbeat stops when normal releases empty the held set. One `atexit` handler, shared by every lock manager of the process, attempts to release the tokens still held at exit. It knows a manager only while that manager holds a lock: a successful acquisition notes it, and the release or the loss of its last lock forgets it. A manager that holds nothing is therefore freed with the catalog that built it; a manager that holds a lock is kept until the lock is released or lost, whether or not anything else still refers to it. A process exit that bypasses cleanup leaves expiry as the recovery mechanism.
 
 An explicit `extend()` renews Redis for that call; it does not update the TTL stored for future heartbeat renewals. Very short TTLs should be evaluated against the one-second minimum heartbeat interval.
 

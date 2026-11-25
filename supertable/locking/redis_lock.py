@@ -10,6 +10,11 @@ so operations of any duration are safe. The TTL controls *crash recovery
 time*, not operation timeout: if the holder dies, the heartbeat dies with
 it, and the lock expires within one TTL cycle.
 
+Locks still held when the interpreter exits are released by one exit hook,
+shared by every instance (see "Exit cleanup" below). An instance is known to
+it only while it holds a lock, so one that holds none is freed like any other
+object.
+
 This module does NOT create its own Redis connection. It receives a
 ``redis.Redis`` client from the caller — ensuring it always participates
 in whatever connection topology (Sentinel, SSL, etc.) the application uses.
@@ -35,7 +40,7 @@ import time
 import threading
 import uuid
 from collections import OrderedDict
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 import redis
 from supertable.config.defaults import logger
@@ -65,6 +70,52 @@ if cur and cur == token then
 end
 return 0
 """
+
+
+# -- Exit cleanup ------------------------------------------------------------ #
+#
+# A lock still held when the interpreter exits is released on the way out, so
+# the next taker does not wait out its TTL.  One exit hook does this for every
+# instance, and it knows an instance only while that instance holds a lock:
+# ``acquire`` notes it, and the release or the loss of its last lock forgets it.
+#
+# It used to be one hook per instance, registered by the constructor.  atexit
+# keeps what it is given until the process ends, so no instance was ever
+# freed, and a catalog (each with a ``RedisLocking`` of its own) is built
+# several times by every read and every write: a long-running process kept
+# 11 to 15 KB more for each of them, for as long as it ran.
+
+_holders_lock = threading.Lock()
+# Instances holding at least one lock.  Strong references on purpose: a lock
+# its owner has lost track of is still a lock to release at exit.
+_holders: "Set[RedisLocking]" = set()
+
+
+def _note_holder(locker: "RedisLocking") -> None:
+    """*locker* holds a lock: release what it still holds at exit."""
+    with _holders_lock:
+        _holders.add(locker)
+
+
+def _forget_holder(locker: "RedisLocking") -> None:
+    """*locker* holds no lock any more: nothing of its is left to release."""
+    with _holders_lock:
+        _holders.discard(locker)
+
+
+def _release_held_locks() -> None:
+    """Exit hook: best-effort release of every lock still held, by anyone."""
+    with _holders_lock:
+        lockers = list(_holders)
+    for locker in lockers:
+        try:
+            locker._on_exit()
+        except Exception as e:
+            # One instance failing must not keep the others' locks held.
+            logger.debug(f"[redis-lock] exit cleanup error: {e}")
+
+
+atexit.register(_release_held_locks)
 
 
 class RedisLocking:
@@ -102,7 +153,10 @@ class RedisLocking:
         self._hb_stop = threading.Event()
         self._hb_thread: Optional[threading.Thread] = None
 
-        atexit.register(self._on_exit)
+        # Nothing is registered for exit here: the module's one exit hook
+        # learns of this instance when it first holds a lock (see
+        # ``_note_holder``).  Registering ``self._on_exit`` kept every
+        # instance alive until the process ended.
 
     # ------------------------------------------------------------------ acquire
 
@@ -133,6 +187,7 @@ class RedisLocking:
                     with self._held_lock:
                         self._held[key] = (token, ttl_ms)
                         self._lost.pop((key, token), None)
+                        _note_holder(self)
                         if self._hb_thread is None or not self._hb_thread.is_alive():
                             self._start_heartbeat()
                     return token
@@ -195,6 +250,7 @@ class RedisLocking:
                 del self._held[key]
             if not self._held:
                 should_stop_hb = True
+                _forget_holder(self)
 
         if should_stop_hb:
             self._stop_heartbeat()
@@ -274,6 +330,8 @@ class RedisLocking:
                             held_entry = self._held.get(key)
                             if held_entry is not None and held_entry[0] == token:
                                 del self._held[key]
+                            if not self._held:
+                                _forget_holder(self)
                 except Exception as e:
                     logger.debug(f"[redis-lock] heartbeat error on {key}: {e}")
 
