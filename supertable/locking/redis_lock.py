@@ -210,9 +210,8 @@ class RedisLocking:
         whether it is safe to publish a mutation, and "unknown" must not be
         treated as "safe".
         """
-        with self._held_lock:
-            if (key, token) in self._lost:
-                return False
+        if self.is_known_lost(key, token):
+            return False
         try:
             cur = self.r.get(key)
         except redis.RedisError as e:
@@ -221,6 +220,20 @@ class RedisLocking:
         if isinstance(cur, bytes):
             cur = cur.decode("utf-8", "replace")
         return cur == token
+
+    def is_known_lost(self, key: str, token: str) -> bool:
+        """Return True when the heartbeat has recorded that *token* lost *key*.
+
+        The first of the two signals of :meth:`is_held`, the one this process
+        holds itself: no round trip to Redis.  A caller that has Redis compare
+        the token inside the script that publishes (the catalog's one-script
+        commit) asks this first.  It is not redundant with that comparison: a
+        heartbeat that could not renew the lock stops renewing it, and the
+        loss counts from then on, while the key goes on holding the token
+        until its time runs out.
+        """
+        with self._held_lock:
+            return (key, token) in self._lost
 
     # ------------------------------------------------------------------ release
 

@@ -23,7 +23,7 @@ from supertable.super_table import SuperTable
 from supertable import redis_keys as RK
 from supertable.simple_table import SimpleTable
 from supertable.utils.timer import Timer
-from supertable.utils.profiler import Profiler
+from supertable.utils.profiler import Profiler, get_null_profiler
 from supertable.processing import (
     ROWID_COL,
     load_tombstone_parts,
@@ -151,11 +151,12 @@ class DataWriter:
     def _assert_lock_still_held(self, simple_name: str, token, lp) -> None:
         """Abort before publishing if this writer no longer owns the lock.
 
-        Called immediately before the leaf commit.  A residual race remains
-        between this check and the commit (one Redis round-trip); closing it
-        fully needs the ownership test and the leaf SET in one script.  This
-        still turns the common case — a lock lost minutes earlier, during the
-        parquet writes — from a silent clobber into a loud failure.
+        Called immediately before the leaf commit, when the commit is made in
+        three steps (see ``_publish_snapshot``, whose one-script commit has
+        Redis make this test and the leaf SET together).  Here a residual race
+        remains between this check and the commit (one Redis round-trip).
+        This still turns the common case — a lock lost minutes earlier, during
+        the parquet writes — from a silent clobber into a loud failure.
 
         Tolerant of catalogs that predate ``verify_simple_lock`` (and of test
         doubles): a missing method skips the check rather than failing the
@@ -182,6 +183,69 @@ class DataWriter:
                 self.super_table.super_name,
                 simple_name,
             )
+
+    def _publish_snapshot(self, simple_name: str, token, snapshot: dict,
+                          snapshot_path: str, lp, profiler=None) -> None:
+        """Make *snapshot* the table's current one: lock check, leaf, root bump.
+
+        One round trip to Redis where there were three.  The catalog's
+        ``commit_leaf_and_bump_root`` has Redis compare the lock token, set
+        the leaf and bump the root in one script, which also closes the gap
+        ``_assert_lock_still_held`` describes: nothing can take the lock
+        between the check and the commit.  ``LockLostError`` means what it
+        meant, and nothing was published.
+
+        The three calls remain, as the way to publish when the one script is
+        not to be had: a catalog that predates it or a test double (anything
+        whose answer is not the two versions the script returns), a write
+        without a lock token, and a failure of the call itself.  That last
+        case covers the snapshot the leaf cannot hold (a number that is not
+        finite), which is refused before anything is sent and then stored as
+        a path-only leaf, as before.  The script reads all it reads before it
+        writes, so after an error from Redis nothing was half done; should the
+        error have come after it finished, the three calls publish the same
+        snapshot once more.
+        """
+        org, sup = self.super_table.organization, self.super_table.super_name
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        p = profiler if profiler is not None else get_null_profiler()
+
+        in_one_script = getattr(self.catalog, "commit_leaf_and_bump_root", None) if token else None
+        if callable(in_one_script):
+            versions = None
+            with p.span("redis.set_leaf"):
+                try:
+                    versions = in_one_script(
+                        org, sup, simple_name, snapshot, snapshot_path,
+                        now_ms=now_ms, lock_token=token,
+                    )
+                except LockLostError:
+                    raise
+                except Exception as e:
+                    logger.debug(lp(f"one-script commit not done, publishing in three steps: {e}"))
+            if type(versions) is tuple and len(versions) == 2:
+                # The root was bumped by the same script; the span is kept so
+                # that a write still reports both timings.
+                with p.span("redis.bump_root"):
+                    pass
+                return
+
+        # --- The three steps -------------------------------------------------
+        self._assert_lock_still_held(simple_name, token, lp)
+
+        with p.span("redis.set_leaf"):
+            try:
+                self.catalog.set_leaf_payload_cas(
+                    org, sup, simple_name, snapshot, snapshot_path, now_ms=now_ms,
+                )
+            except Exception:
+                # Backward compatible fallback.
+                self.catalog.set_leaf_path_cas(
+                    org, sup, simple_name, snapshot_path, now_ms=now_ms,
+                )
+
+        with p.span("redis.bump_root"):
+            self.catalog.bump_root(org, sup, now_ms=now_ms)
 
     def _get_table_config(self, simple_name: str) -> dict:
         """Return table config from local cache, falling back to Redis once."""
@@ -1195,42 +1259,17 @@ class DataWriter:
                 )
                 mark("update_simple")
 
-                # --- Fence: refuse to publish without the lock --------------------
+                # --- Fence + publish: lock still ours, leaf pointer, root bump ----
                 # The leaf write is last-write-wins, so committing after losing
                 # the lock silently clobbers whichever writer took it next.  The
                 # heartbeat can lose a lock mid-write (process stalled past the
                 # TTL, key evicted, operator DEL), and until this check nothing
                 # told the writer.  Everything written so far is immutable and
                 # unreferenced, so aborting here leaks only harmless garbage.
-                self._assert_lock_still_held(simple_name, token, lp)
-
-                # --- CAS set leaf pointer + atomic root bump ----------------------
-                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-                payload = new_snapshot_dict
-
-                with profiler.span("redis.set_leaf"):
-                    try:
-                        self.catalog.set_leaf_payload_cas(
-                            self.super_table.organization,
-                            self.super_table.super_name,
-                            simple_name,
-                            payload,
-                            new_snapshot_path,
-                            now_ms=now_ms,
-                        )
-                    except Exception:
-                        # Backward compatible fallback.
-                        self.catalog.set_leaf_path_cas(
-                            self.super_table.organization,
-                            self.super_table.super_name,
-                            simple_name,
-                            new_snapshot_path,
-                            now_ms=now_ms,
-                        )
-
-                with profiler.span("redis.bump_root"):
-                    self.catalog.bump_root(self.super_table.organization, self.super_table.super_name, now_ms=now_ms)
+                self._publish_snapshot(
+                    simple_name, token, new_snapshot_dict, new_snapshot_path, lp,
+                    profiler=profiler,
+                )
                 mark("bump_root")
 
                 # --- Store schema + table name in Redis (permanent, not cache) ---
@@ -1806,36 +1845,12 @@ class DataWriter:
                 )
                 mark("update_simple")
 
-                # --- Fence: refuse to publish without the lock -------------------
+                # --- Fence + publish: lock still ours, leaf pointer, root bump ---
                 # Same hazard as write(): compaction sunsets files, so
                 # committing without the lock can drop a concurrent writer's
                 # resources from the snapshot.
-                self._assert_lock_still_held(simple_name, token, lp)
-
-                # --- CAS set leaf pointer + atomic root bump ---------------------
-                now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-                payload = new_snapshot_dict
-                try:
-                    self.catalog.set_leaf_payload_cas(
-                        self.super_table.organization,
-                        self.super_table.super_name,
-                        simple_name,
-                        payload,
-                        new_snapshot_path,
-                        now_ms=now_ms,
-                    )
-                except Exception:
-                    self.catalog.set_leaf_path_cas(
-                        self.super_table.organization,
-                        self.super_table.super_name,
-                        simple_name,
-                        new_snapshot_path,
-                        now_ms=now_ms,
-                    )
-                self.catalog.bump_root(
-                    self.super_table.organization,
-                    self.super_table.super_name,
-                    now_ms=now_ms,
+                self._publish_snapshot(
+                    simple_name, token, new_snapshot_dict, new_snapshot_path, lp,
                 )
                 mark("bump_root")
 

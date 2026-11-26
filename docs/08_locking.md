@@ -30,6 +30,7 @@ Each acquisition creates a fresh UUID-hex token. Redis `SET key token NX EX ttl`
 | --- | --- |
 | `acquire(key, ttl_s=30, timeout_s=30, retry_interval=0.05)` | Token on success; `None` after the retry deadline |
 | `is_held(key, token)` | True only if Redis holds that token and it has not been recorded as lost |
+| `is_known_lost(key, token)` | True when the heartbeat has recorded that token's loss of the key; no Redis call |
 | `release(key, token)` | True only when a Lua comparison deletes the matching token |
 | `extend(key, token, ttl_ms)` | True only when a Lua comparison renews the matching token with `PEXPIRE` |
 
@@ -51,9 +52,9 @@ An explicit `extend()` renews Redis for that call; it does not update the TTL st
 
 `DataWriter.write()` and `DataWriter.compact()` acquire a simple-table lock using a 30-second TTL and a 60-second acquisition timeout. They release it in `finally`. The lock covers reading the current snapshot, generating data and metadata, publishing the leaf, and bumping the root version.
 
-Immediately before publishing a new leaf, the writer calls `_assert_lock_still_held()`. A literal false result raises `LockLostError`. The normal catalog's ownership checker returns false when Redis cannot be read. The compatibility helper skips verification if the catalog lacks the method or if that method itself raises.
+The writer publishes through `RedisCatalog.commit_leaf_and_bump_root()`: one Lua script compares the lock token with the lock key, replaces the leaf and bumps the root version. A token that no longer holds the lock, or whose loss the heartbeat recorded (`is_known_lost()`, asked before the script is sent), raises `LockLostError`, and nothing is published. The comparison and the publication being one script, no other writer can take the lock between them.
 
-The ownership check and leaf publication are separate Redis operations. The leaf update Lua script does not receive the lock token and does not compare an expected version. There is consequently a gap between successful verification and publication in which the lease can expire. See [catalog consistency](05_redis_catalog.md) for the exact atomic operations.
+When that script is not to be had (a catalog without the method, a failure of the call, a snapshot the leaf cannot hold) the writer takes the three steps it took before: `_assert_lock_still_held()`, the leaf script, the root script. There a literal false result raises `LockLostError`; the normal catalog's ownership checker returns false when Redis cannot be read; the compatibility helper skips verification if the catalog lacks the method or if that method itself raises. In those three steps the ownership check and leaf publication are separate Redis operations, with a gap between successful verification and publication in which the lease can expire. Neither way compares an expected leaf version. See [catalog consistency](05_redis_catalog.md) for the exact atomic operations.
 
 ## Lock key scope
 

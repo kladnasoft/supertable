@@ -7,7 +7,7 @@ import re
 import time
 import hashlib
 import secrets
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Set
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import redis
 from supertable.config.defaults import logger
@@ -17,6 +17,7 @@ try:
 except ImportError:  # pragma: no cover
     from redis_connector import RedisConnector, RedisOptions
 
+from supertable.errors import LockLostError
 from supertable.locking.redis_lock import RedisLocking
 from supertable.rbac.permissions import RoleType as _RoleType
 from supertable import redis_keys as RK
@@ -330,6 +331,44 @@ redis.call('SET', key, cjson.encode(doc))
 return doc['version']
 """
 
+    # A commit in one round trip: is the table lock still ours, the leaf, the
+    # root.  They were three calls (a GET of the lock key compared here, then
+    # the two scripts above), and between the first and the second another
+    # writer could take the lock and commit, to be overwritten by this one.
+    # Inside one script nothing comes between: Redis runs a script whole.
+    #
+    # The two scripts above are used as they are, as two functions, so the
+    # leaf and the root this script stores are the ones they store.
+    #
+    #   KEYS  leaf, root, lock
+    #   ARGV  payload JSON, snapshot path, now in ms, lock token ('' = no check)
+    #   ->    {1, leaf version, root version}, or {0}: the lock key does not
+    #         hold the token, and nothing was written
+    #
+    # Everything that can fail to be read is read before the first write: the
+    # lock, the root (once more than the root script needs, for this reason)
+    # and the leaf.  So an error leaves both documents as they were.
+    _LUA_LEAF_COMMIT_FENCED = (
+        "local function commit_leaf(KEYS, ARGV)\n"
+        + _LUA_LEAF_PAYLOAD_CAS_SET
+        + "\nend\n"
+        + "local function bump_root(KEYS, ARGV)\n"
+        + _LUA_ROOT_BUMP
+        + "\nend\n"
+        + """
+local token = ARGV[4]
+if token and token ~= '' then
+  if redis.call('GET', KEYS[3]) ~= token then
+    return {0}
+  end
+end
+redis.call('GET', KEYS[2])
+local leaf_version = commit_leaf({KEYS[1]}, {ARGV[1], ARGV[2], ARGV[3]})
+local root_version = bump_root({KEYS[2]}, {ARGV[3]})
+return {1, leaf_version, root_version}
+"""
+    )
+
     # ------------- RBAC Lua scripts ------------- #
 
     _LUA_RBAC_BUMP_META = """
@@ -543,6 +582,7 @@ return generation
         self._leaf_cas_set = self.r.register_script(self._LUA_LEAF_CAS_SET)
         self._leaf_payload_cas_set = self.r.register_script(self._LUA_LEAF_PAYLOAD_CAS_SET)
         self._root_bump = self.r.register_script(self._LUA_ROOT_BUMP)
+        self._leaf_commit_fenced = self.r.register_script(self._LUA_LEAF_COMMIT_FENCED)
 
         # Distributed locking (delegates to supertable.locking.redis_lock)
         self._locker = RedisLocking(self.r)
@@ -852,23 +892,10 @@ return generation
         it as it came.
         """
         try:
-            payload_json = json.dumps(payload or {}, allow_nan=False, separators=(",", ":"))
-        except ValueError:
-            # Either a number that is not finite, or something that cannot be
-            # serialised at all (a circular reference), which was stored as an
-            # empty payload and still is.
-            try:
-                json.dumps(payload or {})
-            except Exception:
-                payload_json = "{}"
-            else:
-                error = redis.ResponseError(
-                    "leaf payload holds a number that is not finite (NaN or Infinity)"
-                )
-                logger.error(f"[redis-catalog] leaf_payload_cas_set error: {error}")
-                raise error
-        except Exception:
-            payload_json = "{}"
+            payload_json = self._leaf_payload_text(payload)
+        except redis.ResponseError as error:
+            logger.error(f"[redis-catalog] leaf_payload_cas_set error: {error}")
+            raise
 
         try:
             return int(
@@ -884,6 +911,80 @@ return generation
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] leaf_payload_cas_set error: {e}")
             raise
+
+    @staticmethod
+    def _leaf_payload_text(payload: Any) -> str:
+        """The JSON text a leaf payload is stored as.
+
+        Raises ``redis.ResponseError`` for a payload holding a number that is
+        not finite, whose text would not be JSON.  Something that cannot be
+        serialised at all (a circular reference, an object of no JSON type)
+        is an empty payload, as it always was.
+        """
+        try:
+            return json.dumps(payload or {}, allow_nan=False, separators=(",", ":"))
+        except ValueError:
+            # Either a number that is not finite, or something that cannot be
+            # serialised at all (a circular reference), which was stored as an
+            # empty payload and still is.
+            try:
+                json.dumps(payload or {})
+            except Exception:
+                return "{}"
+            raise redis.ResponseError(
+                "leaf payload holds a number that is not finite (NaN or Infinity)"
+            )
+        except Exception:
+            return "{}"
+
+    def commit_leaf_and_bump_root(
+            self,
+            org: str,
+            sup: str,
+            simple: str,
+            payload: Dict[str, Any],
+            path: str,
+            now_ms: Optional[int] = None,
+            lock_token: Optional[str] = None,
+    ) -> Tuple[int, int]:
+        """Publish a table's new snapshot in one round trip: lock, leaf, root.
+
+        What ``verify_simple_lock``, ``set_leaf_payload_cas`` and ``bump_root``
+        do one after another, done by one script, so that no other writer can
+        take the lock and commit between the check and this commit.  The leaf
+        and the root stored are the ones those two methods store.
+
+        Returns ``(leaf version, root version)``.
+
+        Raises ``LockLostError``, with nothing written, when *lock_token* no
+        longer holds the table's lock: the heartbeat has recorded its loss, or
+        the lock key holds something else.  Without a *lock_token* nothing is
+        checked.
+
+        Raises ``redis.ResponseError``, with nothing sent, for a payload
+        holding a number that is not finite, as ``set_leaf_payload_cas`` does;
+        any other ``redis.RedisError`` is logged and raised.  Everything the
+        script reads it reads before it writes, so an error from Redis leaves
+        the leaf and the root as they were.
+        """
+        lock_key = RK.lock_leaf(org, sup, simple)
+        if lock_token and self._locker.is_known_lost(lock_key, lock_token):
+            raise LockLostError(org, sup, simple)
+        payload_json = self._leaf_payload_text(payload)
+        try:
+            reply = self._leaf_commit_fenced(
+                keys=[RK.meta_leaf(org, sup, simple), RK.meta_root(org, sup), lock_key],
+                args=[payload_json, path, int(now_ms or _now_ms()), lock_token or ""],
+            )
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] commit_leaf_and_bump_root error: {e}")
+            raise
+        if isinstance(reply, (list, tuple)) and reply:
+            if int(reply[0]) == 1 and len(reply) == 3:
+                return int(reply[1] or 0), int(reply[2] or 0)
+            if int(reply[0]) == 0:
+                raise LockLostError(org, sup, simple)
+        raise redis.ResponseError(f"unexpected reply from the commit script: {reply!r}")
 
     # ------------- Mirror formats (Redis-backed) -------------
 
