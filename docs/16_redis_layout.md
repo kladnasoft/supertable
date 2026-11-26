@@ -80,7 +80,7 @@ The stage's data-file index is a storage JSON file, `<org>/<sup>/staging/<stage>
 | `rbac_role_doc` | `L:rbac:roles:doc:<role_id>` | Hash: role fields; structured fields are JSON strings |
 | `rbac_role_type_index` | `L:rbac:roles:type:doc:<role_type>` | Set of role IDs of that type |
 
-`rbac_user_doc_prefix()` and `rbac_role_type_index_prefix()` expose the respective prefixes for Lua operations. Human-readable usernames and role names are hash fields, not key segments, and have separate validators. See [RBAC](11_rbac.md).
+`rbac_user_doc_prefix()`, `rbac_role_doc_prefix()` and `rbac_role_type_index_prefix()` expose the respective prefixes for Lua operations. Human-readable usernames and role names are hash fields, not key segments, and have separate validators. See [RBAC](11_rbac.md).
 
 ## Organization system state
 

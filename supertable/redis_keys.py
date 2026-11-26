@@ -823,6 +823,22 @@ def rbac_role_doc(org: str, sup: str, role_id: str) -> str:
     )
 
 
+def rbac_role_doc_prefix(org: str, sup: str) -> str:
+    """Prefix (ending with ``doc:``) of :func:`rbac_role_doc`, for use inside Lua.
+
+    The script that reads a role by its name learns the role's id from the
+    name index and reads the document in the same step, so the document's key
+    is assembled in Lua from this prefix.  The id appended there has not been
+    through ``_safe``: whoever takes the script's reply puts the id through
+    :func:`rbac_role_doc` before using what was read
+    (``RedisCatalog.rbac_access_read`` does).
+    """
+    return (
+        f"{SUPERTABLE_PREFIX}:{_safe('org', org)}:{LAKES_SCOPE}"
+        f":{_safe('sup', sup)}:rbac:roles:doc:"
+    )
+
+
 def rbac_role_type_index(org: str, sup: str, role_type: str) -> str:
     """Role IDs grouped by type (SET)."""
     return (

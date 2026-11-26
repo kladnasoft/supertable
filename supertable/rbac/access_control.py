@@ -1,5 +1,6 @@
 # supertable/rbac/access_control.py
 
+import json as _json
 from typing import Any, Dict, List, Tuple
 
 import redis as _redis
@@ -23,7 +24,17 @@ def _resolve_role(role_manager: RoleManager, role_name: str) -> dict:
 
     Raises ``PermissionError`` if the role does not exist or is disabled.
     """
-    role_info = role_manager.get_role_by_name(role_name)
+    return _usable_role(role_manager.get_role_by_name(role_name), role_name)
+
+
+def _usable_role(role_info: dict, role_name: str) -> dict:
+    """The role document read for *role_name*, if it is one that can be used.
+
+    The half of :func:`_resolve_role` that follows the lookup, for a caller
+    that has read the document some other way.
+
+    Raises ``PermissionError`` if the role does not exist or is disabled.
+    """
     if not role_info:
         logger.error(f"Role not found: {role_name}")
         raise PermissionError(f"Invalid or nonexistent role: {role_name}")
@@ -127,7 +138,22 @@ def _check_scope_access(
     """
     role_manager = RoleManager(super_name=super_name, organization=organization)
     role_info = _resolve_role(role_manager, role_name)
+    _require_permission(role_info, role_name, permission, label)
+    return role_info
 
+
+def _require_permission(
+    role_info: dict,
+    role_name: str,
+    permission: Permission,
+    label: str,
+) -> None:
+    """Require that the role document's type holds *permission*.
+
+    The half of :func:`_check_scope_access` that follows the role's
+    resolution.  Raises ``PermissionError`` for a document without a role
+    type, with one that is no ``RoleType``, or whose type lacks *permission*.
+    """
     role_type_str = role_info.get("role")
     if not role_type_str:
         logger.error(f"Role '{role_name}' has no role type")
@@ -142,8 +168,6 @@ def _check_scope_access(
     if not has_permission(role_type, permission):
         logger.error(f"Role '{role_name}' does not have {permission.name} permission.")
         raise PermissionError(f"You don't have permission to {label}.")
-
-    return role_info
 
 
 def _check_readonly_guard(super_name: str, organization: str, label: str) -> None:
@@ -170,15 +194,34 @@ def _check_readonly_guard(super_name: str, organization: str, label: str) -> Non
     except PermissionError:
         raise
     except Exception as e:
-        logger.error(
-            "[readonly-guard] cannot determine read-only state of %s/%s: %s "
-            "— refusing rather than assuming writable",
-            organization, super_name, e,
-        )
-        raise PermissionError(
-            f"Cannot verify whether this SuperTable is read-only. Cannot {label}."
-        )
+        raise _unverifiable_root(super_name, organization, label, e)
 
+    _refuse_if_read_only(root, label)
+
+
+def _unverifiable_root(
+    super_name: str, organization: str, label: str, error: Exception,
+) -> PermissionError:
+    """Log that the lake's read-only state cannot be told; return the refusal.
+
+    The fail-closed half of :func:`_check_readonly_guard`, for its two
+    readers of the root document.  The caller raises what is returned.
+    """
+    logger.error(
+        "[readonly-guard] cannot determine read-only state of %s/%s: %s "
+        "— refusing rather than assuming writable",
+        organization, super_name, error,
+    )
+    return PermissionError(
+        f"Cannot verify whether this SuperTable is read-only. Cannot {label}."
+    )
+
+
+def _refuse_if_read_only(root, label: str) -> None:
+    """Raise ``PermissionError`` when *root* marks the lake as read-only.
+
+    What :func:`_check_readonly_guard` decides once it has the root document.
+    """
     if root and root.get("read_only"):
         clone_type = root.get("clone_type", "")
         if clone_type == "replica":
@@ -192,6 +235,60 @@ def _check_readonly_guard(super_name: str, organization: str, label: str) -> Non
         raise PermissionError(
             f"This SuperTable is {reason}. Cannot {label}."
         )
+
+
+def _guard_and_role_in_one_read(
+    super_name: str,
+    organization: str,
+    role_name: str,
+    label: str,
+):
+    """The read-only guard and the role's lookup, on one read of Redis.
+
+    A mutation's access check read Redis five times, one round trip each: the
+    lake's root for :func:`_check_readonly_guard`, two checks that the role
+    store is initialised when ``RoleManager`` is constructed, the role name's
+    id and the role's document.  ``RoleManager.read_for_access_check`` reads
+    the five at once.
+
+    Returns the role document for *role_name* (``{}`` when the name stands
+    for no role), with the guard already applied to the root read with it:
+    ``PermissionError`` is raised here for a lake that is read-only, or whose
+    root document cannot be read as one, exactly as the guard raises it.
+
+    Returns ``None`` when that one read is not to be had, and the caller then
+    checks as it always did, with the guard's own read and a constructed
+    ``RoleManager``: the role store is not initialised, the collaborators are
+    not the ones that know the read (an older catalog, a test double in the
+    place of ``RoleManager`` or ``RedisCatalog``), or the read failed.  A read
+    that failed says nothing about the lake: the guard's own read follows it,
+    with the failure handling the guard has.
+    """
+    try:
+        reader = getattr(RoleManager, "read_for_access_check", None)
+        if not callable(reader):
+            return None
+        answer = reader(
+            super_name=super_name,
+            organization=organization,
+            role_name=role_name,
+            redis_catalog=RedisCatalog(),
+        )
+    except Exception:
+        return None
+    if type(answer) is not tuple or len(answer) != 2:
+        return None
+    root_text, role_info = answer
+    if not (root_text is None or type(root_text) is str) or type(role_info) is not dict:
+        return None
+
+    try:
+        # As RedisCatalog.get_root makes the document of the stored text.
+        root = _json.loads(root_text) if root_text else None
+    except Exception as e:
+        raise _unverifiable_root(super_name, organization, label, e)
+    _refuse_if_read_only(root, label)
+    return role_info
 
 
 def check_control_access(
@@ -246,12 +343,29 @@ def check_write_access(
     Check whether *role_name* is allowed to WRITE to *table_name*.
 
     Raises ``PermissionError`` if the role lacks the necessary permission.
+
+    One round trip to Redis where there were five: the lake's root and the
+    role are read together (:func:`_guard_and_role_in_one_read`), and the
+    checks made on them are the ones below, in the same order.  When that
+    read is not to be had, the guard and the role's lookup read Redis one
+    after the other, as before.
     """
-    _check_readonly_guard(super_name, organization, "write to this table")
-    _check_operation_access(
-        super_name, organization, role_name, table_name,
-        Permission.WRITE, "write to this table",
-    )
+    label = "write to this table"
+    role_info = _guard_and_role_in_one_read(super_name, organization, role_name, label)
+    if role_info is None:
+        _check_readonly_guard(super_name, organization, label)
+        _check_operation_access(
+            super_name, organization, role_name, table_name,
+            Permission.WRITE, label,
+        )
+        return
+
+    # The read-only guard has passed on the root read with the role.  What
+    # follows is _check_operation_access on a role document already read.
+    role_info = _usable_role(role_info, role_name)
+    _require_permission(role_info, role_name, Permission.WRITE, label)
+    role_tables = _normalize_tables(role_info.get("tables", {}))
+    _check_table_access(role_tables, table_name, label)
 
 
 def check_meta_access(
@@ -474,7 +588,6 @@ def restrict_read_access(
 # ---------------------------------------------------------------------------
 
 import hashlib as _hashlib
-import json as _json
 from dataclasses import dataclass as _dataclass
 from typing import Iterable as _Iterable, Optional as _Optional
 

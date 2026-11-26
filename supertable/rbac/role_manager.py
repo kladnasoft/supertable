@@ -157,6 +157,68 @@ class RoleManager:
             role_name=self._actor_role_name,
         )
 
+    # ── one read for an access check ────────────────────────────────── #
+
+    @classmethod
+    def read_for_access_check(
+        cls,
+        super_name: str,
+        organization: str,
+        role_name,
+        redis_catalog: Optional[RedisCatalog] = None,
+    ):
+        """The lake's root and one role, read in a single round trip.
+
+        An access check constructed a manager and asked it
+        :meth:`get_role_by_name`: four round trips to Redis (the two checks of
+        :meth:`_init_role_storage`, the name index, the role's document),
+        after a fifth for the lake's root.  When the role store is
+        initialised, which is whenever the constructor would only look and do
+        nothing, ``RedisCatalog.rbac_access_read`` reads all five at once.
+
+        Returns ``(root, role)``: the text stored at the lake's root (``None``
+        for no root) and what :meth:`get_role_by_name` returns for
+        *role_name* (``{}`` for no such role).
+
+        Returns ``None`` when it is not to be had that way, and the caller
+        then constructs a manager as it always did: the role store is not
+        initialised (the constructor has work to do), the catalog has no such
+        read or did not answer with one (an older catalog, a test double, a
+        Redis that does not run the read's script), or the read failed.  No
+        instance is made and nothing is written.
+
+        This class's own read, as ``rbac_access_read`` is the catalog's: asked
+        of a subclass it answers ``None``.  It stands for what this class's
+        constructor and lookup do, and a subclass may have changed either.
+        """
+        if cls is not RoleManager:
+            return None
+        try:
+            catalog = redis_catalog or RedisCatalog()
+            read = getattr(catalog, "rbac_access_read", None)
+            if not callable(read):
+                return None
+            answer = read(organization, super_name, role_name)
+        except Exception:
+            # A Redis error was logged by the catalog.  Whatever it was, the
+            # reads the constructor and get_role_by_name make are still there
+            # to be made, and they fail, or not, as they always did.
+            return None
+        if type(answer) is not tuple or len(answer) != 4:
+            return None
+        root, role_meta_exists, superadmin_role_ids, role = answer
+        if not (root is None or type(root) is str) or type(role) is not dict:
+            return None
+        # What _init_role_storage asks before it returns without doing
+        # anything: the meta key is there, and the superadmin it finds listed
+        # is one.  It takes one of the listed ids, whichever comes first, so
+        # a list with an empty id in it is left to it as well.
+        if not role_meta_exists or type(superadmin_role_ids) is not list or not superadmin_role_ids:
+            return None
+        if not all(type(role_id) is str and role_id for role_id in superadmin_role_ids):
+            return None
+        return root, role
+
     # ── bootstrap ───────────────────────────────────────────────────── #
 
     def _init_role_storage(self) -> None:

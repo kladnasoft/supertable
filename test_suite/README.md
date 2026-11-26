@@ -84,6 +84,20 @@ releases writing one table in turn, and on the commands a commit sends. The
 real writer then goes through every kind of write, and after each one the
 entry must hold the snapshot file's document, value for value.
 
+### The reads of the access check
+
+`--write` also runs [`test_access_check_read.py`](test_access_check_read.py).
+Before a write the library reads the lake's root and the role in one Lua
+script, where it made five reads one after another, and what a script hands
+back (a key that is not there, a hash, a set) is made by the real Redis. So the
+one read is compared here with the five calls it stands for: on what it
+answers, on the commands it runs, on what the check decides either way, and on
+a read that Redis refuses, after which the five reads are made as before. The
+script is declared read-only, and only a real Redis shows what that is worth:
+while writes are paused the check is answered, as its five reads were, and the
+same script without the declaration waits with the writes. The real writer
+then writes, and its round trips are counted.
+
 ## Read half
 
 ~90 cases over a deterministic 200-row fact table plus a dimension table,

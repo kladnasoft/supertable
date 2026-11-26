@@ -113,7 +113,7 @@ The all-row scan skips missing/unreadable resources and files without `__rowid__
 
 ## Validation and permissions
 
-Writes require the role's `WRITE` permission for the target table and pass through the read-only guard. `role_name` is a role name, not a user ID or access token.
+Writes require the role's `WRITE` permission for the target table and pass through the read-only guard. `role_name` is a role name, not a user ID or access token. The guard and the role are decided on one read of Redis (`check_write_access`, through `RedisCatalog.rbac_access_read`): the lake's root, the state of the role store, and the role the name stands for. See [RBAC](11_rbac.md#6-enforcement-during-reads-and-writes) for when the five separate reads are made instead.
 
 Validation rejects an empty or overlong table name, a name equal to the SuperTable name, characters outside the table-name pattern, an overwrite-column argument that is a string, missing overwrite columns, and invalid `newer_than` arguments. Redis key construction further restricts names: ordinary SimpleTable names must be lowercase, start with a letter, contain only letters/digits/underscores, and be at most 64 characters. Internal double-underscore names use the separate form documented in [Redis layout](16_redis_layout.md). The method does not enforce a complete input type/schema contract, uniqueness, or primary-key declaration.
 
@@ -121,7 +121,7 @@ The writer overwrites incoming `__rowid__` and `__timestamp__` columns for inser
 
 ## Write sequence
 
-1. Check access, convert Arrow input to Polars, and validate arguments.
+1. Check access in one round trip to Redis (the lake's read-only flag and the role, read together), convert Arrow input to Polars, and validate arguments.
 2. Reserve table row IDs for non-delete input and assign the write timestamp. Read the cached table configuration.
 3. Acquire the SimpleTable lock with a 30-second lease and up to 60 seconds of waiting. Open or create the table and read its current snapshot. The table's catalog entry is read once for both (`SimpleTable(..., keep_leaf=True)`): that read says whether the table exists, and the snapshot is taken from what it returned.
 4. Identify candidate resources. With overwrite keys, use stored bounds to remove impossible candidates, then resolve existing matches and optional version comparisons.
@@ -133,7 +133,7 @@ The writer overwrites incoming `__rowid__` and `__timestamp__` columns for inser
 10. Refresh the schema/table-name cache and read the lake's mirror formats in one round trip (`RedisCatalog.store_schema_and_read_mirrors`), then invoke the mirrors that read named. Release the lock in `finally`.
 11. Enqueue monitoring, notify quality scheduling, and emit the audit event through separate best-effort calls.
 
-A write to a table that exists makes 13 round trips to Redis, 12 with monitoring off: the lake's root for the read-only check; four reads for the role; the row-ID reservation; the lock; the root and the table's entry; the commit (lock token, leaf and root in one script); the schema, table name and mirror formats together; the lock release; and the monitoring record. A delete-only write reserves no row IDs and makes one fewer; auditing and a data-quality schedule, when switched on, add their own. `tests/characterization/test_the_round_trips_of_a_write_to_redis.py` pins the sequence.
+A write to a table that exists makes 9 round trips to Redis, 8 with monitoring off: the access check (the lake's root for the read-only guard and the role, in one script); the row-ID reservation; the lock; the root and the table's entry; the commit (lock token, leaf and root in one script); the schema, table name and mirror formats together; the lock release; and the monitoring record. A delete-only write reserves no row IDs and makes one fewer; auditing and a data-quality schedule, when switched on, add their own. The access check's script is declared read-only, which Redis 7 and later understand: on an older Redis the check makes its five reads one by one and a write makes 13 round trips (12). `tests/characterization/test_the_round_trips_of_a_write_to_redis.py` pins the sequence.
 
 The leaf update and the root increment are one script, together with the comparison of the lock token. Storage writes, mirrors, and observability calls are outside it: publication as a whole is not one transaction. Errors before publication can leave unreferenced files. A failure after leaf publication can leave visible data even if the call raises. Mirror and observability failures are logged or suppressed after the native data update.
 

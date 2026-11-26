@@ -2,8 +2,13 @@
 The round trips a write makes to Redis, and that fewer of them change nothing.
 
 A write to an existing table went to Redis eighteen times here (nineteen with
-monitoring on, which this harness has off).  It is twelve now:
+monitoring on, which this harness has off).  It is eight now:
 
+* the access check read the lake's root for the read-only guard, asked twice
+  whether the role store is initialised, and then read the role's id and its
+  document: five round trips, now one script that reads the five
+  (``RedisCatalog.rbac_access_read``, by way of
+  ``RoleManager.read_for_access_check``);
 * the table was opened with an existence check and its snapshot then read, and
   each of the two first read the lake's root document: four round trips for
   one catalog entry, now two (``SimpleTable(..., keep_leaf=True)``);
@@ -17,16 +22,25 @@ monitoring on, which this harness has off).  It is twelve now:
   round trip: now one for the three
   (``RedisCatalog.store_schema_and_read_mirrors``).
 
+The script of the access check is declared read-only (``#!lua
+flags=no-writes``), so that Redis answers it wherever it answers the five
+reads, and that declaration is Redis 7's.  The fake Redis of this harness does
+not know it, as a Redis before 7 does not; it is made to take it here, as
+Redis 7 does, and one test leaves it as it is: such a Redis is asked the five
+reads, and a write makes the twelve round trips it made before this change.
+
 The real writer and reader run here over the hermetic fake Redis on LOCAL
 storage, and every round trip is recorded.  The sequence of an append is
 pinned, so that a round trip added later shows up as a failure here.  The way
 it was is still reachable (a table opened without ``keep_leaf``, a catalog
-without the two new methods), and the same writes are run both ways: they must
+without the new methods, a role manager without its one read), and the same
+writes are run both ways: they must
 leave the same rows, the same catalog entry and root versions, the same schema
 document, the same table names and the same mirror.
 
-The three changed pieces are compared with the code as it was, state by state,
+The four changed pieces are compared with the code as it was, state by state,
 in ``supertable/tests``:
+``test_an_access_check_reads_redis_once.py``,
 ``test_a_table_opened_for_a_write_reads_its_entry_once.py``,
 ``test_a_commit_checks_the_lock_and_bumps_the_root_in_one_script.py`` and
 ``test_what_follows_a_commit_goes_to_redis_in_one_round_trip.py``.
@@ -53,6 +67,7 @@ from supertable.engine import duckdb as engine_duckdb
 from supertable.engine.engine_enum import Engine
 from supertable.errors import LockLostError
 from supertable.mirroring.mirror_formats import MirrorFormats
+from supertable.rbac.role_manager import RoleManager
 from supertable.redis_catalog import RedisCatalog
 from supertable.simple_table import SimpleTable
 from supertable.super_table import SuperTable
@@ -68,13 +83,22 @@ COMMIT = "EVALSHA meta:leaf:doc:orders meta:root lock:leaf:doc:orders"
 THREE_STEPS = ["GET lock:leaf:doc:orders", "EVALSHA meta:leaf:doc:orders", "EVALSHA meta:root"]
 AFTER_THE_COMMIT = ["SET schema:doc:orders", "SADD meta:table_names", "GET meta:mirrors"]
 
-# An append to a table that exists, in order.
-APPEND = [
+# The access check: is the lake read-only, is the role store initialised, the
+# role's id and its document, in one script.
+ACCESS = "EVALSHA meta:root rbac:roles:meta rbac:roles:type:doc:superadmin rbac:roles:name_to_id"
+# The same five reads one by one, as they were, and as they still are when the
+# one script is not to be had.
+FIVE_READS = [
     "GET meta:root",                                    # is the lake read-only
     "EXISTS rbac:roles:meta",                           # the role
     "SMEMBERS rbac:roles:type:doc:superadmin",
     "HGET rbac:roles:name_to_id",
     "HGETALL rbac:roles:doc:<id>",
+]
+
+# An append to a table that exists, in order.
+APPEND = [
+    ACCESS,                                             # may this role write here
     "INCRBY meta:rowid_seq:doc:orders",                 # row ids
     "SET lock:leaf:doc:orders",                         # the table lock
     "GET meta:root",                                    # the table's entry, once
@@ -83,9 +107,9 @@ APPEND = [
     AFTER_THE_COMMIT,                                   # one round trip
     "EVALSHA lock:leaf:doc:orders",                     # unlock
 ]
-# The same append before: the entry asked for and then read, the commit in
-# three steps, and three round trips after it.
-APPEND_AS_IT_WAS = APPEND[:7] + [
+# The same append before: five reads for the access check, the entry asked for
+# and then read, the commit in three steps, and three round trips after it.
+APPEND_AS_IT_WAS = FIVE_READS + APPEND[1:3] + [
     "GET meta:root", "EXISTS meta:leaf:doc:orders",
     "GET meta:root", "GET meta:leaf:doc:orders",
 ] + THREE_STEPS + AFTER_THE_COMMIT + ["EVALSHA lock:leaf:doc:orders"]
@@ -112,8 +136,26 @@ class _OpenedAsItWas(SimpleTable):
         super().__init__(super_table, simple_name, create_if_missing=create_if_missing)
 
 
-def _lake(monkeypatch, as_it_was: bool = False):
+def _as_redis_7(monkeypatch) -> None:
+    """Make the fake Redis run a script that declares its flags, as Redis 7
+    does: the declaration is read, and the rest is the script."""
+    register = redis.Redis.register_script
+
+    def register_script(self, script):
+        if isinstance(script, str) and script.startswith("#!lua"):
+            script = script.split("\n", 1)[1]
+        return register(self, script)
+
+    monkeypatch.setattr(redis.Redis, "register_script", register_script)
+
+
+def _lake(monkeypatch, as_it_was: bool = False, redis_7: bool = True):
     engine_duckdb.reset_shared_duckdb_state()
+    if redis_7:
+        _as_redis_7(monkeypatch)
+    # which of the two this Redis is, is asked once for each client: here,
+    # before any round trip is recorded
+    RedisCatalog()._runs_declared_scripts()
     sup = f"trips_{uuid.uuid4().hex[:12]}"
     super_table = SuperTable(sup, ORG)
     writer = DataWriter(super_name=sup, organization=ORG)
@@ -171,6 +213,7 @@ def _lake(monkeypatch, as_it_was: bool = False):
         monkeypatch.setattr(data_writer_module, "SimpleTable", _OpenedAsItWas)
         monkeypatch.delattr(RedisCatalog, "commit_leaf_and_bump_root")
         monkeypatch.delattr(RedisCatalog, "store_schema_and_read_mirrors")
+        monkeypatch.delattr(RoleManager, "read_for_access_check")
 
     def recorded(operation):
         """Run one operation of the writer; what it returned and its round trips."""
@@ -182,9 +225,9 @@ def _lake(monkeypatch, as_it_was: bool = False):
             state["recording"] = False
         return result, list(trips)
 
-    def write(frame: pl.DataFrame, overwrite_columns=(), **options):
+    def write(frame: pl.DataFrame, overwrite_columns=(), role=ADMIN, **options):
         return recorded(lambda: writer.write(
-            role_name=ADMIN, simple_name=TABLE, overwrite_columns=list(overwrite_columns),
+            role_name=role, simple_name=TABLE, overwrite_columns=list(overwrite_columns),
             data=frame, **options))
 
     def compact():
@@ -251,13 +294,13 @@ def _expected(ids, amounts=None) -> list:
 # The sequence, pinned
 # ---------------------------------------------------------------------------
 
-def test_an_append_goes_to_redis_these_twelve_times(lake):
+def test_an_append_goes_to_redis_these_eight_times(lake):
     lake.write(_rows(0))
 
     result, trips = lake.write(_rows(3))
 
     assert trips == APPEND
-    assert len(trips) == 12
+    assert len(trips) == 8
     assert result[2] == 3, "three rows inserted"
     assert lake.read() == _expected(range(6))
 
@@ -285,7 +328,8 @@ def test_the_entry_is_read_once_in_a_write_and_never_asked_for(lake):
         _result, trips = lake.write(frame, **options)
         assert trips.count("GET meta:leaf:doc:orders") == 1
         assert "EXISTS meta:leaf:doc:orders" not in trips
-        assert trips.count("GET meta:root") == 2, "the read-only guard, and the open"
+        assert trips.count("GET meta:root") == 1, "the open; the guard's read is in the access check"
+        assert trips.count(ACCESS) == 1 and not any(read in trips for read in FIVE_READS[1:])
         assert trips.count(COMMIT) == 1 and not _any_of_the_three_steps(trips)
 
 
@@ -405,12 +449,12 @@ def test_the_same_writes_both_ways_leave_the_same_everything(hermetic_fakeredis,
     assert by_step["a write that widens the schema"]["redis"]["schema"].get("note") == "String"
     assert by_step["a compaction"]["redis"]["files"] == 1
     assert now[-1]["rows"] == _expected([20, 21, 22])
-    # six round trips fewer on a table that exists, four on the write that
-    # creates it, two on a compaction (which opens its table as it did)
+    # ten round trips fewer on a table that exists, eight on the write that
+    # creates it, six on a compaction (which opens its table as it did)
     fewer = {after["step"]: before["trips"] - after["trips"] for before, after in zip(was, now)}
-    assert fewer.pop("the first write") == 4
-    assert fewer.pop("a compaction") == 2
-    assert set(fewer.values()) == {6}
+    assert fewer.pop("the first write") == 8
+    assert fewer.pop("a compaction") == 6
+    assert set(fewer.values()) == {10}
 
 
 def test_the_way_it_was_is_the_sequence_these_changes_started_from(hermetic_fakeredis, monkeypatch):
@@ -421,7 +465,7 @@ def test_the_way_it_was_is_the_sequence_these_changes_started_from(hermetic_fake
     engine_duckdb.reset_shared_duckdb_state()
 
     assert trips == APPEND_AS_IT_WAS
-    assert (len(APPEND_AS_IT_WAS), len(APPEND)) == (18, 12)
+    assert (len(APPEND_AS_IT_WAS), len(APPEND)) == (18, 8)
 
 
 # ---------------------------------------------------------------------------
@@ -658,3 +702,223 @@ def test_an_entry_that_cannot_be_read_fails_the_write_and_creates_nothing(lake, 
     result, trips = lake.write(_rows(6))
     assert result[2] == 3 and trips == APPEND, "the lock was released; the next write is an ordinary one"
     assert lake.read() == _expected(range(9))
+
+
+# ---------------------------------------------------------------------------
+# The access check, on one read
+# ---------------------------------------------------------------------------
+
+def _refused(lake, frame, **options):
+    """A write that must be refused: the refusal, and the round trips made."""
+    with pytest.raises(PermissionError) as raised:
+        lake.write(frame, **options)
+    return str(raised.value), list(lake.trips)
+
+
+def _roles(lake) -> RoleManager:
+    return RoleManager(super_name=lake.sup, organization=ORG, actor_role_name=ADMIN)
+
+
+def _both(monkeypatch, scenario):
+    """Run *scenario* on a lake the way it was and on one the way it is."""
+    with monkeypatch.context() as patched:
+        was = scenario(_lake(patched, as_it_was=True))
+    with monkeypatch.context() as patched:
+        now = scenario(_lake(patched))
+    engine_duckdb.reset_shared_duckdb_state()
+    return was, now
+
+
+def test_a_locked_lake_refuses_the_write_as_it_did_and_nothing_is_written(hermetic_fakeredis, monkeypatch):
+    def scenario(lake):
+        lake.write(_rows(0))
+        before = (lake.in_redis(), lake.read())
+        RedisCatalog().update_root_flags(ORG, lake.sup, {"read_only": True})
+        refusal, trips = _refused(lake, _rows(3))
+        assert (lake.in_redis(), lake.read()) == before
+        RedisCatalog().update_root_flags(ORG, lake.sup, {"read_only": False})
+        result, _trips = lake.write(_rows(3))
+        return refusal, trips, tuple(result), lake.read()
+
+    was, now = _both(monkeypatch, scenario)
+
+    assert now[0] == was[0] == "This SuperTable is locked. Cannot write to this table."
+    assert was[1] == FIVE_READS[:1], "the guard's read, and the role was never looked at"
+    assert now[1] == [ACCESS]
+    assert now[2:] == was[2:] and now[3] == _expected(range(6))
+
+
+def test_a_role_that_may_not_write_is_refused_as_it_was(hermetic_fakeredis, monkeypatch):
+    everything = {"*": {"columns": ["*"], "filters": ["*"]}}
+
+    def scenario(lake):
+        lake.write(_rows(0))
+        roles = _roles(lake)
+        roles.create_role({"role": "reader", "role_name": "analyst", "tables": everything})
+        roles.create_role({"role": "writer", "role_name": "items_writer",
+                           "tables": {"items": {"columns": ["*"], "filters": ["*"]}}})
+        roles.create_role({"role": "writer", "role_name": "Loader", "tables": everything})
+        before = (lake.in_redis(), lake.read())
+        refusals = [_refused(lake, _rows(3), role=role) for role in ("analyst", "items_writer", "nobody")]
+        assert (lake.in_redis(), lake.read()) == before
+        result, trips = lake.write(_rows(3), role="LOADER")
+        return refusals, tuple(result), trips, lake.read()
+
+    was, now = _both(monkeypatch, scenario)
+
+    assert [message for message, _trips in now[0]] == [message for message, _trips in was[0]] == [
+        "You don't have permission to write to this table.",
+        "You don't have permission to write to this table table 'orders'.",
+        "Invalid or nonexistent role: nobody",
+    ]
+    assert [trips for _message, trips in was[0]] == [FIVE_READS, FIVE_READS, FIVE_READS[:4]]
+    assert [trips for _message, trips in now[0]] == [[ACCESS]] * 3
+    assert now[1] == was[1] and now[3] == was[3] == _expected(range(6))
+    assert (was[2], now[2]) == (APPEND_AS_IT_WAS, APPEND), "and a role that may, by any spelling, writes"
+
+
+def test_a_role_changed_between_two_writes_decides_the_second(hermetic_fakeredis, monkeypatch):
+    """Nothing of the check is remembered from one write to the next: the role
+    is read again, by the one script, every time."""
+    everything = {"*": {"columns": ["*"], "filters": ["*"]}}
+
+    def scenario(lake):
+        lake.write(_rows(0))
+        roles = _roles(lake)
+        role_id = roles.create_role({"role": "writer", "role_name": "loader", "tables": everything})
+        seen = [tuple(lake.write(_rows(3), role="loader")[0])]
+        roles.update_role(role_id, {"tables": {"items": {"columns": ["*"], "filters": ["*"]}}})
+        seen.append(_refused(lake, _rows(6), role="loader")[0])
+        roles.update_role(role_id, {"role": "reader", "tables": everything})
+        seen.append(_refused(lake, _rows(6), role="loader")[0])
+        roles.update_role(role_id, {"role": "writer"})
+        seen.append(tuple(lake.write(_rows(6), role="loader")[0]))
+        RedisCatalog().r.hset(RK.rbac_role_doc(ORG, lake.sup, role_id), "enabled", "false")
+        seen.append(_refused(lake, _rows(9), role="loader")[0])
+        roles.delete_role(role_id)
+        seen.append(_refused(lake, _rows(9), role="loader")[0])
+        return seen, lake.read()
+
+    was, now = _both(monkeypatch, scenario)
+
+    assert now == was
+    assert now[0][1:3] == ["You don't have permission to write to this table table 'orders'.",
+                           "You don't have permission to write to this table."]
+    assert now[0][4:] == ["Role 'loader' is disabled.", "Invalid or nonexistent role: loader"]
+    assert now[1] == _expected(range(9))
+
+
+def test_an_access_read_that_fails_is_followed_by_the_five_reads(lake):
+    lake.write(_rows(0))
+    failed = {"times": 0}
+
+    def fail(trip):
+        if trip == ACCESS and not failed["times"]:
+            failed["times"] += 1
+            return True
+        return False
+
+    lake.state["fail"] = fail
+    result, trips = lake.write(_rows(3))
+    lake.state["fail"] = None
+
+    assert result[2] == 3
+    assert trips == [ACCESS] + FIVE_READS + APPEND[1:]
+    assert lake.read() == _expected(range(6))
+
+    result, trips = lake.write(_rows(6))
+    assert trips == APPEND and lake.read() == _expected(range(9))
+
+
+def test_an_access_read_that_fails_does_not_open_a_locked_lake(lake):
+    lake.write(_rows(0))
+    RedisCatalog().update_root_flags(ORG, lake.sup, {"read_only": True})
+    lake.state["fail"] = lambda trip: trip == ACCESS
+
+    refusal, trips = _refused(lake, _rows(3))
+    lake.state["fail"] = None
+
+    assert refusal == "This SuperTable is locked. Cannot write to this table."
+    assert trips == [ACCESS, "GET meta:root"]
+    assert lake.read() == _expected(range(3))
+
+
+def test_a_role_store_taken_away_under_the_writer_is_made_again_as_before(hermetic_fakeredis, monkeypatch):
+    """The check that the role store is there is made at every write, inside
+    the one read: a store that is gone is given to the constructor, which
+    makes the default role again, as it did."""
+    def scenario(lake):
+        lake.write(_rows(0))
+        client = RedisCatalog().r
+        gone = [key for key in client.keys("*") if ":rbac:roles:" in _text(key)]
+        assert len(gone) >= 5
+        client.delete(*gone)
+        result, trips = lake.write(_rows(3))
+        again = sorted(_text(key).split(":rbac:roles:")[1].split(":")[0]
+                       for key in client.keys("*") if ":rbac:roles:" in _text(key))
+        return tuple(result), trips, again, lake.read()
+
+    was, now = _both(monkeypatch, scenario)
+
+    assert now[0] == was[0] and now[3] == was[3] == _expected(range(6))
+    assert now[2] == was[2] == ["doc", "index", "meta", "name_to_id", "type"], "one role, made again"
+    assert now[1][0] == ACCESS, "the one read found no role store"
+    made_again = now[1][1:now[1].index("INCRBY meta:rowid_seq:doc:orders")]
+    assert made_again == was[1][:was[1].index("INCRBY meta:rowid_seq:doc:orders")]
+    assert len(made_again) > 5, "the constructor had work to do"
+
+
+def test_a_compaction_and_a_first_write_ask_for_access_once_too(lake):
+    _result, first = lake.write(_rows(0))
+    for start in (3, 6, 9):
+        lake.write(_rows(start))
+
+    _result, compaction = lake.compact()
+
+    for trips in (first, compaction):
+        assert trips.count(ACCESS) == 1
+        assert not any(read in trips for read in FIVE_READS[1:])
+
+
+def test_a_redis_that_does_not_run_declared_scripts_is_written_to_as_before(hermetic_fakeredis, monkeypatch):
+    """A Redis before 7: the access check makes its five reads, everything
+    else is as on any other Redis, and the rows are the same rows."""
+    old = _lake(monkeypatch, redis_7=False)
+    assert RedisCatalog()._runs_declared_scripts() is False
+    old.write(_rows(0))
+
+    result, trips = old.write(_rows(3))
+    refusal, refused = None, None
+    RedisCatalog().update_root_flags(ORG, old.sup, {"read_only": True})
+    refusal, refused = _refused(old, _rows(6))
+    engine_duckdb.reset_shared_duckdb_state()
+
+    assert trips == FIVE_READS + APPEND[1:]
+    assert len(trips) == 12 and result[2] == 3
+    assert (refusal, refused) == ("This SuperTable is locked. Cannot write to this table.", FIVE_READS[:1])
+    assert old.read() == _expected(range(6))
+
+
+def test_a_redis_is_asked_once_whether_it_runs_the_script(hermetic_fakeredis, monkeypatch):
+    """Once for each client, before its first access check; the answer is
+    kept, and no later write asks."""
+    _as_redis_7(monkeypatch)
+    asked = []
+    real = redis.Redis.execute_command
+
+    def command(self, *args, **options):
+        if str(args[0]).upper() == "EVALSHA" and int(args[2]) == 0:
+            asked.append(args[1])
+        return real(self, *args, **options)
+
+    monkeypatch.setattr(redis.Redis, "execute_command", command)
+    lake = _lake(monkeypatch)
+    answered = len(asked)
+    for first in (0, 3, 6):
+        lake.write(_rows(first))
+    lake.compact()
+    engine_duckdb.reset_shared_duckdb_state()
+
+    assert answered >= 1 and len(set(asked)) == 1, "one script, the question"
+    assert len(asked) == answered, "three writes and a compaction later, it has not been asked again"
+
