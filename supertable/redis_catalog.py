@@ -890,22 +890,66 @@ return generation
     def get_mirrors(self, org: str, sup: str) -> List[str]:
         """Read enabled mirror formats from Redis key."""
         try:
-            raw = self.r.get(RK.meta_mirrors(org, sup))
-            if not raw:
-                return []
-            obj = json.loads(raw)
-            formats = obj.get("formats", [])
-            seen = set()
-            out: List[str] = []
-            for f in (formats or []):
-                fu = str(f).upper()
-                if fu in ("DELTA", "ICEBERG", "PARQUET") and fu not in seen:
-                    seen.add(fu)
-                    out.append(fu)
-            return out
+            return self._mirrors_from_raw(self.r.get(RK.meta_mirrors(org, sup)))
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] get_mirrors error: {e}")
             return []
+        except Exception:
+            return []
+
+    @staticmethod
+    def _mirrors_from_raw(raw: Any) -> List[str]:
+        """The enabled formats in the value of the ``meta:mirrors`` key.
+
+        What ``get_mirrors`` makes of the value it reads; raises what parsing
+        it raises, which both callers answer with "no formats".
+        """
+        if not raw:
+            return []
+        obj = json.loads(raw)
+        formats = obj.get("formats", [])
+        seen = set()
+        out: List[str] = []
+        for f in (formats or []):
+            fu = str(f).upper()
+            if fu in ("DELTA", "ICEBERG", "PARQUET") and fu not in seen:
+                seen.add(fu)
+                out.append(fu)
+        return out
+
+    def store_schema_and_read_mirrors(
+            self, org: str, sup: str, simple: str, schema_json: str,
+    ) -> List[str]:
+        """What a write does in Redis once its commit is in, in one round trip.
+
+        The table's schema document is stored, its name is added to the lake's
+        table names, and the lake's enabled mirror formats are read: the three
+        commands a write sent one after another (SET, SADD, and the GET inside
+        ``get_mirrors``), in that order, sent together.  Not a transaction,
+        as they were not: each command stands by itself.
+
+        Returns what ``get_mirrors`` returns, the read failing included (logged
+        there, and "no formats").  A SET or SADD that Redis refuses raises
+        after all three were sent: the caller treats a failure to record the
+        schema as it always did, and reads the formats by itself then.  The one
+        thing that differs from the three calls is that the name is still
+        added when the SET was refused, where the SET raising used to skip
+        the SADD.
+        """
+        with self.r.pipeline(transaction=False) as pipe:
+            pipe.set(RK.schema(org, sup, simple), schema_json)
+            pipe.sadd(RK.meta_table_names(org, sup), simple)
+            pipe.get(RK.meta_mirrors(org, sup))
+            stored, added, raw = pipe.execute(raise_on_error=False)
+        for outcome in (stored, added):
+            if isinstance(outcome, Exception):
+                raise outcome
+        if isinstance(raw, redis.RedisError):
+            logger.error(f"[redis-catalog] get_mirrors error: {raw}")
+            return []
+        try:
+            # Anything else that is no readable value ends here too.
+            return self._mirrors_from_raw(raw)
         except Exception:
             return []
 

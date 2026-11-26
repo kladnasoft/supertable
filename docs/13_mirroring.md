@@ -31,7 +31,7 @@ Setting a format only changes configuration. It does not copy existing tables im
 
 ## 2. Publication order
 
-A successful `DataWriter.write` publishes the native snapshot and catalog pointers, then calls `MirrorFormats.mirror_if_enabled`. `DataWriter.compact` also mirrors when it publishes a changed snapshot; a compaction with nothing to change does not rebuild a mirror.
+A successful `DataWriter.write` publishes the native snapshot and catalog pointers, then calls `MirrorFormats.mirror_if_enabled` with the formats it read from the catalog in the same round trip as its schema and table-name update. When that round trip failed it passes none, and `mirror_if_enabled` reads the configured formats itself. `DataWriter.compact` also mirrors when it publishes a changed snapshot; a compaction with nothing to change does not rebuild a mirror.
 
 The calls execute synchronously before the table write lock is released. Enabled writers run in the fixed order Delta, Iceberg, then Parquet. A raised exception stops that sequence; `DataWriter` logs the mirroring error and continues returning the native write result. The catalog commit is not rolled back and there is no persistent mirror status, retry queue, or transaction spanning all formats.
 

@@ -508,9 +508,14 @@ class DataWriter:
             # this call refuses to create, so the only way to reach the
             # bootstrap below is a catalog that positively reported the leaf
             # absent.
+            # ``keep_leaf``: the entry read to open the table is the one the
+            # snapshot is taken from two lines below, so the table lock is
+            # held across a single read of it instead of an existence check
+            # and a read (two round trips where there were four).
             try:
                 simple_table = SimpleTable(
                     self.super_table, simple_name, create_if_missing=False,
+                    keep_leaf=True,
                 )
             except TableNotFoundError:
                 # Explicit table creation: first write to a new name. Logged
@@ -1229,6 +1234,7 @@ class DataWriter:
                 mark("bump_root")
 
                 # --- Store schema + table name in Redis (permanent, not cache) ---
+                enabled_mirrors = None
                 try:
                     schema_raw = new_snapshot_dict.get("schema", {})
                     if isinstance(schema_raw, dict):
@@ -1242,17 +1248,32 @@ class DataWriter:
                     else:
                         schema_json = "{}"
                     _org, _sup = self.super_table.organization, self.super_table.super_name
-                    self.catalog.r.set(RK.schema(_org, _sup, simple_name), schema_json)
-                    self.catalog.r.sadd(RK.meta_table_names(_org, _sup), simple_name)
+                    # One round trip for the two writes and for the read of
+                    # the lake's mirror formats that mirroring starts with.
+                    # A catalog without the method (an older one, a test
+                    # double) is sent the two writes as before.
+                    _store_and_read = getattr(
+                        self.catalog, "store_schema_and_read_mirrors", None)
+                    if callable(_store_and_read):
+                        _formats = _store_and_read(_org, _sup, simple_name, schema_json)
+                        if isinstance(_formats, list):
+                            enabled_mirrors = _formats
+                    else:
+                        self.catalog.r.set(RK.schema(_org, _sup, simple_name), schema_json)
+                        self.catalog.r.sadd(RK.meta_table_names(_org, _sup), simple_name)
                 except Exception as e:
                     logger.debug(f"[data-writer] schema/table_names Redis write failed: {e}")
 
                 # --- Optional mirroring -------------------------------------------
+                # The formats read above are handed over; without them (the
+                # writes failed, or the catalog has no such read) mirroring
+                # reads them itself, as it always did.
                 try:
                     MirrorFormats.mirror_if_enabled(
                         super_table=self.super_table,
                         table_name=simple_name,
                         simple_snapshot=new_snapshot_dict,
+                        **({} if enabled_mirrors is None else {"mirrors": enabled_mirrors}),
                     )
                 except Exception as e:
                     logger.error(lp(f"mirroring failed: {e}"))

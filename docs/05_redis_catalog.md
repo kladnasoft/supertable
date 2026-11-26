@@ -67,6 +67,7 @@ The script calls `GETRANGE` as well as `GET` and `SET`. A Redis user restricted 
 | `set_leaf_path_cas()` | Read version and replace `{version, ts, path}` in one Lua script | Does not retain an existing inline payload |
 | `set_leaf_payload_cas()` | Read version and replace `{version, ts, path, payload}` in one Lua script | Payload JSON is encoded before the script and stored as that text; serialization failure supplies `{}`; a payload holding a number that is not finite (NaN, Infinity) raises `redis.ResponseError` and stores nothing |
 | `bump_root()` | Read, increment, preserve flags, and replace root in one Lua script | Independent of leaf publication |
+| `store_schema_and_read_mirrors()` | None: a `SET` of the table's schema document, a `SADD` of its name to the lake's table names and a `GET` of the lake's mirror formats, sent in one round trip without `MULTI` | Returns the enabled formats as `get_mirrors()` does; a refused `SET` or `SADD` raises after all three were sent |
 | `reserve_rowids(count)` | Redis `INCRBY` reserves a contiguous range | No rollback when subsequent file creation fails |
 | `ensure_root()` | Individual `EXISTS` and `SET` commands | The check and creation are separate operations |
 | `update_root_flags()` | Individual read and write commands | Concurrent updates can overwrite one another |
@@ -130,6 +131,7 @@ Failure handling varies by method:
 | Replica resolution in `get_leaf()`, `leaf_exists()`, `get_leaf_items()`, and leaf scans | Raise; a malformed root reads as no replica |
 | `get_leaf_items()` | Log and raise; a named leaf that is absent or malformed is left out of the result |
 | `list_shares()`, `list_linked_shares()` | Log and raise, for the index or any one document; an indexed document that is missing or malformed is skipped |
+| `get_mirrors()`, and the read inside `store_schema_and_read_mirrors()` | Log and return no formats; an unreadable value is no formats, without a log line |
 | `ping()` | Return false |
 | Leaf scans and batches | Log and stop/skip the failed operation, potentially yielding partial results |
 | Many metadata getters | Return `None`, an empty list, or defaults |

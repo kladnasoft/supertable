@@ -123,15 +123,17 @@ The writer overwrites incoming `__rowid__` and `__timestamp__` columns for inser
 
 1. Check access, convert Arrow input to Polars, and validate arguments.
 2. Reserve table row IDs for non-delete input and assign the write timestamp. Read the cached table configuration.
-3. Acquire the SimpleTable lock with a 30-second lease and up to 60 seconds of waiting. Open or create the table and read its current snapshot.
+3. Acquire the SimpleTable lock with a 30-second lease and up to 60 seconds of waiting. Open or create the table and read its current snapshot. The table's catalog entry is read once for both (`SimpleTable(..., keep_leaf=True)`): that read says whether the table exists, and the snapshot is taken from what it returned.
 4. Identify candidate resources. With overwrite keys, use stored bounds to remove impossible candidates, then resolve existing matches and optional version comparisons.
 5. Load the previous deletion vector and exclude already-retired IDs from new deletion pairs.
 6. Write new data and tombstone artifacts. When data is inserted, those two branches run concurrently in a two-worker executor.
 7. Reclaim fully dead files when new deletion pairs produced a combined vector. Apply tombstone and small-file compaction when their thresholds are reached.
 8. Rebuild statistics for the resulting live resources and write the next snapshot JSON, predecessor pointer, lineage, and row-ID watermark.
 9. Check lock ownership, publish the Redis leaf payload (falling back to a path-only leaf if publication raises), then increment the root version.
-10. Refresh the schema/table-name cache and invoke configured mirrors. Release the lock in `finally`.
+10. Refresh the schema/table-name cache and read the lake's mirror formats in one round trip (`RedisCatalog.store_schema_and_read_mirrors`), then invoke the mirrors that read named. Release the lock in `finally`.
 11. Enqueue monitoring, notify quality scheduling, and emit the audit event through separate best-effort calls.
+
+A write to a table that exists makes 15 round trips to Redis, 14 with monitoring off: the lake's root for the read-only check; four reads for the role; the row-ID reservation; the lock; the root and the table's entry; the lock ownership check, the leaf commit and the root increment; the schema, table name and mirror formats together; the lock release; and the monitoring record. A delete-only write reserves no row IDs and makes one fewer; auditing and a data-quality schedule, when switched on, add their own. `tests/characterization/test_the_round_trips_of_a_write_to_redis.py` pins the sequence.
 
 The Redis leaf update, root increment, storage writes, mirrors, and observability calls are not one transaction. Errors before publication can leave unreferenced files. A failure after leaf publication can leave visible data even if the call raises. Mirror and observability failures are logged or suppressed after the native data update.
 

@@ -103,6 +103,15 @@ class SimpleTable:
             table surfaces as an error instead of being silently
             materialized as a side effect of constructing the Python
             object.
+        keep_leaf: For a caller that opens a table and asks for its
+            snapshot straight away, as a write does under the table lock.
+            The table's catalog entry is then read once: that read decides
+            whether the table exists, and the next
+            ``get_simple_table_snapshot()`` uses the entry it returned
+            instead of reading it again.  Only that one call does; a later
+            one reads the catalog as always.  Honoured with
+            ``create_if_missing=False`` only: whether to create a table is
+            still decided by the existence check (``leaf_exists``).
     """
 
     def __init__(
@@ -111,6 +120,7 @@ class SimpleTable:
         simple_name: str,
         *,
         create_if_missing: bool = True,
+        keep_leaf: bool = False,
     ):
         self.super_table = super_table
         self.identity = "tables"
@@ -129,7 +139,23 @@ class SimpleTable:
         self.snapshot_dir = os.path.join(self.simple_dir, "snapshots")
 
         # Fast path: if meta:leaf exists, don't touch storage
-        if self.catalog.leaf_exists(
+        if keep_leaf and not create_if_missing:
+            # Two round trips instead of four.  The existence check and the
+            # snapshot read that follows it each resolved the lake's replica
+            # state (a read of meta:root) and then went to the entry: EXISTS
+            # here, GET there.  The entry itself answers both.  An entry that
+            # is there but holds nothing (an empty value, a JSON null) reads
+            # as absent here; the caller then meets what it always met, since
+            # the existence check and the snapshot read are still what it
+            # falls back to.  A Redis error raises, as it does from
+            # ``leaf_exists``: a failed read is not an absent table.
+            leaf = self.catalog.get_leaf(
+                self.super_table.organization, self.super_table.super_name, self.simple_name
+            )
+            if leaf is not None:
+                self._opened_leaf = leaf
+                return
+        elif self.catalog.leaf_exists(
                 self.super_table.organization, self.super_table.super_name, self.simple_name
         ):
             return
@@ -254,7 +280,10 @@ class SimpleTable:
 
         If the Redis leaf stores a snapshot payload, use it to avoid storage reads.
         """
-        ptr = self.catalog.get_leaf(self.super_table.organization, self.super_table.super_name, self.simple_name)
+        # The entry this object was opened with (``keep_leaf``), used once.
+        ptr = self.__dict__.pop("_opened_leaf", None)
+        if ptr is None:
+            ptr = self.catalog.get_leaf(self.super_table.organization, self.super_table.super_name, self.simple_name)
         if not ptr or not ptr.get("path"):
             raise FileNotFoundError("No path found in simple table leaf pointer.")
         path = ptr["path"]
