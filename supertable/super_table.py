@@ -43,6 +43,11 @@ class SuperTable:
             ``False`` so a missing supertable surfaces as an error
             instead of being silently materialized as a side effect of
             constructing the Python object.
+        known_to_exist: ``True`` from a caller that has just asked Redis
+            whether this supertable's ``meta:root`` is there, and found it
+            (``DataEstimator``, in the transaction that reads the leaves of
+            a query's tables). The root is then not asked for again.
+            Everything else the constructor does is done as always.
     """
 
     def __init__(
@@ -51,6 +56,7 @@ class SuperTable:
         organization: str,
         *,
         create_if_missing: bool = True,
+        known_to_exist: bool = False,
     ):
         if is_reserved_super_name(super_name):
             raise ValueError(
@@ -72,7 +78,7 @@ class SuperTable:
         self.super_dir = os.path.join(self.organization, self.super_name, self.identity)
 
         # Fast path: if meta:root exists, don't touch storage
-        if self.catalog.root_exists(self.organization, self.super_name):
+        if known_to_exist is True or self.catalog.root_exists(self.organization, self.super_name):
             return
 
         # Read-only opt-out: refuse to bootstrap as a side effect. This

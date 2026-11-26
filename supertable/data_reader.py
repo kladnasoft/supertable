@@ -29,6 +29,12 @@ from supertable.data_classes import TombstoneDef, RbacViewDef
 from supertable.redis_catalog import RedisCatalog
 from supertable.system_query import classify_query, CommandKind, admit_row_predicate
 
+# The catalog as the library defines it.  The check that a query's tables exist
+# is made on one read of the catalog only where the catalog is this class
+# itself: with anything else under its name (a test double, a subclass) every
+# call is made as it always was.
+_CATALOG_AS_DEFINED = RedisCatalog
+
 
 class Status(Enum):
     OK = "ok"
@@ -119,6 +125,24 @@ class DataReader:
         # One catalog handle for the whole loop — cheaper than letting
         # each .exists() call open a fresh connection.
         catalog = RedisCatalog()
+
+        # One round trip for each lake the query names, where the loop below
+        # makes three for each table: see _targets_in_one_read.  What that
+        # read found decides here exactly what the loop decides, in the order
+        # the tables are named.
+        read = self._targets_in_one_read(catalog, physical_tables)
+        if read is not None:
+            targets, by_lake = read
+            for super_name, simple_name in targets:
+                root_exists, leaf_exists = by_lake[super_name]
+                if not root_exists:
+                    raise SuperTableNotFoundError(self.organization, super_name)
+                if not leaf_exists[simple_name]:
+                    raise TableNotFoundError(
+                        self.organization, super_name, simple_name
+                    )
+            return
+
         # Dedup by (super, simple) — SQL may mention the same table
         # multiple times via different aliases.
         seen = set()
@@ -137,6 +161,59 @@ class DataReader:
                 raise TableNotFoundError(
                     self.organization, super_name, simple_name
                 )
+
+    def _targets_in_one_read(self, catalog, physical_tables):
+        """Whether a query's lakes and tables are there, each lake asked once.
+
+        ``RedisCatalog.root_and_leaves_exist`` asks, in one transaction, what
+        ``root_exists`` and ``leaf_exists`` ask one after the other for every
+        table.
+
+        Returns ``(targets, by_lake)``: the distinct ``(super, simple)`` pairs
+        in the order the query names them, and that read's answer for each
+        lake.  Returns ``None`` when the one read is not to be had, and the
+        caller then asks the separate calls from the first, as it always did:
+        the catalog is not the library's own (a test double, a subclass, a
+        call replaced on it), a name no key can be built from, an answer that
+        is not that read's, or a failure of the read.  A read that failed
+        decides nothing: the calls that follow it fail, or answer, their own
+        way.
+        """
+        if type(catalog) is not _CATALOG_AS_DEFINED:
+            return None
+        read = getattr(catalog, "root_and_leaves_exist", None)
+        if not callable(read):
+            return None
+        targets = []
+        names_of: Dict[str, List[str]] = {}
+        seen = set()
+        try:
+            for td in physical_tables:
+                super_name = td.super_name
+                simple_name = td.simple_name
+                if not super_name or not simple_name:
+                    continue
+                key = (super_name, simple_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                targets.append(key)
+                names_of.setdefault(super_name, []).append(simple_name)
+            by_lake = {}
+            for super_name, names in names_of.items():
+                answer = read(self.organization, super_name, names)
+                if not (type(answer) is tuple and len(answer) == 2):
+                    return None
+                root_exists, leaf_exists = answer
+                if not (type(root_exists) is bool
+                        and type(leaf_exists) is dict
+                        and list(leaf_exists) == names
+                        and all(type(there) is bool for there in leaf_exists.values())):
+                    return None
+                by_lake[super_name] = answer
+        except Exception:
+            return None
+        return targets, by_lake
 
     def _resolve_latest_stats_file(
         self, super_name: str, simple_name: str,

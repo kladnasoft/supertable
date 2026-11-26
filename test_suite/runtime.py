@@ -134,7 +134,7 @@ def configure_environment(workspace: Path, redis_port: int) -> None:
 
 SELECTIONS = {
     "write": ["test_write_correctness.py", "test_catalog_commit.py", "test_access_check_read.py"],
-    "read": ["test_read_correctness.py"],
+    "read": ["test_read_correctness.py", "test_read_tables_once.py"],
 }
 
 

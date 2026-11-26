@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections import defaultdict
 from typing import Iterable, Set, List, Dict, Optional, Tuple
 from urllib.parse import urlparse
@@ -33,6 +34,18 @@ from typing import Dict, List, Optional, Set, Tuple
 # Backends whose files are addressed as bucket + key rather than a filesystem
 # path.  Only these may be described with an ``s3://``/HTTP URL.
 _OBJECT_STORE_TYPES = frozenset({"S3", "MINIO", "AZURE", "GCS"})
+
+# The catalog and the lake object as the library defines them.  A lake's root
+# and leaves are read in one transaction, and the lake object is then told its
+# root is there, only while those calls would go to these: with another class
+# under either name, another constructor on the lake object, or another
+# catalog in the module the lake object builds its own from, every call is
+# made as it always was (``DataEstimator._leaf_items_of``,
+# ``DataEstimator._open_lake``).
+_CATALOG_AS_DEFINED = RedisCatalog
+_LAKE_AS_DEFINED = SuperTable
+_LAKE_CONSTRUCTOR = SuperTable.__init__
+_LAKE_MODULE = sys.modules[SuperTable.__module__]
 
 
 def get_missing_columns(
@@ -153,6 +166,9 @@ class DataEstimator:
         # Lazily-built key→path resolver; see _to_duckdb_path.
         self._resolve_plan = None
         self.catalog = RedisCatalog()
+        # The lakes whose root the current ``estimate`` has found, in the
+        # transaction that read their leaves: see _leaf_items_of, _open_lake.
+        self._roots_read: Set[str] = set()
         # (super_name, simple_name) -> the snapshot ``estimate`` took that
         # table's file list from.  The reader takes the deletion vector and the
         # share row filter from here, so one read is one snapshot; see
@@ -487,6 +503,68 @@ class DataEstimator:
         items = list(self.catalog.scan_leaf_items(organization, super_name, count=512))
         return self._snapshots_from_items(items)
 
+    # ----------------------- a lake's root and leaves, read together -----------------------
+
+    def _leaf_items_of(self, fetch, organization, super_name, names: List[str]) -> List[Dict]:
+        """The leaves of *names*, as ``get_leaf_items`` returns them, in one round trip.
+
+        ``fetch`` (the catalog's ``get_leaf_items``) reads the root, for the
+        replica the lake may be, and then the leaves; and each table's lake
+        object asks once more whether the root is there.
+        ``RedisCatalog.get_root_and_leaf_items`` sends those commands in one
+        transaction.  Where it answers, the lake is noted as found, for
+        :meth:`_open_lake`.
+
+        ``fetch`` is asked, as it always was, whenever that one read is not to
+        be had: the catalog is not the library's own (a test double, a
+        subclass, a call replaced on it), the answer is not that read's, or
+        the read failed.  A read that failed decides nothing: ``fetch`` then
+        fails, or answers, its own way.
+        """
+        catalog = self.catalog
+        if type(catalog) is _CATALOG_AS_DEFINED and organization == self.organization:
+            together = getattr(catalog, "get_root_and_leaf_items", None)
+            if callable(together):
+                try:
+                    answer = together(organization, super_name, names)
+                except Exception:
+                    answer = None
+                if (type(answer) is tuple and len(answer) == 2
+                        and type(answer[0]) is bool and type(answer[1]) is list
+                        and all(type(item) is dict for item in answer[1])):
+                    root_exists, items = answer
+                    if root_exists:
+                        self._roots_read.add(super_name)
+                    return items
+        return list(fetch(organization, super_name, names))
+
+    def _open_lake(self, super_name: str) -> SuperTable:
+        """The lake object of *super_name*, for reading a snapshot that is not in the catalog.
+
+        Defence in depth: the read path must never bootstrap a missing
+        supertable.  ``DataReader._assert_targets_exist`` is the primary guard
+        at the entry point; ``create_if_missing=False`` ensures any other
+        caller of ``DataEstimator`` (or any future code path) cannot
+        accidentally side-effect a creation through the SuperTable
+        constructor, which asks Redis whether the root is there.
+
+        Where this estimate has just found the root, in the transaction that
+        read this lake's leaves, the constructor is told so and does not ask
+        again.  It is told only while it is the library's own constructor and
+        would have asked the library's own catalog: a lake object, a
+        constructor or a catalog put in their place is asked as before.
+        """
+        if (super_name in self._roots_read
+                and SuperTable is _LAKE_AS_DEFINED
+                and SuperTable.__init__ is _LAKE_CONSTRUCTOR
+                and getattr(_LAKE_MODULE, "RedisCatalog", None) is _CATALOG_AS_DEFINED):
+            return SuperTable(
+                super_name, self.organization, create_if_missing=False, known_to_exist=True,
+            )
+        return SuperTable(
+            super_name, self.organization, create_if_missing=False,
+        )
+
     def _filter_snapshots(self, super_name, simple_name, snapshots: List[Dict]) -> List[Dict]:
         if super_name.lower() == simple_name.lower():
             return [s for s in snapshots if not (s["table_name"].startswith("__") and s["table_name"].endswith("__"))]
@@ -532,7 +610,8 @@ class DataEstimator:
             return None
 
         by_name: Dict[str, List[Dict]] = {}
-        for snapshot in self._snapshots_from_items(list(fetch(organization, super_name, lowered))):
+        items = self._leaf_items_of(fetch, organization, super_name, lowered)
+        for snapshot in self._snapshots_from_items(items):
             by_name.setdefault(snapshot["table_name"], []).append(snapshot)
 
         named: Dict[str, List[Dict]] = {}
@@ -552,6 +631,10 @@ class DataEstimator:
         named = self._named_snapshots(self.organization, super_name, simple_names)
         if named is not None:
             return named
+        # The lake is listed.  Whether it is there is then asked after the
+        # listing, by each table's lake object, as it always was: a root found
+        # before the listing is not taken for one found after it.
+        self._roots_read.discard(super_name)
         all_snapshots = self._collect_snapshots_from_redis(
             organization=self.organization, super_name=super_name)
         return {
@@ -765,6 +848,8 @@ class DataEstimator:
         # Filled below, per table; emptied first so a second estimate() on this
         # object cannot hand out the snapshots of the first.
         self.resolved_snapshots = {}
+        # The lakes found by this call, and by no call before it.
+        self._roots_read = set()
         reflection_file_size = 0        # projected (selected-column) bytes — routing
         reflection_file_size_raw = 0    # whole-file bytes — physical footprint
         max_freshness_ms = 0
@@ -783,15 +868,9 @@ class DataEstimator:
 
             for simple_name in tables:
                 snapshots = snapshots_by_table[simple_name]
-                # Defence in depth: the read path must never bootstrap a
-                # missing supertable. ``DataReader._assert_targets_exist``
-                # is the primary guard at the entry point; this kwarg
-                # ensures any other caller of ``DataEstimator`` (or any
-                # future code path) cannot accidentally side-effect a
-                # creation through the SuperTable constructor.
-                super_table = SuperTable(
-                    super_name, self.organization, create_if_missing=False,
-                )
+                # Never created here, and asked for its root unless this
+                # estimate has just found it: see _open_lake.
+                super_table = self._open_lake(super_name)
 
                 schema: Set[str] = set()
                 schema_types: Dict[str, str] = {}

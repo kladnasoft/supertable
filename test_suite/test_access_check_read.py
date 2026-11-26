@@ -802,7 +802,9 @@ def test_a_query_of_the_real_reader_asks_for_its_role_once(catalog):
             was = _round_trips(lambda: seen.setdefault("was", query("SELECT * FROM t ORDER BY id", "gyori")))
 
         assert seen["now"] == seen["was"] == [{"id": i, "megye": "Győr"} for i in (0, 2, 4)]
-        around = (["EXISTS", "GET", "EXISTS"], ["GET", "PIPELINE of 1", "EXISTS", "GET"])
+        # the tables are asked about in a transaction before the role and one
+        # after it (test_read_tables_once.py); then the engine's settings
+        around = (["PIPELINE of 3"], ["PIPELINE of 3", "GET"])
         assert now == around[0] + ["EVAL_RO over 3"] + around[1]
         assert was == around[0] + ["EXISTS", "SMEMBERS", "HGET", "HGETALL"] + around[1]
     finally:

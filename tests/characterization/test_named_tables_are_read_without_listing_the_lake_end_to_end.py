@@ -22,6 +22,7 @@ lake then read that table twice. The listing now names each leaf once
 from __future__ import annotations
 
 import uuid
+from collections import Counter
 from types import SimpleNamespace
 
 import polars as pl
@@ -267,14 +268,17 @@ def test_listing_the_lake_did_scan(lakes, list_the_lake, redis_commands):
     assert len(_leaf_scans(redis_commands)) >= 1
 
 
-@pytest.mark.parametrize("sql", [
-    "SELECT id FROM emp WHERE id = 2",
-    "SELECT e.id, d.name FROM emp e JOIN dept d ON e.dept_id = d.dept_id ORDER BY e.id",
-    "SELECT a.id FROM emp a JOIN {other}.emp b ON a.id = b.id ORDER BY a.id",
+@pytest.mark.parametrize("sql,lakes_read,tables_read", [
+    ("SELECT id FROM emp WHERE id = 2", 1, 1),
+    ("SELECT e.id, d.name FROM emp e JOIN dept d ON e.dept_id = d.dept_id ORDER BY e.id", 1, 2),
+    ("SELECT a.id FROM emp a JOIN {other}.emp b ON a.id = b.id ORDER BY a.id", 2, 2),
 ], ids=["one table", "a join", "two lakes"])
 def test_a_read_sends_redis_fewer_commands_than_it_did(
-        lakes, list_the_lake, redis_commands, sql):
-    """Never more: the named fetch is the listing's own commands less its SCAN."""
+        lakes, list_the_lake, redis_commands, sql, lakes_read, tables_read):
+    """Never more: the named fetch is the listing's own commands less its SCAN,
+    and less two that it asks inside the transaction that fetches the leaves:
+    the root of each lake, which a listing reads by itself first, and whether
+    the lake is there, which each table's lake object asks after a listing."""
     query = _sql(lakes, sql)
     _read(lakes.main, query)                  # warm: connections, RBAC scaffolding
     del redis_commands[:]
@@ -288,7 +292,8 @@ def test_a_read_sends_redis_fewer_commands_than_it_did(
 
     assert len(by_name) < len(by_listing)
     without_scans = [c for c in by_listing if not (isinstance(c, tuple) and c[0] == "SCAN")]
-    assert by_name == without_scans
+    assert Counter(without_scans) - Counter(by_name) == Counter({"GET": lakes_read, "EXISTS": tables_read})
+    assert not Counter(by_name) - Counter(without_scans), "and nothing a listing did not send"
 
 
 @pytest.fixture

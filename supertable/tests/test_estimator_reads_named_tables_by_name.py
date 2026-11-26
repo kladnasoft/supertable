@@ -616,7 +616,7 @@ class TestWhatAnEstimateAsksTheCatalog:
         outcome = _outcome(catalog, _tables("SELECT * FROM orders"))
 
         assert outcome["tables"][0]["files"] == ["o1.parquet", "o2.parquet"]
-        assert commands == ["GET", "PIPELINE"]
+        assert commands == ["PIPELINE"]         # the root and the leaves, in one transaction
 
     def test_the_same_read_used_to_scan_the_database(self, catalog, client, commands):
         _a_lake(client)
@@ -636,7 +636,7 @@ class TestWhatAnEstimateAsksTheCatalog:
         outcome = _outcome(catalog, _tables(
             "SELECT * FROM orders o JOIN lines l ON o.id = l.id JOIN customers c ON c.id = o.id"))
         assert [t["simple"] for t in outcome["tables"]] == ["customers", "lines", "orders"]
-        assert commands == ["GET", "PIPELINE"]
+        assert commands == ["PIPELINE"]         # the root and the leaves, in one transaction
 
     def test_each_lake_of_a_query_is_asked_once(self, catalog, client, commands):
         _a_lake(client)
@@ -644,7 +644,7 @@ class TestWhatAnEstimateAsksTheCatalog:
         outcome = _outcome(catalog, _tables(
             f"SELECT * FROM orders o JOIN {OTHER}.customers c ON o.id = c.id"))
         assert len(outcome["tables"]) == 2
-        assert commands == ["GET", "PIPELINE", "GET", "PIPELINE"]
+        assert commands == ["PIPELINE", "PIPELINE"]
 
     def test_a_name_in_another_case_is_still_fetched_by_name(self, catalog, client, commands):
         """The listing matched names case-insensitively; the one leaf that can
@@ -654,7 +654,7 @@ class TestWhatAnEstimateAsksTheCatalog:
         outcome = _outcome(catalog, [_table("Orders"), _table("LINES")])
         assert [(t["simple"], t["files"]) for t in outcome["tables"]] == [
             ("LINES", ["l1.parquet"]), ("Orders", ["o1.parquet", "o2.parquet"])]
-        assert commands == ["GET", "PIPELINE"]
+        assert commands == ["PIPELINE"]         # the root and the leaves, in one transaction
 
     def test_never_more_round_trips_than_listing_the_lake(self, catalog, client, commands):
         """Even where listing is at its cheapest: a lake of one table and
@@ -666,7 +666,7 @@ class TestWhatAnEstimateAsksTheCatalog:
         del commands[:]
         _outcome(catalog, _tables("SELECT * FROM orders"), list_the_lake=True)
         by_listing = list(commands)
-        assert by_name == ["GET", "PIPELINE"]
+        assert by_name == ["PIPELINE"]
         assert by_listing == ["GET", "SCAN", "PIPELINE"]
 
     def test_the_lake_s_own_name_lists_and_fetches_nothing_by_name(
@@ -688,10 +688,10 @@ class TestWhatAnEstimateAsksTheCatalog:
             "SELECT o.id, a.x, b.y FROM orders o JOIN nothere a ON o.id = a.id "
             "JOIN neither b ON o.id = b.id"))
         assert outcome["raised"] == "RuntimeError"
-        assert commands[:2] == ["GET", "PIPELINE"]          # by name: two are missing
-        assert commands[2:].count("GET") == 1                # then one listing
-        assert commands[2:].count("SCAN") >= 1
-        assert commands[2:].count("PIPELINE") == 1
+        assert commands[:1] == ["PIPELINE"]                  # by name: two are missing
+        assert commands[1:].count("GET") == 1                # then one listing
+        assert commands[1:].count("SCAN") >= 1
+        assert commands[1:].count("PIPELINE") == 1
 
     def test_a_catalog_that_cannot_fetch_by_name_is_listed(self, catalog, client):
         """A stand-in without ``get_leaf_items`` gets the read it always got."""

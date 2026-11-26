@@ -214,6 +214,9 @@ def _lake(monkeypatch, as_it_was: bool = False, redis_7: bool = True):
         monkeypatch.delattr(RedisCatalog, "commit_leaf_and_bump_root")
         monkeypatch.delattr(RedisCatalog, "store_schema_and_read_mirrors")
         monkeypatch.delattr(RoleManager, "read_for_access_check")
+        # a query, too, as it was: its tables asked about one call at a time
+        monkeypatch.delattr(RedisCatalog, "root_and_leaves_exist")
+        monkeypatch.delattr(RedisCatalog, "get_root_and_leaf_items")
 
     def recorded(operation):
         """Run one operation of the writer; what it returned and its round trips."""

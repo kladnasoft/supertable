@@ -888,17 +888,28 @@ return generation
         An unreadable root document still reads as a non-replica.
         """
         try:
-            root = self.get_root(org, sup)
-            if root and root.get("clone_type") == "replica":
-                source = root.get("cloned_from", "")
-                if source and source != sup:
-                    tables = root.get("replica_tables")
-                    allowed = tables if isinstance(tables, list) and tables else None
-                    return (source, allowed)
+            return self._replica_info_of(self.get_root(org, sup), sup)
         except redis.RedisError:
             raise
         except Exception:
             pass
+        return None
+
+    @staticmethod
+    def _replica_info_of(root: Any, sup: str) -> Optional[tuple]:
+        """What :meth:`_resolve_replica_info` makes of a root document.
+
+        The decision by itself, for a caller that has the document already
+        (:meth:`_replica_info_of_text`).  Raises what the document makes it
+        raise (a root that is no object has no ``get``); both callers read
+        that as "no replica".
+        """
+        if root and root.get("clone_type") == "replica":
+            source = root.get("cloned_from", "")
+            if source and source != sup:
+                tables = root.get("replica_tables")
+                allowed = tables if isinstance(tables, list) and tables else None
+                return (source, allowed)
         return None
 
     # Keep backward-compatible wrappers for gc.py and other callers
@@ -2138,6 +2149,226 @@ return generation
 
         return list(self._leaf_items(keys, vals))
 
+    # ------------- A lake's root and named leaves, asked together -------------
+    #
+    # A query asked the catalog about its tables one thing at a time, a round
+    # trip each.  Before the role was checked: is the lake there
+    # (``root_exists``: EXISTS root), and for each table, is it there
+    # (``leaf_exists``: GET root, for the replica the lake may be, then EXISTS
+    # leaf).  After it: what the leaves hold (``get_leaf_items``: GET root
+    # again, then the leaves in one transaction), and once more whether the
+    # lake is there for each table's lake object (``SuperTable``: EXISTS
+    # root).  The two methods below send the same commands, each batch in one
+    # transaction, where it was sent before.
+
+    def root_and_leaves_exist(
+            self, org: str, sup: str, simples: Iterable[str],
+    ) -> Tuple[bool, Dict[str, bool]]:
+        """Whether a lake is there and which of the named tables are, in one round trip.
+
+        What ``root_exists(org, sup)`` answers, and for each name in *simples*
+        what ``leaf_exists(org, sup, name)`` answers: ``(root_exists,
+        {name: leaf_exists})``.  One transaction of the commands those calls
+        send: EXISTS and GET of the root, EXISTS of each leaf.  They are
+        answered at one moment, where they were answered one after another.
+
+        A replica's leaves are its source's.  When the root says the lake is
+        one, the leaves are asked for again under the source, in a second
+        transaction; what the first found under the replica's own name is not
+        used, and a table the replica was not given is not asked for.
+
+        Raises ``ValueError`` for a name no key can be built from, where
+        ``leaf_exists`` raises it: at the first such name among those the lake
+        is asked for.  ``leaf_exists`` is called for one table at a time, so
+        whatever a caller made of the tables before that name it has already
+        made; a caller that needs that asks the separate calls.  Raises
+        ``redis.RedisError`` when Redis cannot answer (logged) or answers with
+        anything but those replies.  Nothing is written, whatever happens.
+
+        Raises ``NotImplementedError``, with nothing sent and nothing logged,
+        on a subclass and on a catalog where one of the calls this stands for
+        has been replaced, on the class, on the object or on its Redis client
+        (:meth:`_table_reads_are_its_own`): whoever changed one of them is
+        asked the changed one.
+        """
+        if not self._table_reads_are_its_own():
+            raise NotImplementedError(
+                "root_and_leaves_exist stands for root_exists and leaf_exists of RedisCatalog as "
+                "it defines them; a subclass, or a catalog with a call of theirs replaced, makes "
+                "those calls itself"
+            )
+        what = "root_and_leaves_exist"
+        names = list(dict.fromkeys(simples))
+        root_key = RK.meta_root(org, sup)
+        # A name no key can be built from has no leaf.  Whether asking for it
+        # is an error is known only once the root is read: a replica is not
+        # asked for a table it was not given, whatever the table is called,
+        # and answers that it is not there.
+        own_keys: Dict[str, str] = {}
+        refused: Dict[str, ValueError] = {}
+        for name in names:
+            try:
+                own_keys[name] = RK.meta_leaf(org, sup, name)
+            except ValueError as error:
+                refused[name] = error
+        replies = self._asked_together(
+            [("EXISTS", root_key), ("GET", root_key)] + [("EXISTS", key) for key in own_keys.values()],
+            what,
+        )
+        root_there, info = replies[0], self._replica_info_of_text(replies[1], sup)
+
+        if info is None:
+            for name in names:
+                if name in refused:
+                    raise refused[name]
+            found = dict(zip(own_keys, replies[2:]))
+        else:
+            source, allowed = info
+            asked = [name for name in names if not (allowed and name not in allowed)]
+            keys = [RK.meta_leaf(org, source, name) for name in asked]
+            answers = self._asked_together([("EXISTS", key) for key in keys], what) if keys else []
+            found = dict(zip(asked, answers))
+        return bool(root_there), {name: bool(found.get(name, 0)) for name in names}
+
+    def get_root_and_leaf_items(
+            self, org: str, sup: str, simples: Iterable[str],
+    ) -> Tuple[bool, List[Dict]]:
+        """Whether a lake is there, and the leaves of the named tables, in one round trip.
+
+        ``(root_exists, items)``: what ``root_exists(org, sup)`` answers, and
+        what ``get_leaf_items(org, sup, simples)`` returns.  One transaction
+        of the commands those calls send: EXISTS and GET of the root, GET of
+        each leaf, so the lake and its tables are seen as of one moment.  For
+        a replica the leaves are fetched again under its source, in a second
+        transaction.
+
+        As ``get_leaf_items``: a name with no leaf is left out, and so is a
+        name no key can be built from; an organization or lake name no key can
+        be built from raises ``ValueError``; a Redis that cannot answer raises
+        (logged), and so does an answer that is not those replies.  Nothing is
+        written.
+
+        Raises ``NotImplementedError``, with nothing sent and nothing logged,
+        where :meth:`_table_reads_are_its_own` is false.
+        """
+        if not self._table_reads_are_its_own():
+            raise NotImplementedError(
+                "get_root_and_leaf_items stands for root_exists and get_leaf_items of RedisCatalog "
+                "as it defines them; a subclass, or a catalog with a call of theirs replaced, makes "
+                "those calls itself"
+            )
+        what = "get_root_and_leaf_items"
+        simples = list(simples)
+        root_key = RK.meta_root(org, sup)
+
+        def leaf_keys(lake: str, allowed) -> List[str]:
+            # the loop of get_leaf_items, for the lake the leaves are read from
+            keys: List[str] = []
+            seen: Set[str] = set()
+            for simple in simples:
+                if allowed and simple not in allowed:
+                    continue
+                try:
+                    key = RK.meta_leaf(org, lake, simple)
+                except ValueError:
+                    continue
+                if key not in seen:
+                    seen.add(key)
+                    keys.append(key)
+            return keys
+
+        own = leaf_keys(sup, None)
+        replies = self._asked_together(
+            [("EXISTS", root_key), ("GET", root_key)] + [("GET", key) for key in own], what)
+        root_there, info = replies[0], self._replica_info_of_text(replies[1], sup)
+        if info is None:
+            return bool(root_there), list(self._leaf_items(own, replies[2:]))
+
+        source, allowed = info
+        # Validates the source's name exactly as get_leaf_items does, before
+        # the loop reads a ValueError as "this table name cannot have a leaf".
+        RK.meta_leaf_pattern(org, source)
+        keys = leaf_keys(source, allowed)
+        if not keys:
+            return bool(root_there), []
+        vals = self._asked_together([("GET", key) for key in keys], what)
+        return bool(root_there), list(self._leaf_items(keys, vals))
+
+    def _replica_info_of_text(self, root_text: Optional[str], sup: str) -> Optional[tuple]:
+        """What :meth:`_resolve_replica_info` makes of the text at a root key.
+
+        ``get_root`` parses the text and ``_resolve_replica_info`` reads a
+        root it cannot parse, or that is no object, as no replica.
+        """
+        try:
+            return self._replica_info_of(json.loads(root_text) if root_text else None, sup)
+        except Exception:
+            return None
+
+    def _asked_together(self, asked: List[Tuple[str, str]], what: str) -> List[Any]:
+        """EXISTS and GET commands in one transaction, and their replies.
+
+        *asked* is ``[("EXISTS" | "GET", key), ...]``.  The replies are
+        checked for what those commands answer (a count for EXISTS, text or
+        nothing for GET): anything else is not this transaction's answer, and
+        raises ``redis.ResponseError`` without repeating what was answered.
+        """
+        try:
+            with self.r.pipeline() as p:
+                for command, key in asked:
+                    if command == "EXISTS":
+                        p.exists(key)
+                    else:
+                        p.get(key)
+                replies = p.execute()
+        except redis.RedisError as e:
+            logger.error(f"[redis-catalog] {what} error: {e}")
+            raise
+        well_formed = isinstance(replies, (list, tuple)) and len(replies) == len(asked)
+        if well_formed:
+            well_formed = all(
+                (isinstance(reply, int) and not isinstance(reply, bool)) if command == "EXISTS"
+                else (reply is None or isinstance(reply, str))
+                for (command, _key), reply in zip(asked, replies)
+            )
+        if not well_formed:
+            raise redis.ResponseError(
+                f"unexpected reply to the transaction of {what}: a {type(replies).__name__}"
+            )
+        return list(replies)
+
+    def _table_reads_are_its_own(self) -> bool:
+        """Whether the calls :meth:`root_and_leaves_exist` and
+        :meth:`get_root_and_leaf_items` stand for are this class's.
+
+        False for a subclass, and for a catalog on which one of them has been
+        replaced, on the class or on the object: such a catalog may decide
+        that a table is there, or read its leaf, its own way, and it is its
+        own way that has to be asked.  False as well when EXISTS or GET, which
+        those calls send one at a time, has been replaced on the Redis client,
+        on its class or on the object, or the client is no ``redis.Redis``:
+        the transaction would go round whatever was put there.  The client's
+        ``pipeline`` is not looked at: both methods open one, as
+        ``get_leaf_items`` does.
+        """
+        if type(self) is not RedisCatalog:
+            return False
+        mine = vars(self)
+        if not all(
+            name not in mine and getattr(RedisCatalog, name, None) is original
+            for name, original in _TABLE_READS_STAND_FOR.items()
+        ):
+            return False
+        client = self.r
+        try:
+            on_the_client = vars(client)
+        except TypeError:
+            return False
+        return all(
+            name not in on_the_client and getattr(type(client), name, None) is _CLIENT_READS[name]
+            for name in ("exists", "get")
+        )
+
     # ------------- Deletions (dangerous) -------------
 
     def delete_simple_table(self, org: str, sup: str, simple: str) -> bool:
@@ -2939,5 +3170,22 @@ _ACCESS_READ_STANDS_FOR: Dict[str, Any] = {
         "get_role_details",
         "_role_from_hash",
         "_decode_member",
+    )
+}
+
+#: The calls ``RedisCatalog.root_and_leaves_exist`` and
+#: ``RedisCatalog.get_root_and_leaf_items`` stand for, as the class defines
+#: them (``RedisCatalog._table_reads_are_its_own``).
+_TABLE_READS_STAND_FOR: Dict[str, Any] = {
+    name: getattr(RedisCatalog, name)
+    for name in (
+        "root_exists",
+        "leaf_exists",
+        "_leaf_exists_raw",
+        "get_root",
+        "_resolve_replica_info",
+        "_replica_info_of",
+        "get_leaf_items",
+        "_leaf_items",
     )
 }

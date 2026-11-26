@@ -106,6 +106,19 @@ counted.
 
 ## Read half
 
+### What a query asks about its tables
+
+`--read` also runs [`test_read_tables_once.py`](test_read_tables_once.py).
+A query asks the catalog about its tables in two transactions, one before its
+role is checked and one after, where it sent the same commands one at a time.
+What a transaction of reads hands back is made by the real Redis, so both are
+compared here with the separate calls: on what they answer for lakes that are
+there, not there, unreadable and replicas of another, on the commands Redis
+receives (read from `MONITOR`), and on being answered while writes are paused
+and for a user whose keys are read-only, as the separate reads were. The real
+reader then runs on a lake of its own and on a replica of it, the way it is and
+the way it was, and the rows, the errors and the round trips are compared.
+
 ~90 cases over a deterministic 200-row fact table plus a dimension table,
 written in four batches and then partly updated and partly deleted — so every
 read crosses multiple files, superseded rows and a live deletion vector. A
