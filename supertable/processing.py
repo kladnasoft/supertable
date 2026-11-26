@@ -1607,6 +1607,127 @@ def _write_df_parquet(
     return size
 
 
+# An upsert or delete used to run one semi join for every candidate file.  A
+# join of a small frame costs what the thread pool costs to start it, not what
+# the rows cost: 4.6 ms for a file of a hundred rows as for one of a hundred
+# thousand, on a 16-thread pool.  Every small upsert leaves a small file whose
+# keys later upserts cannot rule out by range, so a table under steady upserts
+# holds dozens of them, and a 100-key upsert took 174 ms with under twenty live
+# files and 741 ms with eighty or more.
+#
+# The candidate files are now joined several at a time: the key and row-id
+# columns of the files are put end to end and matched in one join.  What is
+# put together at once is bounded in bytes, so a write holds at most this much
+# of the key columns in addition to the file it is reading; a file that is
+# larger on its own is joined on its own, as every file was.
+_OVERLAP_JOIN_BATCH_BYTES = 8 * 1024 * 1024
+
+
+def _unused_column_name(taken, base: str = "__st_row_position__") -> str:
+    """A column name that is not in *taken*."""
+    name = base
+    while name in taken:
+        name += "_"
+    return name
+
+
+def _delete_pairs_of_one_file(
+        existing_df,
+        file: str,
+        incoming_keys: polars.DataFrame,
+        overwrite_columns: List[str],
+        p,
+) -> Optional[polars.DataFrame]:
+    """The ``(file, __rowid__)`` pairs of one file, by a join of its own.
+
+    The way every file was matched before files were joined several at a time.
+    Kept for whatever is handed over in place of a polars frame (a subclass, a
+    stand-in): it is asked exactly what it was always asked.
+    """
+    with p.span("delete.semi_join"):
+        # nulls_equal=True so a NULL in an overwrite key matches an existing
+        # NULL (null-safe overwrite/delete), unlike SQL's NULL != NULL.
+        matched = existing_df.join(
+            incoming_keys, on=overwrite_columns, how="semi", nulls_equal=True
+        )
+    if matched.height == 0:
+        return None
+
+    part = (
+        matched.select(polars.col(ROWID_COL).cast(polars.Int64))
+        .drop_nulls()
+        .with_columns(polars.lit(file, dtype=polars.Utf8).alias(TOMBSTONE_FILE_COL))
+        .select(TOMBSTONE_FILE_COL, ROWID_COL)
+    )
+    return part if part.height else None
+
+
+def _delete_pairs_of_batch(
+        frames: List[polars.DataFrame],
+        files: List[str],
+        incoming_keys: polars.DataFrame,
+        overwrite_columns: List[str],
+        p,
+) -> Optional[polars.DataFrame]:
+    """The ``(file, __rowid__)`` pairs of several files, by one join.
+
+    *frames* are the key and row-id columns of *files*, one frame a file, all of
+    one schema.  The result is what joining each file on its own and putting
+    the results end to end gives: the files in the order given, the rows of a
+    file in the order they have in it, rows without a row id left out.
+
+    The rows are numbered before the join, and the number says which file a
+    matched row came from, so no file path is carried per row.  One file needs
+    no numbers.
+    """
+    if len(frames) == 1:
+        position = None
+        batch = frames[0]
+    else:
+        position = _unused_column_name(frames[0].columns)
+        batch = polars.concat(frames, how="vertical").with_row_index(position)
+
+    with p.span("delete.semi_join"):
+        # nulls_equal=True so a NULL in an overwrite key matches an existing
+        # NULL (null-safe overwrite/delete), unlike SQL's NULL != NULL.
+        # maintain_order: the rows keep the order the files had them in.
+        matched = batch.join(
+            incoming_keys, on=overwrite_columns, how="semi", nulls_equal=True,
+            maintain_order="left",
+        )
+    if matched.height == 0:
+        return None
+
+    rowids = matched.get_column(ROWID_COL).cast(polars.Int64)
+    with_rowid = rowids.is_not_null() if rowids.null_count() else None
+    if with_rowid is not None:
+        rowids = rowids.filter(with_rowid)
+    if rowids.len() == 0:
+        return None
+
+    if position is None:
+        paths = polars.Series(
+            TOMBSTONE_FILE_COL, [files[0]], dtype=polars.Utf8,
+        ).new_from_index(0, rowids.len())
+    else:
+        positions = matched.get_column(position)
+        if with_rowid is not None:
+            positions = positions.filter(with_rowid)
+        # ends[i] is the number of rows in files 0..i, so the file of the row
+        # numbered n is the count of ends at or below n.  (A file without rows
+        # repeats the end before it and is never the answer.)
+        ends: List[int] = []
+        total = 0
+        for frame in frames:
+            total += frame.height
+            ends.append(total)
+        file_of_row = polars.Series(ends, dtype=positions.dtype).search_sorted(
+            positions, side="right")
+        paths = polars.Series(TOMBSTONE_FILE_COL, files, dtype=polars.Utf8).gather(file_of_row)
+
+    return polars.DataFrame([paths, rowids])
+
+
 def identify_deleted_rowids(
         df: polars.DataFrame,
         overlapping_files: Set[Tuple[str, bool, int]],
@@ -1617,10 +1738,17 @@ def identify_deleted_rowids(
 ) -> List[Tuple[str, int]]:
     """Find the ``(file, __rowid__)`` pairs of existing rows matching a delete predicate.
 
-    For every overlapping data file, semi-joins the file against the unique
-    *overwrite_columns* key tuples present in *df* and collects the
-    ``__rowid__`` of each matched row plus the file it lives in. These pairs
+    Every overlapping data file is semi-joined against the unique
+    *overwrite_columns* key tuples present in *df*, and the ``__rowid__`` of
+    each matched row is collected with the file it lives in. These pairs
     are appended to the tombstone deletion-vector by the caller.
+
+    The files are read one at a time, in the order given, and joined several
+    at a time: files that follow each other and have the same types in the key
+    and row-id columns are matched by one join, up to
+    ``_OVERLAP_JOIN_BATCH_BYTES`` of those columns (see the note above).  The
+    pairs come out as one join per file gave them: file by file in the order
+    given, the rows of a file in the order they have in it.
 
     Files lacking a ``__rowid__`` column (legacy data written before rowids
     existed) cannot be tombstoned by id and are skipped.
@@ -1636,6 +1764,50 @@ def identify_deleted_rowids(
         return empty_delete_pairs()
     with p.span("delete.incoming_keys"):
         incoming_keys = df.select(overwrite_columns).unique()
+
+    # The columns a file is matched on and read from; the row id once, also
+    # when it is itself a key.
+    needed = list(dict.fromkeys(list(overwrite_columns) + [ROWID_COL]))
+
+    # The files waiting to be joined together, their paths, the bytes of their
+    # key and row-id columns, and the types of those columns.
+    waiting_frames: List[polars.DataFrame] = []
+    waiting_files: List[str] = []
+    waiting_bytes = 0
+    waiting_schema = None
+
+    def _keep(part: Optional[polars.DataFrame]) -> None:
+        if part is not None:
+            parts.append(part)
+            p.add("delete_rows_matched", part.height)
+
+    def _match_waiting() -> None:
+        """Join the files that wait, and forget them."""
+        nonlocal waiting_frames, waiting_files, waiting_bytes, waiting_schema
+        frames, files = waiting_frames, waiting_files
+        waiting_frames, waiting_files, waiting_bytes, waiting_schema = [], [], 0, None
+        if not frames:
+            return
+        try:
+            part = _delete_pairs_of_batch(frames, files, incoming_keys, overwrite_columns, p)
+        except Exception as e:
+            if len(frames) == 1:
+                # One file, the join it always met: what it raises is raised.
+                raise
+            # Joining several files at once is a faster way to the same pairs
+            # and never a reason for a write to fail.  Each of the files is
+            # joined on its own, the way it always was, and what one of them
+            # raises then is what it always raised.
+            logging.info(
+                f"[delete] {len(frames)} files could not be matched in one join, "
+                f"matching them one by one: {e}"
+            )
+            p.add("delete_join_one_by_one", 1)
+            for frame, file in zip(frames, files):
+                _keep(_delete_pairs_of_one_file(
+                    frame, file, incoming_keys, overwrite_columns, p))
+            return
+        _keep(part)
 
     for file, has_overlap, file_size in overlapping_files:
         if not has_overlap:
@@ -1653,24 +1825,38 @@ def identify_deleted_rowids(
         if not all(c in existing_df.columns for c in overwrite_columns):
             continue
 
-        with p.span("delete.semi_join"):
-            # nulls_equal=True so a NULL in an overwrite key matches an existing
-            # NULL (null-safe overwrite/delete), unlike SQL's NULL != NULL.
-            matched = existing_df.join(
-                incoming_keys, on=overwrite_columns, how="semi", nulls_equal=True
-            )
-        if matched.height == 0:
+        if type(existing_df) is not polars.DataFrame:
+            # Not a frame this module read: matched on its own, the old way,
+            # after the files before it.
+            _match_waiting()
+            _keep(_delete_pairs_of_one_file(
+                existing_df, file, incoming_keys, overwrite_columns, p))
             continue
 
-        part = (
-            matched.select(polars.col(ROWID_COL).cast(polars.Int64))
-            .drop_nulls()
-            .with_columns(polars.lit(file, dtype=polars.Utf8).alias(TOMBSTONE_FILE_COL))
-            .select(TOMBSTONE_FILE_COL, ROWID_COL)
+        # Only the key and row-id columns are held while a file waits.
+        keyed = (
+            existing_df if existing_df.columns == needed
+            else polars.DataFrame([existing_df.get_column(c) for c in needed])
         )
-        if part.height:
-            parts.append(part)
-            p.add("delete_rows_matched", part.height)
+        schema = tuple(keyed.dtypes)
+        size = int(keyed.estimated_size())
+
+        # Files are put end to end only when their columns have the same
+        # types, so a file whose key has another type meets the join it always
+        # met, and only while they fit the bound, so a large file is joined on
+        # its own.  A file never moves past another: the order is the order
+        # the files were given in.
+        if waiting_frames and (
+                schema != waiting_schema
+                or waiting_bytes + size > _OVERLAP_JOIN_BATCH_BYTES):
+            _match_waiting()
+
+        waiting_frames.append(keyed)
+        waiting_files.append(file)
+        waiting_bytes += size
+        waiting_schema = schema
+
+    _match_waiting()
 
     if not parts:
         return empty_delete_pairs()
