@@ -166,6 +166,7 @@ class RoleManager:
         organization: str,
         role_name,
         redis_catalog: Optional[RedisCatalog] = None,
+        with_root: bool = True,
     ):
         """The lake's root and one role, read in a single round trip.
 
@@ -178,7 +179,9 @@ class RoleManager:
 
         Returns ``(root, role)``: the text stored at the lake's root (``None``
         for no root) and what :meth:`get_role_by_name` returns for
-        *role_name* (``{}`` for no such role).
+        *role_name* (``{}`` for no such role).  Without *with_root* the root
+        is not read at all and is ``None``: the four reads a manager makes,
+        for a caller that has no use for the root (a query).
 
         Returns ``None`` when it is not to be had that way, and the caller
         then constructs a manager as it always did: the role store is not
@@ -188,17 +191,21 @@ class RoleManager:
         instance is made and nothing is written.
 
         This class's own read, as ``rbac_access_read`` is the catalog's: asked
-        of a subclass it answers ``None``.  It stands for what this class's
-        constructor and lookup do, and a subclass may have changed either.
+        of a subclass it answers ``None``, and so it does when the constructor
+        or the lookup it stands for has been replaced on the class.  Whoever
+        changed one of them is asked the changed one.
         """
-        if cls is not RoleManager:
+        if cls is not RoleManager or any(
+            RoleManager.__dict__.get(name) is not original
+            for name, original in _ACCESS_READ_STANDS_FOR.items()
+        ):
             return None
         try:
             catalog = redis_catalog or RedisCatalog()
             read = getattr(catalog, "rbac_access_read", None)
             if not callable(read):
                 return None
-            answer = read(organization, super_name, role_name)
+            answer = read(organization, super_name, role_name, with_root=bool(with_root))
         except Exception:
             # A Redis error was logged by the catalog.  Whatever it was, the
             # reads the constructor and get_role_by_name make are still there
@@ -515,3 +522,12 @@ class RoleManager:
     def get_superadmin_role_hash(self) -> Optional[str]:
         """Deprecated: use ``get_superadmin_role_id``."""
         return self.get_superadmin_role_id()
+
+
+#: What ``RoleManager.read_for_access_check`` stands for, as the class defines
+#: it: the constructor with its check of the role store, and the lookup of a
+#: role by its name.
+_ACCESS_READ_STANDS_FOR = {
+    name: RoleManager.__dict__[name]
+    for name in ("__init__", "_init_role_storage", "get_role_by_name", "get_role")
+}

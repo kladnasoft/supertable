@@ -74,6 +74,8 @@ The read gate permits one read statement and rejects writes, multiple statements
 
 The SQL role is supplied directly by the caller. `DataReader` does not authenticate a username, select a user's role, or verify a bearer token. An application exposing it must resolve the caller's permitted role before invoking this API.
 
+After the table preflight the role is read from Redis in one round trip (`restrict_read_access`, through `RedisCatalog.rbac_access_read`) on Redis 7 and later, and in the four it always took on an older Redis; see [RBAC](11_rbac.md#6-enforcement-during-reads-and-writes). A query of one table makes 9 round trips to Redis, 8 with monitoring off: the lake's root and the table's entry are checked (three), the role is read (one), the root and the table's entry are read for the snapshot (two), the root is checked once more when the estimator opens the lake, the engine's configuration is read, and the monitoring record is written. `tests/characterization/test_the_round_trips_of_a_query_to_redis.py` pins the sequence.
+
 ## 3. EXPLAIN and SHOW STATS
 
 Use materialized `execute()` for these commands.

@@ -5,8 +5,13 @@ An access check is made on one read of Redis, or on the five it always made.
 lake's root and the role in one round trip, and goes the old way, the guard's
 own read of the root and then a constructed ``RoleManager``, whenever that is
 not to be had: a ``RoleManager`` or a catalog that does not know the read
-(every test double), an answer that is not the root's text and a role
-document, or a failure of the call.
+(every test double), a catalog put in the place of the guard's and not of the
+manager's or the other way round, an answer that is not the root's text and a
+role document, or a failure of the call.
+
+A query's check, ``restrict_read_access``, has no read-only guard: it asks the
+same read for the role alone, without the root, and goes the old way, a
+constructed ``RoleManager`` and its lookup, under the same conditions.
 
 The collaborators here are doubles that record what they are asked, so that
 which way was taken, in which order, and what each answer leads to can be read
@@ -17,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,8 +31,9 @@ import redis
 os.environ.setdefault("SUPERTABLE_ORGANIZATION", "test_org")
 os.environ.setdefault("SUPERTABLE_SUPERUSER_TOKEN", "test_token")
 
-from supertable.rbac import access_control  # noqa: E402
-from supertable.rbac.access_control import check_write_access  # noqa: E402
+from supertable.data_classes import TableDefinition  # noqa: E402
+from supertable.rbac import access_control, role_manager  # noqa: E402
+from supertable.rbac.access_control import check_write_access, restrict_read_access  # noqa: E402
 
 ORG, LAKE = "acme", "sales"
 LOGGER = access_control.logger.name
@@ -80,21 +87,49 @@ class _Doubles:
                 return answer(role)
 
         if not (isinstance(read, str) and read == "absent"):
-            def read_for_access_check(super_name, organization, role_name, redis_catalog=None):
+            def read_for_access_check(super_name, organization, role_name, redis_catalog=None,
+                                      with_root=True):
                 calls.append("read_for_access_check")
                 asked.append(("read_for_access_check", super_name, organization, role_name,
-                              type(redis_catalog)))
+                              type(redis_catalog)) + (() if with_root is True else (("with_root", with_root),)))
                 return answer(read)
 
             Manager.read_for_access_check = staticmethod(read_for_access_check)
 
         self.Catalog, self.Manager = Catalog, Manager
 
-    def check(self, role_name="loader", table="orders"):
+    def check(self, role_name="loader", table="orders", everywhere=True):
+        """``check_write_access`` with the doubles in the place of the catalog and the manager.
+
+        The catalog double stands where the access check builds a catalog for
+        its guard and, unless *everywhere* is false, where a manager builds
+        one for itself: the one read asks one catalog for the root and the
+        role, and is asked for only where the two are one class.
+        """
+        with ExitStack() as places:
+            places.enter_context(patch.object(access_control, "RedisCatalog", self.Catalog))
+            places.enter_context(patch.object(access_control, "RoleManager", self.Manager))
+            if everywhere:
+                places.enter_context(patch.object(role_manager, "RedisCatalog", self.Catalog))
+            try:
+                return ("returned", check_write_access(LAKE, ORG, role_name, table))
+            except Exception as error:   # noqa: BLE001 - whatever it raises is the outcome
+                return ("raised", type(error).__name__, str(error))
+
+    def read(self, role_name="analyst", table="orders", columns=("id",)):
+        """``restrict_read_access`` for one table of a query; the views as plain values.
+
+        The catalog double stands in the access check's place alone here: a
+        query's check builds no catalog, and which one the access check names
+        is nothing to it.
+        """
+        asked_for = [TableDefinition(super_name=LAKE, simple_name=table, alias="t", columns=list(columns))]
         with patch.object(access_control, "RedisCatalog", self.Catalog), \
                 patch.object(access_control, "RoleManager", self.Manager):
             try:
-                return ("returned", check_write_access(LAKE, ORG, role_name, table))
+                views = restrict_read_access(LAKE, ORG, role_name, asked_for, asked_for)
+                return ("returned", {alias: (list(view.allowed_columns), view.where_clause)
+                                     for alias, view in views.items()})
             except Exception as error:   # noqa: BLE001 - whatever it raises is the outcome
                 return ("raised", type(error).__name__, str(error))
 
@@ -338,6 +373,42 @@ def test_a_read_that_is_no_function_is_not_called():
     assert doubles.calls == FIVE_READS
 
 
+def test_a_catalog_in_the_guard_s_place_alone_is_asked_for_the_root_as_before():
+    """The guard read the root through the access check's catalog, and the
+    role came from the catalog a manager builds for itself.  The one read asks
+    one catalog for both: where the two are not one class, each is asked what
+    it was asked before, and the one read is not asked for."""
+    doubles = _Doubles(read=(A_ROOT, dict(WRITER)), root=None, role=dict(WRITER))
+
+    assert doubles.check(everywhere=False) == ("returned", None)
+
+    assert doubles.calls == FIVE_READS
+    assert doubles.asked == [("get_root", ORG, LAKE), ("RoleManager()", LAKE, ORG),
+                             ("get_role_by_name", "loader")]
+
+
+def test_the_root_the_guard_s_own_catalog_reads_decides_and_not_the_one_the_read_would_hand_over():
+    doubles = _Doubles(read=(A_ROOT, dict(WRITER)), root={"read_only": True}, role=dict(WRITER))
+
+    assert doubles.check(everywhere=False) == _refused("This SuperTable is locked. Cannot write to this table.")
+    assert doubles.calls == ["RedisCatalog()", "get_root"]
+
+
+def test_a_manager_s_module_that_names_no_catalog_is_asked_the_five(monkeypatch):
+    doubles = _Doubles(read=(A_ROOT, dict(WRITER)), root=None, role=dict(WRITER))
+    monkeypatch.delattr(role_manager, "RedisCatalog")
+
+    assert doubles.check(everywhere=False) == ("returned", None)
+    assert doubles.calls == FIVE_READS
+
+
+def test_the_two_catalogs_are_one_class_as_the_library_stands():
+    from supertable.redis_catalog import RedisCatalog
+
+    assert access_control.RedisCatalog is role_manager.RedisCatalog is RedisCatalog
+    assert access_control._role_manager is role_manager
+
+
 @pytest.mark.parametrize("failure", [
     redis.exceptions.TimeoutError("Timeout reading from socket"),
     redis.ResponseError("WRONGTYPE"), ValueError("Invalid Redis key segment"),
@@ -415,19 +486,194 @@ def test_a_read_only_root_stops_the_five_before_the_role():
     assert doubles.calls == ["RedisCatalog()", "get_root"]
 
 
-def test_a_mocked_manager_is_asked_the_five_reads():
+@pytest.mark.parametrize("everywhere", [False, True],
+                         ids=["a catalog mocked for the guard", "the same mock where a manager builds its own"])
+def test_a_mocked_manager_is_asked_the_five_reads(everywhere):
     """The shape the access-control tests have: ``patch(...RoleManager,
-    return_value=manager)``."""
+    return_value=manager)`` and ``patch(...RedisCatalog, return_value=catalog)``.
+    A mocked catalog for the guard alone is not asked for the one read; one
+    that stands in both places is, and what a mock answers is no answer."""
     manager = MagicMock()
     manager.get_role_by_name.return_value = dict(WRITER)
     catalog = MagicMock()
     catalog.get_root.return_value = None
+    catalog_class = MagicMock(return_value=catalog)
 
-    with patch.object(access_control, "RoleManager", return_value=manager) as replaced, \
-            patch.object(access_control, "RedisCatalog", return_value=catalog):
+    with ExitStack() as places:
+        replaced = places.enter_context(patch.object(access_control, "RoleManager", return_value=manager))
+        places.enter_context(patch.object(access_control, "RedisCatalog", catalog_class))
+        if everywhere:
+            places.enter_context(patch.object(role_manager, "RedisCatalog", catalog_class))
         check_write_access(LAKE, ORG, "loader", "orders")
 
-    replaced.read_for_access_check.assert_called_once()
+    assert replaced.read_for_access_check.call_count == (1 if everywhere else 0)
     replaced.assert_called_once_with(super_name=LAKE, organization=ORG)
     manager.get_role_by_name.assert_called_once_with("loader")
     catalog.get_root.assert_called_once_with(ORG, LAKE)
+
+
+# ---------------------------------------------------------------------------
+# A query: the role alone, on one read or on four
+# ---------------------------------------------------------------------------
+
+READER = {"role": "reader", "role_name": "analyst", "role_id": "b" * 32,
+          "tables": {"orders": {"columns": ["id"], "filters": ["*"]}}}
+ONE_VIEW = ("returned", {"t": (["id"], "")})
+ROLE_READ = ["read_for_access_check"]
+FOUR_READS = ["RoleManager()", "get_role_by_name"]
+NOT_TO_READ = _refused("You don't have permission to read the table.")
+
+
+def test_a_query_asks_the_one_read_for_the_role_and_not_for_the_root():
+    doubles = _Doubles(read=(None, dict(READER)))
+
+    assert doubles.read() == ONE_VIEW
+
+    assert doubles.calls == ROLE_READ, "no catalog is built by the check, and no manager"
+    assert doubles.asked == [("read_for_access_check", LAKE, ORG, "analyst", type(None), ("with_root", False))]
+
+
+@pytest.mark.parametrize("root", [None, "", A_ROOT, '{"read_only": true, "clone_type": "replica"}',
+                                  "{not json", "[1]", 7, b"{}", {"read_only": True}, MagicMock()],
+                         ids=["none", "empty", "a root", "a replica", "not JSON", "a list", "a number", "bytes",
+                              "a document", "a mock"])
+def test_whatever_comes_back_in_the_place_of_the_root_is_not_looked_at(caplog, root):
+    """A query has no read-only guard.  A lake that is locked or a replica is
+    read, and what stands where the root would be is never opened."""
+    doubles = _Doubles(read=(root, dict(READER)))
+
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        assert doubles.read() == ONE_VIEW
+
+    assert doubles.calls == ROLE_READ
+    assert not [r for r in caplog.records if r.name == LOGGER]
+
+
+READERS = {
+    "one column of the table": (dict(READER), ONE_VIEW),
+    "every column of every table": ({"role": "reader", "tables": EVERYTHING}, ("returned", {})),
+    "the table, rows of one region": (
+        {"role": "reader", "tables": {"orders": {"columns": ["*"], "filters": [
+            {"region": {"operation": "=", "type": "value", "value": "eu"}}]}}},
+        ("returned", {"t": (["*"], "\"region\" = 'eu'")})),
+    "another column of the table": (
+        {"role": "reader", "tables": {"orders": {"columns": ["amount"]}}},
+        _refused("You don't have permission to columns: {'id'} in table 'orders'.")),
+    "another table": ({"role": "reader", "tables": {"items": {"columns": ["*"]}}},
+                      _refused("You don't have permission to read table 'orders'.")),
+    "no column of the table": ({"role": "reader", "tables": {"orders": {"columns": []}}},
+                               _refused("You don't have permission to read any columns in 'orders'.")),
+    "a filter that cannot be rendered": (
+        {"role": "reader", "tables": {"orders": {"columns": ["*"], "filters": [
+            {"region": {"operation": "DROP", "type": "value", "value": "x"}}]}}},
+        _refused("You don't have permission to read table 'orders'.")),
+    "a writer of the table": ({"role": "writer", "tables": {"orders": {"columns": ["id"]}}}, ONE_VIEW),
+    "an admin of nothing": ({"role": "admin", "tables": {}}, ("returned", {})),
+    "a superadmin": ({"role": "superadmin", "tables": EVERYTHING}, ("returned", {})),
+    "a meta role": ({"role": "meta", "tables": EVERYTHING}, NOT_TO_READ),
+    "no role type": ({"tables": EVERYTHING}, NOT_TO_READ),
+    "a role type nobody knows": ({"role": "owner", "tables": EVERYTHING}, NOT_TO_READ),
+    "no role": ({}, _refused("Invalid or nonexistent role: analyst")),
+    "disabled": (dict(READER, enabled="false"), _refused("Role 'analyst' is disabled.")),
+    "disabled as a boolean": (dict(READER, enabled=False), _refused("Role 'analyst' is disabled.")),
+    "enabled": (dict(READER, enabled="true"), ONE_VIEW),
+}
+
+
+@pytest.mark.parametrize("reader", list(READERS))
+def test_a_role_read_at_once_is_judged_as_one_a_manager_read(caplog, reader):
+    document, expected = READERS[reader]
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        one = _Doubles(read=(None, json_copy(document)))
+        on_one_read = one.read()
+        logged_on_one_read = [(r.levelname, r.getMessage()) for r in caplog.records if r.name == LOGGER]
+        caplog.clear()
+        four = _Doubles(role=json_copy(document))
+        on_four_reads = four.read()
+        logged_on_four_reads = [(r.levelname, r.getMessage()) for r in caplog.records if r.name == LOGGER]
+
+    assert on_one_read == on_four_reads == expected
+    assert logged_on_one_read == logged_on_four_reads
+    assert one.calls == ROLE_READ and four.calls == FOUR_READS
+
+
+def json_copy(document):
+    """A copy the check may change without changing the table above."""
+    import copy
+    return copy.deepcopy(document)
+
+
+def test_no_role_for_a_query_is_an_answer_and_not_a_reason_to_read_again():
+    doubles = _Doubles(read=(None, {}), role=dict(READER))
+
+    assert doubles.read() == _refused("Invalid or nonexistent role: analyst")
+    assert doubles.calls == ROLE_READ
+
+
+@pytest.mark.parametrize("answer", [
+    None, MagicMock(), [None, dict(READER)], (None,), (None, dict(READER), 1), (None, None),
+    (None, [("role", "reader")]), (None, MagicMock()), (None, "reader"), "OK", 0, dict(READER),
+], ids=["nothing", "a mock", "a list", "one value", "three values", "no role document", "a role in pairs",
+        "a role that is a mock", "a role that is text", "text", "zero", "the role by itself"])
+def test_an_answer_that_is_not_a_root_and_a_role_is_followed_by_the_four_reads(answer):
+    doubles = _Doubles(read=answer, role=dict(READER))
+
+    assert doubles.read() == ONE_VIEW
+
+    assert doubles.calls == ROLE_READ + FOUR_READS
+    assert doubles.asked[1:] == [("RoleManager()", LAKE, ORG), ("get_role_by_name", "analyst")]
+
+
+def test_a_manager_without_the_one_read_is_asked_the_four():
+    doubles = _Doubles(role=dict(READER))
+
+    assert doubles.read() == ONE_VIEW
+    assert doubles.calls == FOUR_READS
+
+
+def test_a_read_that_is_no_function_is_not_called_by_a_query():
+    doubles = _Doubles(role=dict(READER))
+    doubles.Manager.read_for_access_check = "not to be called"
+
+    assert doubles.read() == ONE_VIEW
+    assert doubles.calls == FOUR_READS
+
+
+@pytest.mark.parametrize("failure", [
+    redis.exceptions.TimeoutError("Timeout reading from socket"), redis.ResponseError("WRONGTYPE"),
+    NotImplementedError("this Redis does not run it"), TypeError("unexpected keyword 'with_root'"),
+    RuntimeError("anything"),
+], ids=["a timeout", "a refusal", "a Redis that does not run the script", "another signature", "anything else"])
+def test_a_failure_of_the_one_read_of_a_query_is_followed_by_the_four(failure):
+    doubles = _Doubles(read=failure, role=dict(READER))
+
+    assert doubles.read() == ONE_VIEW
+    assert doubles.calls == ROLE_READ + FOUR_READS
+
+
+def test_the_four_reads_of_a_query_are_what_they_were():
+    """A manager is constructed, asked for the role, and what it answers is
+    put to the same tests; the catalog of the read-only guard is not built."""
+    assert _Doubles(role={}).read() == _refused("Invalid or nonexistent role: analyst")
+    assert _Doubles(role=dict(READER, enabled="0")).read() == _refused("Role 'analyst' is disabled.")
+    refusing = _Doubles(role=redis.exceptions.TimeoutError("Timeout"))
+    assert refusing.read() == ("raised", "TimeoutError", "Timeout")
+    assert refusing.calls == FOUR_READS
+
+
+def test_a_mocked_manager_is_asked_the_four_reads_of_a_query():
+    """The shape the tests of the read check have: ``patch(...RoleManager,
+    return_value=manager)``."""
+    manager = MagicMock()
+    manager.get_role_by_name.return_value = dict(READER)
+    table = [TableDefinition(super_name=LAKE, simple_name="orders", alias="t", columns=["id"])]
+
+    with patch.object(access_control, "RoleManager", return_value=manager) as replaced:
+        views = restrict_read_access(LAKE, ORG, "analyst", table, table)
+
+    assert {alias: view.allowed_columns for alias, view in views.items()} == {"t": ["id"]}
+    replaced.read_for_access_check.assert_called_once_with(
+        super_name=LAKE, organization=ORG, role_name="analyst", with_root=False)
+    replaced.assert_called_once_with(super_name=LAKE, organization=ORG)
+    manager.get_role_by_name.assert_called_once_with("analyst")
+

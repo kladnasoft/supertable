@@ -22,12 +22,12 @@ monitoring on, which this harness has off).  It is eight now:
   round trip: now one for the three
   (``RedisCatalog.store_schema_and_read_mirrors``).
 
-The script of the access check is declared read-only (``#!lua
-flags=no-writes``), so that Redis answers it wherever it answers the five
-reads, and that declaration is Redis 7's.  The fake Redis of this harness does
-not know it, as a Redis before 7 does not; it is made to take it here, as
-Redis 7 does, and one test leaves it as it is: such a Redis is asked the five
-reads, and a write makes the twelve round trips it made before this change.
+The script of the access check is sent as a read (``EVAL_RO``), so that Redis
+answers it wherever it answers the five reads, and that command is Redis 7's.
+The fake Redis of this harness does not know it, as a Redis before 7 does not;
+it is made to run it here, as Redis 7 does, and one test leaves it as it is:
+such a Redis is asked the five reads, and a write makes the twelve round trips
+it made before this change.
 
 The real writer and reader run here over the hermetic fake Redis on LOCAL
 storage, and every round trip is recorded.  The sequence of an append is
@@ -83,9 +83,9 @@ COMMIT = "EVALSHA meta:leaf:doc:orders meta:root lock:leaf:doc:orders"
 THREE_STEPS = ["GET lock:leaf:doc:orders", "EVALSHA meta:leaf:doc:orders", "EVALSHA meta:root"]
 AFTER_THE_COMMIT = ["SET schema:doc:orders", "SADD meta:table_names", "GET meta:mirrors"]
 
-# The access check: is the lake read-only, is the role store initialised, the
-# role's id and its document, in one script.
-ACCESS = "EVALSHA meta:root rbac:roles:meta rbac:roles:type:doc:superadmin rbac:roles:name_to_id"
+# The access check: is the role store initialised, the role's id and its
+# document, and is the lake read-only, in one script sent as a read.
+ACCESS = "EVAL_RO rbac:roles:meta rbac:roles:type:doc:superadmin rbac:roles:name_to_id meta:root"
 # The same five reads one by one, as they were, and as they still are when the
 # one script is not to be had.
 FIVE_READS = [
@@ -137,16 +137,16 @@ class _OpenedAsItWas(SimpleTable):
 
 
 def _as_redis_7(monkeypatch) -> None:
-    """Make the fake Redis run a script that declares its flags, as Redis 7
-    does: the declaration is read, and the rest is the script."""
-    register = redis.Redis.register_script
+    """Make the fake Redis run a script sent as a read (``EVAL_RO``), as
+    Redis 7 does: the script is run."""
+    real = redis.Redis.execute_command
 
-    def register_script(self, script):
-        if isinstance(script, str) and script.startswith("#!lua"):
-            script = script.split("\n", 1)[1]
-        return register(self, script)
+    def execute_command(self, *args, **options):
+        if str(args[0]).upper() == "EVAL_RO":
+            args = ("EVAL",) + tuple(args[1:])
+        return real(self, *args, **options)
 
-    monkeypatch.setattr(redis.Redis, "register_script", register_script)
+    monkeypatch.setattr(redis.Redis, "execute_command", execute_command)
 
 
 def _lake(monkeypatch, as_it_was: bool = False, redis_7: bool = True):
@@ -155,7 +155,7 @@ def _lake(monkeypatch, as_it_was: bool = False, redis_7: bool = True):
         _as_redis_7(monkeypatch)
     # which of the two this Redis is, is asked once for each client: here,
     # before any round trip is recorded
-    RedisCatalog()._runs_declared_scripts()
+    RedisCatalog()._runs_read_only_scripts()
     sup = f"trips_{uuid.uuid4().hex[:12]}"
     super_table = SuperTable(sup, ORG)
     writer = DataWriter(super_name=sup, organization=ORG)
@@ -174,8 +174,8 @@ def _lake(monkeypatch, as_it_was: bool = False, redis_7: bool = True):
 
     def name(args) -> str:
         command = str(args[0]).upper()
-        if command == "EVALSHA":
-            return "EVALSHA " + " ".join(short(key) for key in args[3:3 + int(args[2])])
+        if command in ("EVALSHA", "EVAL", "EVAL_RO"):
+            return command + " " + " ".join(short(key) for key in args[3:3 + int(args[2])])
         return command + (" " + short(args[1]) if len(args) > 1 else "")
 
     def note(trip) -> None:
@@ -241,6 +241,21 @@ def _lake(monkeypatch, as_it_was: bool = False, redis_7: bool = True):
         assert status is Status.OK, message
         return [(row["id"], row["region"], row["amount"]) for row in frame.to_dicts()]
 
+    def query(sql: str, role=ADMIN):
+        """One query of the real reader, recorded: what came back, as plain
+        values, and its round trips.  A refusal is what came back, too."""
+        def run():
+            try:
+                frame, status, message = DataReader(
+                    super_name=sup, organization=ORG, query=sql,
+                ).execute(role_name=role, engine=Engine.DUCKDB)
+            except PermissionError as refusal:
+                return ("refused", str(refusal))
+            if status is not Status.OK:
+                return ("error", message)
+            return ("rows", [tuple(row.values()) for row in frame.to_dicts()], list(frame.columns))
+        return recorded(run)
+
     def mirrored() -> list:
         folder = os.path.join(ORG, sup, "parquet", TABLE, "files")
         try:
@@ -273,7 +288,7 @@ def _lake(monkeypatch, as_it_was: bool = False, redis_7: bool = True):
                 client.set(lock_key, "another-writer")
         state["before"] = before
 
-    return SimpleNamespace(sup=sup, super_table=super_table, writer=writer, write=write,
+    return SimpleNamespace(sup=sup, super_table=super_table, writer=writer, write=write, query=query,
                            compact=compact, read=read, mirrored=mirrored, in_redis=in_redis,
                            leaf=leaf, state=state, client=client, trips=trips, lock_key=lock_key,
                            take_the_lock_away_before=take_the_lock_away_before)
@@ -880,11 +895,11 @@ def test_a_compaction_and_a_first_write_ask_for_access_once_too(lake):
         assert not any(read in trips for read in FIVE_READS[1:])
 
 
-def test_a_redis_that_does_not_run_declared_scripts_is_written_to_as_before(hermetic_fakeredis, monkeypatch):
+def test_a_redis_that_does_not_run_a_script_sent_as_a_read_is_written_to_as_before(hermetic_fakeredis, monkeypatch):
     """A Redis before 7: the access check makes its five reads, everything
     else is as on any other Redis, and the rows are the same rows."""
     old = _lake(monkeypatch, redis_7=False)
-    assert RedisCatalog()._runs_declared_scripts() is False
+    assert RedisCatalog()._runs_read_only_scripts() is False
     old.write(_rows(0))
 
     result, trips = old.write(_rows(3))
@@ -907,18 +922,16 @@ def test_a_redis_is_asked_once_whether_it_runs_the_script(hermetic_fakeredis, mo
     real = redis.Redis.execute_command
 
     def command(self, *args, **options):
-        if str(args[0]).upper() == "EVALSHA" and int(args[2]) == 0:
+        if str(args[0]).upper() == "EVAL" and int(args[2]) == 0:       # EVAL_RO, as this fake runs it
             asked.append(args[1])
         return real(self, *args, **options)
 
     monkeypatch.setattr(redis.Redis, "execute_command", command)
     lake = _lake(monkeypatch)
-    answered = len(asked)
     for first in (0, 3, 6):
         lake.write(_rows(first))
     lake.compact()
     engine_duckdb.reset_shared_duckdb_state()
 
-    assert answered >= 1 and len(set(asked)) == 1, "one script, the question"
-    assert len(asked) == answered, "three writes and a compaction later, it has not been asked again"
+    assert asked == ["return 1"], "once, before the first check; three writes and a compaction did not ask again"
 

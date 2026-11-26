@@ -28,11 +28,42 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-#: Whether the Redis behind a client runs a script that declares its flags
-#: (``#!lua flags=...``; Redis 7 and later do).  The answer of each client's
-#: server, asked once (``RedisCatalog._runs_declared_scripts``) and kept for as
+#: The clock ``_runs_read_only_scripts`` reads, so that a test can move it.
+_monotonic = time.monotonic
+
+
+#: Whether the Redis behind a client runs a script sent as a read
+#: (``EVAL_RO``; Redis 7 and later do), and when it was asked: the answer of
+#: each client's server (``RedisCatalog._runs_read_only_scripts``), kept for as
 #: long as the client lives.
-_RUNS_DECLARED_SCRIPTS: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
+_RUNS_READ_ONLY_SCRIPTS: weakref.WeakKeyDictionary[Any, Tuple[bool, float]] = weakref.WeakKeyDictionary()
+
+def _client_reads() -> Dict[str, Any]:
+    """The five reads of ``redis.Redis``, as the client library defines them.
+
+    Each is taken from the class that defines it, past ``redis.Redis`` itself,
+    so that a command put in its place on ``redis.Redis`` before this module
+    was imported is still told from the library's own.
+    """
+    reads: Dict[str, Any] = {}
+    for name in ("get", "exists", "smembers", "hget", "hgetall"):
+        defined_by = next((kind for kind in redis.Redis.__mro__[1:] if name in vars(kind)), redis.Redis)
+        reads[name] = vars(defined_by).get(name)
+    return reads
+
+
+#: The reads of the Redis client that ``RedisCatalog.rbac_access_read`` stands
+#: for, as the client library defines them.  A client on which one of them has
+#: been replaced (on its class or on the object) is asked that read, not the
+#: one that would go round it: see ``RedisCatalog._reads_are_its_own``.
+_CLIENT_READS: Dict[str, Any] = _client_reads()
+
+#: How long a Redis that did not say yes is taken at its word before it is
+#: asked again.  A refusal can be of the moment (a server busy with another
+#: script, a replica still syncing), and a process must not go without the one
+#: read for the rest of its life because of one; a Redis that will never say
+#: yes is asked once in this many seconds, which costs it nothing to speak of.
+_ASK_AGAIN_AFTER_S = 60.0
 
 
 #: The largest integer a Lua number (a double) holds exactly, so the largest
@@ -533,54 +564,61 @@ redis.call('HSET', KEYS[2], 'last_updated_ms', now_ms)
 return 1
 """
 
-    # What an access check reads, in one round trip instead of five: the
-    # lake's root (the read-only guard), whether the role store is initialised
-    # (the two things RoleManager's constructor asks), and the role a name
-    # stands for (the name index, then the role's document).
+    # What an access check reads, in one round trip instead of five: whether
+    # the role store is initialised (the two things RoleManager's constructor
+    # asks), the role a name stands for (the name index, then the role's
+    # document), and, for a check that has the read-only guard to apply, the
+    # lake's root.
     #
     # In Lua rather than a pipeline because the last read depends on the one
     # before it: the document's key holds the id the name index returned.
-    # The script only reads.  It is the five commands as they were sent one by
-    # one, and it decides nothing about access: every value goes back as Redis
-    # gave it.
+    # The script only reads.  It is the commands as they were sent one by one,
+    # and it decides nothing about access: every value goes back as Redis gave
+    # it.
     #
-    #   KEYS  root, role meta, the superadmin type index, role name -> id
+    #   KEYS  role meta, the superadmin type index, role name -> id,
+    #         and the root when the root is to be read: a query names three
+    #         keys and its read touches no other but the role's document
     #   ARGV  the role name in lower case ('' = no name to look up),
     #         the role document key prefix
     #   ->    {root text or nil, 1 or 0, {superadmin ids}, role id or nil,
     #          {field, value, ...} of the role document}
     #
-    # Declared ``no-writes``.  Redis then takes the script for the reads it is
-    # made of: it is answered where they are answered (while writes are paused
-    # for a failover or a shutdown, on a read-only replica, over the memory
-    # limit), and a command that writes would be refused inside it.  A script
-    # that declares nothing is held back with the writes, which the five reads
-    # never were.  The declaration is Redis 7's: see ``_runs_declared_scripts``
-    # for a server that does not know it.
+    # Sent with EVAL_RO, the text itself and not its hash.  Redis then takes
+    # it for a read in every respect: it is answered where the five reads are
+    # answered (while writes are held back for a failover or a shutdown, on a
+    # read-only replica, over the memory limit, for a user whose keys are
+    # read-only), whether or not Redis has seen the script before, and a
+    # command that writes would be refused inside it.  Sent with EVALSHA it
+    # was held back with the writes whenever Redis did not hold the script,
+    # and EVAL and EVALSHA are refused to a user whose keys are read-only.
+    # EVAL_RO is Redis 7's: see ``_runs_read_only_scripts`` for a server that
+    # does not know it.
     #
     # Its text names no command that changes a key, here or in a comment:
     # one hand-written test fake picks the script to emulate by the commands
     # a script's text mentions.
-    _LUA_RBAC_ACCESS_READ = """#!lua flags=no-writes
-local root = redis.call('GET', KEYS[1])
-local meta = redis.call('EXISTS', KEYS[2])
-local superadmins = redis.call('SMEMBERS', KEYS[3])
+    _LUA_RBAC_ACCESS_READ = """
+local meta = redis.call('EXISTS', KEYS[1])
+local superadmins = redis.call('SMEMBERS', KEYS[2])
 local role_id = false
 local role = {}
 if ARGV[1] ~= '' then
-    role_id = redis.call('HGET', KEYS[4], ARGV[1])
+    role_id = redis.call('HGET', KEYS[3], ARGV[1])
     if role_id and role_id ~= '' then
         role = redis.call('HGETALL', ARGV[2] .. role_id)
     end
 end
+local root = false
+if #KEYS >= 4 then
+    root = redis.call('GET', KEYS[4])
+end
 return {root, meta, superadmins, role_id, role}
 """
 
-    # Asked once of every client's Redis: does it run a script that declares
-    # its flags?  One that does answers 1.
-    _LUA_DECLARED_SCRIPT_PROBE = """#!lua flags=no-writes
-return 1
-"""
+    # Asked of every client's Redis: does it run a script sent as a read?
+    # One that does answers 1.
+    _LUA_READ_ONLY_PROBE = "return 1"
 
     # ------------- Provider-share Lua scripts ------------- #
 
@@ -650,8 +688,6 @@ return generation
         self._rbac_delete_role = self.r.register_script(self._LUA_RBAC_DELETE_ROLE)
         self._rbac_remove_role_from_user = self.r.register_script(self._LUA_RBAC_REMOVE_ROLE_FROM_USER)
         self._rbac_add_role_to_user = self.r.register_script(self._LUA_RBAC_ADD_ROLE_TO_USER)
-        self._rbac_access_read_script = self.r.register_script(self._LUA_RBAC_ACCESS_READ)
-        self._declared_script_probe = self.r.register_script(self._LUA_DECLARED_SCRIPT_PROBE)
 
         # Provider-share Lua scripts
         self._share_delete_if_unchanged = self.r.register_script(self._LUA_SHARE_DELETE_IF_UNCHANGED)
@@ -1501,7 +1537,7 @@ return generation
         return self._decode_member(val)
 
     def rbac_access_read(
-            self, org: str, sup: str, role_name: Any,
+            self, org: str, sup: str, role_name: Any, with_root: bool = True,
     ) -> Tuple[Optional[str], bool, List[str], Dict[str, Any]]:
         """What an access check reads from Redis, in one round trip.
 
@@ -1510,6 +1546,10 @@ return generation
         things ``RoleManager`` asks when it is constructed), and the role
         *role_name* stands for (the name index, then the role's document).
         One script reads the five, so they are also read at one moment.
+
+        Without *with_root* the root is neither read nor named, and comes back
+        as ``None``: the four reads of the role, for a check that has no
+        read-only guard to apply (a query).
 
         Returns ``(root, role_meta_exists, superadmin_role_ids, role)``:
 
@@ -1531,37 +1571,50 @@ return generation
         stored role id that is no key segment, as ``get_role_details`` does.
         Nothing is written, whatever happens.
 
-        This class's own read: on a subclass it raises ``NotImplementedError``.
-        It stands for five reads of this class, and a subclass may have
-        changed any of them; one that wants this read defines it.
+        Raises ``NotImplementedError``, with nothing sent and nothing logged,
+        where this read does not stand for the reads it replaces:
 
-        It also raises ``NotImplementedError``, with nothing sent, on a Redis
-        that does not run a script declared read-only (Redis before 7, some
-        stand-ins for Redis, a user that may not run scripts): the script
-        would be held back there where the five reads are answered, so the
-        five reads are what such a Redis is asked (``_runs_declared_scripts``).
+        * on a subclass, or when one of those reads has been replaced on the
+          class or on this object (``_reads_are_its_own``): it stands for
+          five reads of this class as this class defines them, and whoever
+          changed one of them is asked the changed one;
+        * on a Redis that does not run a script sent as a read (Redis before
+          7, some stand-ins for Redis, a user that may not run scripts): see
+          ``_runs_read_only_scripts``.
         """
-        if type(self) is not RedisCatalog:
+        if not self._reads_are_its_own():
             raise NotImplementedError(
-                "rbac_access_read stands for five reads of RedisCatalog itself; "
-                "a subclass makes those reads, or defines this one"
+                "rbac_access_read stands for five reads of RedisCatalog as it defines them; "
+                "a subclass, or a catalog with one of them replaced, makes those reads itself"
             )
         name = role_name.lower() if isinstance(role_name, str) and role_name else ""
+        keys = [
+            RK.rbac_role_meta(org, sup),
+            RK.rbac_role_type_index(org, sup, "superadmin"),
+            RK.rbac_rolename_to_id(org, sup),
+        ]
+        if with_root:
+            keys.append(RK.meta_root(org, sup))
+        doc_prefix = RK.rbac_role_doc_prefix(org, sup)
         try:
-            if not self._runs_declared_scripts():
+            if not self._runs_read_only_scripts():
                 raise NotImplementedError(
-                    "rbac_access_read is a script declared read-only, which this Redis "
+                    "rbac_access_read is a script sent as a read (EVAL_RO), which this Redis "
                     "does not run; it is asked the five reads instead"
                 )
-            reply = self._rbac_access_read_script(
-                keys=[
-                    RK.meta_root(org, sup),
-                    RK.rbac_role_meta(org, sup),
-                    RK.rbac_role_type_index(org, sup, "superadmin"),
-                    RK.rbac_rolename_to_id(org, sup),
-                ],
-                args=[name, RK.rbac_role_doc_prefix(org, sup)],
-            )
+            reply = self.r.eval_ro(self._LUA_RBAC_ACCESS_READ, len(keys), *keys, name, doc_prefix)
+        except redis.ResponseError as e:
+            # Redis answered, and would not run this read.  A key that holds
+            # another kind of value is that lake's matter (WRONGTYPE: Redis 7
+            # begins the refusal with the word, a stand-in may wrap it).
+            # Anything else is this Redis's (a user that may not touch a key
+            # the script names or builds, a server that runs "return 1" and
+            # not this): it is not sent the read again for a minute, and is
+            # then asked afresh.
+            if "WRONGTYPE" not in str(e):
+                self._does_not_run_read_only_scripts_for_now()
+            logger.error(f"[redis-catalog] rbac_access_read error: {e}")
+            raise
         except redis.RedisError as e:
             logger.error(f"[redis-catalog] rbac_access_read error: {e}")
             raise
@@ -1571,9 +1624,13 @@ return generation
         well_formed = isinstance(reply, (list, tuple)) and len(reply) == 5
         if well_formed:
             root, meta, superadmins, role_id, fields = reply
+            # What is not there comes back as nothing, or as false to a
+            # client that speaks the newer protocol.
+            root = None if root is False else root
+            role_id = None if role_id is False else role_id
             well_formed = (
                 (root is None or isinstance(root, str))
-                and isinstance(meta, int)
+                and isinstance(meta, int) and not isinstance(meta, bool)
                 and isinstance(superadmins, (list, tuple))
                 and all(isinstance(member, str) for member in superadmins)
                 and (role_id is None or isinstance(role_id, str))
@@ -1592,41 +1649,94 @@ return generation
         if role_id:
             # The id was appended to a prefix inside the script.  It goes
             # through the key constructor here, which raises for an id that
-            # is no key segment, before what was read under it is used.
-            RK.rbac_role_doc(org, sup, role_id)
+            # is no key segment, before what was read under it is used; and
+            # the key the constructor makes has to be the key that was read.
+            if RK.rbac_role_doc(org, sup, role_id) != f"{doc_prefix}{role_id}":
+                raise NotImplementedError(
+                    "rbac_access_read read a role under another key than rbac_role_doc names"
+                )
             role = self._role_from_hash(dict(zip(fields[0::2], fields[1::2])), role_id) or {}
         return root, bool(meta), superadmin_role_ids, role
 
-    def _runs_declared_scripts(self) -> bool:
-        """Whether this Redis runs a script that declares its flags.
+    def _reads_are_its_own(self) -> bool:
+        """Whether the reads ``rbac_access_read`` stands for are this class's.
 
-        ``rbac_access_read`` is such a script (``#!lua flags=no-writes``).
-        Redis 7 and later run it, and take it for the reads it is made of.
-        A Redis before 7 does not know the declaration, and neither do some
-        stand-ins for Redis: there the access check makes its five reads one
-        by one, as it always did.
+        False for a subclass, and for a catalog on which one of those reads
+        (or the decoding of an id they share) has been replaced, on the class
+        or on the object.  Such a catalog may read the root or a role its own
+        way, and it is its own way that has to be asked.  False as well when one of the five commands those reads
+        send has been replaced on the Redis client, on its class or on the
+        object: the script would go round whatever was put there.
+        """
+        if type(self) is not RedisCatalog:
+            return False
+        mine = vars(self)
+        if not all(
+            name not in mine and getattr(RedisCatalog, name, None) is original
+            for name, original in _ACCESS_READ_STANDS_FOR.items()
+        ):
+            return False
+        client = self.r
+        try:
+            on_the_client = vars(client)
+        except TypeError:
+            return False
+        return all(
+            name not in on_the_client and getattr(type(client), name, None) is original
+            for name, original in _CLIENT_READS.items()
+        )
 
-        Asked once of each client's Redis, with a script that only returns 1,
-        and remembered for as long as the client lives.  A refusal is an
-        answer, and so is anything else that is not 1 (a user that may not
-        run scripts is refused too).  A connection that fails is no answer:
-        it is raised, and the question is asked again next time.
+    def _runs_read_only_scripts(self) -> bool:
+        """Whether this Redis runs a script sent as a read (``EVAL_RO``).
+
+        ``rbac_access_read`` is sent that way, so that Redis takes it for the
+        reads it is made of.  Redis 7 and later know the command.  A Redis
+        before 7 does not, and neither do some stand-ins for Redis: there the
+        access check makes its reads one by one, as it always did.
+
+        Asked of each client's Redis with a script that only returns 1, and
+        remembered for as long as the client lives.  A yes is kept.  A refusal
+        is an answer too, and so is anything else that is not 1 (a user that
+        may not run scripts is refused), but it is kept for a minute only
+        (``_ASK_AGAIN_AFTER_S``): a refusal can be of the moment.  A
+        connection that fails is no answer: it is raised, and the question is
+        asked again at the next check.
         """
         try:
-            known = _RUNS_DECLARED_SCRIPTS.get(self.r)
+            known = _RUNS_READ_ONLY_SCRIPTS.get(self.r)
         except TypeError:
             return False            # a client that cannot be remembered is not asked every time
-        if known is None:
-            try:
-                answer = self._declared_script_probe(keys=[], args=[])
-                known = type(answer) is int and answer == 1
-            except redis.ResponseError:
-                known = False
-            try:
-                _RUNS_DECLARED_SCRIPTS[self.r] = known
-            except TypeError:
-                return False
-        return known
+        now = _monotonic()
+        if known is not None and (known[0] or now - known[1] < _ASK_AGAIN_AFTER_S):
+            return known[0]
+        try:
+            answer = self.r.eval_ro(self._LUA_READ_ONLY_PROBE, 0)
+            runs = type(answer) is int and answer == 1
+        except redis.ResponseError:
+            runs = False
+        try:
+            if not runs:
+                # Another thread may have asked at the same moment and been
+                # told yes: a yes is not taken back by a refusal of the moment.
+                heard = _RUNS_READ_ONLY_SCRIPTS.get(self.r)
+                if heard is not None and heard[0]:
+                    return True
+            _RUNS_READ_ONLY_SCRIPTS[self.r] = (runs, now)
+        except TypeError:
+            return False
+        return runs
+
+    def _does_not_run_read_only_scripts_for_now(self) -> None:
+        """Take this Redis for one that does not run the read, for a minute.
+
+        For a Redis that said yes to the question and then refused the read
+        itself: it is not sent the read at every check, to be refused and
+        logged each time.  After ``_ASK_AGAIN_AFTER_S`` it is asked again.
+        """
+        try:
+            _RUNS_READ_ONLY_SCRIPTS[self.r] = (False, _monotonic())
+        except TypeError:
+            pass
 
     # -- User meta init --
 
@@ -2815,3 +2925,19 @@ return generation
         except (redis.RedisError, json.JSONDecodeError) as e:
             logger.error(f"[redis-catalog] get_engine_config error: {e}")
         return None
+
+
+#: The reads ``RedisCatalog.rbac_access_read`` stands for, as the class defines
+#: them (``RedisCatalog._reads_are_its_own``).
+_ACCESS_READ_STANDS_FOR: Dict[str, Any] = {
+    name: getattr(RedisCatalog, name)
+    for name in (
+        "get_root",
+        "rbac_get_role_ids_by_type",
+        "rbac_get_superadmin_role_id",
+        "rbac_get_role_id_by_name",
+        "get_role_details",
+        "_role_from_hash",
+        "_decode_member",
+    )
+}

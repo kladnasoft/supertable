@@ -13,12 +13,11 @@ The five reads are still there, as the way to check when the one is not to be
 had: a role store that is not initialised, a collaborator that does not know
 the read, a Redis that does not run the read's script, a read that failed.
 
-The script is declared read-only (``#!lua flags=no-writes``), which Redis 7
-and later understand and fakeredis, like a Redis before 7, does not.  The fake
-Redis of these tests is therefore one of two: by default it takes the
-declaration as Redis 7 does (the line is read and the rest is run), and where
-a test says so it is left as it is, a Redis that refuses such a script and is
-asked the five reads.
+The script is sent as a read (``EVAL_RO``), a command Redis 7 and later know
+and fakeredis, like a Redis before 7, does not.  The fake Redis of these tests
+is therefore one of two: by default it runs a script sent that way, as Redis 7
+does, and where a test says so it is left as it is, a Redis that answers
+"unknown command" and is asked the five reads.
 
 The comparison here is with the check as it was, kept in this file word for
 word: the functions of ``rbac/access_control.py`` and ``get_role_details`` as
@@ -76,7 +75,7 @@ DOC_PREFIX = RK.rbac_role_doc_prefix(ORG, LAKE)
 LOGGER = redis_catalog.logger.name
 logger = access_control.logger
 
-THE_ONE_READ = ("EVALSHA", (ROOT, ROLE_META, SUPERADMINS, NAMES))
+THE_ONE_READ = ("EVAL_RO", (ROLE_META, SUPERADMINS, NAMES, ROOT))
 A_ROOT = '{"version": 3, "ts": 1794000000000}'
 
 
@@ -195,17 +194,18 @@ def _check_write_access_as_it_was(super_name, organization, role_name, table_nam
 # Two fake Redis servers with the same content
 # ---------------------------------------------------------------------------
 
-#: The round trip that asks a Redis whether it runs a script declaring its flags.
-THE_QUESTION = ("EVALSHA", ())
+#: The round trip that asks a Redis whether it runs a script sent as a read.
+THE_QUESTION = ("EVAL_RO", ())
 
 
 class _Side:
     """A fake Redis of its own, and the round trips made to it.
 
-    ``redis_7``: the fake runs a script that declares its flags, as Redis 7
-    does; without it the fake is what fakeredis is, a Redis that does not.
+    ``redis_7``: the fake runs a script sent as a read (``EVAL_RO``), as
+    Redis 7 does; without it the fake is what fakeredis is, a Redis that does
+    not know the command.
     ``asked``: the catalog has already asked this Redis which of the two it is
-    (once for each client, see ``RedisCatalog._runs_declared_scripts``), so
+    (once for each client, see ``RedisCatalog._runs_read_only_scripts``), so
     the round trips a test sees are those of the check alone.
     """
 
@@ -216,21 +216,15 @@ class _Side:
         self.trips = []
         self.fail = None        # a round trip that times out instead: called with its name and key
         self.asked = asked
-        if redis_7:
-            register = self.client.register_script
-
-            def as_redis_7(script):
-                if script.startswith("#!lua"):
-                    script = script.split("\n", 1)[1]
-                return register(script)
-
-            self.client.register_script = as_redis_7
         real = self.client.execute_command
 
         def command(*args, **options):
             name = str(args[0]).upper()
-            if name == "EVALSHA":
-                trip = ("EVALSHA", tuple(args[3:3 + int(args[2])]))
+            if name in ("EVALSHA", "EVAL", "EVAL_RO"):
+                trip = (name, tuple(args[3:3 + int(args[2])]))
+                if name == "EVAL_RO" and redis_7:
+                    # what Redis 7 does with it: the script is run, as a read
+                    args = ("EVAL",) + tuple(args[1:])
             elif name.startswith("SCRIPT"):
                 # a script this Redis had not seen: the EVALSHA before it was
                 # refused, and is sent again once the script is loaded
@@ -266,7 +260,7 @@ class _Side:
             out[key.decode("utf-8")] = (kind.decode("ascii"), value)
         return out
 
-    def load(self, content: dict) -> "_Side":
+    def load(self, content: dict) -> _Side:
         self.bytes.flushall()
         for key, (kind, value) in content.items():
             if kind == "string":
@@ -276,7 +270,7 @@ class _Side:
             else:
                 self.bytes.sadd(key, *value)
         if self.asked:
-            _catalog_on(self)._runs_declared_scripts()
+            _catalog_on(self)._runs_read_only_scripts()
         self.trips.clear()
         return self
 
@@ -776,22 +770,36 @@ def test_the_script_names_no_command_that_changes_a_key():
     the script to stand in for by what the script's text mentions, and it
     replaces the connector for the rest of the process: a text naming those
     commands would be taken for a role's deletion, and run as one."""
-    for text in (RedisCatalog._LUA_RBAC_ACCESS_READ, RedisCatalog._LUA_DECLARED_SCRIPT_PROBE):
+    for text in (RedisCatalog._LUA_RBAC_ACCESS_READ, RedisCatalog._LUA_READ_ONLY_PROBE):
         for marker in ("DEL", "SREM", "HINCRBY", "HSET", "SADD", "SET'", "last_updated_ms",
                        "type_prefix", "cjson", "roles[#roles + 1]", "new_roles[#new_roles + 1]"):
             assert marker not in text, marker
-        assert "pcall" not in text
+        assert "pcall" not in text and "#!" not in text
     commands = re.findall(r"redis\.call\('([A-Z]+)'", RedisCatalog._LUA_RBAC_ACCESS_READ)
-    assert commands == ["GET", "EXISTS", "SMEMBERS", "HGET", "HGETALL"]
+    assert commands == ["EXISTS", "SMEMBERS", "HGET", "HGETALL", "GET"]
 
 
-def test_the_script_is_declared_to_write_nothing():
-    """Redis then takes it for the reads it is made of, and answers it while
-    writes are paused, as it answered the five; ``test_suite`` shows that on a
-    real Redis.  The question that goes before it is declared the same way,
-    so that a Redis which answers it runs the read."""
-    assert RedisCatalog._LUA_RBAC_ACCESS_READ.startswith("#!lua flags=no-writes\n")
-    assert RedisCatalog._LUA_DECLARED_SCRIPT_PROBE == "#!lua flags=no-writes\nreturn 1\n"
+def test_the_script_is_sent_as_a_read_and_in_full():
+    """``EVAL_RO``, with the text of the script and not its hash.  Redis then
+    takes it for the reads it is made of: it is answered while writes are
+    paused whether or not Redis has seen the script, and for a user whose keys
+    are read-only, as the five reads were; ``test_suite`` shows both on a real
+    Redis.  The question that goes before it is sent the same way, so that a
+    Redis which answers it runs the read."""
+    side = _Side(asked=False).load(_build())
+    sent = []
+    real = side.client.execute_command
+
+    def command(*args, **options):
+        sent.append(args[:3])
+        return real(*args, **options)
+
+    side.client.execute_command = command
+    _catalog_on(side).rbac_access_read(ORG, LAKE, "loader")
+
+    assert sent == [("EVAL_RO", RedisCatalog._LUA_READ_ONLY_PROBE, 0),
+                    ("EVAL_RO", RedisCatalog._LUA_RBAC_ACCESS_READ, 4)]
+    assert RedisCatalog._LUA_READ_ONLY_PROBE == "return 1"
 
 
 def test_the_document_key_the_script_builds_is_the_one_the_library_builds():
@@ -925,7 +933,7 @@ def test_a_key_of_another_kind_fails_the_read_whole(caplog, change):
 def test_a_redis_that_does_not_answer_is_logged_and_raised(caplog):
     side = _Side().load(_build())
     catalog = _catalog_on(side)
-    side.fail = lambda name, key: name == "EVALSHA"
+    side.fail = lambda name, key: name == "EVAL_RO"
 
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         with pytest.raises(redis.exceptions.TimeoutError):
@@ -935,7 +943,19 @@ def test_a_redis_that_does_not_answer_is_logged_and_raised(caplog):
         ("ERROR", "[redis-catalog] rbac_access_read error: Timeout reading from socket")]
 
 
-_ROLE_FIELDS = ["role", "writer", "tables", "{}"]
+def _answering(side, reply, sent=None) -> None:
+    """Have this Redis answer the access read with *reply*, whatever it holds;
+    what the read was sent with goes into *sent*."""
+    real = side.client.eval_ro
+
+    def eval_ro(script, numkeys, *rest):
+        if script != RedisCatalog._LUA_RBAC_ACCESS_READ:
+            return real(script, numkeys, *rest)
+        if sent is not None:
+            sent.append((list(rest[:numkeys]), list(rest[numkeys:])))
+        return reply
+
+    side.client.eval_ro = eval_ro
 
 
 @pytest.mark.parametrize("reply", [
@@ -952,7 +972,7 @@ def test_an_answer_that_is_not_the_five_values_is_refused(caplog, reply):
     """What a stand-in for Redis answers that does not run the script."""
     side = _Side().load(_build())
     catalog = _catalog_on(side)
-    catalog._rbac_access_read_script = lambda keys, args: reply
+    _answering(side, reply)
 
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
         with pytest.raises(redis.ResponseError, match="unexpected reply from the access-read script"):
@@ -964,7 +984,7 @@ def test_an_answer_that_is_not_the_five_values_is_refused(caplog, reply):
 def test_the_refusal_of_an_answer_does_not_repeat_what_was_answered():
     side = _Side().load(_build())
     catalog = _catalog_on(side)
-    catalog._rbac_access_read_script = lambda keys, args: ["a root", 1, ["an id"], "id", ["secret"]]
+    _answering(side, ["a root", 1, ["an id"], "id", ["secret"]])
 
     with pytest.raises(redis.ResponseError) as raised:
         catalog.rbac_access_read(ORG, LAKE, "loader")
@@ -976,17 +996,39 @@ def test_the_read_sends_the_name_in_lower_case_and_the_four_keys():
     side = _Side().load(_build())
     catalog = _catalog_on(side)
     sent = []
-
-    def script(keys, args):
-        sent.append((list(keys), list(args)))
-        return [None, 0, [], None, []]
-
-    catalog._rbac_access_read_script = script
+    _answering(side, [None, 0, [], None, []], sent)
     for name in ("LoAdEr", None, "", 7, b"loader"):
         catalog.rbac_access_read(ORG, LAKE, name)
 
-    assert [keys for keys, _args in sent] == [[ROOT, ROLE_META, SUPERADMINS, NAMES]] * 5
-    assert [args for _keys, args in sent] == [["loader", DOC_PREFIX]] + [["", DOC_PREFIX]] * 4
+    assert [keys for keys, _args in sent] == [[ROLE_META, SUPERADMINS, NAMES, ROOT]] * 5
+    assert [args for _keys, args in sent] == [["loader", DOC_PREFIX]] + [["", DOC_PREFIX]] * 4, \
+        "the name and the prefix of a role's document"
+
+
+@pytest.mark.parametrize("reply,expected", [
+    ([None, 1, ["id"], None, []], (None, True, ["id"], {})),
+    ([False, 1, ["id"], False, []], (None, True, ["id"], {})),
+    (["{}", 0, [], False, []], ("{}", False, [], {})),
+    ((None, 1, ("id",), None, ()), (None, True, ["id"], {})),
+], ids=["nothing where nothing is", "false where nothing is", "false for no id", "tuples for lists"])
+def test_what_is_not_there_may_come_back_as_nothing_or_as_false(reply, expected):
+    """A client that speaks the newer protocol is handed false for what a
+    script found missing, where the older one is handed nothing."""
+    side = _Side().load(_build())
+    _answering(side, reply)
+
+    assert _catalog_on(side).rbac_access_read(ORG, LAKE, "nobody") == expected
+
+
+@pytest.mark.parametrize("reply", [[None, True, ["id"], None, []], [True, 1, ["id"], None, []],
+                                   [None, 1, ["id"], True, []]],
+                         ids=["a count that is true", "a root that is true", "an id that is true"])
+def test_true_is_no_value_of_the_five(reply):
+    side = _Side().load(_build())
+    _answering(side, reply)
+
+    with pytest.raises(redis.ResponseError, match="unexpected reply"):
+        _catalog_on(side).rbac_access_read(ORG, LAKE, "nobody")
 
 
 # ---------------------------------------------------------------------------
@@ -1113,8 +1155,20 @@ def test_a_catalog_whose_answer_is_not_the_four_values_is_no_answer(answer):
     assert RoleManager.read_for_access_check(
         super_name=LAKE, organization=ORG, role_name="loader", redis_catalog=catalog) is None
 
-    catalog.rbac_access_read.assert_called_once_with(ORG, LAKE, "loader")
+    catalog.rbac_access_read.assert_called_once_with(ORG, LAKE, "loader", with_root=True)
     assert [call[0] for call in catalog.method_calls] == ["rbac_access_read"], "and nothing else was asked"
+
+
+@pytest.mark.parametrize("asked,sent", [(True, True), (False, False), (1, True), (0, False), (None, False)])
+def test_the_manager_passes_on_whether_the_root_is_wanted(asked, sent):
+    catalog = MagicMock()
+    catalog.rbac_access_read.return_value = (None, True, ["id"], {"role": "reader"})
+
+    assert RoleManager.read_for_access_check(
+        super_name=LAKE, organization=ORG, role_name="analyst", redis_catalog=catalog, with_root=asked,
+    ) == (None, {"role": "reader"})
+
+    catalog.rbac_access_read.assert_called_once_with(ORG, LAKE, "analyst", with_root=sent)
 
 
 def test_two_superadmins_listed_are_as_good_as_one():
@@ -1149,7 +1203,7 @@ def test_a_catalog_without_the_read_is_no_answer():
 
 @pytest.mark.parametrize("failure", [
     redis.exceptions.ConnectionError("gone"), redis.ResponseError("WRONGTYPE"),
-    ValueError("Invalid Redis key segment"), AttributeError("_rbac_access_read_script"),
+    ValueError("Invalid Redis key segment"), AttributeError("eval_ro"),
     RuntimeError("anything"),
 ], ids=["no connection", "a refusal", "an id that is no segment", "a catalog half built", "anything"])
 def test_a_catalog_whose_read_raises_is_no_answer(failure):
@@ -1190,7 +1244,7 @@ def _failing(*names):
 def test_a_read_that_fails_is_followed_by_the_five_as_they_were(caplog, state, name):
     content = _build(ROOTS[state])
     old, new = _Side().load(content), _Side().load(content)
-    new.fail = _failing("EVALSHA")
+    new.fail = _failing("EVAL_RO")
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
         was = _as_it_was(old, caplog, name, "orders")
         now = _now(new, caplog, name, "orders")
@@ -1204,7 +1258,7 @@ def test_a_read_that_fails_is_followed_by_the_five_as_they_were(caplog, state, n
 def test_a_read_that_fails_does_not_let_a_write_into_a_locked_lake(caplog):
     """The guard reads the root itself then, and the lake is as locked as it was."""
     side = _Side().load(_build(ROOTS["locked"]))
-    side.fail = _failing("EVALSHA")
+    side.fail = _failing("EVAL_RO")
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
         outcome, _logs = _now(side, caplog, "superadmin", "orders")
 
@@ -1220,7 +1274,7 @@ def test_one_of_the_five_failing_after_it_ends_as_it_did(caplog, also, state):
     content = _build(ROOTS[state])
     old, new = _Side().load(content), _Side().load(content)
     old.fail = _failing(also)
-    new.fail = _failing("EVALSHA", also)
+    new.fail = _failing("EVAL_RO", also)
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
         was = _as_it_was(old, caplog, "loader", "orders")
         now = _now(new, caplog, "loader", "orders")
@@ -1298,20 +1352,19 @@ def test_a_library_without_the_read_checks_as_before(caplog, missing):
 
 
 def test_a_redis_stand_in_that_answers_a_script_with_zero_checks_as_before(caplog):
-    """The hand-written Redis of ``rbac/tests/test_rbac.py`` answers 0 to a
-    script it does not know.  It is asked whether it runs declared scripts,
-    answers 0, and is never sent the read."""
+    """A stand-in for Redis that answers 0 to a script it does not know, as
+    the hand-written one of ``rbac/tests/test_rbac.py`` answers its scripts.
+    It is asked whether it runs a script sent as a read, answers 0, and is
+    never sent the read."""
     content = _build()
     old, new = _Side().load(content), _Side(redis_7=False, asked=False).load(content)
     sent = []
 
-    def register(text):
-        def script(keys=None, args=None):
-            sent.append(text)
-            return 0
-        return script
+    def eval_ro(script, numkeys, *rest):
+        sent.append(script)
+        return 0
 
-    new.client.register_script = register
+    new.client.eval_ro = eval_ro
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
         was = _as_it_was(old, caplog, "analyst", "orders")
         now = _now(new, caplog, "analyst", "orders")
@@ -1320,11 +1373,27 @@ def test_a_redis_stand_in_that_answers_a_script_with_zero_checks_as_before(caplo
     assert now == again == was
     assert now[0] == ("raised", "PermissionError", "You don't have permission to write to this table.")
     assert new.trips == old.trips * 2
-    assert sent == [RedisCatalog._LUA_DECLARED_SCRIPT_PROBE], "asked once, and the read was never sent"
+    assert sent == [RedisCatalog._LUA_READ_ONLY_PROBE], "asked once, and the read was never sent"
+
+
+def test_a_redis_of_someone_s_own_making_without_the_command_checks_as_before(caplog):
+    """The hand-written Redis of ``rbac/tests/test_rbac.py`` has no such
+    method at all.  Nothing is sent, nothing is logged, and nothing is kept:
+    there is no answer to keep."""
+    content = _build()
+    old, new = _Side().load(content), _Side(redis_7=False, asked=False).load(content)
+    new.client.eval_ro = None
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        was = _as_it_was(old, caplog, "loader", "orders")
+        now = _now(new, caplog, "loader", "orders")
+
+    assert now == was == (("returned", None), [])
+    assert new.trips == old.trips
+    assert new.client not in redis_catalog._RUNS_READ_ONLY_SCRIPTS
 
 
 # ---------------------------------------------------------------------------
-# A Redis that does not run a script declared read-only
+# A Redis that does not run a script sent as a read
 # ---------------------------------------------------------------------------
 
 FIVE = ["GET", "EXISTS", "SMEMBERS", "HGET", "HGETALL"]
@@ -1381,7 +1450,7 @@ def test_the_read_itself_says_so_and_sends_nothing(caplog):
     catalog = _catalog_on(side)
 
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
-        with pytest.raises(NotImplementedError, match="declared read-only, which this Redis does not run"):
+        with pytest.raises(NotImplementedError, match="sent as a read \\(EVAL_RO\\), which this Redis does not run"):
             catalog.rbac_access_read(ORG, LAKE, "loader")
 
     assert side.trips == [] and not [r for r in caplog.records if r.name == LOGGER]
@@ -1394,39 +1463,90 @@ def _asking(answer):
     catalog = _catalog_on(side)
     asked = []
 
-    def probe(keys=None, args=None):
-        asked.append((keys, args))
+    def eval_ro(script, numkeys, *rest):
+        asked.append((script, numkeys, rest))
         if isinstance(answer, BaseException):
             raise answer
         return answer
 
-    catalog._declared_script_probe = probe
+    side.client.eval_ro = eval_ro
     return side, catalog, asked
 
 
-@pytest.mark.parametrize("answer", [0, 2, None, "1", True, 1.0, [1], b"1", MagicMock(),
-                                    redis.ResponseError("Error compiling script"),
-                                    redis.exceptions.NoPermissionError("no permissions to run the 'evalsha' command")],
-                         ids=["zero", "two", "nothing", "text", "true", "a float", "a list", "bytes", "a mock",
-                              "a script it cannot compile", "a user that may not run scripts"])
-def test_an_answer_that_is_not_1_is_no_and_is_remembered(caplog, answer):
+ASKED_ONCE = [("return 1", 0, ())]
+
+
+NOT_YES = [0, 2, None, "1", True, 1.0, [1], b"1", MagicMock(),
+           redis.ResponseError("unknown command 'EVAL_RO', with args beginning with: 'return 1' '0'"),
+           redis.ResponseError("BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE."),
+           redis.ResponseError("MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'."),
+           redis.exceptions.NoPermissionError("this user has no permissions to run the 'eval_ro' command")]
+NOT_YES_IDS = ["zero", "two", "nothing", "text", "true", "a float", "a list", "bytes", "a mock",
+               "a Redis that does not know the command", "a Redis busy with another script",
+               "a replica that is still syncing", "a user that may not run scripts"]
+
+
+@pytest.mark.parametrize("answer", NOT_YES, ids=NOT_YES_IDS)
+def test_an_answer_that_is_not_1_is_no_and_is_kept_for_a_minute(caplog, monkeypatch, answer):
+    """Kept, so that a Redis that will never say yes is not asked at every
+    check; for a minute, because a refusal can be of the moment, and a process
+    is not to go without the one read for the rest of its life for one."""
     side, catalog, asked = _asking(answer)
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(redis_catalog, "_monotonic", lambda: clock["now"])
 
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
-        assert catalog._runs_declared_scripts() is False
-        assert catalog._runs_declared_scripts() is False
-        assert _catalog_on(side)._runs_declared_scripts() is False, "another catalog on the same client"
+        assert catalog._runs_read_only_scripts() is False
+        assert catalog._runs_read_only_scripts() is False
+        assert _catalog_on(side)._runs_read_only_scripts() is False, "another catalog on the same client"
+        clock["now"] += redis_catalog._ASK_AGAIN_AFTER_S - 0.001
+        assert catalog._runs_read_only_scripts() is False
+        assert asked == ASKED_ONCE, "asked once, with no key and no argument"
 
-    assert asked == [([], [])], "asked once, with no key and no argument"
+        clock["now"] += 0.001
+        assert catalog._runs_read_only_scripts() is False
+        assert asked == ASKED_ONCE * 2, "a minute on, it is asked again"
+        assert catalog._runs_read_only_scripts() is False
+        assert asked == ASKED_ONCE * 2
+
     assert not [r for r in caplog.records if r.name == LOGGER]
+    assert redis_catalog._ASK_AGAIN_AFTER_S == 60.0
 
 
-def test_the_answer_1_is_yes_and_is_remembered():
+def test_a_redis_that_says_no_and_then_yes_is_taken_at_its_new_word(monkeypatch):
+    """The refusal of a moment: the one read is back with the next question."""
+    side = _Side(asked=False).load(_build())
+    catalog = _catalog_on(side)
+    clock = {"now": 5.0}
+    monkeypatch.setattr(redis_catalog, "_monotonic", lambda: clock["now"])
+    real, busy = side.client.eval_ro, {"busy": True}
+
+    def eval_ro(script, numkeys, *rest):
+        if busy["busy"]:
+            raise redis.ResponseError("BUSY Redis is busy running a script.")
+        return real(script, numkeys, *rest)
+
+    side.client.eval_ro = eval_ro
+    assert catalog._runs_read_only_scripts() is False
+    busy["busy"] = False
+    assert catalog._runs_read_only_scripts() is False, "still within the minute"
+    with pytest.raises(NotImplementedError):
+        catalog.rbac_access_read(ORG, LAKE, "loader")
+
+    clock["now"] += redis_catalog._ASK_AGAIN_AFTER_S
+    assert catalog._runs_read_only_scripts() is True
+    assert catalog.rbac_access_read(ORG, LAKE, "loader")[3]["role"] == "writer"
+
+
+def test_the_answer_1_is_yes_and_is_kept(monkeypatch):
     side, catalog, asked = _asking(1)
+    clock = {"now": 0.0}
+    monkeypatch.setattr(redis_catalog, "_monotonic", lambda: clock["now"])
 
-    assert catalog._runs_declared_scripts() is True
-    assert catalog._runs_declared_scripts() is True
-    assert asked == [([], [])]
+    assert catalog._runs_read_only_scripts() is True
+    clock["now"] += 10 * redis_catalog._ASK_AGAIN_AFTER_S
+    assert catalog._runs_read_only_scripts() is True
+    assert asked == ASKED_ONCE, "a yes is not asked for again"
 
 
 @pytest.mark.parametrize("failure", [redis.exceptions.TimeoutError("Timeout reading from socket"),
@@ -1451,7 +1571,7 @@ def test_a_redis_that_could_not_be_asked_is_followed_by_the_five_reads_and_asked
     content = _build()
     old, new = _Side().load(content), _Side(asked=False).load(content)
     failed = []
-    new.fail = lambda name, key: name == "EVALSHA" and not failed and not failed.append(1)
+    new.fail = lambda name, key: name == "EVAL_RO" and not failed and not failed.append(1)
     with caplog.at_level(logging.DEBUG, logger=LOGGER):
         was = _as_it_was(old, caplog, "loader", "orders")
         now = _now(new, caplog, "loader", "orders")
@@ -1472,16 +1592,18 @@ def test_a_client_that_cannot_be_remembered_is_not_asked():
         __hash__ = None
 
         def register_script(self, text):
-            def script(keys=None, args=None):
-                sent.append(text)
-                return 1
-            return script
+            return lambda keys=None, args=None: 1
+
+        def eval_ro(self, script, numkeys, *rest):
+            sent.append(script)
+            return 1
 
     with pytest.MonkeyPatch.context() as patched:
         patched.setattr(redis_catalog, "RedisConnector", lambda options=None: SimpleNamespace(r=Unhashable()))
         catalog = RedisCatalog()
 
-    assert catalog._runs_declared_scripts() is False
+    assert catalog._runs_read_only_scripts() is False
+    assert catalog._does_not_run_read_only_scripts_for_now() is None, "nor can a no be kept: no failure"
     with pytest.raises(NotImplementedError):
         catalog.rbac_access_read(ORG, LAKE, "loader")
     assert sent == []
@@ -1493,15 +1615,15 @@ def test_what_is_remembered_goes_with_the_client():
     import gc
 
     gc.collect()
-    before = len(redis_catalog._RUNS_DECLARED_SCRIPTS)
+    before = len(redis_catalog._RUNS_READ_ONLY_SCRIPTS)
     sides = [_Side().load(_build()) for _ in range(5)]
-    assert len(redis_catalog._RUNS_DECLARED_SCRIPTS) == before + 5
-    assert all(redis_catalog._RUNS_DECLARED_SCRIPTS[side.client] is True for side in sides)
+    assert len(redis_catalog._RUNS_READ_ONLY_SCRIPTS) == before + 5
+    assert all(redis_catalog._RUNS_READ_ONLY_SCRIPTS[side.client][0] is True for side in sides)
 
     del sides
     gc.collect()
 
-    assert len(redis_catalog._RUNS_DECLARED_SCRIPTS) == before
+    assert len(redis_catalog._RUNS_READ_ONLY_SCRIPTS) == before
 
 
 # ---------------------------------------------------------------------------
@@ -1518,7 +1640,7 @@ class _ReadsTheRootItsOwnWay(RedisCatalog):
 class _DefinesTheRead(RedisCatalog):
     """A subclass that says what the one read answers."""
 
-    def rbac_access_read(self, org, sup, role_name):
+    def rbac_access_read(self, org, sup, role_name, with_root=True):
         return ('{"read_only": true}', True, ["an id"], {"role": "writer", "tables": {"*": {}}})
 
 
@@ -1530,7 +1652,7 @@ def test_a_subclass_of_the_catalog_is_asked_the_five_reads_it_may_have_changed()
     with pytest.MonkeyPatch.context() as patched:
         side.use(patched)
         catalog = _ReadsTheRootItsOwnWay()
-        with pytest.raises(NotImplementedError, match="five reads of RedisCatalog itself"):
+        with pytest.raises(NotImplementedError, match="five reads of RedisCatalog as it defines them"):
             catalog.rbac_access_read(ORG, LAKE, "loader")
         assert RoleManager.read_for_access_check(
             super_name=LAKE, organization=ORG, role_name="loader", redis_catalog=catalog) is None
@@ -1544,14 +1666,57 @@ def test_a_subclass_of_the_catalog_is_asked_the_five_reads_it_may_have_changed()
 
 
 def test_a_subclass_that_defines_the_read_is_asked_for_it():
+    """Put where the access check builds its catalog and where a manager
+    builds its own: one class for the root and the role, as the read needs."""
     side = _Side().load(_build())
     with pytest.MonkeyPatch.context() as patched:
         side.use(patched)
-        with patch("supertable.rbac.access_control.RedisCatalog", _DefinesTheRead):
+        with patch("supertable.rbac.access_control.RedisCatalog", _DefinesTheRead), \
+                patch("supertable.rbac.role_manager.RedisCatalog", _DefinesTheRead):
             outcome = _outcome(check_write_access, LAKE, ORG, "loader", "orders")
 
     assert outcome == ("raised", "PermissionError", "This SuperTable is locked. Cannot write to this table.")
     assert side.trips == []
+
+
+# ---------------------------------------------------------------------------
+# The guard's catalog and a manager's: one class, or each is asked its own
+# ---------------------------------------------------------------------------
+
+class _NoNameIsARole(RedisCatalog):
+    """A catalog a test might put where a manager builds its own: no name
+    stands for a role there."""
+
+    def rbac_get_role_id_by_name(self, org, sup, role_name):
+        return None
+
+
+def test_a_catalog_in_the_manager_s_place_alone_is_asked_for_the_role():
+    """The guard read the root through the access check's catalog, and the
+    role came from the one a manager builds for itself.  The one read would
+    have asked the access check's for both, and found the role there."""
+    side = _Side().load(_build())
+    with pytest.MonkeyPatch.context() as patched:
+        side.use(patched)
+        with patch("supertable.rbac.role_manager.RedisCatalog", _NoNameIsARole):
+            outcome = _outcome(check_write_access, LAKE, ORG, "loader", "orders")
+
+    assert outcome == ("raised", "PermissionError", "Invalid or nonexistent role: loader")
+    assert [trip[0] for trip in side.trips] == ["GET", "EXISTS", "SMEMBERS"], \
+        "the root by the guard, the store by the constructor, and a lookup that asks Redis nothing"
+
+
+def test_a_catalog_in_the_guard_s_place_alone_is_asked_for_the_root():
+    """The other way round: a catalog that would answer the one read for both
+    is asked for the root, and the role comes from a manager's own catalog."""
+    side = _Side().load(_build())
+    with pytest.MonkeyPatch.context() as patched:
+        side.use(patched)
+        with patch("supertable.rbac.access_control.RedisCatalog", _DefinesTheRead):
+            outcome = _outcome(check_write_access, LAKE, ORG, "analyst", "orders")
+
+    assert outcome == ("raised", "PermissionError", "You don't have permission to write to this table.")
+    assert [trip[0] for trip in side.trips] == FIVE, "its read of both was not asked for"
 
 
 class _LooksRolesUpItsOwnWay(RoleManager):
@@ -1579,6 +1744,448 @@ def test_a_subclass_of_the_manager_is_asked_the_lookup_it_may_have_changed():
     assert outcome == ("raised", "PermissionError", "Invalid or nonexistent role: loader")
     assert [trip[0] for trip in side.trips] == ["GET", "EXISTS", "SMEMBERS"], \
         "the guard, the constructor, and its own lookup, which asks Redis nothing"
+
+
+# ---------------------------------------------------------------------------
+# A read someone has replaced is the read that is asked
+# ---------------------------------------------------------------------------
+
+STANDS_FOR = ["get_root", "rbac_get_role_ids_by_type", "rbac_get_superadmin_role_id",
+              "rbac_get_role_id_by_name", "get_role_details", "_role_from_hash", "_decode_member"]
+#: Those of them that take no catalog: replaced, they are put there as they are.
+NO_SELF = ("_role_from_hash", "_decode_member")
+
+
+@pytest.mark.parametrize("name", STANDS_FOR)
+@pytest.mark.parametrize("where", ["on the class", "on the object"])
+def test_a_catalog_with_one_of_its_reads_replaced_is_not_asked_for_the_one(monkeypatch, name, where):
+    """The one read stands for these reads as the class defines them.  A
+    replacement of one of them, however it reads, would not be asked."""
+    side = _Side().load(_build())
+    catalog = _catalog_on(side)
+    original = getattr(RedisCatalog, name)
+    if where == "on the class":
+        another = lambda *a, **k: original(*a, **k)     # noqa: E731 - the same read, by another function
+        monkeypatch.setattr(RedisCatalog, name, staticmethod(another) if name in NO_SELF else another)
+    else:
+        bound = original if name in NO_SELF else (lambda *a, **k: original(catalog, *a, **k))
+        setattr(catalog, name, bound)
+
+    assert catalog._reads_are_its_own() is False
+    with pytest.raises(NotImplementedError, match="five reads of RedisCatalog as it defines them"):
+        catalog.rbac_access_read(ORG, LAKE, "loader")
+    assert side.trips == [], "nothing was sent"
+    assert RoleManager.read_for_access_check(
+        super_name=LAKE, organization=ORG, role_name="loader", redis_catalog=catalog) is None
+
+
+def test_a_catalog_as_the_library_defines_it_is_asked_for_the_one():
+    side = _Side().load(_build())
+    catalog = _catalog_on(side)
+
+    assert catalog._reads_are_its_own() is True
+    assert sorted(redis_catalog._ACCESS_READ_STANDS_FOR) == sorted(STANDS_FOR)
+
+
+def test_ids_decoded_another_way_are_the_ids_the_check_looks_up(monkeypatch):
+    """The lookups hand every id through the catalog's decoding.  With another
+    put in its place, the role a name stands for is the one it says."""
+    side = _Side().load(_build())
+    loader, analyst = _role_id("loader"), _role_id("analyst")
+    monkeypatch.setattr(RedisCatalog, "_decode_member",
+                        staticmethod(lambda member: analyst if member == loader else member))
+    with pytest.MonkeyPatch.context() as patched:
+        side.use(patched)
+        outcome = _outcome(check_write_access, LAKE, ORG, "loader", "orders")
+
+    assert outcome == ("raised", "PermissionError", "You don't have permission to write to this table.")
+    assert [trip[0] for trip in side.trips] == FIVE, "the reader's document, by the five reads"
+
+
+def test_a_root_read_put_in_the_place_of_the_catalog_s_decides_the_write(monkeypatch):
+    """What a test does to make a lake read-only without touching Redis."""
+    side = _Side().load(_build())
+    monkeypatch.setattr(RedisCatalog, "get_root", lambda self, org, sup: {"read_only": True})
+    with pytest.MonkeyPatch.context() as patched:
+        side.use(patched)
+        outcome = _outcome(check_write_access, LAKE, ORG, "loader", "orders")
+
+    assert outcome == ("raised", "PermissionError", "This SuperTable is locked. Cannot write to this table.")
+    assert side.trips == [], "neither the one read nor the root was asked of Redis"
+
+
+@pytest.mark.parametrize("name,replacement,expected,trips", [
+    ("get_role_by_name", lambda self, role_name: {},
+     ("raised", "PermissionError", "Invalid or nonexistent role: loader"), ["GET", "EXISTS", "SMEMBERS"]),
+    ("get_role", lambda self, role_id: {"role": "reader", "tables": {"*": {}}},
+     ("raised", "PermissionError", "You don't have permission to write to this table."),
+     ["GET", "EXISTS", "SMEMBERS", "HGET"]),
+    ("_init_role_storage", lambda self: None, ("returned", None), ["GET", "HGET", "HGETALL"]),
+], ids=["the lookup by name", "the lookup by id", "the check of the role store"])
+def test_a_manager_with_one_of_its_reads_replaced_is_asked_that_read(monkeypatch, name, replacement,
+                                                                     expected, trips):
+    side = _Side().load(_build())
+    monkeypatch.setattr(RoleManager, name, replacement)
+    with pytest.MonkeyPatch.context() as patched:
+        side.use(patched)
+        assert RoleManager.read_for_access_check(super_name=LAKE, organization=ORG, role_name="loader") is None
+        assert side.trips == [], "nothing was sent"
+        outcome = _outcome(check_write_access, LAKE, ORG, "loader", "orders")
+
+    assert outcome == expected
+    assert [trip[0] for trip in side.trips] == trips
+
+
+def test_a_manager_whose_constructor_was_replaced_is_constructed(monkeypatch):
+    side = _Side().load(_build())
+    built = []
+    original = RoleManager.__init__
+
+    def watching(self, *args, **options):
+        built.append(options)
+        original(self, *args, **options)
+
+    monkeypatch.setattr(RoleManager, "__init__", watching)
+    with pytest.MonkeyPatch.context() as patched:
+        side.use(patched)
+        assert _outcome(check_write_access, LAKE, ORG, "loader", "orders") == ("returned", None)
+
+    assert built == [{"super_name": LAKE, "organization": ORG}]
+    assert [trip[0] for trip in side.trips] == FIVE
+
+
+def test_the_manager_as_the_library_defines_it_is_asked_for_the_one():
+    from supertable.rbac import role_manager
+
+    assert sorted(role_manager._ACCESS_READ_STANDS_FOR) == [
+        "__init__", "_init_role_storage", "get_role", "get_role_by_name"]
+    assert all(RoleManager.__dict__[name] is original
+               for name, original in role_manager._ACCESS_READ_STANDS_FOR.items())
+
+
+def test_a_guard_put_in_the_place_of_the_module_s_is_the_guard_that_runs(monkeypatch):
+    """A host's test switches the read-only guard off this way.  The one read
+    would have applied the module's own guard to a root the test never meant
+    to be looked at."""
+    side = _Side().load(_build(ROOTS["locked"]))
+    seen = []
+    monkeypatch.setattr(access_control, "_check_readonly_guard",
+                        lambda super_name, organization, label: seen.append((super_name, organization, label)))
+    with pytest.MonkeyPatch.context() as patched:
+        side.use(patched)
+        outcome = _outcome(check_write_access, LAKE, ORG, "loader", "orders")
+
+    assert outcome == ("returned", None)
+    assert seen == [(LAKE, ORG, "write to this table")]
+    assert [trip[0] for trip in side.trips] == FIVE[1:], "the role, by the four reads; the root by nobody"
+
+
+@pytest.mark.parametrize("name", ["_check_operation_access", "_check_scope_access", "_resolve_role"])
+def test_a_check_put_in_the_place_of_the_module_s_is_the_check_that_runs(monkeypatch, name):
+    side = _Side().load(_build())
+    called = []
+    original = getattr(access_control, name)
+
+    def watching(*args, **options):
+        called.append(name)
+        return original(*args, **options)
+
+    monkeypatch.setattr(access_control, name, watching)
+    with pytest.MonkeyPatch.context() as patched:
+        side.use(patched)
+        outcome = _outcome(check_write_access, LAKE, ORG, "analyst", "orders")
+
+    assert outcome == ("raised", "PermissionError", "You don't have permission to write to this table.")
+    assert called == [name]
+    assert [trip[0] for trip in side.trips] == FIVE
+
+
+def test_the_module_s_own_checks_are_what_the_one_read_stands_for():
+    assert access_control._checks_are_this_modules() is True
+    assert access_control._ONE_READ_STANDS_FOR == (
+        access_control._check_readonly_guard, access_control._check_operation_access,
+        access_control._check_scope_access, access_control._resolve_role)
+
+
+# ---------------------------------------------------------------------------
+# A command of the client's someone has replaced is the command that is sent
+# ---------------------------------------------------------------------------
+
+CLIENT_READS = ["get", "exists", "smembers", "hget", "hgetall"]
+
+
+@pytest.mark.parametrize("name", CLIENT_READS)
+@pytest.mark.parametrize("where", ["on the class", "on the object"])
+def test_a_client_with_one_of_its_reads_replaced_is_asked_that_read(monkeypatch, name, where):
+    """What a test does to have Redis fail, or answer as the test likes: it
+    replaces a command on the client.  The script would go round it."""
+    side = _Side().load(_build())
+    catalog = _catalog_on(side)
+    original = getattr(redis.Redis, name)
+    asked = []
+
+    if where == "on the class":
+        def watching(client, *args, **options):
+            asked.append(name)
+            return original(client, *args, **options)
+
+        monkeypatch.setattr(type(side.client), name, watching)
+    else:
+        def watching(*args, **options):
+            asked.append(name)
+            return original(side.client, *args, **options)
+
+        setattr(side.client, name, watching)
+
+    assert catalog._reads_are_its_own() is False
+    with pytest.raises(NotImplementedError, match="five reads of RedisCatalog as it defines them"):
+        catalog.rbac_access_read(ORG, LAKE, "loader")
+    assert side.trips == [] and asked == [], "nothing was sent"
+    with pytest.MonkeyPatch.context() as patched:
+        side.use(patched)
+        assert _outcome(check_write_access, LAKE, ORG, "loader", "orders") == ("returned", None)
+
+    assert [trip[0] for trip in side.trips] == FIVE
+    assert asked == [name], "the command that was put there is the one that was sent"
+
+
+def test_the_clients_the_library_builds_are_sent_the_one_read():
+    """``redis.Redis``, also from a sentinel, and the fake of these tests:
+    their five reads are the client library's own."""
+    import inspect
+
+    from redis.sentinel import Sentinel
+
+    assert sorted(redis_catalog._CLIENT_READS) == sorted(CLIENT_READS)
+    for kind in (redis.Redis, fakeredis.FakeRedis):
+        assert all(getattr(kind, name) is original for name, original in redis_catalog._CLIENT_READS.items())
+    assert inspect.signature(Sentinel.master_for).parameters["redis_class"].default is redis.Redis
+
+    client = redis.Redis(host="127.0.0.1", port=1, decode_responses=True)       # never connected to
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(redis_catalog, "RedisConnector", lambda options=None: SimpleNamespace(r=client))
+        assert RedisCatalog()._reads_are_its_own() is True
+
+
+@pytest.mark.parametrize("name", CLIENT_READS)
+def test_a_command_replaced_before_the_library_was_imported_is_still_told_apart(monkeypatch, name):
+    """The library's own reads are taken from the classes ``redis.Redis`` is
+    made of, not from ``redis.Redis`` as it happens to stand at the import."""
+    original = getattr(redis.Redis, name)
+    assert redis_catalog._client_reads()[name] is original
+    monkeypatch.setattr(redis.Redis, name, lambda self, *args: None)
+
+    assert redis_catalog._client_reads()[name] is original, "what was put on redis.Redis is not taken for it"
+    side = _Side().load(_build())
+    assert _catalog_on(side)._reads_are_its_own() is False
+
+
+class _ItsOwnReads:
+    """What a stand-in for the client has, written by hand: its own reads."""
+    __slots__ = ()
+
+    def register_script(self, text):
+        return lambda keys=None, args=None: 0
+
+    def get(self, key):
+        return None
+
+    def exists(self, key):
+        return 0
+
+    def smembers(self, key):
+        return set()
+
+    def hget(self, key, field):
+        return None
+
+    def hgetall(self, key):
+        return {}
+
+    def eval_ro(self, script, numkeys, *rest):
+        raise AssertionError("a stand-in is not sent the read, nor asked whether it runs it")
+
+
+class _HandWritten(_ItsOwnReads):
+    pass
+
+
+class _WithNoAttributesOfItsOwn(_ItsOwnReads):
+    __slots__ = ()
+
+
+@pytest.mark.parametrize("stand_in", [MagicMock, _HandWritten, _WithNoAttributesOfItsOwn],
+                         ids=["a mock", "a class written by hand", "one that keeps no attributes"])
+def test_a_stand_in_for_the_client_is_asked_its_own_reads(stand_in):
+    client = stand_in()
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(redis_catalog, "RedisConnector", lambda options=None: SimpleNamespace(r=client))
+        catalog = RedisCatalog()
+
+        assert catalog._reads_are_its_own() is False
+        with pytest.raises(NotImplementedError, match="five reads of RedisCatalog as it defines them"):
+            catalog.rbac_access_read(ORG, LAKE, "loader")
+        assert RoleManager.read_for_access_check(
+            super_name=LAKE, organization=ORG, role_name="loader", redis_catalog=catalog) is None
+    if stand_in is MagicMock:
+        client.eval_ro.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# A Redis that says yes, and then refuses the read
+# ---------------------------------------------------------------------------
+
+def _refusing(side, refusal: dict, sent: list) -> None:
+    """Have this Redis refuse the access read with ``refusal["with"]`` for as
+    long as there is one; which of the two scripts was sent goes into *sent*."""
+    real = side.client.eval_ro
+
+    def eval_ro(script, numkeys, *rest):
+        sent.append("the question" if script == RedisCatalog._LUA_READ_ONLY_PROBE else "the read")
+        if script == RedisCatalog._LUA_RBAC_ACCESS_READ and refusal.get("with") is not None:
+            raise refusal["with"]
+        return real(script, numkeys, *rest)
+
+    side.client.eval_ro = eval_ro
+
+
+#: Refusals that are this Redis's, and will be the same for every lake on it.
+OF_THIS_REDIS = [
+    redis.ResponseError("ACL failure in script: No permissions to access a key script: "
+                        "83cd8e8f, on @user_script:9."),
+    redis.exceptions.NoPermissionError("No permissions to access a key"),
+    redis.ResponseError("Script attempted to access a non local key in a cluster node script: "
+                        "83cd8e8f, on @user_script:9."),
+    redis.ResponseError("unknown command 'EVAL_RO', with args beginning with: 'local meta' '4'"),
+]
+OF_THIS_REDIS_IDS = ["a user that may not read a role's document", "a user that may not read a key it names",
+                     "a cluster that does not hold the document's key", "a server that knows the command no more"]
+
+
+@pytest.mark.parametrize("refusal", OF_THIS_REDIS, ids=OF_THIS_REDIS_IDS)
+def test_a_redis_that_said_yes_and_refuses_the_read_is_not_sent_it_again_for_a_minute(caplog, monkeypatch,
+                                                                                      refusal):
+    """A user that may run a script and may not read a role's document, a
+    server that runs "return 1" and not this read: asked, it said yes.  It is
+    not sent the read at every check, to refuse it and be logged each time.  A
+    minute on it is asked again, and sent the read again if it says yes."""
+    content = _build()
+    old, new = _Side().load(content), _Side().load(content)
+    clock = {"now": 500.0}
+    monkeypatch.setattr(redis_catalog, "_monotonic", lambda: clock["now"])
+    sent, state = [], {"with": refusal}
+    _refusing(new, state, sent)
+    line = ("ERROR", READ_REFUSED + str(refusal))
+
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        was = _as_it_was(old, caplog, "loader", "orders")
+        first = _now(new, caplog, "loader", "orders")
+        second = _now(new, caplog, "loader", "orders")
+        clock["now"] += redis_catalog._ASK_AGAIN_AFTER_S - 0.001
+        third = _now(new, caplog, "loader", "orders")
+        within_the_minute = list(sent)
+        clock["now"] += 0.001
+        fourth = _now(new, caplog, "loader", "orders")
+        a_minute_on = list(sent)
+        state["with"] = None
+        fifth = _now(new, caplog, "loader", "orders")
+        clock["now"] += redis_catalog._ASK_AGAIN_AFTER_S
+        sixth = _now(new, caplog, "loader", "orders")
+        seventh = _now(new, caplog, "loader", "orders")
+
+    assert was == (("returned", None), [])
+    assert first == fourth == (was[0], [line]), "refused, logged once, and the five reads decided"
+    assert second == third == fifth == sixth == seventh == was, "decided the same, and nothing logged"
+    assert within_the_minute == ["the read"]
+    assert a_minute_on == ["the read", "the question", "the read"], "asked again, said yes, refused again"
+    assert sent == a_minute_on + ["the question", "the read", "the read"], "and a yes it keeps is kept again"
+    assert [trip[0] for trip in new.trips] == FIVE * 3 + ["EVAL_RO"] + FIVE * 2 + ["EVAL_RO"] * 3
+    assert new.dump() == old.dump()
+
+
+#: Refusals that are one lake's: a key of it holds another kind of value.
+OF_THE_LAKE = [
+    redis.ResponseError("WRONGTYPE Operation against a key holding the wrong kind of value script: "
+                        "83cd8e8f, on @user_script:14."),
+    redis.ResponseError("Error running script (call to f_83cd8e8f): "
+                        "@user_script:?: WRONGTYPE Operation against a key holding the wrong kind of value"),
+]
+
+
+@pytest.mark.parametrize("refusal", OF_THE_LAKE, ids=["as Redis 7 words it", "as a stand-in for Redis wraps it"])
+def test_a_key_of_another_kind_is_the_lake_s_matter_and_the_read_is_sent_again(caplog, refusal):
+    """One lake with a key of the wrong kind is not to cost every other lake
+    on the same Redis its one read."""
+    side = _Side().load(_build())
+    sent, state = [], {"with": refusal}
+    _refusing(side, state, sent)
+    line = ("ERROR", READ_REFUSED + str(refusal))
+
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        first = _now(side, caplog, "loader", "orders")
+        second = _now(side, caplog, "loader", "orders")
+        state["with"] = None
+        third = _now(side, caplog, "loader", "orders")
+
+    assert first == second == (("returned", None), [line])
+    assert third == (("returned", None), [])
+    assert sent == ["the read"] * 3, "sent each time, and never asked again whether it runs"
+    assert redis_catalog._RUNS_READ_ONLY_SCRIPTS[side.client][0] is True
+
+
+def test_a_lake_with_a_key_of_another_kind_is_sent_the_read_at_every_check(caplog):
+    """The same with a key that is of another kind, and no refusal made up."""
+    ran = _same(caplog, _build(ROOTS["a root that is a hash"]), "loader", "orders")
+    assert ran.read_refused
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        again = _now(ran.new, caplog, "loader", "orders")
+
+    assert again == ran.now
+    assert [trip[0] for trip in ran.new.trips] == (["EVAL_RO"] + FIVE) * 2
+    assert redis_catalog._RUNS_READ_ONLY_SCRIPTS[ran.new.client][0] is True
+
+
+def test_a_yes_heard_meanwhile_is_not_taken_back_by_a_refusal_of_the_moment():
+    """Two threads ask a new client's Redis at the same moment: one is told
+    yes, the other is refused.  Whichever answer is written last, the yes
+    stands, and the one read is not lost for a minute."""
+    side = _Side(asked=False).load(_build())
+    catalog = _catalog_on(side)
+    real = side.client.eval_ro
+
+    def eval_ro(script, numkeys, *rest):
+        if script == RedisCatalog._LUA_READ_ONLY_PROBE:
+            redis_catalog._RUNS_READ_ONLY_SCRIPTS[side.client] = (True, 0.0)      # what the other thread heard
+            raise redis.ResponseError("BUSY Redis is busy running a script.")
+        return real(script, numkeys, *rest)
+
+    side.client.eval_ro = eval_ro
+
+    assert catalog._runs_read_only_scripts() is True
+    assert redis_catalog._RUNS_READ_ONLY_SCRIPTS[side.client] == (True, 0.0)
+    assert catalog.rbac_access_read(ORG, LAKE, "loader")[3]["role"] == "writer"
+
+
+# ---------------------------------------------------------------------------
+# The key of a role's document
+# ---------------------------------------------------------------------------
+
+def test_a_document_key_built_another_way_is_the_key_the_check_reads(caplog, monkeypatch):
+    """The script appends the id to a prefix.  Should the library's own
+    constructor ever make another key of it, it is the constructor's key the
+    check has always read, and reads."""
+    content = _build()
+    moved = DOC_PREFIX.replace(":roles:doc:", ":roles:moved:")
+    assert moved != DOC_PREFIX
+    monkeypatch.setattr(RK, "rbac_role_doc", lambda org, sup, role_id: f"{moved}{role_id}")
+
+    ran = _same(caplog, content, "loader", "orders")
+
+    assert ran.now[0] == ("raised", "PermissionError", "Invalid or nonexistent role: loader")
+    assert ran.new.trips == [THE_ONE_READ] + ran.old.trips and [trip[0] for trip in ran.old.trips] == FIVE
+    with pytest.raises(NotImplementedError, match="another key than rbac_role_doc names"):
+        _catalog_on(ran.new).rbac_access_read(ORG, LAKE, "loader")
+    assert _catalog_on(ran.new).rbac_access_read(ORG, LAKE, "nobody")[3] == {}, "no id, and no key to build"
 
 
 # ---------------------------------------------------------------------------

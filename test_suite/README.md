@@ -93,10 +93,16 @@ back (a key that is not there, a hash, a set) is made by the real Redis. So the
 one read is compared here with the five calls it stands for: on what it
 answers, on the commands it runs, on what the check decides either way, and on
 a read that Redis refuses, after which the five reads are made as before. The
-script is declared read-only, and only a real Redis shows what that is worth:
-while writes are paused the check is answered, as its five reads were, and the
-same script without the declaration waits with the writes. The real writer
-then writes, and its round trips are counted.
+script is sent as a read (`EVAL_RO`), and only a real Redis shows what that is
+worth: while writes are paused the check is answered, as its five reads were,
+even when Redis has never seen the script, and a user whose keys are read-only
+is answered too, where the same script sent the usual way waits with the
+writes and is refused to that user. A user that may run scripts and may not
+read a role's document is refused the read once and is then asked the five
+reads, which end as they always did for it; a key of another kind in one lake
+leaves every other lake its one read. A query's check asks the same script for
+its role alone. The real writer and reader then run, and their round trips are
+counted.
 
 ## Read half
 

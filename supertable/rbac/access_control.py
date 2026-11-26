@@ -12,6 +12,7 @@ from supertable.data_classes import TableDefinition
 # lookup and frame setup on the hot path. No cycle: ``redis_catalog`` imports
 # ``rbac.permissions`` (a leaf) and never imports this module.
 from supertable.redis_catalog import RedisCatalog
+from supertable.rbac import role_manager as _role_manager
 from supertable.rbac.role_manager import RoleManager
 from supertable.rbac.permissions import has_permission, Permission, RoleType
 from supertable.rbac.filter_builder import FilterBuilder
@@ -237,6 +238,28 @@ def _refuse_if_read_only(root, label: str) -> None:
         )
 
 
+#: The functions of this module the one read stands for, as the module
+#: defines them.  A caller that has put another in the place of one of them
+#: (a test does, to switch a check off or to watch it) is asked the one it
+#: put there: see ``_checks_are_this_modules``.
+_ONE_READ_STANDS_FOR = (
+    _check_readonly_guard,
+    _check_operation_access,
+    _check_scope_access,
+    _resolve_role,
+)
+
+
+def _checks_are_this_modules() -> bool:
+    """Whether the guard and the role's resolution are still this module's."""
+    return (
+        _check_readonly_guard,
+        _check_operation_access,
+        _check_scope_access,
+        _resolve_role,
+    ) == _ONE_READ_STANDS_FOR
+
+
 def _guard_and_role_in_one_read(
     super_name: str,
     organization: str,
@@ -260,10 +283,19 @@ def _guard_and_role_in_one_read(
     checks as it always did, with the guard's own read and a constructed
     ``RoleManager``: the role store is not initialised, the collaborators are
     not the ones that know the read (an older catalog, a test double in the
-    place of ``RoleManager`` or ``RedisCatalog``), or the read failed.  A read
-    that failed says nothing about the lake: the guard's own read follows it,
-    with the failure handling the guard has.
+    place of ``RoleManager`` or ``RedisCatalog``, another function in the
+    place of this module's guard or role resolution), or the read failed.  A
+    read that failed says nothing about the lake: the guard's own read follows
+    it, with the failure handling the guard has.
     """
+    if not _checks_are_this_modules():
+        return None
+    # The guard read the root through this module's catalog and the role came
+    # from the catalog a manager builds for itself.  The one read asks one
+    # catalog for both, so the two have to be one class: with another put in
+    # the place of either, each is asked what it was asked before.
+    if getattr(_role_manager, "RedisCatalog", None) is not RedisCatalog:
+        return None
     try:
         reader = getattr(RoleManager, "read_for_access_check", None)
         if not callable(reader):
@@ -288,6 +320,46 @@ def _guard_and_role_in_one_read(
     except Exception as e:
         raise _unverifiable_root(super_name, organization, label, e)
     _refuse_if_read_only(root, label)
+    return role_info
+
+
+def _role_in_one_read(super_name: str, organization: str, role_name: str):
+    """The role document for *role_name*, on one read of Redis.
+
+    A check without a read-only guard (a query) read Redis four times for its
+    role, one round trip each: two checks that the role store is initialised
+    when ``RoleManager`` is constructed, the role name's id and the role's
+    document.  ``RoleManager.read_for_access_check`` reads the four at once,
+    and leaves the lake's root alone.
+
+    Returns the role document (``{}`` when the name stands for no role).
+
+    Returns ``None`` when that one read is not to be had, and the caller then
+    constructs a ``RoleManager`` and asks it, as it always did: the role store
+    is not initialised (the constructor then makes the default role), Redis
+    does not run the read's script, ``RoleManager`` is not the class that
+    knows the read (a test double, a subclass), this module's role resolution
+    has had another function put in its place, or the read failed.
+    """
+    if not _checks_are_this_modules():
+        return None
+    try:
+        reader = getattr(RoleManager, "read_for_access_check", None)
+        if not callable(reader):
+            return None
+        answer = reader(
+            super_name=super_name,
+            organization=organization,
+            role_name=role_name,
+            with_root=False,
+        )
+    except Exception:
+        return None
+    if type(answer) is not tuple or len(answer) != 2:
+        return None
+    role_info = answer[1]
+    if type(role_info) is not dict:
+        return None
     return role_info
 
 
@@ -434,8 +506,16 @@ def restrict_read_access(
     """
     from supertable.data_classes import RbacViewDef
 
-    role_manager = RoleManager(super_name=super_name, organization=organization)
-    role_info = _resolve_role(role_manager, role_name)
+    # The role, on one read of Redis where there were four; when that read is
+    # not to be had, from a constructed RoleManager, as before.  Either way it
+    # is the same document, put to the same test of existence and of being
+    # enabled.
+    role_info = _role_in_one_read(super_name, organization, role_name)
+    if role_info is None:
+        role_manager = RoleManager(super_name=super_name, organization=organization)
+        role_info = _resolve_role(role_manager, role_name)
+    else:
+        role_info = _usable_role(role_info, role_name)
 
     role_type_str = role_info.get("role")
     if not role_type_str:

@@ -18,18 +18,22 @@ compared with the five calls where they must agree:
     states the root, the role store, the name index and the document can be
     in;
   * it runs the five reads and nothing else, and writes nothing;
-  * it is answered while Redis holds writes back, as the five reads are: the
-    script is declared read-only, and the same script without the declaration
-    is held with the writes;
+  * it is answered while Redis holds writes back, whether or not Redis has
+    seen the script, and for a user whose keys are read-only, as the five
+    reads are: the script is sent as a read (``EVAL_RO``), and the same script
+    sent the usual way is held with the writes and refused to that user;
   * the check decides on the one read what it decides on the five, and a read
     that Redis refuses sends it back to the five;
   * a role store that is gone is made again by the check, as before;
-  * a write of the real writer asks for access once.
+  * a write of the real writer asks for access once;
+  * a query asks the same script for its role alone: the four reads it made,
+    the lake's root left untouched, the same views and the same refusals.
 """
 
 from __future__ import annotations
 
 import json
+import secrets
 import time
 import uuid
 from types import SimpleNamespace
@@ -295,43 +299,47 @@ def test_a_name_that_stands_for_no_id_reads_no_document(catalog, lake):
 # A read, wherever Redis answers reads
 # ---------------------------------------------------------------------------
 
-def test_this_redis_runs_a_script_that_declares_its_flags(catalog):
+def test_this_redis_runs_a_script_sent_as_a_read(catalog):
     """Redis 7 and later.  The catalog asks once and is told so; a Redis that
     is not is asked the five reads (``supertable/tests`` has that side)."""
     from supertable.redis_catalog import RedisCatalog
 
-    assert catalog._runs_declared_scripts() is True
-    assert RedisCatalog()._runs_declared_scripts() is True
-    assert RedisCatalog._LUA_RBAC_ACCESS_READ.startswith("#!lua flags=no-writes\n")
+    assert catalog._runs_read_only_scripts() is True
+    assert RedisCatalog()._runs_read_only_scripts() is True
+    assert catalog.r.eval_ro(RedisCatalog._LUA_READ_ONLY_PROBE, 0) == 1
 
 
-def test_redis_itself_refuses_a_write_from_a_script_declared_like_this_one(catalog, lake):
-    """What the declaration is worth: not this suite's reading of the script,
-    Redis's own refusal."""
-    writing = catalog.r.register_script("#!lua flags=no-writes\nredis.call('SET', KEYS[1], 'x')\nreturn 1\n")
-
+def test_redis_itself_refuses_a_write_from_a_script_sent_as_a_read(catalog, lake):
+    """What sending it that way is worth: not this suite's reading of the
+    script, Redis's own refusal."""
     with pytest.raises(redis.ResponseError, match="Write commands are not allowed from read-only scripts"):
-        writing(keys=[lake.keys.root], args=[])
+        catalog.r.eval_ro("redis.call('SET', KEYS[1], 'x') return 1", 1, lake.keys.root)
 
     assert catalog.r.get(lake.keys.root) == A_ROOT
 
 
-def test_the_check_is_answered_while_writes_are_paused_as_its_five_reads_were(catalog, lake):
-    """Redis holds writes back for a failover or a shutdown and goes on
-    answering reads.  A script counts as a write unless it says it writes
-    nothing: the same reads, sent as a script that declares nothing, wait for
-    the pause to end, and a refusal would have waited with them."""
+def _reads_sent_the_usual_way(client, lake, name="loader"):
+    """The same script through EVALSHA, as every other script of the catalog
+    is sent; and what it was given."""
     from supertable.redis_catalog import RedisCatalog
 
-    undeclared = RedisCatalog._LUA_RBAC_ACCESS_READ.split("\n", 1)[1]
-    keys = [lake.keys.root, lake.keys.meta, lake.keys.superadmins, lake.keys.names]
-    arguments = ["loader", lake.keys.prefix + "rbac:roles:doc:"]
+    keys = [lake.keys.meta, lake.keys.superadmins, lake.keys.names, lake.keys.root]
+    arguments = [name, lake.keys.prefix + "rbac:roles:doc:"]
+    script = client.register_script(RedisCatalog._LUA_RBAC_ACCESS_READ)
+    return lambda: script(keys=keys, args=arguments)
+
+
+def test_the_check_is_answered_while_writes_are_paused_as_its_five_reads_were(catalog, lake):
+    """Redis holds writes back for a failover or a shutdown and goes on
+    answering reads.  A script sent the usual way counts as a write whenever
+    Redis has not got it yet, and waits for the pause to end; a refusal would
+    have waited with it.  Sent as a read it is answered, script known to
+    Redis or not: Redis is made to forget every script before the pause."""
     options = catalog.r.connection_pool.connection_kwargs
     operator = redis.Redis(**options)                                   # pauses, and ends the pause
-    impatient = redis.Redis(**{**options, "socket_timeout": 1.0})       # gives up after a second
-    held_script = impatient.register_script(undeclared)
-    assert held_script(keys=keys, args=arguments)[3] == lake.ids["loader"], "it is the same read"
-    catalog.rbac_access_read(ORG, lake.name, "loader")                  # both scripts are known to Redis
+    impatient = redis.Redis(**{**options, "socket_timeout": 1.0, "decode_responses": True})
+    the_usual_way = _reads_sent_the_usual_way(impatient, lake)
+    assert the_usual_way()[3] == lake.ids["loader"], "it is the same read"
     took = {}
 
     def timed(label, do):
@@ -341,6 +349,7 @@ def test_the_check_is_answered_while_writes_are_paused_as_its_five_reads_were(ca
         finally:
             took[label] = time.perf_counter() - start
 
+    operator.script_flush()
     operator.execute_command("CLIENT", "PAUSE", "8000", "WRITE")
     try:
         assert timed("a read", lambda: catalog.r.get(lake.keys.root)) == A_ROOT
@@ -348,7 +357,7 @@ def test_the_check_is_answered_while_writes_are_paused_as_its_five_reads_were(ca
         allowed = timed("a check that allows", lambda: _check(lake, "loader", "orders"))
         refused = timed("a check that refuses", lambda: _check(lake, "analyst", "orders"))
         with pytest.raises(redis.exceptions.TimeoutError):
-            timed("the same reads, undeclared", lambda: held_script(keys=keys, args=arguments))
+            timed("the same reads, sent the usual way", the_usual_way)
         impatient.close()
         with pytest.raises(redis.exceptions.TimeoutError):
             timed("a write", lambda: impatient.set(lake.keys.prefix + "paused", "1"))
@@ -363,8 +372,82 @@ def test_the_check_is_answered_while_writes_are_paused_as_its_five_reads_were(ca
     assert refused == ("raised", "PermissionError", "You don't have permission to write to this table.")
     for answered in ("a read", "the one read", "a check that allows", "a check that refuses"):
         assert took[answered] < 0.5, (answered, took)
-    for held in ("the same reads, undeclared", "a write"):
+    for held in ("the same reads, sent the usual way", "a write"):
         assert took[held] >= 0.9, (held, took)
+
+
+def test_a_user_whose_keys_are_read_only_is_answered_as_its_reads_were(catalog, lake):
+    """A reader hardened this way could always make the five reads.  Redis
+    refuses it EVAL and EVALSHA over the same keys, whatever the script does,
+    and answers EVAL_RO."""
+    import supertable.redis_catalog as rc_module
+    from supertable.redis_catalog import RedisCatalog
+
+    options = dict(catalog.r.connection_pool.connection_kwargs)
+    user, password = "reader_" + uuid.uuid4().hex[:8], secrets.token_hex(16)
+    catalog.r.execute_command("ACL", "SETUSER", user, "on", ">" + password,
+                              "%R~" + lake.keys.prefix + "*", "+@all")
+    reader = redis.Redis(**{**options, "username": user, "password": password, "decode_responses": True})
+    try:
+        with pytest.raises(redis.exceptions.NoPermissionError):
+            reader.set(lake.keys.prefix + "written", "1")
+        with pytest.raises(redis.exceptions.NoPermissionError):
+            _reads_sent_the_usual_way(reader, lake)()
+        with pytest.MonkeyPatch.context() as patched:
+            patched.setattr(rc_module, "RedisConnector", lambda options=None: SimpleNamespace(r=reader))
+            assert RedisCatalog()._runs_read_only_scripts() is True
+            read = RedisCatalog().rbac_access_read(ORG, lake.name, "loader")
+            trips, seen = [], {}
+            trips += _round_trips(lambda: seen.setdefault("write", _check(lake, "analyst", "orders")))
+            trips += _round_trips(lambda: seen.setdefault("read", _read_check(lake, "analyst", "one column")))
+    finally:
+        reader.close()
+        catalog.r.execute_command("ACL", "DELUSER", user)
+
+    assert read == _five_calls(catalog, lake, "loader")
+    assert seen["write"] == ("raised", "PermissionError", "You don't have permission to write to this table.")
+    assert seen["read"] == ("returned", {})
+    assert trips == ["EVAL_RO over 4", "EVAL_RO over 3"], "one round trip each, and none refused"
+
+
+def test_a_user_that_may_not_read_a_role_s_document_is_refused_once_and_asked_the_five(catalog, lake):
+    """Redis lets such a user run a script, and refuses it the document from
+    inside the script.  The one read is refused once; the reads that follow
+    end as they always did for this user, and the read is not sent again, to
+    be refused and logged at every check."""
+    import supertable.redis_catalog as rc_module
+    from supertable.redis_catalog import RedisCatalog
+
+    options = dict(catalog.r.connection_pool.connection_kwargs)
+    user, password = "limited_" + uuid.uuid4().hex[:8], secrets.token_hex(16)
+    keys = lake.keys
+    catalog.r.execute_command("ACL", "SETUSER", user, "on", ">" + password, "+@all",
+                              *("%R~" + key for key in (keys.root, keys.meta, keys.superadmins, keys.names)))
+    limited = redis.Redis(**{**options, "username": user, "password": password, "decode_responses": True})
+    seen = {}
+    try:
+        with pytest.MonkeyPatch.context() as patched:
+            patched.setattr(rc_module, "RedisConnector", lambda options=None: SimpleNamespace(r=limited))
+            assert RedisCatalog()._runs_read_only_scripts() is True
+            with pytest.raises(redis.ResponseError, match="No permissions to access a key"):
+                RedisCatalog().rbac_access_read(ORG, lake.name, "loader")
+            assert RedisCatalog()._runs_read_only_scripts() is False, "taken at its word for now"
+            rc_module._RUNS_READ_ONLY_SCRIPTS.pop(limited)      # as in a process that has not met the refusal
+            first = _round_trips(lambda: seen.setdefault("first", _check(lake, "loader", "orders")))
+            again = _round_trips(lambda: seen.setdefault("again", _check(lake, "loader", "orders")))
+            query = _round_trips(lambda: seen.setdefault("query", _read_check(lake, "analyst", "one column")))
+            seen["five"] = _check(lake, "loader", "orders", five=True)
+            seen["four"] = _read_check(lake, "analyst", "one column", four=True)
+    finally:
+        limited.close()
+        catalog.r.execute_command("ACL", "DELUSER", user)
+
+    assert seen["first"] == seen["again"] == seen["five"]
+    assert seen["five"][:2] == ("raised", "PermissionError"), "a document it may not read is no role"
+    assert seen["query"] == seen["four"]
+    assert first == ["EVAL_RO over 0", "EVAL_RO over 4", "GET", "EXISTS", "SMEMBERS", "HGET", "HGETALL"]
+    assert again == ["GET", "EXISTS", "SMEMBERS", "HGET", "HGETALL"]
+    assert query == ["EXISTS", "SMEMBERS", "HGET", "HGETALL"]
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +555,22 @@ def test_a_read_redis_refuses_sends_the_check_back_to_the_five(catalog, lake, wh
     assert _held(catalog, lake) == before
 
 
+def test_a_key_of_another_kind_in_one_lake_leaves_every_lake_its_one_read(catalog, two_lakes):
+    """Redis's refusal names the kind of value, and is taken for that lake's
+    matter: the read is sent again, to this lake and to every other on the
+    same Redis."""
+    spoiled, sound = two_lakes
+    _of_another_kind("the name index")(catalog, spoiled)
+    _check(sound, "loader", "orders")       # whichever client the check uses has been asked by now
+
+    trips = [_round_trips(lambda: _check(spoiled, "loader", "orders")),
+             _round_trips(lambda: _check(sound, "loader", "orders")),
+             _round_trips(lambda: _check(spoiled, "loader", "orders"))]
+
+    assert trips[0] == trips[2] == ["EVAL_RO over 4", "GET", "EXISTS", "SMEMBERS", "HGET"]
+    assert trips[1] == ["EVAL_RO over 4"]
+
+
 # ---------------------------------------------------------------------------
 # The real writer
 # ---------------------------------------------------------------------------
@@ -484,8 +583,8 @@ def _round_trips(do) -> list:
 
     def command(self, *args, **options):
         name = str(args[0]).upper()
-        if name == "EVALSHA":
-            trips.append(f"EVALSHA over {int(args[2])}")
+        if name in ("EVALSHA", "EVAL", "EVAL_RO"):
+            trips.append(f"{name} over {int(args[2])}")
         elif name.startswith("SCRIPT"):
             if trips and trips[-1].startswith("EVALSHA"):
                 trips.pop()         # refused, and sent again once the script is loaded
@@ -525,7 +624,7 @@ def test_a_write_of_the_real_writer_asks_for_access_once(catalog):
             was = _round_trips(lambda: writer.write("superadmin", "t", data=rows(9), overwrite_columns=[]))
 
         rest = ["INCRBY", "SET", "GET", "GET", "EVALSHA over 3", "PIPELINE of 3", "EVALSHA over 1"]
-        assert now == ["EVALSHA over 4"] + rest
+        assert now == ["EVAL_RO over 4"] + rest
         assert was == ["GET", "EXISTS", "SMEMBERS", "HGET", "HGETALL"] + rest
 
         frame, status, message = DataReader(
@@ -540,6 +639,172 @@ def test_a_write_of_the_real_writer_asks_for_access_once(catalog):
             lambda: writer.write("superadmin", "t", data=rows(12), overwrite_columns=[]))))
         assert refused == [("raised", "PermissionError",
                             "This SuperTable is locked. Cannot write to this table.")]
-        assert trips == ["EVALSHA over 4"]
+        assert trips == ["EVAL_RO over 4"]
     finally:
         _remove(catalog, lake)
+
+
+# ---------------------------------------------------------------------------
+# A query: the role alone
+# ---------------------------------------------------------------------------
+
+def _four_calls(catalog, lake, role_name):
+    """What a query's check asked the catalog: no root."""
+    return (None,) + _five_calls(catalog, lake, role_name)[1:]
+
+
+@pytest.mark.parametrize("state", sorted(STATES))
+def test_the_read_of_a_query_answers_what_its_four_calls_answer(catalog, lake, state):
+    STATES[state](catalog, lake)
+    before = _held(catalog, lake)
+
+    for name in NAMES:
+        root, meta, superadmins, role = catalog.rbac_access_read(ORG, lake.name, name, with_root=False)
+        assert (root, meta, sorted(superadmins), role) == _four_calls(catalog, lake, name), name
+
+    assert _held(catalog, lake) == before
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("loader", {"exists": 1, "smembers": 1, "hget": 1, "hgetall": 1}),
+    ("nobody", {"exists": 1, "smembers": 1, "hget": 1}),
+    (None, {"exists": 1, "smembers": 1}),
+])
+def test_the_read_of_a_query_does_not_touch_the_root(catalog, lake, name, expected):
+    """The four reads a manager made, and no fifth: the root is neither read
+    nor named, and one that holds another kind of value does not fail it."""
+    catalog.rbac_access_read(ORG, lake.name, "loader", with_root=False)
+    keys = [lake.keys.root, lake.keys.meta, lake.keys.superadmins, lake.keys.names, lake.document("loader")]
+
+    made = _script_commands(catalog.r, keys,
+                            lambda: catalog.rbac_access_read(ORG, lake.name, name, with_root=False))
+
+    assert made.pop("others") == []
+    assert made == expected
+
+    catalog.r.delete(lake.keys.root)
+    catalog.r.hset(lake.keys.root, "read_only", "true")
+    assert catalog.rbac_access_read(ORG, lake.name, "loader", with_root=False)[3]["role"] == "writer"
+
+
+def _asked_for(*tables):
+    from supertable.data_classes import TableDefinition
+    return [TableDefinition(super_name="unused", simple_name=name, alias=alias, columns=list(columns))
+            for name, alias, columns in tables]
+
+
+REQUESTS = {
+    "one column": (("orders", "o", ["id"]),),
+    "two columns": (("orders", "o", ["id", "amount"]),),
+    "every column": (("orders", "o", []),),
+    "a table outside ASCII": (("tételek", "t", ["id"]),),
+    "two tables": (("orders", "o", ["id"]), ("tételek", "t", ["id"])),
+    "a table nobody was given": (("secrets", "s", ["id"]),),
+}
+
+
+def _read_check(lake, name, request, four: bool = False):
+    """``restrict_read_access``; with *four*, as a library without the one read."""
+    from supertable.rbac.access_control import restrict_read_access
+    from supertable.rbac.role_manager import RoleManager
+
+    tables = _asked_for(*REQUESTS[request])
+    with pytest.MonkeyPatch.context() as patched:
+        if four:
+            patched.delattr(RoleManager, "read_for_access_check")
+        return _outcome(lambda: {
+            alias: (list(view.allowed_columns), view.where_clause)
+            for alias, view in restrict_read_access(lake.name, ORG, name, tables, tables).items()})
+
+
+@pytest.mark.parametrize("state", sorted(set(STATES) - NOT_INITIALISED))
+def test_a_query_is_let_through_on_one_read_as_on_four(catalog, lake, state):
+    STATES[state](catalog, lake)
+    before = _held(catalog, lake)
+
+    for name in NAMES:
+        for request in REQUESTS:
+            assert _read_check(lake, name, request) == _read_check(lake, name, request, four=True), (name, request)
+
+    assert _held(catalog, lake) == before
+
+
+def test_the_views_and_refusals_compared_are_of_every_kind(catalog, lake):
+    assert _read_check(lake, "superadmin", "two tables") == ("returned", {})
+    assert _read_check(lake, "Orders_Writer", "two tables") == ("returned", {"t": (["id"], "")})
+    assert _read_check(lake, "orders_writer", "every column") == ("returned", {})
+    refusals = {
+        ("catalog_viewer", "one column"): "You don't have permission to read the table.",
+        ("Orders_Writer", "a table nobody was given"): "You don't have permission to read table 'secrets'.",
+        ("nobody", "one column"): "Invalid or nonexistent role: nobody",
+    }
+    for (name, request), message in refusals.items():
+        assert _read_check(lake, name, request) == ("raised", "PermissionError", message)
+
+    catalog.r.hset(lake.document("orders_writer"), "tables", json.dumps({"orders": {"columns": ["id"], "filters": [
+        {"megye": {"operation": "=", "type": "value", "value": "Győr"}}]}}, ensure_ascii=False))
+    assert _read_check(lake, "Orders_Writer", "one column") == (
+        "returned", {"o": (["id"], "\"megye\" = 'Győr'")}) == _read_check(lake, "Orders_Writer", "one column", four=True)
+
+    catalog.r.set(lake.keys.root, '{"read_only": true, "clone_type": "replica"}')
+    assert _read_check(lake, "superadmin", "one column") == ("returned", {}), "a replica is read"
+
+
+def test_a_query_is_answered_while_writes_are_paused(catalog, lake):
+    operator = redis.Redis(**catalog.r.connection_pool.connection_kwargs)
+    took = {}
+    operator.script_flush()                                     # Redis has seen no script
+    operator.execute_command("CLIENT", "PAUSE", "6000", "WRITE")
+    try:
+        start = time.perf_counter()
+        allowed = _read_check(lake, "analyst", "one column")
+        took["allowed"] = time.perf_counter() - start
+        start = time.perf_counter()
+        refused = _read_check(lake, "catalog_viewer", "one column")
+        took["refused"] = time.perf_counter() - start
+    finally:
+        operator.execute_command("CLIENT", "UNPAUSE")
+        operator.close()
+
+    assert allowed == ("returned", {})
+    assert refused == ("raised", "PermissionError", "You don't have permission to read the table.")
+    assert max(took.values()) < 0.5, took
+
+
+def test_a_query_of_the_real_reader_asks_for_its_role_once(catalog):
+    from supertable.data_reader import DataReader, Status, engine
+    from supertable.data_writer import DataWriter
+    from supertable.rbac.role_manager import RoleManager
+    from supertable.super_table import SuperTable
+
+    lake = "access_reads_" + uuid.uuid4().hex[:8]
+    try:
+        SuperTable(lake, ORG)
+        writer = DataWriter(super_name=lake, organization=ORG)
+        writer.write("superadmin", "t", overwrite_columns=[], data=pa.table({
+            "id": list(range(6)), "v": [f"r{i}" for i in range(6)], "megye": ["Győr", "Pest"] * 3}))
+        roles = RoleManager(super_name=lake, organization=ORG, actor_role_name="superadmin")
+        roles.create_role({"role": "reader", "role_name": "gyori", "tables": {"t": {
+            "columns": ["id", "megye"],
+            "filters": [{"megye": {"operation": "=", "type": "value", "value": "Győr"}}]}}})
+
+        def query(sql, role):
+            frame, status, message = DataReader(super_name=lake, organization=ORG, query=sql).execute(
+                role_name=role, engine=engine.DUCKDB)
+            assert status is Status.OK, message
+            return frame.to_dicts()
+
+        seen = {}
+        query("SELECT id FROM t ORDER BY id", "superadmin")
+        now = _round_trips(lambda: seen.setdefault("now", query("SELECT * FROM t ORDER BY id", "gyori")))
+        with pytest.MonkeyPatch.context() as patched:
+            patched.delattr(RoleManager, "read_for_access_check")
+            was = _round_trips(lambda: seen.setdefault("was", query("SELECT * FROM t ORDER BY id", "gyori")))
+
+        assert seen["now"] == seen["was"] == [{"id": i, "megye": "Győr"} for i in (0, 2, 4)]
+        around = (["EXISTS", "GET", "EXISTS"], ["GET", "PIPELINE of 1", "EXISTS", "GET"])
+        assert now == around[0] + ["EVAL_RO over 3"] + around[1]
+        assert was == around[0] + ["EXISTS", "SMEMBERS", "HGET", "HGETALL"] + around[1]
+    finally:
+        _remove(catalog, lake)
+
