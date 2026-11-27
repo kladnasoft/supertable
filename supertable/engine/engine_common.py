@@ -2237,20 +2237,54 @@ def dv_table_name(cache_key: str) -> str:
     return f"dv_{h}"
 
 
+# The hour partition a deletion-vector part is filed under
+# (``helper.hourly_partition_subpath``): ``year=YYYY/month=MM/day=DD/hour=HH``.
+_DV_PARTITION_TAIL = re.compile(r"(?:[/\\]+(?:year|month|day|hour)=\d+)+$")
+
+
 def dv_table_id(cache_key: str) -> str:
     """Group key identifying the logical table a deletion-vector belongs to.
 
-    Every version of a table's deletion-vector is written to the same
-    directory (``<simple_dir>/tombstone/<ts>_<rand>_deleted.parquet``); only
-    the filename rotates when a write adds new deletes.  The parent directory
-    is therefore a stable per-table identity derivable from the cache key
-    alone — no extra plumbing from the engines.  Falls back to the whole key
-    when there is no separator (each version then groups alone, which merely
-    relaxes the per-table cap for that key — never a correctness issue, since
-    the materialised DV table is keyed by the path hash regardless).
+    Every part of a table's deletion-vector is written under the same
+    directory (``<simple_dir>/tombstone/``): directly in it in the flat
+    layout, and in ``year=/month=/day=/hour=`` folders below it since the
+    parts are filed by the hour.  Only those folders and the filename change
+    from one write to the next.  That directory is therefore a stable
+    per-table identity derivable from the cache key alone — no extra plumbing
+    from the engines.
+
+    The key is what the reader made it (``DataReader.execute``): the snapshot's
+    ``tombstone`` pointer as text.  For a snapshot that holds one path that is
+    the path.  For a vector of parts it is the text of the whole LIST of
+    paths, and every delete adds a path to it.  The table is read from the
+    LAST path of the key, never from the text before the key's last
+    separator: for a list that text holds every earlier part, so it differed
+    with every version, every version was a "table" of its own, and the
+    per-table cap never applied to a vector of more than one part — a table
+    that was deleted from and read kept every version until its idle time ran
+    out (1,750 of them for one table, 541 MB, in a five-minute test).
+
+    The hour folders are left out, so the versions of one table group
+    together across an hour boundary and with parts of the flat layout that
+    preceded the folders.
+
+    Falls back to the whole key when there is no separator (each version then
+    groups alone, which merely relaxes the per-table cap for that key — never
+    a correctness issue, since the materialised DV table is keyed by the path
+    hash regardless).
     """
     idx = max(cache_key.rfind("/"), cache_key.rfind("\\"))
-    return cache_key[:idx] if idx > 0 else cache_key
+    if idx <= 0:
+        return cache_key
+    # Where the key's last path starts: after the quote that opens it in the
+    # text of a list, at the start of the key when the key is one path.
+    start = max(cache_key.rfind("'", 0, idx), cache_key.rfind('"', 0, idx)) + 1
+    # ``rstrip``: in the text of a list a backslash separator is written twice,
+    # and the first of the pair before the file name is still on the end.
+    directory = cache_key[start:idx].rstrip("/\\")
+    if not directory:
+        return cache_key[:idx]
+    return _DV_PARTITION_TAIL.sub("", directory) or directory
 
 
 class TombstoneCache:

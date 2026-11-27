@@ -101,7 +101,7 @@ View names are derived from the table, snapshot version, and projection; query-s
 
 With `SUPERTABLE_DUCKDB_MATERIALIZE=table` the reflection is a table instead of a view: the rows are read into the connection when the query starts. That table is the query's own. Its name carries the query's suffix, two aliases of one table with the same columns share it, and handle closure drops it after the views that stand on it, so repeated and concurrent reads of a table neither meet an existing table nor lose one to another query's teardown.
 
-Deletion-vector tables are cached with a configured capacity and TTL, defaulting to 8 entries and 300 seconds. Referenced cache entries are released when the stream closes.
+Deletion-vector tables are cached on each reader thread's connection with a configured capacity and TTL: by default the 8 most recently used versions of each table's vector, and 300 seconds without a read. A delete adds a part to the vector and so makes a new version of it; the versions of one table are recognised by the folder its parts are written under (`<table>/tombstone/`, whichever hour folder below it), so a table that is deleted from and read keeps at most that many. Referenced cache entries are released when the stream closes, and an entry that is referenced is never dropped.
 
 ### File-access lock
 
