@@ -63,6 +63,22 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_read_ahead_threads() -> int:
+    """``SUPERTABLE_WRITE_READ_AHEAD_THREADS``: unset is 0 (choose by the storage).
+
+    A value that is not a whole number is 1, one file after another: someone
+    who wrote ``off`` or ``false`` meant the setting that needs no trust, and
+    falling back to the default would switch reading ahead on.
+    """
+    raw = (os.getenv("SUPERTABLE_WRITE_READ_AHEAD_THREADS") or "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        return 1
+
+
 def _env_float(name: str, default: float) -> float:
     raw = (os.getenv(name) or "").strip()
     if not raw:
@@ -344,6 +360,17 @@ class Settings:
     # its keys.  Least recently used files go first.  0 keeps nothing and
     # turns the test off: every file the key range cannot rule out is read.
     SUPERTABLE_KEY_VALUES_CACHE_MAX_BYTES: int = 32 * 1024 * 1024   # SUPERTABLE_KEY_VALUES_CACHE_MAX_BYTES
+
+    # How many of the files an upsert or delete could not rule out are read at
+    # a time.  The files are used in the order given; the ones after the file
+    # in use are read ahead by threads the process keeps.  0 chooses by the
+    # storage: 2 on LOCAL, and one file after another on an object store,
+    # where several at a time is faster and is the operator's to set (a store
+    # that limits requests refuses sooner, and a refused read of a file is
+    # taken for a file that is not there).  1 reads one file after another, as
+    # before; at most 8.  A value that is not a whole number reads one file
+    # after another.
+    SUPERTABLE_WRITE_READ_AHEAD_THREADS: int = 0   # SUPERTABLE_WRITE_READ_AHEAD_THREADS
 
     # Max number of tables whose *latest* tombstone (deletion-vector) artifact is
     # held in the in-process tombstone cache (one DataFrame per table; older
@@ -664,6 +691,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_SUPER_META_CACHE_TTL_S=meta_ttl,
         SUPERTABLE_STATS_CACHE_MAX_TABLES=_env_int("SUPERTABLE_STATS_CACHE_MAX_TABLES", 64),
         SUPERTABLE_KEY_VALUES_CACHE_MAX_BYTES=_env_int("SUPERTABLE_KEY_VALUES_CACHE_MAX_BYTES", 32 * 1024 * 1024),
+        SUPERTABLE_WRITE_READ_AHEAD_THREADS=_env_read_ahead_threads(),
         SUPERTABLE_TOMBSTONE_MAX_PARTS=_env_int("SUPERTABLE_TOMBSTONE_MAX_PARTS", 100),
         SUPERTABLE_STREAM_BATCH_ROWS=_env_int("SUPERTABLE_STREAM_BATCH_ROWS", 65_536),
         SUPERTABLE_STREAM_CHUNK_BYTES=_env_int("SUPERTABLE_STREAM_CHUNK_BYTES", 32 * 1024 * 1024),

@@ -10,7 +10,8 @@ import threading
 import uuid
 from array import array
 from bisect import bisect_left
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
 from datetime import datetime, date, timedelta, timezone
 from functools import lru_cache
 from typing import Callable, Dict, List, Set, Tuple, Optional
@@ -355,6 +356,408 @@ def _read_parquet_safe(
         if required:
             raise
         return None
+
+
+# ---------------------------------------------------------------------------
+# Candidate files, read ahead of their turn
+# ---------------------------------------------------------------------------
+# An upsert or delete reads every file it could not rule out and uses them in
+# the order given.  The reads do not depend on one another, and most of what
+# one costs is waiting: on an object store an existence check and a download,
+# two round trips, for every file.  So while the file whose turn it is is
+# being used, the ones after it are already being read, by a few threads that
+# the process keeps.
+#
+# What does not change:
+#   * A file's frame is used for that file and no other, in its turn: the
+#     frames are asked for by path and size, in the order the files were
+#     given, and a file that is asked for out of that order is read the way
+#     it always was.
+#   * Whether a file is there and can be read is decided as it always was:
+#     by a read of the caller's with no other read of the write beside it.
+#     ``_read_parquet_safe`` takes a file that cannot be read for a file that
+#     is not there, and a write then matches nothing in it; a store asked for
+#     several files at once may refuse some, and a local ``stat`` that fails
+#     says "not there" like one that finds nothing.  So a read that did not
+#     return the file while others were on their way, on a thread or by the
+#     caller, is not believed: the reads handed over are let end, the file is
+#     read again by the caller, in its turn, and the files after it in that
+#     pass over the files are read one after another.
+#   * A file that could be read is read once.  What its read raises that
+#     ``_read_parquet_safe`` does not catch is raised when its turn comes.
+#
+# What does change, and why reading ahead is not chosen for an object store:
+# a write asks the store for several files at once, and for as many more in
+# the same time.  The caller's deciding read is alone among the reads of its
+# own write, not among those of other writers, and it comes right after the
+# write's own burst.  A store that limits requests by rate or by total has
+# that much less room before it refuses one, and a refused request, believed,
+# is a row the write did not match.  One file after another has the same
+# weakness, further from the limit.  On a local disk nothing refuses a second
+# reader.
+#   * The counters of a read are added when its file is used, so a write that
+#     stops at a file has counted the files up to it and no others.  The span
+#     timings (``io.exists``, ``io.read_parquet``, ``io.arrow_to_polars``) add
+#     up the time the reads took where they ran, which is more than the time
+#     the caller waited for them.
+#
+# What bounds it: ``_candidate_read_threads()`` files at a time for one
+# write, ``_READ_AHEAD_MAX_THREADS`` reading threads in the process, and
+# ``_READ_AHEAD_BYTES`` of files read ahead of the one in use (their size as
+# stored; a file larger than that, or whose size is not stored, is read on
+# its own).  A thread that has not started on a file when its turn comes
+# loses it to the caller, who reads it as before, so a busy pool never makes
+# a write wait for a read it could do itself.
+#
+# One write at a time: a write reads ahead only when no other write of the
+# process is reading its candidate files, and reads one file after another
+# otherwise.  Writers that run at once already compete for the interpreter;
+# reading threads on top made each of four such writes 15% slower (measured),
+# where a writer on its own gains.  It also means a process never asks the
+# store for more than its writers and one write's files at once.
+#
+# What ends it: when the caller is done, a read no thread has started on is
+# taken back and one that is running is waited for, so nothing of a write is
+# being read once it has returned or raised.  A caller that is being stopped
+# (KeyboardInterrupt, SystemExit) does not wait; the reads that are running
+# end on their own, and the process waits for them when it exits, as it does
+# for any thread of a pool.
+
+_READ_AHEAD_MAX_THREADS = 8
+_READ_AHEAD_BYTES = 8 * 1024 * 1024
+
+# Files read at a time when the setting says "choose".  On a local disk a
+# read is the reader's own work: a second thread is the most that helps, and
+# small files gain nothing from more (measured).  On an object store a read is
+# two round trips of waiting and several at a time is where the time is, but
+# it is not chosen there (see the note above): it is for the operator who
+# knows the store's limits to set.
+_READ_AHEAD_THREADS_LOCAL = 2
+_READ_AHEAD_THREADS_REMOTE = 1
+
+# The caller looks up from waiting for a read this often.  A wait on a thread
+# is not interrupted by a signal once polars has installed its handler, so a
+# Ctrl-C would otherwise wait for the read.
+_READ_AHEAD_WAIT_SECONDS = 0.1
+
+# After the threads could not be started, the pool is not asked for again for
+# this long: the files are read one after another meanwhile.
+_READ_AHEAD_NO_POOL_SECONDS = 30.0
+
+_read_ahead_pool: Optional[ThreadPoolExecutor] = None
+_read_ahead_pool_lock = threading.Lock()
+_read_ahead_no_pool_until = 0.0
+
+# Writes of this process that are reading more than one candidate file now.
+_candidate_passes = 0
+_candidate_passes_lock = threading.Lock()
+
+
+def _forget_read_ahead_pool() -> None:
+    """A forked child has the pool object and none of its threads, and no write under way."""
+    global _read_ahead_pool, _read_ahead_pool_lock, _read_ahead_no_pool_until
+    global _candidate_passes, _candidate_passes_lock
+    _read_ahead_pool = None
+    _read_ahead_pool_lock = threading.Lock()
+    _read_ahead_no_pool_until = 0.0
+    _candidate_passes = 0
+    _candidate_passes_lock = threading.Lock()
+
+
+def _candidate_pass_begins() -> bool:
+    """A write starts on its candidate files; True when no other write of the process is on its own."""
+    global _candidate_passes
+    with _candidate_passes_lock:
+        alone = _candidate_passes == 0
+        _candidate_passes += 1
+    return alone
+
+
+def _candidate_pass_ends() -> None:
+    global _candidate_passes
+    with _candidate_passes_lock:
+        _candidate_passes = max(0, _candidate_passes - 1)
+
+
+if hasattr(os, "register_at_fork"):  # pragma: no branch - always true on POSIX
+    os.register_at_fork(after_in_child=_forget_read_ahead_pool)
+
+
+def _start_every_thread(pool: ThreadPoolExecutor) -> None:
+    """Make *pool* start all of its threads now.
+
+    A pool starts a thread when work is handed to it and none is idle, after
+    it has queued the work: a thread that cannot be started then leaves the
+    work queued with nobody waiting for it.  Started here, on work that waits,
+    the threads all exist before a file is handed over, and handing a file
+    over never starts one.
+    """
+    go = threading.Event()
+    try:
+        for _ in range(_READ_AHEAD_MAX_THREADS):
+            pool.submit(go.wait)
+    finally:
+        go.set()
+
+
+def _read_ahead_executor() -> ThreadPoolExecutor:
+    """The threads that read candidate files ahead, made on first use and kept.
+
+    Raises ``RuntimeError`` when they cannot be started; the caller then reads
+    one file after another.
+    """
+    global _read_ahead_pool, _read_ahead_no_pool_until
+    pool = _read_ahead_pool
+    if pool is None:
+        with _read_ahead_pool_lock:
+            pool = _read_ahead_pool
+            if pool is None:
+                if time.monotonic() < _read_ahead_no_pool_until:
+                    raise RuntimeError("the threads that read ahead could not be started")
+                pool = ThreadPoolExecutor(
+                    max_workers=_READ_AHEAD_MAX_THREADS,
+                    thread_name_prefix="supertable-read",
+                )
+                try:
+                    _start_every_thread(pool)
+                except BaseException:
+                    _read_ahead_no_pool_until = time.monotonic() + _READ_AHEAD_NO_POOL_SECONDS
+                    pool.shutdown(wait=False)
+                    raise
+                _read_ahead_pool = pool
+    return pool
+
+
+def _candidate_read_threads() -> int:
+    """How many candidate files one write reads at a time; 1 is one after another.
+
+    ``SUPERTABLE_WRITE_READ_AHEAD_THREADS``: ``0`` chooses by the storage
+    (``_READ_AHEAD_THREADS_LOCAL`` on LOCAL, ``_READ_AHEAD_THREADS_REMOTE``
+    elsewhere), ``1`` reads one file after another as before, a larger number
+    is taken up to ``_READ_AHEAD_MAX_THREADS``.  A negative number, and
+    anything that is not an integer, reads one after another.
+    """
+    try:
+        threads = settings.SUPERTABLE_WRITE_READ_AHEAD_THREADS
+        if type(threads) is not int:
+            return 1
+        if threads == 0:
+            local = str(settings.STORAGE_TYPE or "").strip().upper() == "LOCAL"
+            threads = _READ_AHEAD_THREADS_LOCAL if local else _READ_AHEAD_THREADS_REMOTE
+    except Exception:
+        return 1
+    return max(1, min(threads, _READ_AHEAD_MAX_THREADS))
+
+
+def _read_candidate(path: str, file_size: int, columns: Optional[List[str]]):
+    """One candidate file, read while others are being read: ``(frame, counted, error)``.
+
+    Run on a thread of the pool, and by the caller when it reads beside them.
+    The read is the one it always was, asked not to take a failure for an
+    absent file (``required=True``).  A file that was read is
+    ``(frame, counted, None)``.  One that was not is ``(None, counted, error)``:
+    found absent (no error) or failed.  Nothing is raised here; what becomes of
+    it is the caller's to say, in the file's turn (``_CandidateReads._taken``).
+    """
+    counted = Profiler()
+    try:
+        frame = _read_parquet_safe(
+            path, profiler=counted, file_size=file_size, columns=columns, required=True)
+    except BaseException as e:  # noqa: BLE001 - handed to the caller with what the read counted
+        return None, counted, e
+    return frame, counted, None
+
+
+def _stored_bytes(file_size) -> int:
+    """A file's size as the catalog has it, or more than may be read ahead when it has none."""
+    try:
+        size = int(file_size)
+    except (TypeError, ValueError, OverflowError):
+        return _READ_AHEAD_BYTES + 1
+    return size if size > 0 else _READ_AHEAD_BYTES + 1
+
+
+class _CandidateReads:
+    """The candidate files of one write, each read once and used in its turn.
+
+    *files* are ``(path, file_size)`` in the order they will be asked for.
+    ``read(path, file_size)`` returns what ``_read_parquet_safe`` returns for
+    that file.  Used in a ``with``: leaving it gives up the files that were
+    read ahead and not asked for (``close``).  One write has one of these; it
+    is not shared between threads.
+    """
+
+    __slots__ = ("_files", "_columns", "_profiler", "_threads", "_turn", "_handed", "_ahead", "_ahead_bytes",
+                 "_in_a_pass")
+
+    def __init__(
+            self,
+            files: List[Tuple[str, int]],
+            read_columns: Optional[List[str]],
+            profiler,
+    ) -> None:
+        self._files = files
+        self._columns = read_columns
+        self._profiler = profiler
+        # One file needs nobody ahead of it.  More than one are read ahead
+        # only when no other write of the process is reading its own.
+        self._in_a_pass = len(files) > 1
+        alone = _candidate_pass_begins() if self._in_a_pass else True
+        self._threads = _candidate_read_threads() if (self._in_a_pass and alone) else 1
+        self._turn = 0        # the file whose turn it is
+        self._handed = 0      # files[:_handed] were handed to a thread or read here
+        self._ahead: deque = deque()   # the reads of files[_turn:_handed], in order, with their bytes
+        self._ahead_bytes = 0
+
+    def __enter__(self) -> "_CandidateReads":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        # A caller that is being stopped does not wait for reads.
+        stopped = exc_type is not None and issubclass(exc_type, (KeyboardInterrupt, SystemExit))
+        self.close(wait=not stopped)
+
+    def _read_here(self, path: str, file_size: int) -> Optional[polars.DataFrame]:
+        return _read_parquet_safe(
+            path, profiler=self._profiler, file_size=file_size, columns=self._columns)
+
+    def _hand_over(self) -> None:
+        """Hand the next files to the pool, within the threads and the bytes allowed.
+
+        Called when a file's turn has come: the first of ``_ahead``, if any,
+        is that file, and its bytes are not bytes read ahead.
+        """
+        files = self._files
+        while (
+                self._threads > 1
+                and self._handed < len(files)
+                and len(self._ahead) < self._threads
+        ):
+            path, file_size = files[self._handed]
+            size = _stored_bytes(file_size)
+            if self._ahead and self._ahead_bytes - self._ahead[0][1] + size > _READ_AHEAD_BYTES:
+                break
+            try:
+                future = _read_ahead_executor().submit(
+                    _read_candidate, path, file_size, self._columns)
+            except RuntimeError:
+                # The pool takes no work (its threads could not be started, or
+                # the interpreter is going down): the files left are read one
+                # after another.
+                self._threads = 1
+                break
+            self._ahead.append((future, size))
+            self._ahead_bytes += size
+            self._handed += 1
+
+    @staticmethod
+    def _wait_for(future):
+        """What a read on a thread returned, waited for in short waits (see the constant)."""
+        while True:
+            try:
+                return future.result(timeout=_READ_AHEAD_WAIT_SECONDS)
+            except _FutureTimeout:
+                continue
+
+    def read(self, path: str, file_size: int) -> Optional[polars.DataFrame]:
+        turn = self._turn
+        if turn >= len(self._files) or self._files[turn] != (path, file_size):
+            # Not the file whose turn it is: read by the caller, as it always
+            # was.  The files read ahead keep their turn.
+            return self._read_by_the_caller(path, file_size)
+        self._hand_over()
+        if not self._ahead:
+            # One file after another: nothing was handed over.
+            return self._read_here(path, file_size)
+
+        # The read stays the first of _ahead until it has ended, so that a
+        # caller stopped while it waits leaves nothing behind that close()
+        # does not know of.
+        future, size = self._ahead[0]
+        outcome = None if future.cancel() else self._wait_for(future)
+        self._ahead.popleft()
+        self._ahead_bytes -= size
+        self._turn = turn + 1
+        if outcome is None:
+            # No thread had started on it: it is read here, now.
+            return self._read_by_the_caller(path, file_size)
+        return self._taken(path, file_size, *outcome)
+
+    def _read_by_the_caller(self, path: str, file_size: int) -> Optional[polars.DataFrame]:
+        """The caller's own read of a file.
+
+        With nothing handed over it is the read it always was, and what it
+        finds is final.  Beside reads that were handed over it is one of
+        several at once, like theirs, and is no more believed than theirs
+        when it fails.
+        """
+        if not self._ahead:
+            return self._read_here(path, file_size)
+        return self._taken(path, file_size, *_read_candidate(path, file_size, self._columns))
+
+    def _taken(self, path: str, file_size: int, frame, counted, error) -> Optional[polars.DataFrame]:
+        """What a read made beside others comes to (see ``_read_candidate``)."""
+        if frame is not None:
+            self._profiler.merge(counted)
+            return frame
+        if error is not None and not isinstance(error, Exception):
+            # What _read_parquet_safe does not catch: raised here as the
+            # caller's own read would have raised it, with what it counted.
+            self._profiler.merge(counted)
+            raise error
+        # The read did not return the file: it failed, or found no file.
+        # Nothing it counted is kept; the read below counts.
+        # Whether the file is there and can be read is decided as it always
+        # was: by one read of the caller's, with no other read of this write
+        # beside it.  The files after it are read one after another: a store
+        # that refused a file is not asked for several at once again in this
+        # pass over the files.
+        self._one_after_another_from_here()
+        return self._read_here(path, file_size)
+
+    def _one_after_another_from_here(self) -> None:
+        """Hand nothing more over, and let the reads that were handed over end.
+
+        A read no thread has started on is taken back; its file is read here
+        when its turn comes.  One that is running is waited for; what it
+        returned is taken in its turn.
+        """
+        self._threads = 1
+        for future, _ in self._ahead:
+            if not future.cancel():
+                self._until_done(future)
+
+    @staticmethod
+    def _until_done(future) -> None:
+        """Wait, in short waits, until a read on a thread has ended; raises nothing of the read."""
+        while True:
+            try:
+                future.exception(timeout=_READ_AHEAD_WAIT_SECONDS)
+                return
+            except _FutureTimeout:
+                continue
+
+    def close(self, wait: bool = True) -> None:
+        """Give up what was read ahead and not asked for.
+
+        A read no thread has started on is taken back.  One that is running
+        is waited for unless *wait* is false, so that nothing of this write
+        is being read once it has returned or raised.  What such a read
+        returned is dropped.
+        """
+        if self._in_a_pass:
+            self._in_a_pass = False
+            _candidate_pass_ends()
+        self._threads = 1
+        running = []
+        while self._ahead:
+            future, _ = self._ahead.popleft()
+            if not future.cancel():
+                running.append(future)
+        self._ahead_bytes = 0
+        if wait:
+            for future in running:
+                self._until_done(future)
 
 
 # =========================
@@ -1390,36 +1793,39 @@ def filter_stale_incoming_rows(
 
     # Read and collect relevant rows from overlapping files
     existing_parts: List[polars.DataFrame] = []
-    for file_path, file_size in overlap_true_files:
-        part = _read_parquet_safe(file_path, profiler=p, file_size=file_size, columns=read_columns)
-        if part is None:
-            continue
-        # A small file that had to be read is known from here on (see "the key
-        # values of small files"): the matching that follows finds it in
-        # file_cache and reads nothing, so this is where it is met.
-        remember_file_key_values(file_path, file_size, part, overwrite_columns)
-        # Cache the full DataFrame for downstream reuse (avoids double-read)
-        if file_cache is not None:
-            file_cache[file_path] = part
-        # If the file doesn't have the newer_than column, skip it (legacy data → allow overwrite)
-        if newer_than_col not in part.columns:
-            continue
-        # Drop rows the deletion vector has removed BEFORE their watermark is
-        # taken, or a deleted row blocks its own replacement (AUDIT_BUGS M1).
-        # Done here, per file, rather than after the concat: __rowid__ is
-        # already in *part* (read_columns includes it) but the projection below
-        # drops it, and a legacy file without one is simply left unfiltered
-        # instead of forcing a schema union across parts.
-        with p.span("newer_than.drop_tombstoned"):
-            part = _drop_tombstoned(part, dead_rowids)
-        if part.height == 0:
-            continue
+    # Every one of these files is read: the ones after the file in use are
+    # read ahead of their turn (see "Candidate files, read ahead of their turn").
+    with _CandidateReads(overlap_true_files, read_columns, p) as reads:
+        for file_path, file_size in overlap_true_files:
+            part = reads.read(file_path, file_size)
+            if part is None:
+                continue
+            # A small file that had to be read is known from here on (see "the key
+            # values of small files"): the matching that follows finds it in
+            # file_cache and reads nothing, so this is where it is met.
+            remember_file_key_values(file_path, file_size, part, overwrite_columns)
+            # Cache the full DataFrame for downstream reuse (avoids double-read)
+            if file_cache is not None:
+                file_cache[file_path] = part
+            # If the file doesn't have the newer_than column, skip it (legacy data → allow overwrite)
+            if newer_than_col not in part.columns:
+                continue
+            # Drop rows the deletion vector has removed BEFORE their watermark is
+            # taken, or a deleted row blocks its own replacement (AUDIT_BUGS M1).
+            # Done here, per file, rather than after the concat: __rowid__ is
+            # already in *part* (read_columns includes it) but the projection below
+            # drops it, and a legacy file without one is simply left unfiltered
+            # instead of forcing a schema union across parts.
+            with p.span("newer_than.drop_tombstoned"):
+                part = _drop_tombstoned(part, dead_rowids)
+            if part.height == 0:
+                continue
 
-        # Select only the columns we need, filtering to matching keys
-        available_cols = [c for c in needed_cols if c in part.columns]
-        if not all(c in available_cols for c in overwrite_columns):
-            continue
-        existing_parts.append(part.select(available_cols))
+            # Select only the columns we need, filtering to matching keys
+            available_cols = [c for c in needed_cols if c in part.columns]
+            if not all(c in available_cols for c in overwrite_columns):
+                continue
+            existing_parts.append(part.select(available_cols))
 
     if not existing_parts:
         # No existing data with the newer_than column → all incoming rows proceed
@@ -1827,59 +2233,68 @@ def identify_deleted_rowids(
             return
         _keep(part)
 
-    for file, has_overlap, file_size in overlapping_files:
-        if not has_overlap:
-            continue
-        p.add("delete_files_seen", 1)
+    # The files that will be read, in the order their turn comes: the ones
+    # after the file in use are read ahead (see "Candidate files, read ahead
+    # of their turn").  A file found in file_cache is not read.
+    candidates = list(overlapping_files)
+    to_read = [
+        (file, file_size) for file, has_overlap, file_size in candidates
+        if has_overlap and not (file_cache is not None and file in file_cache)
+    ]
+    with _CandidateReads(to_read, read_columns, p) as reads:
+        for file, has_overlap, file_size in candidates:
+            if not has_overlap:
+                continue
+            p.add("delete_files_seen", 1)
 
-        if file_cache is not None and file in file_cache:
-            existing_df = file_cache.get(file)
-        else:
-            existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size, columns=read_columns)
-            # A small file that had to be read is known from here on: the next
-            # write of this process whose keys it does not hold will not read
-            # it (see "the key values of small files").  Only a frame read
-            # here is taken for the file: what a caller put in file_cache is
-            # the caller's, and may be less than the file.
-            if existing_df is not None:
-                remember_file_key_values(file, file_size, existing_df, overwrite_columns)
-        if existing_df is None:
-            continue
-        if ROWID_COL not in existing_df.columns:
-            continue
-        if not all(c in existing_df.columns for c in overwrite_columns):
-            continue
+            if file_cache is not None and file in file_cache:
+                existing_df = file_cache.get(file)
+            else:
+                existing_df = reads.read(file, file_size)
+                # A small file that had to be read is known from here on: the next
+                # write of this process whose keys it does not hold will not read
+                # it (see "the key values of small files").  Only a frame read
+                # here is taken for the file: what a caller put in file_cache is
+                # the caller's, and may be less than the file.
+                if existing_df is not None:
+                    remember_file_key_values(file, file_size, existing_df, overwrite_columns)
+            if existing_df is None:
+                continue
+            if ROWID_COL not in existing_df.columns:
+                continue
+            if not all(c in existing_df.columns for c in overwrite_columns):
+                continue
 
-        if type(existing_df) is not polars.DataFrame:
-            # Not a frame this module read: matched on its own, the old way,
-            # after the files before it.
-            _match_waiting()
-            _keep(_delete_pairs_of_one_file(
-                existing_df, file, incoming_keys, overwrite_columns, p))
-            continue
+            if type(existing_df) is not polars.DataFrame:
+                # Not a frame this module read: matched on its own, the old way,
+                # after the files before it.
+                _match_waiting()
+                _keep(_delete_pairs_of_one_file(
+                    existing_df, file, incoming_keys, overwrite_columns, p))
+                continue
 
-        # Only the key and row-id columns are held while a file waits.
-        keyed = (
-            existing_df if existing_df.columns == needed
-            else polars.DataFrame([existing_df.get_column(c) for c in needed])
-        )
-        schema = tuple(keyed.dtypes)
-        size = int(keyed.estimated_size())
+            # Only the key and row-id columns are held while a file waits.
+            keyed = (
+                existing_df if existing_df.columns == needed
+                else polars.DataFrame([existing_df.get_column(c) for c in needed])
+            )
+            schema = tuple(keyed.dtypes)
+            size = int(keyed.estimated_size())
 
-        # Files are put end to end only when their columns have the same
-        # types, so a file whose key has another type meets the join it always
-        # met, and only while they fit the bound, so a large file is joined on
-        # its own.  A file never moves past another: the order is the order
-        # the files were given in.
-        if waiting_frames and (
-                schema != waiting_schema
-                or waiting_bytes + size > _OVERLAP_JOIN_BATCH_BYTES):
-            _match_waiting()
+            # Files are put end to end only when their columns have the same
+            # types, so a file whose key has another type meets the join it always
+            # met, and only while they fit the bound, so a large file is joined on
+            # its own.  A file never moves past another: the order is the order
+            # the files were given in.
+            if waiting_frames and (
+                    schema != waiting_schema
+                    or waiting_bytes + size > _OVERLAP_JOIN_BATCH_BYTES):
+                _match_waiting()
 
-        waiting_frames.append(keyed)
-        waiting_files.append(file)
-        waiting_bytes += size
-        waiting_schema = schema
+            waiting_frames.append(keyed)
+            waiting_files.append(file)
+            waiting_bytes += size
+            waiting_schema = schema
 
     _match_waiting()
 
