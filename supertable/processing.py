@@ -8,6 +8,8 @@ import io
 import time
 import threading
 import uuid
+from array import array
+from bisect import bisect_left
 from collections import OrderedDict
 from datetime import datetime, date, timedelta, timezone
 from functools import lru_cache
@@ -1054,8 +1056,14 @@ def write_parquet_and_collect_resources(
         write_df, overwrite_columns, data_dir, new_resources, compression_level=10,
         profiler: Optional[Profiler] = None,
         footer_md_out: Optional[Dict] = None,
+        key_columns: Optional[List[str]] = None,
 ):
     """Write a DataFrame as a single Parquet file and append a resource dict.
+
+    *key_columns* (optional) names the columns the rows were matched on.  When
+    the file is small their distinct values are remembered by this process, so
+    that a later write whose keys the file does not hold need not read it
+    (``remember_file_key_values``).  It changes nothing about the file.
 
     Sharding strategy:
       - If ``__timestamp__`` is present, the file is written into a Hive-style
@@ -1106,11 +1114,11 @@ def write_parquet_and_collect_resources(
         )
         _write_single_parquet_file(
             write_df, overwrite_columns, partition_dir, new_resources, compression_level,
-            profiler=profiler, footer_md_out=footer_md_out,
+            profiler=profiler, footer_md_out=footer_md_out, key_columns=key_columns,
         )
     else:
         # --- Flat write path (no __timestamp__) — backward compatible ---
-        _write_single_parquet_file(write_df, overwrite_columns, data_dir, new_resources, compression_level, profiler=profiler, footer_md_out=footer_md_out)
+        _write_single_parquet_file(write_df, overwrite_columns, data_dir, new_resources, compression_level, profiler=profiler, footer_md_out=footer_md_out, key_columns=key_columns)
 
 
 def _rows_already_in_order(write_df: polars.DataFrame, sort_cols: List[str]) -> bool:
@@ -1140,6 +1148,7 @@ def _write_single_parquet_file(
         write_df, overwrite_columns, target_dir, new_resources, compression_level=10,
         profiler: Optional[Profiler] = None,
         footer_md_out: Optional[Dict] = None,
+        key_columns: Optional[List[str]] = None,
 ):
     """Write a single Parquet file into *target_dir* and append a resource entry.
 
@@ -1287,6 +1296,11 @@ def _write_single_parquet_file(
         }
     )
 
+    # The file is written and holds exactly the rows of write_df (sorting
+    # moved rows, not values), under the size the snapshot will list it with.
+    if key_columns:
+        remember_file_key_values(new_parquet_path, int(file_size), write_df, key_columns)
+
 
 # =========================
 # Newer-than filtering (idempotency / conflict resolution)
@@ -1380,6 +1394,10 @@ def filter_stale_incoming_rows(
         part = _read_parquet_safe(file_path, profiler=p, file_size=file_size, columns=read_columns)
         if part is None:
             continue
+        # A small file that had to be read is known from here on (see "the key
+        # values of small files"): the matching that follows finds it in
+        # file_cache and reads nothing, so this is where it is met.
+        remember_file_key_values(file_path, file_size, part, overwrite_columns)
         # Cache the full DataFrame for downstream reuse (avoids double-read)
         if file_cache is not None:
             file_cache[file_path] = part
@@ -1818,6 +1836,13 @@ def identify_deleted_rowids(
             existing_df = file_cache.get(file)
         else:
             existing_df = _read_parquet_safe(file, profiler=p, file_size=file_size, columns=read_columns)
+            # A small file that had to be read is known from here on: the next
+            # write of this process whose keys it does not hold will not read
+            # it (see "the key values of small files").  Only a frame read
+            # here is taken for the file: what a caller put in file_cache is
+            # the caller's, and may be less than the file.
+            if existing_df is not None:
+                remember_file_key_values(file, file_size, existing_df, overwrite_columns)
         if existing_df is None:
             continue
         if ROWID_COL not in existing_df.columns:
@@ -2238,6 +2263,25 @@ def resolve_overwrite_writes(
         return incoming_df, empty_delete_pairs()
 
     incoming_keys = incoming_df.select(overwrite_columns).unique()
+
+    # The small files this process knows to hold none of these keys are not
+    # candidates: neither the probe, nor the stale filter, nor the matching
+    # below opens them.  With none left there is nothing to match, which is
+    # what no candidate at all has always meant.
+    every_overlap_true = overlap_true
+    overlapping_files = drop_files_without_incoming_keys(
+        overlapping_files, incoming_keys, overwrite_columns, profiler=p,
+    )
+    overlap_true = [(f, sz) for f, has_overlap, sz in overlapping_files if has_overlap]
+    dropped = len(every_overlap_true) - len(overlap_true)
+    if dropped:
+        logging.debug(
+            f"[key-values] {dropped}/{len(every_overlap_true)} overlapping file(s) "
+            f"hold none of the incoming keys on {overwrite_columns} (not opened)"
+        )
+    if not overlap_true:
+        return incoming_df, empty_delete_pairs()
+
     logging.debug(
         f"[write-probe] resolve: {len(overlap_true)} overlapping file(s), "
         f"{incoming_keys.height} unique incoming key(s) on {overwrite_columns}, "
@@ -2252,6 +2296,19 @@ def resolve_overwrite_writes(
         matched = _duckdb_probe_overlap_matches(
             overlap_true, overwrite_columns, newer_than_col, incoming_keys, profiler=p,
         )
+        if matched is None and dropped:
+            # The scan binds its columns by name over the files it is given:
+            # a key column that only dropped files have is read as NULL from
+            # the others when they are scanned together, and is no column at
+            # all when they are scanned alone, so the probe fails where it
+            # found rows.  Before the probe is given up it is given every
+            # candidate, as it always was; what it finds then is what it
+            # found.  The files read below are the ones that are left.
+            p.add("probe_retry_all_files", 1)
+            matched = _duckdb_probe_overlap_matches(
+                every_overlap_true, overwrite_columns, newer_than_col, incoming_keys,
+                profiler=p,
+            )
     if matched is not None:
         try:
             return _derive_stale_and_deletes(
@@ -3013,6 +3070,404 @@ def prune_overlapping_files_by_stats(
             pruned += 1
     p.add("stats_pruned_files", pruned)
     return kept
+
+
+# ===========================================================================
+# Consumer 5a, second test: the key values of small files
+# ---------------------------------------------------------------------------
+# The range test above cannot rule out a file whose few keys are spread over
+# the key range, and that is what every small upsert leaves behind: a file of
+# 100 keys drawn from the whole table has the table's minimum and maximum.
+# Each later upsert then read every such file to find nothing in it, until a
+# merge collected them (measured: 2.7 ms a file, a 100-key upsert rising from
+# 0.12 s to 0.33 s as 99 of them gathered).
+#
+# A small file's key values are few enough to keep, so they are kept: the
+# distinct non-null values of each key column, exactly.  A file none of whose
+# values of some key column is among the incoming ones cannot hold a matching
+# row, and is not read.
+#
+# They are kept by the process, not in the table.  A data file is immutable
+# and its name is never used twice (millisecond stamp plus 64 random bits), so
+# what was true of a file stays true; an entry is also tied to the file's
+# size.  The values come from the frame a file was written from, or from the
+# frame this module read it into the first time it had to be read (never from
+# a frame a caller handed in).  A process that has not met a file reads it
+# once, as before, and then knows it.
+#
+# The contract is the one of the range test: a file is dropped only when it
+# is proven to hold none of the incoming keys.  Everything else keeps it:
+#   - a file not remembered, or remembered for other columns;
+#   - a key column that is not of an integer type or a string (values are
+#     compared as the join compares them only where that is exact: integers
+#     of the widths below as integers, strings byte for byte; never across
+#     the two, never floats, dates, decimals or categoricals);
+#   - an incoming NULL in the column (it matches a NULL in a file, and NULLs
+#     are not among the kept values);
+#   - more incoming values than ``_KEY_VALUES_MAX_INCOMING``.
+# ===========================================================================
+
+# A file of more rows than this is not remembered.
+_KEY_VALUES_MAX_ROWS = 4096
+# A string column whose values take more bytes than this is not remembered
+# (the integers of a file never take more than 32 KiB).
+_KEY_VALUES_MAX_STRING_BYTES = 256 * 1024
+# With more distinct incoming values of a column than this, the column is not
+# used: turning them into Python values would cost a large write more than a
+# few skipped small files give back.
+_KEY_VALUES_MAX_INCOMING = 16384
+
+_KEY_VALUES_INT = "int"
+_KEY_VALUES_STR = "str"
+
+# What an entry is counted as against the bound, measured on CPython 3.10: the
+# key, its place in the table and the dict of columns (plus the length of the
+# path), a column that is known and cannot be kept, a column of values (plus 8
+# bytes an integer, or 88 bytes and its own bytes a string: the object and
+# its place in the set).
+_KEY_VALUES_ENTRY_BYTES = 544
+_KEY_VALUES_NO_COLUMN_BYTES = 16
+_KEY_VALUES_COLUMN_BYTES = 136
+_KEY_VALUES_STRING_BYTES = 88
+
+# polars reports a failure inside its native code (a string that is not valid
+# UTF-8 turned into a Python value, say) with an exception that is not an
+# ``Exception``.  Nothing here may end a write, so it is caught by name.
+_KEY_VALUES_FAILURES: tuple = (Exception,) + tuple(
+    e for e in (getattr(polars.exceptions, "PanicException", None),) if e is not None
+)
+
+
+def _key_values_family(dtype) -> Optional[str]:
+    """``int`` / ``str`` for a column whose values can be kept, else ``None``.
+
+    The integer widths are the ones the range test compares as integers
+    (UInt64 can exceed Int64 and is left out, Boolean is not an integer here).
+    Two integer columns of different widths are joined on their common wider
+    type, so their values are equal exactly when the integers are.
+    """
+    if dtype in _PROBE_BIGINT_DTYPES:
+        return _KEY_VALUES_INT
+    if dtype == polars.Utf8:
+        return _KEY_VALUES_STR
+    return None
+
+
+def _key_values_as_python(values: polars.Series, family: str) -> list:
+    """The values of a column as the Python values they are compared as.
+
+    Integers as integers.  Strings as their bytes: the join compares strings
+    byte for byte, and a string read from a file need not be valid UTF-8, in
+    which case it has bytes and no Python string.
+    """
+    if family == _KEY_VALUES_STR:
+        values = values.cast(polars.Binary)
+    return values.to_list()
+
+
+def _distinct_key_values(column: polars.Series):
+    """``(family, values, bytes)`` of a column, or ``None`` when not kept.
+
+    The values are the distinct non-null ones: integers in a sorted ``array``
+    of 64-bit integers (8 bytes each, searched by bisection), strings as
+    ``bytes`` in a ``frozenset``.
+
+    polars is asked for the column and nothing else.  Its ``unique`` goes
+    through the thread pool and costs half a millisecond for a hundred values
+    on sixteen threads, on every file written or first read; numpy sorts and
+    de-duplicates the same integers in twenty microseconds, and a set of the
+    strings needs no order.
+    """
+    family = _key_values_family(column.dtype)
+    if family is None:
+        return None
+    values = column.drop_nulls() if column.null_count() else column
+    if family == _KEY_VALUES_INT:
+        import numpy  # the package's own requirement; imported by polars for to_numpy anyway
+
+        kept = array("q")
+        kept.frombytes(
+            numpy.unique(values.to_numpy()).astype(numpy.int64, copy=False).tobytes())
+        return family, kept, _KEY_VALUES_COLUMN_BYTES + 8 * len(kept)
+    # Every value's bytes, before any of them is turned into a Python object.
+    if int(values.str.len_bytes().sum() or 0) > _KEY_VALUES_MAX_STRING_BYTES:
+        return None
+    kept = frozenset(_key_values_as_python(values, family))
+    return (family, kept,
+            _KEY_VALUES_COLUMN_BYTES + _KEY_VALUES_STRING_BYTES * len(kept) + sum(map(len, kept)))
+
+
+class _FileKeyValues:
+    """What this process knows of the key values of small data files.
+
+    ``(file path, file size) -> {column: (family, values) | None}``; ``None``
+    says the column was looked at and cannot be kept, so it is not looked at
+    again.  Least recently used entries go first once what is kept exceeds
+    the bound, which is in bytes and read at every call
+    (``SUPERTABLE_KEY_VALUES_CACHE_MAX_BYTES``; ``<= 0`` keeps nothing and
+    turns the test off).
+    """
+
+    __slots__ = ("_lock", "_entries", "_bytes", "_cap_getter")
+
+    def __init__(self, cap_getter: Callable[[], int]) -> None:
+        self._lock = threading.Lock()
+        # (path, size) -> [columns, bytes]
+        self._entries: "OrderedDict[Tuple[str, int], list]" = OrderedDict()
+        self._bytes = 0
+        self._cap_getter = cap_getter
+
+    def cap(self) -> int:
+        """The bound in bytes; 0 when it cannot be read or is not an integer."""
+        try:
+            cap = self._cap_getter()
+        except Exception:
+            return 0
+        if type(cap) is not int:
+            return 0
+        return cap
+
+    def get(self, file: str, file_size: int) -> Optional[dict]:
+        """The columns known of a file (not a copy: read only), or ``None``."""
+        key = (file, int(file_size or 0))
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            self._entries.move_to_end(key)
+            return entry[0]
+
+    def unknown(self, file: str, file_size: int, columns) -> List[str]:
+        """The columns of *columns* nothing is known about for this file."""
+        with self._lock:
+            entry = self._entries.get((file, int(file_size or 0)))
+            if entry is None:
+                return list(columns)
+            return [c for c in columns if c not in entry[0]]
+
+    def add(self, file: str, file_size: int, found: dict) -> None:
+        """Add ``{column: (answer, bytes)}`` to what is known of a file.
+
+        What is known of a column already is not replaced, and is not counted
+        a second time.
+        """
+        cap = self.cap()
+        if cap <= 0 or not found:
+            return
+        key = (file, int(file_size or 0))
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                nbytes = (_KEY_VALUES_ENTRY_BYTES + len(file)
+                          + sum(int(b) for _, b in found.values()))
+                if nbytes > cap:
+                    return  # larger than the bound on its own: nothing makes room for it
+                # A new dict per change: a reader holding the old one is not
+                # shown a dict that changes under it.
+                self._entries[key] = [{c: v for c, (v, _) in found.items()}, nbytes]
+                self._bytes += nbytes
+            else:
+                fresh = {c: vb for c, vb in found.items() if c not in entry[0]}
+                if not fresh:
+                    return
+                nbytes = sum(int(b) for _, b in fresh.values())
+                entry[0] = {**entry[0], **{c: v for c, (v, _) in fresh.items()}}
+                entry[1] += nbytes
+                self._bytes += nbytes
+            self._entries.move_to_end(key)
+            while self._entries and self._bytes > cap:
+                _, gone = self._entries.popitem(last=False)
+                self._bytes -= gone[1]
+
+    def stats(self) -> Tuple[int, int]:
+        """``(files, bytes)`` held now."""
+        with self._lock:
+            return len(self._entries), self._bytes
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+            self._bytes = 0
+
+
+def _key_values_cache_cap() -> int:
+    return settings.SUPERTABLE_KEY_VALUES_CACHE_MAX_BYTES
+
+
+_FILE_KEY_VALUES = _FileKeyValues(_key_values_cache_cap)
+
+
+def remember_file_key_values(
+        file: str,
+        file_size: int,
+        frame: polars.DataFrame,
+        columns: List[str],
+) -> None:
+    """Keep the distinct values *frame* has in *columns*, as those of *file*.
+
+    *frame* must hold every row of the file: the frame it was written from, or
+    the one it was read into.  Nothing is kept for a file of more than
+    ``_KEY_VALUES_MAX_ROWS`` rows, for a column the frame lacks, or when the
+    file's columns are known already.  Keeping is never a reason for a write
+    to fail: whatever goes wrong here leaves the file unknown, which only
+    means it is read.
+    """
+    try:
+        if not file or not columns or _FILE_KEY_VALUES.cap() <= 0:
+            return
+        if type(frame) is not polars.DataFrame or frame.height > _KEY_VALUES_MAX_ROWS:
+            return
+        unknown = _FILE_KEY_VALUES.unknown(file, file_size, columns)
+        if not unknown:
+            return
+        found: dict = {}
+        for column in unknown:
+            if column not in frame.columns:
+                continue
+            got = _distinct_key_values(frame.get_column(column))
+            if got is None:
+                found[column] = (None, _KEY_VALUES_NO_COLUMN_BYTES)
+            else:
+                found[column] = ((got[0], got[1]), got[2])
+        _FILE_KEY_VALUES.add(file, file_size, found)
+    except _KEY_VALUES_FAILURES as e:
+        logging.debug(f"[key-values] not kept for {file}: {e}")
+
+
+class _IncomingKeyValues:
+    """The distinct values of one key column of the incoming rows."""
+
+    __slots__ = ("family", "as_set", "_sorted")
+
+    def __init__(self, family: str, values: list) -> None:
+        self.family = family
+        self.as_set = set(values)
+        self._sorted: Optional[list] = None
+
+    def __len__(self) -> int:
+        return len(self.as_set)
+
+    def in_order(self) -> list:
+        if self._sorted is None:
+            self._sorted = sorted(self.as_set)
+        return self._sorted
+
+
+def _incoming_key_values(
+        incoming_keys: polars.DataFrame, column: str,
+) -> Optional[_IncomingKeyValues]:
+    """One key column of the incoming keys, or ``None`` when it rules nothing out."""
+    values = incoming_keys.get_column(column)
+    family = _key_values_family(values.dtype)
+    if family is None or values.null_count() > 0:
+        return None
+    if values.len() > _KEY_VALUES_MAX_INCOMING:
+        if incoming_keys.width == 1:
+            # The rows of a single key column are distinct already.
+            return None
+        values = values.unique()
+        if values.len() > _KEY_VALUES_MAX_INCOMING:
+            return None
+    return _IncomingKeyValues(family, _key_values_as_python(values, family))
+
+
+def _no_common_value(file_values, incoming: _IncomingKeyValues) -> bool:
+    """True when none of a file's kept values is an incoming one.
+
+    Whichever side is the smaller is the one walked.  Two sets do that by
+    themselves (strings).  A file's integers are a sorted array: a few
+    incoming values are searched for in it, otherwise its values are looked
+    up among the incoming ones.
+    """
+    n = len(file_values)
+    if n == 0:
+        return True
+    if isinstance(file_values, frozenset):
+        return incoming.as_set.isdisjoint(file_values)
+    if len(incoming) * 8 < n:
+        for value in incoming.in_order():
+            at = bisect_left(file_values, value)
+            if at < n and file_values[at] == value:
+                return False
+        return True
+    return incoming.as_set.isdisjoint(file_values)
+
+
+def drop_files_without_incoming_keys(
+        overlapping_files,
+        incoming_keys: polars.DataFrame,
+        overwrite_columns: List[str],
+        profiler: Optional[Profiler] = None,
+):
+    """Drop the candidates this process knows to hold none of the incoming keys.
+
+    *incoming_keys* holds the key columns of the incoming rows.  A candidate
+    is dropped when, for one of the key columns, the file's kept values and
+    the incoming values have nothing in common: a matching row would need the
+    same value in every key column.  A file that is not known, a column that
+    cannot be compared and ``has_overlap=False`` entries are kept, as in
+    :func:`prune_overlapping_files_by_stats`.
+
+    The collection that was given is returned itself when nothing is dropped;
+    otherwise a set for a set and a list for anything else, the kept entries
+    in the order they were met.  Dropping is never a reason for a write to
+    fail: whatever goes wrong here returns the candidates as they were given.
+    """
+    p = profiler or get_null_profiler()
+    if not overwrite_columns or _FILE_KEY_VALUES.cap() <= 0:
+        return overlapping_files
+
+    try:
+        incoming: Dict[str, Optional[_IncomingKeyValues]] = {}
+        kept = []
+        dropped = 0
+        for entry in overlapping_files:
+            file, has_overlap, file_size = entry
+            if has_overlap:
+                known = _FILE_KEY_VALUES.get(file, file_size)
+                if known and _known_file_cannot_match(
+                        known, incoming_keys, overwrite_columns, incoming):
+                    dropped += 1
+                    continue
+            kept.append(entry)
+    except _KEY_VALUES_FAILURES as e:
+        logging.debug(f"[key-values] no candidate dropped: {e}")
+        return overlapping_files
+    if not dropped:
+        return overlapping_files
+    p.add("key_values_pruned_files", dropped)
+    if isinstance(overlapping_files, (set, frozenset)):
+        return type(overlapping_files)(kept)
+    return kept
+
+
+def _known_file_cannot_match(
+        known: dict,
+        incoming_keys: polars.DataFrame,
+        overwrite_columns: List[str],
+        incoming: Dict[str, Optional[_IncomingKeyValues]],
+) -> bool:
+    """True when a key column of a known file shares no value with the incoming keys.
+
+    *incoming* collects each column of the incoming keys the first time a
+    known file asks for it, so a write whose candidates are all unknown never
+    turns its keys into Python values.
+    """
+    for column in overwrite_columns:
+        of_file = known.get(column)
+        if of_file is None:
+            continue  # not kept for this file, or cannot be kept
+        if column not in incoming:
+            incoming[column] = (
+                _incoming_key_values(incoming_keys, column)
+                if column in incoming_keys.columns else None
+            )
+        of_incoming = incoming[column]
+        if of_incoming is None or of_incoming.family != of_file[0]:
+            continue
+        if _no_common_value(of_file[1], of_incoming):
+            return True
+    return False
 
 
 # ===========================================================================

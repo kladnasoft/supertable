@@ -102,6 +102,21 @@ def hermetic_fakeredis():
 
 
 @pytest.fixture(autouse=True)
+def _no_key_values_from_another_test():
+    """Start every test with a process that knows no data file.
+
+    The write path keeps the key values of small data files for the life of
+    the process (``processing._FILE_KEY_VALUES``), by path and size.  Lakes
+    here are made anew for every test; what a test taught the process is of
+    no use to the next and is not left for it.
+    """
+    from supertable import processing
+    processing._FILE_KEY_VALUES.clear()
+    yield
+    processing._FILE_KEY_VALUES.clear()
+
+
+@pytest.fixture(autouse=True)
 def _reset_probe_pool():
     """Keep the thread-local write-probe connection pool from leaking across tests.
 

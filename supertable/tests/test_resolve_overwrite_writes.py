@@ -45,10 +45,21 @@ def _enable_write_probe(monkeypatch):
     (``SUPERTABLE_DUCKDB_WRITE_PROBE``, default off).  Force it on so the probe
     is actually exercised; without this the gate in ``resolve_overwrite_writes``
     would route every call to the polars fallback and the probe assertions
-    (``probe_files`` present, no ``overwrite_resolve_fallback``) would be vacuous."""
+    (``probe_files`` present, no ``overwrite_resolve_fallback``) would be vacuous.
+
+    The key values of small files are not kept here
+    (``SUPERTABLE_KEY_VALUES_CACHE_MAX_BYTES=0``).  Each test runs the polars
+    oracle first, and the oracle's own reads would teach the process what the
+    files hold: a file without any of the incoming keys would then be dropped
+    before the probe, and a test of the probe would not run it.  That drop has
+    its own tests (``test_small_files_are_ruled_out_by_their_key_values.py``)."""
     monkeypatch.setattr(
         st_processing, "settings",
-        dataclasses.replace(settings, SUPERTABLE_DUCKDB_WRITE_PROBE=True),
+        dataclasses.replace(
+            settings,
+            SUPERTABLE_DUCKDB_WRITE_PROBE=True,
+            SUPERTABLE_KEY_VALUES_CACHE_MAX_BYTES=0,
+        ),
     )
 
 

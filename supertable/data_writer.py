@@ -700,8 +700,15 @@ class DataWriter:
                 mark("resolve_overwrite")
                 _counts = profiler.counts
                 _fallback = bool(_counts.get("overwrite_resolve_fallback"))
+                # Neither ran when no candidate was left to look at: none at
+                # all, or every one ruled out by its key values.
+                _via = (
+                    "polars-fallback" if _fallback
+                    else "duckdb-pushdown" if _counts.get("probe_files")
+                    else "nothing (no candidate file left)"
+                )
                 logger.debug(lp(
-                    f"step[probe-resolve] via {'polars-fallback' if _fallback else 'duckdb-pushdown'}: "
+                    f"step[probe-resolve] via {_via}: "
                     f"matched {_counts.get('probe_rows_matched', _counts.get('delete_rows_matched', 0))} "
                     f"existing row(s) on {overwrite_columns} → "
                     f"{resolved_delete_pairs.height} (file,__rowid__) delete pair(s); "
@@ -855,6 +862,9 @@ class DataWriter:
                         compression_level=compression_level,
                         profiler=sub,
                         footer_md_out=footer_md_cache,
+                        # A small upsert file is known to this process by the
+                        # keys it holds, so its later upserts need not read it.
+                        key_columns=overwrite_columns,
                     )
                     return sub, time.perf_counter() - t
 

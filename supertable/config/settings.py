@@ -338,6 +338,13 @@ class Settings:
     # always read fresh and never cached).  0 disables caching.
     SUPERTABLE_STATS_CACHE_MAX_TABLES: int = 64   # SUPERTABLE_STATS_CACHE_MAX_TABLES
 
+    # Bytes of key values the write path keeps in the process for small data
+    # files (their distinct values in the columns they were matched on), so
+    # that an upsert or delete need not read a small file that holds none of
+    # its keys.  Least recently used files go first.  0 keeps nothing and
+    # turns the test off: every file the key range cannot rule out is read.
+    SUPERTABLE_KEY_VALUES_CACHE_MAX_BYTES: int = 32 * 1024 * 1024   # SUPERTABLE_KEY_VALUES_CACHE_MAX_BYTES
+
     # Max number of tables whose *latest* tombstone (deletion-vector) artifact is
     # held in the in-process tombstone cache (one DataFrame per table; older
     # versions are always read fresh and never cached).  Mirrors the stats cache
@@ -656,6 +663,7 @@ def _build_settings() -> Settings:
         # ── Meta Reader / Caching ────────────────────────────────────
         SUPERTABLE_SUPER_META_CACHE_TTL_S=meta_ttl,
         SUPERTABLE_STATS_CACHE_MAX_TABLES=_env_int("SUPERTABLE_STATS_CACHE_MAX_TABLES", 64),
+        SUPERTABLE_KEY_VALUES_CACHE_MAX_BYTES=_env_int("SUPERTABLE_KEY_VALUES_CACHE_MAX_BYTES", 32 * 1024 * 1024),
         SUPERTABLE_TOMBSTONE_MAX_PARTS=_env_int("SUPERTABLE_TOMBSTONE_MAX_PARTS", 100),
         SUPERTABLE_STREAM_BATCH_ROWS=_env_int("SUPERTABLE_STREAM_BATCH_ROWS", 65_536),
         SUPERTABLE_STREAM_CHUNK_BYTES=_env_int("SUPERTABLE_STREAM_CHUNK_BYTES", 32 * 1024 * 1024),
