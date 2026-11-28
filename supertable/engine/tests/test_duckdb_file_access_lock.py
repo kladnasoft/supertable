@@ -564,11 +564,13 @@ def test_a_connection_locked_for_local_files_is_replaced_when_a_url_comes(
     assert engine_duckdb._shared_state()["file_access"] == ec.FILE_ACCESS_LOCAL
 
     # the URL read itself is a one-row local relation: no store is reached
-    monkeypatch.setattr(
-        ec, "create_reflection_view",
-        lambda con, name, files, columns=None, column_types=None: con.execute(
-            f"CREATE OR REPLACE VIEW {name} AS SELECT 2 AS id, 'us' AS region, "
-            f"2 AS __rowid__, 0 AS __timestamp__"))
+    def one_row(con, name, files, columns=None, column_types=None, over=None):
+        select = "SELECT 2 AS id, 'us' AS region, 2 AS __rowid__, 0 AS __timestamp__"
+        # what the engine folds into the reflection's view (over) stays its own
+        con.execute(f"CREATE OR REPLACE VIEW {name} AS "
+                    f"{select if over is None else over(select)}")
+
+    monkeypatch.setattr(ec, "create_reflection_view", one_row)
     _settings(monkeypatch, STORAGE_ENDPOINT_URL="http://127.0.0.1:1",
               STORAGE_ACCESS_KEY="test-key", STORAGE_SECRET_KEY="test-secret")
     assert _rows(_stream(engine, lake, "SELECT id FROM emp",

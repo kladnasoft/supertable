@@ -88,7 +88,7 @@ The view chain is:
 
 ```mermaid
 flowchart LR
-    P[Selected Parquet resources] --> V[Reflection view]
+    P[Selected Parquet resources] --> V[Reflection]
     V --> D[Deletion-vector anti join]
     D --> R[Allowed columns and row predicate]
     R --> Q[Rewritten user query]
@@ -97,7 +97,9 @@ flowchart LR
 
 The reflection projection includes `__rowid__` and `__timestamp__` when needed for internal processing. A deletion vector removes row IDs through an anti join, and the public view normally hides both system columns. RBAC views then restrict rows and columns. Columns needed only to evaluate a row filter are available inside the filter and hidden from the resulting projection.
 
-View names are derived from the table, snapshot version, and projection; query-specific suffixes distinguish control views. On handle closure the engine closes the Arrow reader and cursor, drops query views, and releases deletion-vector cache references. The shared connection remains available for later queries.
+The reflection and the deletion-vector layer are one view per table of the query: the reflection is a subquery of the view that strips the system columns and anti-joins the vector. DuckDB resolves a view's files when the view is created and again whenever something is bound over it, opening every file each time, so a reflection that was a view of its own cost every read one more pass over all its files; the files as they are, system columns and deleted rows included, also no longer have a name in the connection's catalog. A table named twice in a query with the same columns has one view. The RBAC view is a view of its own on top. A view per layer, the reflection first, is kept in two cases: with `SUPERTABLE_DUCKDB_MATERIALIZE=table`, and for a read that has to fetch a deletion vector's parts from an object store itself (the vector is not yet cached on the connection, or the cache is off), because whether the data files had to be read through presigned URLs decides how the vector's parts are asked for.
+
+View names are derived from the table, snapshot version, and projection, with a query-specific suffix. On handle closure the engine closes the Arrow reader and cursor, drops query views, and releases deletion-vector cache references. The shared connection remains available for later queries.
 
 With `SUPERTABLE_DUCKDB_MATERIALIZE=table` the reflection is a table instead of a view: the rows are read into the connection when the query starts. That table is the query's own. Its name carries the query's suffix, two aliases of one table with the same columns share it, and handle closure drops it after the views that stand on it, so repeated and concurrent reads of a table neither meet an existing table nor lose one to another query's teardown.
 

@@ -759,12 +759,41 @@ def _empty_relation_select(
     return ", ".join(parts) if parts else None
 
 
+def reflection_view_select(
+        view_name: str,
+        files: List[str],
+        columns: Optional[List[str]] = None,
+        column_types: Optional[Dict[str, str]] = None,
+) -> str:
+    """The SELECT a reflection view stands for: *columns* of *files*.
+
+    With no *files* but a declared *column_types*, a typed zero-row relation
+    (see ``create_reflection_view``).  *view_name* is only named in the error
+    for a table that has neither files nor a schema.
+    """
+    if not files:
+        empty_select = _empty_relation_select(columns, column_types)
+        if empty_select is None:
+            raise ValueError(f"No files provided for reflection view '{view_name}'")
+        # WHERE 1=0 keeps the declared column types while guaranteeing no row.
+        return f"SELECT {empty_select} WHERE 1=0"
+
+    parquet_files_str = ", ".join(f"'{escape_parquet_path(f)}'" for f in files)
+    select_cols = _reflection_select_cols(columns)
+    return (
+        f"SELECT {select_cols} "
+        f"FROM parquet_scan([{parquet_files_str}], "
+        f"union_by_name=TRUE, HIVE_PARTITIONING=FALSE)"
+    )
+
+
 def create_reflection_view(
         con: duckdb.DuckDBPyConnection,
         view_name: str,
         files: List[str],
         columns: Optional[List[str]] = None,
         column_types: Optional[Dict[str, str]] = None,
+        over: Optional[Callable[[str], str]] = None,
 ) -> None:
     """CREATE OR REPLACE VIEW ... AS SELECT ... FROM parquet_scan(...).
 
@@ -784,28 +813,19 @@ def create_reflection_view(
     only way a file list is empty here: the read-path pruner deliberately never
     prunes to zero (see ``prune_files_by_predicates``), precisely so that an
     empty list means "no resources" and nothing else.
+
+    *over* makes the view hold more than the reflection: it is given the
+    reflection's SELECT and returns the SELECT the view is created with, the
+    reflection inside it as a subquery (``tombstone_select`` over
+    ``(<reflection>) AS <name>``).  DuckDB resolves a view's files when the
+    view is created and again whenever something is bound over it, opening
+    every file each time; a layer that is a view of its own over this one
+    costs a read one more pass over all its files than the same layer written
+    into this view.
     """
-    if not files:
-        empty_select = _empty_relation_select(columns, column_types)
-        if empty_select is None:
-            raise ValueError(f"No files provided for reflection view '{view_name}'")
-        # WHERE 1=0 keeps the declared column types while guaranteeing no row.
-        con.execute(
-            f"CREATE OR REPLACE VIEW {view_name} AS "
-            f"SELECT {empty_select} WHERE 1=0;"
-        )
-        return
-
-    parquet_files_str = ", ".join(f"'{escape_parquet_path(f)}'" for f in files)
-    select_cols = _reflection_select_cols(columns)
-
-    sql = (
-        f"CREATE OR REPLACE VIEW {view_name} AS "
-        f"SELECT {select_cols} "
-        f"FROM parquet_scan([{parquet_files_str}], "
-        f"union_by_name=TRUE, HIVE_PARTITIONING=FALSE);"
-    )
-    con.execute(sql)
+    select = reflection_view_select(view_name, files, columns, column_types)
+    body = select if over is None else over(select)
+    con.execute(f"CREATE OR REPLACE VIEW {view_name} AS {body};")
 
 
 def reflections_are_materialised() -> bool:
@@ -825,6 +845,7 @@ def create_reflection_view_with_presign_retry(
         columns: Optional[List[str]] = None,
         log_prefix: str = "",
         column_types: Optional[Dict[str, str]] = None,
+        over: Optional[Callable[[str], str]] = None,
 ) -> bool:
     """
     Create a lazy reflection VIEW with automatic presign fallback on HTTP errors.
@@ -834,19 +855,34 @@ def create_reflection_view_with_presign_retry(
     ``SUPERTABLE_DUCKDB_MATERIALIZE`` (default: ``view``; set to ``table`` to
     revert to the old eager-materialisation behaviour).
 
+    *over* is ``create_reflection_view``'s: the layers the view holds above
+    the reflection.  A retry makes the same view over the presigned files.  It
+    must not name a file the object store could refuse: what is signed here
+    are the reflection's own files.  A materialised reflection is a table and
+    holds nothing but its rows.
+
     Returns True if the presign fallback was used.
     """
     if reflections_are_materialised():
+        if over is not None:
+            raise ValueError(
+                "a materialised reflection is a table: no layer is folded into it")
         return create_reflection_table_with_presign_retry(
             con, storage, view_name, files, columns, log_prefix,
             column_types=column_types,
         )
 
+    def create(paths: List[str]) -> None:
+        if over is None:
+            create_reflection_view(con, view_name, paths, columns, column_types)
+        else:
+            create_reflection_view(con, view_name, paths, columns, column_types, over=over)
+
     configure_httpfs_and_s3(con, files)
     tried_presign = False
 
     try:
-        create_reflection_view(con, view_name, files, columns, column_types)
+        create(files)
     except Exception as e:
         msg = str(e)
         if wants_presign_retry(e):
@@ -854,7 +890,7 @@ def create_reflection_view_with_presign_retry(
             tried_presign = True
             presigned_files = make_presigned_list(storage, files)
             configure_httpfs_and_s3(con, presigned_files)
-            create_reflection_view(con, view_name, presigned_files, columns, column_types)
+            create(presigned_files)
         else:
             raise
 
@@ -2147,6 +2183,67 @@ ROWID_COL = "__rowid__"
 TIMESTAMP_COL = "__timestamp__"
 
 
+def tombstone_select(
+        source: str,
+        source_name: str,
+        dv_table: Optional[str] = None,
+        parts: Optional[List[str]] = None,
+        expose_rowid: bool = False,
+) -> str:
+    """The SELECT a tombstone view stands for: *source* without its system
+    columns and without the rows its deletion vector names.
+
+    *source* is what is read: the name of a table or view, or a subquery
+    written ``(<select>) AS <source_name>``.  *source_name* is the name its
+    ``__rowid__`` is qualified with in the anti-join, which for a table or a
+    view is *source* itself.
+
+    The vector is *dv_table* (a table of row ids, see ``TombstoneCache``) or,
+    without one, the *parts* read in place; with neither, only the system
+    columns are stripped.  ``create_tombstone_view`` says what each form
+    means; this is the one place that writes them.
+    """
+    # Tolerant, static system-column strip: ``COLUMNS(c -> ...)`` silently
+    # skips a system column that is absent (pre-``__rowid__`` parquet), where
+    # a literal ``EXCLUDE`` list would raise. In an ANTI JOIN only the left
+    # table's columns reach the output, so the unqualified ``COLUMNS()`` never
+    # picks up the deletion-vector's ``__rowid__``.
+    hidden = (f"'{TIMESTAMP_COL}'" if expose_rowid
+              else f"'{ROWID_COL}', '{TIMESTAMP_COL}'")
+    live_cols = f"COLUMNS(c -> c NOT IN ({hidden}))"
+    rid = quote_if_needed(ROWID_COL)
+
+    if dv_table:
+        # Cached deletion-vector: anti-join the already-materialised table.
+        # Semantically identical to the inline subquery below — the table is
+        # exactly `SELECT DISTINCT __rowid__ FROM read_parquet(...)`.
+        return (
+            f"SELECT {live_cols} FROM {source} "
+            f"ANTI JOIN {dv_table} AS __dv__ "
+            f"ON {source_name}.{rid} = __dv__.{rid}"
+        )
+    if parts:
+        files_sql = ", ".join(f"'{escape_parquet_path(x)}'" for x in parts)
+        return (
+            f"SELECT {live_cols} FROM {source} "
+            f"ANTI JOIN (SELECT DISTINCT {rid} FROM read_parquet([{files_sql}])) AS __dv__ "
+            f"ON {source_name}.{rid} = __dv__.{rid}"
+        )
+    return f"SELECT {live_cols} FROM {source}"
+
+
+def vector_parts(tombstone_def) -> List[str]:
+    """The parts of a deletion vector, as a list.
+
+    The vector is a LIST of immutable parts (a checkpoint base plus per-write
+    deltas); older snapshots hold a single path.  Every part must be read:
+    missing one silently resurrects exactly the rows it recorded.
+    """
+    tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
+    return ([tomb_path] if isinstance(tomb_path, str)
+            else [x for x in (tomb_path or []) if x])
+
+
 def create_tombstone_view(
         con: duckdb.DuckDBPyConnection,
         source_table: str,
@@ -2214,53 +2311,22 @@ def create_tombstone_view(
         presigned: the data files of this query already needed presigned
             URLs, so the parts are signed before the first attempt.
     """
-    # Tolerant, static system-column strip: ``COLUMNS(c -> ...)`` silently
-    # skips a system column that is absent (pre-``__rowid__`` parquet), where
-    # a literal ``EXCLUDE`` list would raise. In an ANTI JOIN only the left
-    # table's columns reach the output, so the unqualified ``COLUMNS()`` never
-    # picks up the deletion-vector's ``__rowid__``.
-    hidden = (f"'{TIMESTAMP_COL}'" if expose_rowid
-              else f"'{ROWID_COL}', '{TIMESTAMP_COL}'")
-    live_cols = f"COLUMNS(c -> c NOT IN ({hidden}))"
+    tomb_parts = vector_parts(tombstone_def)
 
-    tomb_path = getattr(tombstone_def, "tombstone_path", None) if tombstone_def else None
-    # The vector is a LIST of immutable parts (a checkpoint base plus per-write
-    # deltas); older snapshots hold a single path.  Every part must be read —
-    # missing one silently resurrects exactly the rows it recorded.
-    tomb_parts = ([tomb_path] if isinstance(tomb_path, str)
-                  else [x for x in (tomb_path or []) if x])
-    rid = quote_if_needed(ROWID_COL)
-
-    if dv_table:
-        # Cached deletion-vector: anti-join the already-materialised table.
-        # Semantically identical to the inline subquery below — the table is
-        # exactly `SELECT DISTINCT __rowid__ FROM read_parquet(...)`.
-        sql = (
-            f"CREATE OR REPLACE VIEW {view_name} AS "
-            f"SELECT {live_cols} FROM {source_table} "
-            f"ANTI JOIN {dv_table} AS __dv__ "
-            f"ON {source_table}.{rid} = __dv__.{rid};"
-        )
-    elif tomb_parts:
+    if not dv_table and tomb_parts:
         def _inline(parts: List[str]) -> None:
-            files_sql = ", ".join(f"'{escape_parquet_path(x)}'" for x in parts)
-            con.execute(
-                f"CREATE OR REPLACE VIEW {view_name} AS "
-                f"SELECT {live_cols} FROM {source_table} "
-                f"ANTI JOIN (SELECT DISTINCT {rid} FROM read_parquet([{files_sql}])) AS __dv__ "
-                f"ON {source_table}.{rid} = __dv__.{rid};"
-            )
+            select = tombstone_select(
+                source_table, source_table, parts=parts, expose_rowid=expose_rowid)
+            con.execute(f"CREATE OR REPLACE VIEW {view_name} AS {select};")
 
         return read_vector_parts_with_presign_retry(
             con, storage, tomb_parts, _inline, presigned=presigned,
             what=f"deletion vector of {view_name}", log_prefix=log_prefix,
         )
-    else:
-        sql = (
-            f"CREATE OR REPLACE VIEW {view_name} AS "
-            f"SELECT {live_cols} FROM {source_table};"
-        )
-    con.execute(sql)
+
+    select = tombstone_select(
+        source_table, source_table, dv_table=dv_table, expose_rowid=expose_rowid)
+    con.execute(f"CREATE OR REPLACE VIEW {view_name} AS {select};")
     return False
 
 
@@ -2439,6 +2505,13 @@ class TombstoneCache:
     @property
     def enabled(self) -> bool:
         return self.capacity > 0
+
+    def holds(self, cache_key: Optional[str]) -> bool:
+        """True when ``acquire`` would find *cache_key*'s table and read no part."""
+        if not self.enabled or not cache_key:
+            return False
+        with self._lock:
+            return cache_key in self._registry
 
     def acquire(
             self,

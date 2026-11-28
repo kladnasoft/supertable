@@ -596,6 +596,56 @@ def test_the_second_read_finds_the_vector_it_cached(lake, store):
     assert len([s for s in store.seen if s[0] in VECTOR_KEYS]) == requests_after_two
 
 
+def _open_views():
+    con = engine_duckdb._shared_state()["con"]
+    return sorted(name for (name,) in con.execute(
+        "SELECT view_name FROM duckdb_views() WHERE NOT internal").fetchall())
+
+
+def test_the_read_that_fetches_the_vector_keeps_a_view_per_layer(lake, store):
+    """The reflection and the tombstone layer are one view where nothing has
+    to be read from the store between them.  Here something has: the vector's
+    parts, signed or not according to what the data files met.  So this read
+    binds the reflection first, by itself, as every read used to; the next
+    one finds the vector's table and makes one view."""
+    engine = engine_duckdb.DuckDBEngine(storage=store.storage)
+    files, vector = [store.url(DATA_KEY)], [store.url(key) for key in VECTOR_KEYS]
+
+    first = _stream(engine, lake, "SELECT id FROM emp", files, vector=vector,
+                    cache_key=VECTOR_KEYS[0])
+    views = _open_views()
+    assert len(views) == 2
+    assert views[0].startswith("st_") and views[1] == f"tomb_{views[0]}_{views[1][-8:]}"
+    assert _rows(first) == [{"id": 1}]
+    # the data file was refused once and the vector never asked for unsigned
+    assert store.seen.count((DATA_KEY, False)) >= 1
+    assert not any(store.unsigned(key) for key in VECTOR_KEYS)
+
+    parts_asked = len([s for s in store.seen if s[0] in VECTOR_KEYS])
+    refused_before = store.seen.count((DATA_KEY, False))
+    second = _stream(engine, lake, "SELECT id FROM emp", files, vector=vector,
+                     cache_key=VECTOR_KEYS[0])
+    views = _open_views()
+    assert len(views) == 1 and views[0].startswith("st_") and len(views[0]) == 3 + 16 + 1 + 8
+    assert _rows(second) == [{"id": 1}]
+    assert _open_views() == []
+    # the one view fell back as the reflection does: refused unsigned, read signed
+    assert store.seen.count((DATA_KEY, False)) > refused_before
+    assert len([s for s in store.seen if s[0] in VECTOR_KEYS]) == parts_asked
+
+
+def test_an_inline_vector_from_the_store_keeps_a_view_per_layer_every_time(lake, store):
+    """No cache key: the parts are read by every read, so every read binds the
+    reflection first."""
+    engine = engine_duckdb.DuckDBEngine(storage=store.storage)
+    files, vector = [store.url(DATA_KEY)], [store.url(key) for key in VECTOR_KEYS]
+    for _ in range(2):
+        handle = _stream(engine, lake, "SELECT id FROM emp", files, vector=vector)
+        assert len(_open_views()) == 2
+        assert _rows(handle) == [{"id": 1}]
+    assert not any(store.unsigned(key) for key in VECTOR_KEYS)
+
+
 def test_without_a_storage_to_sign_with_the_read_fails_and_brings_no_row_back(lake, store):
     engine = engine_duckdb.DuckDBEngine(storage=None)
     with pytest.raises(Exception, match="403|HTTP"):

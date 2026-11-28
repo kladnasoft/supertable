@@ -74,9 +74,12 @@ SETTINGS = ["http_timeout", "enable_http_metadata_cache",
             "enable_external_file_cache", "memory_limit", "threads"]
 
 
-def _one_row_view(con, view_name, files, columns=None, column_types=None):
-    """The reflection view as a local relation: no scan, so no store."""
-    con.execute(f"CREATE OR REPLACE VIEW {view_name} AS SELECT 1 AS amount")
+def _one_row_view(con, view_name, files, columns=None, column_types=None, over=None):
+    """The reflection as a local relation: no scan, so no store.  The layers
+    the engine folds into the reflection's view (*over*) are the engine's."""
+    select = "SELECT 1 AS amount"
+    con.execute(f"CREATE OR REPLACE VIEW {view_name} AS "
+                f"{select if over is None else over(select)}")
 
 
 @pytest.fixture

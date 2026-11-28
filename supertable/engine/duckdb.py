@@ -26,6 +26,8 @@ from supertable.engine.engine_common import (
     apply_runtime_pragmas,
     create_rbac_view,
     create_tombstone_view,
+    tombstone_select,
+    vector_parts,
     widen_projection_for_row_filter,
     TombstoneCache,
     lock_file_access,
@@ -192,6 +194,24 @@ class DuckDBEngine:
     # Core execution
     # ------------------------------------------------------------------
 
+    def _reads_vector_from_a_store(self, tomb_def) -> bool:
+        """True when this query has to read *tomb_def*'s parts from an object
+        store itself: the parts are URLs, and the cache holds no table of
+        this version of the vector (or is off).
+
+        Such a read keeps a view per layer, the reflection first.  An object
+        store that refuses the data files unsigned refuses the vector's parts
+        too, and the parts are then signed before they are asked for
+        (``read_vector_parts_with_presign_retry``): whether the data files
+        were refused has to be known before the vector is read, and it is
+        known once the reflection has been bound.  Folded into one view, the
+        vector would have to be read before that view exists.
+        """
+        parts = vector_parts(tomb_def)
+        if not parts or not has_remote_path(parts):
+            return False
+        return not self._tombstone_cache.holds(getattr(tomb_def, "cache_key", None))
+
     def _build_view_chain(
             self,
             con,
@@ -218,6 +238,21 @@ class DuckDBEngine:
         buffered read sees — the same deletion-vector anti-join, the same RBAC
         column and row filtering — otherwise streaming would quietly become a
         way to bypass both.
+
+        The reflection and the tombstone layer of a table are ONE view where
+        they can be: the reflection is a subquery of the view that strips the
+        system columns and anti-joins the deletion vector.  DuckDB resolves a
+        view's files when the view is created and again whenever something is
+        bound over it, and opens every file each time, so a reflection that
+        was a view of its own cost every read one more pass over all its files
+        (0.19 ms a file).  The layers are the same SELECTs either way
+        (``reflection_view_select``, ``tombstone_select``); the RBAC view on
+        top is made as it always was.  Two cases keep a view per layer:
+
+          * ``SUPERTABLE_DUCKDB_MATERIALIZE=table``, where the reflection is
+            a table;
+          * a deletion vector whose parts this query has to read from an
+            object store (see ``_reads_vector_from_a_store``).
 
         ``created_views`` and ``acquired_dv_keys`` are appended in place so the
         CALLER owns teardown: a buffered query tears down when it returns, a
@@ -248,11 +283,57 @@ class DuckDBEngine:
         # dropped by one query while another still read through it.
         materialised = reflections_are_materialised()
         materialised_names: set = set()
+        tombstone_views = getattr(reflection, "tombstone_views", None) or {}
+
+        # alias -> the view that already holds its tombstone layer, and what
+        # each such view was made of (a table named twice in a query, with
+        # the same columns, has one view: the second would be the same
+        # statement, and one more pass over every file).
+        folded: dict = {}
+        folded_from: dict = {}
 
         tried_presign = False
         for alias, table_name in alias_to_table_name.items():
             files = alias_to_files[alias]
             cols = alias_to_columns[alias]
+            tomb_def = tombstone_views.get(alias)
+
+            if not materialised and not self._reads_vector_from_a_store(tomb_def):
+                # One view for the files and the vector, named for this query
+                # like the tombstone view it stands in for.
+                view = f"{table_name}_{query_suffix}"
+                cache_key = getattr(tomb_def, "cache_key", None) if tomb_def else None
+                tomb_path = getattr(tomb_def, "tombstone_path", None) if tomb_def else None
+                made_of = (files, cols, cache_key, tomb_path)
+                if folded_from.get(view) == made_of:
+                    folded[alias] = view
+                    continue
+                # A table the cache already holds, or parts on the local disk:
+                # nothing here asks an object store for the vector.
+                dv_table = self._tombstone_cache.acquire(
+                    con, cache_key, tomb_path,
+                    storage=self.storage, presigned=tried_presign,
+                )
+                if dv_table:
+                    acquired_dv_keys.append(cache_key)
+                parts = [] if dv_table else vector_parts(tomb_def)
+
+                def over(select, _name=table_name, _dv=dv_table, _parts=parts):
+                    return tombstone_select(
+                        f"({select}) AS {_name}", _name,
+                        dv_table=_dv, parts=_parts, expose_rowid=expose_rowid,
+                    )
+
+                used_presign = create_reflection_view_with_presign_retry(
+                    con, self.storage, view, files, cols, log_prefix,
+                    column_types=alias_to_column_types.get(alias), over=over,
+                )
+                created_views.append(view)
+                folded[alias] = view
+                folded_from[view] = made_of
+                if used_presign:
+                    tried_presign = True
+                continue
 
             # Use VIEW (lazy, default). Set SUPERTABLE_DUCKDB_MATERIALIZE=table to revert.
             if materialised:
@@ -278,12 +359,16 @@ class DuckDBEngine:
 
         timer_capture("CREATING_REFLECTION")
 
-        # Tombstone / system-column view — created for EVERY alias so the
+        # Tombstone / system-column layer — there for EVERY alias so the
         # system columns (__rowid__, __timestamp__) are always stripped and
         # the deletion-vector (when present) is anti-joined out.  Sits on
-        # the reflection table directly, before RBAC.
-        tombstone_views = getattr(reflection, "tombstone_views", None) or {}
+        # the reflection directly, before RBAC: inside the alias's one view
+        # where the loop above made one, a view of its own otherwise.
         for alias in list(query_alias_to_name.keys()):
+            if alias in folded:
+                # Its one view already does both.
+                query_alias_to_name[alias] = folded[alias]
+                continue
             source = query_alias_to_name[alias]
             tomb_def = tombstone_views.get(alias)
             view = f"tomb_{source}_{query_suffix}"
