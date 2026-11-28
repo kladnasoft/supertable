@@ -66,6 +66,10 @@ The estimate is a routing input, not measured peak memory or a billed byte count
 
 Plan statistics include `REFLECTIONS`, `REFLECTION_SIZE`, and `REFLECTION_SIZE_RAW`. When pruning is enabled, they also include `FILES_BEFORE_PRUNE`, `FILES_PRUNED`, `FILES_KEPT`, `PRUNE_DURATION_MS`, and available pruning counters.
 
+### What is kept of a table's statistics
+
+Pruning needs each file's bounds for the columns a query constrains, and the size estimate each file's stored bytes for the columns it names. Neither depends on the values a query compares with, so both are worked out of the table's statistics once and kept with the cached statistics frame, under the columns: a read of a shape that has been read before looks them up. A write puts new statistics under a new path, which is a new frame with nothing kept for it; what was kept for the old frame goes with it. Per cached frame the eight most recently used answers are kept, about 1 KB of memory per file for a bounds index and 0.25 KB per file for the stored bytes of a column set. Results and plan statistics are the same as without it.
+
 ## 3. Select an engine
 
 AUTO examines active Spark cluster registrations for the organization:

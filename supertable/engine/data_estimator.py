@@ -24,6 +24,7 @@ from supertable.utils.sql_parser import TableDefinition
 from supertable.processing import (
     load_stats,
     prune_files_by_predicates,
+    stats_derived,
     ROWID_COL,
     TIMESTAMP_COL,
 )
@@ -776,6 +777,10 @@ class DataEstimator:
         carried a non-NULL ``compressed_bytes``.  A file with any NULL (an older
         carried-forward row) is omitted so the caller falls back to a whole-file
         ratio rather than under-counting it as zero.
+
+        The sums depend on the frame and on the columns, so they are made once
+        for a frame and kept with it (``processing.stats_derived``): what is
+        returned is shared between reads and is not to be changed.
         """
         if (
             stats_df is None
@@ -783,6 +788,17 @@ class DataEstimator:
             or "compressed_bytes" not in stats_df.columns
         ):
             return set(), {}
+        return stats_derived(
+            stats_df, ("projected bytes", frozenset(selected_cols)),
+            lambda: self._sum_projected_bytes(stats_df, selected_cols),
+        )
+
+    @staticmethod
+    def _sum_projected_bytes(
+        stats_df: "polars.DataFrame",
+        selected_cols: Set[str],
+    ) -> Tuple[Set[str], Dict[str, int]]:
+        """``_projected_bytes_index``, worked out of the frame."""
         sel = (
             stats_df.select(["file_path", "column_name", "compressed_bytes"])
             .with_columns(polars.col("column_name").str.to_lowercase().alias("__cn"))

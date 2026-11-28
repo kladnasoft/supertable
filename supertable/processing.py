@@ -7,6 +7,7 @@ import os
 import io
 import time
 import threading
+import weakref
 import uuid
 from array import array
 from bisect import bisect_left
@@ -14,7 +15,7 @@ from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
 from datetime import datetime, date, timedelta, timezone
 from functools import lru_cache
-from typing import Callable, Dict, List, Set, Tuple, Optional
+from typing import Any, Callable, Dict, List, Set, Tuple, Optional
 
 import polars
 import pyarrow as pa
@@ -4461,6 +4462,22 @@ def _occurrence_excludes_file(
     return True
 
 
+def _bounds_index(
+        stored_stats_df: polars.DataFrame,
+        constrained_cols: List[str],
+) -> Dict[str, Dict[int, Dict[str, Optional[Tuple[str, object, object]]]]]:
+    """``file_path -> row_group_id -> column_name -> (lane, min, max) | None``
+    for *constrained_cols*, read from a statistics frame."""
+    needed = stored_stats_df.filter(polars.col("column_name").is_in(constrained_cols))
+    index: Dict[str, Dict[int, Dict[str, Optional[Tuple[str, object, object]]]]] = {}
+    for row in needed.iter_rows(named=True):
+        fp = row["file_path"]
+        rg = row["row_group_id"]
+        col = row["column_name"]
+        index.setdefault(fp, {}).setdefault(rg, {})[col] = _stored_lane(row)
+    return index
+
+
 def prune_files_by_predicates(
         file_keys: List[str],
         stored_stats_df: Optional[polars.DataFrame],
@@ -4491,13 +4508,13 @@ def prune_files_by_predicates(
         return file_keys
 
     constrained_cols = sorted({c for occ in occurrences for c in occ})
-    needed = stored_stats_df.filter(polars.col("column_name").is_in(constrained_cols))
-    index: Dict[str, Dict[int, Dict[str, Optional[Tuple[str, object, object]]]]] = {}
-    for row in needed.iter_rows(named=True):
-        fp = row["file_path"]
-        rg = row["row_group_id"]
-        col = row["column_name"]
-        index.setdefault(fp, {}).setdefault(rg, {})[col] = _stored_lane(row)
+    # The bounds of these columns, per file and row group.  They depend on the
+    # frame and on the columns, not on what the query compares them with, so
+    # they are read from the frame once and kept with it (stats_derived).
+    index = stats_derived(
+        stored_stats_df, ("bounds", tuple(constrained_cols)),
+        lambda: _bounds_index(stored_stats_df, constrained_cols),
+    )
 
     kept: List[str] = []
     pruned = 0
@@ -4555,17 +4572,20 @@ def _schema_covering_subset(
     if stored_stats_df is None or stored_stats_df.height == 0:
         return file_keys
 
-    try:
+    def _columns_by_file() -> Dict[str, Set[str]]:
         grouped = (
             stored_stats_df
             .select(["file_path", "column_name"])
             .group_by("file_path")
             .agg(polars.col("column_name").unique())
         )
-        cols_by_file = {
+        return {
             row["file_path"]: set(row["column_name"])
             for row in grouped.iter_rows(named=True)
         }
+
+    try:
+        cols_by_file = stats_derived(stored_stats_df, ("columns by file",), _columns_by_file)
     except Exception:                                  # pragma: no cover
         return file_keys
 
@@ -4694,6 +4714,87 @@ def _tombstone_cache_cap() -> int:
 
 _STATS_CACHE = _PathKeyedFrameCache(_stats_cache_cap)
 _TOMBSTONE_CACHE = _PathKeyedFrameCache(_tombstone_cache_cap)
+
+
+# ---------------------------------------------------------------------------
+# What a read derives from a statistics frame, kept for as long as the frame
+# ---------------------------------------------------------------------------
+# Pruning needs each file's bounds for the columns a query constrains, and
+# projection sizing each file's stored bytes for the columns it names.  Both
+# were worked out of the frame again for every read, with polars, on a frame
+# of a few hundred rows, where one polars call costs milliseconds on its
+# thread pool: 6 to 9 ms for pruning and 7 to 14 ms for sizing, of every read
+# that has a predicate and names its columns.
+#
+# What is derived depends on the frame and on the columns asked about, not on
+# the values a query compares them with, so it is kept: per frame object,
+# under the columns.  A frame is never changed in place (a write builds a new
+# frame under a new path, and the cache above then holds that one), so
+# nothing derived from a frame can go stale while the frame lives, and it is
+# found only through that very object (a weak reference: a frame that is gone
+# is not kept alive, and what was derived from it is dropped the next time
+# something is kept).  A frame that is not cached (time travel, the cache
+# switched off) is a new object for every read and derives what it derived
+# before.
+#
+# What is handed out is shared between reads and must not be changed.
+# ---------------------------------------------------------------------------
+
+#: Values remembered per frame; the least recently asked for goes first.  A
+#: bounds index takes about 1 KB of Python memory a file (measured: 3.3 to
+#: 4.5 MiB for one to three columns of 4,000 files, whose frame is 3.7 MiB;
+#: 0.13 MiB for 100 files), the stored bytes of a column set 0.25 KB a file.
+_STATS_DERIVED_MAX_PER_FRAME = 8
+_STATS_DERIVED_LOCK = threading.Lock()
+# id(frame) -> (weak reference to the frame, key -> what was derived)
+_STATS_DERIVED: Dict[int, Tuple[Any, "OrderedDict[Any, Any]"]] = {}
+
+
+def stats_derived(frame: Any, key: Any, build: Callable[[], Any]) -> Any:
+    """What *build* makes of the statistics *frame* for *key*, made once per frame.
+
+    *key* names what is derived and for which columns; *build* takes no
+    argument and derives it.  The value of an earlier call with the same frame
+    object and an equal key is returned without calling *build*.  An exception
+    from *build* is the caller's and nothing is kept.
+    """
+    if frame is None:
+        return build()
+    ident = id(frame)
+    with _STATS_DERIVED_LOCK:
+        entry = _STATS_DERIVED.get(ident)
+        # ``is``: an id is used again once its object is gone.
+        if entry is not None and entry[0]() is frame and key in entry[1]:
+            entry[1].move_to_end(key)
+            return entry[1][key]
+
+    value = build()
+
+    try:
+        reference = weakref.ref(frame)
+    except TypeError:                       # cannot be remembered: derived every time
+        return value
+    with _STATS_DERIVED_LOCK:
+        entry = _STATS_DERIVED.get(ident)
+        if entry is None or entry[0]() is not frame:
+            # A frame not seen before.  Whatever was kept for frames that are
+            # gone goes now: there is no other moment at which it would.
+            for gone in [i for i, (ref, _) in _STATS_DERIVED.items() if ref() is None]:
+                del _STATS_DERIVED[gone]
+            entry = (reference, OrderedDict())
+            _STATS_DERIVED[ident] = entry
+        kept = entry[1]
+        kept[key] = value
+        kept.move_to_end(key)
+        while len(kept) > _STATS_DERIVED_MAX_PER_FRAME:
+            kept.popitem(last=False)
+    return value
+
+
+def forget_stats_derived() -> None:
+    """Drop everything derived from statistics frames (tests)."""
+    with _STATS_DERIVED_LOCK:
+        _STATS_DERIVED.clear()
 
 
 def load_stats(
