@@ -428,6 +428,15 @@ class Settings:
     # False to fall back to whole-file sizing (every query charged all columns).
     SUPERTABLE_READ_PROJECTION_SIZING_ENABLED: bool = True
 
+    # File order for top-N reads: when True, a query of the shape
+    # ``SELECT ... FROM one_table ORDER BY column [DESC] LIMIT n`` has the
+    # table's files handed to DuckDB in the order of that column's stored
+    # bounds (newest first for DESC) instead of the order they were written
+    # in, so its top-N can skip most of them. Never changes which rows come
+    # back; applied only where the statistics show the columns a read returns
+    # are the same either way. Set False to hand files over as listed.
+    SUPERTABLE_READ_FILE_ORDER_ENABLED: bool = True
+
     # ── Audit ────────────────────────────────────────────────────────
     # Audit is OFF by default.  Enable per-organization in the WebUI
     # /ui/audit → Compliance tab (persisted at supertable:{org}:system:audit:config),
@@ -702,6 +711,7 @@ def _build_settings() -> Settings:
         SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES=_env_int("SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES", 64),
         SUPERTABLE_READ_PRUNING_ENABLED=_env_bool("SUPERTABLE_READ_PRUNING_ENABLED", True),
         SUPERTABLE_READ_PROJECTION_SIZING_ENABLED=_env_bool("SUPERTABLE_READ_PROJECTION_SIZING_ENABLED", True),
+        SUPERTABLE_READ_FILE_ORDER_ENABLED=_env_bool("SUPERTABLE_READ_FILE_ORDER_ENABLED", True),
 
         # ── Audit ────────────────────────────────────────────────────
         SUPERTABLE_AUDIT_ENABLED=_env_bool("SUPERTABLE_AUDIT_ENABLED", False),

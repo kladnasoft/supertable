@@ -4624,6 +4624,223 @@ def _schema_covering_subset(
 
 
 # ===========================================================================
+# Consumer 5c: the order a table's files are handed to a top-N read in
+# ---------------------------------------------------------------------------
+# ``SELECT ... FROM t ORDER BY c DESC LIMIT n`` has no predicate, so no file
+# is pruned, and DuckDB reads the files in the order it is given them: the
+# order they were written in, oldest first.  Its top-N operator skips a row
+# group once it holds n rows that beat the group's bounds, which never happens
+# while every file it opens next holds newer rows than all before it: the
+# whole table is read for n rows (1.5 s for 1,000 of 10,000,000 rows on two
+# threads; 85 ms with the same files newest first).
+#
+# So for that shape (``SQLParser.get_scan_order``) the files are handed over
+# in the order of the column's stored bounds.  The order of the files is a
+# hint to the engine and never decides which rows come back, but it is seen in
+# one place: a reader of several files takes each column's name, and for
+# ``SELECT *`` its position, from the first file that has it.  The files are
+# therefore reordered only when the statistics show that this comes out the
+# same either way; in every other case they are left as they are listed.
+# ===========================================================================
+
+#: The statistics' typed bounds, as ``_stored_lane`` reads them.
+_STATS_LANES = (
+    ("bigint", "min_bigint", "max_bigint"),
+    ("double", "min_double", "max_double"),
+    ("timestamp", "min_timestamp", "max_timestamp"),
+    ("string", "min_string", "max_string"),
+)
+
+
+def _file_bounds(
+        stored_stats_df: polars.DataFrame,
+        column: str,
+) -> Dict[str, Tuple[str, object, object]]:
+    """``file_path -> (lane, lowest min, highest max)`` of *column*, named in
+    any case, over the file's row groups.
+
+    A file is left out when none of its row groups has bounds for the column
+    (no statistics, only NULLs, a type that is not routed) or when its row
+    groups disagree about the lane.
+
+    The frame's columns are taken as they are and walked here: on a frame of
+    a few hundred rows one polars expression costs milliseconds in its query
+    engine, and this runs for the first read of every new statistics file.
+    """
+    wanted = column.lower()
+    names = stored_stats_df.get_column("column_name").to_list()
+    at = [i for i, name in enumerate(names) if name is not None and name.lower() == wanted]
+    if not at:
+        return {}
+
+    def taken(name: str) -> list:
+        return stored_stats_df.get_column(name).gather(at).to_list()
+
+    paths, available = taken("file_path"), taken("stats_available")
+    lanes = [(lane, taken(lo), taken(hi)) for lane, lo, hi in _STATS_LANES]
+    out: Dict[str, Tuple[str, object, object]] = {}
+    mixed: Set[str] = set()
+    for k, fp in enumerate(paths):
+        if fp is None or not available[k]:
+            continue
+        for lane, lows, highs in lanes:           # the first lane that is filled: _stored_lane
+            lo, hi = lows[k], highs[k]
+            if lo is not None and hi is not None:
+                break
+        else:
+            continue
+        if lo != lo or hi != hi:                  # NaN orders nothing
+            continue
+        seen = out.get(fp)
+        if seen is None:
+            out[fp] = (lane, lo, hi)
+        elif seen[0] != lane:
+            mixed.add(fp)
+        else:
+            out[fp] = (lane, min(seen[1], lo), max(seen[2], hi))
+    for fp in mixed:
+        out.pop(fp, None)
+    return out
+
+
+def _column_sequences(
+        stored_stats_df: polars.DataFrame,
+) -> Tuple[Dict[str, int], List[Tuple[str, ...]]]:
+    """Which columns each file has, in the order its footer lists them.
+
+    Returns ``(file_path -> n, sequences)`` where ``sequences[n]`` is the
+    file's column paths; files with the same columns in the same order share
+    one *n*.  The statistics hold a row for every column of every row group,
+    written in footer order (``_stats_rows_for_metadata``) and kept in that
+    order when they are carried forward (``build_stats_file`` filters and
+    appends), so the rows of a file's first row group are its columns as a
+    reader finds them.  The system columns are not recorded; no read returns
+    them."""
+    by_file: Dict[str, List[str]] = {}
+    for group, fp, name in zip(
+            stored_stats_df.get_column("row_group_id").to_list(),
+            stored_stats_df.get_column("file_path").to_list(),
+            stored_stats_df.get_column("column_name").to_list()):
+        if group == 0 and fp is not None and name is not None:
+            by_file.setdefault(fp, []).append(name)
+    known: Dict[Tuple[str, ...], int] = {}
+    sequences: List[Tuple[str, ...]] = []
+    of_file: Dict[str, int] = {}
+    for fp, names in by_file.items():
+        sequence = tuple(names)
+        n = known.get(sequence)
+        if n is None:
+            n = known[sequence] = len(sequences)
+            sequences.append(sequence)
+        of_file[fp] = n
+    return of_file, sequences
+
+
+def _columns_read_together(
+        sequence_of_each_file: List[int],
+        sequences: List[Tuple[str, ...]],
+) -> Tuple[str, ...]:
+    """The columns a reader of these files finds, in its order.
+
+    Every name where it first appears, the files taken in turn; names are
+    compared without case and spelled as first met.  That is DuckDB's
+    ``union_by_name`` (sealed against the engine in the tests)."""
+    taken: Set[int] = set()
+    seen: Set[str] = set()
+    out: List[str] = []
+    for n in sequence_of_each_file:
+        if n in taken:
+            continue
+        taken.add(n)
+        for name in sequences[n]:
+            low = name.lower()
+            if low not in seen:
+                seen.add(low)
+                out.append(name)
+    return tuple(out)
+
+
+def order_files_by_stats(
+        file_keys: List[str],
+        stored_stats_df: Optional[polars.DataFrame],
+        column: str,
+        descending: bool,
+        every_column: bool,
+) -> List[str]:
+    """*file_keys* in the order of *column*'s stored bounds, for a read that
+    takes its first rows by that column.
+
+    Descending: the file with the highest value first; ascending: the one with
+    the lowest.  Files the statistics give no bounds for go last, as listed.
+
+    Returns *file_keys* itself, unchanged, unless the statistics show that
+    the read returns the same columns either way:
+
+    * every file is described by the statistics;
+    * the files have the same columns in the same order; or, when they do
+      not, the columns a reader finds (each name where it first appears,
+      spelled as first met) are the same in both orders, and no column is
+      nested;
+    * with nested columns and *every_column* (``SELECT *``) the files are
+      left as listed even when they agree: the statistics name a nested field
+      by a dotted path, which cannot be told from a column whose name has a
+      dot in it, and ``SELECT *`` shows the difference.
+
+    The types a reader gives the columns do not depend on the order of the
+    files (sealed against the engine in the tests).  Which rows come back
+    never depends on it: this is called only for a query whose own ORDER BY
+    pins them.
+    """
+    if stored_stats_df is None or stored_stats_df.height == 0 or len(file_keys) < 2:
+        return file_keys
+    if len(set(file_keys)) != len(file_keys):
+        return file_keys
+
+    bounds = stats_derived(
+        stored_stats_df, ("file bounds", column.lower()),
+        lambda: _file_bounds(stored_stats_df, column),
+    )
+    bounded = [fk for fk in file_keys if fk in bounds]
+    if not bounded:
+        return file_keys
+    # Whole numbers and fractions order together; nothing else does.
+    lanes = {"number" if bounds[fk][0] in ("bigint", "double") else bounds[fk][0]
+             for fk in bounded}
+    if len(lanes) != 1:
+        return file_keys
+
+    if descending:
+        ordered = sorted(bounded, key=lambda fk: (bounds[fk][2], bounds[fk][1]), reverse=True)
+    else:
+        ordered = sorted(bounded, key=lambda fk: (bounds[fk][1], bounds[fk][2]))
+    if len(bounded) != len(file_keys):
+        ordered.extend(fk for fk in file_keys if fk not in bounds)
+    if ordered == file_keys:
+        return file_keys
+
+    of_file, sequences = stats_derived(
+        stored_stats_df, ("column sequences",),
+        lambda: _column_sequences(stored_stats_df),
+    )
+    try:
+        listed = [of_file[fk] for fk in file_keys]
+    except KeyError:
+        return file_keys                 # a file the statistics do not describe
+    distinct = set(listed)
+    nested = any("." in name for n in distinct for name in sequences[n])
+    if len(distinct) > 1:
+        if nested:
+            return file_keys
+        reordered = [of_file[fk] for fk in ordered]
+        if (_columns_read_together(listed, sequences)
+                != _columns_read_together(reordered, sequences)):
+            return file_keys
+    elif nested and every_column:
+        return file_keys
+    return ordered
+
+
+# ===========================================================================
 # Stats + tombstone artifact accessors + in-process caches
 # ---------------------------------------------------------------------------
 # The stats parquet is read on every overwrite/delete (write-path pruning) and

@@ -1174,3 +1174,116 @@ class SQLParser:
                 result.setdefault(key, []).append(per_alias[alias])
 
         return result
+
+    # ---------------- Row order (read-path file order) ----------------
+
+    #: What the statement of ``get_scan_order`` may have: everything else a
+    #: SELECT can carry (joins, grouping, DISTINCT, QUALIFY, a sample, ...)
+    #: makes it another shape.
+    _SCAN_ORDER_SELECT_ARGS = frozenset(
+        {"expressions", "from", "from_", "where", "order", "limit", "offset"})
+
+    def get_scan_order(self) -> Dict[Tuple[str, str], Tuple[str, bool]]:
+        """The column a query takes its first rows by, per physical table.
+
+        ``{(super_name.lower(), simple_name.lower()): (column, descending)}``
+        for a query of exactly this shape, and ``{}`` for every other::
+
+            SELECT <columns, or expressions of one row> FROM <one table>
+            [WHERE ...] ORDER BY <column> [ASC | DESC] [, ...] LIMIT <n> [OFFSET <m>]
+
+        DuckDB answers such a query without reading what it can rule out: once
+        it holds *n* rows it skips every row group whose bounds cannot beat
+        them.  That helps only if the rows that win are met early, and a
+        table's files are read in the order they are handed over (the order
+        they were written in).  The estimator uses this to hand the files over
+        in the order of the column's stored bounds instead
+        (``processing.order_files_by_stats``).
+
+        The shape is narrow on purpose.  The order of the files is not seen in
+        the result only where the query itself pins the order of its rows and
+        every row of the result comes from one row of the table:
+
+        * one table, named once: no join, subquery, CTE or set operation, so
+          no second read of the table that the order could show in;
+        * no aggregate, window, DISTINCT, GROUP BY, HAVING, QUALIFY or sample,
+          whose answers can depend on the order their input arrives in;
+        * the first ORDER BY key is a column of the table itself, not a name
+          the select list gives to something else (``SELECT -ts AS ts ...
+          ORDER BY ts`` sorts by the alias);
+        * a LIMIT, without which every row is read anyway.
+
+        Rows that tie on every ORDER BY key come out in no promised order, with
+        or without this.  Never raises: anything unexpected is ``{}``.
+        """
+        try:
+            return self._scan_order()
+        except Exception:
+            return {}
+
+    def _scan_order(self) -> Dict[Tuple[str, str], Tuple[str, bool]]:
+        root = self._parsed
+        if not isinstance(root, exp.Select):
+            return {}
+        for name, value in root.args.items():
+            if value and name not in self._SCAN_ORDER_SELECT_ARGS:
+                return {}
+        order, limit = root.args.get("order"), root.args.get("limit")
+        if order is None or limit is None or not order.expressions:
+            return {}
+        first = order.expressions[0]
+        if not isinstance(first, exp.Ordered):
+            return {}
+        key = _unwrap_paren(first.this)
+        if not isinstance(key, exp.Column) or not key.name:
+            return {}
+        if key.args.get("db") or key.args.get("catalog"):
+            return {}
+
+        # One table, read once, and nothing that reads it a second time or
+        # folds rows together.  One pass over the statement, made only for a
+        # query that got this far.
+        table = None
+        for node in root.walk():
+            if node is root:
+                continue
+            if isinstance(node, exp.Table):
+                if table is not None:
+                    return {}
+                table = node
+            elif isinstance(node, (exp.Select, exp.Subquery, exp.With, exp.Join,
+                                   exp.Lateral, exp.AggFunc, exp.Window,
+                                   exp.TableSample)):
+                return {}
+        source = root.args.get("from") or root.args.get("from_")
+        if table is None or source is None or source.this is not table or not table.name:
+            return {}
+        table_alias = table.args.get("alias")
+        if isinstance(table_alias, exp.TableAlias) and table_alias.args.get("columns"):
+            return {}                     # FROM t AS x(a, b) gives the columns other names
+        alias = self._get_alias(table) or table.name
+        if alias in self._cte_aliases or alias not in self._alias_to_table:
+            return {}
+
+        qualifier = key.table
+        if qualifier:
+            if qualifier.lower() != alias.lower():
+                return {}                 # a field of a struct, or not this table
+        else:
+            # Unqualified, a name the select list gives out wins over the
+            # table's column of the same name (an alias, or a column that
+            # ``* REPLACE`` / ``* RENAME`` puts under it).
+            wanted = key.name.lower()
+            for projection in root.expressions:
+                for given in projection.find_all(exp.Alias):
+                    if (given.alias or "").lower() != wanted:
+                        continue
+                    inner = _unwrap_paren(given.this)
+                    if not (given is projection
+                            and isinstance(inner, exp.Column)
+                            and inner.name.lower() == wanted
+                            and (not inner.table or inner.table.lower() == alias.lower())):
+                        return {}
+
+        db = self._get_db_name(table) or self.default_super_name
+        return {(db.lower(), table.name.lower()): (key.name, bool(first.args.get("desc")))}

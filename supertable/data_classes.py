@@ -53,6 +53,14 @@ class SuperSnapshot:
     #: of types for building a typed zero-row relation. Empty otherwise, since
     #: a real scan gets its types from the files.
     column_types: Dict[str, str] = field(default_factory=dict)
+    #: The same ``files`` in the order a query that takes its first rows by a
+    #: column (``ORDER BY c LIMIT n``) is best handed them: by that column's
+    #: stored bounds, so that the engine's top-N meets the rows that win first
+    #: and can skip the rest.  ``None`` for every other query, and whenever
+    #: the order of the files could show in the result: the files are then
+    #: read as ``files`` lists them.  Set by ``DataEstimator.estimate``, used
+    #: by the DuckDB engine only.
+    files_in_read_order: Optional[List[str]] = None
 
 
 @dataclass

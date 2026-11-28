@@ -277,6 +277,7 @@ These are declarations, not a guarantee that every field is consumed by every se
 | `SUPERTABLE_TOMBSTONE_CACHE_MAX_TABLES` | `int` | `64` |
 | `SUPERTABLE_READ_PRUNING_ENABLED` | `bool` | `true` |
 | `SUPERTABLE_READ_PROJECTION_SIZING_ENABLED` | `bool` | `true` |
+| `SUPERTABLE_READ_FILE_ORDER_ENABLED` | `bool` | `true` |
 
 ### Audit and sharing
 

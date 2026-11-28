@@ -552,7 +552,11 @@ class DuckDBEngine:
             alias_to_table_name[td.alias] = hashed_table_name(
                 sup.super_name, sup.simple_name, sup.simple_version, cols,
             )
-            alias_to_files[td.alias] = list(sup.files)
+            # A top-N read is handed the files in the order of the column it
+            # takes its rows by, when the estimator worked one out; every
+            # other read, and every other engine, takes them as listed.
+            alias_to_files[td.alias] = list(
+                getattr(sup, "files_in_read_order", None) or sup.files)
             alias_to_columns[td.alias] = cols
             # Only consulted when the file list is empty: an existing
             # table with no resources has no footer to take a schema from.

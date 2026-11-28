@@ -1619,6 +1619,7 @@ class TestExecuteExecutorArgs:
         mock_parser.get_table_tuples.return_value = tables
         mock_parser.get_physical_tables.return_value = physical_tables
         mock_parser.get_predicate_constraints.return_value = {}
+        mock_parser.get_scan_order.return_value = {("s", "t"): ("id", True)}
         mock_parser.original_query = "SELECT * FROM t"
         MockParser.return_value = mock_parser
 
@@ -1650,6 +1651,10 @@ class TestExecuteExecutorArgs:
             # escape hatch that disables it so a test can compare pruned and
             # unpruned results and assert they are identical.
             fullscan=False,
+            # The column the query takes its first rows by, as the parser
+            # reports it (ORDER BY column LIMIT n over one table), so the
+            # estimator can order that table's files by it.
+            scan_order={("s", "t"): ("id", True)},
         )
 
 

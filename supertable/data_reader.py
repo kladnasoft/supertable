@@ -547,6 +547,18 @@ class DataReader:
                 logger.debug(self._lp(f"[prune] predicate extraction failed: {pc_err}"))
                 predicate_constraints = {}
 
+            # The column the query takes its first rows by (ORDER BY column
+            # LIMIT n over one table), so the estimator can hand that table's
+            # files over in the order of the column's bounds.  A hint: {} for
+            # every other shape, and never a reason to fail a read.
+            try:
+                scan_order = parser.get_scan_order()
+            except Exception as so_err:
+                logger.debug(self._lp(f"[order] scan order not derived: {so_err}"))
+                scan_order = {}
+            if not isinstance(scan_order, dict):
+                scan_order = {}
+
             # 1) ESTIMATE — use physical_tables so CTE aliases are excluded
             estimator = DataEstimator(
                 organization=self.organization,
@@ -555,6 +567,7 @@ class DataReader:
                 predicate_constraints=predicate_constraints,
                 plan_stats=self.plan_stats,
                 fullscan=fullscan,
+                scan_order=scan_order,
             )
             reflection = estimator.estimate()
 

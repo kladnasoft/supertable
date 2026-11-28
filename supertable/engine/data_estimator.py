@@ -23,6 +23,7 @@ from supertable.redis_catalog import RedisCatalog  # Redis leaf pointers for sna
 from supertable.utils.sql_parser import TableDefinition
 from supertable.processing import (
     load_stats,
+    order_files_by_stats,
     prune_files_by_predicates,
     stats_derived,
     ROWID_COL,
@@ -144,6 +145,7 @@ class DataEstimator:
         predicate_constraints: Optional[Dict] = None,
         plan_stats: Optional[PlanStats] = None,
         fullscan: bool = False,
+        scan_order: Optional[Dict] = None,
     ):
         self.organization = organization
         self.storage = storage
@@ -152,6 +154,12 @@ class DataEstimator:
         # query's WHERE clauses; used to prune files by the stats artifact.
         # None / empty ⇒ no read-path pruning.
         self.predicate_constraints = predicate_constraints or {}
+        # (super_lower, simple_lower) -> (column, descending): the column the
+        # query takes its first rows by, for ``ORDER BY column LIMIT n`` over
+        # one table (SQLParser.get_scan_order); used to hand that table's
+        # files over in the order of the column's bounds.  None / empty ⇒ the
+        # files are read as listed.
+        self.scan_order = scan_order if isinstance(scan_order, dict) else {}
         self.timer: Optional[Timer] = None
         # When the caller (DataReader) injects its PlanStats, estimator stats —
         # REFLECTIONS, REFLECTION_SIZE and the read-pruning counters — land on
@@ -699,6 +707,34 @@ class DataEstimator:
             logger.warning(f"[estimate.prune] pruning skipped for {super_name}.{simple_name}: {e}")
             return raw_keys
 
+    def _order_files(
+        self,
+        super_name: str,
+        simple_name: str,
+        files: List[str],
+        stats_df: Optional["polars.DataFrame"],
+        order_by: Optional[Tuple[str, bool]],
+        every_column: bool,
+    ) -> Optional[List[str]]:
+        """*files* in the order of the column the query takes its first rows
+        by, or ``None`` when they are to be read as listed.
+
+        ``None`` whenever there is nothing to order by, no statistics, or the
+        statistics cannot show that the read returns the same columns either
+        way (``processing.order_files_by_stats``).  Never raises: the order is
+        a hint to the engine, and a failure to work it out must not break a
+        read.
+        """
+        if order_by is None or stats_df is None or len(files) < 2:
+            return None
+        try:
+            column, descending = order_by
+            ordered = order_files_by_stats(files, stats_df, column, bool(descending), every_column)
+        except Exception as e:
+            logger.warning(f"[estimate.order] files left as listed for {super_name}.{simple_name}: {e}")
+            return None
+        return None if ordered is files or ordered == files else ordered
+
     # ----------------------- projection-aware sizing -----------------------
 
     # Rough per-value byte widths for the type-width *fallback* (used only when
@@ -872,6 +908,7 @@ class DataEstimator:
         files_before_prune = 0
         files_pruned = 0
         files_kept = 0
+        files_ordered_by: List[str] = []
 
         super_map = self._get_supertable_map()
 
@@ -936,12 +973,20 @@ class DataEstimator:
                     self.predicate_constraints.get((super_name.lower(), simple_name.lower()))
                 )
 
-                # Load the stats artifact ONCE per table and reuse it for BOTH
-                # predicate pruning and projection sizing (cache-backed: a repeated
-                # read of the same table is a memory hit). Only load when at least
-                # one consumer needs it, so a SELECT * with no WHERE stays free.
+                # The column the query takes its first rows by, when it has
+                # that shape (ORDER BY column LIMIT n over this one table).
+                # Not under fullscan: that read hands over every file as
+                # listed, and is what a pruned and ordered read is compared with.
+                order_by = None
+                if settings.SUPERTABLE_READ_FILE_ORDER_ENABLED and not self.fullscan:
+                    order_by = self.scan_order.get((super_name.lower(), simple_name.lower()))
+
+                # Load the stats artifact ONCE per table and reuse it for
+                # predicate pruning, projection sizing and the file order
+                # (cache-backed: a repeated read of the same table is a memory
+                # hit). Only load when at least one consumer needs it.
                 stats_df: Optional["polars.DataFrame"] = None
-                if stats_file and (need_projection or has_predicate):
+                if stats_file and (need_projection or has_predicate or order_by):
                     stats_df = load_stats(stats_file, allow_cache=True, profiler=prune_profiler)
 
                 # Read-path pruning: drop raw keys whose stats prove they cannot
@@ -967,6 +1012,16 @@ class DataEstimator:
                 proj: Dict[str, int] = {}
                 if need_projection:
                     tier3_files, proj = self._projected_bytes_index(stats_df, selected_cols)
+
+                # The same files in the order a top-N read is best handed
+                # them, or None: as listed.  ``files`` itself stays as listed.
+                in_read_order = self._order_files(
+                    super_name, simple_name, survivors, stats_df, order_by,
+                    every_column=selected_cols is None,
+                )
+                if in_read_order is not None:
+                    files_ordered_by.append(
+                        f"{simple_name}.{order_by[0]} {'DESC' if order_by[1] else 'ASC'}")
 
                 parquet_files: List[str] = []
                 for file_key in survivors:
@@ -994,6 +1049,11 @@ class DataEstimator:
                                                    # Carried only so a resource-free table can still be
                                                    # given a typed empty relation; see all_have_files below.
                                                    column_types=dict(schema_types))
+                    if in_read_order is not None:
+                        # Resolved as the listed files are (a key resolves to
+                        # one path: the listed list's own entry).
+                        resolved = dict(zip(survivors, parquet_files))
+                        super_snapshot.files_in_read_order = [resolved[k] for k in in_read_order]
                     supers.append(super_snapshot)
 
                     # Keep the snapshot these files were listed from, for the
@@ -1086,6 +1146,11 @@ class DataEstimator:
             prune_counts = prune_profiler.emit_counts()
             if prune_counts:
                 self.plan_stats.add_stat({"PRUNE_COUNTS": prune_counts})
+
+        # Only when a table's files were handed over in another order than
+        # listed: which table, by which column, in which direction.
+        if files_ordered_by:
+            self.plan_stats.add_stat({"FILES_ORDERED_BY": ", ".join(files_ordered_by)})
 
         return Reflection(
             storage_type=type(self.storage).__name__,
