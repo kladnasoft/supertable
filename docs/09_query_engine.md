@@ -145,7 +145,7 @@ The lock is frozen when it is set, so everything a connection will need is put i
 - `httpfs` cannot be loaded afterwards. The engine loads it before the lock when the first query reads URLs, and also when the configured storage is an object store and the first query happens to read none. It is looked for where `LOAD` finds it, under the application home, then where DuckDB auto-loads it from, under the operating-system home, and is installed only where `SUPERTABLE_DUCKDB_ALLOW_EXTENSION_DOWNLOAD` permits.
 - A connection locked without `httpfs` has no URL scheme on its list: a LOCAL deployment's read connection reaches no network. If a later query does bring a URL, the engine replaces the connection with a new one. Streams still open on the old one read to their end.
 - DuckDB's secret manager is started before the lock. It starts on first use by listing `~/.duckdb/stored_secrets` under the operating-system home, which is outside the list; a first use under the lock would fail there and leave the manager unusable for the life of the process.
-- `lock_configuration` is not used. The memory limit, thread count, HTTP timeout and cache switches are set per query, and they and the store's secret can still be set on a locked connection.
+- `lock_configuration` is not used. The memory limit, thread count, HTTP timeout and cache switches follow the engine configuration, which is read for every query: a query sends the statement for one of them when its value is not the one already in force on the connection (it used to send all of them every time). They and the store's secret can still be set on a locked connection.
 
 What the lock does not do:
 

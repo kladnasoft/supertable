@@ -323,3 +323,95 @@ def test_the_cursor_runs_the_query_and_nothing_else(engine, tmp_path, files):
     assert [len(cursor.sql) for cursor in cursors] == [1, 1]
     assert all(cursor.sql[0].lstrip().upper().startswith("SELECT ")
                for cursor in cursors)
+
+
+# --------------------------------------------------------------------------
+# The engine settings are sent when they change, not with every stream
+# --------------------------------------------------------------------------
+
+class _RecordingEverything(_RecordingConnection):
+    """... recording what the connection itself is sent as well."""
+
+    def __init__(self, con):
+        super().__init__(con)
+        self.sql = []
+
+    def execute(self, sql, *args, **kwargs):
+        self.sql.append(str(sql))
+        return self._con.execute(sql, *args, **kwargs)
+
+    def settings_sent(self):
+        """The settings statements since the last call."""
+        sent, self.sql = self.sql, []
+        return [sql for sql in sent if sql.startswith(("SET ", "PRAGMA "))]
+
+
+RUNTIME_STATEMENTS = ["PRAGMA memory_limit='256MB';", "SET threads=2;",
+                      "SET GLOBAL http_timeout=7;",
+                      "SET enable_external_file_cache=false;"]
+
+
+def _recorded(engine, tmp_path):
+    state = engine_duckdb._shared_state()
+    state["con"] = _RecordingEverything(
+        engine._get_connection(temp_dir=str(tmp_path / "spill")))
+    return state["con"]
+
+
+def test_a_second_stream_sends_no_engine_setting(engine, tmp_path):
+    """``apply_runtime_pragmas`` sent the four statements before every query;
+    it sends them when the configuration differs from what is in force."""
+    con = _recorded(engine, tmp_path)
+
+    assert _rows(_stream(engine, tmp_path, _settings_query(), RUNTIME))
+    first = con.settings_sent()
+    # after whatever configuring the store took, the runtime config has the last word
+    assert first[-len(RUNTIME_STATEMENTS):] == RUNTIME_STATEMENTS
+
+    for _ in range(3):
+        on_cursor = _rows(_stream(engine, tmp_path, _settings_query(), RUNTIME))[0]
+        assert con.settings_sent() == []
+        assert on_cursor["http_timeout"] == 7
+        assert on_cursor["threads"] == 2
+        assert on_cursor["enable_external_file_cache"] is False
+        assert on_cursor == _current_settings(con, SETTINGS)
+
+
+def test_a_changed_engine_configuration_is_what_the_next_stream_reads_with(engine, tmp_path):
+    con = _recorded(engine, tmp_path)
+    _rows(_stream(engine, tmp_path, _settings_query(), RUNTIME))
+    con.settings_sent()
+
+    changed = dataclasses.replace(RUNTIME, duckdb_threads=4, duckdb_http_timeout=11)
+    on_cursor = _rows(_stream(engine, tmp_path, _settings_query(), changed))[0]
+    assert con.settings_sent() == ["SET threads=4;", "SET GLOBAL http_timeout=11;"]
+    assert (on_cursor["threads"], on_cursor["http_timeout"]) == (4, 11)
+
+    on_cursor = _rows(_stream(engine, tmp_path, _settings_query(), RUNTIME))[0]
+    assert con.settings_sent() == ["SET threads=2;", "SET GLOBAL http_timeout=7;"]
+    assert (on_cursor["threads"], on_cursor["http_timeout"]) == (2, 7)
+
+
+def test_a_reconfigured_store_does_not_leave_its_own_timeout_in_force(
+        engine, tmp_path, monkeypatch):
+    """The store's settings change (here its region), so the next read
+    configures the connection again, and that sets the timeout from
+    ``SUPERTABLE_DUCKDB_HTTP_TIMEOUT`` (3 here).  The engine configuration (7)
+    is unchanged, but it has to be sent again, or the stream reads at 3."""
+    con = _recorded(engine, tmp_path)
+    assert _rows(_stream(engine, tmp_path, _settings_query(), RUNTIME))[0]["http_timeout"] == 7
+
+    monkeypatch.setattr(ec, "settings", dataclasses.replace(
+        ec.settings, STORAGE_REGION="eu-west-1"))
+    # what the reflection view's own call does on the next read of the store
+    ec.configure_httpfs_and_s3(con, S3_FILES)
+    assert _current_settings(con, ["http_timeout"]) == {"http_timeout": 3}
+    con.settings_sent()
+
+    on_cursor = _rows(_stream(engine, tmp_path, _settings_query(), RUNTIME))[0]
+    assert con.settings_sent() == RUNTIME_STATEMENTS
+    assert on_cursor["http_timeout"] == 7
+    assert _signing_secret(con, S3_FILES[0])["region"] == "eu-west-1"
+
+    _rows(_stream(engine, tmp_path, _settings_query(), RUNTIME))    # and then nothing again
+    assert con.settings_sent() == []

@@ -306,6 +306,14 @@ def configure_httpfs_and_s3(
         if _HTTPFS_APPLIED.get(con) == fingerprint:
             return
 
+    # From here on this sets http_timeout and the file cache switch from the
+    # process's settings, which a query's engine config may have set
+    # differently (``apply_runtime_pragmas``).  That function is called after
+    # this one for every query and has the last word; so that it still has it,
+    # it is made to forget what it put in force here.  Before the first
+    # statement: one that fails half-way has still changed the connection.
+    forget_runtime_pragmas(con)
+
     # Load httpfs.  It is baked into the image and seeded into the DuckDB
     # extension dir (see the container entrypoint), so LOAD normally succeeds
     # with no network access.
@@ -999,6 +1007,11 @@ def init_connection(
     - Thread count defaults to 4 to limit concurrent buffer-pool competition
       inside a constrained container.  Override with ``SUPERTABLE_DUCKDB_THREADS``.
     """
+    # Memory limit, threads and the file cache switch are set below from the
+    # process's settings: whatever a query's engine config had put in force on
+    # this connection no longer holds, and is sent again with the next query.
+    forget_runtime_pragmas(con)
+
     # Pin DuckDB's home directory to the (guaranteed-writable) app home before
     # anything else.  DuckDB otherwise derives it from the OS ``$HOME`` and uses
     # it for extension/secret lookups; under a restricted service user that path
@@ -1212,14 +1225,80 @@ def reset_pooled_duckdb_connections() -> None:
             pass
 
 
+# What ``apply_runtime_pragmas`` last put in force on each connection, so a
+# query sends a settings statement only when its value has changed.  Keyed by
+# the connection, weakly, like ``_HTTPFS_APPLIED``: a closed connection drops
+# out on its own and a new one starts with nothing remembered.
+_RUNTIME_APPLIED_LOCK = threading.Lock()
+_RUNTIME_APPLIED: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _runtime_applied(con) -> Dict[str, Any]:
+    """The record of *con*: what each of its runtime settings was last set to.
+
+    The record of one connection is only ever touched by the code that is
+    using that connection, so it needs no lock of its own; the lock is for the
+    table of connections.  A connection that cannot be referred to weakly gets
+    a record that is thrown away, and is sent every statement as before.
+    """
+    try:
+        with _RUNTIME_APPLIED_LOCK:
+            record = _RUNTIME_APPLIED.get(con)
+            if record is None:
+                record = {}
+                _RUNTIME_APPLIED[con] = record
+            return record
+    except TypeError:
+        return {}
+
+
+def forget_runtime_pragmas(con) -> None:
+    """Forget what ``apply_runtime_pragmas`` has put in force on *con*.
+
+    For whatever else sets one of the same settings on the connection
+    (``init_connection``, ``configure_httpfs_and_s3``): the next query then
+    sends every statement again, as a query used to every time.
+    """
+    try:
+        with _RUNTIME_APPLIED_LOCK:
+            _RUNTIME_APPLIED.pop(con, None)
+    except TypeError:
+        pass
+
+
 def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
-    """Re-apply the session-settable DuckDB pragmas from a live engine config.
+    """Put the session-settable DuckDB pragmas of a live engine config in force.
 
     DuckDB Lite/Pro reuse a persistent connection, so settings applied once at
     ``init_connection`` time would otherwise freeze for the connection's life.
     Calling this immediately before each query makes the org's engine config
     (memory limit, thread count, HTTP timeout, external file cache) take effect
     live — the connection adopts the latest values without being torn down.
+
+    A statement is sent only when its value differs from the one this function
+    last put in force on *con* (``_RUNTIME_APPLIED``).  It used to send all of
+    them before every query, changed or not, which cost a read 4 to 20 ms (a
+    point lookup 8 of its 50): ``PRAGMA memory_limit`` makes DuckDB flush its
+    allocator even when the limit is the one already set, and the query after
+    it starts on memory it has to ask for again.  A value changed in the
+    configuration is still in force for the next query, since the
+    configuration is resolved for every query and compared here.  A statement
+    DuckDB refuses is not remembered: it is sent again, and logged again,
+    with the next query.  ``init_connection``
+    and a (re)configuration by ``configure_httpfs_and_s3`` set some of the same
+    settings from the process's own settings, and make this function forget
+    the connection; anything else that sets one of them on a connection this
+    function is used on has to call ``forget_runtime_pragmas`` as well.  A
+    query cannot: the read gate admits no SET and no PRAGMA.
+
+    The flush had one more effect, which went with it: after a query that used
+    much memory, the next query's ``PRAGMA memory_limit`` handed that memory
+    back to the operating system at once.  DuckDB now hands it back on its own
+    schedule, a few seconds later (measured after a COUNT(DISTINCT) over ten
+    million rows, 572 MB resident: 221 MB at the next query with the flush;
+    without it 506 MB over the next thirty point lookups, 373 MB after fifty,
+    219 MB after fifteen seconds without a query).  The peak and the limit
+    are as they were.
 
     ``cfg`` is an ``EngineRuntimeConfig``.  When None the connection keeps
     whatever ``init_connection`` applied (settings-based), so callers without a
@@ -1233,14 +1312,19 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
     if cfg is None:
         return
 
+    applied = _runtime_applied(con)
+
     # normalize_memory_size guarantees a unit (UI sends a bare "2" -> "2GB");
     # a rejected value is logged rather than silently swallowed so a bad
     # config can never quietly leave the connection at the wrong limit.
     memory_limit = normalize_memory_size(cfg.duckdb_memory_limit, default="1GB")
-    try:
-        con.execute(f"PRAGMA memory_limit='{memory_limit}';")
-    except Exception as e:
-        logger.warning(f"[duckdb.pragma] memory_limit='{memory_limit}' rejected: {e}")
+    if applied.get("memory_limit") != memory_limit:
+        try:
+            con.execute(f"PRAGMA memory_limit='{memory_limit}';")
+            applied["memory_limit"] = memory_limit
+        except Exception as e:
+            applied.pop("memory_limit", None)
+            logger.warning(f"[duckdb.pragma] memory_limit='{memory_limit}' rejected: {e}")
 
     # Explicit thread count wins; otherwise derive from the live memory limit
     # and IO multiplier (same formula as init_connection).
@@ -1248,19 +1332,23 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
         thread_count = cfg.duckdb_threads
     else:
         thread_count = _derive_thread_count(memory_limit, multiplier=cfg.duckdb_io_multiplier)
-    try:
-        con.execute(f"SET threads={thread_count};")
-    except Exception:
-        pass
+    if applied.get("threads") != thread_count:
+        try:
+            con.execute(f"SET threads={thread_count};")
+            applied["threads"] = thread_count
+        except Exception:
+            applied.pop("threads", None)
 
     # httpfs settings — only effective once httpfs is loaded (remote reads).
     # GLOBAL, because a plain SET of http_timeout holds for this connection's
     # session only, and a stream's cursor would read at DuckDB's 30 s.
     if cfg.duckdb_http_timeout is not None:
-        try:
-            con.execute(f"SET GLOBAL http_timeout={int(cfg.duckdb_http_timeout)};")
-        except Exception:
-            pass
+        if applied.get("http_timeout") != cfg.duckdb_http_timeout:
+            try:
+                con.execute(f"SET GLOBAL http_timeout={int(cfg.duckdb_http_timeout)};")
+                applied["http_timeout"] = cfg.duckdb_http_timeout
+            except Exception:
+                applied.pop("http_timeout", None)
 
     # External file cache: enable whenever the org configures a cache size.
     # The cache is in-memory and bounded by memory_limit (DuckDB enforces that
@@ -1268,20 +1356,27 @@ def apply_runtime_pragmas(con: duckdb.DuckDBPyConnection, cfg) -> None:
     # only on builds that expose external_file_cache_max_size (no released
     # DuckDB through 1.5.x does); otherwise memory_limit is the bound.
     cache_size = normalize_memory_size(cfg.duckdb_external_cache_size, default="")
-    if cache_size:
-        try:
-            con.execute("SET enable_external_file_cache=true;")
-            if _external_file_cache_cappable(con):
-                con.execute(
-                    f"SET external_file_cache_max_size='{sanitize_sql_string(cache_size)}';"
-                )
-        except Exception as e:
-            logger.warning(f"[duckdb.pragma] external file cache config failed: {e}")
-    else:
-        try:
-            con.execute("SET enable_external_file_cache=false;")
-        except Exception:
-            pass
+    # Whether the build has a dedicated cap cannot change while the process
+    # runs, so the switch and the size are the whole of what is asked for.
+    external_cache = ("on", cache_size) if cache_size else ("off",)
+    if applied.get("external_cache") != external_cache:
+        if cache_size:
+            try:
+                con.execute("SET enable_external_file_cache=true;")
+                if _external_file_cache_cappable(con):
+                    con.execute(
+                        f"SET external_file_cache_max_size='{sanitize_sql_string(cache_size)}';"
+                    )
+                applied["external_cache"] = external_cache
+            except Exception as e:
+                applied.pop("external_cache", None)
+                logger.warning(f"[duckdb.pragma] external file cache config failed: {e}")
+        else:
+            try:
+                con.execute("SET enable_external_file_cache=false;")
+                applied["external_cache"] = external_cache
+            except Exception:
+                applied.pop("external_cache", None)
 
 
 # =========================================================
@@ -1454,7 +1549,8 @@ def lock_file_access(
         outside the list; a first use under the lock fails there and leaves
         the manager unusable until the process restarts.
       * ``lock_configuration`` is not used: memory limit, threads, HTTP
-        timeout and the cache switches are set per query, and all of them, the
+        timeout and the cache switches are set by any query that finds their
+        value changed (``apply_runtime_pragmas``), and all of them, the
         store's secret included, can still be set after this.
 
     Call it once per connection, after ``init_connection`` (the spill

@@ -144,7 +144,7 @@ class EngineRuntimeConfig:
     engine_spark_min_bytes: int
     engine_freshness_sec: int
 
-    # duckdb session pragmas (per-engine, re-applied live per query)
+    # duckdb session pragmas (per-engine, compared for every query and sent when changed)
     duckdb_memory_limit: str             # e.g. "1GB"
     duckdb_io_multiplier: float
     duckdb_threads: Optional[int]        # None → auto-derive from memory limit
